@@ -1,0 +1,71 @@
+
+        NVIDIA Linux Capture SDK 8.0.8
+
+        README and Getting Started Guide
+
+System Requirements
+===================
+
+* An NVIDIA GPU board with a Kepler or later GPU.
+
+* For x86_64 and x86, an NVIDIA GPU driver 455.23.04, or later.
+
+* For aarch64, an NVIDIA GPU driver 470.82.00, or later.
+
+Getting Started
+===============
+
+To build a sample application:
+
+* Change to the directory containing the application's source code:
+  cd {sdk_installation_path}/NvFBC/samples/{sample_application_name}
+
+* Add the appropriate header (-I) and library (-L) search paths for any
+  dependent packages in the sample application's makefile, wherever
+  required.
+
+* run `make`.
+
+* Additionally, to build the 32-bit/64-bit application binary, pass an
+  appropriate argument to the make command.
+  e.g.
+    To build 32-bit binary, run 'make i386=1' or 'make i686=1'.
+    To build 64-bit binary, run 'make x86_64=1'.
+
+To run a sample application:
+
+* cd {sdk_installation_path}/NvFBC/samples/{sample_application_name}
+    ./{sample_application_name}
+
+How to capture the cursor update in Linux NvFBC?
+
+* Applications wishing this feature should disable mouse capture in NvFBC, 
+  and rely on the following Xlib API:
+  GetCursorImage
+
+  For further details on the GetCursorImage(), refer to below:
+  https://cgit.freedesktop.org/xorg/proto/fixesproto/plain/fixesproto.txt
+
+
+WARNING
+=======
+
+* Use of NvIFR is deprecated. The NvIFR header file and sample applications
+  are removed from the NVIDIA Capture SDK. Please refer to section 6 of 
+  Release notes.
+  
+* NVIFR interface will not be supported on future GPU architectures or 
+  Drivers. 
+
+* Applications using NvIFR ToHWEnc interface can instead use 
+  NVIDIA Video Codec SDK directly.
+
+* The old NVFBC_CAPTURE_TO_HW_ENCODER interface is retired. An application
+  requesting that capture interface will get the NVFBC_ERR_UNSUPPORTED error.
+
+* If an application wishes to capture and encode, it is recommended
+  to capture, using NvFBC, to system memory or video memory,
+  and then pass that captured memory to the encoder using the Video
+  SDK's NVENC API. This approach provides finer encode control than is
+  available with ToHwEnc.
+  See: https://developer.nvidia.com/nvidia-video-codec-sdk

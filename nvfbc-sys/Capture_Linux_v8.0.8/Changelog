@@ -1,0 +1,317 @@
+==== NVIDIA Capture SDK 8.0.8
+
+ * Added support for aarch64.
+
+==== NVIDIA Capture SDK 8.0.4
+
+ * Retired the NVFBC_CAPTURE_TO_HW_ENCODER interface. Applications requesting
+   that interface will get the NVFBC_ERR_UNSUPPORTED error.
+   The recommended way to encode captured frames with NVENC is by using the
+   NVIDIA Video Codec SDK.
+   See: https://developer.nvidia.com/nvidia-video-codec-sdk
+
+ * Removed the NvFBCHwEnc and NvFBCHwEncCaps sample applications.
+
+ * See the NvFBC header file for feature changes and documentation.
+
+==== NVIDIA Capture SDK 7.1.9
+
+ * Added new NvFBC flags NVFBC_*_GRAB_FLAGS_NOWAIT_IF_NEW_FRAME_READY 
+   to return immediately if there is already a new frame available, rather
+   than wait for the next frame after the capture call is made.
+
+ * NvFBC will now fail gracefully if GLX is missing.
+
+ * Fixed a bug that caused NvFBC to not show changes for certain colours in
+   differential maps.
+
+ * Added support for logging in NvFBC via environment variables.
+
+ * Fixed a bug that caused NvFBC capture to break with Xorg 1.19.
+
+ * Added frame timestamps as part of the NvFBC grabInfo.
+
+ * NvFBC clients can now specify the rate at which the X driver component of
+   NvFBC should attempt to sample frames.
+
+ * Added push model support to NvFBC blocking capture where NvFBC clients 
+   can receive frames as soon as they are presented by applications.
+
+ * NvFBC headers and samples are now MIT licensed.
+
+ * NvIFROpenGL headers and samples are removed from the SDK. Please refer to 
+   README for more details.
+
+==== NVIDIA Capture SDK 7.0.5
+
+ * Added a new byte-ordered capture format NVFBC_BUFFER_FORMAT_BGRA in NvFBC 
+   supporting BGRA8888 format.
+
+ * Added support to not block NvFBC capture when automatic modeset recovery is disabled and
+   VT switched away.
+
+ * Fixed a bug that could generate incorrect differential maps when using
+   non blocking calls.
+
+ * Fixed a bug that resulted in corrupted differential maps when scaled.
+
+==== NVIDIA Capture SDK 6.1.10
+
+ * Added a sample application NvFBCToGLEnc to demonstrate the usage of ToGL
+   interface, to grab frames to an OpenGL texture in video memory and send them
+   to the HW encoder using NvEncodeAPI's OpenGL interface.
+
+ * Added new byte-ordered capture format NVFBC_BUFFER_FORMAT_RGBA in NvFBC 
+   supporting RGBA8888 format.
+
+ * Added timeout feature for NvFBC's blocking capture calls.
+
+ * Relaxed frame size and diffmap size requirements for supported pixel formats
+   in NvFBC.
+
+==== NVIDIA Capture SDK 6.0.6
+
+ * Added new ToGL interface in NvFBC to grab frames to an OpenGL texture in video memory 
+ 
+ * Added a sample application NvFBCToGL to demonstrate the usage of ToGL interface,
+   to grab frames to an OpenGL texture in video memory 
+
+ * Fixed a bug that caused segmentation fault on running the sample OpenGLIFRNVENCPerf,
+   with preset set to lossless
+   
+ * Added a sample application OpenGLIFRNVENCDynRes to demonstrate NvIFROGL usage,
+   to encode the contents of a framebuffer with dynamically varying resolution and bitrate.
+
+ * Fixed backward compatibility breakage in NvFBC   
+
+==== NVIDIA Capture SDK 5.0.9
+
+ * Added support to query the underlying hardware encoder capability
+
+ * Fixed a bug that caused segmentation fault on running the sample OpenGLIFRNVENCPerf
+
+ * Added new command line parameter to OpenGLIFRNVENCPerf to
+   select input format in sample
+
+ * Added sample applications NvFBCHwEncCaps, OpenGLIFRNVENCGetCaps to demonstrate the
+   usage of new API which queries the underlying encoder capability
+
+ * Added new error codes to improve the Error reporting.
+
+ * Fixed a race condition in the NvIFROpenGLNVENCThreaded sample.
+
+ * Added scaling factor support for diffmap in NvFBC
+
+ * Fixed a bug in NvIFROpenGL that caused issue when dynamic resolution
+   and dynamic bitrate are used together.
+
+ * Fixed a bug in NvFBCMultiThread sample application fails to capture on
+   multi-display set up with message "Invalid capture box".
+
+ * Use of ToHwEnc for NvIFR and NvFBC is deprecated, Refer to README for details.
+
+==== GRID SDK 4.0.13
+
+ * Fixed a bug which caused the OpenGLIFRNVENCPerf sample app to print the
+   error message "No BMP image found" and exit, when running on RHEL and
+   CentOS.
+
+ * Fixed a bug that caused NvFBC to crash when dynamically reconfiguring
+   the hardware encoder.
+
+ * Added support in NvIFROpenGL and NvFBC to capture and encode to HEVC
+   bit-stream. Only Main profile and YUV420 encode is supported.
+
+ * Added a codec agnostic interface for NvIFROpenGL and NvFBC.
+   Codec specific data-type/function/variable names are renamed to more
+   generic names. Backward source compatibility is supported.
+
+ * All NvIFROpenGL and NvFBC samples using capture and H.264 encode are
+   modified to support HEVC encode as well. A new command line parameter is
+   added to select codec to use for encoding.
+
+ * Fixed a crash in NvFBC when failed to create a handle.
+
+ * Modified an API NvIFROGLGetError() to delete an internal error string after
+   the client has retrieved it. A new parameter 'pendingBytes' is added to
+   return total size of the remaining internal error messages.
+
+ * Fixed a hang in NvIFROpenGL while doing YUV444 encoding on the GPU that
+   does not support the feature.
+
+ * Fixed a corruption in NvIFROpenGL YUV444 encoding when the captured
+   width/height is not a multiple of 32.
+
+ * Deprecated rate control mode CBR_IFRAME_2_PASS from NvIFROpenGL and
+   NvFBCd.
+
+ * Added a check to ensure NvIFROpenGL always uses even width and height
+   for YUV420 encoding. YUV44 encoding has no such limitation.
+
+ * Added a check to ensure profile value is set to HIGH_444_INTRA (244)
+   while using YUV444 encoding.
+
+ * Deprecated rate control mode NV_IFROGL_HW_ENC_RATE_CONTROL_VBR_MINQP. 
+   API returns NV_IFROGL_UNSUPPORTED_FEATURE if this rate control mode is set.
+
+ * Improved parameter validations in the NvIFROpenGL API.
+
+ * Added 'lowLatency' and 'highQuality' command line options to the
+   OpenGLIFRNVENCPerf sample to demonstrate low latency and high quality
+   encoding respectively, with other encoder parameters being the same.
+
+ * Updated sample applications using infinite GOP length to use single
+   frame VBV, whereas ones using finite GOP length to use 1 second
+   VBV buffer which is the recommended encoder setting.
+
+ * Fixed a race conditions in the NvIFROpenGLNVENCThreaded sample that
+   caused an application to report failure to lock transfered data or
+   to wait for worker thread to complete.
+
+ * Added support for processing of BMP images of bit-depth 32 by the
+   OpenGLIFRNVENCPerf sample app.
+
+==== GRID SDK 3.0.8
+
+ * Fixed a bug that caused corruption when using NvFBC to capture frames
+   at high resolutions using the YUV420p buffer format.
+
+ * Updated sample application NvFBCCUDAAsync to allow selection of the
+   buffer format.
+
+ * Added a new sample application NvFBCSharedContext.
+
+ * Fixed a bug in the bitrate calculation of NvIFROpenGL sample applications.
+
+ * Fixed a synchronization issue in multi-threaded NvIFROpenGL sample
+   (OpenGLIFRNVENCThreaded).
+
+ * Improved multi-threaded support in NvFBC by implementing an API
+   locking mechanism. Also, added new APIs in NvFBC to allow bind/release
+   NvFBC session to different threads. This is required for NvFBC
+   clients wishing to share a session between different threads.
+
+ * Added support in NvIFROpenGL and NvFBC to optionally encode H.264 in
+   YUV444 format.
+
+ * Additional documentation provided in the GRID SDK to help configure
+   Linux on the GRID server.
+
+ * Added a new encoder configuration parameter in NvFBC to enable/disable
+   returning the mean squared error (MSE) per channel during H.264
+   hardware encoding.
+
+ * Added a new lossless preset to support H.264 complient lossless mode
+   for NvIFR and NvFBC. This feature is available on Maxwell and above
+   GPUs.
+
+ * Added a new encoder configuration parameter to enable/disable adaptive
+   quantization during NvIFR and NvFBC H.264 encoding.
+
+ * Fixed a crash while configuring NvIFR H.264 encoder, when it runs out of
+   video memory.
+
+ * Fixed a memory leak in NvIFR H.264 hardware encoding.
+
+ * Added support for dynamically changing the resolution of a H.264 encoded
+   stream in NvIFR.
+
+ * Added new error code NV_IFROGL_CLIENT_VERSION_UNSUPPORTED. This error is
+   returned if the installed NvIFR library does not support NvIFR version
+   against which the client was built.
+
+ * Fixed a bug to use a correct version number for the Lock Bitstream structure
+   in NvIFR API.
+
+ * Added a new encoder configuration parameter for a client to specify number
+   of encoder reference frames to be invalidated during NvIFR H.264 hardware
+   encoding.
+
+ * Added a new encoder parameter to specify input timestamp, to be associated
+   with the input frame during NvIFR H.264 hardware encoding.
+
+ * Added a new encoder configuration parameter to specify the DPB size used
+   for NvIFR H.264 hardware encoder.
+
+ * Added a new API NvIFROGLGetH264EncSPSPPSHeader() to read the SPS PPS header
+   from the hardware encoder. A new encoder configuration parameter is provided
+   for client to be able to get SPSPPS header for every IDR frame.
+
+ * Added a new encoder configuration parameter to encode current frame as an
+   IDR picture during NvIFR H.264 hardware encoding.
+
+ * Added a new sample application OpenGLIFRChrome.
+
+ * Added support for cross compilation of 32-bit samples on a 64-bit OS.
+
+==== GRID SDK 2.2.12
+
+ * Fixed an intermittent segmentation fault when starting a capture session with NvFBC.
+
+ * Fixed a ghosting in an output H.264 stream, when the captured width or
+   height is not a multiple of 32. An application is modified to initialize
+   the VBV buffer to one frame size during an encoder configuration, to avoid
+   this corruption in the H.264 captured stream.
+
+ * Fixed an corruption in OpenGLIFRNVENCPerf's output H.264 stream, which
+   occures when the bitmap image in the dataset provided as an input has
+   an image size set to 0 in the bitmap's header information.
+
+==== GRID SDK 2.2.9 beta
+
+
+ * Added sample applications NvFBCCUDAAsync, NvFBCH264 and
+   NvFBCMultiThread to demonstrate NvFBC usage.
+
+ * Added support for NVIDIA Framebuffer Capture (NvFBC).
+   This library provides a high performance, low latency interface to
+   capture and optionally encode the composited framebuffer of an X screen.
+
+ * Fixed an issue in NvIFROpenGL library to improve performance and
+   reliability in the multi-threading scenarios.
+
+ * Fixed a bug causing random hang during NvIFROpenGL session creation.
+
+ * Added support to capture content of window-system provided framebuffer
+   to either system memory ot H.264 stream.
+
+==== GRID SDK 2.1
+
+ * Added an interface to query library's API version by an application.
+
+ * Fixed a bug causing corruption in the encoded H.264 bit-stream for the
+   captured surface of 720P and VGA resolution.
+
+ * Added an intra refresh support. This feature allows gradual encoder
+   refresh over a client specified number of P-frames, without actually
+   inserting I-frame.
+
+ * Added a dynamic slicing mode. This feature allows to control how an
+   encoded picture is divided into slices.
+
+ * Added support for VBV buffer setting.
+
+ * Added sample applications OpenGLIFRAsync, OpenGLIFRShim, and
+   OpenGLIFRNVENCPerf.
+
+ * Fixed a bug in fps calculations in NvIFROpenGL samples on Linux.
+
+ * Added support for NV_IFROGL_H264_RATE_CONTROL_2_PASS_QUALITY, and 
+   NV_IFROGL_H264_RATE_CONTROL_2_PASS_FRAMSIZE_CAP rate control modes. 
+
+ * Added support for setting low latency presets used to configure H.264
+   hardware encoder.
+
+ * Removed the CUDA 5.0 toolkit dependency of the NvIFROpenGL.
+   NvIFROpenGL now depends on the CUDA driver only.
+
+ * Added the NvIFROpenGL library as a part of the Linux graphics driver package.
+
+==== NvIFROpenGL SDK 2.0 beta
+
+ * Added sample applications NvIFROpenGLSimple, NvIFROpenGLNVENC, and
+   NvIFROpenGLNVENCThreaded to demonstates NvIFROpenGL usage.
+
+ * Added support for OpenGL-based NVIDIA Inband Frame Readback (NvIFROpenGL).
+   This library supports capture to system memory and optionally capture to
+   H.264 bit-stream.

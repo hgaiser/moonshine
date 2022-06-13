@@ -1,0 +1,59 @@
+Introduction
+
+This is release 8.0.8 of Linux Capture SDK. 
+
+Applications built with an earlier version of the Capture SDK(formerly known as GRID SDK) are guaranteed to
+work with the graphics driver supported by the Capture SDK 8.0.8. Whereas, 
+applications built with the Capture SDK 8.0.8 are not guaranteed to work with
+an older driver.
+
+This package contains:
+
+1) NVFBC (NVIDIA Framebuffer Capture) API header
+   [./NvFBC/inc/NvFBC.h]
+
+2) NVFBC (NVIDIA Framebuffer Capture) API Reference Manual
+   [./NvFBC/docs/NVFBC_v.8.0.8.pdf]
+
+3) Sample application source code:
+
+   These are the sample applications to demonstrate how to use the Capture SDK API
+
+   [./NvFBC/samples/NvFBCCUDAAsync]
+     This sample demonstrates how to use NvFBC to asynchronously grab
+     frames to video memory then save them to the disk.
+
+   [./NvFBC/samples/NvFBCMultiThread]
+     This sample demonstrates how to use NvFBC to grab frames in
+     parallel to system memory then save them to the disk.
+
+   [./NvFBC/samples/NvFBCSharedContext]
+     This sample demonstrates how a main thread can create a FBC context,
+     then create a worker thread that performs the capture.
+
+   [./NvFBC/samples/NvFBCToGL]
+     This sample demonstrates how to use NvFBC to grab frames to 
+     an OpenGL texture in video memory.
+
+   [./NvFBC/samples/NvFBCToGLEnc]
+     This sample demonstrates how to use NvFBC to grab frames to an OpenGL
+     texture in video memory and send them to the HW encoder using
+     NvEncodeAPI's OpenGL interface.
+
+4) README:
+   [./README]
+   [./docs/GRID_GettingStarted-Server-Setup.pdf]
+   [./docs/AMAZON_G2_Instance_Getting_Started_Guide_Linux.pdf]
+   [./docs/DesignWorks SDKs Samples and Tools License Agreement_distrib use rights (13 06 2017).pdf]
+
+5) Changelog
+   [./Changelog]
+
+6) SUPPORTED HARDWARE
+   
+   Capture SDK can be only used on GRID, Tesla, or Quadro X2000+ (X = K/M/P/RTX
+   etc) hardware products. Other configurations are not permitted under the end 
+   user license agreement terms and conditions.
+
+   Please refer the Driver related documentation if particular GPU is supported 
+   or not for the driver in use.
