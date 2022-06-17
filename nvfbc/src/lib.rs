@@ -1,4 +1,4 @@
-use std::{ffi::{CStr, c_void}, mem::MaybeUninit, ptr::null_mut, os::raw::c_ulonglong};
+use std::{ffi::{CStr, c_void}, mem::MaybeUninit, ptr::null_mut, os::raw::{c_ulonglong, c_uint}};
 
 use nvfbc_sys::{NVFBC_VERSION, NVFBC_API_FUNCTION_LIST, _NVFBCSTATUS_NVFBC_SUCCESS, NVFBCSTATUS};
 
@@ -58,16 +58,16 @@ impl NvFbc {
 		Ok(handle)
 	}
 
-	// fn destroy_handle(&self) -> Result<(), NvFbcError> {
-	// 	let mut params: nvfbc_sys::_NVFBC_DESTROY_HANDLE_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
-	// 	params.dwVersion = nvfbc_sys::NVFBC_DESTROY_HANDLE_PARAMS_VER;
-	// 	let ret = unsafe { self.nvfbc_funcs.nvFBCDestroyHandle.unwrap()(self.handle, &mut params) };
-	// 	if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-	// 		return Err(ret.into());
-	// 	}
+	pub fn destroy_handle(&self) -> Result<(), NvFbcError> {
+		let mut params: nvfbc_sys::_NVFBC_DESTROY_HANDLE_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
+		params.dwVersion = nvfbc_sys::NVFBC_DESTROY_HANDLE_PARAMS_VER;
+		let ret = unsafe { self.nvfbc_funcs.nvFBCDestroyHandle.unwrap()(self.handle, &mut params) };
+		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
+			return Err(ret.into());
+		}
 
-	// 	Ok(())
-	// }
+		Ok(())
+	}
 
 	fn create_instance(lib: &libloading::Library) -> Result<NVFBC_API_FUNCTION_LIST, NvFbcError> {
 		let nvfbc_create_instance: libloading::Symbol<unsafe extern fn(*mut NVFBC_API_FUNCTION_LIST) -> NVFBCSTATUS> =
@@ -92,7 +92,7 @@ impl NvFbc {
 	pub fn get_status(&self) -> Result<Status, NvFbcError> {
 		let mut params: nvfbc_sys::_NVFBC_GET_STATUS_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
 		params.dwVersion = nvfbc_sys::NVFBC_GET_STATUS_PARAMS_VER;
-		let ret = unsafe {self.nvfbc_funcs.nvFBCGetStatus.unwrap()(self.handle, &mut params as *mut nvfbc_sys::_NVFBC_GET_STATUS_PARAMS) };
+		let ret = unsafe { self.nvfbc_funcs.nvFBCGetStatus.unwrap()(self.handle, &mut params as *mut nvfbc_sys::_NVFBC_GET_STATUS_PARAMS) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
 			return Err(ret.into());
 		}
@@ -100,15 +100,37 @@ impl NvFbc {
 		Ok(params.into())
 	}
 
-	pub fn create_cuda_capture_session(&self) -> Result<(), NvFbcError> {
+	pub fn create_capture_session(&self, capture_type: CaptureType) -> Result<(), NvFbcError> {
 		let mut params: nvfbc_sys::_NVFBC_CREATE_CAPTURE_SESSION_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
 		params.dwVersion = nvfbc_sys::NVFBC_CREATE_CAPTURE_SESSION_PARAMS_VER;
-		params.eCaptureType = nvfbc_sys::_NVFBC_CAPTURE_TYPE_NVFBC_CAPTURE_SHARED_CUDA;
+		params.eCaptureType = capture_type as c_uint;
 		params.bWithCursor = nvfbc_sys::_NVFBC_BOOL_NVFBC_TRUE;
 		params.frameSize = nvfbc_sys::NVFBC_SIZE { w: 0, h: 0 };
 		params.eTrackingType = nvfbc_sys::NVFBC_TRACKING_TYPE_NVFBC_TRACKING_DEFAULT;
-		let ret = unsafe {self.nvfbc_funcs.nvFBCCreateCaptureSession.unwrap()(self.handle, &mut params as *mut nvfbc_sys::_NVFBC_CREATE_CAPTURE_SESSION_PARAMS) };
+		let ret = unsafe { self.nvfbc_funcs.nvFBCCreateCaptureSession.unwrap()(self.handle, &mut params as *mut nvfbc_sys::_NVFBC_CREATE_CAPTURE_SESSION_PARAMS) };
+		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
+			return Err(ret.into());
+		}
 
+		Ok(())
+	}
+
+	pub fn destroy_capture_session(&self) -> Result<(), NvFbcError> {
+		let mut params: nvfbc_sys::_NVFBC_DESTROY_CAPTURE_SESSION_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
+		params.dwVersion = nvfbc_sys::NVFBC_DESTROY_HANDLE_PARAMS_VER;
+		let ret = unsafe { self.nvfbc_funcs.nvFBCDestroyCaptureSession.unwrap()(self.handle, &mut params) };
+		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
+			return Err(ret.into());
+		}
+
+		Ok(())
+	}
+
+	pub fn to_gl_setup(&self) -> Result<(), NvFbcError> {
+		let mut params: nvfbc_sys::NVFBC_TOGL_SETUP_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
+		params.dwVersion = nvfbc_sys::NVFBC_TOGL_SETUP_PARAMS_VER;
+		params.eBufferFormat = BufferFormat::Rgb as u32;
+		let ret = unsafe { self.nvfbc_funcs.nvFBCToGLSetUp.unwrap()(self.handle, &mut params as *mut nvfbc_sys::NVFBC_TOGL_SETUP_PARAMS) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
 			return Err(ret.into());
 		}
@@ -120,8 +142,7 @@ impl NvFbc {
 		let mut params: nvfbc_sys::NVFBC_TOCUDA_SETUP_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
 		params.dwVersion = nvfbc_sys::NVFBC_TOCUDA_SETUP_PARAMS_VER;
 		params.eBufferFormat = BufferFormat::Rgb as u32;
-		let ret = unsafe {self.nvfbc_funcs.nvFBCToCudaSetUp.unwrap()(self.handle, &mut params as *mut nvfbc_sys::NVFBC_TOCUDA_SETUP_PARAMS) };
-
+		let ret = unsafe { self.nvfbc_funcs.nvFBCToCudaSetUp.unwrap()(self.handle, &mut params as *mut nvfbc_sys::NVFBC_TOCUDA_SETUP_PARAMS) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
 			return Err(ret.into());
 		}
@@ -137,8 +158,7 @@ impl NvFbc {
 		params.dwFlags = nvfbc_sys::NVFBC_TOCUDA_FLAGS_NVFBC_TOCUDA_GRAB_FLAGS_NOWAIT;
 		params.pFrameGrabInfo = &mut frame_info as *mut nvfbc_sys::NVFBC_FRAME_GRAB_INFO;
 		params.pCUDADeviceBuffer = &mut device_buffer as *mut _ as *mut c_void;
-		let ret = unsafe {self.nvfbc_funcs.nvFBCToCudaGrabFrame.unwrap()(self.handle, &mut params as *mut nvfbc_sys::NVFBC_TOCUDA_GRAB_FRAME_PARAMS) };
-
+		let ret = unsafe { self.nvfbc_funcs.nvFBCToCudaGrabFrame.unwrap()(self.handle, &mut params as *mut nvfbc_sys::NVFBC_TOCUDA_GRAB_FRAME_PARAMS) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
 			return Err(ret.into());
 		}

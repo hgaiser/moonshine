@@ -1,6 +1,18 @@
 use std::ffi::CStr;
 
 #[derive(Debug, Copy, Clone)]
+pub enum CaptureType {
+	/// Capture frames to a buffer in system memory.
+	ToSystem = nvfbc_sys::_NVFBC_CAPTURE_TYPE_NVFBC_CAPTURE_TO_SYS as isize,
+	/// Capture frames to a CUDA device in video memory.
+	///
+	/// Specifying this will dlopen() libcuda.so.1 and fail if not available.
+	SharedCuda = nvfbc_sys::_NVFBC_CAPTURE_TYPE_NVFBC_CAPTURE_SHARED_CUDA as isize,
+	/// Capture frames to an OpenGL buffer in video memory.
+	ToOpenGl = nvfbc_sys::_NVFBC_CAPTURE_TYPE_NVFBC_CAPTURE_TO_GL as isize,
+}
+
+#[derive(Debug, Copy, Clone)]
 pub(crate) enum BufferFormat {
 	/// Data will be converted to ARGB8888 byte-order format. 32 bpp.
 	Argb = nvfbc_sys::_NVFBC_BUFFER_FORMAT_NVFBC_BUFFER_FORMAT_ARGB as isize,

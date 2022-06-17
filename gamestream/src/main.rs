@@ -1,7 +1,6 @@
 use std::error::Error;
-use std::ffi::c_void;
 
-use image::EncodableLayout;
+use nvfbc::CaptureType;
 use rustacuda::memory::*;
 use rustacuda::{CudaFlags, device::Device};
 use rustacuda::prelude::*;
@@ -21,13 +20,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 	// Get the first device
 	let device = Device::get_device(0)?;
-	println!("device: {}", device.device);
 
 	// Create a context associated to this device
 	let _context = Context::create_and_push(
 		ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, device)?;
 
-	nvfbc.create_cuda_capture_session()?;
+	nvfbc.create_capture_session(CaptureType::SharedCuda)?;
 	nvfbc.to_cuda_setup()?;
 
 	let frame_info = nvfbc.to_cuda_grab_frame()?;
@@ -43,6 +41,11 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let mut frame = image::RgbImage::new(frame_info.width, frame_info.height);
 	device_buffer.copy_to(frame.as_mut())?;
 	frame.save("/home/hgaiser/frame.png")?;
+
+	nvfbc.destroy_capture_session()?;
+	nvfbc.destroy_handle()?;
+
+	println!("Done!");
 
 	Ok(())
 }
