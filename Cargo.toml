@@ -1,2 +1,2 @@
 [workspace]
-members = ["nvfbc-sys", "gamestream"]
+members = ["nvfbc", "nvfbc-sys", "gamestream"]

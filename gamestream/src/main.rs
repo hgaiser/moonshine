@@ -1,40 +1,48 @@
-use nvfbc_sys::{NVFBC_VERSION, NVFBC_API_FUNCTION_LIST, _NVFBCSTATUS_NVFBC_SUCCESS, NVFBCSTATUS};
+use std::error::Error;
+use std::ffi::c_void;
 
-fn main() {
-	unsafe {
-		let lib = libloading::Library::new("libnvidia-fbc.so").unwrap();
-		let nvfbc_create_instance: libloading::Symbol<unsafe extern fn(*mut NVFBC_API_FUNCTION_LIST) -> NVFBCSTATUS> = lib.get(b"NvFBCCreateInstance").unwrap();
+use image::EncodableLayout;
+use rustacuda::memory::*;
+use rustacuda::{CudaFlags, device::Device};
+use rustacuda::prelude::*;
+use rustacuda_core::DevicePointer;
 
-		let mut nvfbc_api_function_list: NVFBC_API_FUNCTION_LIST = NVFBC_API_FUNCTION_LIST {
-			dwVersion: NVFBC_VERSION,
-			nvFBCGetLastErrorStr: None,
-			nvFBCCreateHandle: None,
-			nvFBCDestroyHandle: None,
-			nvFBCGetStatus: None,
-			nvFBCCreateCaptureSession: None,
-			nvFBCDestroyCaptureSession: None,
-			nvFBCToSysSetUp: None,
-			nvFBCToSysGrabFrame: None,
-			nvFBCToCudaSetUp: None,
-			nvFBCToCudaGrabFrame: None,
-			pad1: std::ptr::null_mut(),
-			pad2: std::ptr::null_mut(),
-			pad3: std::ptr::null_mut(),
-			nvFBCBindContext: None,
-			nvFBCReleaseContext: None,
-			pad4: std::ptr::null_mut(),
-			pad5: std::ptr::null_mut(),
-			pad6: std::ptr::null_mut(),
-			pad7: std::ptr::null_mut(),
-			nvFBCToGLSetUp: None,
-			nvFBCToGLGrabFrame: None
-		};
-		let ret = nvfbc_create_instance(&mut nvfbc_api_function_list as *mut NVFBC_API_FUNCTION_LIST);
-		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			eprintln!("Unable to create NvFBC instance");
-		}
+fn main() -> Result<(), Box<dyn Error>> {
+	let nvfbc = nvfbc::NvFbc::new()?;
+	let status = nvfbc.get_status()?;
+	println!("get_status: {:#?}", status);
 
-		println!("{:#?}", ret);
-
+	if !status.can_create_now {
+		panic!("Can't create a capture session.");
 	}
+
+	// Initialize the CUDA API
+	rustacuda::init(CudaFlags::empty())?;
+
+	// Get the first device
+	let device = Device::get_device(0)?;
+	println!("device: {}", device.device);
+
+	// Create a context associated to this device
+	let _context = Context::create_and_push(
+		ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, device)?;
+
+	nvfbc.create_cuda_capture_session()?;
+	nvfbc.to_cuda_setup()?;
+
+	let frame_info = nvfbc.to_cuda_grab_frame()?;
+	println!("frame_info: {:#?}", frame_info);
+
+	// Wrap the GPU memory.
+	let device_buffer = unsafe { DeviceBuffer::from_raw_parts(
+		DevicePointer::wrap(frame_info.device_buffer as *mut u8),
+		frame_info.byte_size as usize,
+	) };
+
+	// Create system memory buffer.
+	let mut frame = image::RgbImage::new(frame_info.width, frame_info.height);
+	device_buffer.copy_to(frame.as_mut())?;
+	frame.save("/home/hgaiser/frame.png")?;
+
+	Ok(())
 }
