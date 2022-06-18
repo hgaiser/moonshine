@@ -581,7 +581,6 @@ dependencies = [
 name = "nvfbc"
 version = "0.1.0"
 dependencies = [
- "libloading",
  "nvfbc-sys",
  "thiserror",
 ]

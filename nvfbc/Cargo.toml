@@ -4,6 +4,5 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-libloading = "0.7.3"
 nvfbc-sys = { path = "../nvfbc-sys" }
 thiserror = "1.0.24"

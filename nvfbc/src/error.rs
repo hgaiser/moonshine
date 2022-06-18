@@ -3,9 +3,6 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum NvFbcError {
-	#[error("failed to load library")]
-	LibraryLoading(#[from] libloading::Error),
-
 	#[error("internal nvfbc error")]
 	InternalError(NvFbcSysError, Option<String>),
 

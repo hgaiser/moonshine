@@ -5,6 +5,7 @@ use std::path::PathBuf;
 
 fn main() {
 	println!("cargo:rerun-if-changed=NvFBC.h");
+	println!("cargo:rustc-link-lib=dylib=nvidia-fbc");
 
 	// Generate bindings for NvFBC.h.
 	let bindings = builder()

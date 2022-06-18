@@ -25,9 +25,6 @@ pub struct CudaFrameInfo {
 }
 
 pub struct NvFbc {
-	#[allow(dead_code)]
-	lib: libloading::Library,
-
 	nvfbc_funcs: NVFBC_API_FUNCTION_LIST,
 
 	handle: nvfbc_sys::NVFBC_SESSION_HANDLE,
@@ -35,12 +32,10 @@ pub struct NvFbc {
 
 impl NvFbc {
 	pub fn new() -> Result<Self, NvFbcError> {
-		let lib = unsafe { libloading::Library::new("libnvidia-fbc.so") }?;
-
-		let nvfbc_funcs = Self::create_instance(&lib)?;
+		let nvfbc_funcs = Self::create_instance()?;
 		let handle = Self::create_handle(&nvfbc_funcs)?;
 
-		Ok(Self { lib, nvfbc_funcs, handle })
+		Ok(Self { nvfbc_funcs, handle })
 	}
 
 	fn create_handle(nvfbc_funcs: &NVFBC_API_FUNCTION_LIST) -> Result<nvfbc_sys::NVFBC_SESSION_HANDLE, NvFbcError> {
@@ -69,13 +64,10 @@ impl NvFbc {
 		Ok(())
 	}
 
-	fn create_instance(lib: &libloading::Library) -> Result<NVFBC_API_FUNCTION_LIST, NvFbcError> {
-		let nvfbc_create_instance: libloading::Symbol<unsafe extern fn(*mut NVFBC_API_FUNCTION_LIST) -> NVFBCSTATUS> =
-			unsafe { lib.get(b"NvFBCCreateInstance")? };
-
+	fn create_instance() -> Result<NVFBC_API_FUNCTION_LIST, NvFbcError> {
 		let mut nvfbc_funcs: NVFBC_API_FUNCTION_LIST = unsafe { MaybeUninit::zeroed().assume_init() };
 		nvfbc_funcs.dwVersion = NVFBC_VERSION;
-		let ret = unsafe { nvfbc_create_instance(&mut nvfbc_funcs as *mut NVFBC_API_FUNCTION_LIST) };
+		let ret = unsafe { nvfbc_sys::NvFBCCreateInstance(&mut nvfbc_funcs as *mut NVFBC_API_FUNCTION_LIST) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
 			return Err(NvFbcError::InternalError(ret.into(), None));
 		}
@@ -175,7 +167,7 @@ impl NvFbc {
 
 impl Drop for NvFbc {
 	fn drop(&mut self) {
-		// TODO: Figure out why this crashes (nvfbc examples also fail here..
+		// TODO: Figure out why this crashes (nvfbc examples also fail here..)
 		self.destroy_handle().unwrap();
 	}
 }
