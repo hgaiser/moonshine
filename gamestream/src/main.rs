@@ -43,7 +43,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 	frame.save("/home/hgaiser/frame.png")?;
 
 	nvfbc.destroy_capture_session()?;
-	nvfbc.destroy_handle()?;
 
 	println!("Done!");
 

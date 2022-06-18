@@ -58,7 +58,7 @@ impl NvFbc {
 		Ok(handle)
 	}
 
-	pub fn destroy_handle(&self) -> Result<(), NvFbcError> {
+	fn destroy_handle(&self) -> Result<(), NvFbcError> {
 		let mut params: nvfbc_sys::_NVFBC_DESTROY_HANDLE_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
 		params.dwVersion = nvfbc_sys::NVFBC_DESTROY_HANDLE_PARAMS_VER;
 		let ret = unsafe { self.nvfbc_funcs.nvFBCDestroyHandle.unwrap()(self.handle, &mut params) };
@@ -173,12 +173,12 @@ impl NvFbc {
 	}
 }
 
-// impl Drop for NvFbc {
-// 	fn drop(&mut self) {
-// 		// TODO: Fix cleanup...
-// 		self.destroy_handle().unwrap();
-// 	}
-// }
+impl Drop for NvFbc {
+	fn drop(&mut self) {
+		// TODO: Figure out why this crashes (nvfbc examples also fail here..
+		self.destroy_handle().unwrap();
+	}
+}
 
 #[cfg(test)]
 mod tests {
