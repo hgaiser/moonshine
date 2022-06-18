@@ -52,7 +52,7 @@ impl NvFbc {
 			&mut params
 		)};
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(ret.into());
+			return Err(NvFbcError::InternalError(ret.into(), None));
 		}
 
 		Ok(handle)
@@ -63,7 +63,7 @@ impl NvFbc {
 		params.dwVersion = nvfbc_sys::NVFBC_DESTROY_HANDLE_PARAMS_VER;
 		let ret = unsafe { self.nvfbc_funcs.nvFBCDestroyHandle.unwrap()(self.handle, &mut params) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(ret.into());
+			return Err(NvFbcError::InternalError(ret.into(), self.get_last_error().ok()));
 		}
 
 		Ok(())
@@ -77,16 +77,16 @@ impl NvFbc {
 		nvfbc_funcs.dwVersion = NVFBC_VERSION;
 		let ret = unsafe { nvfbc_create_instance(&mut nvfbc_funcs as *mut NVFBC_API_FUNCTION_LIST) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(ret.into());
+			return Err(NvFbcError::InternalError(ret.into(), None));
 		}
 
 		Ok(nvfbc_funcs)
 	}
 
-	pub fn get_last_error(&self) -> Result<&str, NvFbcError> {
+	pub fn get_last_error(&self) -> Result<String, NvFbcError> {
 		let error = unsafe {self.nvfbc_funcs.nvFBCGetLastErrorStr.unwrap()(self.handle) };
 		let error = unsafe { CStr::from_ptr(error) };
-		error.to_str().map_err(|_| NvFbcError::Utf8)
+		error.to_str().map_err(|_| NvFbcError::Utf8).map(|o| o.to_string())
 	}
 
 	pub fn get_status(&self) -> Result<Status, NvFbcError> {
@@ -94,7 +94,7 @@ impl NvFbc {
 		params.dwVersion = nvfbc_sys::NVFBC_GET_STATUS_PARAMS_VER;
 		let ret = unsafe { self.nvfbc_funcs.nvFBCGetStatus.unwrap()(self.handle, &mut params as *mut nvfbc_sys::_NVFBC_GET_STATUS_PARAMS) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(ret.into());
+			return Err(NvFbcError::InternalError(ret.into(), self.get_last_error().ok()));
 		}
 
 		Ok(params.into())
@@ -109,7 +109,7 @@ impl NvFbc {
 		params.eTrackingType = nvfbc_sys::NVFBC_TRACKING_TYPE_NVFBC_TRACKING_DEFAULT;
 		let ret = unsafe { self.nvfbc_funcs.nvFBCCreateCaptureSession.unwrap()(self.handle, &mut params as *mut nvfbc_sys::_NVFBC_CREATE_CAPTURE_SESSION_PARAMS) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(ret.into());
+			return Err(NvFbcError::InternalError(ret.into(), self.get_last_error().ok()));
 		}
 
 		Ok(())
@@ -117,10 +117,10 @@ impl NvFbc {
 
 	pub fn destroy_capture_session(&self) -> Result<(), NvFbcError> {
 		let mut params: nvfbc_sys::_NVFBC_DESTROY_CAPTURE_SESSION_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
-		params.dwVersion = nvfbc_sys::NVFBC_DESTROY_HANDLE_PARAMS_VER;
+		params.dwVersion = nvfbc_sys::NVFBC_DESTROY_CAPTURE_SESSION_PARAMS_VER;
 		let ret = unsafe { self.nvfbc_funcs.nvFBCDestroyCaptureSession.unwrap()(self.handle, &mut params) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(ret.into());
+			return Err(NvFbcError::InternalError(ret.into(), self.get_last_error().ok()));
 		}
 
 		Ok(())
@@ -132,7 +132,7 @@ impl NvFbc {
 		params.eBufferFormat = BufferFormat::Rgb as u32;
 		let ret = unsafe { self.nvfbc_funcs.nvFBCToGLSetUp.unwrap()(self.handle, &mut params as *mut nvfbc_sys::NVFBC_TOGL_SETUP_PARAMS) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(ret.into());
+			return Err(NvFbcError::InternalError(ret.into(), self.get_last_error().ok()));
 		}
 
 		Ok(())
@@ -144,7 +144,7 @@ impl NvFbc {
 		params.eBufferFormat = BufferFormat::Rgb as u32;
 		let ret = unsafe { self.nvfbc_funcs.nvFBCToCudaSetUp.unwrap()(self.handle, &mut params as *mut nvfbc_sys::NVFBC_TOCUDA_SETUP_PARAMS) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(ret.into());
+			return Err(NvFbcError::InternalError(ret.into(), self.get_last_error().ok()));
 		}
 
 		Ok(())
@@ -160,7 +160,7 @@ impl NvFbc {
 		params.pCUDADeviceBuffer = &mut device_buffer as *mut _ as *mut c_void;
 		let ret = unsafe { self.nvfbc_funcs.nvFBCToCudaGrabFrame.unwrap()(self.handle, &mut params as *mut nvfbc_sys::NVFBC_TOCUDA_GRAB_FRAME_PARAMS) };
 		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(ret.into());
+			return Err(NvFbcError::InternalError(ret.into(), self.get_last_error().ok()));
 		}
 
 		Ok(CudaFrameInfo {
