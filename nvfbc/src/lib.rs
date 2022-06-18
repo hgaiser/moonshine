@@ -104,18 +104,6 @@ impl NvFbc {
 		Ok(())
 	}
 
-	pub fn to_gl_setup(&self) -> Result<(), NvFbcError> {
-		let mut params: nvfbc_sys::NVFBC_TOGL_SETUP_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
-		params.dwVersion = nvfbc_sys::NVFBC_TOGL_SETUP_PARAMS_VER;
-		params.eBufferFormat = BufferFormat::Rgb as u32;
-		let ret = unsafe { nvfbc_sys::NvFBCToGLSetUp(self.handle, &mut params as *mut nvfbc_sys::NVFBC_TOGL_SETUP_PARAMS) };
-		if ret != _NVFBCSTATUS_NVFBC_SUCCESS {
-			return Err(NvFbcError::InternalError(ret.into(), self.get_last_error().ok()));
-		}
-
-		Ok(())
-	}
-
 	pub fn to_cuda_setup(&self) -> Result<(), NvFbcError> {
 		let mut params: nvfbc_sys::NVFBC_TOCUDA_SETUP_PARAMS = unsafe { MaybeUninit::zeroed().assume_init() };
 		params.dwVersion = nvfbc_sys::NVFBC_TOCUDA_SETUP_PARAMS_VER;
