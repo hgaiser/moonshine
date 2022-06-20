@@ -13,7 +13,7 @@ pub enum CaptureType {
 }
 
 #[derive(Debug, Copy, Clone)]
-pub(crate) enum BufferFormat {
+pub enum BufferFormat {
 	/// Data will be converted to ARGB8888 byte-order format. 32 bpp.
 	Argb = nvfbc_sys::_NVFBC_BUFFER_FORMAT_NVFBC_BUFFER_FORMAT_ARGB as isize,
 	/// Data will be converted to RGB888 byte-order format. 24 bpp.

@@ -1,9 +1,7 @@
 use std::error::Error;
 
-use nvfbc::CaptureType;
-use rustacuda::memory::*;
-use rustacuda::{CudaFlags, device::Device};
-use rustacuda::prelude::*;
+use nvfbc::{CaptureType, BufferFormat};
+use rustacuda::{CudaFlags, device::Device, context::{Context, ContextFlags}, prelude::{DeviceBuffer, CopyDestination}};
 use rustacuda_core::DevicePointer;
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -26,7 +24,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 		ContextFlags::MAP_HOST | ContextFlags::SCHED_AUTO, device)?;
 
 	nvfbc.create_capture_session(CaptureType::SharedCuda)?;
-	nvfbc.to_cuda_setup()?;
+	nvfbc.to_cuda_setup(BufferFormat::Rgb)?;
 
 	let frame_info = nvfbc.to_cuda_grab_frame()?;
 	println!("frame_info: {:#?}", frame_info);
