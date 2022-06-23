@@ -301,17 +301,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "21163e139fa306126e6eedaf49ecdb4588f939600f0b1e770f4205ee4b7fa868"
 
 [[package]]
-name = "gamestream"
-version = "0.1.0"
-dependencies = [
- "image",
- "nvfbc",
- "rustacuda",
- "rustacuda_core",
- "rustacuda_derive",
-]
-
-[[package]]
 name = "getrandom"
 version = "0.2.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -508,6 +497,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moonshine"
+version = "0.1.0"
+dependencies = [
+ "image",
+ "nvfbc",
+ "rustacuda",
+ "rustacuda_core",
+ "rustacuda_derive",
+]
+
+[[package]]
 name = "nanorand"
 version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -578,11 +578,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "nvenc-sys"
+version = "0.1.0"
+dependencies = [
+ "bindgen",
+]
+
+[[package]]
 name = "nvfbc"
 version = "0.1.0"
 dependencies = [
  "nvfbc-sys",
- "thiserror",
 ]
 
 [[package]]
@@ -800,26 +806,6 @@ name = "textwrap"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b1141d4d61095b28419e22cb0bbf02755f5e54e0526f97f1e3d1d160e60885fb"
-
-[[package]]
-name = "thiserror"
-version = "1.0.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd829fe32373d27f76265620b5309d0340cb8550f523c1dda251d6298069069a"
-dependencies = [
- "thiserror-impl",
-]
-
-[[package]]
-name = "thiserror-impl"
-version = "1.0.31"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0396bc89e626244658bef819e22d0cc459e795a5ebe878e6ec336d1674a8d79a"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn",
-]
 
 [[package]]
 name = "threadpool"
