@@ -1,8 +1,0 @@
-[package]
-name = "nvfbc"
-version = "0.1.0"
-edition = "2021"
-
-[dependencies]
-nvfbc-sys = { path = "../nvfbc-sys" }
-thiserror = "1.0.24"
