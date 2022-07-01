@@ -18,6 +18,8 @@ enum VideoQuality {
 	HIGH = 2
 };
 
+CUcontext init_cuda();
+
 AVCodecContext * create_video_codec_context(
 	AVFormatContext * av_format_context,
 	enum VideoQuality video_quality,
@@ -30,4 +32,18 @@ void open_video(
 	AVBufferRef ** device_ctx,
 	CUgraphicsResource * cuda_graphics_resource,
 	CUcontext cuda_context
+);
+
+AVStream * create_stream(
+	AVFormatContext * av_format_context,
+	AVCodecContext * codec_context
+);
+
+void receive_frames(
+	AVCodecContext * av_codec_context,
+	int stream_index,
+	AVStream * stream,
+	AVFrame * frame,
+	AVFormatContext * av_format_context
+	// std::mutex &write_output_mutex
 );

@@ -1,6 +1,45 @@
 #include "wrapper.h"
 #include <assert.h>
 
+CUcontext init_cuda() {
+	CUresult res;
+
+	res = cuInit(0);
+	if (res != CUDA_SUCCESS) {
+		const char *err_str;
+		cuGetErrorString(res, &err_str);
+		fprintf(stderr, "Error: cuInit failed, error %s (result: %d)\n", err_str, res);
+		return 1;
+	}
+
+	int nGpu = 0;
+	cuDeviceGetCount(&nGpu);
+	if (nGpu <= 0) {
+		fprintf(stderr, "Error: no cuda supported devices found\n");
+		return 1;
+	}
+
+	CUdevice cu_dev;
+	res = cuDeviceGet(&cu_dev, 0);
+	if (res != CUDA_SUCCESS) {
+		const char *err_str;
+		cuGetErrorString(res, &err_str);
+		fprintf(stderr, "Error: unable to get CUDA device, error: %s (result: %d)\n", err_str, res);
+		return 1;
+	}
+
+	CUcontext cu_ctx;
+	res = cuCtxCreate_v2(&cu_ctx, CU_CTX_SCHED_AUTO, cu_dev);
+	if (res != CUDA_SUCCESS) {
+		const char *err_str;
+		cuGetErrorString(res, &err_str);
+		fprintf(stderr, "Error: unable to create CUDA context, error: %s (result: %d)\n", err_str, res);
+		return 1;
+	}
+
+	return cu_ctx;
+}
+
 AVCodecContext * create_video_codec_context(
 	AVFormatContext * av_format_context,
 	enum VideoQuality video_quality,
@@ -151,4 +190,60 @@ void open_video(
 				"blabla"); // av_err2str(ret));
 		exit(1);
 	}
+}
+
+AVStream * create_stream(
+	AVFormatContext * av_format_context,
+	AVCodecContext * codec_context
+) {
+	AVStream *stream = avformat_new_stream(av_format_context, NULL);
+	if (!stream) {
+		fprintf(stderr, "Error: Could not allocate stream\n");
+		exit(1);
+	}
+	stream->id = av_format_context->nb_streams - 1;
+	stream->time_base = codec_context->time_base;
+	stream->avg_frame_rate = codec_context->framerate;
+	return stream;
+}
+
+void receive_frames(
+	AVCodecContext * av_codec_context,
+	int stream_index,
+	AVStream * stream,
+	AVFrame * frame,
+	AVFormatContext * av_format_context
+	// std::mutex &write_output_mutex
+) {
+	AVPacket av_packet;
+	memset(&av_packet, 0, sizeof(av_packet));
+	for (;;) {
+		av_packet.data = NULL;
+		av_packet.size = 0;
+		int res = avcodec_receive_packet(av_codec_context, &av_packet);
+		if (res == 0) { // we have a packet, send the packet to the muxer
+			av_packet.stream_index = stream_index;
+			av_packet.pts = av_packet.dts = frame->pts;
+
+			// std::lock_guard<std::mutex> lock(write_output_mutex);
+			av_packet_rescale_ts(&av_packet, av_codec_context->time_base, stream->time_base);
+			av_packet.stream_index = stream->index;
+			int ret = av_interleaved_write_frame(av_format_context, &av_packet);
+			if(ret < 0) {
+				/* fprintf(stderr, "Error: Failed to write frame index %d to muxer, reason: %s (%d)\n", av_packet.stream_index, av_error_to_string(ret), ret); */
+				fprintf(stderr, "Error: Failed to write frame index %d to muxer, reason: %d\n", av_packet.stream_index, ret);
+			}
+			av_packet_unref(&av_packet);
+		} else if (res == AVERROR(EAGAIN)) { // we have no packet
+			// fprintf(stderr, "No packet!\n");
+			break;
+		} else if (res == AVERROR_EOF) { // this is the end of the stream
+			fprintf(stderr, "End of stream!\n");
+			break;
+		} else {
+			fprintf(stderr, "Unexpected error: %d\n", res);
+			break;
+		}
+	}
+	//av_packet_unref(&av_packet);
 }
