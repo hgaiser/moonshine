@@ -1,45 +1,6 @@
 #include "wrapper.h"
 #include <assert.h>
 
-CUcontext init_cuda() {
-	CUresult res;
-
-	res = cuInit(0);
-	if (res != CUDA_SUCCESS) {
-		const char *err_str;
-		cuGetErrorString(res, &err_str);
-		fprintf(stderr, "Error: cuInit failed, error %s (result: %d)\n", err_str, res);
-		return 1;
-	}
-
-	int nGpu = 0;
-	cuDeviceGetCount(&nGpu);
-	if (nGpu <= 0) {
-		fprintf(stderr, "Error: no cuda supported devices found\n");
-		return 1;
-	}
-
-	CUdevice cu_dev;
-	res = cuDeviceGet(&cu_dev, 0);
-	if (res != CUDA_SUCCESS) {
-		const char *err_str;
-		cuGetErrorString(res, &err_str);
-		fprintf(stderr, "Error: unable to get CUDA device, error: %s (result: %d)\n", err_str, res);
-		return 1;
-	}
-
-	CUcontext cu_ctx;
-	res = cuCtxCreate_v2(&cu_ctx, CU_CTX_SCHED_AUTO, cu_dev);
-	if (res != CUDA_SUCCESS) {
-		const char *err_str;
-		cuGetErrorString(res, &err_str);
-		fprintf(stderr, "Error: unable to create CUDA context, error: %s (result: %d)\n", err_str, res);
-		return 1;
-	}
-
-	return cu_ctx;
-}
-
 AVCodecContext * create_video_codec_context(
 	AVFormatContext * av_format_context,
 	enum VideoQuality video_quality,

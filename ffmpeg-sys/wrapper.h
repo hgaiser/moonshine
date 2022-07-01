@@ -18,8 +18,6 @@ enum VideoQuality {
 	HIGH = 2
 };
 
-CUcontext init_cuda();
-
 AVCodecContext * create_video_codec_context(
 	AVFormatContext * av_format_context,
 	enum VideoQuality video_quality,

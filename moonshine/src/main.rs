@@ -1,11 +1,14 @@
 #![feature(cstr_from_bytes_until_nul)]
 
-use std::{error::Error, ffi::CStr, ptr::{null, null_mut}};
+use std::{ffi::CStr, ptr::{null, null_mut}};
 
 use ffmpeg_sys::{AVFormatContext, VideoQuality_HIGH, AVBufferRef, CUgraphicsResource};
 use nvfbc::{BufferFormat, CudaCapturer};
 
-fn ffmpeg_get_error(error_code: i32) -> Result<String, String> {
+mod cuda;
+mod error;
+
+fn get_ffmpeg_error(error_code: i32) -> Result<String, String> {
 	const buffer_size: usize = 512;
 	let mut buffer = [0u8; buffer_size];
 	unsafe {
@@ -23,8 +26,8 @@ fn ffmpeg_get_error(error_code: i32) -> Result<String, String> {
 	)
 }
 
-fn main() -> Result<(), Box<dyn Error>> {
-	let cuda_context = unsafe { ffmpeg_sys::init_cuda() };
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let cuda_context = cuda::init_cuda(0)?;
 
 	// Create a capturer that captures to CUDA context.
 	let mut capturer = CudaCapturer::new()?;
@@ -86,12 +89,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 			ffmpeg_sys::AVIO_FLAG_WRITE as i32
 		);
 		if res < 0 {
-			panic!("Could not open '{}': {}", filename, ffmpeg_get_error(res)?);
+			panic!("Could not open '{}': {}", filename, get_ffmpeg_error(res)?);
 		}
 
 		let res = ffmpeg_sys::avformat_write_header(av_format_context, null_mut());
 		if res < 0 {
-			panic!("Error occurred when writing header to output file: {}", ffmpeg_get_error(res)?);
+			panic!("Error occurred when writing header to output file: {}", get_ffmpeg_error(res)?);
 		}
 
 		let frame: *mut ffmpeg_sys::AVFrame = ffmpeg_sys::av_frame_alloc();
@@ -129,7 +132,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 				// 	write_output_mutex
 				);
 			} else {
-				eprintln!("Error: avcodec_send_frame failed: {}", ffmpeg_get_error(res)?);
+				eprintln!("Error: avcodec_send_frame failed: {}", get_ffmpeg_error(res)?);
 			}
 
 			std::thread::sleep(next_recording_time.duration_since(std::time::Instant::now()));
