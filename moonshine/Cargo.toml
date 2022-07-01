@@ -9,3 +9,4 @@ nvfbc = "0.1.2"
 rustacuda = "0.1.3"
 rustacuda_core = "0.1.2"
 rustacuda_derive = "0.1.2"
+moonshine-ffmpeg = { path = "../moonshine-ffmpeg" }

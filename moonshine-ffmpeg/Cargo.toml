@@ -1,0 +1,9 @@
+[package]
+name = "moonshine-ffmpeg"
+version = "0.1.0"
+edition = "2021"
+
+[build-dependencies]
+bindgen = "0.60.1"
+cc = "1.0.73"
+pkg-config = "0.3.25"
