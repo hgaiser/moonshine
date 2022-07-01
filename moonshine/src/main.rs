@@ -2,7 +2,7 @@
 
 use std::{ffi::CStr, ptr::{null, null_mut}};
 
-use ffmpeg_sys::{AVFormatContext, VideoQuality_HIGH, AVBufferRef, CUgraphicsResource};
+use ffmpeg_sys::{AVFormatContext, VideoQuality_HIGH, AVBufferRef, CUgraphicsResource, av_log_set_level, AV_LOG_QUIET};
 use nvfbc::{BufferFormat, CudaCapturer};
 
 mod cuda;
@@ -51,6 +51,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 	let video_stream_index = 0;
 
 	unsafe {
+		av_log_set_level(AV_LOG_QUIET);
 		let mut av_format_context: *mut AVFormatContext = null_mut();
 		let res = ffmpeg_sys::avformat_alloc_output_context2(
 			&mut av_format_context,
