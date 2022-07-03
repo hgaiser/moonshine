@@ -17,6 +17,7 @@ impl bindgen::callbacks::ParseCallbacks for IgnoreMacros {
 
 fn main() {
 	println!("cargo:rerun-if-changed=wrapper.h");
+	println!("cargo:rerun-if-changed=wrapper.c");
 
 	// https://github.com/rust-lang/rust-bindgen/issues/687
 	let ignored_macros = IgnoreMacros(

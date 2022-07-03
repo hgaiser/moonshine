@@ -4,6 +4,7 @@ use std::{ffi::CStr, ptr::{null, null_mut}};
 
 use ffmpeg_sys::{AVFormatContext, VideoQuality_HIGH, AVBufferRef, CUgraphicsResource, av_log_set_level, AV_LOG_QUIET};
 use nvfbc::{BufferFormat, CudaCapturer};
+use nvfbc::cuda::CaptureMethod;
 
 mod cuda;
 mod error;
@@ -38,17 +39,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		panic!("Can't create a CUDA capture session.");
 	}
 
-	capturer.start(BufferFormat::Bgra)?;
-
-	let frame_info = capturer.next_frame()?;
-	println!("{:#?}", frame_info);
-
 	let width = status.screen_size.w;
 	let height = status.screen_size.h;
 	let fps = 30;
 	let use_hevc = false;
 	let filename = "test.mp4";
 	let video_stream_index = 0;
+
+	capturer.start(BufferFormat::Bgra, fps)?;
 
 	unsafe {
 		av_log_set_level(AV_LOG_QUIET);
@@ -82,7 +80,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 			cuda_context,
 		);
 
-		ffmpeg_sys::avcodec_parameters_from_context((*video_stream).codecpar, video_codec_context);
+		let res = ffmpeg_sys::avcodec_parameters_from_context((*video_stream).codecpar, video_codec_context);
+		if res < 0 {
+			panic!("Failed to set parameters from context: {}", res);
+		}
 
 		let res = ffmpeg_sys::avio_open(
 			&mut (*av_format_context).pb,
@@ -114,14 +115,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 		(*frame).height = (height & !1) as i32;
 
 		let start_time = std::time::Instant::now();
-		let time_step = 1.0 / 30.0;
-		let next_recording_time = start_time + std::time::Duration::from_secs_f64(time_step);
+		let time_step = 1.0 / fps as f64;
 
 		while start_time.elapsed().as_secs() < 2 {
-			let frame_info = capturer.next_frame()?;
+			let start = std::time::Instant::now();
+			let frame_info = capturer.next_frame(CaptureMethod::NoWaitIfNewFrame)?;
 			(*frame).data[0] = frame_info.device_buffer as *mut u8;
-
 			(*frame).pts = (start_time.elapsed().as_secs_f64() * ffmpeg_sys::AV_TIME_BASE as f64) as i64;
+			// next_recording_time = std::time::Instant::now() + std::time::Duration::from_secs_f64(time_step);
+
 			let res = ffmpeg_sys::avcodec_send_frame(video_codec_context, frame);
 			if res >= 0 {
 				ffmpeg_sys::receive_frames(
@@ -136,7 +138,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 				eprintln!("Error: avcodec_send_frame failed: {}", get_ffmpeg_error(res)?);
 			}
 
-			std::thread::sleep(next_recording_time.duration_since(std::time::Instant::now()));
+			println!("Capture: {}msec", start.elapsed().as_millis());
 		}
 
 		if ffmpeg_sys::av_write_trailer(av_format_context) != 0 {

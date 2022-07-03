@@ -575,8 +575,6 @@ dependencies = [
 [[package]]
 name = "nvfbc"
 version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "abe317417387abd1a402b20b009fb2b016be2a1fb87b60504e83c75045b63e7d"
 dependencies = [
  "nvfbc-sys",
 ]
@@ -584,8 +582,6 @@ dependencies = [
 [[package]]
 name = "nvfbc-sys"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d0bd4e31d9aa201246466ad33da66c53c78ecc5e5013dc9de95e2b454ddb89ab"
 
 [[package]]
 name = "once_cell"
