@@ -1,10 +1,10 @@
 use std::{ffi::CStr, ptr::{null_mut, null}, mem::MaybeUninit};
 
-use ffmpeg_sys::{av_log_set_level, AVFormatContext, VideoQuality_HIGH, AVBufferRef, CUgraphicsResource, AVFrame, AVCodecContext, AVStream, CUcontext, AV_LOG_QUIET, AV_LOG_TRACE, av_hwdevice_ctx_init};
+use ffmpeg_sys::{av_log_set_level, AVFormatContext, AVBufferRef, AVFrame, AVCodecContext, AVStream, CUcontext, AV_LOG_TRACE};
 
 use crate::error::FfmpegError;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Codec {
 	H264,
 	Hevc,
@@ -20,7 +20,8 @@ impl From<&str> for Codec {
 	}
 }
 
-#[derive(Debug, PartialEq)]
+#[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum VideoQuality {
 	Low,
 	Medium,
@@ -38,10 +39,10 @@ fn check_ret(error_code: i32) -> Result<(), FfmpegError> {
 }
 
 fn get_error(error_code: i32) -> Result<String, String> {
-	const buffer_size: usize = 512;
-	let mut buffer = [0u8; buffer_size];
+	const BUFFER_SIZE: usize = 512;
+	let mut buffer = [0u8; BUFFER_SIZE];
 	unsafe {
-		if ffmpeg_sys::av_strerror(error_code, buffer.as_mut_ptr() as *mut _, buffer_size as u64) < 0 {
+		if ffmpeg_sys::av_strerror(error_code, buffer.as_mut_ptr() as *mut _, BUFFER_SIZE as u64) < 0 {
 			return Err("Failed to get last ffmpeg error".into());
 		}
 	};
@@ -157,7 +158,6 @@ fn create_video_codec_context(
 fn open_video(
 	codec_context: *mut AVCodecContext,
 	device_ctx: *mut *mut AVBufferRef,
-	cuda_graphics_resource: *mut CUgraphicsResource,
 	cuda_context: CUcontext,
 ) -> Result<(), FfmpegError> {
 	unsafe {
@@ -262,7 +262,14 @@ pub struct NvencEncoder {
 }
 
 impl NvencEncoder {
-	pub fn new(cuda_context: CUcontext, codec: Codec, width: u32, height: u32, fps: u32) -> Result<Self, Box<dyn std::error::Error>> {
+	pub fn new(
+		cuda_context: CUcontext,
+		codec: Codec,
+		width: u32,
+		height: u32,
+		fps: u32,
+		quality: VideoQuality,
+	) -> Result<Self, Box<dyn std::error::Error>> {
 		let filename = "test.mp4";
 		unsafe {
 			av_log_set_level(AV_LOG_TRACE as i32);
@@ -278,7 +285,7 @@ impl NvencEncoder {
 
 			let video_codec_context = create_video_codec_context(
 				av_format_context,
-				VideoQuality::High,
+				quality,
 				width,
 				height,
 				fps,
@@ -288,11 +295,9 @@ impl NvencEncoder {
 			let video_stream = create_stream(av_format_context, video_codec_context)?;
 
 			let mut device_ctx: *mut AVBufferRef = null_mut();
-			let mut cuda_graphics_resource: CUgraphicsResource = null_mut();
 			open_video(
 				video_codec_context,
 				&mut device_ctx,
-				&mut cuda_graphics_resource,
 				cuda_context,
 			)?;
 

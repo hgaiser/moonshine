@@ -1,11 +1,6 @@
 use std::fmt;
 
 #[derive(Debug)]
-pub enum Error {
-	CudaError,
-}
-
-#[derive(Debug)]
 pub struct CudaError {
 	code: u32,
 	message: String,
