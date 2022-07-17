@@ -27,7 +27,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	capturer.start(BufferFormat::Bgra, fps)?;
 
-	let encoder = NvencEncoder::new(cuda_context, Codec::H264, width, height, fps, VideoQuality::High)?;
+	let encoder = NvencEncoder::new(cuda_context, Codec::H264, width, height, fps, VideoQuality::Medium)?;
 
 	let start_time = std::time::Instant::now();
 	while start_time.elapsed().as_secs() < 2 {

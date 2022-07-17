@@ -23,9 +23,13 @@ impl From<&str> for Codec {
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum VideoQuality {
-	Low,
+	Slowest,
+	Slower,
+	Slow,
 	Medium,
-	High,
+	Fast,
+	Faster,
+	Fastest,
 }
 
 fn check_ret(error_code: i32) -> Result<(), FfmpegError> {
@@ -57,8 +61,6 @@ fn get_error(error_code: i32) -> Result<String, String> {
 }
 
 fn create_video_codec_context(
-	av_format_context: *mut AVFormatContext,
-	video_quality: VideoQuality,
 	width: u32,
 	height: u32,
 	fps: u32,
@@ -90,66 +92,66 @@ fn create_video_codec_context(
 		(*codec_context).codec_id = (*codec).id;
 		(*codec_context).width = width as i32;
 		(*codec_context).height = height as i32;
-		(*codec_context).bit_rate = 12500000i64 + ((*codec_context).width * (*codec_context).height) as i64 / 2;
 		(*codec_context).time_base.num = 1;
 		(*codec_context).time_base.den = ffmpeg_sys::AV_TIME_BASE as i32;
 		(*codec_context).framerate.num = fps as i32;
 		(*codec_context).framerate.den = 1;
-		(*codec_context).sample_aspect_ratio.num = 0;
-		(*codec_context).sample_aspect_ratio.den = 0;
-		(*codec_context).gop_size = fps as i32 * 2;
-		(*codec_context).max_b_frames = 0;
+		// (*codec_context).sample_aspect_ratio.num = 0;
+		// (*codec_context).sample_aspect_ratio.den = 0;
+		// (*codec_context).gop_size = fps as i32 * 2;
+		// (*codec_context).max_b_frames = 0;
 		(*codec_context).pix_fmt = ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA;
-		(*codec_context).color_range = ffmpeg_sys::AVColorRange_AVCOL_RANGE_JPEG;
-		match video_quality {
-			VideoQuality::Low => {
-				(*codec_context).bit_rate = 10000000i64 + ((*codec_context).width * (*codec_context).height) as i64 / 2;
-				match codec_type {
-					Codec::Hevc => {
-						(*codec_context).qmin = 20;
-						(*codec_context).qmax = 35;
-					},
-					Codec::H264 => {
-						(*codec_context).qmin = 5;
-						(*codec_context).qmax = 20;
-					}
-				};
-			},
-			VideoQuality::Medium => {
-				match codec_type {
-					Codec::Hevc => {
-						(*codec_context).qmin = 17;
-						(*codec_context).qmax = 30;
-					},
-					Codec::H264 => {
-						(*codec_context).qmin = 5;
-						(*codec_context).qmax = 15;
-					}
-				};
-			},
-			VideoQuality::High => {
-				(*codec_context).bit_rate = 15000000i64 + ((*codec_context).width * (*codec_context).height) as i64 / 2;
+		// (*codec_context).color_range = ffmpeg_sys::AVColorRange_AVCOL_RANGE_JPEG;
+		// (*codec_context).bit_rate = 12500000i64 + ((*codec_context).width * (*codec_context).height) as i64 / 2;
+		// match video_quality {
+		// 	VideoQuality::Low => {
+		// 		(*codec_context).bit_rate = 10000000i64 + ((*codec_context).width * (*codec_context).height) as i64 / 2;
+		// 		match codec_type {
+		// 			Codec::Hevc => {
+		// 				(*codec_context).qmin = 20;
+		// 				(*codec_context).qmax = 35;
+		// 			},
+		// 			Codec::H264 => {
+		// 				(*codec_context).qmin = 5;
+		// 				(*codec_context).qmax = 20;
+		// 			}
+		// 		};
+		// 	},
+		// 	VideoQuality::Medium => {
+		// 		match codec_type {
+		// 			Codec::Hevc => {
+		// 				(*codec_context).qmin = 17;
+		// 				(*codec_context).qmax = 30;
+		// 			},
+		// 			Codec::H264 => {
+		// 				(*codec_context).qmin = 5;
+		// 				(*codec_context).qmax = 15;
+		// 			}
+		// 		};
+		// 	},
+		// 	VideoQuality::High => {
+		// 		(*codec_context).bit_rate = 15000000i64 + ((*codec_context).width * (*codec_context).height) as i64 / 2;
 
-				match codec_type {
-					Codec::Hevc => {
-						(*codec_context).qmin = 16;
-						(*codec_context).qmax = 25;
-					},
-					Codec::H264 => {
-						(*codec_context).qmin = 3;
-						(*codec_context).qmax = 13;
-					}
-				};
-			}
-		};
-		if (*codec_context).codec_type == ffmpeg_sys::AVCodecID_AV_CODEC_ID_MPEG1VIDEO as i32 {
-			(*codec_context).mb_decision = 2;
-		}
+		// 		match codec_type {
+		// 			Codec::Hevc => {
+		// 				(*codec_context).qmin = 16;
+		// 				(*codec_context).qmax = 25;
+		// 			},
+		// 			Codec::H264 => {
+		// 				(*codec_context).qmin = 3;
+		// 				(*codec_context).qmax = 13;
+		// 			}
+		// 		};
+		// 	}
+		// };
+		// if (*codec_context).codec_type == ffmpeg_sys::AVCodecID_AV_CODEC_ID_MPEG1VIDEO as i32 {
+		// 	(*codec_context).mb_decision = 2;
+		// }
 
-		// Some formats want stream headers to be seperate
-		if ((*(*av_format_context).oformat).flags & ffmpeg_sys::AVFMT_GLOBALHEADER as i32) != 0 {
-			(*av_format_context).flags |= ffmpeg_sys::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
-		}
+		// // Some formats want stream headers to be seperate
+		// if ((*(*av_format_context).oformat).flags & ffmpeg_sys::AVFMT_GLOBALHEADER as i32) != 0 {
+		// 	(*av_format_context).flags |= ffmpeg_sys::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
+		// }
 
 		Ok(codec_context)
 	}
@@ -159,6 +161,7 @@ fn open_video(
 	codec_context: *mut AVCodecContext,
 	device_ctx: *mut *mut AVBufferRef,
 	cuda_context: CUcontext,
+	video_quality: VideoQuality,
 ) -> Result<(), FfmpegError> {
 	unsafe {
 		*device_ctx = ffmpeg_sys::av_hwdevice_ctx_alloc(ffmpeg_sys::AVHWDeviceType_AV_HWDEVICE_TYPE_CUDA);
@@ -189,7 +192,21 @@ fn open_video(
 		(*codec_context).hw_device_ctx = *device_ctx;
 		(*codec_context).hw_frames_ctx = frame_context;
 
-		check_ret(ffmpeg_sys::avcodec_open2(codec_context, (*codec_context).codec, null_mut()))?;
+		let mut options: *mut ffmpeg_sys::AVDictionary = null_mut();
+		check_ret(ffmpeg_sys::av_dict_set(
+			&mut options,
+			CStr::from_bytes_with_nul(b"preset\0").map_err(|e| FfmpegError::new(-1, format!("Failed to create output filename cstr: {}", e)))?.as_ptr(),
+			CStr::from_bytes_with_nul(b"slow\0").map_err(|e| FfmpegError::new(-1, format!("Failed to create output filename cstr: {}", e)))?.as_ptr(),
+			0
+		))?;
+		// check_ret(ffmpeg_sys::av_opt_set(
+		// 	(*codec_context).priv_data,
+		// 	CStr::from_bytes_with_nul(b"tune\0").map_err(|e| FfmpegError::new(-1, format!("Failed to create output filename cstr: {}", e)))?.as_ptr(),
+		// 	CStr::from_bytes_with_nul(b"zerolatency\0").map_err(|e| FfmpegError::new(-1, format!("Failed to create output filename cstr: {}", e)))?.as_ptr(),
+		// 	0
+		// ))?;
+
+		check_ret(ffmpeg_sys::avcodec_open2(codec_context, (*codec_context).codec, &mut options))?;
 
 		Ok(())
 	}
@@ -207,7 +224,7 @@ fn create_stream(
 		(*stream).id = (*av_format_context).nb_streams as i32 - 1;
 		(*stream).time_base = (*codec_context).time_base;
 		(*stream).avg_frame_rate = (*codec_context).framerate;
-		return Ok(stream);
+		Ok(stream)
 	}
 }
 
@@ -284,8 +301,6 @@ impl NvencEncoder {
 			}
 
 			let video_codec_context = create_video_codec_context(
-				av_format_context,
-				quality,
 				width,
 				height,
 				fps,
@@ -299,6 +314,7 @@ impl NvencEncoder {
 				video_codec_context,
 				&mut device_ctx,
 				cuda_context,
+				quality,
 			)?;
 
 			let res = ffmpeg_sys::avcodec_parameters_from_context((*video_stream).codecpar, video_codec_context);
