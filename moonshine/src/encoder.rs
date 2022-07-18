@@ -1,4 +1,4 @@
-use std::{ffi::CStr, ptr::{null_mut, null, NonNull}, mem::MaybeUninit};
+use std::{ffi::{CStr, CString}, ptr::{null_mut, null, NonNull}, mem::MaybeUninit, os::raw::c_char};
 
 use ffmpeg_sys::{av_log_set_level, AVFormatContext, AVBufferRef, AVFrame, AVCodecContext, AVStream, CUcontext, AV_LOG_TRACE};
 
@@ -42,22 +42,30 @@ fn check_ret(error_code: i32) -> Result<(), FfmpegError> {
 	Ok(())
 }
 
+unsafe fn parse_c_str<'a>(data: *const c_char) -> Result<&'a str, String> {
+	CStr::from_ptr(data)
+		.to_str()
+		.map_err(|_e| "invalid UTF-8".to_string())
+}
+
+fn to_c_str(data: &str) -> Result<CString, String> {
+	CString::new(data)
+		.map_err(|e| format!("Failed to create CString: {}", e))
+}
+
 fn get_error(error_code: i32) -> Result<String, String> {
-	const BUFFER_SIZE: usize = 512;
-	let mut buffer = [0u8; BUFFER_SIZE];
+	let mut buffer = [0 as c_char; ffmpeg_sys::AV_ERROR_MAX_STRING_SIZE as usize];
 	unsafe {
-		if ffmpeg_sys::av_strerror(error_code, buffer.as_mut_ptr() as *mut _, BUFFER_SIZE as u64) < 0 {
+		if ffmpeg_sys::av_strerror(error_code, buffer.as_mut_ptr() as *mut _, ffmpeg_sys::AV_ERROR_MAX_STRING_SIZE as u64) < 0 {
 			return Err("Failed to get last ffmpeg error".into());
 		}
-	};
 
-	Ok(
-		CStr::from_bytes_until_nul(&buffer)
-			.map_err(|e| format!("Failed to convert buffer to cstr: {}", e))?
-			.to_str()
-			.map_err(|e| format!("Failed to convert cstr to str: {}", e))?
-			.to_string()
-	)
+		Ok(
+			parse_c_str(buffer.as_ptr())
+				.map_err(|e| format!("Failed to parse error message: {}", e))?
+				.to_string()
+		)
+	}
 }
 
 fn create_video_codec_context(
@@ -68,14 +76,8 @@ fn create_video_codec_context(
 ) -> Result<NonNull<AVCodecContext>, String> {
 	unsafe {
 		let codec: *const ffmpeg_sys::AVCodec = match codec_type {
-			Codec::H264 => ffmpeg_sys::avcodec_find_encoder_by_name(
-				CStr::from_bytes_with_nul(b"h264_nvenc\0")
-					.map_err(|e| format!("failed to create output filename cstr: {}", e))?.as_ptr()
-			),
-			Codec::Hevc => ffmpeg_sys::avcodec_find_encoder_by_name(
-				CStr::from_bytes_with_nul(b"hevc_nvenc\0")
-					.map_err(|e| format!("failed to create output filename cstr: {}", e))?.as_ptr()
-			),
+			Codec::H264 => ffmpeg_sys::avcodec_find_encoder_by_name(to_c_str("h264_nvenc")?.as_ptr()),
+			Codec::Hevc => ffmpeg_sys::avcodec_find_encoder_by_name(to_c_str("hevc_nvenc")?.as_ptr()),
 		};
 		if codec.is_null() {
 			return Err(format!("Codec '{:?}' is not found in ffmpeg.", codec_type));
@@ -189,6 +191,9 @@ fn open_video(
 		(*hw_frame_context).device_ctx = (*device_ctx).data as *mut ffmpeg_sys::AVHWDeviceContext;
 
 		check_ret(ffmpeg_sys::av_hwframe_ctx_init(frame_context))?;
+		let frames_context2 = &*hw_frame_context;
+
+		println!("{:#?}", frames_context2);
 
 		codec_context.as_mut().hw_device_ctx = device_ctx;
 		codec_context.as_mut().hw_frames_ctx = frame_context;
@@ -196,14 +201,14 @@ fn open_video(
 		let mut options: *mut ffmpeg_sys::AVDictionary = null_mut();
 		check_ret(ffmpeg_sys::av_dict_set(
 			&mut options,
-			CStr::from_bytes_with_nul(b"preset\0").map_err(|e| FfmpegError::new(-1, format!("Failed to create output filename cstr: {}", e)))?.as_ptr(),
-			CStr::from_bytes_with_nul(b"slow\0").map_err(|e| FfmpegError::new(-1, format!("Failed to create output filename cstr: {}", e)))?.as_ptr(),
+			to_c_str("preset").map_err(|e| FfmpegError::new(-1, e))?.as_ptr(),
+			to_c_str("slow").map_err(|e| FfmpegError::new(-1, e))?.as_ptr(),
 			0
 		))?;
 		// check_ret(ffmpeg_sys::av_opt_set(
 		// 	(*codec_context).priv_data,
-		// 	CStr::from_bytes_with_nul(b"tune\0").map_err(|e| FfmpegError::new(-1, format!("Failed to create output filename cstr: {}", e)))?.as_ptr(),
-		// 	CStr::from_bytes_with_nul(b"zerolatency\0").map_err(|e| FfmpegError::new(-1, format!("Failed to create output filename cstr: {}", e)))?.as_ptr(),
+		//	to_c_str("tune").map_err(|e| FfmpegError::new(-1, e))?.as_ptr(),
+		//	to_c_str("zerolatency").map_err(|e| FfmpegError::new(-1, e))?.as_ptr(),
 		// 	0
 		// ))?;
 
@@ -296,7 +301,7 @@ impl NvencEncoder {
 			let res = ffmpeg_sys::avformat_alloc_output_context2(
 				&mut av_format_context,
 				null(), null(),
-				CStr::from_bytes_with_nul(b"test.mp4\0").map_err(|e| format!("failed to create output filename cstr: {}", e))?.as_ptr()
+				to_c_str("test.mp4")?.as_ptr()
 			);
 			if res < 0 {
 				panic!("Failed to create output format context: {}", res);
@@ -327,7 +332,7 @@ impl NvencEncoder {
 
 			let res = ffmpeg_sys::avio_open(
 				&mut av_format_context.as_mut().pb,
-				CStr::from_bytes_with_nul(b"test.mp4\0").map_err(|e| format!("failed to create output filename cstr: {}", e))?.as_ptr(),
+				to_c_str("test.mp4")?.as_ptr(),
 				ffmpeg_sys::AVIO_FLAG_WRITE as i32
 			);
 			if res < 0 {
@@ -346,17 +351,25 @@ impl NvencEncoder {
 			frame.as_mut().height = video_codec_context.as_ref().height;
 			frame.as_mut().key_frame = 1;
 			frame.as_mut().hw_frames_ctx = video_codec_context.as_ref().hw_frames_ctx;
-
-			// println!("{:#?}", (*frame));
 			// println!("Format: {}", ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA);
-			// (*frame).hw_frames_ctx = ffmpeg_sys::av_hwframe_ctx_alloc((*video_codec_context).hw_device_ctx);
-			// if (*frame).hw_frames_ctx.is_null() {
+			// frame.as_mut().hw_frames_ctx = ffmpeg_sys::av_hwframe_ctx_alloc(video_codec_context.as_ref().hw_device_ctx);
+			// if frame.as_ref().hw_frames_ctx.is_null() {
 			// 	return Err("Failed to allocated a hardware frame context.".into());
 			// }
-			// check_ret(ffmpeg_sys::av_hwframe_ctx_init((*frame).hw_frames_ctx))?;
+			// let frames_context = &mut *((*video_codec_context.as_ref().hw_frames_ctx).data as *mut ffmpeg_sys::AVHWFramesContext);
+			// frames_context.format = ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA;
+			// frames_context.sw_format = video_codec_context.as_ref().sw_pix_fmt;
+			// frames_context.width = frame.as_mut().width;
+			// frames_context.height = frame.as_mut().height;
+			// check_ret(ffmpeg_sys::av_hwframe_ctx_init(frame.as_ref().hw_frames_ctx))
+			// 	.map_err(|e| format!("Failed to initialize hwframe context: {}", e))?;
+			let frames_context2 = &mut *((*frame.as_mut().hw_frames_ctx).data as *mut ffmpeg_sys::AVHWFramesContext);
+			println!("{:#?}", frames_context2);
 			if ffmpeg_sys::av_hwframe_get_buffer(video_codec_context.as_ref().hw_frames_ctx, frame.as_ptr(), 0) < 0 {
 				panic!("Failed to allocate hardware buffer");
 			}
+			let frames_context2 = &mut *((*frame.as_mut().hw_frames_ctx).data as *mut ffmpeg_sys::AVHWFramesContext);
+			println!("{:#?}", frames_context2);
 
 			// panic!("{:#?}", (*frame));
 
