@@ -56,6 +56,7 @@ fn to_c_str(data: &str) -> Result<CString, String> {
 fn get_error(error_code: i32) -> Result<String, String> {
 	let mut buffer = [0 as c_char; ffmpeg_sys::AV_ERROR_MAX_STRING_SIZE as usize];
 	unsafe {
+		// Don't use check_ret here, because this function is called by check_ret.
 		if ffmpeg_sys::av_strerror(error_code, buffer.as_mut_ptr() as *mut _, ffmpeg_sys::AV_ERROR_MAX_STRING_SIZE as u64) < 0 {
 			return Err("Failed to get last ffmpeg error".into());
 		}
@@ -68,103 +69,66 @@ fn get_error(error_code: i32) -> Result<String, String> {
 	}
 }
 
-fn create_video_codec_context(
-	width: u32,
-	height: u32,
-	fps: u32,
-	codec_type: Codec,
-) -> Result<NonNull<AVCodecContext>, String> {
-	unsafe {
-		let codec: *const ffmpeg_sys::AVCodec = match codec_type {
-			Codec::H264 => ffmpeg_sys::avcodec_find_encoder_by_name(to_c_str("h264_nvenc")?.as_ptr()),
-			Codec::Hevc => ffmpeg_sys::avcodec_find_encoder_by_name(to_c_str("hevc_nvenc")?.as_ptr()),
-		};
-		if codec.is_null() {
-			return Err(format!("Codec '{:?}' is not found in ffmpeg.", codec_type));
+struct CodecContext {
+	inner: *mut AVCodecContext,
+}
+
+impl CodecContext {
+	fn new(width: u32, height: u32, codec_type: Codec) -> Result<Self, String> {
+		unsafe {
+			// Find the right codec.
+			let codec = match codec_type {
+				Codec::H264 => ffmpeg_sys::avcodec_find_encoder_by_name(to_c_str("h264_nvenc")?.as_ptr()),
+				Codec::Hevc => ffmpeg_sys::avcodec_find_encoder_by_name(to_c_str("hevc_nvenc")?.as_ptr()),
+			};
+			if codec.is_null() {
+				return Err(format!("Codec '{:?}' is not found in ffmpeg.", codec_type));
+			}
+			let codec = &*codec;
+
+			// Allocate a video codec context.
+			let codec_context = ffmpeg_sys::avcodec_alloc_context3(codec);
+			if codec_context.is_null() {
+				return Err("Failed to create codec context.".into());
+			}
+			let codec_context = &mut *codec_context;
+			if codec.type_ != ffmpeg_sys::AVMediaType_AVMEDIA_TYPE_VIDEO {
+				return Err(format!("Expected video encoder, but got type: {}", (*codec).type_));
+			}
+
+			// Configure the codec context.
+			codec_context.width = width as i32;
+			codec_context.height = height as i32;
+			codec_context.time_base.num = 1;
+			codec_context.time_base.den = ffmpeg_sys::AV_TIME_BASE as i32;
+			codec_context.pix_fmt = ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA;
+
+			Ok(Self { inner: codec_context })
 		}
-		let codec = &*codec;
+	}
 
-		let codec_context: *mut AVCodecContext = ffmpeg_sys::avcodec_alloc_context3(codec);
-		if codec_context.is_null() {
-			return Err("Failed to create codec context.".into());
-		}
-		let codec_context = &mut *codec_context;
+	fn as_ptr(&self) -> *mut ffmpeg_sys::AVCodecContext {
+		self.inner
+	}
 
-		if codec.type_ != ffmpeg_sys::AVMediaType_AVMEDIA_TYPE_VIDEO {
-			return Err(format!("Expected video encoder, but got type: {}", (*codec).type_));
-		}
-		codec_context.codec_id = codec.id;
-		codec_context.width = width as i32;
-		codec_context.height = height as i32;
-		codec_context.time_base.num = 1;
-		codec_context.time_base.den = ffmpeg_sys::AV_TIME_BASE as i32;
-		codec_context.framerate.num = fps as i32;
-		codec_context.framerate.den = 1;
-		// codec_context.sample_aspect_ratio.num = 0;
-		// codec_context.sample_aspect_ratio.den = 0;
-		// codec_context.gop_size = fps as i32 * 2;
-		// codec_context.max_b_frames = 0;
-		codec_context.pix_fmt = ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA;
-		// codec_context.color_range = ffmpeg_sys::AVColorRange_AVCOL_RANGE_JPEG;
-		// codec_context.bit_rate = 12500000i64 + ((*codec_context).width * (*codec_context).height) as i64 / 2;
-		// match video_quality {
-		// 	VideoQuality::Low => {
-		// 		codec_context).bit_rate = 10000000i64 + ((*codec_context).width * (*codec_context).height) as i64 / 2;
-		// 		match codec_type {
-		// 			Codec::Hevc => {
-		// 				codec_context.qmin = 20;
-		// 				codec_context.qmax = 35;
-		// 			},
-		// 			Codec::H264 => {
-		// 				codec_context.qmin = 5;
-		// 				codec_context.qmax = 20;
-		// 			}
-		// 		};
-		// 	},
-		// 	VideoQuality::Medium => {
-		// 		match codec_type {
-		// 			Codec::Hevc => {
-		// 				codec_context.qmin = 17;
-		// 				codec_context.qmax = 30;
-		// 			},
-		// 			Codec::H264 => {
-		// 				codec_context.qmin = 5;
-		// 				codec_context.qmax = 15;
-		// 			}
-		// 		};
-		// 	},
-		// 	VideoQuality::High => {
-		// 		codec_context.bit_rate = 15000000i64 + (codec_context).width * codec_context.height) as i64 / 2;
+	unsafe fn as_ref(&self) -> &ffmpeg_sys::AVCodecContext {
+		&*self.inner
+	}
 
-		// 		match codec_type {
-		// 			Codec::Hevc => {
-		// 				codec_context.qmin = 16;
-		// 				codec_context.qmax = 25;
-		// 			},
-		// 			Codec::H264 => {
-		// 				codec_context.qmin = 3;
-		// 				codec_context.qmax = 13;
-		// 			}
-		// 		};
-		// 	}
-		// };
-		// if codec_context.codec_type == ffmpeg_sys::AVCodecID_AV_CODEC_ID_MPEG1VIDEO as i32 {
-		// 	codec_context.mb_decision = 2;
-		// }
+	unsafe fn as_mut(&self) -> &mut ffmpeg_sys::AVCodecContext {
+		&mut *self.inner
+	}
+}
 
-		// // Some formats want stream headers to be seperate
-		// if ((*(*av_format_context).oformat).flags & ffmpeg_sys::AVFMT_GLOBALHEADER as i32) != 0 {
-		// 	(*av_format_context).flags |= ffmpeg_sys::AV_CODEC_FLAG_GLOBAL_HEADER as i32;
-		// }
-
-		Ok(NonNull::new(codec_context as *mut AVCodecContext).unwrap())
+impl Drop for CodecContext {
+	fn drop(&mut self) {
+		unsafe { ffmpeg_sys::avcodec_free_context(&mut self.inner); };
 	}
 }
 
 fn open_video(
-	mut codec_context: NonNull<AVCodecContext>,
+	codec_context: &CodecContext,
 	cuda_context: CUcontext,
-	video_quality: VideoQuality,
 ) -> Result<NonNull<AVBufferRef>, FfmpegError> {
 	unsafe {
 		let device_ctx = ffmpeg_sys::av_hwdevice_ctx_alloc(ffmpeg_sys::AVHWDeviceType_AV_HWDEVICE_TYPE_CUDA);
@@ -220,7 +184,7 @@ fn open_video(
 
 fn create_stream(
 	av_format_context: NonNull<AVFormatContext>,
-	codec_context: NonNull<AVCodecContext>,
+	codec_context: &CodecContext,
 ) -> Result<NonNull<AVStream>, FfmpegError> {
 	unsafe {
 		let stream = ffmpeg_sys::avformat_new_stream(av_format_context.as_ptr(), null());
@@ -236,7 +200,7 @@ fn create_stream(
 }
 
 fn receive_frames(
-	av_codec_context: NonNull<AVCodecContext>,
+	av_codec_context: &CodecContext,
 	stream_index: i32,
 	stream: NonNull<AVStream>,
 	frame: NonNull<AVFrame>,
@@ -279,10 +243,10 @@ fn receive_frames(
 }
 
 pub struct NvencEncoder {
-	pub frame: NonNull<AVFrame>,
-	pub format_context: NonNull<AVFormatContext>,
-	pub video_codec_context: NonNull<AVCodecContext>,
-	pub video_stream: NonNull<AVStream>,
+	frame: NonNull<AVFrame>,
+	format_context: NonNull<AVFormatContext>,
+	video_codec_context: CodecContext,
+	video_stream: NonNull<AVStream>,
 }
 
 impl NvencEncoder {
@@ -291,8 +255,6 @@ impl NvencEncoder {
 		codec: Codec,
 		width: u32,
 		height: u32,
-		fps: u32,
-		quality: VideoQuality,
 	) -> Result<Self, String> {
 		let filename = "test.mp4";
 		unsafe {
@@ -301,27 +263,25 @@ impl NvencEncoder {
 			let res = ffmpeg_sys::avformat_alloc_output_context2(
 				&mut av_format_context,
 				null(), null(),
-				to_c_str("test.mp4")?.as_ptr()
+				to_c_str(filename)?.as_ptr()
 			);
 			if res < 0 {
 				panic!("Failed to create output format context: {}", res);
 			}
 			let mut av_format_context = NonNull::new(av_format_context).unwrap();
 
-			let video_codec_context = create_video_codec_context(
+			let video_codec_context = CodecContext::new(
 				width,
 				height,
-				fps,
 				codec,
 			)?;
 
-			let video_stream = create_stream(av_format_context, video_codec_context)
+			let video_stream = create_stream(av_format_context, &video_codec_context)
 				.map_err(|e| format!("Failed to create stream: {}", e))?;
 
 			let device_ctx = open_video(
-				video_codec_context,
+				&video_codec_context,
 				cuda_context,
-				quality,
 			)
 				.map_err(|e| format!("Failed to open video: {}", e))?;
 
@@ -332,7 +292,7 @@ impl NvencEncoder {
 
 			let res = ffmpeg_sys::avio_open(
 				&mut av_format_context.as_mut().pb,
-				to_c_str("test.mp4")?.as_ptr(),
+				to_c_str(filename)?.as_ptr(),
 				ffmpeg_sys::AVIO_FLAG_WRITE as i32
 			);
 			if res < 0 {
@@ -345,7 +305,7 @@ impl NvencEncoder {
 			}
 
 			let frame = NonNull::new(ffmpeg_sys::av_frame_alloc());
-			let mut frame = frame.ok_or("Failed to allocate frame".to_string())?;
+			let mut frame = frame.ok_or_else(|| "Failed to allocate frame".to_string())?;
 			frame.as_mut().format = video_codec_context.as_ref().pix_fmt;
 			frame.as_mut().width = video_codec_context.as_ref().width;
 			frame.as_mut().height = video_codec_context.as_ref().height;
@@ -396,7 +356,7 @@ impl NvencEncoder {
 			let res = ffmpeg_sys::avcodec_send_frame(self.video_codec_context.as_ptr(), self.frame.as_ptr());
 			if res >= 0 {
 				receive_frames(
-					self.video_codec_context,
+					&self.video_codec_context,
 					video_stream_index,
 					self.video_stream,
 					self.frame,
