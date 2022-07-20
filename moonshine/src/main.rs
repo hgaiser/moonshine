@@ -3,7 +3,7 @@
 use nvfbc::{BufferFormat, CudaCapturer};
 use nvfbc::cuda::CaptureMethod;
 
-use crate::encoder::{NvencEncoder, Codec, VideoQuality};
+use crate::encoder::{NvencEncoder, CodecType, VideoQuality};
 
 mod cuda;
 mod encoder;
@@ -29,7 +29,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	let mut encoder = NvencEncoder::new(
 		cuda_context,
-		Codec::H264,
+		CodecType::H264,
 		width,
 		height,
 	)?;
