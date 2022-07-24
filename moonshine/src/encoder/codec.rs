@@ -17,7 +17,7 @@ impl From<&str> for CodecType {
 }
 
 pub(super) struct Codec {
-	pub(super) inner: *mut ffmpeg_sys::AVCodecContext,
+	pub(super) codec_context: *mut ffmpeg_sys::AVCodecContext,
 }
 
 impl Codec {
@@ -50,25 +50,25 @@ impl Codec {
 			codec_context.time_base.den = ffmpeg_sys::AV_TIME_BASE as i32;
 			codec_context.pix_fmt = ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA;
 
-			Ok(Self { inner: codec_context })
+			Ok(Self { codec_context })
 		}
 	}
 
 	pub(super) fn as_ptr(&self) -> *mut ffmpeg_sys::AVCodecContext {
-		self.inner
+		self.codec_context
 	}
 
 	pub(super) unsafe fn as_ref(&self) -> &ffmpeg_sys::AVCodecContext {
-		&*self.inner
+		&*self.codec_context
 	}
 
 	pub(super) unsafe fn as_mut(&self) -> &mut ffmpeg_sys::AVCodecContext {
-		&mut *self.inner
+		&mut *self.codec_context
 	}
 }
 
 impl Drop for Codec {
 	fn drop(&mut self) {
-		unsafe { ffmpeg_sys::avcodec_free_context(&mut self.inner); };
+		unsafe { ffmpeg_sys::avcodec_free_context(&mut self.codec_context); };
 	}
 }

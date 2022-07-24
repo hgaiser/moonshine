@@ -1,4 +1,4 @@
-use std::{ffi::{CStr, CString}, ptr::{null_mut, null, NonNull}, mem::MaybeUninit, os::raw::c_char};
+use std::{ffi::{CStr, CString}, ptr::{null_mut, NonNull}, mem::MaybeUninit, os::raw::c_char};
 
 use ffmpeg_sys::{av_log_set_level, AVFormatContext, AVBufferRef, AVFrame, AVStream, CUcontext, AV_LOG_TRACE};
 
@@ -7,7 +7,10 @@ use crate::error::FfmpegError;
 use self::codec::Codec;
 pub use self::codec::CodecType;
 
+use self::muxer::Muxer;
+
 mod codec;
+mod muxer;
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
@@ -114,29 +117,12 @@ fn open_video(
 	}
 }
 
-fn create_stream(
-	av_format_context: NonNull<AVFormatContext>,
-	codec_context: &Codec,
-) -> Result<NonNull<AVStream>, FfmpegError> {
-	unsafe {
-		let stream = ffmpeg_sys::avformat_new_stream(av_format_context.as_ptr(), null());
-		if stream.is_null() {
-			return Err(FfmpegError::new(-1, "Could not allocate stream.".into()));
-		}
-		let stream = &mut *stream;
-		stream.id = av_format_context.as_ref().nb_streams as i32 - 1;
-		stream.time_base = codec_context.as_ref().time_base;
-		stream.avg_frame_rate = codec_context.as_ref().framerate;
-		Ok(NonNull::new(stream as *mut AVStream).unwrap())
-	}
-}
-
 fn receive_frames(
 	av_codec_context: &Codec,
 	stream_index: i32,
-	stream: NonNull<AVStream>,
+	stream: *const AVStream,
 	frame: NonNull<AVFrame>,
-	av_format_context: NonNull<AVFormatContext>,
+	av_format_context: *mut AVFormatContext,
 	// std::mutex &write_output_mutex
 ) -> Result<(), FfmpegError> {
 	unsafe {
@@ -151,9 +137,9 @@ fn receive_frames(
 				av_packet.dts = frame.as_ref().pts;
 
 				// std::lock_guard<std::mutex> lock(write_output_mutex);
-				ffmpeg_sys::av_packet_rescale_ts(&mut av_packet, av_codec_context.as_ref().time_base, stream.as_ref().time_base);
-				av_packet.stream_index = stream.as_ref().index;
-				check_ret(ffmpeg_sys::av_interleaved_write_frame(av_format_context.as_ptr(), &mut av_packet))?;
+				ffmpeg_sys::av_packet_rescale_ts(&mut av_packet, av_codec_context.as_ref().time_base, (*stream).time_base);
+				av_packet.stream_index = (*stream).index;
+				check_ret(ffmpeg_sys::av_interleaved_write_frame(av_format_context, &mut av_packet))?;
 				ffmpeg_sys::av_packet_unref(&mut av_packet);
 			} else if res == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) { // we have no packet
 				// fprintf(stderr, "No packet!\n");
@@ -176,64 +162,33 @@ fn receive_frames(
 
 pub struct NvencEncoder {
 	frame: NonNull<AVFrame>,
-	format_context: NonNull<AVFormatContext>,
 	codec: Codec,
-	video_stream: NonNull<AVStream>,
+	muxer: Muxer,
 }
 
 impl NvencEncoder {
 	pub fn new(
 		cuda_context: CUcontext,
-		codec: CodecType,
+		codec_type: CodecType,
 		width: u32,
 		height: u32,
 	) -> Result<Self, String> {
-		let filename = "test.mp4";
 		unsafe {
 			av_log_set_level(AV_LOG_TRACE as i32);
 
 			let codec = Codec::new(
 				width,
 				height,
-				codec,
+				codec_type,
 			)?;
 
-			let mut av_format_context = null_mut();
-			check_ret(ffmpeg_sys::avformat_alloc_output_context2(
-				&mut av_format_context,
-				null(), null(),
-				to_c_str(filename)?.as_ptr()
-			))
-				.map_err(|e| format!("Failed to allocate output context: {}", e))?;
-			let mut av_format_context = NonNull::new(av_format_context).unwrap();
-
-			let video_stream = create_stream(av_format_context, &codec)
-				.map_err(|e| format!("Failed to create stream: {}", e))?;
+			let muxer = Muxer::new(&codec)?;
 
 			let device_ctx = open_video(
 				&codec,
 				cuda_context,
 			)
 				.map_err(|e| format!("Failed to open video: {}", e))?;
-
-			let res = ffmpeg_sys::avcodec_parameters_from_context(video_stream.as_ref().codecpar, codec.as_ptr());
-			if res < 0 {
-				panic!("Failed to set parameters from context: {}", res);
-			}
-
-			let res = ffmpeg_sys::avio_open(
-				&mut av_format_context.as_mut().pb,
-				to_c_str(filename)?.as_ptr(),
-				ffmpeg_sys::AVIO_FLAG_WRITE as i32
-			);
-			if res < 0 {
-				panic!("Could not open '{}': {}", filename, get_error(res)?);
-			}
-
-			let res = ffmpeg_sys::avformat_write_header(av_format_context.as_ptr(), null_mut());
-			if res < 0 {
-				panic!("Error occurred when writing header to output file: {}", get_error(res)?);
-			}
 
 			let frame = NonNull::new(ffmpeg_sys::av_frame_alloc());
 			let mut frame = frame.ok_or_else(|| "Failed to allocate frame".to_string())?;
@@ -269,9 +224,8 @@ impl NvencEncoder {
 
 			Ok(Self {
 				frame,
-				format_context: av_format_context,
 				codec,
-				video_stream,
+				muxer,
 			})
 		}
 
@@ -289,9 +243,9 @@ impl NvencEncoder {
 				receive_frames(
 					&self.codec,
 					video_stream_index,
-					self.video_stream,
+					self.muxer.video_stream(),
 					self.frame,
-					self.format_context,
+					self.muxer.as_ptr(),
 				)
 					.map_err(|e| format!("Failed to encode image: {}", e))?;
 			} else {
@@ -303,14 +257,7 @@ impl NvencEncoder {
 	}
 
 	pub fn stop(&self) -> Result<(), String> {
-		unsafe {
-			if ffmpeg_sys::av_write_trailer(self.format_context.as_ptr()) != 0 {
-				panic!("Failed to write trailer");
-			}
-			if ffmpeg_sys::avio_close(self.format_context.as_ref().pb) != 0 {
-				panic!("Failed to close file");
-			}
-		};
+		self.muxer.stop()?;
 		Ok(())
 	}
 }
