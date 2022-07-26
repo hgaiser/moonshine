@@ -1,6 +1,6 @@
 use std::{ffi::{CStr, CString}, ptr::{null_mut, NonNull}, mem::MaybeUninit, os::raw::c_char};
 
-use ffmpeg_sys::{av_log_set_level, AVFormatContext, AVBufferRef, AVFrame, AVStream, CUcontext, AV_LOG_TRACE};
+use ffmpeg_sys::{av_log_set_level, AVFormatContext, AVBufferRef, AV_LOG_TRACE, CUcontext, AVStream};
 
 use crate::error::FfmpegError;
 
@@ -9,8 +9,11 @@ pub use self::codec::CodecType;
 
 use self::muxer::Muxer;
 
+use video_frame::VideoFrame;
+
 mod codec;
 mod muxer;
+mod video_frame;
 
 #[allow(dead_code)]
 #[derive(Debug, PartialEq, Eq)]
@@ -121,7 +124,7 @@ fn receive_frames(
 	av_codec_context: &Codec,
 	stream_index: i32,
 	stream: *const AVStream,
-	frame: NonNull<AVFrame>,
+	frame: &VideoFrame,
 	av_format_context: *mut AVFormatContext,
 	// std::mutex &write_output_mutex
 ) -> Result<(), FfmpegError> {
@@ -161,7 +164,7 @@ fn receive_frames(
 }
 
 pub struct NvencEncoder {
-	frame: NonNull<AVFrame>,
+	frame: VideoFrame,
 	codec: Codec,
 	muxer: Muxer,
 }
@@ -190,37 +193,7 @@ impl NvencEncoder {
 			)
 				.map_err(|e| format!("Failed to open video: {}", e))?;
 
-			let frame = NonNull::new(ffmpeg_sys::av_frame_alloc());
-			let mut frame = frame.ok_or_else(|| "Failed to allocate frame".to_string())?;
-			frame.as_mut().format = codec.as_ref().pix_fmt;
-			frame.as_mut().width = codec.as_ref().width;
-			frame.as_mut().height = codec.as_ref().height;
-			frame.as_mut().key_frame = 1;
-			frame.as_mut().hw_frames_ctx = codec.as_ref().hw_frames_ctx;
-			// println!("Format: {}", ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA);
-			// frame.as_mut().hw_frames_ctx = ffmpeg_sys::av_hwframe_ctx_alloc(codec.as_ref().hw_device_ctx);
-			// if frame.as_ref().hw_frames_ctx.is_null() {
-			// 	return Err("Failed to allocated a hardware frame context.".into());
-			// }
-			// let frames_context = &mut *((*codec.as_ref().hw_frames_ctx).data as *mut ffmpeg_sys::AVHWFramesContext);
-			// frames_context.format = ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA;
-			// frames_context.sw_format = codec.as_ref().sw_pix_fmt;
-			// frames_context.width = frame.as_mut().width;
-			// frames_context.height = frame.as_mut().height;
-			// check_ret(ffmpeg_sys::av_hwframe_ctx_init(frame.as_ref().hw_frames_ctx))
-			// 	.map_err(|e| format!("Failed to initialize hwframe context: {}", e))?;
-			let frames_context2 = &mut *((*frame.as_mut().hw_frames_ctx).data as *mut ffmpeg_sys::AVHWFramesContext);
-			println!("{:#?}", frames_context2);
-			if ffmpeg_sys::av_hwframe_get_buffer(codec.as_ref().hw_frames_ctx, frame.as_ptr(), 0) < 0 {
-				panic!("Failed to allocate hardware buffer");
-			}
-			let frames_context2 = &mut *((*frame.as_mut().hw_frames_ctx).data as *mut ffmpeg_sys::AVHWFramesContext);
-			println!("{:#?}", frames_context2);
-
-			// panic!("{:#?}", (*frame));
-
-			// Recompute the linesize, because ffmpeg assumes the CUDA blob is pitched (aligned) memory, which it isn't.
-			frame.as_mut().linesize[0] = frame.as_ref().width * 4;
+			let frame = VideoFrame::new(&codec)?;
 
 			Ok(Self {
 				frame,
@@ -234,23 +207,18 @@ impl NvencEncoder {
 	pub fn encode(&mut self, device_buffer: usize, time: std::time::Duration) -> Result<(), String> {
 		let video_stream_index = 0;
 		unsafe {
-			self.frame.as_mut().data[0] = device_buffer as *mut u8;
-			self.frame.as_mut().pts = (time.as_secs_f64() * ffmpeg_sys::AV_TIME_BASE as f64) as i64;
-			// next_recording_time = std::time::Instant::now() + std::time::Duration::from_secs_f64(time_step);
+			self.frame.set_buffer(device_buffer, time);
+			self.codec.send_frame(&self.frame)
+				.map_err(|e| format!("Failed to send frame to codec: {}", e))?;
 
-			let res = ffmpeg_sys::avcodec_send_frame(self.codec.as_ptr(), self.frame.as_ptr());
-			if res >= 0 {
-				receive_frames(
-					&self.codec,
-					video_stream_index,
-					self.muxer.video_stream(),
-					self.frame,
-					self.muxer.as_ptr(),
-				)
-					.map_err(|e| format!("Failed to encode image: {}", e))?;
-			} else {
-				eprintln!("Error: avcodec_send_frame failed: {}", get_error(res)?);
-			}
+			receive_frames(
+				&self.codec,
+				video_stream_index,
+				self.muxer.video_stream(),
+				&self.frame,
+				self.muxer.as_ptr(),
+			)
+				.map_err(|e| format!("Failed to encode image: {}", e))?;
 		};
 
 		Ok(())

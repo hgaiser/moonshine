@@ -1,4 +1,6 @@
-use super::to_c_str;
+use crate::error::FfmpegError;
+
+use super::{to_c_str, video_frame::VideoFrame, check_ret};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum CodecType {
@@ -51,6 +53,12 @@ impl Codec {
 			codec_context.pix_fmt = ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA;
 
 			Ok(Self { codec_context })
+		}
+	}
+
+	pub(super) fn send_frame(&self, frame: &VideoFrame) -> Result<(), FfmpegError> {
+		unsafe {
+			check_ret(ffmpeg_sys::avcodec_send_frame(self.as_ptr(), frame.as_ptr()))
 		}
 	}
 
