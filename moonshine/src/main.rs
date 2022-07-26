@@ -23,15 +23,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	let width = status.screen_size.w;
 	let height = status.screen_size.h;
-	let fps = 30;
+	let fps = 60;
 
 	capturer.start(BufferFormat::Bgra, fps)?;
 
 	let mut encoder = NvencEncoder::new(
-		cuda_context,
-		CodecType::H264,
 		width,
 		height,
+		CodecType::H264,
+		VideoQuality::Slowest,
+		cuda_context,
 	)?;
 
 	let start_time = std::time::Instant::now();

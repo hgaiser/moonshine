@@ -85,10 +85,6 @@ impl Muxer {
 	pub(super) unsafe fn as_ref(&self) -> &ffmpeg_sys::AVFormatContext {
 		&*self.format_context
 	}
-
-	pub(super) unsafe fn as_mut(&self) -> &mut ffmpeg_sys::AVFormatContext {
-		&mut *self.format_context
-	}
 }
 
 impl Drop for Muxer {
