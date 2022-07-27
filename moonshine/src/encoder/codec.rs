@@ -85,6 +85,7 @@ impl Codec {
 			codec_context.time_base.num = 1;
 			codec_context.time_base.den = ffmpeg_sys::AV_TIME_BASE as i32;
 			codec_context.pix_fmt = ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA;
+			// codec_context.gop_size = 0; // Only intra frames.
 
 			let device_ctx = ffmpeg_sys::av_hwdevice_ctx_alloc(ffmpeg_sys::AVHWDeviceType_AV_HWDEVICE_TYPE_CUDA);
 			if device_ctx.is_null() {
@@ -107,16 +108,20 @@ impl Codec {
 			hw_frame_context.height = codec_context.height;
 			hw_frame_context.sw_format = ffmpeg_sys::AV_PIX_FMT_0RGB32;
 			hw_frame_context.format = codec_context.pix_fmt;
-			hw_frame_context.device_ref = device_ctx;
-			hw_frame_context.device_ctx = (*device_ctx).data as *mut ffmpeg_sys::AVHWDeviceContext;
 
 			check_ret(ffmpeg_sys::av_hwframe_ctx_init(frame_context))
 				.map_err(|e| format!("Failed to initialize hardware frame context: {}", e))?;
 
-			codec_context.hw_device_ctx = device_ctx;
 			codec_context.hw_frames_ctx = frame_context;
 
 			let mut options: *mut ffmpeg_sys::AVDictionary = null_mut();
+			check_ret(ffmpeg_sys::av_dict_set(
+				&mut options,
+				to_c_str("zerolatency")?.as_ptr(),
+				to_c_str("1")?.as_ptr(),
+				0
+			))
+				.map_err(|e| format!("Failed to set dictionary with options: {}", e))?;
 			check_ret(ffmpeg_sys::av_dict_set(
 				&mut options,
 				to_c_str("preset")?.as_ptr(),
@@ -136,21 +141,15 @@ impl Codec {
 		unsafe {
 			check_ret(ffmpeg_sys::avcodec_send_frame(self.as_ptr(), frame.as_ptr()))?;
 
-			let mut packet: ffmpeg_sys::AVPacket = MaybeUninit::zeroed().assume_init();
 			loop {
-				packet.data = null_mut();
-				packet.size = 0;
+				let mut packet: ffmpeg_sys::AVPacket = MaybeUninit::zeroed().assume_init();
 				let res = ffmpeg_sys::avcodec_receive_packet(self.as_ptr(), &mut packet);
 				if res == 0 { // we have a packet, send the packet to the muxer
-					packet.stream_index = (*muxer.video_stream()).index;
 					packet.pts = frame.as_ref().pts;
 					packet.dts = frame.as_ref().pts;
 
-					// std::lock_guard<std::mutex> lock(write_output_mutex);
 					ffmpeg_sys::av_packet_rescale_ts(&mut packet, self.as_ref().time_base, (*muxer.video_stream()).time_base);
-					packet.stream_index = (*muxer.video_stream()).index;
 					check_ret(ffmpeg_sys::av_interleaved_write_frame(muxer.as_ptr(), &mut packet))?;
-					ffmpeg_sys::av_packet_unref(&mut packet);
 				} else if res == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) {
 					// This means we can't encode the frame yet.
 					break;
@@ -164,7 +163,6 @@ impl Codec {
 					return Err(FfmpegError::new(res, error_message));
 				}
 			}
-			//av_packet_unref(&av_packet);
 
 			Ok(())
 		}
