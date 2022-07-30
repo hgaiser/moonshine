@@ -7,3 +7,7 @@ edition = "2021"
 image = "0.24.2"
 nvfbc = "0.1.2"
 ffmpeg-sys = { path = "../ffmpeg-sys" }
+zeroconf = "0.10.5"
+tokio = { version = "1.20.1", features = ["rt-multi-thread", "macros", "net"] }
+axum = "0.5.13"
+serde = "1.0.140"

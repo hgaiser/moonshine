@@ -66,7 +66,8 @@ impl NvencEncoder {
 		cuda_context: ffmpeg_sys::CUcontext,
 	) -> Result<Self, String> {
 		unsafe {
-			ffmpeg_sys::av_log_set_level(ffmpeg_sys::AV_LOG_TRACE as i32);
+			// ffmpeg_sys::av_log_set_level(ffmpeg_sys::AV_LOG_TRACE as i32);
+			ffmpeg_sys::av_log_set_level(ffmpeg_sys::AV_LOG_QUIET as i32);
 
 			let codec = Codec::new(
 				width,
