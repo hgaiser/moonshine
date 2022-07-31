@@ -1,0 +1,74 @@
+#!/bin/sh
+
+set -euo pipefail
+
+cd "$(dirname "$0")"
+
+main() {
+	colorize
+	if ! command -v bindgen >/dev/null;  then
+		die "bindgen not found: you can install it by running: cargo install bindgen"
+	fi
+
+	check_pkgconf cuda 11.0
+
+	bindgen \
+		-o src/generated.rs \
+		--allowlist-function "cu.*" \
+		--allowlist-type "CU.*" \
+		--allowlist-function "av.*" \
+		--allowlist-var "AV.*" \
+		--allowlist-var "EAGAIN" \
+		--allowlist-type "AV.*" \
+		./wrapper.h \
+		-- \
+		$(pkg-config --cflags cuda)
+
+	msg "Successfully generated bindings at '$PWD/src/generated.rs'"
+}
+
+check_pkgconf() {
+	local package="$1"
+	local min_version="$2"
+	pkg-config "$package" --atleast-version "$min_version" ||
+		die "Package '$package' with at least version '$min_version' is not found."
+}
+
+die() {
+	local msg="$1"
+	shift
+	printf "\n${BOLD}${RED}Error${ALL_OFF}${BOLD}:${ALL_OFF} $msg\n" "$@" >&2
+	exit 1
+}
+
+msg() {
+	local mesg=$1; shift
+	printf "${GREEN}==>${ALL_OFF}${BOLD} ${mesg}${ALL_OFF}\n" "$@"
+}
+
+msg2() {
+	local mesg=$1; shift
+	printf "${BLUE}  ->${ALL_OFF}${BOLD} ${mesg}${ALL_OFF}\n" "$@"
+}
+
+colorize() {
+	# prefer terminal safe colored and bold text when tput is supported
+	if tput setaf 0 &>/dev/null; then
+		ALL_OFF="$(tput sgr0)"
+		BOLD="$(tput bold)"
+		BLUE="${BOLD}$(tput setaf 4)"
+		GREEN="${BOLD}$(tput setaf 2)"
+		RED="${BOLD}$(tput setaf 1)"
+		YELLOW="${BOLD}$(tput setaf 3)"
+	else
+		ALL_OFF="\e[0m"
+		BOLD="\e[1m"
+		BLUE="${BOLD}\e[34m"
+		GREEN="${BOLD}\e[32m"
+		RED="${BOLD}\e[31m"
+		YELLOW="${BOLD}\e[33m"
+	fi
+	readonly ALL_OFF BOLD BLUE GREEN RED YELLOW
+}
+
+main "$@"
