@@ -103,7 +103,7 @@ async fn serve(req: Request<Body>, clients: Clients) -> Result<Response<Body>, h
 
 	match (req.method(), req.uri().path()) {
 		(&Method::GET, "/pin") => Ok(pin(req, clients).await),
-		(&Method::GET, "/serverinfo") => Ok(server_info()),
+		(&Method::GET, "/serverinfo") => Ok(server_info(req, clients).await),
 		(&Method::GET, "/pair") => Ok(pair(req, clients).await),
 		(&Method::GET, "/unpair") => Ok(unpair(req, clients).await),
 		_ => Ok(
@@ -115,8 +115,24 @@ async fn serve(req: Request<Body>, clients: Clients) -> Result<Response<Body>, h
 	}
 }
 
-fn server_info() -> Response<Body> {
-	let mut response = Response::new(Body::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>
+async fn server_info(req: Request<Body>, clients: Clients) -> Response<Body> {
+	let params = parse_params(req.uri());
+
+	let unique_id = match params.get("uniqueid") {
+		Some(unique_id) => unique_id,
+		None => {
+			println!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
+			return bad_request();
+		}
+	};
+
+	let paired = if clients.lock().await.contains_key(unique_id) {
+		"1"
+	} else {
+		"0"
+	};
+
+	let mut response = Response::new(Body::from(format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <root status_code=\"200\">
 	<hostname>Moonshine Game PC</hostname>
 	<appversion>7.1.431.0</appversion>
@@ -135,10 +151,10 @@ fn server_info() -> Response<Body> {
 			<RefreshRate>120</RefreshRate>
 		</DisplayMode>
 	</SupportedDisplayMode>
-	<PairStatus>0</PairStatus>
+	<PairStatus>{}</PairStatus>
 	<currentgame>0</currentgame>
 	<state>SUNSHINE_SERVER_FREE</state>
-</root>"));
+</root>", paired)));
 	response.headers_mut().insert(CONTENT_TYPE, "application/xml".parse().unwrap());
 
 	response
