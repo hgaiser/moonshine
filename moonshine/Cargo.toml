@@ -14,3 +14,4 @@ openssl = "0.10.41"
 hex = "0.4.3"
 hyper = { version = "0.14.20", features = ["server", "http1", "tcp"] }
 url = "2.2.2"
+tls-listener = { version = "0.5.1", features = ["hyper-h1", "openssl"] }

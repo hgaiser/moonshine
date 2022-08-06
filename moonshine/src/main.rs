@@ -11,7 +11,7 @@ mod service_publisher;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-	tokio::spawn(webserver::run(47989));
+	tokio::spawn(webserver::run(47989, 47984));
 	// tokio::spawn(service_publisher::run(47989));
 	service_publisher::run(47989).await;
 
