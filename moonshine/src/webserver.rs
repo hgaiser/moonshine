@@ -72,7 +72,7 @@ fn server_info() -> Response<Body> {
 	<currentgame>0</currentgame>
 	<state>SUNSHINE_SERVER_FREE</state>
 </root>"));
-	response.headers_mut().insert(CONTENT_TYPE, "application/json".parse().unwrap());
+	response.headers_mut().insert(CONTENT_TYPE, "application/xml".parse().unwrap());
 
 	response
 }
@@ -89,29 +89,54 @@ fn pair(req: Request<Body>) -> Response<Body> {
 		.unwrap_or_else(HashMap::new)
 	;
 
-	let client_cert = match params.get("clientcert") {
-		Some(client_cert) => client_cert,
-		None => {
-			println!("Expected client certificate in pairing request, got {:?}.", params.keys());
-			return Response::builder()
-				.status(StatusCode::BAD_REQUEST)
-				.body(Body::from("BAD REQUEST".to_string()))
-				.unwrap()
+	println!("Params: {:#?}", params);
+
+	if params.contains_key("phrase") {
+		match params.get("phrase").unwrap().as_str() {
+			"getservercert" => {
+				let client_cert = match params.get("clientcert") {
+					Some(client_cert) => client_cert,
+					None => {
+						println!("Expected client certificate in pairing request, got {:?}.", params.keys());
+						return Response::builder()
+							.status(StatusCode::BAD_REQUEST)
+							.body(Body::from("BAD REQUEST".to_string()))
+							.unwrap()
+					}
+				};
+				let pem = hex::decode(client_cert).unwrap();
+				let pem = openssl::x509::X509::from_pem(pem.as_slice()).unwrap();
+
+				println!("Client cert: {:#?}", pem);
+
+				let server_pem = openssl::x509::X509::from_pem(&std::fs::read("./cert.pem").unwrap()).unwrap();
+				println!("Server cert: {:#?}", server_pem);
+
+				let response = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
+	<root status_code=\"200\">
+		<paired>1</paired>
+		<plaincert>{}</plaincert>
+	</root>", hex::encode(server_pem.to_pem().unwrap()));
+				Response::builder()
+					.header("CONTENT_TYPE", "application/xml")
+					.body(Body::from(response))
+					.unwrap()
+			},
+			unknown => {
+				println!("Unknown pair phrase received: {}", unknown);
+				Response::builder()
+					.status(400)
+					.body(Body::from("INVALID REQUEST"))
+					.unwrap()
+			}
 		}
-	};
-	let pem = hex::decode(client_cert).unwrap();
-	let pem = openssl::x509::X509::from_pem(pem.as_slice());
+	} else if params.contains_key("clientchallenge") {
+		println!("Client challenge!");
+		todo!();
+	} else {
+		todo!();
+	}
 
-	println!("Client cert: {:#?}", pem);
-
-	let response = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<root status_code=\"200\">
-	<paired>1</paired>
-</root>";
-	let mut response = Response::new(Body::from(response));
-	response.headers_mut().insert(CONTENT_TYPE, "application/json".parse().unwrap());
-
-	response
 }
 
 async fn router(req: Request<Body>) -> Result<Response<Body>, hyper::Error> {
