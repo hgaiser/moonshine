@@ -1,8 +1,10 @@
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use hyper::Uri;
-use hyper::server::conn::AddrIncoming;
+use hyper::Body;
+use hyper::Request;
+use hyper::Response;
+use hyper::StatusCode;
 use openssl::cipher::Cipher;
 use openssl::cipher_ctx::CipherCtx;
 use openssl::hash::MessageDigest;
@@ -10,18 +12,16 @@ use openssl::md::Md;
 use openssl::md_ctx::MdCtx;
 use openssl::pkey::PKey;
 use openssl::pkey::PKeyRef;
-use openssl::ssl::SslContext;
-use openssl::ssl::SslFiletype;
-use openssl::ssl::SslMethod;
-use tls_listener::TlsListener;
-use tokio::sync::Notify;
 use tokio::sync::Mutex;
-use hyper::{service::service_fn, Response, Body, header::CONTENT_TYPE, Request, Method, StatusCode};
+use tokio::sync::Notify;
 
-type Clients = Arc<Mutex<HashMap<String, Client>>>;
-type Params = HashMap<String, String>;
+use super::Params;
+use super::parse_params;
+use super::bad_request;
 
-pub(crate) struct Client {
+pub(super) type Clients = Arc<Mutex<HashMap<String, Client>>>;
+
+pub(super) struct Client {
 	id: String,
 	pem: openssl::x509::X509,
 	salt: [u8; 16],
@@ -32,135 +32,7 @@ pub(crate) struct Client {
 	client_hash: Option<Vec<u8>>,
 }
 
-pub(crate) async fn run(http_port: u16, https_port: u16) -> Result<(), hyper::Error> {
-	let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
-
-	let make_service = hyper::service::make_service_fn({
-		let clients = clients.clone();
-		move |_| {
-			let clients = clients.clone();
-			async {
-				Ok::<_, String>(service_fn(move |req| {
-					let clients = clients.clone();
-					async {
-						serve(req, clients).await
-					}
-				}))
-			}
-		}
-	});
-
-	let http_address = tokio::net::lookup_host(("localhost", http_port))
-		.await
-		.unwrap()
-		.next()
-		.unwrap()
-	;
-	println!("Binding http webserver to {}", http_address);
-	tokio::spawn(hyper::Server::try_bind(&http_address)?.serve(make_service));
-
-	let https_address = tokio::net::lookup_host(("localhost", https_port))
-		.await
-		.unwrap()
-		.next()
-		.unwrap()
-	;
-	println!("Binding https webserver to {}", https_address);
-
-	let mut builder = SslContext::builder(SslMethod::tls_server()).unwrap();
-	builder
-		.set_certificate_file("./cert/cert.pem", SslFiletype::PEM)
-		.unwrap();
-	builder
-		.set_private_key_file("./cert/key.pem", SslFiletype::PEM)
-		.unwrap();
-	let listener = builder.build();
-	let incoming = TlsListener::new(listener, AddrIncoming::bind(&https_address)?);
-
-	let make_service = hyper::service::make_service_fn({
-		let clients = clients.clone();
-		move |_| {
-			let clients = clients.clone();
-			async {
-				Ok::<_, String>(service_fn(move |req| {
-					let clients = clients.clone();
-					async {
-						serve(req, clients).await
-					}
-				}))
-			}
-		}
-	});
-
-	hyper::Server::builder(incoming)
-		.serve(make_service).await.unwrap();
-
-	Ok(())
-}
-
-async fn serve(req: Request<Body>, clients: Clients) -> Result<Response<Body>, hyper::Error> {
-	println!("{} '{}' request.", req.method(), req.uri().path());
-
-	match (req.method(), req.uri().path()) {
-		(&Method::GET, "/pin") => Ok(pin(req, clients).await),
-		(&Method::GET, "/serverinfo") => Ok(server_info(req, clients).await),
-		(&Method::GET, "/pair") => Ok(pair(req, clients).await),
-		(&Method::GET, "/unpair") => Ok(unpair(req, clients).await),
-		_ => Ok(
-			Response::builder()
-				.status(StatusCode::NOT_FOUND)
-				.body(Body::from("NOT FOUND".to_string()))
-				.unwrap()
-		)
-	}
-}
-
-async fn server_info(req: Request<Body>, clients: Clients) -> Response<Body> {
-	let params = parse_params(req.uri());
-
-	let unique_id = match params.get("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			println!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-
-	let paired = if clients.lock().await.contains_key(unique_id) {
-		"1"
-	} else {
-		"0"
-	};
-
-	let mut response = Response::new(Body::from(format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<root status_code=\"200\">
-	<hostname>Moonshine Game PC</hostname>
-	<appversion>7.1.431.0</appversion>
-	<GfeVersion>3.23.0.74</GfeVersion>
-	<uniqueid>7AD14F7C-2F8B-7329-AF86-42A06F6471FE</uniqueid>
-	<HttpsPort>47984</HttpsPort>
-	<ExternalPort>47989</ExternalPort>
-	<mac>64:bc:58:be:e5:88</mac>
-	<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>
-	<LocalIP>10.0.5.137</LocalIP>
-	<ServerCodecModeSupport>259</ServerCodecModeSupport>
-	<SupportedDisplayMode>
-		<DisplayMode>
-			<Width>2560</Width>
-			<Height>1440</Height>
-			<RefreshRate>120</RefreshRate>
-		</DisplayMode>
-	</SupportedDisplayMode>
-	<PairStatus>{}</PairStatus>
-	<currentgame>0</currentgame>
-	<state>SUNSHINE_SERVER_FREE</state>
-</root>", paired)));
-	response.headers_mut().insert(CONTENT_TYPE, "application/xml".parse().unwrap());
-
-	response
-}
-
-async fn unpair(req: Request<Body>, clients: Clients) -> Response<Body> {
+pub(super) async fn unpair(req: Request<Body>, clients: Clients) -> Response<Body> {
 	let params = parse_params(req.uri());
 
 	let unique_id = match params.get("uniqueid") {
@@ -186,7 +58,7 @@ async fn unpair(req: Request<Body>, clients: Clients) -> Response<Body> {
 	}
 }
 
-async fn pin(req: Request<Body>, clients: Clients) -> Response<Body> {
+pub(super) async fn pin(req: Request<Body>, clients: Clients) -> Response<Body> {
 	let params = parse_params(req.uri());
 
 	let unique_id = match params.get("uniqueid") {
@@ -480,7 +352,7 @@ async fn pair_challenge(params: Params, clients: Clients) -> Response<Body> {
 		.unwrap()
 }
 
-async fn pair(req: Request<Body>, clients: Clients) -> Response<Body> {
+pub(super) async fn pair(req: Request<Body>, clients: Clients) -> Response<Body> {
 	let params = parse_params(req.uri());
 
 	println!("Params: {:#?}", params);
@@ -506,24 +378,6 @@ async fn pair(req: Request<Body>, clients: Clients) -> Response<Body> {
 	} else {
 		todo!();
 	}
-}
-
-fn parse_params(uri: &Uri) -> Params {
-	uri
-		.query()
-		.map(|v| {
-			url::form_urlencoded::parse(v.as_bytes())
-				.into_owned()
-				.collect()
-		})
-		.unwrap_or_else(HashMap::new)
-}
-
-fn bad_request() -> Response<Body> {
-	Response::builder()
-		.status(StatusCode::BAD_REQUEST)
-		.body(Body::from("BAD REQUEST".to_string()))
-		.unwrap()
 }
 
 fn create_key(salt: &[u8; 16], pin: &str) -> [u8; 16] {

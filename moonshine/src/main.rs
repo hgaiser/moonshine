@@ -1,5 +1,6 @@
 use nvfbc::{BufferFormat, CudaCapturer};
 use nvfbc::cuda::CaptureMethod;
+use webserver::WebserverConfig;
 
 use crate::encoder::{NvencEncoder, CodecType, VideoQuality};
 
@@ -11,9 +12,17 @@ mod service_publisher;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-	tokio::spawn(webserver::run(47989, 47984));
+	let webserver_config = WebserverConfig {
+		name: "Moonshine PC".to_string(),
+		address: "localhost".to_string(),
+		port: 47989,
+		tls_port: 47984,
+		cert: "./cert/cert.pem".into(),
+		key: "./cert/key.pem".into(),
+	};
+	tokio::spawn(webserver::run(webserver_config.clone()));
 	// tokio::spawn(service_publisher::run(47989));
-	service_publisher::run(47989).await;
+	service_publisher::run(webserver_config.port).await;
 
 	// let cuda_context = cuda::init_cuda(0)?;
 
