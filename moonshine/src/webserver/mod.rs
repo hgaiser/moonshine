@@ -20,7 +20,7 @@ use crate::util::flatten;
 type Params = HashMap<String, String>;
 
 pub(crate) async fn run(config: config::Config) -> Result<(), ()> {
-	let clients = Clients::new();
+	let clients = Clients::from_state_or_default();
 
 	let http_task = tokio::spawn(run_http_server(config.clone(), clients.clone()));
 	log::info!("Http server listening on '{}:{}'", config.address, config.port);
@@ -141,7 +141,7 @@ async fn server_info(req: Request<Body>, config: config::Config, clients: Client
 		}
 	};
 
-	let paired = if clients.has_pairing_client(unique_id).await {
+	let paired = if clients.has_client(unique_id).await {
 		"1"
 	} else {
 		"0"

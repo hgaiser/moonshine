@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use hyper::Body;
@@ -12,14 +12,14 @@ use openssl::md::Md;
 use openssl::md_ctx::MdCtx;
 use openssl::pkey::PKey;
 use openssl::pkey::PKeyRef;
+use serde::Deserialize;
+use serde::Serialize;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
 
 use super::Params;
 use super::parse_params;
 use super::bad_request;
-
-// pub(super) type Clients = Arc<Mutex<HashMap<String, Client>>>;
 
 pub(super) struct PairingClient {
 	_id: String,
@@ -32,21 +32,53 @@ pub(super) struct PairingClient {
 	client_hash: Option<Vec<u8>>,
 }
 
+#[derive(Serialize, Deserialize)]
 pub(super) struct Client {}
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub(super) struct Clients {
-	pairing_clients: Arc<Mutex<HashMap<String, PairingClient>>>,
-
-	clients: Arc<Mutex<HashMap<String, Client>>>,
+	pairing_clients: Arc<Mutex<BTreeMap<String, PairingClient>>>,
+	clients: Arc<Mutex<BTreeMap<String, Client>>>,
 }
 
 impl Clients {
-	pub(super) fn new() -> Self {
-		Self {
-			pairing_clients: Arc::new(Mutex::new(HashMap::new())),
-			clients: Arc::new(Mutex::new(HashMap::new())),
+	pub(super) fn from_state_or_default() -> Self {
+		let mut path = match dirs::state_dir() {
+			Some(path) => path,
+			None => {
+				log::warn!("Failed to get user state directory.");
+				return Self::default();
+			}
+		};
+		path.push("moonshine");
+		path.push("clients.toml");
+
+		if path.exists() {
+			let serialized = match std::fs::read(&path) {
+				Ok(serialized) => serialized,
+				Err(e) => {
+					log::warn!("Failed to read clients state file: {}", e);
+					return Self::default();
+				}
+			};
+			let clients: BTreeMap<String, Client> = match toml::from_slice(&serialized) {
+				Ok(clients) => clients,
+				Err(e) => {
+					log::warn!("Failed to deserialize clients state: {}", e);
+					return Self::default();
+				}
+			};
+
+			log::debug!("Successfully loaded clients state from {:?}", path);
+
+			return Self {
+				pairing_clients: Default::default(),
+				clients: Arc::new(Mutex::new(clients)),
+			};
 		}
+
+		log::debug!("No clients state found, starting with an empty state.");
+		Self::default()
 	}
 
 	pub(super) async fn has_pairing_client(&self, key: &str) -> bool {
@@ -59,17 +91,51 @@ impl Clients {
 
 	async fn add_client(&self, key: &str) {
 		self.clients.lock().await.insert(key.to_string(), Client {});
+		self.pairing_clients.lock().await.remove(key);
+		self.save_state().await;
 	}
 
 	async fn remove_client(&self, key: &str) -> bool {
 		if self.clients.lock().await.remove(key).is_none() {
 			return false;
 		}
-		if self.pairing_clients.lock().await.remove(key).is_none() {
-			return false;
-		}
+		self.pairing_clients.lock().await.remove(key);
+		self.save_state().await;
 
 		true
+	}
+
+	async fn save_state(&self) {
+		let mut path = match dirs::state_dir() {
+			Some(path) => path,
+			None => {
+				log::warn!("Failed to get user state directory.");
+				return;
+			}
+		};
+
+		path.push("moonshine");
+		if let Err(e) = std::fs::create_dir_all(&path) {
+			log::warn!("Failed to save clients state file: {}", e);
+			return;
+		}
+
+		path.push("clients.toml");
+
+		let clients = self.clients.lock().await;
+		let serialized = match toml::to_string_pretty(&*clients) {
+			Ok(serialized) => serialized,
+			Err(e) => {
+				log::warn!("Failed to serialize clients: {}", e);
+				return;
+			}
+		};
+
+		if let Err(e) = std::fs::write(&path, serialized) {
+			log::warn!("Failed to save serialized clients: {}", e);
+		}
+
+		log::debug!("Saved clients state to {:?}", path);
 	}
 
 	pub(super) async fn unpair(&self, req: Request<Body>) -> Response<Body> {
@@ -83,7 +149,7 @@ impl Clients {
 			}
 		};
 
-		if self.remove_client(&unique_id).await {
+		if self.remove_client(unique_id).await {
 			log::info!("Successfully unpaired client '{}'", unique_id);
 			Response::builder()
 				.status(StatusCode::OK)
@@ -173,7 +239,6 @@ impl Clients {
 
 			let mut pairing_clients = self.pairing_clients.lock().await;
 			pairing_clients.insert(unique_id.to_owned(), pairing_client);
-			println!("Pairing clients: {:#?}", pairing_clients.keys());
 
 			notify
 		};
@@ -374,7 +439,6 @@ impl Clients {
 			}
 		};
 
-		println!("Pairing clients: {:#?}", self.pairing_clients.lock().await.keys());
 		if !self.has_pairing_client(unique_id).await {
 			log::error!("Unknown unique id '{}' provided in pair challenge.", unique_id);
 			return bad_request();

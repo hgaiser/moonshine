@@ -5,6 +5,7 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "3.2.17", features = ["derive"] }
+dirs = "4.0.0"
 env_logger = "0.9.0"
 # ffmpeg-sys = { path = "../ffmpeg-sys" }
 hex = "0.4.3"
