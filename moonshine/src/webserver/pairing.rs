@@ -19,9 +19,9 @@ use super::Params;
 use super::parse_params;
 use super::bad_request;
 
-pub(super) type Clients = Arc<Mutex<HashMap<String, Client>>>;
+// pub(super) type Clients = Arc<Mutex<HashMap<String, Client>>>;
 
-pub(super) struct Client {
+pub(super) struct PairingClient {
 	_id: String,
 	pem: openssl::x509::X509,
 	salt: [u8; 16],
@@ -30,359 +30,395 @@ pub(super) struct Client {
 	server_secret: Option<[u8; 16]>,
 	server_challenge: Option<[u8; 16]>,
 	client_hash: Option<Vec<u8>>,
-	paired: bool,
 }
 
-pub(super) async fn unpair(req: Request<Body>, clients: Clients) -> Response<Body> {
-	let params = parse_params(req.uri());
+pub(super) struct Client {}
 
-	let unique_id = match params.get("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			log::error!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
-			return bad_request();
+#[derive(Clone)]
+pub(super) struct Clients {
+	pairing_clients: Arc<Mutex<HashMap<String, PairingClient>>>,
+
+	clients: Arc<Mutex<HashMap<String, Client>>>,
+}
+
+impl Clients {
+	pub(super) fn new() -> Self {
+		Self {
+			pairing_clients: Arc::new(Mutex::new(HashMap::new())),
+			clients: Arc::new(Mutex::new(HashMap::new())),
 		}
-	};
+	}
 
-	match clients.lock().await.remove(unique_id) {
-		Some(_) => {
+	pub(super) async fn has_pairing_client(&self, key: &str) -> bool {
+		self.pairing_clients.lock().await.contains_key(key)
+	}
+
+	pub(super) async fn has_client(&self, key: &str) -> bool {
+		self.clients.lock().await.contains_key(key)
+	}
+
+	async fn add_client(&self, key: &str) {
+		self.clients.lock().await.insert(key.to_string(), Client {});
+	}
+
+	async fn remove_client(&self, key: &str) -> bool {
+		if self.clients.lock().await.remove(key).is_none() {
+			return false;
+		}
+		if self.pairing_clients.lock().await.remove(key).is_none() {
+			return false;
+		}
+
+		true
+	}
+
+	pub(super) async fn unpair(&self, req: Request<Body>) -> Response<Body> {
+		let params = parse_params(req.uri());
+
+		let unique_id = match params.get("uniqueid") {
+			Some(unique_id) => unique_id,
+			None => {
+				log::error!("Expected 'uniqueid' in unpair request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+
+		if self.remove_client(&unique_id).await {
 			log::info!("Successfully unpaired client '{}'", unique_id);
 			Response::builder()
 				.status(StatusCode::OK)
 				.body(Body::from("Successfully unpaired.".to_string()))
 				.unwrap()
-		},
-		None => {
+		} else {
 			log::error!("Failed to unpair: unknown unique id '{}'.", unique_id);
 			bad_request()
 		}
 	}
-}
 
-pub(super) async fn pin(req: Request<Body>, clients: Clients) -> Response<Body> {
-	let params = parse_params(req.uri());
+	pub(super) async fn pin(&self, req: Request<Body>) -> Response<Body> {
+		let params = parse_params(req.uri());
 
-	let unique_id = match params.get("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			log::error!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-
-	let pin = match params.get("pin") {
-		Some(pin) => pin,
-		None => {
-			log::error!("Expected 'pin' in pin request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-
-	match clients.lock().await.get_mut(unique_id) {
-		Some(mut client) => {
-			client.key = Some(create_key(&client.salt, pin));
-			client.notify_pin_received.notify_waiters();
-			log::info!("Successfully notified of pin entry: {:?}", pin);
-		},
-		None => {
-			log::error!("Unknown unique id '{}'.", unique_id);
-			return bad_request();
-		}
-	};
-
-	Response::builder()
-		.status(StatusCode::OK)
-		.body(Body::from(format!("Successfully received pin '{}' for unique id '{}'.", pin, unique_id)))
-		.unwrap()
-}
-
-async fn get_server_cert(params: Params, clients: Clients) -> Response<Body> {
-	let client_cert = match params.get("clientcert") {
-		Some(client_cert) => hex::decode(client_cert).unwrap(),
-		None => {
-			log::error!("Expected 'clientcert' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-	let unique_id = match params.get("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-	let salt = match params.get("salt") {
-		Some(salt) => hex::decode(salt).unwrap(),
-		None => {
-			log::error!("Expected 'salt' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-
-	let pem = openssl::x509::X509::from_pem(client_cert.as_slice()).unwrap();
-	let server_pem = openssl::x509::X509::from_pem(&std::fs::read("./cert/cert.pem").unwrap()).unwrap();
-
-	let notify_pin = {
-		let client = Client {
-			_id: unique_id.to_owned(),
-			pem,
-			salt: salt.clone().try_into().unwrap(),
-			notify_pin_received: Arc::new(Notify::new()),
-			key: None,
-			server_secret: None,
-			server_challenge: None,
-			client_hash: None,
-			paired: false,
-		};
-		let notify = client.notify_pin_received.clone();
-
-		let mut clients = clients.lock().await;
-		clients.insert(unique_id.to_owned(), client);
-
-		notify
-	};
-
-	log::info!("Waiting for pin to be sent at /pin?uniqueid={}&pin=<PIN>", unique_id);
-	notify_pin.notified().await;
-
-	let response = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<root status_code=\"200\">
-	<paired>1</paired>
-	<plaincert>{}</plaincert>
-</root>", hex::encode(server_pem.to_pem().unwrap()));
-	Response::builder()
-		.header("CONTENT_TYPE", "application/xml")
-		.body(Body::from(response))
-		.unwrap()
-}
-
-async fn client_challenge(params: Params, clients: Clients) -> Response<Body> {
-	let client_challenge = match params.get("clientchallenge") {
-		Some(client_challenge) => hex::decode(client_challenge).unwrap(),
-		None => {
-			log::error!("Expected 'clientchallenge' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-	let unique_id = match params.get("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-
-	let mut clients = clients.lock().await;
-	let client = match clients.get_mut(unique_id) {
-		Some(client) => client,
-		None => {
-			log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
-			return bad_request();
-		}
-	};
-
-	let key = match &client.key {
-		Some(key) => key,
-		None => {
-			log::error!("Client has not provided a pin yet.");
-			return bad_request();
-		}
-	};
-
-	let mut server_secret = [0u8; 16];
-	openssl::rand::rand_bytes(&mut server_secret).unwrap();
-	client.server_secret = Some(server_secret);
-
-	let server_pem = openssl::x509::X509::from_pem(&std::fs::read("./cert/cert.pem").unwrap()).unwrap();
-	let mut decrypted = decrypt(&client_challenge, key);
-	decrypted.extend_from_slice(server_pem.signature().as_slice());
-	decrypted.extend_from_slice(&server_secret);
-
-	let mut server_challenge = [0u8; 16];
-	openssl::rand::rand_bytes(&mut server_challenge).unwrap();
-	client.server_challenge = Some(server_challenge);
-
-	let mut challenge_response = openssl::hash::hash(MessageDigest::sha256(), decrypted.as_slice()).unwrap().to_vec();
-	challenge_response.extend(server_challenge);
-
-	let challenge_response = encrypt(&challenge_response, key);
-	let challenge_response = hex::encode(challenge_response);
-
-	let response = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<root status_code=\"200\">
-	<paired>1</paired>
-	<challengeresponse>{}</challengeresponse>
-</root>", challenge_response);
-
-	Response::builder()
-		.header("CONTENT_TYPE", "application/xml")
-		.body(Body::from(response))
-		.unwrap()
-}
-
-async fn server_challenge_response(params: Params, clients: Clients) -> Response<Body> {
-	let server_challenge_response = match params.get("serverchallengeresp") {
-		Some(server_challenge_response) => hex::decode(server_challenge_response).unwrap(),
-		None => {
-			log::error!("Expected 'serverchallengeresp' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-	let unique_id = match params.get("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-
-	let mut clients = clients.lock().await;
-	let client = match clients.get_mut(unique_id) {
-		Some(client) => client,
-		None => {
-			log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
-			return bad_request();
-		}
-	};
-
-	let key = match &client.key {
-		Some(key) => key,
-		None => {
-			log::warn!("Client has not provided a pin yet.");
-			return bad_request();
-		}
-	};
-
-	let decrypted = decrypt(&server_challenge_response, key);
-	client.client_hash = Some(decrypted);
-
-	let pkey = PKey::private_key_from_pem(&std::fs::read("./cert/key.pem").unwrap()).unwrap();
-
-	let mut pairing_secret = client.server_secret.unwrap().to_vec();
-	pairing_secret.extend(sign(&client.server_secret.unwrap(), pkey.as_ref()));
-	let pairing_secret = hex::encode(pairing_secret);
-
-	let response = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<root status_code=\"200\">
-	<paired>1</paired>
-	<pairingsecret>{}</pairingsecret>
-</root>", pairing_secret);
-
-	Response::builder()
-		.header("CONTENT_TYPE", "application/xml")
-		.body(Body::from(response))
-		.unwrap()
-}
-
-async fn client_pairing_secret(params: Params, clients: Clients) -> Response<Body> {
-	let client_pairing_secret = match params.get("clientpairingsecret") {
-		Some(client_pairing_secret) => hex::decode(client_pairing_secret).unwrap(),
-		None => {
-			log::error!("Expected 'clientpairingsecret' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-	let unique_id = match params.get("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-
-	let mut clients = clients.lock().await;
-	let client = match clients.get_mut(unique_id) {
-		Some(client) => client,
-		None => {
-			log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
-			return bad_request();
-		}
-	};
-
-	if client_pairing_secret.len() != 256 + 16 {
-		panic!("Expected client pairing secret to be of size {}, but got {} bytes.", 256 + 16, client_pairing_secret.len());
-	}
-
-	let client_secret = &client_pairing_secret[..16];
-	// let signed_client_secret = &client_pairing_secret[16..];
-
-	let mut data = client.server_challenge.unwrap().to_vec();
-	data.extend(client.pem.signature().as_slice());
-	data.extend(client_secret);
-
-	if !openssl::hash::hash(MessageDigest::sha256(), &data).unwrap().to_vec().eq(client.client_hash.as_ref().unwrap()) {
-		log::error!("Client hash is not as expected, MITM?");
-		return bad_request();
-	}
-
-	// TODO: Verify x509 cert.
-
-	let response = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<root status_code=\"200\">
-	<paired>1</paired>
-</root>";
-
-	Response::builder()
-		.header("CONTENT_TYPE", "application/xml")
-		.body(Body::from(response))
-		.unwrap()
-}
-
-async fn pair_challenge(params: Params, clients: Clients) -> Response<Body> {
-	let unique_id = match params.get("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-
-	let mut clients = clients.lock().await;
-	let client = match clients.get_mut(unique_id) {
-		Some(client) => client,
-		None => {
-			log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
-			return bad_request();
-		}
-	};
-	client.paired = true;
-
-	let response = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<root status_code=\"200\">
-	<paired>1</paired>
-</root>";
-
-	Response::builder()
-		.header("CONTENT_TYPE", "application/xml")
-		.body(Body::from(response))
-		.unwrap()
-}
-
-pub(super) async fn pair(req: Request<Body>, clients: Clients) -> Response<Body> {
-	let params = parse_params(req.uri());
-
-	if params.contains_key("phrase") {
-		match params.get("phrase").unwrap().as_str() {
-			"getservercert" => get_server_cert(params, clients).await,
-			"pairchallenge" => pair_challenge(params, clients).await,
-			unknown => {
-				log::error!("Unknown pair phrase received: {}", unknown);
-				Response::builder()
-					.status(400)
-					.body(Body::from("INVALID REQUEST"))
-					.unwrap()
+		let unique_id = match params.get("uniqueid") {
+			Some(unique_id) => unique_id,
+			None => {
+				log::error!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
+				return bad_request();
 			}
-		}
-	} else if params.contains_key("clientchallenge") {
-		client_challenge(params, clients).await
-	} else if params.contains_key("serverchallengeresp") {
-		server_challenge_response(params, clients).await
-	} else if params.contains_key("clientpairingsecret") {
-		client_pairing_secret(params, clients).await
-	} else {
-		log::error!("Unknown pair command with params: {:?}", params);
-		bad_request()
+		};
+
+		let pin = match params.get("pin") {
+			Some(pin) => pin,
+			None => {
+				log::error!("Expected 'pin' in pin request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+
+		match self.pairing_clients.lock().await.get_mut(unique_id) {
+			Some(mut client) => {
+				client.key = Some(create_key(&client.salt, pin));
+				client.notify_pin_received.notify_waiters();
+				log::info!("Successfully notified of pin entry: {:?}", pin);
+			},
+			None => {
+				log::error!("Unknown unique id '{}'.", unique_id);
+				return bad_request();
+			}
+		};
+
+		Response::builder()
+			.status(StatusCode::OK)
+			.body(Body::from(format!("Successfully received pin '{}' for unique id '{}'.", pin, unique_id)))
+			.unwrap()
 	}
+
+	async fn get_server_cert(&self, params: Params) -> Response<Body> {
+		let client_cert = match params.get("clientcert") {
+			Some(client_cert) => hex::decode(client_cert).unwrap(),
+			None => {
+				log::error!("Expected 'clientcert' in get server cert request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+		let unique_id = match params.get("uniqueid") {
+			Some(unique_id) => unique_id,
+			None => {
+				log::error!("Expected 'uniqueid' in get server cert request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+		let salt = match params.get("salt") {
+			Some(salt) => hex::decode(salt).unwrap(),
+			None => {
+				log::error!("Expected 'salt' in get server cert request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+
+		let pem = openssl::x509::X509::from_pem(client_cert.as_slice()).unwrap();
+		let server_pem = openssl::x509::X509::from_pem(&std::fs::read("./cert/cert.pem").unwrap()).unwrap();
+
+		let notify_pin = {
+			let pairing_client = PairingClient {
+				_id: unique_id.to_owned(),
+				pem,
+				salt: salt.clone().try_into().unwrap(),
+				notify_pin_received: Arc::new(Notify::new()),
+				key: None,
+				server_secret: None,
+				server_challenge: None,
+				client_hash: None,
+			};
+			let notify = pairing_client.notify_pin_received.clone();
+
+			let mut pairing_clients = self.pairing_clients.lock().await;
+			pairing_clients.insert(unique_id.to_owned(), pairing_client);
+			println!("Pairing clients: {:#?}", pairing_clients.keys());
+
+			notify
+		};
+
+		log::info!("Waiting for pin to be sent at /pin?uniqueid={}&pin=<PIN>", unique_id);
+		notify_pin.notified().await;
+
+		let response = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
+	<root status_code=\"200\">
+		<paired>1</paired>
+		<plaincert>{}</plaincert>
+	</root>", hex::encode(server_pem.to_pem().unwrap()));
+		Response::builder()
+			.header("CONTENT_TYPE", "application/xml")
+			.body(Body::from(response))
+			.unwrap()
+	}
+
+	async fn client_challenge(&self, params: Params) -> Response<Body> {
+		let client_challenge = match params.get("clientchallenge") {
+			Some(client_challenge) => hex::decode(client_challenge).unwrap(),
+			None => {
+				log::error!("Expected 'clientchallenge' in client challenge request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+		let unique_id = match params.get("uniqueid") {
+			Some(unique_id) => unique_id,
+			None => {
+				log::error!("Expected 'uniqueid' in client challenge request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+
+		let mut pairing_clients = self.pairing_clients.lock().await;
+		let client = match pairing_clients.get_mut(unique_id) {
+			Some(client) => client,
+			None => {
+				log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
+				return bad_request();
+			}
+		};
+
+		let key = match &client.key {
+			Some(key) => key,
+			None => {
+				log::error!("Client has not provided a pin yet.");
+				return bad_request();
+			}
+		};
+
+		let mut server_secret = [0u8; 16];
+		openssl::rand::rand_bytes(&mut server_secret).unwrap();
+		client.server_secret = Some(server_secret);
+
+		let server_pem = openssl::x509::X509::from_pem(&std::fs::read("./cert/cert.pem").unwrap()).unwrap();
+		let mut decrypted = decrypt(&client_challenge, key);
+		decrypted.extend_from_slice(server_pem.signature().as_slice());
+		decrypted.extend_from_slice(&server_secret);
+
+		let mut server_challenge = [0u8; 16];
+		openssl::rand::rand_bytes(&mut server_challenge).unwrap();
+		client.server_challenge = Some(server_challenge);
+
+		let mut challenge_response = openssl::hash::hash(MessageDigest::sha256(), decrypted.as_slice()).unwrap().to_vec();
+		challenge_response.extend(server_challenge);
+
+		let challenge_response = encrypt(&challenge_response, key);
+		let challenge_response = hex::encode(challenge_response);
+
+		let response = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
+	<root status_code=\"200\">
+		<paired>1</paired>
+		<challengeresponse>{}</challengeresponse>
+	</root>", challenge_response);
+
+		Response::builder()
+			.header("CONTENT_TYPE", "application/xml")
+			.body(Body::from(response))
+			.unwrap()
+	}
+
+	async fn server_challenge_response(&self, params: Params) -> Response<Body> {
+		let server_challenge_response = match params.get("serverchallengeresp") {
+			Some(server_challenge_response) => hex::decode(server_challenge_response).unwrap(),
+			None => {
+				log::error!("Expected 'serverchallengeresp' in server challenge response request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+		let unique_id = match params.get("uniqueid") {
+			Some(unique_id) => unique_id,
+			None => {
+				log::error!("Expected 'uniqueid' in server challenge response request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+
+		let mut pairing_clients = self.pairing_clients.lock().await;
+		let client = match pairing_clients.get_mut(unique_id) {
+			Some(client) => client,
+			None => {
+				log::error!("Unknown unique id '{}' provided in server challenge response.", unique_id);
+				return bad_request();
+			}
+		};
+
+		let key = match &client.key {
+			Some(key) => key,
+			None => {
+				log::warn!("Client has not provided a pin yet.");
+				return bad_request();
+			}
+		};
+
+		let decrypted = decrypt(&server_challenge_response, key);
+		client.client_hash = Some(decrypted);
+
+		let pkey = PKey::private_key_from_pem(&std::fs::read("./cert/key.pem").unwrap()).unwrap();
+
+		let mut pairing_secret = client.server_secret.unwrap().to_vec();
+		pairing_secret.extend(sign(&client.server_secret.unwrap(), pkey.as_ref()));
+		let pairing_secret = hex::encode(pairing_secret);
+
+		let response = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
+	<root status_code=\"200\">
+		<paired>1</paired>
+		<pairingsecret>{}</pairingsecret>
+	</root>", pairing_secret);
+
+		Response::builder()
+			.header("CONTENT_TYPE", "application/xml")
+			.body(Body::from(response))
+			.unwrap()
+	}
+
+	async fn client_pairing_secret(&self, params: Params) -> Response<Body> {
+		let client_pairing_secret = match params.get("clientpairingsecret") {
+			Some(client_pairing_secret) => hex::decode(client_pairing_secret).unwrap(),
+			None => {
+				log::error!("Expected 'clientpairingsecret' in client pairing secret request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+		let unique_id = match params.get("uniqueid") {
+			Some(unique_id) => unique_id,
+			None => {
+				log::error!("Expected 'uniqueid' in client pairing secret request, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+
+		let mut pairing_clients = self.pairing_clients.lock().await;
+
+		let pairing_client = match pairing_clients.get_mut(unique_id) {
+			Some(pairing_client) => pairing_client,
+			None => {
+				log::error!("Unknown unique id '{}' provided in client pairing secret.", unique_id);
+				return bad_request();
+			}
+		};
+
+		if client_pairing_secret.len() != 256 + 16 {
+			panic!("Expected client pairing secret to be of size {}, but got {} bytes.", 256 + 16, client_pairing_secret.len());
+		}
+
+		let client_secret = &client_pairing_secret[..16];
+		// let signed_client_secret = &client_pairing_secret[16..];
+
+		let mut data = pairing_client.server_challenge.unwrap().to_vec();
+		data.extend(pairing_client.pem.signature().as_slice());
+		data.extend(client_secret);
+
+		if !openssl::hash::hash(MessageDigest::sha256(), &data).unwrap().to_vec().eq(pairing_client.client_hash.as_ref().unwrap()) {
+			log::error!("Client hash is not as expected, MITM?");
+			return bad_request();
+		}
+
+		// TODO: Verify x509 cert.
+
+		let response = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+	<root status_code=\"200\">
+		<paired>1</paired>
+	</root>";
+
+		Response::builder()
+			.header("CONTENT_TYPE", "application/xml")
+			.body(Body::from(response))
+			.unwrap()
+	}
+
+	async fn pair_challenge(&self, params: Params) -> Response<Body> {
+		let unique_id = match params.get("uniqueid") {
+			Some(unique_id) => unique_id,
+			None => {
+				log::error!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
+				return bad_request();
+			}
+		};
+
+		println!("Pairing clients: {:#?}", self.pairing_clients.lock().await.keys());
+		if !self.has_pairing_client(unique_id).await {
+			log::error!("Unknown unique id '{}' provided in pair challenge.", unique_id);
+			return bad_request();
+		}
+		self.add_client(unique_id).await;
+
+		let response = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+	<root status_code=\"200\">
+		<paired>1</paired>
+	</root>";
+
+		Response::builder()
+			.header("CONTENT_TYPE", "application/xml")
+			.body(Body::from(response))
+			.unwrap()
+	}
+
+	pub(super) async fn pair(&self, req: Request<Body>) -> Response<Body> {
+		let params = parse_params(req.uri());
+
+		if params.contains_key("phrase") {
+			match params.get("phrase").unwrap().as_str() {
+				"getservercert" => self.get_server_cert(params).await,
+				"pairchallenge" => self.pair_challenge(params).await,
+				unknown => {
+					log::error!("Unknown pair phrase received: {}", unknown);
+					Response::builder()
+						.status(400)
+						.body(Body::from("INVALID REQUEST"))
+						.unwrap()
+				}
+			}
+		} else if params.contains_key("clientchallenge") {
+			self.client_challenge(params).await
+		} else if params.contains_key("serverchallengeresp") {
+			self.server_challenge_response(params).await
+		} else if params.contains_key("clientpairingsecret") {
+			self.client_pairing_secret(params).await
+		} else {
+			log::error!("Unknown pair command with params: {:?}", params);
+			bad_request()
+		}
+	}
+
 }
 
 fn create_key(salt: &[u8; 16], pin: &str) -> [u8; 16] {

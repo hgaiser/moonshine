@@ -1,13 +1,11 @@
 use std::net::SocketAddr;
 use std::net::ToSocketAddrs;
-use std::sync::Arc;
 use std::collections::HashMap;
 
 use hyper::Uri;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
-use tokio::sync::Mutex;
 use hyper::{Response, Body, header::CONTENT_TYPE, Request, Method, StatusCode};
 
 mod pairing;
@@ -22,7 +20,7 @@ use crate::util::flatten;
 type Params = HashMap<String, String>;
 
 pub(crate) async fn run(config: config::Config) -> Result<(), ()> {
-	let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
+	let clients = Clients::new();
 
 	let http_task = tokio::spawn(run_http_server(config.clone(), clients.clone()));
 	log::info!("Http server listening on '{}:{}'", config.address, config.port);
@@ -124,10 +122,10 @@ async fn serve(req: Request<Body>, config: config::Config, clients: Clients) -> 
 
 	match (req.method(), req.uri().path()) {
 		(&Method::GET, "/applist") => app_list(req, config, clients).await,
-		(&Method::GET, "/pair") => pairing::pair(req, clients).await,
-		(&Method::GET, "/pin") => pairing::pin(req, clients).await,
+		(&Method::GET, "/pair") => clients.pair(req).await,
+		(&Method::GET, "/pin") => clients.pin(req).await,
 		(&Method::GET, "/serverinfo") => server_info(req, config, clients).await,
-		(&Method::GET, "/unpair") => pairing::unpair(req, clients).await,
+		(&Method::GET, "/unpair") => clients.unpair(req).await,
 		_ => not_found()
 	}
 }
@@ -143,7 +141,7 @@ async fn server_info(req: Request<Body>, config: config::Config, clients: Client
 		}
 	};
 
-	let paired = if clients.lock().await.contains_key(unique_id) {
+	let paired = if clients.has_pairing_client(unique_id).await {
 		"1"
 	} else {
 		"0"
@@ -170,7 +168,7 @@ async fn server_info(req: Request<Body>, config: config::Config, clients: Client
 	</SupportedDisplayMode>
 	<PairStatus>{}</PairStatus>
 	<currentgame>0</currentgame>
-	<state>SUNSHINE_SERVER_FREE</state>
+	<state>MOONSHINE_SERVER_FREE</state>
 </root>",
 		config.name,
 		config.tls.port,
@@ -193,9 +191,8 @@ async fn app_list(req: Request<Body>, config: config::Config, clients: Clients) 
 		}
 	};
 
-	let clients = clients.lock().await;
-	if !clients.contains_key(unique_id) {
-		log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
+	if !clients.has_client(unique_id).await {
+		log::warn!("Unknown unique id '{}' received in /applist.", unique_id);
 		return bad_request();
 	}
 
