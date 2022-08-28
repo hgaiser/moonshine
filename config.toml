@@ -2,6 +2,12 @@ name = "Moonshine PC"
 address = "localhost"
 port = 47989
 
+[[applications]]
+title = "Desktop"
+
+# [[applications]]
+# title = "Desktop low resolution"
+
 [tls]
 port = 47984
 certificate_chain = "./cert/cert.pem"

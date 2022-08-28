@@ -34,6 +34,8 @@ async fn main() -> Result<(), ()> {
 	let config: config::Config = toml::from_slice(&config)
 		.map_err(|e| log::error!("Failed to parse configuration file: {}", e))?;
 
+	log::debug!("Using configuration:\n{:#?}", config);
+
 	let webserver_task = tokio::spawn(webserver::run(config.clone()));
 	let publisher_task = tokio::spawn(service_publisher::run(config.port));
 

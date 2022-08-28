@@ -123,7 +123,7 @@ async fn serve(req: Request<Body>, config: config::Config, clients: Clients) -> 
 	log::info!("{} '{}' request.", req.method(), req.uri().path());
 
 	match (req.method(), req.uri().path()) {
-		(&Method::GET, "/applist") => app_list(req, clients).await,
+		(&Method::GET, "/applist") => app_list(req, config, clients).await,
 		(&Method::GET, "/pair") => pairing::pair(req, clients).await,
 		(&Method::GET, "/pin") => pairing::pin(req, clients).await,
 		(&Method::GET, "/serverinfo") => server_info(req, config, clients).await,
@@ -182,7 +182,7 @@ async fn server_info(req: Request<Body>, config: config::Config, clients: Client
 	response
 }
 
-async fn app_list(req: Request<Body>, clients: Clients) -> Response<Body> {
+async fn app_list(req: Request<Body>, config: config::Config, clients: Clients) -> Response<Body> {
 	let params = parse_params(req.uri());
 
 	let unique_id = match params.get("uniqueid") {
@@ -199,15 +199,19 @@ async fn app_list(req: Request<Body>, clients: Clients) -> Response<Body> {
 		return bad_request();
 	}
 
-	let mut response = Response::new(Body::from("<?xml version=\"1.0\" encoding=\"utf-8\"?>
-<root status_code=\"200\">
-	<App>
+	let mut response = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<root status_code=\"200\">".to_string();
+
+	for (i, application) in config.applications.iter().enumerate() {
+		response += &format!("	<App>
 		<IsHdrSupported>0</IsHdrSupported>
-		<AppTitle>Test</AppTitle>
-		<ID>0</ID>
-	</App>
-</root>",
-	));
+		<AppTitle>{}</AppTitle>
+		<ID>{}</ID>
+	</App>\n", application.title, i);
+	}
+	response += "</root>";
+
+	let mut response = Response::new(Body::from(response));
 	response.headers_mut().insert(CONTENT_TYPE, "application/xml".parse().unwrap());
 
 	response
