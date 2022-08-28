@@ -1,0 +1,8 @@
+name = "Moonshine PC"
+address = "localhost"
+port = 47989
+
+[tls]
+port = 47984
+certificate_chain = "./cert/cert.pem"
+private_key = "./cert/key.pem"

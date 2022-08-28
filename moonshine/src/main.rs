@@ -1,6 +1,10 @@
 // use nvfbc::{BufferFormat, CudaCapturer};
 // use nvfbc::cuda::CaptureMethod;
 
+use std::path::PathBuf;
+
+use clap::Parser;
+
 // use crate::encoder::{NvencEncoder, CodecType, VideoQuality};
 use crate::util::flatten;
 
@@ -12,20 +16,24 @@ mod webserver;
 mod service_publisher;
 mod util;
 
+#[derive(Parser, Debug)]
+#[clap(version)]
+struct Args {
+	/// Path to configuration file.
+	config: PathBuf,
+}
+
 #[tokio::main]
 async fn main() -> Result<(), ()> {
 	env_logger::init();
 
-	let config = config::Config {
-		name: "Moonshine PC".to_string(),
-		address: "localhost".to_string(),
-		port: 47989,
-		tls: config::Tls {
-			port: 47984,
-			certificate_chain: "./cert/cert.pem".into(),
-			private_key: "./cert/key.pem".into(),
-		},
-	};
+	let args = Args::parse();
+
+	let config = std::fs::read(args.config)
+		.map_err(|e| log::error!("Failed to open configuration file: {}", e))?;
+	let config: config::Config = toml::from_slice(&config)
+		.map_err(|e| log::error!("Failed to parse configuration file: {}", e))?;
+
 	let webserver_task = tokio::spawn(webserver::run(config.clone()));
 	let publisher_task = tokio::spawn(service_publisher::run(config.port));
 
