@@ -1,5 +1,5 @@
 [workspace]
 members = ["moonshine"]
 
-[patch.crates-io]
-nvfbc = { path = "../nvfbc-rs/nvfbc" }
+# [patch.crates-io]
+# nvfbc = { path = "../nvfbc-rs/nvfbc" }

@@ -1,23 +1,16 @@
-use nvfbc::{BufferFormat, CudaCapturer};
-use nvfbc::cuda::CaptureMethod;
-use tokio::task::JoinHandle;
+// use nvfbc::{BufferFormat, CudaCapturer};
+// use nvfbc::cuda::CaptureMethod;
 
-use crate::encoder::{NvencEncoder, CodecType, VideoQuality};
+// use crate::encoder::{NvencEncoder, CodecType, VideoQuality};
+use crate::util::flatten;
 
 mod config;
-mod cuda;
-mod encoder;
-mod error;
+// mod cuda;
+// mod encoder;
+// mod error;
 mod webserver;
 mod service_publisher;
-
-async fn flatten<T>(handle: JoinHandle<Result<T, ()>>) -> Result<T, ()> {
-	match handle.await {
-		Ok(Ok(result)) => Ok(result),
-		Ok(Err(err)) => Err(err),
-		Err(err) => Err(()),
-	}
-}
+mod util;
 
 #[tokio::main]
 async fn main() -> Result<(), ()> {
@@ -33,16 +26,10 @@ async fn main() -> Result<(), ()> {
 			private_key: "./cert/key.pem".into(),
 		},
 	};
-	let webserver_task = tokio::spawn({
-		let config = config.clone();
-		async move {
-			webserver::run(config).await
-		}
-	});
+	let webserver_task = tokio::spawn(webserver::run(config.clone()));
 	let publisher_task = tokio::spawn(service_publisher::run(config.port));
 
 	let result = tokio::try_join!(flatten(webserver_task), flatten(publisher_task));
-	// let result = tokio::try_join!(flatten(webserver_task));
 	match result {
 		Ok(_) => {
 			println!("Finished without errors.");

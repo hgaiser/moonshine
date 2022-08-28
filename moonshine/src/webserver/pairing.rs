@@ -22,7 +22,7 @@ use super::bad_request;
 pub(super) type Clients = Arc<Mutex<HashMap<String, Client>>>;
 
 pub(super) struct Client {
-	id: String,
+	_id: String,
 	pem: openssl::x509::X509,
 	salt: [u8; 16],
 	notify_pin_received: Arc<Notify>,
@@ -124,7 +124,7 @@ async fn get_server_cert(params: Params, clients: Clients) -> Response<Body> {
 
 	let notify_pin = {
 		let client = Client {
-			id: unique_id.to_owned(),
+			_id: unique_id.to_owned(),
 			pem,
 			salt: salt.clone().try_into().unwrap(),
 			notify_pin_received: Arc::new(Notify::new()),
