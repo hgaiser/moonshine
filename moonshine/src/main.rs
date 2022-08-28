@@ -1,28 +1,56 @@
 use nvfbc::{BufferFormat, CudaCapturer};
 use nvfbc::cuda::CaptureMethod;
-use webserver::WebserverConfig;
+use tokio::task::JoinHandle;
 
 use crate::encoder::{NvencEncoder, CodecType, VideoQuality};
 
+mod config;
 mod cuda;
 mod encoder;
 mod error;
 mod webserver;
 mod service_publisher;
 
+async fn flatten<T>(handle: JoinHandle<Result<T, ()>>) -> Result<T, ()> {
+	match handle.await {
+		Ok(Ok(result)) => Ok(result),
+		Ok(Err(err)) => Err(err),
+		Err(err) => Err(()),
+	}
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-	let webserver_config = WebserverConfig {
+async fn main() -> Result<(), ()> {
+	env_logger::init();
+
+	let config = config::Config {
 		name: "Moonshine PC".to_string(),
 		address: "localhost".to_string(),
 		port: 47989,
-		tls_port: 47984,
-		cert: "./cert/cert.pem".into(),
-		key: "./cert/key.pem".into(),
+		tls: config::Tls {
+			port: 47984,
+			certificate_chain: "./cert/cert.pem".into(),
+			private_key: "./cert/key.pem".into(),
+		},
 	};
-	tokio::spawn(webserver::run(webserver_config.clone()));
-	// tokio::spawn(service_publisher::run(47989));
-	service_publisher::run(webserver_config.port).await;
+	let webserver_task = tokio::spawn({
+		let config = config.clone();
+		async move {
+			webserver::run(config).await
+		}
+	});
+	let publisher_task = tokio::spawn(service_publisher::run(config.port));
+
+	let result = tokio::try_join!(flatten(webserver_task), flatten(publisher_task));
+	// let result = tokio::try_join!(flatten(webserver_task));
+	match result {
+		Ok(_) => {
+			println!("Finished without errors.");
+		},
+		Err(_) => {
+			println!("Finished with errors.");
+		}
+	};
 
 	// let cuda_context = cuda::init_cuda(0)?;
 

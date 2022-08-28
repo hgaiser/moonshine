@@ -1,18 +1,19 @@
 use zeroconf::prelude::*;
 
-pub(crate) async fn run(port: u16) {
+pub(crate) async fn run(port: u16) -> Result<(), ()> {
 	let mut service = zeroconf::MdnsService::new(
 		zeroconf::ServiceType::new(
 			"nvstream",
 			"tcp"
-		).unwrap(),
+		).map_err(|e| log::error!("Failed to publish: {}", e))?,
 		port
 	);
 
 	service.set_registered_callback(Box::new(on_service_registered));
 	service.set_name("Moonshine");
 
-	let event_loop = service.register().unwrap();
+	let event_loop = service.register()
+		.map_err(|e| log::error!("Failed to register service: {}", e))?;
 
 	loop {
 		// Calling `poll()` will keep this service alive.
@@ -26,9 +27,9 @@ fn on_service_registered(
 	_context: Option<std::sync::Arc<dyn std::any::Any>>,
 ) {
 	if let Err(e) = result {
-		println!("Failed to register service: {}", e);
+		log::error!("Failed to register service: {}", e);
 	} else {
-		println!("Service registered.");
+		log::info!("Service successfully registered.");
 	}
 }
 

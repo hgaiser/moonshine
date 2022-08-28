@@ -1,34 +1,33 @@
+use std::convert::Infallible;
 use std::net::ToSocketAddrs;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::collections::HashMap;
 
 use hyper::Uri;
+use hyper::body::Bytes;
 use hyper::server::conn::AddrIncoming;
+use openssl::ssl::Ssl;
+use openssl::ssl::SslAcceptor;
 use openssl::ssl::SslContext;
 use openssl::ssl::SslFiletype;
 use openssl::ssl::SslMethod;
-use tls_listener::TlsListener;
+use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use hyper::{service::service_fn, Response, Body, header::CONTENT_TYPE, Request, Method, StatusCode};
 
 mod pairing;
 use pairing::Clients;
+use tokio_openssl::SslStream;
+
+mod tls;
+use tls::TlsAcceptor;
+
+use crate::config;
 
 type Params = HashMap<String, String>;
 
-#[derive(Clone, Debug)]
-pub struct WebserverConfig {
-	pub name: String,
-	pub address: String,
-	pub port: u16,
-	pub tls_port: u16,
-
-	pub cert: PathBuf,
-	pub key: PathBuf,
-}
-
-pub(crate) async fn run(config: WebserverConfig) -> Result<(), hyper::Error> {
+pub(crate) async fn run(config: config::Config) -> Result<(), ()> {
 	let clients: Clients = Arc::new(Mutex::new(HashMap::new()));
 
 	let make_service = hyper::service::make_service_fn({
@@ -51,43 +50,56 @@ pub(crate) async fn run(config: WebserverConfig) -> Result<(), hyper::Error> {
 
 	let http_address = (config.address.clone(), config.port).to_socket_addrs().unwrap().next()
 		.ok_or(format!("no address resolved for {}:{}", config.address, config.port)).unwrap();
-	println!("Binding http webserver to {}", http_address);
-	tokio::spawn(hyper::Server::try_bind(&http_address)?.serve(make_service));
+	log::info!("Binding http webserver to {}", http_address);
+	tokio::spawn(hyper::Server::try_bind(&http_address)
+		.map_err(|e| log::error!("failed to bind to {}: {}", e, &http_address))?
+		.serve(make_service));
 
-	let https_address = (config.address.clone(), config.tls_port).to_socket_addrs().unwrap().next()
-		.ok_or(format!("no address resolved for {}:{}", config.address, config.tls_port)).unwrap();
-	println!("Binding https webserver to {}", https_address);
+	let https_address = (config.address.clone(), config.tls.port).to_socket_addrs()
+		.map_err(|e| log::error!("No address resolved for '{}:{}': {}", config.address, config.tls.port, e))?
+		.next()
+		.ok_or_else(|| log::error!("No address resolved for {}:{}", config.address, config.tls.port))?;
+	log::info!("Binding https webserver to {}", https_address);
 
-	let mut builder = SslContext::builder(SslMethod::tls_server()).unwrap();
-	builder.set_certificate_file(&config.cert, SslFiletype::PEM).unwrap();
-	builder.set_private_key_file(&config.key, SslFiletype::PEM).unwrap();
-	let incoming = TlsListener::new(builder.build(), AddrIncoming::bind(&https_address)?);
+	let listener = TcpListener::bind(https_address)
+		.await
+		.map_err(|e| log::error!("Failed to bind to {}: {}", https_address, e))?;
 
-	let make_service = hyper::service::make_service_fn({
-		let clients = clients.clone();
-		let config = config.clone();
-		move |_| {
+	let acceptor = TlsAcceptor::from_config(&config.tls)?;
+
+	loop {
+		let (connection, address) = listener.accept()
+			.await
+			.map_err(|e| log::error!("Failed to accept connection: {}", e))?;
+		log::debug!("Accepted connection from {}", address);
+
+		let connection = acceptor.accept(connection).await?;
+		tokio::spawn({
 			let clients = clients.clone();
 			let config = config.clone();
-			async {
-				Ok::<_, String>(service_fn(move |req| {
-					let clients = clients.clone();
-					let config = config.clone();
-					async {
-						Ok::<_, String>(serve(req, config, clients).await)
+			async move {
+				let result = hyper::server::conn::Http::new()
+					.serve_connection(connection, hyper::service::service_fn(move |request| {
+						let clients = clients.clone();
+						let config = config.clone();
+						async move {
+							Ok::<_, String>(serve(request, config, clients).await)
+						}
+					}))
+					.await;
+				if let Err(e) = result {
+					let message = e.to_string();
+					if !message.starts_with("error shutting down connection:") {
+						log::error!("Error in connection with {}: {}", address, message);
 					}
-				}))
+				}
 			}
-		}
-	});
-
-	hyper::Server::builder(incoming).serve(make_service).await?;
-
-	Ok(())
+		});
+	}
 }
 
-async fn serve(req: Request<Body>, config: WebserverConfig, clients: Clients) -> Response<Body> {
-	println!("{} '{}' request.", req.method(), req.uri().path());
+async fn serve(req: Request<Body>, config: config::Config, clients: Clients) -> Response<Body> {
+	log::info!("{} '{}' request.", req.method(), req.uri().path());
 
 	match (req.method(), req.uri().path()) {
 		(&Method::GET, "/pin") => pairing::pin(req, clients).await,
@@ -98,13 +110,13 @@ async fn serve(req: Request<Body>, config: WebserverConfig, clients: Clients) ->
 	}
 }
 
-async fn server_info(req: Request<Body>, config: WebserverConfig, clients: Clients) -> Response<Body> {
+async fn server_info(req: Request<Body>, config: config::Config, clients: Clients) -> Response<Body> {
 	let params = parse_params(req.uri());
 
 	let unique_id = match params.get("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			println!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
+			log::error!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
@@ -139,7 +151,7 @@ async fn server_info(req: Request<Body>, config: WebserverConfig, clients: Clien
 	<state>SUNSHINE_SERVER_FREE</state>
 </root>",
 		config.name,
-		config.tls_port,
+		config.tls.port,
 		config.port,
 		paired,
 	)));

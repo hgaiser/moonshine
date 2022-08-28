@@ -30,6 +30,7 @@ pub(super) struct Client {
 	server_secret: Option<[u8; 16]>,
 	server_challenge: Option<[u8; 16]>,
 	client_hash: Option<Vec<u8>>,
+	paired: bool,
 }
 
 pub(super) async fn unpair(req: Request<Body>, clients: Clients) -> Response<Body> {
@@ -38,21 +39,21 @@ pub(super) async fn unpair(req: Request<Body>, clients: Clients) -> Response<Bod
 	let unique_id = match params.get("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			println!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
+			log::error!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
 
 	match clients.lock().await.remove(unique_id) {
 		Some(_) => {
-			println!("Successfully unpaired client '{}'", unique_id);
+			log::info!("Successfully unpaired client '{}'", unique_id);
 			Response::builder()
 				.status(StatusCode::OK)
 				.body(Body::from("Successfully unpaired.".to_string()))
 				.unwrap()
 		},
 		None => {
-			println!("Failed to unpair: unknown unique id '{}'.", unique_id);
+			log::error!("Failed to unpair: unknown unique id '{}'.", unique_id);
 			bad_request()
 		}
 	}
@@ -64,7 +65,7 @@ pub(super) async fn pin(req: Request<Body>, clients: Clients) -> Response<Body> 
 	let unique_id = match params.get("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			println!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
+			log::error!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
@@ -72,7 +73,7 @@ pub(super) async fn pin(req: Request<Body>, clients: Clients) -> Response<Body> 
 	let pin = match params.get("pin") {
 		Some(pin) => pin,
 		None => {
-			println!("Expected 'pin' in pin request, got {:?}.", params.keys());
+			log::error!("Expected 'pin' in pin request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
@@ -81,10 +82,10 @@ pub(super) async fn pin(req: Request<Body>, clients: Clients) -> Response<Body> 
 		Some(mut client) => {
 			client.key = Some(create_key(&client.salt, pin));
 			client.notify_pin_received.notify_waiters();
-			println!("Successfully notified of pin entry: {:?}", pin);
+			log::info!("Successfully notified of pin entry: {:?}", pin);
 		},
 		None => {
-			println!("Unknown unique id '{}'.", unique_id);
+			log::error!("Unknown unique id '{}'.", unique_id);
 			return bad_request();
 		}
 	};
@@ -99,21 +100,21 @@ async fn get_server_cert(params: Params, clients: Clients) -> Response<Body> {
 	let client_cert = match params.get("clientcert") {
 		Some(client_cert) => hex::decode(client_cert).unwrap(),
 		None => {
-			println!("Expected 'clientcert' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'clientcert' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
 	let unique_id = match params.get("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			println!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
 	let salt = match params.get("salt") {
 		Some(salt) => hex::decode(salt).unwrap(),
 		None => {
-			println!("Expected 'salt' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'salt' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
@@ -131,6 +132,7 @@ async fn get_server_cert(params: Params, clients: Clients) -> Response<Body> {
 			server_secret: None,
 			server_challenge: None,
 			client_hash: None,
+			paired: false,
 		};
 		let notify = client.notify_pin_received.clone();
 
@@ -140,7 +142,7 @@ async fn get_server_cert(params: Params, clients: Clients) -> Response<Body> {
 		notify
 	};
 
-	println!("Waiting for pin to be sent at /pin?uniqueid={}&pin=<PIN>", unique_id);
+	log::info!("Waiting for pin to be sent at /pin?uniqueid={}&pin=<PIN>", unique_id);
 	notify_pin.notified().await;
 
 	let response = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
@@ -158,14 +160,14 @@ async fn client_challenge(params: Params, clients: Clients) -> Response<Body> {
 	let client_challenge = match params.get("clientchallenge") {
 		Some(client_challenge) => hex::decode(client_challenge).unwrap(),
 		None => {
-			println!("Expected 'clientchallenge' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'clientchallenge' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
 	let unique_id = match params.get("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			println!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
@@ -174,7 +176,7 @@ async fn client_challenge(params: Params, clients: Clients) -> Response<Body> {
 	let client = match clients.get_mut(unique_id) {
 		Some(client) => client,
 		None => {
-			println!("Unknown unique id '{}' provided in client challenge.", unique_id);
+			log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
 			return bad_request();
 		}
 	};
@@ -182,7 +184,7 @@ async fn client_challenge(params: Params, clients: Clients) -> Response<Body> {
 	let key = match &client.key {
 		Some(key) => key,
 		None => {
-			println!("Client has not provided a pin yet.");
+			log::error!("Client has not provided a pin yet.");
 			return bad_request();
 		}
 	};
@@ -222,14 +224,14 @@ async fn server_challenge_response(params: Params, clients: Clients) -> Response
 	let server_challenge_response = match params.get("serverchallengeresp") {
 		Some(server_challenge_response) => hex::decode(server_challenge_response).unwrap(),
 		None => {
-			println!("Expected 'serverchallengeresp' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'serverchallengeresp' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
 	let unique_id = match params.get("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			println!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
@@ -238,7 +240,7 @@ async fn server_challenge_response(params: Params, clients: Clients) -> Response
 	let client = match clients.get_mut(unique_id) {
 		Some(client) => client,
 		None => {
-			println!("Unknown unique id '{}' provided in client challenge.", unique_id);
+			log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
 			return bad_request();
 		}
 	};
@@ -246,7 +248,7 @@ async fn server_challenge_response(params: Params, clients: Clients) -> Response
 	let key = match &client.key {
 		Some(key) => key,
 		None => {
-			println!("Client has not provided a pin yet.");
+			log::warn!("Client has not provided a pin yet.");
 			return bad_request();
 		}
 	};
@@ -276,14 +278,14 @@ async fn client_pairing_secret(params: Params, clients: Clients) -> Response<Bod
 	let client_pairing_secret = match params.get("clientpairingsecret") {
 		Some(client_pairing_secret) => hex::decode(client_pairing_secret).unwrap(),
 		None => {
-			println!("Expected 'clientpairingsecret' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'clientpairingsecret' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
 	let unique_id = match params.get("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			println!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
@@ -292,7 +294,7 @@ async fn client_pairing_secret(params: Params, clients: Clients) -> Response<Bod
 	let client = match clients.get_mut(unique_id) {
 		Some(client) => client,
 		None => {
-			println!("Unknown unique id '{}' provided in client challenge.", unique_id);
+			log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
 			return bad_request();
 		}
 	};
@@ -309,7 +311,7 @@ async fn client_pairing_secret(params: Params, clients: Clients) -> Response<Bod
 	data.extend(client_secret);
 
 	if !openssl::hash::hash(MessageDigest::sha256(), &data).unwrap().to_vec().eq(client.client_hash.as_ref().unwrap()) {
-		println!("Client hash is not as expected, MITM?");
+		log::error!("Client hash is not as expected, MITM?");
 		return bad_request();
 	}
 
@@ -330,16 +332,20 @@ async fn pair_challenge(params: Params, clients: Clients) -> Response<Body> {
 	let unique_id = match params.get("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			println!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
+			log::error!("Expected 'uniqueid' in pairing request, got {:?}.", params.keys());
 			return bad_request();
 		}
 	};
 
-	let clients = clients.lock().await;
-	if !clients.contains_key(unique_id) {
-		println!("Unknown unique id '{}' provided in client challenge.", unique_id);
-		return bad_request();
-	}
+	let mut clients = clients.lock().await;
+	let client = match clients.get_mut(unique_id) {
+		Some(client) => client,
+		None => {
+			log::error!("Unknown unique id '{}' provided in client challenge.", unique_id);
+			return bad_request();
+		}
+	};
+	client.paired = true;
 
 	let response = "<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <root status_code=\"200\">
@@ -355,14 +361,12 @@ async fn pair_challenge(params: Params, clients: Clients) -> Response<Body> {
 pub(super) async fn pair(req: Request<Body>, clients: Clients) -> Response<Body> {
 	let params = parse_params(req.uri());
 
-	println!("Params: {:#?}", params);
-
 	if params.contains_key("phrase") {
 		match params.get("phrase").unwrap().as_str() {
 			"getservercert" => get_server_cert(params, clients).await,
 			"pairchallenge" => pair_challenge(params, clients).await,
 			unknown => {
-				println!("Unknown pair phrase received: {}", unknown);
+				log::error!("Unknown pair phrase received: {}", unknown);
 				Response::builder()
 					.status(400)
 					.body(Body::from("INVALID REQUEST"))
@@ -376,7 +380,8 @@ pub(super) async fn pair(req: Request<Body>, clients: Clients) -> Response<Body>
 	} else if params.contains_key("clientpairingsecret") {
 		client_pairing_secret(params, clients).await
 	} else {
-		todo!();
+		log::error!("Unknown pair command with params: {:?}", params);
+		bad_request()
 	}
 }
 
