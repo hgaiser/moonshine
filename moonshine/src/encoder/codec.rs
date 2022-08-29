@@ -57,7 +57,7 @@ impl Codec {
 		codec_type: CodecType,
 		quality: VideoQuality,
 		cuda_context: ffmpeg_sys::CUcontext,
-	) -> Result<Self, String> {
+	) -> Result<Self, ()> {
 		unsafe {
 			// Find the right codec.
 			let codec = match codec_type {
@@ -65,18 +65,21 @@ impl Codec {
 				CodecType::Hevc => ffmpeg_sys::avcodec_find_encoder_by_name(to_c_str("hevc_nvenc")?.as_ptr()),
 			};
 			if codec.is_null() {
-				return Err(format!("Codec '{:?}' is not found in ffmpeg.", codec_type));
+				log::error!("Codec '{:?}' is not found in ffmpeg.", codec_type);
+				return Err(());
 			}
 			let codec = &*codec;
 
 			// Allocate a video codec context.
 			let codec_context = ffmpeg_sys::avcodec_alloc_context3(codec);
 			if codec_context.is_null() {
-				return Err("Failed to create codec context.".into());
+				log::error!("Failed to create codec context.");
+				return Err(());
 			}
 			let codec_context = &mut *codec_context;
 			if codec.type_ != ffmpeg_sys::AVMediaType_AVMEDIA_TYPE_VIDEO {
-				return Err(format!("Expected video encoder, but got type: {}", (*codec).type_));
+				log::error!("Expected video encoder, but got type: {}", (*codec).type_);
+				return Err(());
 			}
 
 			// Configure the codec context.
@@ -89,18 +92,20 @@ impl Codec {
 
 			let device_ctx = ffmpeg_sys::av_hwdevice_ctx_alloc(ffmpeg_sys::AVHWDeviceType_AV_HWDEVICE_TYPE_CUDA);
 			if device_ctx.is_null() {
-				return Err("Failed to create hardware device context.".to_string());
+				log::error!("Failed to create hardware device context.");
+				return Err(());
 			}
 
 			let hw_device_context = (*device_ctx).data as *mut ffmpeg_sys::AVHWDeviceContext;
 			let cuda_device_context = (*hw_device_context).hwctx as *mut ffmpeg_sys::AVCUDADeviceContext;
 			(*cuda_device_context).cuda_ctx = cuda_context;
 			check_ret(ffmpeg_sys::av_hwdevice_ctx_init(device_ctx))
-				.map_err(|e| format!("Failed to initialize hardware device: {}", e))?;
+				.map_err(|e| log::error!("Failed to initialize hardware device: {}", e))?;
 
 			let frame_context = ffmpeg_sys::av_hwframe_ctx_alloc(device_ctx) as *mut ffmpeg_sys::AVBufferRef;
 			if frame_context.is_null() {
-				return Err("Failed to create hwframe context.".to_string());
+				log::error!("Failed to create hwframe context.");
+				return Err(());
 			}
 
 			let hw_frame_context = &mut *((*frame_context).data as *mut ffmpeg_sys::AVHWFramesContext);
@@ -110,7 +115,7 @@ impl Codec {
 			hw_frame_context.format = codec_context.pix_fmt;
 
 			check_ret(ffmpeg_sys::av_hwframe_ctx_init(frame_context))
-				.map_err(|e| format!("Failed to initialize hardware frame context: {}", e))?;
+				.map_err(|e| log::error!("Failed to initialize hardware frame context: {}", e))?;
 
 			codec_context.hw_frames_ctx = frame_context;
 
@@ -121,17 +126,17 @@ impl Codec {
 				to_c_str("1")?.as_ptr(),
 				0
 			))
-				.map_err(|e| format!("Failed to set dictionary with options: {}", e))?;
+				.map_err(|e| log::error!("Failed to set dictionary with options: {}", e))?;
 			check_ret(ffmpeg_sys::av_dict_set(
 				&mut options,
 				to_c_str("preset")?.as_ptr(),
 				to_c_str(quality.into())?.as_ptr(),
 				0
 			))
-				.map_err(|e| format!("Failed to set dictionary with options: {}", e))?;
+				.map_err(|e| log::error!("Failed to set dictionary with options: {}", e))?;
 
 			check_ret(ffmpeg_sys::avcodec_open2(codec_context, codec_context.codec, &mut options))
-				.map_err(|e| format!("Failed to open codec: {}", e))?;
+				.map_err(|e| log::error!("Failed to open codec: {}", e))?;
 
 			Ok(Self { codec_context })
 		}

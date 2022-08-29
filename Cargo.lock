@@ -441,6 +441,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "ffmpeg-sys"
+version = "0.1.0"
+dependencies = [
+ "pkg-config",
+]
+
+[[package]]
 name = "flate2"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -849,10 +856,12 @@ dependencies = [
  "clap 3.2.17",
  "dirs",
  "env_logger 0.9.0",
+ "ffmpeg-sys",
  "hex",
  "hyper",
  "image",
  "log",
+ "nvfbc",
  "openssl",
  "serde",
  "tokio",
@@ -931,6 +940,17 @@ dependencies = [
  "hermit-abi",
  "libc",
 ]
+
+[[package]]
+name = "nvfbc"
+version = "0.1.2"
+dependencies = [
+ "nvfbc-sys",
+]
+
+[[package]]
+name = "nvfbc-sys"
+version = "0.1.0"
 
 [[package]]
 name = "once_cell"

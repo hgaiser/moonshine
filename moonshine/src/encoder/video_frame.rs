@@ -5,11 +5,12 @@ pub(super) struct VideoFrame {
 }
 
 impl VideoFrame {
-	pub(super) fn new(codec: &Codec) -> Result<Self, String> {
+	pub(super) fn new(codec: &Codec) -> Result<Self, ()> {
 		unsafe {
 			let frame = ffmpeg_sys::av_frame_alloc();
 			if frame.is_null() {
-				return Err("Failed to allocate VideoFrame.".to_string());
+				log::error!("Failed to allocate VideoFrame.");
+				return Err(());
 			}
 
 			let frame = &mut *frame;
@@ -22,7 +23,7 @@ impl VideoFrame {
 			// TODO: Remove this, this shouldn't be necessary!
 			// This allocates a HW frame, but we should manually create our own frame (through nvfbc).
 			check_ret(ffmpeg_sys::av_hwframe_get_buffer(frame.hw_frames_ctx, frame, 0))
-				.map_err(|e| format!("Failed to allocate hardware frame: {}", e))?;
+				.map_err(|e| log::error!("Failed to allocate hardware frame: {}", e))?;
 			frame.linesize[0] = frame.width * 4;
 
 			Ok(Self { frame })

@@ -8,13 +8,14 @@ pub(super) struct Muxer {
 }
 
 impl Muxer {
-	pub(super) fn new(codec: &Codec) -> Result<Self, String> {
+	pub(super) fn new(codec: &Codec) -> Result<Self, ()> {
 		let filename = "test.mp4";
 
 		unsafe {
 			let format_context = ffmpeg_sys::avformat_alloc_context();
 			if format_context.is_null() {
-				return Err("Failed to allocate a format context.".to_string());
+				log::error!("Failed to allocate a format context.");
+				return Err(());
 			}
 			let format_context = &mut *format_context;
 
@@ -25,31 +26,34 @@ impl Muxer {
 			// TODO: Delete this, we don't want to write to a file.
 			check_ret(ffmpeg_sys::avio_open(
 				&mut format_context.pb,
-				to_c_str(filename)?.as_ptr(),
+				to_c_str(filename)?
+				.as_ptr(),
 				ffmpeg_sys::AVIO_FLAG_WRITE as i32
 			))
-				.map_err(|e| format!("Failed to open output file: {}", e))?;
+				.map_err(|e| log::error!("Failed to open output file: {}", e))?;
 			check_ret(ffmpeg_sys::avformat_write_header(format_context, null_mut()))
-				.map_err(|e| format!("Failed to write output header: {}", e))?;
+				.map_err(|e| log::error!("Failed to write output header: {}", e))?;
 
 			Ok(Self { format_context, video_stream })
 		}
 	}
 
-	fn create_format() -> Result<*const ffmpeg_sys::AVOutputFormat, String> {
+	fn create_format() -> Result<*const ffmpeg_sys::AVOutputFormat, ()> {
 		let output_format = unsafe { ffmpeg_sys::av_guess_format(to_c_str("mp4")?.as_ptr(), null(), null()) };
 		if output_format.is_null() {
-			return Err("Failed to determine output format.".to_string());
+			log::error!("Failed to determine output format.");
+			return Err(());
 		}
 
 		Ok(output_format)
 	}
 
-	fn create_video_stream(format_context: *mut ffmpeg_sys::AVFormatContext, codec: &Codec) -> Result<*const ffmpeg_sys::AVStream, String> {
+	fn create_video_stream(format_context: *mut ffmpeg_sys::AVFormatContext, codec: &Codec) -> Result<*const ffmpeg_sys::AVStream, ()> {
 		unsafe {
 			let stream = ffmpeg_sys::avformat_new_stream(format_context, null());
 			if stream.is_null() {
-				return Err("Could not create a new stream.".to_string());
+				log::error!("Could not create a new stream.");
+				return Err(());
 			}
 			let stream = &mut *stream;
 			stream.id = (*format_context).nb_streams as i32 - 1;
@@ -58,17 +62,17 @@ impl Muxer {
 
 			// Set parameters based on the codec.
 			check_ret(ffmpeg_sys::avcodec_parameters_from_context(stream.codecpar, codec.as_ptr()))
-				.map_err(|e| format!("Failed to set codec parameters: {}", e))?;
+				.map_err(|e| log::error!("Failed to set codec parameters: {}", e))?;
 			Ok(stream)
 		}
 	}
 
-	pub(super) fn stop(&self) -> Result<(), String> {
+	pub(super) fn stop(&self) -> Result<(), ()> {
 		unsafe {
 			check_ret(ffmpeg_sys::av_write_trailer(self.as_ptr()))
-				.map_err(|e| format!("Failed to write format trailer: {}", e))?;
+				.map_err(|e| log::error!("Failed to write format trailer: {}", e))?;
 			check_ret(ffmpeg_sys::avio_close(self.as_ref().pb))
-				.map_err(|e| format!("Failed to close file: {}", e))?;
+				.map_err(|e| log::error!("Failed to close file: {}", e))?;
 		};
 
 		Ok(())

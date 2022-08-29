@@ -30,9 +30,9 @@ unsafe fn parse_c_str<'a>(data: *const c_char) -> Result<&'a str, String> {
 		.map_err(|_e| "invalid UTF-8".to_string())
 }
 
-fn to_c_str(data: &str) -> Result<CString, String> {
+fn to_c_str(data: &str) -> Result<CString, ()> {
 	CString::new(data)
-		.map_err(|e| format!("Failed to create CString: {}", e))
+		.map_err(|e| log::error!("Failed to create CString: {}", e))
 }
 
 fn get_error(error_code: i32) -> Result<String, String> {
@@ -64,7 +64,7 @@ impl NvencEncoder {
 		codec_type: CodecType,
 		quality: VideoQuality,
 		cuda_context: ffmpeg_sys::CUcontext,
-	) -> Result<Self, String> {
+	) -> Result<Self, ()> {
 		unsafe {
 			// ffmpeg_sys::av_log_set_level(ffmpeg_sys::AV_LOG_TRACE as i32);
 			ffmpeg_sys::av_log_set_level(ffmpeg_sys::AV_LOG_QUIET as i32);
@@ -97,7 +97,7 @@ impl NvencEncoder {
 		Ok(())
 	}
 
-	pub fn stop(&self) -> Result<(), String> {
+	pub fn stop(&self) -> Result<(), ()> {
 		self.muxer.stop()?;
 		Ok(())
 	}
