@@ -14,8 +14,9 @@ image = "0.24.2"
 log = "0.4.17"
 nvfbc = "0.1.2"
 openssl = "0.10.41"
+rtsp-types = "0.0.3"
 serde = "1.0.140"
-tokio = { version = "1.20.1", features = ["rt-multi-thread", "macros", "net"] }
+tokio = { version = "1.20.1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-openssl = "0.6.3"
 toml = "0.5.9"
 url = "2.2.2"
