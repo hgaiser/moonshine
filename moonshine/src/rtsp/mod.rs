@@ -71,7 +71,8 @@ async fn handle_request(request: &rtsp_types::Request<Vec<u8>>) -> Result<Respon
 	match request.method() {
 		Method::Options => Ok(handle_options_request(request, cseq)),
 		Method::Describe => handle_describe_request(request, cseq),
-		Method::Setup => Ok(handle_setup_request(request, cseq)),
+		Method::Setup => handle_setup_request(request, cseq),
+		Method::Play => Ok(handle_play_request(request, cseq)),
 		method => {
 			log::error!("Received request with unsupported method {:?}", method);
 			Err(())
@@ -84,7 +85,6 @@ fn handle_options_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> 
 		.header(headers::CSEQ, cseq.to_string())
 		.header(headers::PUBLIC, "OPTIONS DESCRIBE")
 		.build(Vec::new())
-		// .empty()
 }
 
 fn handle_describe_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
@@ -144,11 +144,33 @@ fn handle_describe_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) ->
 	)
 }
 
-fn handle_setup_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
+fn handle_setup_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
+	let transport = request.header(&headers::TRANSPORT)
+		.ok_or_else(|| log::error!("No Transport header in SETUP request."))?;
+	let elements: Vec<&str> = transport
+		.as_str()
+		.split(";")
+		.into_iter()
+		.filter(|e| e.starts_with("client_port"))
+		.collect();
+
+	if elements.len() != 1 {
+		log::error!("Expected exactly one 'client_port' parameter, got: {:?}", elements);
+		return Err(());
+	}
+
+	let client_port = elements[0];
+
+	Ok(rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
+		.header(headers::CSEQ, cseq.to_string())
+		.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
+		.header(headers::TRANSPORT, format!("RTP/AVP/UDP;unicast;{};server_port=2001", client_port))
+		.build(Vec::new())
+	)
+}
+
+fn handle_play_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
 	rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 		.header(headers::CSEQ, cseq.to_string())
-		.header(headers::SESSION, "DEADBEEFCAFE;timeout = 90".to_string())
-		.header(headers::TRANSPORT, "server_port=1337".to_string())
 		.build(Vec::new())
-		// .empty()
 }
