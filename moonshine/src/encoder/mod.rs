@@ -59,6 +59,7 @@ pub struct NvencEncoder {
 
 impl NvencEncoder {
 	pub fn new(
+		port: u16,
 		width: u32,
 		height: u32,
 		codec_type: CodecType,
@@ -77,7 +78,7 @@ impl NvencEncoder {
 				cuda_context,
 			)?;
 
-			let muxer = Muxer::new(&codec)?;
+			let muxer = Muxer::new(port, &codec)?;
 
 			let frame = VideoFrame::new(&codec)?;
 

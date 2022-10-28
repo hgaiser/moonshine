@@ -1,4 +1,6 @@
-use std::ptr::{null, null_mut};
+use std::{ptr::{null, null_mut}, ffi::CStr};
+
+use ffmpeg_sys::URLContext;
 
 use super::{to_c_str, check_ret, codec::Codec};
 
@@ -8,8 +10,8 @@ pub(super) struct Muxer {
 }
 
 impl Muxer {
-	pub(super) fn new(codec: &Codec) -> Result<Self, ()> {
-		let filename = "test.mp4";
+	pub(super) fn new(port: u16, codec: &Codec) -> Result<Self, ()> {
+		let url = format!("rtp://localhost:port");
 
 		unsafe {
 			let format_context = ffmpeg_sys::avformat_alloc_context();
@@ -26,7 +28,7 @@ impl Muxer {
 			// TODO: Delete this, we don't want to write to a file.
 			check_ret(ffmpeg_sys::avio_open(
 				&mut format_context.pb,
-				to_c_str(filename)?
+				to_c_str(url.as_str())?
 				.as_ptr(),
 				ffmpeg_sys::AVIO_FLAG_WRITE as i32
 			))
@@ -34,12 +36,15 @@ impl Muxer {
 			check_ret(ffmpeg_sys::avformat_write_header(format_context, null_mut()))
 				.map_err(|e| log::error!("Failed to write output header: {}", e))?;
 
+			let url_context = (*format_context.pb).opaque as *mut URLContext;
+			log::info!("URLContext address: {:?}", CStr::from_ptr(&mut (*url_context)._address as *mut u8 as *mut i8));
+
 			Ok(Self { format_context, video_stream })
 		}
 	}
 
 	fn create_format() -> Result<*const ffmpeg_sys::AVOutputFormat, ()> {
-		let output_format = unsafe { ffmpeg_sys::av_guess_format(to_c_str("mp4")?.as_ptr(), null(), null()) };
+		let output_format = unsafe { ffmpeg_sys::av_guess_format(to_c_str("rtp")?.as_ptr(), null(), null()) };
 		if output_format.is_null() {
 			log::error!("Failed to determine output format.");
 			return Err(());

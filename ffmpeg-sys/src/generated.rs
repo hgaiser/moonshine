@@ -114,6 +114,7 @@ pub const AV_DICT_DONT_STRDUP_VAL: u32 = 8;
 pub const AV_DICT_DONT_OVERWRITE: u32 = 16;
 pub const AV_DICT_APPEND: u32 = 32;
 pub const AV_DICT_MULTIKEY: u32 = 64;
+pub const AV_CH_LAYOUT_NATIVE: i64 = -9223372036854775808;
 pub const AV_NUM_DATA_POINTERS: u32 = 8;
 pub const AV_FRAME_FLAG_CORRUPT: u32 = 1;
 pub const AV_FRAME_FLAG_DISCARD: u32 = 4;
@@ -245,6 +246,7 @@ pub const AV_DISPOSITION_VISUAL_IMPAIRED: u32 = 256;
 pub const AV_DISPOSITION_CLEAN_EFFECTS: u32 = 512;
 pub const AV_DISPOSITION_ATTACHED_PIC: u32 = 1024;
 pub const AV_DISPOSITION_TIMED_THUMBNAILS: u32 = 2048;
+pub const AV_DISPOSITION_NON_DIEGETIC: u32 = 4096;
 pub const AV_DISPOSITION_CAPTIONS: u32 = 65536;
 pub const AV_DISPOSITION_DESCRIPTIONS: u32 = 131072;
 pub const AV_DISPOSITION_METADATA: u32 = 262144;
@@ -276,6 +278,7 @@ pub const AVFMT_FLAG_SHORTEST: u32 = 1048576;
 pub const AVFMT_FLAG_AUTO_BSF: u32 = 2097152;
 pub const AVFMT_EVENT_FLAG_METADATA_UPDATED: u32 = 1;
 pub const AVFMT_AVOID_NEG_TS_AUTO: i32 = -1;
+pub const AVFMT_AVOID_NEG_TS_DISABLED: u32 = 0;
 pub const AVFMT_AVOID_NEG_TS_MAKE_NON_NEGATIVE: u32 = 1;
 pub const AVFMT_AVOID_NEG_TS_MAKE_ZERO: u32 = 2;
 pub const AVSEEK_FLAG_BACKWARD: u32 = 1;
@@ -312,6 +315,109 @@ pub type __int64_t = ::std::os::raw::c_long;
 pub type __uint64_t = ::std::os::raw::c_ulong;
 pub type __off_t = ::std::os::raw::c_long;
 pub type __off64_t = ::std::os::raw::c_long;
+pub const AVSampleFormat_AV_SAMPLE_FMT_NONE: AVSampleFormat = -1;
+pub const AVSampleFormat_AV_SAMPLE_FMT_U8: AVSampleFormat = 0;
+pub const AVSampleFormat_AV_SAMPLE_FMT_S16: AVSampleFormat = 1;
+pub const AVSampleFormat_AV_SAMPLE_FMT_S32: AVSampleFormat = 2;
+pub const AVSampleFormat_AV_SAMPLE_FMT_FLT: AVSampleFormat = 3;
+pub const AVSampleFormat_AV_SAMPLE_FMT_DBL: AVSampleFormat = 4;
+pub const AVSampleFormat_AV_SAMPLE_FMT_U8P: AVSampleFormat = 5;
+pub const AVSampleFormat_AV_SAMPLE_FMT_S16P: AVSampleFormat = 6;
+pub const AVSampleFormat_AV_SAMPLE_FMT_S32P: AVSampleFormat = 7;
+pub const AVSampleFormat_AV_SAMPLE_FMT_FLTP: AVSampleFormat = 8;
+pub const AVSampleFormat_AV_SAMPLE_FMT_DBLP: AVSampleFormat = 9;
+pub const AVSampleFormat_AV_SAMPLE_FMT_S64: AVSampleFormat = 10;
+pub const AVSampleFormat_AV_SAMPLE_FMT_S64P: AVSampleFormat = 11;
+pub const AVSampleFormat_AV_SAMPLE_FMT_NB: AVSampleFormat = 12;
+pub type AVSampleFormat = ::std::os::raw::c_int;
+extern "C" {
+	pub fn av_get_sample_fmt_name(sample_fmt: AVSampleFormat) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_get_sample_fmt(name: *const ::std::os::raw::c_char) -> AVSampleFormat;
+}
+extern "C" {
+	pub fn av_get_alt_sample_fmt(sample_fmt: AVSampleFormat, planar: ::std::os::raw::c_int) -> AVSampleFormat;
+}
+extern "C" {
+	pub fn av_get_packed_sample_fmt(sample_fmt: AVSampleFormat) -> AVSampleFormat;
+}
+extern "C" {
+	pub fn av_get_planar_sample_fmt(sample_fmt: AVSampleFormat) -> AVSampleFormat;
+}
+extern "C" {
+	pub fn av_get_sample_fmt_string(
+		buf: *mut ::std::os::raw::c_char,
+		buf_size: ::std::os::raw::c_int,
+		sample_fmt: AVSampleFormat,
+	) -> *mut ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_get_bytes_per_sample(sample_fmt: AVSampleFormat) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_sample_fmt_is_planar(sample_fmt: AVSampleFormat) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_samples_get_buffer_size(
+		linesize: *mut ::std::os::raw::c_int,
+		nb_channels: ::std::os::raw::c_int,
+		nb_samples: ::std::os::raw::c_int,
+		sample_fmt: AVSampleFormat,
+		align: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_samples_fill_arrays(
+		audio_data: *mut *mut u8,
+		linesize: *mut ::std::os::raw::c_int,
+		buf: *const u8,
+		nb_channels: ::std::os::raw::c_int,
+		nb_samples: ::std::os::raw::c_int,
+		sample_fmt: AVSampleFormat,
+		align: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_samples_alloc(
+		audio_data: *mut *mut u8,
+		linesize: *mut ::std::os::raw::c_int,
+		nb_channels: ::std::os::raw::c_int,
+		nb_samples: ::std::os::raw::c_int,
+		sample_fmt: AVSampleFormat,
+		align: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_samples_alloc_array_and_samples(
+		audio_data: *mut *mut *mut u8,
+		linesize: *mut ::std::os::raw::c_int,
+		nb_channels: ::std::os::raw::c_int,
+		nb_samples: ::std::os::raw::c_int,
+		sample_fmt: AVSampleFormat,
+		align: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_samples_copy(
+		dst: *mut *mut u8,
+		src: *const *mut u8,
+		dst_offset: ::std::os::raw::c_int,
+		src_offset: ::std::os::raw::c_int,
+		nb_samples: ::std::os::raw::c_int,
+		nb_channels: ::std::os::raw::c_int,
+		sample_fmt: AVSampleFormat,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_samples_set_silence(
+		audio_data: *mut *mut u8,
+		offset: ::std::os::raw::c_int,
+		nb_samples: ::std::os::raw::c_int,
+		nb_channels: ::std::os::raw::c_int,
+		sample_fmt: AVSampleFormat,
+	) -> ::std::os::raw::c_int;
+}
 extern "C" {
 	pub fn avutil_version() -> ::std::os::raw::c_uint;
 }
@@ -1647,109 +1753,6 @@ extern "C" {
 extern "C" {
 	pub fn av_fourcc_make_string(buf: *mut ::std::os::raw::c_char, fourcc: u32) -> *mut ::std::os::raw::c_char;
 }
-pub const AVSampleFormat_AV_SAMPLE_FMT_NONE: AVSampleFormat = -1;
-pub const AVSampleFormat_AV_SAMPLE_FMT_U8: AVSampleFormat = 0;
-pub const AVSampleFormat_AV_SAMPLE_FMT_S16: AVSampleFormat = 1;
-pub const AVSampleFormat_AV_SAMPLE_FMT_S32: AVSampleFormat = 2;
-pub const AVSampleFormat_AV_SAMPLE_FMT_FLT: AVSampleFormat = 3;
-pub const AVSampleFormat_AV_SAMPLE_FMT_DBL: AVSampleFormat = 4;
-pub const AVSampleFormat_AV_SAMPLE_FMT_U8P: AVSampleFormat = 5;
-pub const AVSampleFormat_AV_SAMPLE_FMT_S16P: AVSampleFormat = 6;
-pub const AVSampleFormat_AV_SAMPLE_FMT_S32P: AVSampleFormat = 7;
-pub const AVSampleFormat_AV_SAMPLE_FMT_FLTP: AVSampleFormat = 8;
-pub const AVSampleFormat_AV_SAMPLE_FMT_DBLP: AVSampleFormat = 9;
-pub const AVSampleFormat_AV_SAMPLE_FMT_S64: AVSampleFormat = 10;
-pub const AVSampleFormat_AV_SAMPLE_FMT_S64P: AVSampleFormat = 11;
-pub const AVSampleFormat_AV_SAMPLE_FMT_NB: AVSampleFormat = 12;
-pub type AVSampleFormat = ::std::os::raw::c_int;
-extern "C" {
-	pub fn av_get_sample_fmt_name(sample_fmt: AVSampleFormat) -> *const ::std::os::raw::c_char;
-}
-extern "C" {
-	pub fn av_get_sample_fmt(name: *const ::std::os::raw::c_char) -> AVSampleFormat;
-}
-extern "C" {
-	pub fn av_get_alt_sample_fmt(sample_fmt: AVSampleFormat, planar: ::std::os::raw::c_int) -> AVSampleFormat;
-}
-extern "C" {
-	pub fn av_get_packed_sample_fmt(sample_fmt: AVSampleFormat) -> AVSampleFormat;
-}
-extern "C" {
-	pub fn av_get_planar_sample_fmt(sample_fmt: AVSampleFormat) -> AVSampleFormat;
-}
-extern "C" {
-	pub fn av_get_sample_fmt_string(
-		buf: *mut ::std::os::raw::c_char,
-		buf_size: ::std::os::raw::c_int,
-		sample_fmt: AVSampleFormat,
-	) -> *mut ::std::os::raw::c_char;
-}
-extern "C" {
-	pub fn av_get_bytes_per_sample(sample_fmt: AVSampleFormat) -> ::std::os::raw::c_int;
-}
-extern "C" {
-	pub fn av_sample_fmt_is_planar(sample_fmt: AVSampleFormat) -> ::std::os::raw::c_int;
-}
-extern "C" {
-	pub fn av_samples_get_buffer_size(
-		linesize: *mut ::std::os::raw::c_int,
-		nb_channels: ::std::os::raw::c_int,
-		nb_samples: ::std::os::raw::c_int,
-		sample_fmt: AVSampleFormat,
-		align: ::std::os::raw::c_int,
-	) -> ::std::os::raw::c_int;
-}
-extern "C" {
-	pub fn av_samples_fill_arrays(
-		audio_data: *mut *mut u8,
-		linesize: *mut ::std::os::raw::c_int,
-		buf: *const u8,
-		nb_channels: ::std::os::raw::c_int,
-		nb_samples: ::std::os::raw::c_int,
-		sample_fmt: AVSampleFormat,
-		align: ::std::os::raw::c_int,
-	) -> ::std::os::raw::c_int;
-}
-extern "C" {
-	pub fn av_samples_alloc(
-		audio_data: *mut *mut u8,
-		linesize: *mut ::std::os::raw::c_int,
-		nb_channels: ::std::os::raw::c_int,
-		nb_samples: ::std::os::raw::c_int,
-		sample_fmt: AVSampleFormat,
-		align: ::std::os::raw::c_int,
-	) -> ::std::os::raw::c_int;
-}
-extern "C" {
-	pub fn av_samples_alloc_array_and_samples(
-		audio_data: *mut *mut *mut u8,
-		linesize: *mut ::std::os::raw::c_int,
-		nb_channels: ::std::os::raw::c_int,
-		nb_samples: ::std::os::raw::c_int,
-		sample_fmt: AVSampleFormat,
-		align: ::std::os::raw::c_int,
-	) -> ::std::os::raw::c_int;
-}
-extern "C" {
-	pub fn av_samples_copy(
-		dst: *mut *mut u8,
-		src: *const *mut u8,
-		dst_offset: ::std::os::raw::c_int,
-		src_offset: ::std::os::raw::c_int,
-		nb_samples: ::std::os::raw::c_int,
-		nb_channels: ::std::os::raw::c_int,
-		sample_fmt: AVSampleFormat,
-	) -> ::std::os::raw::c_int;
-}
-extern "C" {
-	pub fn av_samples_set_silence(
-		audio_data: *mut *mut u8,
-		offset: ::std::os::raw::c_int,
-		nb_samples: ::std::os::raw::c_int,
-		nb_channels: ::std::os::raw::c_int,
-		sample_fmt: AVSampleFormat,
-	) -> ::std::os::raw::c_int;
-}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct AVBuffer {
@@ -1995,6 +1998,398 @@ extern "C" {
 		pairs_sep: ::std::os::raw::c_char,
 	) -> ::std::os::raw::c_int;
 }
+pub const AVChannel_AV_CHAN_NONE: AVChannel = -1;
+pub const AVChannel_AV_CHAN_FRONT_LEFT: AVChannel = 0;
+pub const AVChannel_AV_CHAN_FRONT_RIGHT: AVChannel = 1;
+pub const AVChannel_AV_CHAN_FRONT_CENTER: AVChannel = 2;
+pub const AVChannel_AV_CHAN_LOW_FREQUENCY: AVChannel = 3;
+pub const AVChannel_AV_CHAN_BACK_LEFT: AVChannel = 4;
+pub const AVChannel_AV_CHAN_BACK_RIGHT: AVChannel = 5;
+pub const AVChannel_AV_CHAN_FRONT_LEFT_OF_CENTER: AVChannel = 6;
+pub const AVChannel_AV_CHAN_FRONT_RIGHT_OF_CENTER: AVChannel = 7;
+pub const AVChannel_AV_CHAN_BACK_CENTER: AVChannel = 8;
+pub const AVChannel_AV_CHAN_SIDE_LEFT: AVChannel = 9;
+pub const AVChannel_AV_CHAN_SIDE_RIGHT: AVChannel = 10;
+pub const AVChannel_AV_CHAN_TOP_CENTER: AVChannel = 11;
+pub const AVChannel_AV_CHAN_TOP_FRONT_LEFT: AVChannel = 12;
+pub const AVChannel_AV_CHAN_TOP_FRONT_CENTER: AVChannel = 13;
+pub const AVChannel_AV_CHAN_TOP_FRONT_RIGHT: AVChannel = 14;
+pub const AVChannel_AV_CHAN_TOP_BACK_LEFT: AVChannel = 15;
+pub const AVChannel_AV_CHAN_TOP_BACK_CENTER: AVChannel = 16;
+pub const AVChannel_AV_CHAN_TOP_BACK_RIGHT: AVChannel = 17;
+pub const AVChannel_AV_CHAN_STEREO_LEFT: AVChannel = 29;
+pub const AVChannel_AV_CHAN_STEREO_RIGHT: AVChannel = 30;
+pub const AVChannel_AV_CHAN_WIDE_LEFT: AVChannel = 31;
+pub const AVChannel_AV_CHAN_WIDE_RIGHT: AVChannel = 32;
+pub const AVChannel_AV_CHAN_SURROUND_DIRECT_LEFT: AVChannel = 33;
+pub const AVChannel_AV_CHAN_SURROUND_DIRECT_RIGHT: AVChannel = 34;
+pub const AVChannel_AV_CHAN_LOW_FREQUENCY_2: AVChannel = 35;
+pub const AVChannel_AV_CHAN_TOP_SIDE_LEFT: AVChannel = 36;
+pub const AVChannel_AV_CHAN_TOP_SIDE_RIGHT: AVChannel = 37;
+pub const AVChannel_AV_CHAN_BOTTOM_FRONT_CENTER: AVChannel = 38;
+pub const AVChannel_AV_CHAN_BOTTOM_FRONT_LEFT: AVChannel = 39;
+pub const AVChannel_AV_CHAN_BOTTOM_FRONT_RIGHT: AVChannel = 40;
+pub const AVChannel_AV_CHAN_UNUSED: AVChannel = 512;
+pub const AVChannel_AV_CHAN_UNKNOWN: AVChannel = 768;
+pub const AVChannel_AV_CHAN_AMBISONIC_BASE: AVChannel = 1024;
+pub const AVChannel_AV_CHAN_AMBISONIC_END: AVChannel = 2047;
+pub type AVChannel = ::std::os::raw::c_int;
+pub const AVChannelOrder_AV_CHANNEL_ORDER_UNSPEC: AVChannelOrder = 0;
+pub const AVChannelOrder_AV_CHANNEL_ORDER_NATIVE: AVChannelOrder = 1;
+pub const AVChannelOrder_AV_CHANNEL_ORDER_CUSTOM: AVChannelOrder = 2;
+pub const AVChannelOrder_AV_CHANNEL_ORDER_AMBISONIC: AVChannelOrder = 3;
+pub type AVChannelOrder = ::std::os::raw::c_uint;
+pub const AVMatrixEncoding_AV_MATRIX_ENCODING_NONE: AVMatrixEncoding = 0;
+pub const AVMatrixEncoding_AV_MATRIX_ENCODING_DOLBY: AVMatrixEncoding = 1;
+pub const AVMatrixEncoding_AV_MATRIX_ENCODING_DPLII: AVMatrixEncoding = 2;
+pub const AVMatrixEncoding_AV_MATRIX_ENCODING_DPLIIX: AVMatrixEncoding = 3;
+pub const AVMatrixEncoding_AV_MATRIX_ENCODING_DPLIIZ: AVMatrixEncoding = 4;
+pub const AVMatrixEncoding_AV_MATRIX_ENCODING_DOLBYEX: AVMatrixEncoding = 5;
+pub const AVMatrixEncoding_AV_MATRIX_ENCODING_DOLBYHEADPHONE: AVMatrixEncoding = 6;
+pub const AVMatrixEncoding_AV_MATRIX_ENCODING_NB: AVMatrixEncoding = 7;
+pub type AVMatrixEncoding = ::std::os::raw::c_uint;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AVChannelCustom {
+	pub id: AVChannel,
+	pub name: [::std::os::raw::c_char; 16usize],
+	pub opaque: *mut ::std::os::raw::c_void,
+}
+#[test]
+fn bindgen_test_layout_AVChannelCustom() {
+	assert_eq!(
+		::std::mem::size_of::<AVChannelCustom>(),
+		32usize,
+		concat!("Size of: ", stringify!(AVChannelCustom))
+	);
+	assert_eq!(
+		::std::mem::align_of::<AVChannelCustom>(),
+		8usize,
+		concat!("Alignment of ", stringify!(AVChannelCustom))
+	);
+	fn test_field_id() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVChannelCustom>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).id) as usize - ptr as usize
+			},
+			0usize,
+			concat!("Offset of field: ", stringify!(AVChannelCustom), "::", stringify!(id))
+		);
+	}
+	test_field_id();
+	fn test_field_name() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVChannelCustom>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).name) as usize - ptr as usize
+			},
+			4usize,
+			concat!("Offset of field: ", stringify!(AVChannelCustom), "::", stringify!(name))
+		);
+	}
+	test_field_name();
+	fn test_field_opaque() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVChannelCustom>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).opaque) as usize - ptr as usize
+			},
+			24usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVChannelCustom),
+				"::",
+				stringify!(opaque)
+			)
+		);
+	}
+	test_field_opaque();
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct AVChannelLayout {
+	pub order: AVChannelOrder,
+	pub nb_channels: ::std::os::raw::c_int,
+	pub u: AVChannelLayout__bindgen_ty_1,
+	pub opaque: *mut ::std::os::raw::c_void,
+}
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub union AVChannelLayout__bindgen_ty_1 {
+	pub mask: u64,
+	pub map: *mut AVChannelCustom,
+}
+#[test]
+fn bindgen_test_layout_AVChannelLayout__bindgen_ty_1() {
+	assert_eq!(
+		::std::mem::size_of::<AVChannelLayout__bindgen_ty_1>(),
+		8usize,
+		concat!("Size of: ", stringify!(AVChannelLayout__bindgen_ty_1))
+	);
+	assert_eq!(
+		::std::mem::align_of::<AVChannelLayout__bindgen_ty_1>(),
+		8usize,
+		concat!("Alignment of ", stringify!(AVChannelLayout__bindgen_ty_1))
+	);
+	fn test_field_mask() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVChannelLayout__bindgen_ty_1>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).mask) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVChannelLayout__bindgen_ty_1),
+				"::",
+				stringify!(mask)
+			)
+		);
+	}
+	test_field_mask();
+	fn test_field_map() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVChannelLayout__bindgen_ty_1>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).map) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVChannelLayout__bindgen_ty_1),
+				"::",
+				stringify!(map)
+			)
+		);
+	}
+	test_field_map();
+}
+#[test]
+fn bindgen_test_layout_AVChannelLayout() {
+	assert_eq!(
+		::std::mem::size_of::<AVChannelLayout>(),
+		24usize,
+		concat!("Size of: ", stringify!(AVChannelLayout))
+	);
+	assert_eq!(
+		::std::mem::align_of::<AVChannelLayout>(),
+		8usize,
+		concat!("Alignment of ", stringify!(AVChannelLayout))
+	);
+	fn test_field_order() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVChannelLayout>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).order) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVChannelLayout),
+				"::",
+				stringify!(order)
+			)
+		);
+	}
+	test_field_order();
+	fn test_field_nb_channels() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVChannelLayout>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).nb_channels) as usize - ptr as usize
+			},
+			4usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVChannelLayout),
+				"::",
+				stringify!(nb_channels)
+			)
+		);
+	}
+	test_field_nb_channels();
+	fn test_field_u() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVChannelLayout>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).u) as usize - ptr as usize
+			},
+			8usize,
+			concat!("Offset of field: ", stringify!(AVChannelLayout), "::", stringify!(u))
+		);
+	}
+	test_field_u();
+	fn test_field_opaque() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVChannelLayout>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).opaque) as usize - ptr as usize
+			},
+			16usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVChannelLayout),
+				"::",
+				stringify!(opaque)
+			)
+		);
+	}
+	test_field_opaque();
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AVBPrint {
+	_unused: [u8; 0],
+}
+extern "C" {
+	pub fn av_get_channel_layout(name: *const ::std::os::raw::c_char) -> u64;
+}
+extern "C" {
+	pub fn av_get_extended_channel_layout(
+		name: *const ::std::os::raw::c_char,
+		channel_layout: *mut u64,
+		nb_channels: *mut ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_get_channel_layout_string(
+		buf: *mut ::std::os::raw::c_char,
+		buf_size: ::std::os::raw::c_int,
+		nb_channels: ::std::os::raw::c_int,
+		channel_layout: u64,
+	);
+}
+extern "C" {
+	pub fn av_bprint_channel_layout(bp: *mut AVBPrint, nb_channels: ::std::os::raw::c_int, channel_layout: u64);
+}
+extern "C" {
+	pub fn av_get_channel_layout_nb_channels(channel_layout: u64) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_get_default_channel_layout(nb_channels: ::std::os::raw::c_int) -> i64;
+}
+extern "C" {
+	pub fn av_get_channel_layout_channel_index(channel_layout: u64, channel: u64) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_layout_extract_channel(channel_layout: u64, index: ::std::os::raw::c_int) -> u64;
+}
+extern "C" {
+	pub fn av_get_channel_name(channel: u64) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_get_channel_description(channel: u64) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_get_standard_channel_layout(
+		index: ::std::os::raw::c_uint,
+		layout: *mut u64,
+		name: *mut *const ::std::os::raw::c_char,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_name(
+		buf: *mut ::std::os::raw::c_char,
+		buf_size: size_t,
+		channel: AVChannel,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_name_bprint(bp: *mut AVBPrint, channel_id: AVChannel);
+}
+extern "C" {
+	pub fn av_channel_description(
+		buf: *mut ::std::os::raw::c_char,
+		buf_size: size_t,
+		channel: AVChannel,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_description_bprint(bp: *mut AVBPrint, channel_id: AVChannel);
+}
+extern "C" {
+	pub fn av_channel_from_string(name: *const ::std::os::raw::c_char) -> AVChannel;
+}
+extern "C" {
+	pub fn av_channel_layout_from_mask(channel_layout: *mut AVChannelLayout, mask: u64) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_layout_from_string(
+		channel_layout: *mut AVChannelLayout,
+		str_: *const ::std::os::raw::c_char,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_layout_default(ch_layout: *mut AVChannelLayout, nb_channels: ::std::os::raw::c_int);
+}
+extern "C" {
+	pub fn av_channel_layout_standard(opaque: *mut *mut ::std::os::raw::c_void) -> *const AVChannelLayout;
+}
+extern "C" {
+	pub fn av_channel_layout_uninit(channel_layout: *mut AVChannelLayout);
+}
+extern "C" {
+	pub fn av_channel_layout_copy(dst: *mut AVChannelLayout, src: *const AVChannelLayout) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_layout_describe(
+		channel_layout: *const AVChannelLayout,
+		buf: *mut ::std::os::raw::c_char,
+		buf_size: size_t,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_layout_describe_bprint(
+		channel_layout: *const AVChannelLayout,
+		bp: *mut AVBPrint,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_layout_channel_from_index(
+		channel_layout: *const AVChannelLayout,
+		idx: ::std::os::raw::c_uint,
+	) -> AVChannel;
+}
+extern "C" {
+	pub fn av_channel_layout_index_from_channel(
+		channel_layout: *const AVChannelLayout,
+		channel: AVChannel,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_layout_index_from_string(
+		channel_layout: *const AVChannelLayout,
+		name: *const ::std::os::raw::c_char,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_layout_channel_from_string(
+		channel_layout: *const AVChannelLayout,
+		name: *const ::std::os::raw::c_char,
+	) -> AVChannel;
+}
+extern "C" {
+	pub fn av_channel_layout_subset(channel_layout: *const AVChannelLayout, mask: u64) -> u64;
+}
+extern "C" {
+	pub fn av_channel_layout_check(channel_layout: *const AVChannelLayout) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_channel_layout_compare(
+		chl: *const AVChannelLayout,
+		chl1: *const AVChannelLayout,
+	) -> ::std::os::raw::c_int;
+}
 pub const AVFrameSideDataType_AV_FRAME_DATA_PANSCAN: AVFrameSideDataType = 0;
 pub const AVFrameSideDataType_AV_FRAME_DATA_A53_CC: AVFrameSideDataType = 1;
 pub const AVFrameSideDataType_AV_FRAME_DATA_STEREO3D: AVFrameSideDataType = 2;
@@ -2020,6 +2415,7 @@ pub const AVFrameSideDataType_AV_FRAME_DATA_FILM_GRAIN_PARAMS: AVFrameSideDataTy
 pub const AVFrameSideDataType_AV_FRAME_DATA_DETECTION_BBOXES: AVFrameSideDataType = 22;
 pub const AVFrameSideDataType_AV_FRAME_DATA_DOVI_RPU_BUFFER: AVFrameSideDataType = 23;
 pub const AVFrameSideDataType_AV_FRAME_DATA_DOVI_METADATA: AVFrameSideDataType = 24;
+pub const AVFrameSideDataType_AV_FRAME_DATA_DYNAMIC_HDR_VIVID: AVFrameSideDataType = 25;
 pub type AVFrameSideDataType = ::std::os::raw::c_uint;
 pub const AVActiveFormatDescription_AV_AFD_SAME: AVActiveFormatDescription = 8;
 pub const AVActiveFormatDescription_AV_AFD_4_3: AVActiveFormatDescription = 9;
@@ -2247,7 +2643,7 @@ fn bindgen_test_layout_AVRegionOfInterest() {
 	test_field_qoffset();
 }
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub struct AVFrame {
 	pub data: [*mut u8; 8usize],
 	pub linesize: [::std::os::raw::c_int; 8usize],
@@ -2298,12 +2694,13 @@ pub struct AVFrame {
 	pub crop_left: size_t,
 	pub crop_right: size_t,
 	pub private_ref: *mut AVBufferRef,
+	pub ch_layout: AVChannelLayout,
 }
 #[test]
 fn bindgen_test_layout_AVFrame() {
 	assert_eq!(
 		::std::mem::size_of::<AVFrame>(),
-		448usize,
+		472usize,
 		concat!("Size of: ", stringify!(AVFrame))
 	);
 	assert_eq!(
@@ -2974,6 +3371,18 @@ fn bindgen_test_layout_AVFrame() {
 		);
 	}
 	test_field_private_ref();
+	fn test_field_ch_layout() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVFrame>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).ch_layout) as usize - ptr as usize
+			},
+			448usize,
+			concat!("Offset of field: ", stringify!(AVFrame), "::", stringify!(ch_layout))
+		);
+	}
+	test_field_ch_layout();
 }
 extern "C" {
 	pub fn av_get_colorspace_name(val: AVColorSpace) -> *const ::std::os::raw::c_char;
@@ -3929,6 +4338,10 @@ pub const AVCodecID_AV_CODEC_ID_CRI: AVCodecID = 254;
 pub const AVCodecID_AV_CODEC_ID_SIMBIOSIS_IMX: AVCodecID = 255;
 pub const AVCodecID_AV_CODEC_ID_SGA_VIDEO: AVCodecID = 256;
 pub const AVCodecID_AV_CODEC_ID_GEM: AVCodecID = 257;
+pub const AVCodecID_AV_CODEC_ID_VBN: AVCodecID = 258;
+pub const AVCodecID_AV_CODEC_ID_JPEGXL: AVCodecID = 259;
+pub const AVCodecID_AV_CODEC_ID_QOI: AVCodecID = 260;
+pub const AVCodecID_AV_CODEC_ID_PHM: AVCodecID = 261;
 pub const AVCodecID_AV_CODEC_ID_FIRST_AUDIO: AVCodecID = 65536;
 pub const AVCodecID_AV_CODEC_ID_PCM_S16LE: AVCodecID = 65536;
 pub const AVCodecID_AV_CODEC_ID_PCM_S16BE: AVCodecID = 65537;
@@ -4125,6 +4538,7 @@ pub const AVCodecID_AV_CODEC_ID_SIREN: AVCodecID = 86108;
 pub const AVCodecID_AV_CODEC_ID_HCA: AVCodecID = 86109;
 pub const AVCodecID_AV_CODEC_ID_FASTAUDIO: AVCodecID = 86110;
 pub const AVCodecID_AV_CODEC_ID_MSNSIREN: AVCodecID = 86111;
+pub const AVCodecID_AV_CODEC_ID_DFPWM: AVCodecID = 86112;
 pub const AVCodecID_AV_CODEC_ID_FIRST_SUBTITLE: AVCodecID = 94208;
 pub const AVCodecID_AV_CODEC_ID_DVD_SUBTITLE: AVCodecID = 94208;
 pub const AVCodecID_AV_CODEC_ID_DVB_SUBTITLE: AVCodecID = 94209;
@@ -4233,11 +4647,6 @@ fn bindgen_test_layout_AVProfile() {
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct AVCodecDefault {
-	_unused: [u8; 0],
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
 pub struct AVCodec {
 	pub name: *const ::std::os::raw::c_char,
 	pub long_name: *const ::std::os::raw::c_char,
@@ -4253,58 +4662,13 @@ pub struct AVCodec {
 	pub priv_class: *const AVClass,
 	pub profiles: *const AVProfile,
 	pub wrapper_name: *const ::std::os::raw::c_char,
-	pub caps_internal: ::std::os::raw::c_int,
-	pub priv_data_size: ::std::os::raw::c_int,
-	pub update_thread_context: ::std::option::Option<
-		unsafe extern "C" fn(dst: *mut AVCodecContext, src: *const AVCodecContext) -> ::std::os::raw::c_int,
-	>,
-	pub update_thread_context_for_user: ::std::option::Option<
-		unsafe extern "C" fn(dst: *mut AVCodecContext, src: *const AVCodecContext) -> ::std::os::raw::c_int,
-	>,
-	pub defaults: *const AVCodecDefault,
-	pub init_static_data: ::std::option::Option<unsafe extern "C" fn(codec: *mut AVCodec)>,
-	pub init: ::std::option::Option<unsafe extern "C" fn(arg1: *mut AVCodecContext) -> ::std::os::raw::c_int>,
-	pub encode_sub: ::std::option::Option<
-		unsafe extern "C" fn(
-			arg1: *mut AVCodecContext,
-			buf: *mut u8,
-			buf_size: ::std::os::raw::c_int,
-			sub: *const AVSubtitle,
-		) -> ::std::os::raw::c_int,
-	>,
-	pub encode2: ::std::option::Option<
-		unsafe extern "C" fn(
-			avctx: *mut AVCodecContext,
-			avpkt: *mut AVPacket,
-			frame: *const AVFrame,
-			got_packet_ptr: *mut ::std::os::raw::c_int,
-		) -> ::std::os::raw::c_int,
-	>,
-	pub decode: ::std::option::Option<
-		unsafe extern "C" fn(
-			avctx: *mut AVCodecContext,
-			outdata: *mut ::std::os::raw::c_void,
-			got_frame_ptr: *mut ::std::os::raw::c_int,
-			avpkt: *mut AVPacket,
-		) -> ::std::os::raw::c_int,
-	>,
-	pub close: ::std::option::Option<unsafe extern "C" fn(arg1: *mut AVCodecContext) -> ::std::os::raw::c_int>,
-	pub receive_packet: ::std::option::Option<
-		unsafe extern "C" fn(avctx: *mut AVCodecContext, avpkt: *mut AVPacket) -> ::std::os::raw::c_int,
-	>,
-	pub receive_frame: ::std::option::Option<
-		unsafe extern "C" fn(avctx: *mut AVCodecContext, frame: *mut AVFrame) -> ::std::os::raw::c_int,
-	>,
-	pub flush: ::std::option::Option<unsafe extern "C" fn(arg1: *mut AVCodecContext)>,
-	pub bsfs: *const ::std::os::raw::c_char,
-	pub hw_configs: *const *mut AVCodecHWConfigInternal,
-	pub codec_tags: *const u32,
+	pub ch_layouts: *const AVChannelLayout,
 }
 #[test]
 fn bindgen_test_layout_AVCodec() {
 	assert_eq!(
 		::std::mem::size_of::<AVCodec>(),
-		224usize,
+		104usize,
 		concat!("Size of: ", stringify!(AVCodec))
 	);
 	assert_eq!(
@@ -4495,245 +4859,18 @@ fn bindgen_test_layout_AVCodec() {
 		);
 	}
 	test_field_wrapper_name();
-	fn test_field_caps_internal() {
+	fn test_field_ch_layouts() {
 		assert_eq!(
 			unsafe {
 				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
 				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).caps_internal) as usize - ptr as usize
+				::std::ptr::addr_of!((*ptr).ch_layouts) as usize - ptr as usize
 			},
 			96usize,
-			concat!(
-				"Offset of field: ",
-				stringify!(AVCodec),
-				"::",
-				stringify!(caps_internal)
-			)
+			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(ch_layouts))
 		);
 	}
-	test_field_caps_internal();
-	fn test_field_priv_data_size() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).priv_data_size) as usize - ptr as usize
-			},
-			100usize,
-			concat!(
-				"Offset of field: ",
-				stringify!(AVCodec),
-				"::",
-				stringify!(priv_data_size)
-			)
-		);
-	}
-	test_field_priv_data_size();
-	fn test_field_update_thread_context() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).update_thread_context) as usize - ptr as usize
-			},
-			104usize,
-			concat!(
-				"Offset of field: ",
-				stringify!(AVCodec),
-				"::",
-				stringify!(update_thread_context)
-			)
-		);
-	}
-	test_field_update_thread_context();
-	fn test_field_update_thread_context_for_user() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).update_thread_context_for_user) as usize - ptr as usize
-			},
-			112usize,
-			concat!(
-				"Offset of field: ",
-				stringify!(AVCodec),
-				"::",
-				stringify!(update_thread_context_for_user)
-			)
-		);
-	}
-	test_field_update_thread_context_for_user();
-	fn test_field_defaults() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).defaults) as usize - ptr as usize
-			},
-			120usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(defaults))
-		);
-	}
-	test_field_defaults();
-	fn test_field_init_static_data() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).init_static_data) as usize - ptr as usize
-			},
-			128usize,
-			concat!(
-				"Offset of field: ",
-				stringify!(AVCodec),
-				"::",
-				stringify!(init_static_data)
-			)
-		);
-	}
-	test_field_init_static_data();
-	fn test_field_init() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).init) as usize - ptr as usize
-			},
-			136usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(init))
-		);
-	}
-	test_field_init();
-	fn test_field_encode_sub() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).encode_sub) as usize - ptr as usize
-			},
-			144usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(encode_sub))
-		);
-	}
-	test_field_encode_sub();
-	fn test_field_encode2() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).encode2) as usize - ptr as usize
-			},
-			152usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(encode2))
-		);
-	}
-	test_field_encode2();
-	fn test_field_decode() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).decode) as usize - ptr as usize
-			},
-			160usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(decode))
-		);
-	}
-	test_field_decode();
-	fn test_field_close() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).close) as usize - ptr as usize
-			},
-			168usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(close))
-		);
-	}
-	test_field_close();
-	fn test_field_receive_packet() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).receive_packet) as usize - ptr as usize
-			},
-			176usize,
-			concat!(
-				"Offset of field: ",
-				stringify!(AVCodec),
-				"::",
-				stringify!(receive_packet)
-			)
-		);
-	}
-	test_field_receive_packet();
-	fn test_field_receive_frame() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).receive_frame) as usize - ptr as usize
-			},
-			184usize,
-			concat!(
-				"Offset of field: ",
-				stringify!(AVCodec),
-				"::",
-				stringify!(receive_frame)
-			)
-		);
-	}
-	test_field_receive_frame();
-	fn test_field_flush() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).flush) as usize - ptr as usize
-			},
-			192usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(flush))
-		);
-	}
-	test_field_flush();
-	fn test_field_bsfs() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).bsfs) as usize - ptr as usize
-			},
-			200usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(bsfs))
-		);
-	}
-	test_field_bsfs();
-	fn test_field_hw_configs() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).hw_configs) as usize - ptr as usize
-			},
-			208usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(hw_configs))
-		);
-	}
-	test_field_hw_configs();
-	fn test_field_codec_tags() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVCodec>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).codec_tags) as usize - ptr as usize
-			},
-			216usize,
-			concat!("Offset of field: ", stringify!(AVCodec), "::", stringify!(codec_tags))
-		);
-	}
-	test_field_codec_tags();
+	test_field_ch_layouts();
 }
 extern "C" {
 	pub fn av_codec_iterate(opaque: *mut *mut ::std::os::raw::c_void) -> *const AVCodec;
@@ -4993,7 +5130,7 @@ pub const AVFieldOrder_AV_FIELD_TB: AVFieldOrder = 4;
 pub const AVFieldOrder_AV_FIELD_BT: AVFieldOrder = 5;
 pub type AVFieldOrder = ::std::os::raw::c_uint;
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub struct AVCodecParameters {
 	pub codec_type: AVMediaType,
 	pub codec_id: AVCodecID,
@@ -5024,12 +5161,13 @@ pub struct AVCodecParameters {
 	pub initial_padding: ::std::os::raw::c_int,
 	pub trailing_padding: ::std::os::raw::c_int,
 	pub seek_preroll: ::std::os::raw::c_int,
+	pub ch_layout: AVChannelLayout,
 }
 #[test]
 fn bindgen_test_layout_AVCodecParameters() {
 	assert_eq!(
 		::std::mem::size_of::<AVCodecParameters>(),
-		144usize,
+		168usize,
 		concat!("Size of: ", stringify!(AVCodecParameters))
 	);
 	assert_eq!(
@@ -5530,6 +5668,23 @@ fn bindgen_test_layout_AVCodecParameters() {
 		);
 	}
 	test_field_seek_preroll();
+	fn test_field_ch_layout() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVCodecParameters>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).ch_layout) as usize - ptr as usize
+			},
+			144usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVCodecParameters),
+				"::",
+				stringify!(ch_layout)
+			)
+		);
+	}
+	test_field_ch_layout();
 }
 extern "C" {
 	pub fn avcodec_parameters_alloc() -> *mut AVCodecParameters;
@@ -6331,7 +6486,7 @@ pub struct AVCodecInternal {
 	_unused: [u8; 0],
 }
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Copy, Clone)]
 pub struct AVCodecContext {
 	pub av_class: *const AVClass,
 	pub log_level_offset: ::std::os::raw::c_int,
@@ -6544,12 +6699,13 @@ pub struct AVCodecContext {
 			flags: ::std::os::raw::c_int,
 		) -> ::std::os::raw::c_int,
 	>,
+	pub ch_layout: AVChannelLayout,
 }
 #[test]
 fn bindgen_test_layout_AVCodecContext() {
 	assert_eq!(
 		::std::mem::size_of::<AVCodecContext>(),
-		920usize,
+		944usize,
 		concat!("Size of: ", stringify!(AVCodecContext))
 	);
 	assert_eq!(
@@ -9222,11 +9378,23 @@ fn bindgen_test_layout_AVCodecContext() {
 		);
 	}
 	test_field_get_encode_buffer();
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct MpegEncContext {
-	_unused: [u8; 0],
+	fn test_field_ch_layout() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVCodecContext>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).ch_layout) as usize - ptr as usize
+			},
+			920usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVCodecContext),
+				"::",
+				stringify!(ch_layout)
+			)
+		);
+	}
+	test_field_ch_layout();
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -9255,7 +9423,6 @@ pub struct AVHWAccel {
 	>,
 	pub end_frame: ::std::option::Option<unsafe extern "C" fn(avctx: *mut AVCodecContext) -> ::std::os::raw::c_int>,
 	pub frame_priv_data_size: ::std::os::raw::c_int,
-	pub decode_mb: ::std::option::Option<unsafe extern "C" fn(s: *mut MpegEncContext)>,
 	pub init: ::std::option::Option<unsafe extern "C" fn(avctx: *mut AVCodecContext) -> ::std::os::raw::c_int>,
 	pub uninit: ::std::option::Option<unsafe extern "C" fn(avctx: *mut AVCodecContext) -> ::std::os::raw::c_int>,
 	pub priv_data_size: ::std::os::raw::c_int,
@@ -9268,7 +9435,7 @@ pub struct AVHWAccel {
 fn bindgen_test_layout_AVHWAccel() {
 	assert_eq!(
 		::std::mem::size_of::<AVHWAccel>(),
-		112usize,
+		104usize,
 		concat!("Size of: ", stringify!(AVHWAccel))
 	);
 	assert_eq!(
@@ -9438,18 +9605,6 @@ fn bindgen_test_layout_AVHWAccel() {
 		);
 	}
 	test_field_frame_priv_data_size();
-	fn test_field_decode_mb() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<AVHWAccel>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).decode_mb) as usize - ptr as usize
-			},
-			72usize,
-			concat!("Offset of field: ", stringify!(AVHWAccel), "::", stringify!(decode_mb))
-		);
-	}
-	test_field_decode_mb();
 	fn test_field_init() {
 		assert_eq!(
 			unsafe {
@@ -9457,7 +9612,7 @@ fn bindgen_test_layout_AVHWAccel() {
 				let ptr = uninit.as_ptr();
 				::std::ptr::addr_of!((*ptr).init) as usize - ptr as usize
 			},
-			80usize,
+			72usize,
 			concat!("Offset of field: ", stringify!(AVHWAccel), "::", stringify!(init))
 		);
 	}
@@ -9469,7 +9624,7 @@ fn bindgen_test_layout_AVHWAccel() {
 				let ptr = uninit.as_ptr();
 				::std::ptr::addr_of!((*ptr).uninit) as usize - ptr as usize
 			},
-			88usize,
+			80usize,
 			concat!("Offset of field: ", stringify!(AVHWAccel), "::", stringify!(uninit))
 		);
 	}
@@ -9481,7 +9636,7 @@ fn bindgen_test_layout_AVHWAccel() {
 				let ptr = uninit.as_ptr();
 				::std::ptr::addr_of!((*ptr).priv_data_size) as usize - ptr as usize
 			},
-			96usize,
+			88usize,
 			concat!(
 				"Offset of field: ",
 				stringify!(AVHWAccel),
@@ -9498,7 +9653,7 @@ fn bindgen_test_layout_AVHWAccel() {
 				let ptr = uninit.as_ptr();
 				::std::ptr::addr_of!((*ptr).caps_internal) as usize - ptr as usize
 			},
-			100usize,
+			92usize,
 			concat!(
 				"Offset of field: ",
 				stringify!(AVHWAccel),
@@ -9515,7 +9670,7 @@ fn bindgen_test_layout_AVHWAccel() {
 				let ptr = uninit.as_ptr();
 				::std::ptr::addr_of!((*ptr).frame_params) as usize - ptr as usize
 			},
-			104usize,
+			96usize,
 			concat!(
 				"Offset of field: ",
 				stringify!(AVHWAccel),
@@ -11747,6 +11902,13 @@ extern "C" {
 	pub fn avio_feof(s: *mut AVIOContext) -> ::std::os::raw::c_int;
 }
 extern "C" {
+	pub fn avio_vprintf(
+		s: *mut AVIOContext,
+		fmt: *const ::std::os::raw::c_char,
+		ap: *mut __va_list_tag,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
 	pub fn avio_printf(s: *mut AVIOContext, fmt: *const ::std::os::raw::c_char, ...) -> ::std::os::raw::c_int;
 }
 extern "C" {
@@ -11870,11 +12032,6 @@ extern "C" {
 		timestamp: i64,
 		flags: ::std::os::raw::c_int,
 	) -> i64;
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct AVBPrint {
-	_unused: [u8; 0],
 }
 extern "C" {
 	pub fn avio_read_to_bprint(h: *mut AVIOContext, pb: *mut AVBPrint, max_size: size_t) -> ::std::os::raw::c_int;
@@ -15602,6 +15759,12 @@ pub const CUctx_flags_enum_CU_CTX_LMEM_RESIZE_TO_MAX: CUctx_flags_enum = 16;
 pub const CUctx_flags_enum_CU_CTX_FLAGS_MASK: CUctx_flags_enum = 31;
 pub type CUctx_flags_enum = ::std::os::raw::c_uint;
 pub use self::CUctx_flags_enum as CUctx_flags;
+pub const CUevent_sched_flags_enum_CU_EVENT_SCHED_AUTO: CUevent_sched_flags_enum = 0;
+pub const CUevent_sched_flags_enum_CU_EVENT_SCHED_SPIN: CUevent_sched_flags_enum = 1;
+pub const CUevent_sched_flags_enum_CU_EVENT_SCHED_YIELD: CUevent_sched_flags_enum = 2;
+pub const CUevent_sched_flags_enum_CU_EVENT_SCHED_BLOCKING_SYNC: CUevent_sched_flags_enum = 4;
+pub type CUevent_sched_flags_enum = ::std::os::raw::c_uint;
+pub use self::CUevent_sched_flags_enum as CUevent_sched_flags;
 pub const CUstream_flags_enum_CU_STREAM_DEFAULT: CUstream_flags_enum = 0;
 pub const CUstream_flags_enum_CU_STREAM_NON_BLOCKING: CUstream_flags_enum = 1;
 pub type CUstream_flags_enum = ::std::os::raw::c_uint;
@@ -16514,6 +16677,7 @@ pub const CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_FLUSH_WRIT
 	117;
 pub const CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_GPU_DIRECT_RDMA_WRITES_ORDERING: CUdevice_attribute_enum = 118;
 pub const CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_MEMPOOL_SUPPORTED_HANDLE_TYPES: CUdevice_attribute_enum = 119;
+pub const CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_CLUSTER_LAUNCH: CUdevice_attribute_enum = 120;
 pub const CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_DEFERRED_MAPPING_CUDA_ARRAY_SUPPORTED: CUdevice_attribute_enum =
 	121;
 pub const CUdevice_attribute_enum_CU_DEVICE_ATTRIBUTE_CAN_USE_64_BIT_STREAM_MEM_OPS_V2: CUdevice_attribute_enum = 122;
@@ -16753,7 +16917,14 @@ pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_BINARY_VERSION: CUfunction
 pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_CACHE_MODE_CA: CUfunction_attribute_enum = 7;
 pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES: CUfunction_attribute_enum = 8;
 pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_PREFERRED_SHARED_MEMORY_CARVEOUT: CUfunction_attribute_enum = 9;
-pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX: CUfunction_attribute_enum = 10;
+pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_CLUSTER_SIZE_MUST_BE_SET: CUfunction_attribute_enum = 10;
+pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_WIDTH: CUfunction_attribute_enum = 11;
+pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_HEIGHT: CUfunction_attribute_enum = 12;
+pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_REQUIRED_CLUSTER_DEPTH: CUfunction_attribute_enum = 13;
+pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_NON_PORTABLE_CLUSTER_SIZE_ALLOWED: CUfunction_attribute_enum = 14;
+pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE: CUfunction_attribute_enum =
+	15;
+pub const CUfunction_attribute_enum_CU_FUNC_ATTRIBUTE_MAX: CUfunction_attribute_enum = 16;
 pub type CUfunction_attribute_enum = ::std::os::raw::c_uint;
 pub use self::CUfunction_attribute_enum as CUfunction_attribute;
 pub const CUfunc_cache_enum_CU_FUNC_CACHE_PREFER_NONE: CUfunc_cache_enum = 0;
@@ -16848,6 +17019,8 @@ pub const CUjit_target_enum_CU_TARGET_COMPUTE_75: CUjit_target_enum = 75;
 pub const CUjit_target_enum_CU_TARGET_COMPUTE_80: CUjit_target_enum = 80;
 pub const CUjit_target_enum_CU_TARGET_COMPUTE_86: CUjit_target_enum = 86;
 pub const CUjit_target_enum_CU_TARGET_COMPUTE_87: CUjit_target_enum = 87;
+pub const CUjit_target_enum_CU_TARGET_COMPUTE_89: CUjit_target_enum = 89;
+pub const CUjit_target_enum_CU_TARGET_COMPUTE_90: CUjit_target_enum = 90;
 pub type CUjit_target_enum = ::std::os::raw::c_uint;
 pub use self::CUjit_target_enum as CUjit_target;
 pub const CUjit_fallback_enum_CU_PREFER_PTX: CUjit_fallback_enum = 0;
@@ -17428,41 +17601,219 @@ pub const CUsynchronizationPolicy_enum_CU_SYNC_POLICY_YIELD: CUsynchronizationPo
 pub const CUsynchronizationPolicy_enum_CU_SYNC_POLICY_BLOCKING_SYNC: CUsynchronizationPolicy_enum = 4;
 pub type CUsynchronizationPolicy_enum = ::std::os::raw::c_uint;
 pub use self::CUsynchronizationPolicy_enum as CUsynchronizationPolicy;
-pub const CUkernelNodeAttrID_enum_CU_KERNEL_NODE_ATTRIBUTE_ACCESS_POLICY_WINDOW: CUkernelNodeAttrID_enum = 1;
-pub const CUkernelNodeAttrID_enum_CU_KERNEL_NODE_ATTRIBUTE_COOPERATIVE: CUkernelNodeAttrID_enum = 2;
-pub const CUkernelNodeAttrID_enum_CU_KERNEL_NODE_ATTRIBUTE_PRIORITY: CUkernelNodeAttrID_enum = 8;
-pub type CUkernelNodeAttrID_enum = ::std::os::raw::c_uint;
-pub use self::CUkernelNodeAttrID_enum as CUkernelNodeAttrID;
+pub const CUclusterSchedulingPolicy_enum_CU_CLUSTER_SCHEDULING_POLICY_DEFAULT: CUclusterSchedulingPolicy_enum = 0;
+pub const CUclusterSchedulingPolicy_enum_CU_CLUSTER_SCHEDULING_POLICY_SPREAD: CUclusterSchedulingPolicy_enum = 1;
+pub const CUclusterSchedulingPolicy_enum_CU_CLUSTER_SCHEDULING_POLICY_LOAD_BALANCING: CUclusterSchedulingPolicy_enum =
+	2;
+pub type CUclusterSchedulingPolicy_enum = ::std::os::raw::c_uint;
+pub use self::CUclusterSchedulingPolicy_enum as CUclusterSchedulingPolicy;
+pub const CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_IGNORE: CUlaunchAttributeID_enum = 0;
+pub const CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_ACCESS_POLICY_WINDOW: CUlaunchAttributeID_enum = 1;
+pub const CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_COOPERATIVE: CUlaunchAttributeID_enum = 2;
+pub const CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_SYNCHRONIZATION_POLICY: CUlaunchAttributeID_enum = 3;
+pub const CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_DIMENSION: CUlaunchAttributeID_enum = 4;
+pub const CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_CLUSTER_SCHEDULING_POLICY_PREFERENCE: CUlaunchAttributeID_enum =
+	5;
+pub const CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_STREAM_SERIALIZATION: CUlaunchAttributeID_enum = 6;
+pub const CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_PROGRAMMATIC_EVENT: CUlaunchAttributeID_enum = 7;
+pub const CUlaunchAttributeID_enum_CU_LAUNCH_ATTRIBUTE_PRIORITY: CUlaunchAttributeID_enum = 8;
+pub type CUlaunchAttributeID_enum = ::std::os::raw::c_uint;
+pub use self::CUlaunchAttributeID_enum as CUlaunchAttributeID;
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub union CUkernelNodeAttrValue_union {
+pub union CUlaunchAttributeValue_union {
+	pub pad: [::std::os::raw::c_char; 64usize],
 	pub accessPolicyWindow: CUaccessPolicyWindow,
 	pub cooperative: ::std::os::raw::c_int,
+	pub syncPolicy: CUsynchronizationPolicy,
+	pub clusterDim: CUlaunchAttributeValue_union__bindgen_ty_1,
+	pub clusterSchedulingPolicyPreference: CUclusterSchedulingPolicy,
+	pub programmaticStreamSerializationAllowed: ::std::os::raw::c_int,
+	pub programmaticEvent: CUlaunchAttributeValue_union__bindgen_ty_2,
 	pub priority: ::std::os::raw::c_int,
 }
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct CUlaunchAttributeValue_union__bindgen_ty_1 {
+	pub x: ::std::os::raw::c_uint,
+	pub y: ::std::os::raw::c_uint,
+	pub z: ::std::os::raw::c_uint,
+}
 #[test]
-fn bindgen_test_layout_CUkernelNodeAttrValue_union() {
+fn bindgen_test_layout_CUlaunchAttributeValue_union__bindgen_ty_1() {
 	assert_eq!(
-		::std::mem::size_of::<CUkernelNodeAttrValue_union>(),
-		32usize,
-		concat!("Size of: ", stringify!(CUkernelNodeAttrValue_union))
+		::std::mem::size_of::<CUlaunchAttributeValue_union__bindgen_ty_1>(),
+		12usize,
+		concat!("Size of: ", stringify!(CUlaunchAttributeValue_union__bindgen_ty_1))
 	);
 	assert_eq!(
-		::std::mem::align_of::<CUkernelNodeAttrValue_union>(),
+		::std::mem::align_of::<CUlaunchAttributeValue_union__bindgen_ty_1>(),
+		4usize,
+		concat!("Alignment of ", stringify!(CUlaunchAttributeValue_union__bindgen_ty_1))
+	);
+	fn test_field_x() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union__bindgen_ty_1>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).x) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union__bindgen_ty_1),
+				"::",
+				stringify!(x)
+			)
+		);
+	}
+	test_field_x();
+	fn test_field_y() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union__bindgen_ty_1>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).y) as usize - ptr as usize
+			},
+			4usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union__bindgen_ty_1),
+				"::",
+				stringify!(y)
+			)
+		);
+	}
+	test_field_y();
+	fn test_field_z() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union__bindgen_ty_1>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).z) as usize - ptr as usize
+			},
+			8usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union__bindgen_ty_1),
+				"::",
+				stringify!(z)
+			)
+		);
+	}
+	test_field_z();
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct CUlaunchAttributeValue_union__bindgen_ty_2 {
+	pub event: CUevent,
+	pub flags: ::std::os::raw::c_int,
+	pub triggerAtBlockStart: ::std::os::raw::c_int,
+}
+#[test]
+fn bindgen_test_layout_CUlaunchAttributeValue_union__bindgen_ty_2() {
+	assert_eq!(
+		::std::mem::size_of::<CUlaunchAttributeValue_union__bindgen_ty_2>(),
+		16usize,
+		concat!("Size of: ", stringify!(CUlaunchAttributeValue_union__bindgen_ty_2))
+	);
+	assert_eq!(
+		::std::mem::align_of::<CUlaunchAttributeValue_union__bindgen_ty_2>(),
 		8usize,
-		concat!("Alignment of ", stringify!(CUkernelNodeAttrValue_union))
+		concat!("Alignment of ", stringify!(CUlaunchAttributeValue_union__bindgen_ty_2))
 	);
+	fn test_field_event() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union__bindgen_ty_2>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).event) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union__bindgen_ty_2),
+				"::",
+				stringify!(event)
+			)
+		);
+	}
+	test_field_event();
+	fn test_field_flags() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union__bindgen_ty_2>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).flags) as usize - ptr as usize
+			},
+			8usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union__bindgen_ty_2),
+				"::",
+				stringify!(flags)
+			)
+		);
+	}
+	test_field_flags();
+	fn test_field_triggerAtBlockStart() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union__bindgen_ty_2>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).triggerAtBlockStart) as usize - ptr as usize
+			},
+			12usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union__bindgen_ty_2),
+				"::",
+				stringify!(triggerAtBlockStart)
+			)
+		);
+	}
+	test_field_triggerAtBlockStart();
+}
+#[test]
+fn bindgen_test_layout_CUlaunchAttributeValue_union() {
+	assert_eq!(
+		::std::mem::size_of::<CUlaunchAttributeValue_union>(),
+		64usize,
+		concat!("Size of: ", stringify!(CUlaunchAttributeValue_union))
+	);
+	assert_eq!(
+		::std::mem::align_of::<CUlaunchAttributeValue_union>(),
+		8usize,
+		concat!("Alignment of ", stringify!(CUlaunchAttributeValue_union))
+	);
+	fn test_field_pad() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).pad) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union),
+				"::",
+				stringify!(pad)
+			)
+		);
+	}
+	test_field_pad();
 	fn test_field_accessPolicyWindow() {
 		assert_eq!(
 			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<CUkernelNodeAttrValue_union>::uninit();
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union>::uninit();
 				let ptr = uninit.as_ptr();
 				::std::ptr::addr_of!((*ptr).accessPolicyWindow) as usize - ptr as usize
 			},
 			0usize,
 			concat!(
 				"Offset of field: ",
-				stringify!(CUkernelNodeAttrValue_union),
+				stringify!(CUlaunchAttributeValue_union),
 				"::",
 				stringify!(accessPolicyWindow)
 			)
@@ -17472,31 +17823,116 @@ fn bindgen_test_layout_CUkernelNodeAttrValue_union() {
 	fn test_field_cooperative() {
 		assert_eq!(
 			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<CUkernelNodeAttrValue_union>::uninit();
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union>::uninit();
 				let ptr = uninit.as_ptr();
 				::std::ptr::addr_of!((*ptr).cooperative) as usize - ptr as usize
 			},
 			0usize,
 			concat!(
 				"Offset of field: ",
-				stringify!(CUkernelNodeAttrValue_union),
+				stringify!(CUlaunchAttributeValue_union),
 				"::",
 				stringify!(cooperative)
 			)
 		);
 	}
 	test_field_cooperative();
+	fn test_field_syncPolicy() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).syncPolicy) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union),
+				"::",
+				stringify!(syncPolicy)
+			)
+		);
+	}
+	test_field_syncPolicy();
+	fn test_field_clusterDim() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).clusterDim) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union),
+				"::",
+				stringify!(clusterDim)
+			)
+		);
+	}
+	test_field_clusterDim();
+	fn test_field_clusterSchedulingPolicyPreference() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).clusterSchedulingPolicyPreference) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union),
+				"::",
+				stringify!(clusterSchedulingPolicyPreference)
+			)
+		);
+	}
+	test_field_clusterSchedulingPolicyPreference();
+	fn test_field_programmaticStreamSerializationAllowed() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).programmaticStreamSerializationAllowed) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union),
+				"::",
+				stringify!(programmaticStreamSerializationAllowed)
+			)
+		);
+	}
+	test_field_programmaticStreamSerializationAllowed();
+	fn test_field_programmaticEvent() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).programmaticEvent) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttributeValue_union),
+				"::",
+				stringify!(programmaticEvent)
+			)
+		);
+	}
+	test_field_programmaticEvent();
 	fn test_field_priority() {
 		assert_eq!(
 			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<CUkernelNodeAttrValue_union>::uninit();
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttributeValue_union>::uninit();
 				let ptr = uninit.as_ptr();
 				::std::ptr::addr_of!((*ptr).priority) as usize - ptr as usize
 			},
 			0usize,
 			concat!(
 				"Offset of field: ",
-				stringify!(CUkernelNodeAttrValue_union),
+				stringify!(CUlaunchAttributeValue_union),
 				"::",
 				stringify!(priority)
 			)
@@ -17504,7 +17940,279 @@ fn bindgen_test_layout_CUkernelNodeAttrValue_union() {
 	}
 	test_field_priority();
 }
-pub type CUkernelNodeAttrValue_v1 = CUkernelNodeAttrValue_union;
+pub type CUlaunchAttributeValue = CUlaunchAttributeValue_union;
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CUlaunchAttribute_st {
+	pub id: CUlaunchAttributeID,
+	pub pad: [::std::os::raw::c_char; 4usize],
+	pub value: CUlaunchAttributeValue,
+}
+#[test]
+fn bindgen_test_layout_CUlaunchAttribute_st() {
+	assert_eq!(
+		::std::mem::size_of::<CUlaunchAttribute_st>(),
+		72usize,
+		concat!("Size of: ", stringify!(CUlaunchAttribute_st))
+	);
+	assert_eq!(
+		::std::mem::align_of::<CUlaunchAttribute_st>(),
+		8usize,
+		concat!("Alignment of ", stringify!(CUlaunchAttribute_st))
+	);
+	fn test_field_id() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttribute_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).id) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttribute_st),
+				"::",
+				stringify!(id)
+			)
+		);
+	}
+	test_field_id();
+	fn test_field_pad() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttribute_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).pad) as usize - ptr as usize
+			},
+			4usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttribute_st),
+				"::",
+				stringify!(pad)
+			)
+		);
+	}
+	test_field_pad();
+	fn test_field_value() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchAttribute_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).value) as usize - ptr as usize
+			},
+			8usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchAttribute_st),
+				"::",
+				stringify!(value)
+			)
+		);
+	}
+	test_field_value();
+}
+pub type CUlaunchAttribute = CUlaunchAttribute_st;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct CUlaunchConfig_st {
+	pub gridDimX: ::std::os::raw::c_uint,
+	pub gridDimY: ::std::os::raw::c_uint,
+	pub gridDimZ: ::std::os::raw::c_uint,
+	pub blockDimX: ::std::os::raw::c_uint,
+	pub blockDimY: ::std::os::raw::c_uint,
+	pub blockDimZ: ::std::os::raw::c_uint,
+	pub sharedMemBytes: ::std::os::raw::c_uint,
+	pub hStream: CUstream,
+	pub attrs: *mut CUlaunchAttribute,
+	pub numAttrs: ::std::os::raw::c_uint,
+}
+#[test]
+fn bindgen_test_layout_CUlaunchConfig_st() {
+	assert_eq!(
+		::std::mem::size_of::<CUlaunchConfig_st>(),
+		56usize,
+		concat!("Size of: ", stringify!(CUlaunchConfig_st))
+	);
+	assert_eq!(
+		::std::mem::align_of::<CUlaunchConfig_st>(),
+		8usize,
+		concat!("Alignment of ", stringify!(CUlaunchConfig_st))
+	);
+	fn test_field_gridDimX() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).gridDimX) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(gridDimX)
+			)
+		);
+	}
+	test_field_gridDimX();
+	fn test_field_gridDimY() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).gridDimY) as usize - ptr as usize
+			},
+			4usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(gridDimY)
+			)
+		);
+	}
+	test_field_gridDimY();
+	fn test_field_gridDimZ() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).gridDimZ) as usize - ptr as usize
+			},
+			8usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(gridDimZ)
+			)
+		);
+	}
+	test_field_gridDimZ();
+	fn test_field_blockDimX() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).blockDimX) as usize - ptr as usize
+			},
+			12usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(blockDimX)
+			)
+		);
+	}
+	test_field_blockDimX();
+	fn test_field_blockDimY() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).blockDimY) as usize - ptr as usize
+			},
+			16usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(blockDimY)
+			)
+		);
+	}
+	test_field_blockDimY();
+	fn test_field_blockDimZ() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).blockDimZ) as usize - ptr as usize
+			},
+			20usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(blockDimZ)
+			)
+		);
+	}
+	test_field_blockDimZ();
+	fn test_field_sharedMemBytes() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).sharedMemBytes) as usize - ptr as usize
+			},
+			24usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(sharedMemBytes)
+			)
+		);
+	}
+	test_field_sharedMemBytes();
+	fn test_field_hStream() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).hStream) as usize - ptr as usize
+			},
+			32usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(hStream)
+			)
+		);
+	}
+	test_field_hStream();
+	fn test_field_attrs() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).attrs) as usize - ptr as usize
+			},
+			40usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(attrs)
+			)
+		);
+	}
+	test_field_attrs();
+	fn test_field_numAttrs() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<CUlaunchConfig_st>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).numAttrs) as usize - ptr as usize
+			},
+			48usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(CUlaunchConfig_st),
+				"::",
+				stringify!(numAttrs)
+			)
+		);
+	}
+	test_field_numAttrs();
+}
+pub type CUlaunchConfig = CUlaunchConfig_st;
+pub use self::CUlaunchAttributeID as CUkernelNodeAttrID;
+pub type CUkernelNodeAttrValue_v1 = CUlaunchAttributeValue;
 pub type CUkernelNodeAttrValue = CUkernelNodeAttrValue_v1;
 pub const CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_NONE: CUstreamCaptureStatus_enum = 0;
 pub const CUstreamCaptureStatus_enum_CU_STREAM_CAPTURE_STATUS_ACTIVE: CUstreamCaptureStatus_enum = 1;
@@ -17515,65 +18223,9 @@ pub const CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_GLOBAL: CUstreamCaptur
 pub const CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_THREAD_LOCAL: CUstreamCaptureMode_enum = 1;
 pub const CUstreamCaptureMode_enum_CU_STREAM_CAPTURE_MODE_RELAXED: CUstreamCaptureMode_enum = 2;
 pub type CUstreamCaptureMode_enum = ::std::os::raw::c_uint;
+pub use self::CUlaunchAttributeID as CUstreamAttrID;
 pub use self::CUstreamCaptureMode_enum as CUstreamCaptureMode;
-pub const CUstreamAttrID_enum_CU_STREAM_ATTRIBUTE_ACCESS_POLICY_WINDOW: CUstreamAttrID_enum = 1;
-pub const CUstreamAttrID_enum_CU_STREAM_ATTRIBUTE_SYNCHRONIZATION_POLICY: CUstreamAttrID_enum = 3;
-pub type CUstreamAttrID_enum = ::std::os::raw::c_uint;
-pub use self::CUstreamAttrID_enum as CUstreamAttrID;
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub union CUstreamAttrValue_union {
-	pub accessPolicyWindow: CUaccessPolicyWindow,
-	pub syncPolicy: CUsynchronizationPolicy,
-}
-#[test]
-fn bindgen_test_layout_CUstreamAttrValue_union() {
-	assert_eq!(
-		::std::mem::size_of::<CUstreamAttrValue_union>(),
-		32usize,
-		concat!("Size of: ", stringify!(CUstreamAttrValue_union))
-	);
-	assert_eq!(
-		::std::mem::align_of::<CUstreamAttrValue_union>(),
-		8usize,
-		concat!("Alignment of ", stringify!(CUstreamAttrValue_union))
-	);
-	fn test_field_accessPolicyWindow() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<CUstreamAttrValue_union>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).accessPolicyWindow) as usize - ptr as usize
-			},
-			0usize,
-			concat!(
-				"Offset of field: ",
-				stringify!(CUstreamAttrValue_union),
-				"::",
-				stringify!(accessPolicyWindow)
-			)
-		);
-	}
-	test_field_accessPolicyWindow();
-	fn test_field_syncPolicy() {
-		assert_eq!(
-			unsafe {
-				let uninit = ::std::mem::MaybeUninit::<CUstreamAttrValue_union>::uninit();
-				let ptr = uninit.as_ptr();
-				::std::ptr::addr_of!((*ptr).syncPolicy) as usize - ptr as usize
-			},
-			0usize,
-			concat!(
-				"Offset of field: ",
-				stringify!(CUstreamAttrValue_union),
-				"::",
-				stringify!(syncPolicy)
-			)
-		);
-	}
-	test_field_syncPolicy();
-}
-pub type CUstreamAttrValue_v1 = CUstreamAttrValue_union;
+pub type CUstreamAttrValue_v1 = CUlaunchAttributeValue;
 pub type CUstreamAttrValue = CUstreamAttrValue_v1;
 pub const CUdriverProcAddress_flags_enum_CU_GET_PROC_ADDRESS_DEFAULT: CUdriverProcAddress_flags_enum = 0;
 pub const CUdriverProcAddress_flags_enum_CU_GET_PROC_ADDRESS_LEGACY_STREAM: CUdriverProcAddress_flags_enum = 1;
@@ -17787,6 +18439,7 @@ pub const cudaError_enum_CUDA_ERROR_MPS_RPC_FAILURE: cudaError_enum = 806;
 pub const cudaError_enum_CUDA_ERROR_MPS_SERVER_NOT_READY: cudaError_enum = 807;
 pub const cudaError_enum_CUDA_ERROR_MPS_MAX_CLIENTS_REACHED: cudaError_enum = 808;
 pub const cudaError_enum_CUDA_ERROR_MPS_MAX_CONNECTIONS_REACHED: cudaError_enum = 809;
+pub const cudaError_enum_CUDA_ERROR_MPS_CLIENT_TERMINATED: cudaError_enum = 810;
 pub const cudaError_enum_CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED: cudaError_enum = 900;
 pub const cudaError_enum_CUDA_ERROR_STREAM_CAPTURE_INVALIDATED: cudaError_enum = 901;
 pub const cudaError_enum_CUDA_ERROR_STREAM_CAPTURE_MERGE: cudaError_enum = 902;
@@ -17799,6 +18452,7 @@ pub const cudaError_enum_CUDA_ERROR_STREAM_CAPTURE_WRONG_THREAD: cudaError_enum 
 pub const cudaError_enum_CUDA_ERROR_TIMEOUT: cudaError_enum = 909;
 pub const cudaError_enum_CUDA_ERROR_GRAPH_EXEC_UPDATE_FAILURE: cudaError_enum = 910;
 pub const cudaError_enum_CUDA_ERROR_EXTERNAL_DEVICE: cudaError_enum = 911;
+pub const cudaError_enum_CUDA_ERROR_INVALID_CLUSTER_SIZE: cudaError_enum = 912;
 pub const cudaError_enum_CUDA_ERROR_UNKNOWN: cudaError_enum = 999;
 pub type cudaError_enum = ::std::os::raw::c_uint;
 pub use self::cudaError_enum as CUresult;
@@ -23738,6 +24392,13 @@ extern "C" {
 extern "C" {
 	pub fn cuModuleUnload(hmod: CUmodule) -> CUresult;
 }
+pub const CUmoduleLoadingMode_enum_CU_MODULE_EAGER_LOADING: CUmoduleLoadingMode_enum = 1;
+pub const CUmoduleLoadingMode_enum_CU_MODULE_LAZY_LOADING: CUmoduleLoadingMode_enum = 2;
+pub type CUmoduleLoadingMode_enum = ::std::os::raw::c_uint;
+pub use self::CUmoduleLoadingMode_enum as CUmoduleLoadingMode;
+extern "C" {
+	pub fn cuModuleGetLoadingMode(mode: *mut CUmoduleLoadingMode) -> CUresult;
+}
 extern "C" {
 	pub fn cuModuleGetFunction(hfunc: *mut CUfunction, hmod: CUmodule, name: *const ::std::os::raw::c_char)
 		-> CUresult;
@@ -24168,6 +24829,15 @@ extern "C" {
 }
 extern "C" {
 	pub fn cuMipmappedArrayDestroy(hMipmappedArray: CUmipmappedArray) -> CUresult;
+}
+extern "C" {
+	pub fn cuMemGetHandleForAddressRange(
+		handle: *mut ::std::os::raw::c_void,
+		dptr: CUdeviceptr,
+		size: size_t,
+		handleType: CUmemRangeHandleType,
+		flags: ::std::os::raw::c_ulonglong,
+	) -> CUresult;
 }
 extern "C" {
 	pub fn cuMemAddressReserve(
@@ -24652,6 +25322,14 @@ extern "C" {
 		blockDimZ: ::std::os::raw::c_uint,
 		sharedMemBytes: ::std::os::raw::c_uint,
 		hStream: CUstream,
+		kernelParams: *mut *mut ::std::os::raw::c_void,
+		extra: *mut *mut ::std::os::raw::c_void,
+	) -> CUresult;
+}
+extern "C" {
+	pub fn cuLaunchKernelEx(
+		config: *const CUlaunchConfig,
+		f: CUfunction,
 		kernelParams: *mut *mut ::std::os::raw::c_void,
 		extra: *mut *mut ::std::os::raw::c_void,
 	) -> CUresult;
@@ -25219,6 +25897,20 @@ extern "C" {
 	) -> CUresult;
 }
 extern "C" {
+	pub fn cuOccupancyMaxPotentialClusterSize(
+		clusterSize: *mut ::std::os::raw::c_int,
+		func: CUfunction,
+		config: *const CUlaunchConfig,
+	) -> CUresult;
+}
+extern "C" {
+	pub fn cuOccupancyMaxActiveClusters(
+		numClusters: *mut ::std::os::raw::c_int,
+		func: CUfunction,
+		config: *const CUlaunchConfig,
+	) -> CUresult;
+}
+extern "C" {
 	pub fn cuTexRefSetArray(hTexRef: CUtexref, hArray: CUarray, Flags: ::std::os::raw::c_uint) -> CUresult;
 }
 extern "C" {
@@ -25437,22 +26129,6 @@ extern "C" {
 		flags: cuuint64_t,
 	) -> CUresult;
 }
-pub const CUmoduleLoadingMode_enum_CU_MODULE_EAGER_LOADING: CUmoduleLoadingMode_enum = 1;
-pub const CUmoduleLoadingMode_enum_CU_MODULE_LAZY_LOADING: CUmoduleLoadingMode_enum = 2;
-pub type CUmoduleLoadingMode_enum = ::std::os::raw::c_uint;
-pub use self::CUmoduleLoadingMode_enum as CUmoduleLoadingMode;
-extern "C" {
-	pub fn cuModuleGetLoadingMode(mode: *mut CUmoduleLoadingMode) -> CUresult;
-}
-extern "C" {
-	pub fn cuMemGetHandleForAddressRange(
-		handle: *mut ::std::os::raw::c_void,
-		dptr: CUdeviceptr,
-		size: size_t,
-		handleType: CUmemRangeHandleType,
-		flags: ::std::os::raw::c_ulonglong,
-	) -> CUresult;
-}
 extern "C" {
 	pub fn cuGetExportTable(
 		ppExportTable: *mut *const ::std::os::raw::c_void,
@@ -25554,6 +26230,7 @@ pub const AVOptionType_AV_OPT_TYPE_DURATION: AVOptionType = 15;
 pub const AVOptionType_AV_OPT_TYPE_COLOR: AVOptionType = 16;
 pub const AVOptionType_AV_OPT_TYPE_CHANNEL_LAYOUT: AVOptionType = 17;
 pub const AVOptionType_AV_OPT_TYPE_BOOL: AVOptionType = 18;
+pub const AVOptionType_AV_OPT_TYPE_CHLAYOUT: AVOptionType = 19;
 pub type AVOptionType = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -26194,6 +26871,14 @@ extern "C" {
 	) -> ::std::os::raw::c_int;
 }
 extern "C" {
+	pub fn av_opt_set_chlayout(
+		obj: *mut ::std::os::raw::c_void,
+		name: *const ::std::os::raw::c_char,
+		layout: *const AVChannelLayout,
+		search_flags: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
 	pub fn av_opt_set_dict_val(
 		obj: *mut ::std::os::raw::c_void,
 		name: *const ::std::os::raw::c_char,
@@ -26275,6 +26960,14 @@ extern "C" {
 	) -> ::std::os::raw::c_int;
 }
 extern "C" {
+	pub fn av_opt_get_chlayout(
+		obj: *mut ::std::os::raw::c_void,
+		name: *const ::std::os::raw::c_char,
+		search_flags: ::std::os::raw::c_int,
+		layout: *mut AVChannelLayout,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
 	pub fn av_opt_get_dict_val(
 		obj: *mut ::std::os::raw::c_void,
 		name: *const ::std::os::raw::c_char,
@@ -26330,6 +27023,12 @@ extern "C" {
 		key_val_sep: ::std::os::raw::c_char,
 		pairs_sep: ::std::os::raw::c_char,
 	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn ff_rtp_get_local_rtp_port(h: *mut URLContext) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn ff_rtp_get_local_rtcp_port(h: *mut URLContext) -> ::std::os::raw::c_int;
 }
 pub type __builtin_va_list = [__va_list_tag; 1usize];
 #[repr(C)]
@@ -26420,11 +27119,6 @@ fn bindgen_test_layout___va_list_tag() {
 		);
 	}
 	test_field_reg_save_area();
-}
-#[repr(C)]
-#[derive(Debug, Copy, Clone)]
-pub struct AVCodecHWConfigInternal {
-	pub _address: u8,
 }
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
