@@ -11,7 +11,7 @@ pub(super) struct Muxer {
 
 impl Muxer {
 	pub(super) fn new(port: u16, codec: &Codec) -> Result<Self, ()> {
-		let url = format!("rtp://localhost:port");
+		let url = format!("rtp://localhost:{}", port);
 
 		unsafe {
 			let format_context = ffmpeg_sys::avformat_alloc_context();

@@ -214,7 +214,7 @@ fn handle_setup_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> Re
 				return Ok(rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 					.header(headers::CSEQ, cseq.to_string())
 					.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
-					.header(headers::TRANSPORT, format!("RTP/AVP/UDP;unicast;{}-{};server_port=2001", rtp_port, rtc_port))
+					.header(headers::TRANSPORT, format!("RTP/AVP/UDP;unicast;client_port={}-{};server_port=2001", rtp_port, rtc_port))
 					.build(Vec::new())
 				);
 			}
