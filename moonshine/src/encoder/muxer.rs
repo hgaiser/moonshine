@@ -25,7 +25,6 @@ impl Muxer {
 
 			format_context.oformat = Self::create_format()?;
 
-			// TODO: Delete this, we don't want to write to a file.
 			check_ret(ffmpeg_sys::avio_open(
 				&mut format_context.pb,
 				to_c_str(url.as_str())?
@@ -36,8 +35,25 @@ impl Muxer {
 			check_ret(ffmpeg_sys::avformat_write_header(format_context, null_mut()))
 				.map_err(|e| log::error!("Failed to write output header: {}", e))?;
 
-			let url_context = (*format_context.pb).opaque as *mut URLContext;
-			log::info!("URLContext address: {:?}", CStr::from_ptr(&mut (*url_context)._address as *mut u8 as *mut i8));
+			let mut rtp_port: i64 = 0;
+			check_ret(ffmpeg_sys::av_opt_get_int(
+					format_context.pb as *mut ffmpeg_sys::AVIOContext as *mut ::std::os::raw::c_void,
+					to_c_str("local_rtpport")?.as_ptr(),
+					ffmpeg_sys::AV_OPT_SEARCH_CHILDREN as i32,
+					&mut rtp_port as *mut i64
+				))
+				.map_err(|e| log::error!("Failed to find local RTP port in format context."))?;
+
+			let mut rtcp_port: i64 = 0;
+			check_ret(ffmpeg_sys::av_opt_get_int(
+					format_context.pb as *mut ffmpeg_sys::AVIOContext as *mut ::std::os::raw::c_void,
+					to_c_str("local_rtcpport")?.as_ptr(),
+					ffmpeg_sys::AV_OPT_SEARCH_CHILDREN as i32,
+					&mut rtcp_port as *mut i64
+				))
+				.map_err(|e| log::error!("Failed to find local RTCP port in format context."))?;
+
+			log::info!("Local ports: {}-{}", rtp_port, rtcp_port);
 
 			Ok(Self { format_context, video_stream })
 		}

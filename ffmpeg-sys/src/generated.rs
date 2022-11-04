@@ -27024,12 +27024,6 @@ extern "C" {
 		pairs_sep: ::std::os::raw::c_char,
 	) -> ::std::os::raw::c_int;
 }
-extern "C" {
-	pub fn ff_rtp_get_local_rtp_port(h: *mut URLContext) -> ::std::os::raw::c_int;
-}
-extern "C" {
-	pub fn ff_rtp_get_local_rtcp_port(h: *mut URLContext) -> ::std::os::raw::c_int;
-}
 pub type __builtin_va_list = [__va_list_tag; 1usize];
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
