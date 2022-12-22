@@ -98,8 +98,21 @@ impl NvencEncoder {
 		Ok(())
 	}
 
+	pub fn start(&self) -> Result<(), ()> {
+		self.muxer.start()?;
+		Ok(())
+	}
+
 	pub fn stop(&self) -> Result<(), ()> {
 		self.muxer.stop()?;
 		Ok(())
+	}
+
+	pub fn local_rtp_port(&self) -> i64 {
+		self.muxer.local_rtp_port()
+	}
+
+	pub fn local_rtcp_port(&self) -> i64 {
+		self.muxer.local_rtcp_port()
 	}
 }

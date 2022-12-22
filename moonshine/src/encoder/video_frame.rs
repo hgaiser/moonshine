@@ -50,6 +50,9 @@ impl VideoFrame {
 	}
 }
 
+unsafe impl Send for VideoFrame {}
+unsafe impl Sync for VideoFrame {}
+
 // impl Drop for VideoFrame {
 // 	fn drop(&mut self) {
 // 		unsafe {

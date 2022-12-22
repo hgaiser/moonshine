@@ -182,6 +182,9 @@ impl Codec {
 	}
 }
 
+unsafe impl Send for Codec {}
+unsafe impl Sync for Codec {}
+
 impl Drop for Codec {
 	fn drop(&mut self) {
 		unsafe { ffmpeg_sys::avcodec_free_context(&mut self.codec_context); };

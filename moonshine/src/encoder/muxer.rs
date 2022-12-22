@@ -7,6 +7,9 @@ use super::{to_c_str, check_ret, codec::Codec};
 pub(super) struct Muxer {
 	format_context: *mut ffmpeg_sys::AVFormatContext,
 	video_stream: *const ffmpeg_sys::AVStream,
+
+	local_rtp_port: i64,
+	local_rtcp_port: i64,
 }
 
 impl Muxer {
@@ -32,30 +35,26 @@ impl Muxer {
 				ffmpeg_sys::AVIO_FLAG_WRITE as i32
 			))
 				.map_err(|e| log::error!("Failed to open output file: {}", e))?;
-			check_ret(ffmpeg_sys::avformat_write_header(format_context, null_mut()))
-				.map_err(|e| log::error!("Failed to write output header: {}", e))?;
 
-			let mut rtp_port: i64 = 0;
+			let mut local_rtp_port: i64 = 0;
 			check_ret(ffmpeg_sys::av_opt_get_int(
 					format_context.pb as *mut ffmpeg_sys::AVIOContext as *mut ::std::os::raw::c_void,
 					to_c_str("local_rtpport")?.as_ptr(),
 					ffmpeg_sys::AV_OPT_SEARCH_CHILDREN as i32,
-					&mut rtp_port as *mut i64
+					&mut local_rtp_port as *mut i64
 				))
 				.map_err(|e| log::error!("Failed to find local RTP port in format context."))?;
 
-			let mut rtcp_port: i64 = 0;
+			let mut local_rtcp_port: i64 = 0;
 			check_ret(ffmpeg_sys::av_opt_get_int(
 					format_context.pb as *mut ffmpeg_sys::AVIOContext as *mut ::std::os::raw::c_void,
 					to_c_str("local_rtcpport")?.as_ptr(),
 					ffmpeg_sys::AV_OPT_SEARCH_CHILDREN as i32,
-					&mut rtcp_port as *mut i64
+					&mut local_rtcp_port as *mut i64
 				))
 				.map_err(|e| log::error!("Failed to find local RTCP port in format context."))?;
 
-			log::info!("Local ports: {}-{}", rtp_port, rtcp_port);
-
-			Ok(Self { format_context, video_stream })
+			Ok(Self { format_context, video_stream, local_rtp_port, local_rtcp_port })
 		}
 	}
 
@@ -88,6 +87,15 @@ impl Muxer {
 		}
 	}
 
+	pub(super) fn start(&self) -> Result<(), ()> {
+		unsafe {
+			check_ret(ffmpeg_sys::avformat_write_header(self.format_context, null_mut()))
+				.map_err(|e| log::error!("Failed to write output header: {}", e))?;
+		}
+
+		Ok(())
+	}
+
 	pub(super) fn stop(&self) -> Result<(), ()> {
 		unsafe {
 			check_ret(ffmpeg_sys::av_write_trailer(self.as_ptr()))
@@ -103,6 +111,14 @@ impl Muxer {
 		self.video_stream
 	}
 
+	pub(super) fn local_rtp_port(&self) -> i64 {
+		self.local_rtp_port
+	}
+
+	pub(super) fn local_rtcp_port(&self) -> i64 {
+		self.local_rtcp_port
+	}
+
 	pub(super) fn as_ptr(&self) -> *mut ffmpeg_sys::AVFormatContext {
 		self.format_context
 	}
@@ -111,6 +127,9 @@ impl Muxer {
 		&*self.format_context
 	}
 }
+
+unsafe impl Send for Muxer {}
+unsafe impl Sync for Muxer {}
 
 impl Drop for Muxer {
 	fn drop(&mut self) {

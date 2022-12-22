@@ -1,10 +1,17 @@
-use std::net::{ToSocketAddrs, SocketAddr};
+use std::{net::{ToSocketAddrs, SocketAddr}, sync::{Mutex, Arc}};
 
 use nvfbc::{CudaCapturer, cuda::CaptureMethod, BufferFormat};
 use rtsp_types::{Method, headers::{self, Transport}, Response, Empty};
 use tokio::{net::TcpListener, io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt}};
 
 use crate::{encoder::{NvencEncoder, VideoQuality, CodecType}, cuda};
+
+struct Session {
+	capturer: CudaCapturer,
+	encoder: NvencEncoder,
+}
+
+unsafe impl Send for Session {}
 
 pub async fn run(address: String, port: u16) -> Result<(), ()> {
 	let address = (address.clone(), port).to_socket_addrs()
@@ -31,7 +38,9 @@ async fn handle_connection<C>(mut connection: C, address: SocketAddr) -> Result<
 where
 	C: AsyncRead + AsyncReadExt + AsyncWrite + AsyncWriteExt + Unpin + 'static,
 {
+	let session: Arc<Mutex<Option<Session>>> = Arc::new(Mutex::new(None));
 	loop {
+		let session = session.clone();
 		let mut buffer = [0u8; 1024];
 		connection.read(&mut buffer).await
 			.map_err(|e| log::error!("Failed to read from connection '{}': {}", address, e))?;
@@ -42,7 +51,7 @@ where
 		log::trace!("Consumed {} bytes into RTSP request: {:#?}", consumed, message);
 
 		let response = match message {
-			rtsp_types::Message::Request(ref request) => handle_request(request).await,
+			rtsp_types::Message::Request(ref request) => handle_request(request, session).await,
 			_ => {
 				log::error!("Unknown RTSP message type received");
 				Err(())
@@ -61,7 +70,10 @@ where
 	}
 }
 
-async fn handle_request(request: &rtsp_types::Request<Vec<u8>>) -> Result<Response<Vec<u8>>, ()> {
+async fn handle_request(
+	request: &rtsp_types::Request<Vec<u8>>,
+	session: Arc<Mutex<Option<Session>>>
+) -> Result<Response<Vec<u8>>, ()> {
 	log::debug!("Received RTSP {:?} request", request.method());
 
 	let cseq: i32 = request.header(&headers::CSEQ)
@@ -74,8 +86,8 @@ async fn handle_request(request: &rtsp_types::Request<Vec<u8>>) -> Result<Respon
 	match request.method() {
 		Method::Options => Ok(handle_options_request(request, cseq)),
 		Method::Describe => handle_describe_request(request, cseq),
-		Method::Setup => handle_setup_request(request, cseq),
-		Method::Play => Ok(handle_play_request(request, cseq)),
+		Method::Setup => handle_setup_request(request, cseq, session),
+		Method::Play => handle_play_request(request, cseq, session),
 		method => {
 			log::error!("Received request with unsupported method {:?}", method);
 			Err(())
@@ -147,7 +159,11 @@ fn handle_describe_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) ->
 	)
 }
 
-fn handle_setup_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
+fn handle_setup_request(
+	request: &rtsp_types::Request<Vec<u8>>,
+	cseq: i32,
+	session: Arc<Mutex<Option<Session>>>,
+) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
 	let transports = request
 		.typed_header::<rtsp_types::headers::Transports>()
 		.map_err(|e| {
@@ -160,61 +176,51 @@ fn handle_setup_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> Re
 			Transport::Rtp(transport) => {
 				let (rtp_port, rtcp_port) = transport.params.client_port
 					.ok_or_else(|| log::error!("No client_port in SETUP request."))?;
-				let rtc_port = rtcp_port.ok_or_else(|| log::error!("No RTC port in SETUP request."))?;
+				let rtcp_port = rtcp_port.ok_or_else(|| log::error!("No RTC port in SETUP request."))?;
 
 				// rtp_port = ffmpeg_sys::ff_rtp_get_local_rtp_port(rtp_c->rtp_handles[stream_index]);
 				// rtcp_port = ffmpeg_sys::ff_rtp_get_local_rtcp_port(rtp_c->rtp_handles[stream_index]);
 
-				log::info!("Client port: {}-{}", rtp_port, rtc_port);
+				log::info!("Client port: {}-{}", rtp_port, rtcp_port);
 
-				tokio::spawn(async move {
-					let cuda_context = cuda::init_cuda(0)
-						.map_err(|e| log::error!("Failed to initialize CUDA: {}", e)).unwrap();
+				let cuda_context = cuda::init_cuda(0)
+					.map_err(|e| log::error!("Failed to initialize CUDA: {}", e)).unwrap();
 
-					// Create a capturer that captures to CUDA context.
-					let mut capturer = CudaCapturer::new()
-						.map_err(|e| log::error!("Failed to create CUDA capture device: {}", e)).unwrap();
+				// Create a capturer that captures to CUDA context.
+				let mut capturer = CudaCapturer::new()
+					.map_err(|e| log::error!("Failed to create CUDA capture device: {}", e)).unwrap();
 
-					let status = capturer.status()
-						.map_err(|e| log::error!("Failed to get capturer status: {}", e)).unwrap();
-					println!("{:#?}", status);
-					if !status.can_create_now {
-						panic!("Can't create a CUDA capture session.");
-					}
+				let status = capturer.status()
+					.map_err(|e| log::error!("Failed to get capturer status: {}", e)).unwrap();
+				println!("{:#?}", status);
+				if !status.can_create_now {
+					panic!("Can't create a CUDA capture session.");
+				}
 
-					let width = status.screen_size.w;
-					let height = status.screen_size.h;
-					let fps = 60;
+				let width = status.screen_size.w;
+				let height = status.screen_size.h;
 
-					capturer.start(BufferFormat::Bgra, fps)
-						.map_err(|e| log::error!("Failed to start frame capturer: {}", e)).unwrap();
+				let encoder = NvencEncoder::new(
+					rtp_port,
+					width,
+					height,
+					CodecType::H264,
+					VideoQuality::Slowest,
+					cuda_context,
+				)?;
 
-					let mut encoder = NvencEncoder::new(
-						rtp_port,
-						width,
-						height,
-						CodecType::H264,
-						VideoQuality::Slowest,
-						cuda_context,
-					).unwrap();
+				let local_rtp_port = encoder.local_rtp_port();
+				let local_rtcp_port = encoder.local_rtcp_port();
 
-					let start_time = std::time::Instant::now();
-					while start_time.elapsed().as_secs() < 20 {
-						let start = std::time::Instant::now();
-						let frame_info = capturer.next_frame(CaptureMethod::NoWaitIfNewFrame)
-							.map_err(|e| log::error!("Failed to capture frame: {}", e)).unwrap();
-						encoder.encode(frame_info.device_buffer, start_time.elapsed())
-							.map_err(|e| log::error!("Failed to encode frame: {}", e)).unwrap();
-						println!("Capture: {}msec", start.elapsed().as_millis());
-					}
-
-					encoder.stop().unwrap();
-				});
+				let mut session = session.lock().map_err(|e| log::error!("Failed to lock session mutex"))?;
+				*session = Some(Session { capturer, encoder });
 
 				return Ok(rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 					.header(headers::CSEQ, cseq.to_string())
 					.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
-					.header(headers::TRANSPORT, format!("RTP/AVP/UDP;unicast;client_port={}-{};server_port=2001", rtp_port, rtc_port))
+					.header(headers::TRANSPORT, format!(
+						"RTP/AVP/UDP;unicast;client_port={}-{};server_port={}-{}",
+						rtp_port, rtcp_port, local_rtp_port, local_rtcp_port))
 					.build(Vec::new())
 				);
 			}
@@ -229,8 +235,42 @@ fn handle_setup_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> Re
 	Err(())
 }
 
-fn handle_play_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
-	rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
+fn handle_play_request(
+	request: &rtsp_types::Request<Vec<u8>>,
+	cseq: i32,
+	session: Arc<Mutex<Option<Session>>>,
+) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
+	let mut session = session.lock().map_err(|e| log::error!("Failed to lock session mutex"))?;
+	let mut session = match session.take() {
+		Some(session) => session,
+		None => {
+			return Ok(rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::BadRequest)
+				.header(headers::CSEQ, cseq.to_string())
+				.build(Vec::new()))
+		}
+	};
+
+	let fps = 60;
+
+	session.capturer.start(BufferFormat::Bgra, fps)
+		.map_err(|e| log::error!("Failed to start frame capturer: {}", e))?;
+	session.encoder.start()
+		.map_err(|_| log::error!("Failed to start encoder"))?;
+
+	let start_time = std::time::Instant::now();
+	tokio::spawn(async move {
+		loop {
+			let frame_info = session.capturer.next_frame(CaptureMethod::NoWaitIfNewFrame)
+				.map_err(|e| log::error!("Failed to capture frame: {}", e)).unwrap();
+			session.encoder.encode(frame_info.device_buffer, start_time.elapsed())
+				.map_err(|e| log::error!("Failed to encode frame: {}", e)).unwrap();
+		}
+	});
+
+	// encoder.stop().unwrap();
+	// session.capturer.stop().unwrap();
+
+	Ok(rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 		.header(headers::CSEQ, cseq.to_string())
-		.build(Vec::new())
+		.build(Vec::new()))
 }
