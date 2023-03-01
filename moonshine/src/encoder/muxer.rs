@@ -1,6 +1,7 @@
 use std::{ptr::{null, null_mut}, ffi::CStr};
 
 use ffmpeg_sys::URLContext;
+use std::io::Write;
 
 use super::{to_c_str, check_ret, codec::Codec};
 
@@ -14,7 +15,7 @@ pub(super) struct Muxer {
 
 impl Muxer {
 	pub(super) fn new(port: u16, codec: &Codec) -> Result<Self, ()> {
-		let url = format!("rtp://localhost:{}", port);
+		let url = format!("rtp://localhost:{port}");
 
 		unsafe {
 			let format_context = ffmpeg_sys::avformat_alloc_context();
@@ -24,17 +25,16 @@ impl Muxer {
 			}
 			let format_context = &mut *format_context;
 
-			let video_stream = Self::create_video_stream(format_context, codec)?;
-
 			format_context.oformat = Self::create_format()?;
 
 			check_ret(ffmpeg_sys::avio_open(
 				&mut format_context.pb,
-				to_c_str(url.as_str())?
-				.as_ptr(),
+				to_c_str(url.as_str())?.as_ptr(),
 				ffmpeg_sys::AVIO_FLAG_WRITE as i32
 			))
 				.map_err(|e| log::error!("Failed to open output file: {}", e))?;
+
+			let video_stream = Self::create_video_stream(format_context, codec)?;
 
 			let mut local_rtp_port: i64 = 0;
 			check_ret(ffmpeg_sys::av_opt_get_int(
@@ -87,10 +87,23 @@ impl Muxer {
 		}
 	}
 
-	pub(super) fn start(&self) -> Result<(), ()> {
+	pub(super) fn start(&mut self) -> Result<(), ()> {
 		unsafe {
-			check_ret(ffmpeg_sys::avformat_write_header(self.format_context, null_mut()))
-				.map_err(|e| log::error!("Failed to write output header: {}", e))?;
+			let mut buf = [0u8; 200000];
+			ffmpeg_sys::av_sdp_create(&mut self.format_context, 1, buf.as_mut_ptr() as *mut i8, buf.len() as i32);
+			let mut w = std::fs::File::create("video.sdp").unwrap();
+			w.write_all(&buf).unwrap();
+			std::thread::sleep_ms(10_000);
+
+			let ret = ffmpeg_sys::avformat_write_header(self.format_context, null_mut());
+			if ret as u32 != ffmpeg_sys::AVSTREAM_INIT_IN_WRITE_HEADER {
+				log::error!("Failed to write header.");
+				return Err(());
+			} else {
+				log::info!("Successfully encoded header!");
+			}
+			check_ret(ffmpeg_sys::fflush(ffmpeg_sys::stdout))
+				.map_err(|e| log::error!("Failed to flush data: {e}"))?;
 		}
 
 		Ok(())

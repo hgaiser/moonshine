@@ -37,7 +37,7 @@ async fn main() -> Result<(), ()> {
 
 	log::debug!("Using configuration:\n{:#?}", config);
 
-	let rtsp_task = tokio::spawn(rtsp::run(config.address, 2000));
+	let rtsp_task = tokio::spawn(rtsp::run(config.address, 8554));
 
 	flatten(rtsp_task).await?;
 

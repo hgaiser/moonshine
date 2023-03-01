@@ -98,7 +98,7 @@ async fn handle_request(
 fn handle_options_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
 	rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 		.header(headers::CSEQ, cseq.to_string())
-		.header(headers::PUBLIC, "OPTIONS DESCRIBE")
+		.header(headers::PUBLIC, "OPTIONS DESCRIBE SETUP PLAY")
 		.build(Vec::new())
 }
 

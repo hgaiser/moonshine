@@ -4,3 +4,4 @@
 #include <libavformat/avformat.h>
 #include <libavutil/hwcontext_cuda.h>
 #include <libavutil/opt.h>
+#include <libavutil/imgutils.h>

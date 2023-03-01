@@ -307,6 +307,15 @@ pub const AV_OPT_ALLOW_NULL: u32 = 4;
 pub const AV_OPT_MULTI_COMPONENT_RANGE: u32 = 4096;
 pub const AV_OPT_SERIALIZE_SKIP_DEFAULTS: u32 = 1;
 pub const AV_OPT_SERIALIZE_OPT_FLAGS_EXACT: u32 = 2;
+pub const AV_PIX_FMT_FLAG_BE: u32 = 1;
+pub const AV_PIX_FMT_FLAG_PAL: u32 = 2;
+pub const AV_PIX_FMT_FLAG_BITSTREAM: u32 = 4;
+pub const AV_PIX_FMT_FLAG_HWACCEL: u32 = 8;
+pub const AV_PIX_FMT_FLAG_PLANAR: u32 = 16;
+pub const AV_PIX_FMT_FLAG_RGB: u32 = 32;
+pub const AV_PIX_FMT_FLAG_ALPHA: u32 = 128;
+pub const AV_PIX_FMT_FLAG_BAYER: u32 = 256;
+pub const AV_PIX_FMT_FLAG_FLOAT: u32 = 512;
 pub type __uint8_t = ::std::os::raw::c_uchar;
 pub type __int16_t = ::std::os::raw::c_short;
 pub type __uint16_t = ::std::os::raw::c_ushort;
@@ -930,6 +939,24 @@ fn bindgen_test_layout__IO_FILE() {
 		);
 	}
 	test_field__unused2();
+}
+extern "C" {
+	pub static mut stdout: *mut FILE;
+}
+extern "C" {
+	pub fn fflush(__stream: *mut FILE) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn fflush_unlocked(__stream: *mut FILE) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn ffs(__i: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn ffsl(__l: ::std::os::raw::c_long) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn ffsll(__ll: ::std::os::raw::c_longlong) -> ::std::os::raw::c_int;
 }
 extern "C" {
 	pub fn av_log2(v: ::std::os::raw::c_uint) -> ::std::os::raw::c_int;
@@ -27022,6 +27049,551 @@ extern "C" {
 		buffer: *mut *mut ::std::os::raw::c_char,
 		key_val_sep: ::std::os::raw::c_char,
 		pairs_sep: ::std::os::raw::c_char,
+	) -> ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AVComponentDescriptor {
+	pub plane: ::std::os::raw::c_int,
+	pub step: ::std::os::raw::c_int,
+	pub offset: ::std::os::raw::c_int,
+	pub shift: ::std::os::raw::c_int,
+	pub depth: ::std::os::raw::c_int,
+}
+#[test]
+fn bindgen_test_layout_AVComponentDescriptor() {
+	assert_eq!(
+		::std::mem::size_of::<AVComponentDescriptor>(),
+		20usize,
+		concat!("Size of: ", stringify!(AVComponentDescriptor))
+	);
+	assert_eq!(
+		::std::mem::align_of::<AVComponentDescriptor>(),
+		4usize,
+		concat!("Alignment of ", stringify!(AVComponentDescriptor))
+	);
+	fn test_field_plane() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVComponentDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).plane) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVComponentDescriptor),
+				"::",
+				stringify!(plane)
+			)
+		);
+	}
+	test_field_plane();
+	fn test_field_step() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVComponentDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).step) as usize - ptr as usize
+			},
+			4usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVComponentDescriptor),
+				"::",
+				stringify!(step)
+			)
+		);
+	}
+	test_field_step();
+	fn test_field_offset() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVComponentDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).offset) as usize - ptr as usize
+			},
+			8usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVComponentDescriptor),
+				"::",
+				stringify!(offset)
+			)
+		);
+	}
+	test_field_offset();
+	fn test_field_shift() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVComponentDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).shift) as usize - ptr as usize
+			},
+			12usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVComponentDescriptor),
+				"::",
+				stringify!(shift)
+			)
+		);
+	}
+	test_field_shift();
+	fn test_field_depth() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVComponentDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).depth) as usize - ptr as usize
+			},
+			16usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVComponentDescriptor),
+				"::",
+				stringify!(depth)
+			)
+		);
+	}
+	test_field_depth();
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct AVPixFmtDescriptor {
+	pub name: *const ::std::os::raw::c_char,
+	pub nb_components: u8,
+	pub log2_chroma_w: u8,
+	pub log2_chroma_h: u8,
+	pub flags: u64,
+	pub comp: [AVComponentDescriptor; 4usize],
+	pub alias: *const ::std::os::raw::c_char,
+}
+#[test]
+fn bindgen_test_layout_AVPixFmtDescriptor() {
+	assert_eq!(
+		::std::mem::size_of::<AVPixFmtDescriptor>(),
+		112usize,
+		concat!("Size of: ", stringify!(AVPixFmtDescriptor))
+	);
+	assert_eq!(
+		::std::mem::align_of::<AVPixFmtDescriptor>(),
+		8usize,
+		concat!("Alignment of ", stringify!(AVPixFmtDescriptor))
+	);
+	fn test_field_name() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVPixFmtDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).name) as usize - ptr as usize
+			},
+			0usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVPixFmtDescriptor),
+				"::",
+				stringify!(name)
+			)
+		);
+	}
+	test_field_name();
+	fn test_field_nb_components() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVPixFmtDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).nb_components) as usize - ptr as usize
+			},
+			8usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVPixFmtDescriptor),
+				"::",
+				stringify!(nb_components)
+			)
+		);
+	}
+	test_field_nb_components();
+	fn test_field_log2_chroma_w() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVPixFmtDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).log2_chroma_w) as usize - ptr as usize
+			},
+			9usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVPixFmtDescriptor),
+				"::",
+				stringify!(log2_chroma_w)
+			)
+		);
+	}
+	test_field_log2_chroma_w();
+	fn test_field_log2_chroma_h() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVPixFmtDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).log2_chroma_h) as usize - ptr as usize
+			},
+			10usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVPixFmtDescriptor),
+				"::",
+				stringify!(log2_chroma_h)
+			)
+		);
+	}
+	test_field_log2_chroma_h();
+	fn test_field_flags() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVPixFmtDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).flags) as usize - ptr as usize
+			},
+			16usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVPixFmtDescriptor),
+				"::",
+				stringify!(flags)
+			)
+		);
+	}
+	test_field_flags();
+	fn test_field_comp() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVPixFmtDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).comp) as usize - ptr as usize
+			},
+			24usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVPixFmtDescriptor),
+				"::",
+				stringify!(comp)
+			)
+		);
+	}
+	test_field_comp();
+	fn test_field_alias() {
+		assert_eq!(
+			unsafe {
+				let uninit = ::std::mem::MaybeUninit::<AVPixFmtDescriptor>::uninit();
+				let ptr = uninit.as_ptr();
+				::std::ptr::addr_of!((*ptr).alias) as usize - ptr as usize
+			},
+			104usize,
+			concat!(
+				"Offset of field: ",
+				stringify!(AVPixFmtDescriptor),
+				"::",
+				stringify!(alias)
+			)
+		);
+	}
+	test_field_alias();
+}
+extern "C" {
+	pub fn av_get_bits_per_pixel(pixdesc: *const AVPixFmtDescriptor) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_get_padded_bits_per_pixel(pixdesc: *const AVPixFmtDescriptor) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_pix_fmt_desc_get(pix_fmt: AVPixelFormat) -> *const AVPixFmtDescriptor;
+}
+extern "C" {
+	pub fn av_pix_fmt_desc_next(prev: *const AVPixFmtDescriptor) -> *const AVPixFmtDescriptor;
+}
+extern "C" {
+	pub fn av_pix_fmt_desc_get_id(desc: *const AVPixFmtDescriptor) -> AVPixelFormat;
+}
+extern "C" {
+	pub fn av_pix_fmt_get_chroma_sub_sample(
+		pix_fmt: AVPixelFormat,
+		h_shift: *mut ::std::os::raw::c_int,
+		v_shift: *mut ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_pix_fmt_count_planes(pix_fmt: AVPixelFormat) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_color_range_name(range: AVColorRange) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_color_range_from_name(name: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_color_primaries_name(primaries: AVColorPrimaries) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_color_primaries_from_name(name: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_color_transfer_name(transfer: AVColorTransferCharacteristic) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_color_transfer_from_name(name: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_color_space_name(space: AVColorSpace) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_color_space_from_name(name: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_chroma_location_name(location: AVChromaLocation) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_chroma_location_from_name(name: *const ::std::os::raw::c_char) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_get_pix_fmt(name: *const ::std::os::raw::c_char) -> AVPixelFormat;
+}
+extern "C" {
+	pub fn av_get_pix_fmt_name(pix_fmt: AVPixelFormat) -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_get_pix_fmt_string(
+		buf: *mut ::std::os::raw::c_char,
+		buf_size: ::std::os::raw::c_int,
+		pix_fmt: AVPixelFormat,
+	) -> *mut ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn av_read_image_line2(
+		dst: *mut ::std::os::raw::c_void,
+		data: *mut *const u8,
+		linesize: *const ::std::os::raw::c_int,
+		desc: *const AVPixFmtDescriptor,
+		x: ::std::os::raw::c_int,
+		y: ::std::os::raw::c_int,
+		c: ::std::os::raw::c_int,
+		w: ::std::os::raw::c_int,
+		read_pal_component: ::std::os::raw::c_int,
+		dst_element_size: ::std::os::raw::c_int,
+	);
+}
+extern "C" {
+	pub fn av_read_image_line(
+		dst: *mut u16,
+		data: *mut *const u8,
+		linesize: *const ::std::os::raw::c_int,
+		desc: *const AVPixFmtDescriptor,
+		x: ::std::os::raw::c_int,
+		y: ::std::os::raw::c_int,
+		c: ::std::os::raw::c_int,
+		w: ::std::os::raw::c_int,
+		read_pal_component: ::std::os::raw::c_int,
+	);
+}
+extern "C" {
+	pub fn av_write_image_line2(
+		src: *const ::std::os::raw::c_void,
+		data: *mut *mut u8,
+		linesize: *const ::std::os::raw::c_int,
+		desc: *const AVPixFmtDescriptor,
+		x: ::std::os::raw::c_int,
+		y: ::std::os::raw::c_int,
+		c: ::std::os::raw::c_int,
+		w: ::std::os::raw::c_int,
+		src_element_size: ::std::os::raw::c_int,
+	);
+}
+extern "C" {
+	pub fn av_write_image_line(
+		src: *const u16,
+		data: *mut *mut u8,
+		linesize: *const ::std::os::raw::c_int,
+		desc: *const AVPixFmtDescriptor,
+		x: ::std::os::raw::c_int,
+		y: ::std::os::raw::c_int,
+		c: ::std::os::raw::c_int,
+		w: ::std::os::raw::c_int,
+	);
+}
+extern "C" {
+	pub fn av_pix_fmt_swap_endianness(pix_fmt: AVPixelFormat) -> AVPixelFormat;
+}
+extern "C" {
+	pub fn av_get_pix_fmt_loss(
+		dst_pix_fmt: AVPixelFormat,
+		src_pix_fmt: AVPixelFormat,
+		has_alpha: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_find_best_pix_fmt_of_2(
+		dst_pix_fmt1: AVPixelFormat,
+		dst_pix_fmt2: AVPixelFormat,
+		src_pix_fmt: AVPixelFormat,
+		has_alpha: ::std::os::raw::c_int,
+		loss_ptr: *mut ::std::os::raw::c_int,
+	) -> AVPixelFormat;
+}
+extern "C" {
+	pub fn av_image_fill_max_pixsteps(
+		max_pixsteps: *mut ::std::os::raw::c_int,
+		max_pixstep_comps: *mut ::std::os::raw::c_int,
+		pixdesc: *const AVPixFmtDescriptor,
+	);
+}
+extern "C" {
+	pub fn av_image_get_linesize(
+		pix_fmt: AVPixelFormat,
+		width: ::std::os::raw::c_int,
+		plane: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_fill_linesizes(
+		linesizes: *mut ::std::os::raw::c_int,
+		pix_fmt: AVPixelFormat,
+		width: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_fill_plane_sizes(
+		size: *mut size_t,
+		pix_fmt: AVPixelFormat,
+		height: ::std::os::raw::c_int,
+		linesizes: *const isize,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_fill_pointers(
+		data: *mut *mut u8,
+		pix_fmt: AVPixelFormat,
+		height: ::std::os::raw::c_int,
+		ptr: *mut u8,
+		linesizes: *const ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_alloc(
+		pointers: *mut *mut u8,
+		linesizes: *mut ::std::os::raw::c_int,
+		w: ::std::os::raw::c_int,
+		h: ::std::os::raw::c_int,
+		pix_fmt: AVPixelFormat,
+		align: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_copy_plane(
+		dst: *mut u8,
+		dst_linesize: ::std::os::raw::c_int,
+		src: *const u8,
+		src_linesize: ::std::os::raw::c_int,
+		bytewidth: ::std::os::raw::c_int,
+		height: ::std::os::raw::c_int,
+	);
+}
+extern "C" {
+	pub fn av_image_copy_plane_uc_from(
+		dst: *mut u8,
+		dst_linesize: isize,
+		src: *const u8,
+		src_linesize: isize,
+		bytewidth: isize,
+		height: ::std::os::raw::c_int,
+	);
+}
+extern "C" {
+	pub fn av_image_copy(
+		dst_data: *mut *mut u8,
+		dst_linesizes: *mut ::std::os::raw::c_int,
+		src_data: *mut *const u8,
+		src_linesizes: *const ::std::os::raw::c_int,
+		pix_fmt: AVPixelFormat,
+		width: ::std::os::raw::c_int,
+		height: ::std::os::raw::c_int,
+	);
+}
+extern "C" {
+	pub fn av_image_copy_uc_from(
+		dst_data: *mut *mut u8,
+		dst_linesizes: *const isize,
+		src_data: *mut *const u8,
+		src_linesizes: *const isize,
+		pix_fmt: AVPixelFormat,
+		width: ::std::os::raw::c_int,
+		height: ::std::os::raw::c_int,
+	);
+}
+extern "C" {
+	pub fn av_image_fill_arrays(
+		dst_data: *mut *mut u8,
+		dst_linesize: *mut ::std::os::raw::c_int,
+		src: *const u8,
+		pix_fmt: AVPixelFormat,
+		width: ::std::os::raw::c_int,
+		height: ::std::os::raw::c_int,
+		align: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_get_buffer_size(
+		pix_fmt: AVPixelFormat,
+		width: ::std::os::raw::c_int,
+		height: ::std::os::raw::c_int,
+		align: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_copy_to_buffer(
+		dst: *mut u8,
+		dst_size: ::std::os::raw::c_int,
+		src_data: *const *const u8,
+		src_linesize: *const ::std::os::raw::c_int,
+		pix_fmt: AVPixelFormat,
+		width: ::std::os::raw::c_int,
+		height: ::std::os::raw::c_int,
+		align: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_check_size(
+		w: ::std::os::raw::c_uint,
+		h: ::std::os::raw::c_uint,
+		log_offset: ::std::os::raw::c_int,
+		log_ctx: *mut ::std::os::raw::c_void,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_check_size2(
+		w: ::std::os::raw::c_uint,
+		h: ::std::os::raw::c_uint,
+		max_pixels: i64,
+		pix_fmt: AVPixelFormat,
+		log_offset: ::std::os::raw::c_int,
+		log_ctx: *mut ::std::os::raw::c_void,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_check_sar(
+		w: ::std::os::raw::c_uint,
+		h: ::std::os::raw::c_uint,
+		sar: AVRational,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn av_image_fill_black(
+		dst_data: *mut *mut u8,
+		dst_linesize: *const isize,
+		pix_fmt: AVPixelFormat,
+		range: AVColorRange,
+		width: ::std::os::raw::c_int,
+		height: ::std::os::raw::c_int,
 	) -> ::std::os::raw::c_int;
 }
 pub type __builtin_va_list = [__va_list_tag; 1usize];

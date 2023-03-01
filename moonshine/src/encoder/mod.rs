@@ -92,13 +92,13 @@ impl NvencEncoder {
 	}
 
 	pub fn encode(&mut self, device_buffer: usize, time: std::time::Duration) -> Result<(), String> {
-		self.frame.set_buffer(device_buffer, time);
-		self.codec.send_frame(&self.frame, &self.muxer)
-			.map_err(|e| format!("Failed to send frame to codec: {}", e))?;
+		// self.frame.set_buffer(device_buffer, time);
+		// self.codec.send_frame(&self.frame, &self.muxer)
+		// 	.map_err(|e| format!("Failed to send frame to codec: {}", e))?;
 		Ok(())
 	}
 
-	pub fn start(&self) -> Result<(), ()> {
+	pub fn start(&mut self) -> Result<(), ()> {
 		self.muxer.start()?;
 		Ok(())
 	}

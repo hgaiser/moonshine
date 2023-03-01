@@ -78,7 +78,7 @@ impl Codec {
 			}
 			let codec_context = &mut *codec_context;
 			if codec.type_ != ffmpeg_sys::AVMediaType_AVMEDIA_TYPE_VIDEO {
-				log::error!("Expected video encoder, but got type: {}", (*codec).type_);
+				log::error!("Expected video encoder, but got type: {}", codec.type_);
 				return Err(());
 			}
 

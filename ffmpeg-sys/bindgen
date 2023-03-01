@@ -18,9 +18,11 @@ main() {
 		--allowlist-type "CU.*" \
 		--allowlist-function "av.*" \
 		--allowlist-var "AV.*" \
-		--allowlist-function "ff_.*" \
+		--allowlist-function "ff.*" \
 		--allowlist-var "EAGAIN" \
 		--allowlist-type "AV.*" \
+		--allowlist-function "do_fflush" \
+		--allowlist-var "stdout" \
 		./wrapper.h \
 		-- \
 		$(pkg-config --cflags cuda)
