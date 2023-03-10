@@ -20,7 +20,7 @@ fn main() {
 
 	for library in &libraries {
 		for lib in &library.libs {
-			println!("cargo:rustc-link-lib=dylib={}", lib);
+			println!("cargo:rustc-link-lib=dylib={lib}");
 		}
 	}
 }

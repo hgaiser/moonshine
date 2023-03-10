@@ -132,6 +132,16 @@ impl Muxer {
 		self.local_rtcp_port
 	}
 
+	pub(super) fn session_description(&mut self) -> Result<sdp_types::Session, ()> {
+		let mut buf = [0u8; 1024];
+		unsafe {
+			ffmpeg_sys::av_sdp_create(&mut self.format_context, 1, buf.as_mut_ptr() as *mut i8, buf.len() as i32);
+		}
+
+		sdp_types::Session::parse(&buf)
+			.map_err(|e| log::error!("Failed to create session descriptor: {e}"))
+	}
+
 	pub(super) fn as_ptr(&self) -> *mut ffmpeg_sys::AVFormatContext {
 		self.format_context
 	}

@@ -2,7 +2,7 @@ use std::{ffi::{CStr, CString}, os::raw::c_char};
 
 use crate::error::FfmpegError;
 
-use self::codec::Codec;
+pub use self::codec::Codec;
 pub use self::codec::VideoQuality;
 pub use self::codec::CodecType;
 
@@ -14,7 +14,7 @@ mod codec;
 mod muxer;
 mod video_frame;
 
-fn check_ret(error_code: i32) -> Result<(), FfmpegError> {
+pub fn check_ret(error_code: i32) -> Result<(), FfmpegError> {
 	if error_code != 0 {
 		let error_message = get_error(error_code)
 			.map_err(|_| FfmpegError::new(error_code, "Unknown error".into()))?;
@@ -24,13 +24,13 @@ fn check_ret(error_code: i32) -> Result<(), FfmpegError> {
 	Ok(())
 }
 
-unsafe fn parse_c_str<'a>(data: *const c_char) -> Result<&'a str, String> {
+pub unsafe fn parse_c_str<'a>(data: *const c_char) -> Result<&'a str, String> {
 	CStr::from_ptr(data)
 		.to_str()
 		.map_err(|_e| "invalid UTF-8".to_string())
 }
 
-fn to_c_str(data: &str) -> Result<CString, ()> {
+pub fn to_c_str(data: &str) -> Result<CString, ()> {
 	CString::new(data)
 		.map_err(|e| log::error!("Failed to create CString: {}", e))
 }

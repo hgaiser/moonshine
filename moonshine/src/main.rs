@@ -1,21 +1,21 @@
-use nvfbc::{BufferFormat, CudaCapturer};
-use nvfbc::cuda::CaptureMethod;
+// use nvfbc::{BufferFormat, CudaCapturer};
+// use nvfbc::cuda::CaptureMethod;
 
 use std::path::PathBuf;
 
 use clap::Parser;
 
-use crate::encoder::{NvencEncoder, CodecType, VideoQuality};
+// use crate::encoder::{NvencEncoder, CodecType, VideoQuality};
 use crate::util::flatten;
 
 mod config;
 mod cuda;
-mod encoder;
+// mod encoder;
 mod error;
 mod rtsp;
-mod service_publisher;
+// mod service_publisher;
 mod util;
-mod webserver;
+// mod webserver;
 
 #[derive(Parser, Debug)]
 #[clap(version)]

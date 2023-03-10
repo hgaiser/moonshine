@@ -139,14 +139,14 @@ fn main() -> Result<(), ()> {
 		// ffmpeg_sys::av_image_alloc((*frame).data.as_mut_ptr(), (*frame).linesize.as_mut_ptr(), (*frame).width, (*frame).height, (*codec_context).pix_fmt, 32);
 
 		//Init the format context
-		let mut formant_context = ffmpeg_sys::avformat_alloc_context();
+		let mut format_context = ffmpeg_sys::avformat_alloc_context();
 		let format = ffmpeg_sys::av_guess_format(to_c_str("rtp")?.as_ptr(), null_mut(), null_mut());
-		ffmpeg_sys::avformat_alloc_output_context2(&mut formant_context, format, (*format).name, to_c_str("rtp://127.0.0.1:49990")?.as_ptr());
+		ffmpeg_sys::avformat_alloc_output_context2(&mut format_context, format, (*format).name, to_c_str("rtp://127.0.0.1:49990")?.as_ptr());
 
-		ffmpeg_sys::avio_open(&mut (*formant_context).pb, to_c_str("rtp://127.0.0.1:49990")?.as_ptr(), ffmpeg_sys::AVIO_FLAG_WRITE as i32);
+		ffmpeg_sys::avio_open(&mut (*format_context).pb, to_c_str("rtp://127.0.0.1:49990")?.as_ptr(), ffmpeg_sys::AVIO_FLAG_WRITE as i32);
 
 		//Configure the AVStream for the output format context
-		let stream = ffmpeg_sys::avformat_new_stream(formant_context, codec);
+		let stream = ffmpeg_sys::avformat_new_stream(format_context, codec);
 
 		ffmpeg_sys::avcodec_parameters_from_context((*stream).codecpar, codec_context);
 		(*stream).time_base.num = 1;
@@ -155,11 +155,11 @@ fn main() -> Result<(), ()> {
 		std::thread::sleep(std::time::Duration::from_secs(5));
 
 		// Rewrite the header.
-		ffmpeg_sys::avformat_write_header(formant_context, null_mut());
+		ffmpeg_sys::avformat_write_header(format_context, null_mut());
 
 		// Write a file for VLC.
-		let mut buf = [0u8; 200000];
-		ffmpeg_sys::av_sdp_create(&mut formant_context, 1, buf.as_mut_ptr() as *mut i8, buf.len() as i32);
+		let mut buf = [0u8; 1024];
+		ffmpeg_sys::av_sdp_create(&mut format_context, 1, buf.as_mut_ptr() as *mut i8, buf.len() as i32);
 		let mut w = std::fs::File::create("video.sdp").unwrap();
 		w.write_all(&buf).unwrap();
 
@@ -220,7 +220,7 @@ fn main() -> Result<(), ()> {
 
 				/* Write the data on the packet to the output format  */
 				ffmpeg_sys::av_packet_rescale_ts(&mut packet, (*codec_context).time_base, (*stream).time_base);
-				ffmpeg_sys::av_interleaved_write_frame(formant_context, &mut packet);
+				ffmpeg_sys::av_interleaved_write_frame(format_context, &mut packet);
 
 				/* Reset the packet */
 				ffmpeg_sys::av_packet_unref(&mut packet);
@@ -234,7 +234,7 @@ fn main() -> Result<(), ()> {
 
 		//Free everything
 		ffmpeg_sys::av_free(codec_context as *mut _);
-		ffmpeg_sys::av_free(formant_context as *mut _);
+		ffmpeg_sys::av_free(format_context as *mut _);
 	}
 
 	Ok(())
