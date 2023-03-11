@@ -7,7 +7,7 @@ cd "$(dirname "$0")"
 main() {
 	colorize
 	if ! command -v bindgen >/dev/null;  then
-		die "bindgen not found: you can install it by running: cargo install bindgen"
+		die "bindgen not found: you can install it by running: cargo install bindgen-cli"
 	fi
 
 	check_pkgconf cuda 11.0

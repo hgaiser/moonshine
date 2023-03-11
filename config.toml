@@ -12,3 +12,8 @@ title = "Desktop"
 port = 47984
 certificate_chain = "./cert/cert.pem"
 private_key = "./cert/key.pem"
+
+[session]
+fps = 60
+video_quality = "Fastest"
+codec = "H264"

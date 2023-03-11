@@ -4,22 +4,22 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-clap = { version = "3.2.17", features = ["derive"] }
+clap = { version = "4.1.8", features = ["derive"] }
 dirs = "4.0.0"
-env_logger = "0.9.0"
+env_logger = "0.10.0"
 ffmpeg = { path = "../ffmpeg" }
 ffmpeg-sys = { path = "../ffmpeg-sys" }
 hex = "0.4.3"
-hyper = { version = "0.14.20", features = ["server", "http1", "tcp"] }
-image = "0.24.2"
+hyper = { version = "0.14.25", features = ["server", "http1", "tcp"] }
+image = "0.24.5"
 log = "0.4.17"
 nvfbc = "0.1.2"
-openssl = "0.10.41"
-rtsp-types = "0.0.3"
-sdp-types = "0.1.4"
-serde = "1.0.140"
-tokio = { version = "1.20.1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+openssl = "0.10.45"
+rtsp-types = "0.0.5"
+sdp-types = "0.1.5"
+serde = "1.0.155"
+tokio = { version = "1.26.0", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 tokio-openssl = "0.6.3"
-toml = "0.5.9"
-url = "2.2.2"
+toml = "0.7.2"
+url = "2.3.1"
 zeroconf = "0.10.5"

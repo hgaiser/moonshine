@@ -27,7 +27,7 @@ impl Session {
 			let status = capturer.status()
 				.map_err(|e| println!("Failed to get capturer status: {e}"))?;
 
-			println!("{status:#?}");
+			log::trace!("NVFBC status: {status:#?}");
 			if !status.can_create_now {
 				panic!("Can't create a CUDA capture session.");
 			}
