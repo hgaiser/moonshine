@@ -4,15 +4,13 @@ use openssl::ssl::{SslMethod, SslFiletype, SslContext, SslAcceptor, Ssl};
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 
-use crate::config;
-
 pub struct TlsAcceptor {
 	context: SslContext,
 }
 
 impl TlsAcceptor {
-	pub fn from_config(config: &config::Tls) -> Result<Self, ()> {
-		let context = load_tls_files(&config.certificate_chain, &config.private_key)?;
+	pub fn from_config(certificate_chain: &Path, private_key: &Path) -> Result<Self, ()> {
+		let context = load_tls_files(certificate_chain, private_key)?;
 		Ok(Self { context })
 	}
 

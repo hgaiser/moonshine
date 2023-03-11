@@ -54,14 +54,14 @@ impl Clients {
 		path.push("clients.toml");
 
 		if path.exists() {
-			let serialized = match std::fs::read(&path) {
+			let serialized = match std::fs::read_to_string(&path) {
 				Ok(serialized) => serialized,
 				Err(e) => {
 					log::warn!("Failed to read clients state file: {}", e);
 					return Self::default();
 				}
 			};
-			let clients: BTreeMap<String, Client> = match toml::from_slice(&serialized) {
+			let clients: BTreeMap<String, Client> = match toml::from_str(&serialized) {
 				Ok(clients) => clients,
 				Err(e) => {
 					log::warn!("Failed to deserialize clients state: {}", e);

@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 use ffmpeg::{CodecType, VideoQuality};
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Config {
 	/// Name of the service.
 	pub name: String,
@@ -11,11 +11,11 @@ pub struct Config {
 	/// Address to bind to.
 	pub address: String,
 
-	/// Port number to bind RTSP server to.
-	pub port: u16,
+	/// Configuration for the webserver.
+	pub webserver: WebserverConfig,
 
-	/// Config for SSL certificates.
-	pub tls: TlsConfig,
+	/// Configuration for the RTSP server.
+	pub rtsp: RtspConfig,
 
 	/// List of applications to expose to clients.
 	pub applications: Vec<ApplicationConfig>,
@@ -24,8 +24,14 @@ pub struct Config {
 	pub session: SessionConfig,
 }
 
-#[derive(Debug, Deserialize)]
-pub struct TlsConfig {
+#[derive(Clone, Debug, Deserialize)]
+pub struct WebserverConfig {
+	/// Port number of the webserver.
+	pub port: u16,
+
+	/// Port number of the HTTPS webserver.
+	pub port_https: u16,
+
 	/// Path to the certificate chain for SSL encryption.
 	pub certificate_chain: PathBuf,
 
@@ -33,13 +39,13 @@ pub struct TlsConfig {
 	pub private_key: PathBuf,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct ApplicationConfig {
 	/// Title of the application.
 	pub title: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct SessionConfig {
 	/// Target frames per second for the stream.
 	pub fps: u32,
@@ -49,4 +55,10 @@ pub struct SessionConfig {
 
 	/// Quality for the stream.
 	pub video_quality: VideoQuality,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct RtspConfig {
+	/// Port to bind the RTSP server to.
+	pub port: u16,
 }

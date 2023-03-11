@@ -23,10 +23,10 @@ pub(crate) async fn run(config: config::Config) -> Result<(), ()> {
 	let clients = Clients::from_state_or_default();
 
 	let http_task = tokio::spawn(run_http_server(config.clone(), clients.clone()));
-	log::info!("Http server listening on '{}:{}'", config.address, config.port);
+	log::info!("Http server listening on '{}:{}'", config.address, config.webserver.port);
 
 	let https_task = tokio::spawn(run_https_server(config.clone(), clients.clone()));
-	log::info!("Https server listening on '{}:{}'", config.address, config.tls.port);
+	log::info!("Https server listening on '{}:{}'", config.address, config.webserver.port_https);
 
 	let result = tokio::try_join!(flatten(http_task), flatten(https_task));
 	match result {
@@ -45,19 +45,19 @@ async fn run_http_server(
 	config: config::Config,
 	clients: Clients,
 ) -> Result<(), ()> {
-	let http_address = (config.address.clone(), config.port).to_socket_addrs()
-		.map_err(|e| log::error!("Failed to resolve address '{}:{}': {}", config.address, config.port, e))?
+	let http_address = (config.address.clone(), config.webserver.port).to_socket_addrs()
+		.map_err(|e| log::error!("Failed to resolve address '{}:{}': {e}", config.address, config.webserver.port))?
 		.next()
-		.ok_or_else(|| log::error!("Failed to resolve address '{}:{}'", config.address, config.port))?;
+		.ok_or_else(|| log::error!("Failed to resolve address '{}:{}'", config.address, config.webserver.port))?;
 	let listener = TcpListener::bind(http_address)
 		.await
-		.map_err(|e| log::error!("Failed to bind to address '{}': {}", http_address, e))?;
+		.map_err(|e| log::error!("Failed to bind to address '{http_address}': {e}"))?;
 
 	loop {
 		let (connection, address) = listener.accept()
 			.await
-			.map_err(|e| log::error!("Failed to accept connection: {}", e))?;
-		log::debug!("Accepted connection from {}", address);
+			.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
+		log::debug!("Accepted connection from {address}");
 
 		tokio::spawn(handle_connection(connection, address, config.clone(), clients.clone()));
 	}
@@ -67,15 +67,15 @@ async fn run_https_server(
 	config: config::Config,
 	clients: Clients,
 ) -> Result<(), ()> {
-	let https_address = (config.address.clone(), config.tls.port).to_socket_addrs()
-		.map_err(|e| log::error!("No address resolved for '{}:{}': {}", config.address, config.tls.port, e))?
+	let https_address = (config.address.clone(), config.webserver.port_https).to_socket_addrs()
+		.map_err(|e| log::error!("No address resolved for '{}:{}': {}", config.address, config.webserver.port_https, e))?
 		.next()
-		.ok_or_else(|| log::error!("No address resolved for {}:{}", config.address, config.tls.port))?;
+		.ok_or_else(|| log::error!("No address resolved for {}:{}", config.address, config.webserver.port_https))?;
 
 	let listener = TcpListener::bind(https_address)
 		.await
 		.map_err(|e| log::error!("Failed to bind to {}: {}", https_address, e))?;
-	let acceptor = TlsAcceptor::from_config(&config.tls)?;
+	let acceptor = TlsAcceptor::from_config(&config.webserver.certificate_chain, &config.webserver.private_key)?;
 
 	loop {
 		let (connection, address) = listener.accept()
@@ -171,8 +171,8 @@ async fn server_info(req: Request<Body>, config: config::Config, clients: Client
 	<state>MOONSHINE_SERVER_FREE</state>
 </root>",
 		config.name,
-		config.tls.port,
-		config.port,
+		config.webserver.port_https,
+		config.webserver.port,
 		paired,
 	)));
 	response.headers_mut().insert(CONTENT_TYPE, "application/xml".parse().unwrap());

@@ -2,17 +2,15 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-// use crate::encoder::{NvencEncoder, CodecType, VideoQuality};
 use crate::util::flatten;
 
 mod config;
 mod cuda;
-// mod encoder;
 mod error;
 mod rtsp;
 mod service_publisher;
 mod util;
-// mod webserver;
+mod webserver;
 
 #[derive(Parser, Debug)]
 #[clap(version)]
@@ -34,14 +32,14 @@ async fn main() -> Result<(), ()> {
 
 	log::debug!("Using configuration:\n{:#?}", config);
 
-	let rtsp_task = tokio::spawn(rtsp::run(config.address, config.port));
-	let publisher_task = tokio::spawn(service_publisher::run(config.port));
-	// let webserver_task = tokio::spawn(webserver::run(config.clone()));
+	let rtsp_task = tokio::spawn(rtsp::run(config.address.clone(), config.rtsp.port));
+	let publisher_task = tokio::spawn(service_publisher::run(config.webserver.port));
+	let webserver_task = tokio::spawn(webserver::run(config.clone()));
 
 	let result = tokio::try_join!(
 		flatten(rtsp_task),
 		flatten(publisher_task),
-		// flatten(webserver_task),
+		flatten(webserver_task),
 	);
 
 	match result {
