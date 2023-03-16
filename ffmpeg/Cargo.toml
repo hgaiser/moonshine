@@ -1,0 +1,8 @@
+[package]
+name = "ffmpeg"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ffmpeg-sys = { path = "../ffmpeg-sys" }
+serde = { version = "1.0.155", features = ["derive"] }
