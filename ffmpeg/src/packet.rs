@@ -12,6 +12,10 @@ impl Packet {
 		Ok(Self { packet })
 	}
 
+	pub fn data(&self) -> &[u8] {
+		unsafe { std::slice::from_raw_parts(self.as_raw().data, self.as_raw().size as usize) }
+	}
+
 	pub fn as_raw_mut(&mut self) -> &mut ffmpeg_sys::AVPacket {
 		unsafe { &mut *self.packet }
 	}
@@ -26,3 +30,6 @@ impl Drop for Packet {
 		unsafe { ffmpeg_sys::av_packet_free(&mut self.packet) };
 	}
 }
+
+// TODO: Check if this is correct.
+unsafe impl Send for Packet { }
