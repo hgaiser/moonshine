@@ -8,14 +8,14 @@ use tokio::io::AsyncWrite;
 use tokio::net::TcpListener;
 use hyper::{Response, Body, header::CONTENT_TYPE, Request, Method, StatusCode};
 
-mod pairing;
-use pairing::Clients;
-
-mod tls;
-use tls::TlsAcceptor;
-
 use crate::config;
 use crate::util::flatten;
+
+use client::Clients;
+use tls::TlsAcceptor;
+
+mod client;
+mod tls;
 
 type Params = HashMap<String, String>;
 
@@ -126,6 +126,7 @@ async fn serve(req: Request<Body>, config: config::Config, clients: Clients) -> 
 		(&Method::GET, "/pin") => clients.pin(req).await,
 		(&Method::GET, "/serverinfo") => server_info(req, config, clients).await,
 		(&Method::GET, "/unpair") => clients.unpair(req).await,
+		(&Method::GET, "/launch") => launch(req, config, clients).await,
 		_ => not_found()
 	}
 }
@@ -163,7 +164,7 @@ async fn server_info(req: Request<Body>, config: config::Config, clients: Client
 		<DisplayMode>
 			<Width>2560</Width>
 			<Height>1440</Height>
-			<RefreshRate>120</RefreshRate>
+			<RefreshRate>{}</RefreshRate>
 		</DisplayMode>
 	</SupportedDisplayMode>
 	<PairStatus>{}</PairStatus>
@@ -173,6 +174,7 @@ async fn server_info(req: Request<Body>, config: config::Config, clients: Client
 		config.name,
 		config.webserver.port_https,
 		config.webserver.port,
+		config.session.fps,
 		paired,
 	)));
 	response.headers_mut().insert(CONTENT_TYPE, "application/xml".parse().unwrap());
@@ -207,6 +209,34 @@ async fn app_list(req: Request<Body>, config: config::Config, clients: Clients) 
 	</App>\n", application.title, i);
 	}
 	response += "</root>";
+
+	let mut response = Response::new(Body::from(response));
+	response.headers_mut().insert(CONTENT_TYPE, "application/xml".parse().unwrap());
+
+	response
+}
+
+async fn launch(req: Request<Body>, config: config::Config, clients: Clients) -> Response<Body> {
+	let params = parse_params(req.uri());
+
+	let unique_id = match params.get("uniqueid") {
+		Some(unique_id) => unique_id,
+		None => {
+			log::error!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
+			return bad_request();
+		}
+	};
+
+	if !clients.has_client(unique_id).await {
+		log::warn!("Unknown unique id '{}' received in /applist.", unique_id);
+		return bad_request();
+	}
+
+	let response = format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
+<root status_code=\"200\">
+	<sessionUrl0>rtsp://{}:{}</sessionUrl0>
+	<gamesession>1</gamesession>
+</root>", config.address, config.rtsp.port);
 
 	let mut response = Response::new(Body::from(response));
 	response.headers_mut().insert(CONTENT_TYPE, "application/xml".parse().unwrap());

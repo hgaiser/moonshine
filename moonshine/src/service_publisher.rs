@@ -11,6 +11,7 @@ pub(crate) async fn run(port: u16) -> Result<(), ()> {
 
 	service.set_registered_callback(Box::new(on_service_registered));
 	service.set_name("Moonshine");
+	service.set_network_interface(zeroconf::NetworkInterface::AtIndex(1));
 
 	let event_loop = service.register()
 		.map_err(|e| log::error!("Failed to register service: {}", e))?;

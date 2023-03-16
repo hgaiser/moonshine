@@ -5,8 +5,8 @@ use clap::Parser;
 use crate::util::flatten;
 
 mod config;
-mod cuda;
-mod error;
+// mod cuda;
+// mod error;
 mod rtsp;
 mod service_publisher;
 mod util;

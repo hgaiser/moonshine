@@ -9,7 +9,7 @@ use ffmpeg_sys::{
 	CUcontext,
 	CUctx_flags_enum_CU_CTX_SCHED_AUTO,
 	CUresult,
-	cudaError_enum_CUDA_SUCCESS, cuGetErrorString
+	cudaError_enum_CUDA_SUCCESS, cuGetErrorString, cuCtxPopCurrent_v2, cuCtxPushCurrent_v2
 };
 
 use crate::error::CudaError;
@@ -50,4 +50,12 @@ pub(crate) fn init_cuda(gpu: i32) -> Result<CUcontext, CudaError> {
 		check_ret(cuCtxCreate_v2(&mut context, CUctx_flags_enum_CU_CTX_SCHED_AUTO, device))?;
 		Ok(context)
 	}
+}
+
+pub(crate) fn release_context(mut context: CUcontext) -> Result<(), CudaError> {
+	unsafe { check_ret(cuCtxPopCurrent_v2(&mut context)) }
+}
+
+pub(crate) fn bind_context(context: CUcontext) -> Result<(), CudaError> {
+	unsafe { check_ret(cuCtxPushCurrent_v2(context)) }
 }

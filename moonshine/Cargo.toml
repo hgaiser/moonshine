@@ -5,7 +5,9 @@ edition = "2021"
 
 [dependencies]
 clap = { version = "4.1.8", features = ["derive"] }
+cstr = "0.2.11"
 dirs = "4.0.0"
+enet = "0.3.0"
 env_logger = "0.10.0"
 ffmpeg = { path = "../ffmpeg" }
 ffmpeg-sys = { path = "../ffmpeg-sys" }

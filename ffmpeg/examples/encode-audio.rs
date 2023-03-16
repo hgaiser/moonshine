@@ -1,6 +1,14 @@
 use std::{io::Write, f32::consts::PI, ptr::null};
 
-use ffmpeg::{CodecContext, Frame, Packet, Codec, CodecContextBuilder, FrameBuilder, check_ret};
+use ffmpeg::{
+	Codec,
+	CodecContext,
+	CodecContextBuilder,
+	Frame,
+	FrameBuilder,
+	Packet,
+	check_ret,
+};
 
 // /// Check that a given sample format is supported by the encoder.
 // static int check_sample_fmt(const AVCodec *codec, enum AVSampleFormat sample_fmt)
@@ -15,51 +23,51 @@ use ffmpeg::{CodecContext, Frame, Packet, Codec, CodecContextBuilder, FrameBuild
 // 	return 0;
 // }
 
- /// Just pick the highest supported samplerate.
- fn select_sample_rate(codec: &Codec) -> u32 {
- 	if !codec.as_raw().supported_samplerates.is_null() {
- 		return 44100;
+/// Just pick the highest supported samplerate.
+fn select_sample_rate(codec: &Codec) -> u32 {
+	if !codec.as_raw().supported_samplerates.is_null() {
+		return 44100;
 	}
 
- 	let mut p = codec.as_raw().supported_samplerates;
- 	let mut best_samplerate: i32 = 0;
- 	while !p.is_null() {
- 		let value = unsafe { *p };
- 		if best_samplerate == 0 || (44100 - value).abs() < (44100 - best_samplerate).abs() {
- 			best_samplerate = value;
+	let mut p = codec.as_raw().supported_samplerates;
+	let mut best_samplerate: i32 = 0;
+	while !p.is_null() {
+		let value = unsafe { *p };
+		if best_samplerate == 0 || (44100 - value).abs() < (44100 - best_samplerate).abs() {
+			best_samplerate = value;
 		}
 		p = unsafe { p.offset(1) };
- 	}
-
- 	best_samplerate as u32
- }
-
- /// Select layout with the highest channel count.
- fn select_channel_layout(
- 	codec: &Codec,
- 	dst: *mut ffmpeg_sys::AVChannelLayout,
- ) -> Result<(), ()> {
-	if codec.as_raw().ch_layouts.is_null() {
- 		return check_ret(unsafe { ffmpeg_sys::av_channel_layout_copy(dst, &ffmpeg_sys::AV_CHANNEL_LAYOUT_STEREO) })
- 			.map_err(|e| println!("Failed to copy channel layout: {e}"));
 	}
 
- 	let mut p = codec.as_raw().ch_layouts;
- 	let mut nb_channels = unsafe { *p }.nb_channels;
- 	let mut best_nb_channels = 0;
- 	let mut best_ch_layout = null();
- 	while nb_channels > 0 {
- 		if nb_channels > best_nb_channels {
- 			best_ch_layout   = p;
- 			best_nb_channels = nb_channels;
- 		}
- 		p = unsafe { p.offset(1) };
-		nb_channels = unsafe { *p }.nb_channels;
- 	}
+	best_samplerate as u32
+}
 
- 	check_ret(unsafe { ffmpeg_sys::av_channel_layout_copy(dst, best_ch_layout) })
- 		.map_err(|e| println!("Failed to copy channel layout: {e}"))
- }
+/// Select layout with the highest channel count.
+fn select_channel_layout(
+	codec: &Codec,
+	dst: *mut ffmpeg_sys::AVChannelLayout,
+) -> Result<(), ()> {
+	if codec.as_raw().ch_layouts.is_null() {
+		return check_ret(unsafe { ffmpeg_sys::av_channel_layout_copy(dst, &ffmpeg_sys::AV_CHANNEL_LAYOUT_STEREO) })
+			.map_err(|e| println!("Failed to copy channel layout: {e}"));
+	}
+
+	let mut p = codec.as_raw().ch_layouts;
+	let mut nb_channels = unsafe { *p }.nb_channels;
+	let mut best_nb_channels = 0;
+	let mut best_ch_layout = null();
+	while nb_channels > 0 {
+		if nb_channels > best_nb_channels {
+			best_ch_layout   = p;
+			best_nb_channels = nb_channels;
+		}
+		p = unsafe { p.offset(1) };
+		nb_channels = unsafe { *p }.nb_channels;
+	}
+
+	check_ret(unsafe { ffmpeg_sys::av_channel_layout_copy(dst, best_ch_layout) })
+		.map_err(|e| println!("Failed to copy channel layout: {e}"))
+}
 
 fn encode(
 	codec_context: &mut CodecContext,

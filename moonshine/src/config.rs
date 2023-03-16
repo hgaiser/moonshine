@@ -1,8 +1,6 @@
 use std::path::PathBuf;
 use serde::Deserialize;
 
-use ffmpeg::{CodecType, VideoQuality};
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
 	/// Name of the service.
@@ -51,10 +49,10 @@ pub struct SessionConfig {
 	pub fps: u32,
 
 	/// Type of codec to use.
-	pub codec: CodecType,
+	pub codec: String,
 
-	/// Quality for the stream.
-	pub video_quality: VideoQuality,
+	// /// Quality for the stream.
+	// pub video_quality: VideoQuality,
 }
 
 #[derive(Clone, Debug, Deserialize)]

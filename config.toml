@@ -1,11 +1,8 @@
 name = "Moonshine PC"
-address = "::"
+address = "127.0.0.1"
 
 [[applications]]
 title = "Desktop"
-
-# [[applications]]
-# title = "Desktop low resolution"
 
 [webserver]
 port = 47989
@@ -15,8 +12,8 @@ private_key = "./cert/key.pem"
 
 [session]
 fps = 60
-video_quality = "Fastest"
-codec = "H264"
+# video_quality = "Fastest"
+codec = "libx264"
 
 [rtsp]
 port = 48010

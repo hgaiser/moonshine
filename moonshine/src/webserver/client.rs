@@ -32,7 +32,7 @@ pub(super) struct PairingClient {
 	client_hash: Option<Vec<u8>>,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub(super) struct Client {}
 
 #[derive(Clone, Default)]
@@ -70,6 +70,7 @@ impl Clients {
 			};
 
 			log::debug!("Successfully loaded clients state from {:?}", path);
+			log::trace!("Clients: {clients:?}");
 
 			return Self {
 				pairing_clients: Default::default(),
