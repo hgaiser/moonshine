@@ -3,7 +3,7 @@ use std::io::Write;
 use ffmpeg::{CodecContext, CodecContextBuilder, Codec, FrameBuilder, Frame, Packet};
 
 fn encode(
-	codec: &mut CodecContext,
+	codec_context: &mut CodecContext,
 	frame: Option<&Frame>,
 	packet: &mut Packet,
 	file: &mut std::fs::File,
@@ -13,14 +13,14 @@ fn encode(
 	}
 
 	// Send the frame to the encoder.
-	codec.send_frame(frame)
+	codec_context.send_frame(frame)
 		.map_err(|e| println!("Error sending frame for encoding: {e}"))?;
 
 	loop {
-		match codec.receive_packet(packet) {
+		match codec_context.receive_packet(packet) {
 			Ok(()) => {
 				println!("Write packet {} (size={})", packet.as_raw().pts, packet.as_raw().size);
-				file.write(unsafe { std::slice::from_raw_parts(packet.as_raw().data, packet.as_raw().size as usize) })
+				file.write(packet.data())
 					.map_err(|e| println!("Failed to write to file: {e}"))?;
 			},
 			Err(e) => {
@@ -54,9 +54,9 @@ fn main() -> Result<(), ()> {
 		.map_err(|e| println!("Failed to find codec: {e}"))?;
 	println!("Using codec: {codec:?}");
 
-	let mut codec_builder = CodecContextBuilder::new(&codec)
+	let mut codec_context_builder = CodecContextBuilder::new(&codec)
 		.map_err(|e| println!("Failed to create codec: {e}"))?;
-	codec_builder
+	codec_context_builder
 		.set_width(2560)
 		.set_height(1600)
 		.set_framerate(30)
@@ -64,7 +64,7 @@ fn main() -> Result<(), ()> {
 		.set_pix_fmt(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P)
 		.set_bit_rate(1000000)
 		.set_gop_size(30);
-	let mut codec = codec_builder
+	let mut codec_context = codec_context_builder
 		.open()
 		.map_err(|e| println!("Failed to open codec: {e}"))?;
 
@@ -76,9 +76,10 @@ fn main() -> Result<(), ()> {
 
 	let mut frame_builder = FrameBuilder::new()
 		.map_err(|e| println!("Failed to create frame: {e}"))?;
-	frame_builder.set_format(codec.as_raw().pix_fmt);
-	frame_builder.set_width(codec.as_raw().width as u32);
-	frame_builder.set_height(codec.as_raw().height as u32);
+	frame_builder
+		.set_format(codec_context.as_raw().pix_fmt)
+		.set_width(codec_context.as_raw().width as u32)
+		.set_height(codec_context.as_raw().height as u32);
 	let mut frame = frame_builder.allocate(0)
 		.map_err(|e| println!("Failed to allocate frame: {e}"))?;
 
@@ -102,18 +103,27 @@ fn main() -> Result<(), ()> {
 		// frame.
 		unsafe {
 			// Y
-			let y_data = std::slice::from_raw_parts_mut(frame.as_raw().data[0], frame.as_raw().linesize[0] as usize * codec.as_raw().height as usize);
-			for y in 0..codec.as_raw().height {
-				for x in 0..codec.as_raw().width {
+			let y_data = std::slice::from_raw_parts_mut(
+				frame.as_raw_mut().data[0],
+				frame.as_raw().linesize[0] as usize * codec_context.as_raw().height as usize,
+			);
+			for y in 0..codec_context.as_raw().height {
+				for x in 0..codec_context.as_raw().width {
 					y_data[(y * frame.as_raw().linesize[0] + x) as usize] = (x + y + i * 3) as u8;
 				}
 			}
 
 			// Cb and Cr
-			let cb_data = std::slice::from_raw_parts_mut(frame.as_raw().data[1], frame.as_raw().linesize[1] as usize * codec.as_raw().height as usize);
-			let cr_data = std::slice::from_raw_parts_mut(frame.as_raw().data[2], frame.as_raw().linesize[2] as usize * codec.as_raw().height as usize);
-			for y in 0..codec.as_raw().height / 2 {
-				for x in 0..codec.as_raw().width / 2 {
+			let cb_data = std::slice::from_raw_parts_mut(
+				frame.as_raw_mut().data[1],
+				frame.as_raw().linesize[1] as usize * codec_context.as_raw().height as usize,
+			);
+			let cr_data = std::slice::from_raw_parts_mut(
+				frame.as_raw_mut().data[2],
+				frame.as_raw().linesize[2] as usize * codec_context.as_raw().height as usize,
+			);
+			for y in 0..codec_context.as_raw().height / 2 {
+				for x in 0..codec_context.as_raw().width / 2 {
 					cb_data[(y * frame.as_raw().linesize[1] + x) as usize] = (128 + y + i * 2) as u8;
 					cr_data[(y * frame.as_raw().linesize[2] + x) as usize] = (64 + x + i * 5) as u8;
 				}
@@ -123,11 +133,11 @@ fn main() -> Result<(), ()> {
 		frame.as_raw_mut().pts = i as i64;
 
 		// Encode the image.
-		encode(&mut codec, Some(&frame), &mut packet, &mut file)?;
+		encode(&mut codec_context, Some(&frame), &mut packet, &mut file)?;
 	}
 
 	// Flush the encoder.
-	encode(&mut codec, None, &mut packet, &mut file)?;
+	encode(&mut codec_context, None, &mut packet, &mut file)?;
 
 	Ok(())
 }

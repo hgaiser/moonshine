@@ -27,7 +27,7 @@ fn get_error(error_code: i32) -> Result<String, String> {
 	let mut buffer = [0 as c_char; ffmpeg_sys::AV_ERROR_MAX_STRING_SIZE as usize];
 	unsafe {
 		// Don't use check_ret here, because this function is called by check_ret.
-		if ffmpeg_sys::av_strerror(error_code, buffer.as_mut_ptr() as *mut _, ffmpeg_sys::AV_ERROR_MAX_STRING_SIZE as u64) < 0 {
+		if ffmpeg_sys::av_strerror(error_code, buffer.as_mut_ptr() as *mut _, ffmpeg_sys::AV_ERROR_MAX_STRING_SIZE as usize) < 0 {
 			return Err("failed to get last ffmpeg error".into());
 		}
 

@@ -68,6 +68,11 @@ impl FrameBuilder {
 		self
 	}
 
+	pub fn set_nb_samples(&mut self, nb_samples: u32) -> &mut Self {
+		self.as_raw_mut().nb_samples = nb_samples as i32;
+		self
+	}
+
 	pub fn as_raw_mut(&mut self) -> &mut ffmpeg_sys::AVFrame {
 		unsafe { &mut *self.frame }
 	}

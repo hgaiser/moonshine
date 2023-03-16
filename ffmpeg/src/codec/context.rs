@@ -103,6 +103,17 @@ impl CodecContextBuilder {
 		self
 	}
 
+	pub fn set_sample_fmt(&mut self, sample_fmt: u32) -> &mut Self {
+		// TODO: Make sample_fmt an enum.
+		self.as_raw_mut().sample_fmt = sample_fmt as i32;
+		self
+	}
+
+	pub fn set_sample_rate(&mut self, sample_rate: u32) -> &mut Self {
+		self.as_raw_mut().sample_rate = sample_rate as i32;
+		self
+	}
+
 	pub fn as_raw_mut(&mut self) -> &mut ffmpeg_sys::AVCodecContext {
 		unsafe { &mut *self.codec_context }
 	}

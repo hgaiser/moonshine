@@ -1,5 +1,5 @@
 [workspace]
-members = ["moonshine", "ffmpeg", "ffmpeg-stream-test"]
+members = ["moonshine", "ffmpeg"]
 
 [patch.crates-io]
 nvfbc = { path = "../nvfbc-rs/nvfbc" }
