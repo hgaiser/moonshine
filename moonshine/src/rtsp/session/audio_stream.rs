@@ -159,13 +159,12 @@ impl AudioStream {
 				}
 			}
 
-			self.frame.as_raw_mut().pts = i as i64;
-
-			// Encode the image.
+			// Encode the audio.
 			if let Some(client_address) = client_address {
 				self.encode(&client_address).await?;
 			}
 
+			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 		}
 
 		Ok(())
@@ -175,7 +174,7 @@ impl AudioStream {
 		&mut self,
 		client_address: &SocketAddr,
 	) -> Result<(), ()> {
-		log::trace!("Send frame {}", self.frame.as_raw().pts);
+		log::trace!("Send frame");
 
 		// Send the frame to the encoder.
 		self.codec_context.send_frame(Some(&self.frame))
@@ -184,7 +183,7 @@ impl AudioStream {
 		loop {
 			match self.codec_context.receive_packet(&mut self.packet) {
 				Ok(()) => {
-					log::info!("Write packet {} (size={})", self.packet.as_raw().pts, self.packet.as_raw().size);
+					log::info!("Write packet (size={})", self.packet.as_raw().size);
 					let data = self.packet.data();
 					self.socket.send_to(
 						data,
