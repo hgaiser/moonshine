@@ -60,10 +60,14 @@ fn main() -> Result<(), ()> {
 		.set_width(2560)
 		.set_height(1600)
 		.set_framerate(30)
-		.set_max_b_frames(1)
+		.set_max_b_frames(0)
 		.set_pix_fmt(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P)
 		.set_bit_rate(1000000)
-		.set_gop_size(30);
+		.set_gop_size(30)
+		.set_flags(ffmpeg_sys::AV_CODEC_FLAG_CLOSED_GOP | ffmpeg_sys::AV_CODEC_FLAG_LOW_DELAY)
+		.set_flags2(ffmpeg_sys::AV_CODEC_FLAG2_FAST)
+	;
+
 	let mut codec_context = codec_context_builder
 		.open()
 		.map_err(|e| println!("Failed to open codec: {e}"))?;

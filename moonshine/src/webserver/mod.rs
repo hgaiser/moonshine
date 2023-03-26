@@ -23,10 +23,10 @@ pub(crate) async fn run(config: config::Config) -> Result<(), ()> {
 	let clients = Clients::from_state_or_default();
 
 	let http_task = tokio::spawn(run_http_server(config.clone(), clients.clone()));
-	log::info!("Http server listening on '{}:{}'", config.address, config.webserver.port);
+	log::info!("Http server listening on {}:{}", config.address, config.webserver.port);
 
 	let https_task = tokio::spawn(run_https_server(config.clone(), clients.clone()));
-	log::info!("Https server listening on '{}:{}'", config.address, config.webserver.port_https);
+	log::info!("Https server listening on {}:{}", config.address, config.webserver.port_https);
 
 	let result = tokio::try_join!(flatten(http_task), flatten(https_task));
 	match result {
@@ -151,7 +151,7 @@ async fn server_info(req: Request<Body>, config: config::Config, clients: Client
 	let mut response = Response::new(Body::from(format!("<?xml version=\"1.0\" encoding=\"utf-8\"?>
 <root status_code=\"200\">
 	<hostname>{}</hostname>
-	<appversion>7.1.431.0</appversion>
+	<appversion>7.1.450.0</appversion>
 	<GfeVersion>3.23.0.74</GfeVersion>
 	<uniqueid>7AD14F7C-2F8B-7329-AF86-42A06F6471FE</uniqueid>
 	<HttpsPort>{}</HttpsPort>
@@ -218,6 +218,7 @@ async fn app_list(req: Request<Body>, config: config::Config, clients: Clients) 
 
 async fn launch(req: Request<Body>, config: config::Config, clients: Clients) -> Response<Body> {
 	let params = parse_params(req.uri());
+	log::trace!("Launch request params: {params:?}");
 
 	let unique_id = match params.get("uniqueid") {
 		Some(unique_id) => unique_id,

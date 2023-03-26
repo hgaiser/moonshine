@@ -3,9 +3,11 @@ use rtsp_types::{headers::{self, Transport}, Method};
 use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}, sync::Mutex};
 use session::Session;
 
+use crate::config::SessionConfig;
+
 mod session;
 
-pub async fn run(address: String, port: u16) -> Result<(), ()> {
+pub async fn run(address: String, port: u16, config: SessionConfig) -> Result<(), ()> {
 	let address = (address.clone(), port).to_socket_addrs()
 		.map_err(|e| log::error!("Failed to resolve address {}:{}: {}", address, port, e))?
 		.next()
@@ -16,7 +18,7 @@ pub async fn run(address: String, port: u16) -> Result<(), ()> {
 
 	log::info!("RTSP server listening on {}", address);
 
-	let session = Arc::new(Mutex::new(Session::new().await?));
+	let session = Arc::new(Mutex::new(Session::new(config).await?));
 	loop {
 		let (connection, address) = listener.accept()
 			.await
@@ -65,7 +67,7 @@ async fn handle_connection(
 				.map_err(|e| log::error!("Failed to parse CSeq header: {}", e))?;
 
 			match request.method() {
-				Method::Announce => handle_announce_request(request, cseq),
+				Method::Announce => handle_announce_request(request, cseq, session.clone()).await,
 				Method::Describe => handle_describe_request(request, cseq, session.clone()).await,
 				Method::Options => handle_options_request(request, cseq),
 				Method::Setup => handle_setup_request(request, cseq),
@@ -100,11 +102,59 @@ async fn handle_connection(
 	Ok(())
 }
 
-fn handle_announce_request(request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
+async fn handle_announce_request(
+	request: &rtsp_types::Request<Vec<u8>>,
+	cseq: i32,
+	session: Arc<Mutex<Session>>,
+) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
 	let sdp_session = sdp_types::Session::parse(request.body())
 		.map_err(|e| log::error!("Failed to parse ANNOUNCE request as SDP session: {e}"))?;
 
 	log::trace!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
+
+	let mut session = session.lock().await;
+	session.video_stream_config.width = sdp_session.get_first_attribute_value("x-nv-video[0].clientViewportWd")
+		.map_err(|e| log::error!("Failed to get width attribute from announce request: {e}"))?
+		.ok_or_else(|| log::error!("No width attribute in announce request"))?
+		.trim()
+		.parse()
+		.map_err(|e| log::error!("Width attribute is not an integer: {e}"))?;
+	session.video_stream_config.height = sdp_session.get_first_attribute_value("x-nv-video[0].clientViewportHt")
+		.map_err(|e| log::error!("Failed to get height attribute from announce request: {e}"))?
+		.ok_or_else(|| log::error!("No height attribute in announce request"))?
+		.trim()
+		.parse()
+		.map_err(|e| log::error!("Height attribute is not an integer: {e}"))?;
+	session.video_stream_config.fps = sdp_session.get_first_attribute_value("x-nv-video[0].maxFPS")
+		.map_err(|e| log::error!("Failed to get FPS attribute from announce request: {e}"))?
+		.ok_or_else(|| log::error!("No FPS attribute in announce request"))?
+		.trim()
+		.parse()
+		.map_err(|e| log::error!("FPS attribute is not an integer: {e}"))?;
+	session.video_stream_config.packet_size = sdp_session.get_first_attribute_value("x-nv-video[0].packetSize")
+		.map_err(|e| log::error!("Failed to get packet size attribute from announce request: {e}"))?
+		.ok_or_else(|| log::error!("No packet size attribute in announce request"))?
+		.trim()
+		.parse()
+		.map_err(|e| log::error!("Packet size attribute is not an integer: {e}"))?;
+	session.video_stream_config.bitrate = sdp_session.get_first_attribute_value("x-nv-vqos[0].bw.maximumBitrateKbps")
+		.map_err(|e| log::error!("Failed to get bitrate attribute from announce request: {e}"))?
+		.ok_or_else(|| log::error!("No bitrate attribute in announce request"))?
+		.trim()
+		.parse()
+		.map_err(|e| log::error!("Bitrate attribute is not an integer: {e}"))?;
+	session.video_stream_config.minimum_fec_packets = sdp_session.get_first_attribute_value("x-nv-vqos[0].fec.minRequiredFecPackets")
+		.map_err(|e| log::error!("Failed to get minimum required FEC packets attribute from announce request: {e}"))?
+		.ok_or_else(|| log::error!("No minimum required FEC packets attribute in announce request"))?
+		.trim()
+		.parse()
+		.map_err(|e| log::error!("Minimum required FEC packets attribute is not an integer: {e}"))?;
+	session.audio_stream_config.packet_duration = sdp_session.get_first_attribute_value("x-nv-aqos.packetDuration")
+		.map_err(|e| log::error!("Failed to get packet duration attribute from announce request: {e}"))?
+		.ok_or_else(|| log::error!("No packet duration attribute in announce request"))?
+		.trim()
+		.parse()
+		.map_err(|e| log::error!("Packet duration attribute is not an integer: {e}"))?;
 
 	Ok(rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 		.header(headers::CSEQ, cseq.to_string())
@@ -178,7 +228,7 @@ fn handle_setup_request(
 				}
 
 				// Example query: streamid=control/13/0
-				let (stream_id, port) = match query.1.split("/").next() {
+				let (stream_id, port) = match query.1.split('/').next() {
 					Some("control") => ("control", 47999u16),
 					Some("audio") => ("audio", 48000u16),
 					Some("video") => ("video", 47998u16),
@@ -217,9 +267,13 @@ fn handle_play_request(
 	cseq: i32,
 	session: Arc<Mutex<Session>>,
 ) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
-	tokio::task::spawn(async move {
-		session.lock().await.run().await
-	});
+	// TODO: Think of a better way to prevent double running.
+	let locked = session.try_lock().is_err();
+	if !locked {
+		tokio::task::spawn(async move {
+			session.lock().await.run().await
+		});
+	}
 
 	Ok(rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 		.header(headers::CSEQ, cseq.to_string())

@@ -9,7 +9,15 @@ use ffmpeg::{
 	Packet,
 	check_ret,
 };
+use reed_solomon::ReedSolomon;
 use tokio::net::UdpSocket;
+
+use crate::rtsp::session::rtp::{RtpHeader, PacketType};
+
+#[derive(Clone, Default)]
+pub struct AudioStreamConfig {
+	pub packet_duration: u32,
+}
 
 /// Just pick the highest supported samplerate.
 fn select_sample_rate(codec: &Codec) -> u32 {
@@ -63,10 +71,17 @@ pub(super) struct AudioStream {
 	codec_context: CodecContext,
 	frame: Frame,
 	packet: Packet,
+	fec_encoder: ReedSolomon,
+	sequence_number: u16,
+	timestamp: u32,
+	config: AudioStreamConfig,
 }
 
 impl AudioStream {
-	pub(super) async fn new(address: &str, port: u16) -> Result<Self, ()> {
+	const RTPA_DATA_SHARDS: usize = 4;
+	const RTPA_FEC_SHARDS: usize = 2;
+
+	pub(super) async fn new(address: &str, port: u16, config: AudioStreamConfig) -> Result<Self, ()> {
 		let socket = UdpSocket::bind((address, port)).await
 			.map_err(|e| log::error!("Failed to bind to UDP socket: {e}"))?;
 
@@ -104,11 +119,18 @@ impl AudioStream {
 		let frame = frame_builder.allocate(0)
 			.map_err(|e| println!("Failed to allocate frame: {e}"))?;
 
+		let fec_encoder = ReedSolomon::new(Self::RTPA_DATA_SHARDS, Self::RTPA_FEC_SHARDS)
+			.map_err(|e| log::error!("Failed to create FEC encoder: {e}"))?;
+
 		Ok(Self {
 			socket,
 			codec_context,
 			frame,
 			packet,
+			fec_encoder,
+			sequence_number: 0,
+			timestamp: 0,
+			config,
 		})
 	}
 
@@ -121,7 +143,7 @@ impl AudioStream {
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
-		for i in 0.. {
+		for _ in 0.. {
 			match self.socket.try_recv_from(&mut buf) {
 				Ok((len, addr)) => {
 					if &buf[..len] == b"PING" {
@@ -170,6 +192,74 @@ impl AudioStream {
 		Ok(())
 	}
 
+	async fn send_packet(
+		&mut self,
+		client_address: &SocketAddr,
+	) -> Result<(), ()> {
+		log::trace!("Write packet (size={})", self.packet.as_raw().size);
+		let data = self.packet.data();
+		self.socket.send_to(
+			data,
+			client_address,
+		).await
+			.map_err(|e| log::error!("Failed to send packet: {e}"))?;
+
+
+
+		let packet_data = self.packet.data();
+		let nr_data_shards = Self::RTPA_DATA_SHARDS;
+		let nr_parity_shards = Self::RTPA_FEC_SHARDS;
+		let payload_size = (packet_data.len() + nr_data_shards - 1) / nr_data_shards;
+
+		let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
+		for i in 0..nr_data_shards {
+			let start = i * payload_size;
+			let end = ((i + 1) * payload_size).min(packet_data.len());
+
+			// TODO: Do this without cloning.
+			let mut shard = vec![0u8; payload_size];
+			shard[..(end - start)].copy_from_slice(&packet_data[start..end]);
+			shards.push(shard);
+		}
+		for _ in 0..nr_parity_shards {
+			shards.push(vec![0u8; payload_size]);
+		}
+		self.fec_encoder.encode(&mut shards)
+			.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
+
+		for (index, shard) in shards.iter().enumerate() {
+			let rtp_header = RtpHeader {
+				header: 0x80, // What is this?
+				packet_type: PacketType::Audio,
+				sequence_number: self.sequence_number,
+				timestamp: self.timestamp,
+				ssrc: 0,
+				padding: 0,
+			};
+
+			let mut buffer = Vec::with_capacity(
+				std::mem::size_of::<RtpHeader>()
+				+ shard.len(),
+			);
+			rtp_header.serialize(&mut buffer);
+			buffer.extend(shard);
+
+			log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
+			self.socket.send_to(
+				buffer.as_slice(),
+				client_address,
+			).await
+				.map_err(|e| log::error!("Failed to send packet: {e}"))?;
+
+			self.sequence_number += 1;
+		}
+
+		self.timestamp += self.config.packet_duration;
+
+
+		Ok(())
+	}
+
 	async fn encode(
 		&mut self,
 		client_address: &SocketAddr,
@@ -182,15 +272,7 @@ impl AudioStream {
 
 		loop {
 			match self.codec_context.receive_packet(&mut self.packet) {
-				Ok(()) => {
-					log::info!("Write packet (size={})", self.packet.as_raw().size);
-					let data = self.packet.data();
-					self.socket.send_to(
-						data,
-						client_address,
-					).await
-						.map_err(|e| log::error!("Failed to send packet: {e}"))?;
-				},
+				Ok(()) => self.send_packet(client_address).await?,
 				Err(e) => {
 					if e.code == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) {
 						// log::info!("Need more frames for encoding...");

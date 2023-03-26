@@ -1,5 +1,6 @@
 [workspace]
-members = ["moonshine", "ffmpeg"]
+members = ["ffmpeg", "moonshine", "reed-solomon"]
 
 [patch.crates-io]
 nvfbc = { path = "../nvfbc-rs/nvfbc" }
+enet = { path = "../enet-rs" }

@@ -5,8 +5,6 @@ use clap::Parser;
 use crate::util::flatten;
 
 mod config;
-// mod cuda;
-// mod error;
 mod rtsp;
 mod service_publisher;
 mod util;
@@ -25,14 +23,11 @@ async fn main() -> Result<(), ()> {
 
 	let args = Args::parse();
 
-	let config = std::fs::read_to_string(args.config)
-		.map_err(|e| log::error!("Failed to open configuration file: {}", e))?;
-	let config: config::Config = toml::from_str(&config)
-		.map_err(|e| log::error!("Failed to parse configuration file: {}", e))?;
+	let config = config::Config::read_from_file(args.config)?;
 
 	log::debug!("Using configuration:\n{:#?}", config);
 
-	let rtsp_task = tokio::spawn(rtsp::run(config.address.clone(), config.rtsp.port));
+	let rtsp_task = tokio::spawn(rtsp::run(config.address.clone(), config.rtsp.port, config.session.clone()));
 	let publisher_task = tokio::spawn(service_publisher::run(config.webserver.port));
 	let webserver_task = tokio::spawn(webserver::run(config.clone()));
 

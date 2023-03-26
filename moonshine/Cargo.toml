@@ -17,6 +17,7 @@ image = "0.24.5"
 log = "0.4.17"
 nvfbc = "0.1.2"
 openssl = "0.10.45"
+reed-solomon = { version = "0.1.0", path = "../reed-solomon" }
 rtsp-types = "0.0.5"
 sdp-types = "0.1.5"
 serde = "1.0.155"

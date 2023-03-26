@@ -12,8 +12,8 @@ private_key = "./cert/key.pem"
 
 [session]
 fps = 60
-# video_quality = "Fastest"
 codec = "libx264"
+fec_percentage = 20
 
 [rtsp]
 port = 48010

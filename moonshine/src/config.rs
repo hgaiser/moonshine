@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{PathBuf, Path};
 use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
@@ -20,6 +20,17 @@ pub struct Config {
 
 	/// Configuration for sessions with clients.
 	pub session: SessionConfig,
+}
+
+impl Config {
+	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config, ()> {
+		let config = std::fs::read_to_string(file)
+			.map_err(|e| log::error!("Failed to open configuration file: {}", e))?;
+		let config: Config = toml::from_str(&config)
+			.map_err(|e| log::error!("Failed to parse configuration file: {}", e))?;
+
+		Ok(config)
+	}
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -51,8 +62,8 @@ pub struct SessionConfig {
 	/// Type of codec to use.
 	pub codec: String,
 
-	// /// Quality for the stream.
-	// pub video_quality: VideoQuality,
+	/// What percentage of data packets should be parity packets.
+	pub fec_percentage: u32,
 }
 
 #[derive(Clone, Debug, Deserialize)]

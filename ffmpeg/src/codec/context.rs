@@ -114,6 +114,16 @@ impl CodecContextBuilder {
 		self
 	}
 
+	pub fn set_flags(&mut self, flags: u32) -> &mut Self {
+		self.as_raw_mut().flags = flags as i32;
+		self
+	}
+
+	pub fn set_flags2(&mut self, flags: u32) -> &mut Self {
+		self.as_raw_mut().flags2 = flags as i32;
+		self
+	}
+
 	pub fn as_raw_mut(&mut self) -> &mut ffmpeg_sys::AVCodecContext {
 		unsafe { &mut *self.codec_context }
 	}

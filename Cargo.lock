@@ -457,8 +457,6 @@ checksum = "7fcaabb2fef8c910e7f4c7ce9f67a1283a1715879a7c230ca9d6d1ae31f16d91"
 [[package]]
 name = "enet"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd5c84ebdecb28194d15e063436a4b7863546a9dea268aee131ca23dbb2a21ac"
 dependencies = [
  "enet-sys",
  "thiserror",
@@ -1024,6 +1022,7 @@ dependencies = [
  "log",
  "nvfbc",
  "openssl",
+ "reed-solomon",
  "rtsp-types",
  "sdp-types",
  "serde",
@@ -1315,6 +1314,13 @@ dependencies = [
  "getrandom",
  "redox_syscall",
  "thiserror",
+]
+
+[[package]]
+name = "reed-solomon"
+version = "0.1.0"
+dependencies = [
+ "cc",
 ]
 
 [[package]]
