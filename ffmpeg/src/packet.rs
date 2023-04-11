@@ -33,3 +33,4 @@ impl Drop for Packet {
 
 // TODO: Check if this is correct.
 unsafe impl Send for Packet { }
+unsafe impl Sync for Packet { }

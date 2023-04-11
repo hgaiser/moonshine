@@ -140,3 +140,5 @@ impl Drop for CodecContextBuilder {
 		}
 	}
 }
+
+unsafe impl Send for CodecContextBuilder { }

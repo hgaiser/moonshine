@@ -170,3 +170,6 @@ pub const AV_CHANNEL_LAYOUT_CUBE: AVChannelLayout              = av_channel_layo
 pub const AV_CHANNEL_LAYOUT_HEXADECAGONAL: AVChannelLayout     = av_channel_layout_mask(16, AV_CH_LAYOUT_HEXADECAGONAL);
 pub const AV_CHANNEL_LAYOUT_STEREO_DOWNMIX: AVChannelLayout    = av_channel_layout_mask(2,  AV_CH_LAYOUT_STEREO_DOWNMIX);
 pub const AV_CHANNEL_LAYOUT_22POINT2: AVChannelLayout          = av_channel_layout_mask(24, AV_CH_LAYOUT_22POINT2);
+
+unsafe impl Sync for AVPacket {}
+unsafe impl Send for AVPacket {}

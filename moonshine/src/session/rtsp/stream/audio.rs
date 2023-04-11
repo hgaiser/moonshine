@@ -12,8 +12,6 @@ use ffmpeg::{
 use reed_solomon::ReedSolomon;
 use tokio::net::UdpSocket;
 
-use crate::session::rtsp::stream::rtp::RtpHeader;
-
 #[derive(Clone, Default)]
 pub struct AudioStreamConfig {
 	pub packet_duration: u32,
@@ -134,7 +132,7 @@ impl AudioStream {
 		})
 	}
 
-	pub(super) async fn run(mut self) -> Result<(), ()> {
+	pub(super) async fn run(self) -> Result<(), ()> {
 		log::info!(
 			"Listening for audio messages on {}",
 			self.socket.local_addr()
@@ -192,102 +190,102 @@ impl AudioStream {
 		Ok(())
 	}
 
-	async fn send_packet(
-		&mut self,
-		client_address: &SocketAddr,
-	) -> Result<(), ()> {
-		log::trace!("Write packet (size={})", self.packet.as_raw().size);
-		let data = self.packet.data();
-		self.socket.send_to(
-			data,
-			client_address,
-		).await
-			.map_err(|e| log::error!("Failed to send packet: {e}"))?;
+	// async fn send_packet(
+	// 	&mut self,
+	// 	client_address: &SocketAddr,
+	// ) -> Result<(), ()> {
+	// 	log::trace!("Write packet (size={})", self.packet.as_raw().size);
+	// 	let data = self.packet.data();
+	// 	self.socket.send_to(
+	// 		data,
+	// 		client_address,
+	// 	).await
+	// 		.map_err(|e| log::error!("Failed to send packet: {e}"))?;
 
 
 
-		let packet_data = self.packet.data();
-		let nr_data_shards = Self::RTPA_DATA_SHARDS;
-		let nr_parity_shards = Self::RTPA_FEC_SHARDS;
-		let payload_size = (packet_data.len() + nr_data_shards - 1) / nr_data_shards;
+	// 	let packet_data = self.packet.data();
+	// 	let nr_data_shards = Self::RTPA_DATA_SHARDS;
+	// 	let nr_parity_shards = Self::RTPA_FEC_SHARDS;
+	// 	let payload_size = (packet_data.len() + nr_data_shards - 1) / nr_data_shards;
 
-		let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
-		for i in 0..nr_data_shards {
-			let start = i * payload_size;
-			let end = ((i + 1) * payload_size).min(packet_data.len());
+	// 	let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
+	// 	for i in 0..nr_data_shards {
+	// 		let start = i * payload_size;
+	// 		let end = ((i + 1) * payload_size).min(packet_data.len());
 
-			// TODO: Do this without cloning.
-			let mut shard = vec![0u8; payload_size];
-			shard[..(end - start)].copy_from_slice(&packet_data[start..end]);
-			shards.push(shard);
-		}
-		for _ in 0..nr_parity_shards {
-			shards.push(vec![0u8; payload_size]);
-		}
-		self.fec_encoder.encode(&mut shards)
-			.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
+	// 		// TODO: Do this without cloning.
+	// 		let mut shard = vec![0u8; payload_size];
+	// 		shard[..(end - start)].copy_from_slice(&packet_data[start..end]);
+	// 		shards.push(shard);
+	// 	}
+	// 	for _ in 0..nr_parity_shards {
+	// 		shards.push(vec![0u8; payload_size]);
+	// 	}
+	// 	self.fec_encoder.encode(&mut shards)
+	// 		.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
 
-		for (index, shard) in shards.iter().enumerate() {
-			let rtp_header = RtpHeader {
-				header: 0x80, // What is this?
-				packet_type: 0,
-				sequence_number: self.sequence_number,
-				timestamp: self.timestamp,
-				ssrc: 0,
-				padding: 0,
-			};
+	// 	for (index, shard) in shards.iter().enumerate() {
+	// 		let rtp_header = RtpHeader {
+	// 			header: 0x80, // What is this?
+	// 			packet_type: 0,
+	// 			sequence_number: self.sequence_number,
+	// 			timestamp: self.timestamp,
+	// 			ssrc: 0,
+	// 			padding: 0,
+	// 		};
 
-			let mut buffer = Vec::with_capacity(
-				std::mem::size_of::<RtpHeader>()
-				+ shard.len(),
-			);
-			rtp_header.serialize(&mut buffer);
-			buffer.extend(shard);
+	// 		let mut buffer = Vec::with_capacity(
+	// 			std::mem::size_of::<RtpHeader>()
+	// 			+ shard.len(),
+	// 		);
+	// 		rtp_header.serialize(&mut buffer);
+	// 		buffer.extend(shard);
 
-			log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
-			self.socket.send_to(
-				buffer.as_slice(),
-				client_address,
-			).await
-				.map_err(|e| log::error!("Failed to send packet: {e}"))?;
+	// 		log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
+	// 		self.socket.send_to(
+	// 			buffer.as_slice(),
+	// 			client_address,
+	// 		).await
+	// 			.map_err(|e| log::error!("Failed to send packet: {e}"))?;
 
-			self.sequence_number += 1;
-		}
+	// 		self.sequence_number += 1;
+	// 	}
 
-		self.timestamp += self.config.packet_duration;
+	// 	self.timestamp += self.config.packet_duration;
 
 
-		Ok(())
-	}
+	// 	Ok(())
+	// }
 
-	async fn encode(
-		&mut self,
-		client_address: &SocketAddr,
-	) -> Result<(), ()> {
-		log::trace!("Send frame");
+	// async fn encode(
+	// 	&mut self,
+	// 	client_address: &SocketAddr,
+	// ) -> Result<(), ()> {
+	// 	log::trace!("Send frame");
 
-		// Send the frame to the encoder.
-		self.codec_context.send_frame(Some(&self.frame))
-			.map_err(|e| log::error!("Error sending frame for encoding: {e}"))?;
+	// 	// Send the frame to the encoder.
+	// 	self.codec_context.send_frame(Some(&self.frame))
+	// 		.map_err(|e| log::error!("Error sending frame for encoding: {e}"))?;
 
-		loop {
-			match self.codec_context.receive_packet(&mut self.packet) {
-				Ok(()) => self.send_packet(client_address).await?,
-				Err(e) => {
-					if e.code == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) {
-						// log::info!("Need more frames for encoding...");
-						return Ok(());
-					} else if e.code == ffmpeg_sys::AVERROR_EOF {
-						log::info!("End of file");
-						return Ok(());
-					} else {
-						log::error!("Error while encoding: {e}");
-						return Err(());
-					}
-				}
-			}
-		}
-	}
+	// 	loop {
+	// 		match self.codec_context.receive_packet(&mut self.packet) {
+	// 			Ok(()) => self.send_packet(client_address).await?,
+	// 			Err(e) => {
+	// 				if e.code == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) {
+	// 					// log::info!("Need more frames for encoding...");
+	// 					return Ok(());
+	// 				} else if e.code == ffmpeg_sys::AVERROR_EOF {
+	// 					log::info!("End of file");
+	// 					return Ok(());
+	// 				} else {
+	// 					log::error!("Error while encoding: {e}");
+	// 					return Err(());
+	// 				}
+	// 			}
+	// 		}
+	// 	}
+	// }
 }
 
 unsafe impl Send for AudioStream { }

@@ -37,3 +37,5 @@ impl Debug for Codec {
 		}
 	}
 }
+
+unsafe impl Send for Codec { }

@@ -30,6 +30,8 @@ impl Drop for Frame {
 	}
 }
 
+unsafe impl Send for Frame { }
+
 pub struct FrameBuilder {
 	frame: *mut ffmpeg_sys::AVFrame,
 }
@@ -89,3 +91,5 @@ impl Drop for FrameBuilder {
 		}
 	}
 }
+
+unsafe impl Send for FrameBuilder { }
