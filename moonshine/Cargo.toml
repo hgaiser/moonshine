@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+async-shutdown = "0.1.2"
 clap = { version = "4.1.8", features = ["derive"] }
 cstr = "0.2.11"
 dirs = "4.0.0"
@@ -16,13 +17,14 @@ hyper = { version = "0.14.25", features = ["server", "http1", "tcp"] }
 image = "0.24.5"
 log = "0.4.17"
 nvfbc = "0.1.2"
-openssl = "0.10.45"
+openssl = "0.10.48"
 reed-solomon = { version = "0.1.0", path = "../reed-solomon" }
 rtsp-types = "0.0.5"
 sdp-types = "0.1.5"
 serde = "1.0.155"
-tokio = { version = "1.26.0", features = ["rt-multi-thread", "macros", "net", "io-util"] }
+tokio = { version = "1.26.0", features = ["rt-multi-thread", "macros", "net", "io-util", "signal"] }
 tokio-openssl = "0.6.3"
 toml = "0.7.2"
 url = "2.3.1"
+xml-rs = "0.8.4"
 zeroconf = "0.10.5"

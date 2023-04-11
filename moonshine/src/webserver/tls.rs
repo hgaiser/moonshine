@@ -9,7 +9,7 @@ pub struct TlsAcceptor {
 }
 
 impl TlsAcceptor {
-	pub fn from_config(certificate_chain: &Path, private_key: &Path) -> Result<Self, ()> {
+	pub fn from_config<P: AsRef<Path>>(certificate_chain: P, private_key: P) -> Result<Self, ()> {
 		let context = load_tls_files(certificate_chain, private_key)?;
 		Ok(Self { context })
 	}
@@ -26,27 +26,15 @@ impl TlsAcceptor {
 	}
 }
 
-fn load_tls_files(certificate_chain: &Path, private_key: &Path) -> Result<SslContext, ()> {
-	// let mut builder = {
-	// 	use openssl::ssl::{SslMethod, SslOptions};
-	// 	let mut context = SslContext::builder(SslMethod::tls_server()).unwrap();
-	// 	context.set_options(SslOptions::NO_SSL_MASK & !SslOptions::NO_TLSV1_3);
-	// 	context.set_ciphersuites(
-	// 		"TLS_AES_128_GCM_SHA256:TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256",
-	// 	).unwrap();
-	// 	context
-	// };
-
+fn load_tls_files<P: AsRef<Path>>(certificate_chain: P, private_key: P) -> Result<SslContext, ()> {
 	let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls_server())
 		.map_err(|e| log::error!("Failed to initialize SSL acceptor: {}", e))?;
 	builder
 		.set_private_key_file(&private_key, SslFiletype::PEM)
-		.map_err(|e| log::error!("Failed to set private key file '{:?}': {}", private_key, e))?
-	;
+		.map_err(|e| log::error!("Failed to set private key file '{:?}': {}", private_key.as_ref(), e))?;
 	builder
 		.set_certificate_chain_file(&certificate_chain)
-		.map_err(|e| log::error!("Failed to set certificate chain file '{:?}': {}", certificate_chain, e))?
-	;
+		.map_err(|e| log::error!("Failed to set certificate chain file '{:?}': {}", certificate_chain.as_ref(), e))?;
 
 	Ok(builder.build().into_context())
 }

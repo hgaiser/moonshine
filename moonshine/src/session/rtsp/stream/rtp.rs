@@ -5,16 +5,25 @@ pub(super) enum RtpFlag {
 	StartOfFrame = 0x4,
 }
 
-#[derive(Copy, Clone)]
-#[repr(u8)]
-pub(super) enum PacketType {
-	Audio = 97,
-	ForwardErrorCorrection = 127,
+pub(super) struct VideoFrameHeader {
+	pub(super) header_type: u8,
+	pub(super) padding1: u16,
+	pub(super) frame_type: u8,
+	pub(super) padding2: u32,
+}
+
+impl VideoFrameHeader {
+	pub(super) fn serialize(&self, buffer: &mut Vec<u8>) {
+		buffer.extend(self.header_type.to_le_bytes());
+		buffer.extend(self.padding1.to_le_bytes());
+		buffer.extend(self.frame_type.to_le_bytes());
+		buffer.extend(self.padding2.to_le_bytes());
+	}
 }
 
 pub(super) struct RtpHeader {
 	pub(super) header: u8,
-	pub(super) packet_type: PacketType,
+	pub(super) packet_type: u8,
 	pub(super) sequence_number: u16,
 	pub(super) timestamp: u32,
 	pub(super) ssrc: u32,
@@ -24,7 +33,7 @@ pub(super) struct RtpHeader {
 impl RtpHeader {
 	pub(super) fn serialize(&self, buffer: &mut Vec<u8>) {
 		buffer.extend(self.header.to_be_bytes());
-		buffer.extend((self.packet_type as u8).to_be_bytes());
+		buffer.extend(self.packet_type.to_be_bytes());
 		buffer.extend(self.sequence_number.to_be_bytes());
 		buffer.extend(self.timestamp.to_be_bytes());
 		buffer.extend(self.ssrc.to_be_bytes());

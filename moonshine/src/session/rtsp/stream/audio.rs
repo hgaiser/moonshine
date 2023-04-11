@@ -12,7 +12,7 @@ use ffmpeg::{
 use reed_solomon::ReedSolomon;
 use tokio::net::UdpSocket;
 
-use crate::rtsp::session::rtp::{RtpHeader, PacketType};
+use crate::session::rtsp::stream::rtp::RtpHeader;
 
 #[derive(Clone, Default)]
 pub struct AudioStreamConfig {
@@ -147,7 +147,7 @@ impl AudioStream {
 			match self.socket.try_recv_from(&mut buf) {
 				Ok((len, addr)) => {
 					if &buf[..len] == b"PING" {
-						log::info!("Received audio stream PING message from {addr}.");
+						log::debug!("Received audio stream PING message from {addr}.");
 						client_address = Some(addr);
 					} else {
 						log::warn!("Received unknown message on audio stream of length {len}.");
@@ -161,30 +161,30 @@ impl AudioStream {
 				}
 			}
 
-			self.frame.make_writable()
-				.map_err(|e| println!("Failed to make frame writable: {e}"))?;
+			// self.frame.make_writable()
+			// 	.map_err(|e| println!("Failed to make frame writable: {e}"))?;
 
-			let mut t: f32 = 0.0;
-			let tincr = 2.0 * PI * 440.0 / self.codec_context.as_raw().sample_rate as f32;
-			unsafe {
-				let data = std::slice::from_raw_parts_mut(
-					self.frame.as_raw_mut().data[0] as *mut u16,
-					self.frame.as_raw().linesize[0] as usize,
-				);
-				for j in 0..self.codec_context.as_raw().frame_size {
-					data[(2 * j) as usize] = (t.sin() * 10000.0) as u16;
+			// let mut t: f32 = 0.0;
+			// let tincr = 2.0 * PI * 440.0 / self.codec_context.as_raw().sample_rate as f32;
+			// unsafe {
+			// 	let data = std::slice::from_raw_parts_mut(
+			// 		self.frame.as_raw_mut().data[0] as *mut u16,
+			// 		self.frame.as_raw().linesize[0] as usize,
+			// 	);
+			// 	for j in 0..self.codec_context.as_raw().frame_size {
+			// 		data[(2 * j) as usize] = (t.sin() * 10000.0) as u16;
 
-					for k in 1..self.codec_context.as_raw().ch_layout.nb_channels {
-						data[(2 * j + k) as usize] = data[(2 * j) as usize];
-					}
-					t += tincr;
-				}
-			}
+			// 		for k in 1..self.codec_context.as_raw().ch_layout.nb_channels {
+			// 			data[(2 * j + k) as usize] = data[(2 * j) as usize];
+			// 		}
+			// 		t += tincr;
+			// 	}
+			// }
 
-			// Encode the audio.
-			if let Some(client_address) = client_address {
-				self.encode(&client_address).await?;
-			}
+			// // Encode the audio.
+			// if let Some(client_address) = client_address {
+			// 	self.encode(&client_address).await?;
+			// }
 
 			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 		}
@@ -230,7 +230,7 @@ impl AudioStream {
 		for (index, shard) in shards.iter().enumerate() {
 			let rtp_header = RtpHeader {
 				header: 0x80, // What is this?
-				packet_type: PacketType::Audio,
+				packet_type: 0,
 				sequence_number: self.sequence_number,
 				timestamp: self.timestamp,
 				ssrc: 0,

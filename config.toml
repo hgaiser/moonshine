@@ -1,12 +1,12 @@
 name = "Moonshine PC"
-address = "127.0.0.1"
+address = "0.0.0.0"
 
 [[applications]]
 title = "Desktop"
 
 [webserver]
 port = 47989
-port_https = 47990
+port_https = 47984
 certificate_chain = "./cert/cert.pem"
 private_key = "./cert/key.pem"
 

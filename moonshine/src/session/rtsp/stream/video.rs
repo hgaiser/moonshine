@@ -1,9 +1,10 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, io::Write};
 
 use ffmpeg::{CodecContext, Frame, Packet, Codec, CodecContextBuilder, FrameBuilder};
+use ffmpeg_sys::AV_PKT_FLAG_KEY;
 use tokio::{net::UdpSocket, sync::mpsc};
 
-use crate::rtsp::session::rtp::{RtpHeader, RtpFlag, PacketType, NvVideoPacket};
+use crate::session::rtsp::stream::rtp::{RtpHeader, RtpFlag, NvVideoPacket, VideoFrameHeader};
 
 pub(super) enum VideoCommand {
 	StartStreaming,
@@ -46,18 +47,21 @@ impl VideoStream {
 			.set_width(config.width)
 			.set_height(config.height)
 			.set_framerate(config.fps)
-			.set_max_b_frames(1)
+			.set_max_b_frames(0)
 			.set_pix_fmt(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P)
 			.set_bit_rate(config.bitrate)
-			.set_gop_size(30);
+			.set_gop_size(i32::max_value() as u32);
+		codec_context_builder.as_raw_mut().refs = 1;
+
 		let codec_context = codec_context_builder.open()
 			.map_err(|e| log::error!("Failed to open codec context: {e}"))?;
 
 		let mut frame_builder = FrameBuilder::new()
 			.map_err(|e| log::error!("Failed to create frame builder: {e}"))?;
-		frame_builder.set_format(codec_context.as_raw().pix_fmt);
-		frame_builder.set_width(codec_context.as_raw().width as u32);
-		frame_builder.set_height(codec_context.as_raw().height as u32);
+		frame_builder
+			.set_format(codec_context.as_raw().pix_fmt)
+			.set_width(codec_context.as_raw().width as u32)
+			.set_height(codec_context.as_raw().height as u32);
 		let frame = frame_builder.allocate(0)
 			.map_err(|e| log::error!("Failed to allocate frame: {e}"))?;
 
@@ -71,7 +75,7 @@ impl VideoStream {
 			packet,
 			sequence_number: 0,
 			frame_number: 0,
-			config
+			config,
 		})
 	}
 
@@ -85,6 +89,7 @@ impl VideoStream {
 				.map_err(|e| log::error!("Failed to get local address associated with control socket: {e}"))?
 		);
 
+		let stream_start_time = std::time::Instant::now();
 		let mut start_streaming = true;
 		let mut buf = [0; 1024];
 		let mut client_address = None;
@@ -92,7 +97,7 @@ impl VideoStream {
 			match self.socket.try_recv_from(&mut buf) {
 				Ok((len, addr)) => {
 					if &buf[..len] == b"PING" {
-						log::info!("Received video stream PING message from {addr}.");
+						log::debug!("Received video stream PING message from {addr}.");
 						client_address = Some(addr);
 					} else {
 						log::warn!("Received unknown message on video stream of length {len}.");
@@ -157,20 +162,17 @@ impl VideoStream {
 			// We increase this value here, because the first value expected is a 1.
 			self.frame_number += 1;
 
-			if self.frame_number % 30 == 0 {
-				self.frame.as_raw_mut().pict_type = ffmpeg_sys::AVPictureType_AV_PICTURE_TYPE_I;
-				self.frame.as_raw_mut().key_frame = 1;
-			}
-
 			// Encode the image.
 			if let Some(client_address) = client_address {
-				self.encode(&client_address).await?;
+				self.encode(&client_address, stream_start_time).await?;
 			}
 
 			// TODO: Check if this is necessary?
 			// Reset possible request for keyframe.
 			self.frame.as_raw_mut().pict_type = ffmpeg_sys::AVPictureType_AV_PICTURE_TYPE_NONE;
 			self.frame.as_raw_mut().key_frame = 0;
+
+			tokio::time::sleep(std::time::Duration::from_millis(33)).await;
 		}
 
 		Ok(())
@@ -179,9 +181,21 @@ impl VideoStream {
 	async fn send_packet(
 		&mut self,
 		client_address: &SocketAddr,
+		stream_start_time: std::time::Instant,
 	) -> Result<(), ()> {
 		// TODO: Figure out what this header means?
-		let packet_data = ["\x017charss".as_bytes(), self.packet.data()].concat();
+		let video_frame_header = VideoFrameHeader {
+			header_type: 0x01, // Always 0x01 for short headers. What is this exactly?
+			padding1: 0,
+			frame_type: if (self.packet.as_raw().flags & AV_PKT_FLAG_KEY as i32) != 0 { 2 } else { 1 },
+			padding2: 0,
+		};
+		let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
+		log::info!("Timestamp: {}", timestamp);
+
+		let mut buffer = Vec::new();
+		video_frame_header.serialize(&mut buffer);
+		let packet_data = [&buffer, self.packet.data()].concat();
 
 		let payload_size = self.config.packet_size - std::mem::size_of::<NvVideoPacket>();
 		let nr_data_shards = (packet_data.len() + payload_size - 1) / payload_size;
@@ -197,6 +211,7 @@ impl VideoStream {
 		for i in 0..nr_data_shards {
 			let start = i * payload_size;
 			let end = ((i + 1) * payload_size).min(packet_data.len());
+			log::info!("total: {}, blocksize: {}, i: {}, start: {}, end: {}", packet_data.len(), payload_size, i, start, end);
 
 			// TODO: Do this without cloning.
 			let mut shard = vec![0u8; payload_size];
@@ -211,10 +226,10 @@ impl VideoStream {
 
 		for (index, shard) in shards.iter().enumerate() {
 			let rtp_header = RtpHeader {
-				header: 0x10, // What is this?
-				packet_type: PacketType::ForwardErrorCorrection,
+				header: 0x90, // What is this?
+				packet_type: 0,
 				sequence_number: self.sequence_number,
-				timestamp: 0,
+				timestamp,
 				ssrc: 0,
 				padding: 0,
 			};
@@ -244,7 +259,7 @@ impl VideoStream {
 			video_packet_header.serialize(&mut buffer);
 			buffer.extend(shard);
 
-			log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
+			log::info!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
 			self.socket.send_to(
 				buffer.as_slice(),
 				client_address,
@@ -260,6 +275,7 @@ impl VideoStream {
 	async fn encode(
 		&mut self,
 		client_address: &SocketAddr,
+		stream_start_time: std::time::Instant,
 	) -> Result<(), ()> {
 		log::trace!("Send frame {}", self.frame.as_raw().pts);
 
@@ -269,7 +285,7 @@ impl VideoStream {
 
 		loop {
 			match self.codec_context.receive_packet(&mut self.packet) {
-				Ok(()) => self.send_packet(client_address).await?,
+				Ok(()) => self.send_packet(client_address, stream_start_time).await?,
 				Err(e) => {
 					if e.code == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) {
 						// log::info!("Need more frames for encoding...");

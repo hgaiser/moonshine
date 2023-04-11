@@ -1,0 +1,247 @@
+use std::{ptr::null_mut, mem::MaybeUninit, net::Ipv4Addr};
+use enet::{Enet, Address, ChannelLimit, BandwidthLimit, Event};
+use ffmpeg_sys::CUcontext;
+use nvfbc::{BufferFormat, cuda::CaptureMethod, CudaCapturer};
+use ffmpeg::{to_c_str, Codec, CodecType, VideoQuality, check_ret};
+use tokio::net::UdpSocket;
+
+use crate::cuda::{self, release_context, bind_context};
+
+pub(super) struct Session {
+	codec: Codec,
+	frame: *mut ffmpeg_sys::AVFrame,
+	video_stream: *mut ffmpeg_sys::AVStream,
+	format_context: *mut ffmpeg_sys::AVFormatContext,
+	cuda_context: CUcontext,
+}
+
+unsafe impl Send for Session {}
+
+impl Session {
+	pub(super) fn new() -> Result<Self, ()> {
+		unsafe {
+			let cuda_context = cuda::init_cuda(0)
+				.map_err(|e| log::error!("Failed to initialize CUDA: {e}"))?;
+
+			let width = 2560;
+			let height = 1600;
+			let fps = 60;
+
+			let codec = Codec::new(
+				width,
+				height,
+				fps,
+				CodecType::H264,
+				VideoQuality::Fastest,
+				cuda_context,
+			)
+				.map_err(|e| log::error!("Failed to create codec: {e}"))?;
+
+			// Init the format context
+			let mut format_context = ffmpeg_sys::avformat_alloc_context();
+			let format = ffmpeg_sys::av_guess_format(
+				to_c_str("rtp")
+					.map_err(|e| log::error!("Failed to create C string: {e}"))?
+					.as_ptr(),
+				null_mut(), null_mut()
+			);
+			ffmpeg_sys::avformat_alloc_output_context2(&mut format_context, format, (*format).name, null_mut());
+
+			// Configure the AVStream for the output format context
+			let video_stream = ffmpeg_sys::avformat_new_stream(format_context, codec.as_ref().codec);
+
+			ffmpeg_sys::avcodec_parameters_from_context((*video_stream).codecpar, codec.as_ptr());
+			(*video_stream).time_base.num = 1;
+			(*video_stream).time_base.den = fps as i32;
+
+			// Init the Frame containing our raw data
+			let frame = ffmpeg_sys::av_frame_alloc();
+			(*frame).format = codec.as_ref().pix_fmt;
+			(*frame).width  = codec.as_ref().width;
+			(*frame).height = codec.as_ref().height;
+			(*frame).hw_frames_ctx = codec.as_ref().hw_frames_ctx;
+
+			// TODO: Remove this, this shouldn't be necessary!
+			// This allocates a HW frame, but we should manually create our own frame (through nvfbc).
+			check_ret(ffmpeg_sys::av_hwframe_get_buffer((*frame).hw_frames_ctx, frame, 0))
+				.map_err(|e| log::error!("Failed to allocate hardware frame: {e}"))?;
+			(*frame).linesize[0] = (*frame).width * 4;
+			// ffmpeg_sys::av_image_alloc((*frame).data.as_mut_ptr(), (*frame).linesize.as_mut_ptr(), (*frame).width, (*frame).height, (*codec_context).pix_fmt, 32);
+
+			release_context(cuda_context)
+				.map_err(|e| log::error!("Failed to release CUDA context: {e}"))?;
+
+			tokio::task::spawn_blocking(move || {
+				let enet = Enet::new().unwrap();
+
+				let local_addr = Address::new(Ipv4Addr::LOCALHOST, 47999);
+
+				let mut host = enet
+					.create_host::<()>(
+						Some(&local_addr),
+						10,
+						ChannelLimit::Maximum,
+						BandwidthLimit::Unlimited,
+						BandwidthLimit::Unlimited,
+					)
+					.unwrap();
+
+				loop {
+					match host.service(1000).unwrap() {
+						Some(Event::Connect(_)) => println!("new connection!"),
+						Some(Event::Disconnect(..)) => println!("disconnect!"),
+						Some(Event::Receive {
+							channel_id,
+							ref packet,
+							..
+						}) => println!(
+							"got packet on channel {}, content: '{:?}'",
+							channel_id,
+							std::str::from_utf8(packet.data())
+						),
+						_ => (),
+					}
+				}
+			});
+
+			Ok(Self {
+				codec,
+				frame,
+				video_stream,
+				format_context,
+				cuda_context,
+			})
+		}
+	}
+
+	pub(super) fn description(&mut self) -> Result<sdp_types::Session, ()> {
+		let mut buf = [0u8; 1024];
+		unsafe {
+			ffmpeg_sys::av_sdp_create(
+				&mut self.format_context,
+				1,
+				buf.as_mut_ptr() as *mut i8,
+				buf.len() as i32,
+			);
+		}
+
+		sdp_types::Session::parse(&buf)
+			.map_err(|e| log::error!("Failed to create session descriptor: {e}"))
+	}
+
+	pub(super) fn setup(&mut self, rtp_port: u16) -> Result<(u16, u16), ()> {
+		unsafe {
+			ffmpeg_sys::avio_open(
+				&mut (*self.format_context).pb,
+				to_c_str(format!("rtp://127.0.0.1:{rtp_port}?localrtpport=47998&localrtcpport=46000").as_str())
+				.map_err(|e| log::error!("{e}"))?
+				.as_ptr(),
+				ffmpeg_sys::AVIO_FLAG_WRITE as i32
+			);
+		}
+
+		let mut local_rtp_port: i64 = 0;
+		check_ret(unsafe { ffmpeg_sys::av_opt_get_int(
+				(*self.format_context).pb as *mut ffmpeg_sys::AVIOContext as *mut ::std::os::raw::c_void,
+				to_c_str("local_rtpport")
+				.map_err(|e| log::error!("Failed to create C string: {e}"))?
+				.as_ptr(),
+				ffmpeg_sys::AV_OPT_SEARCH_CHILDREN as i32,
+				&mut local_rtp_port as *mut i64
+		) })
+			.map_err(|e| log::error!("Failed to find local RTP port in format context: {e}"))?;
+
+		let mut local_rtcp_port: i64 = 0;
+		check_ret(unsafe {ffmpeg_sys::av_opt_get_int(
+				(*self.format_context).pb as *mut ffmpeg_sys::AVIOContext as *mut ::std::os::raw::c_void,
+				to_c_str("local_rtcpport")
+				.map_err(|e| log::error!("Failed to create C string: {e}"))?
+				.as_ptr(),
+				ffmpeg_sys::AV_OPT_SEARCH_CHILDREN as i32,
+				&mut local_rtcp_port as *mut i64
+		) })
+			.map_err(|e| log::error!("Failed to find local RTCP port in format context: {e}"))?;
+
+		Ok((local_rtp_port as u16, local_rtcp_port as u16))
+	}
+
+	pub(super) async fn play(&mut self) -> Result<(), ()> {
+		let sock = UdpSocket::bind("127.0.0.1:47998").await
+			.map_err(|e| log::error!("Failed to bind to UDP socket: {e}"))
+			.unwrap();
+
+		log::trace!("Waiting for PING on port 47998...");
+		let mut buf = [0; 1024];
+		let client_address;
+		loop {
+			let (len, addr) = sock.recv_from(&mut buf)
+				.await
+				.map_err(|e| log::error!("Failed to receive UDP message: {e}"))?;
+
+			if &buf[..len] == b"PING" {
+				log::info!("Received PING message from {addr}.");
+				client_address = addr;
+				break;
+			} else {
+				log::warn!("Received unknown message on video stream of length {len}.");
+			}
+		}
+
+		drop(sock);
+		self.setup(client_address.port())?;
+
+		bind_context(self.cuda_context)
+			.map_err(|e| log::error!("Failed to bind CUDA context: {e}"))?;
+
+		// Create a capturer that captures to CUDA context.
+		let mut capturer = CudaCapturer::new()
+			.map_err(|e| log::error!("Failed to create CUDA capture device: {e}"))?;
+
+		unsafe {
+			// Write the header to the client.
+			ffmpeg_sys::avformat_write_header(self.format_context, null_mut());
+
+			capturer.start(BufferFormat::Bgra, 60)
+				.map_err(|e| log::error!("Failed to start frame capturer: {e}")).unwrap();
+
+			let mut packet: ffmpeg_sys::AVPacket = MaybeUninit::zeroed().assume_init();
+			let mut j = 0;
+			for i in 0.. {
+				let frame_info = capturer.next_frame(CaptureMethod::NoWaitIfNewFrame)
+					.map_err(|e| log::error!("Failed to capture frame: {e}")).unwrap();
+				(*self.frame).data[0] = frame_info.device_buffer as *mut u8;
+
+				ffmpeg_sys::fflush(ffmpeg_sys::stdout);
+				ffmpeg_sys::av_init_packet(&mut packet);
+				packet.data = null_mut();    // packet data will be allocated by the encoder
+				packet.size = 0;
+
+				/* Which frame is it ? */
+				(*self.frame).pts = i;
+
+				/* Send the frame to the codec */
+				ffmpeg_sys::avcodec_send_frame(self.codec.as_ptr(), self.frame);
+
+				/* Use the data in the codec to the AVPacket */
+				let ret = ffmpeg_sys::avcodec_receive_packet(self.codec.as_ptr(), &mut packet);
+				if ret == ffmpeg_sys::AVERROR_EOF {
+					log::error!("Stream EOF");
+				} else if ret == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) {
+					log::error!("Stream EAGAIN");
+				} else {
+					// log::info!("Write frame {} (size={})", j, packet.size);
+					j += 1;
+
+					/* Write the data on the packet to the output format  */
+					ffmpeg_sys::av_packet_rescale_ts(&mut packet, self.codec.as_ref().time_base, (*self.video_stream).time_base);
+					ffmpeg_sys::av_interleaved_write_frame(self.format_context, &mut packet);
+
+					/* Reset the packet */
+					ffmpeg_sys::av_packet_unref(&mut packet);
+				}
+			}
+		}
+
+		Ok(())
+	}
+}

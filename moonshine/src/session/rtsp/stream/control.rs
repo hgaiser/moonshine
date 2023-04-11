@@ -6,9 +6,16 @@ use enet::{
 	Event,
 	Host,
 };
+use openssl::symm::Cipher;
 use tokio::sync::mpsc;
 
-use super::video_stream::VideoCommand;
+use crate::session::SessionContext;
+
+use super::video::VideoCommand;
+
+const ENCRYPTION_TAG_LENGTH: usize = 16;
+// Sequence number + tag + control message id
+const MINIMUM_ENCRYPTED_LENGTH: usize = 4 + ENCRYPTION_TAG_LENGTH + 4;
 
 #[repr(u16)]
 enum ControlMessageType {
@@ -64,18 +71,30 @@ enum ControlMessage {
 impl ControlMessage {
 	fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
 		if buffer.len() < 2 {
-			log::error!("Expected control message to have at least two bytes, got {}", buffer.len());
+			log::warn!("Expected control message to have at least two bytes, got {}", buffer.len());
 			return Err(());
 		}
 
 		match u16::from_le_bytes(buffer[..2].try_into().unwrap()).try_into() {
 			Ok(ControlMessageType::Encrypted) => {
+				if buffer.len() < MINIMUM_ENCRYPTED_LENGTH {
+					log::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
+					return Err(());
+				}
+
 				let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
+				if (length as usize) < MINIMUM_ENCRYPTED_LENGTH {
+					log::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
+					return Err(());
+				}
+
 				let sequence_number = u32::from_le_bytes(buffer[4..8].try_into().unwrap());
 				Ok(Self::Encrypted(EncryptedControlMessage {
 					_length: length,
 					sequence_number,
-					payload: buffer[8..].to_vec(),
+					tag: buffer[8..8 + ENCRYPTION_TAG_LENGTH].try_into()
+						.map_err(|e| log::warn!("Failed to get tag from encrypted control message: {e}"))?,
+					payload: buffer[8 + ENCRYPTION_TAG_LENGTH..].to_vec(),
 				}))
 			},
 			Ok(ControlMessageType::Ping) => Ok(Self::Ping),
@@ -99,6 +118,7 @@ impl ControlMessage {
 struct EncryptedControlMessage {
 	_length: u16,
 	sequence_number: u32,
+	tag: [u8; 16],
 	payload: Vec<u8>,
 }
 
@@ -132,6 +152,7 @@ impl ControlStream {
 	pub(super) async fn run(
 		mut self,
 		video_command_tx: mpsc::Sender<VideoCommand>,
+		context: SessionContext,
 	) -> Result<(), ()> {
 		log::info!("Listening for control messages on {:?}", self.host.address());
 
@@ -144,11 +165,45 @@ impl ControlStream {
 					ref packet,
 					..
 				}) => {
-					let control_message = ControlMessage::from_bytes(packet.data())?;
-					log::info!("Received control message: {control_message:?}");
+					let mut control_message = ControlMessage::from_bytes(packet.data())?;
+					log::debug!("Received control message: {control_message:?}");
+
+					// First check for encrypted control messages and decrypt them.
+					if let ControlMessage::Encrypted(message) = control_message {
+						let mut initialization_vector = [0u8; 16];
+						initialization_vector[0] = message.sequence_number as u8;
+
+						let decrypted = openssl::symm::decrypt_aead(
+							Cipher::aes_128_gcm(),
+							&context.remote_input_key,
+							Some(&initialization_vector),
+							&[],
+							&message.payload,
+							&message.tag,
+						);
+
+						let decrypted = match decrypted {
+							Ok(decrypted) => decrypted,
+							Err(e) => {
+								log::error!("Failed to decrypt control message: {:?}", e.errors());
+								continue;
+							}
+						};
+
+						control_message = match ControlMessage::from_bytes(&decrypted) {
+							Ok(decrypted_message) => decrypted_message,
+							Err(()) => {
+								log::warn!("Failed to parse decrypted control message.");
+								continue;
+							},
+						};
+
+						log::debug!("Decrypted control message: {control_message:?}");
+					}
 
 					match control_message {
-						ControlMessage::InvalidateReferenceFrames | ControlMessage::RequestIdrFrame => {
+						ControlMessage::Encrypted(_) => unreachable!("Encrypted control messages should be decrypted already."),
+						ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
 							video_command_tx.send(VideoCommand::RequestIdrFrame).await
 								.map_err(|e| log::error!("Failed to send video command: {e}"))?;
 						},

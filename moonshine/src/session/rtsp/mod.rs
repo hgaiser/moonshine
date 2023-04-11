@@ -1,13 +1,20 @@
 use std::{net::{ToSocketAddrs, SocketAddr}, sync::Arc};
 use rtsp_types::{headers::{self, Transport}, Method};
 use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}, sync::Mutex};
-use session::Session;
+use stream::Session;
 
 use crate::config::SessionConfig;
 
-mod session;
+use super::SessionContext;
 
-pub async fn run(address: String, port: u16, config: SessionConfig) -> Result<(), ()> {
+mod stream;
+
+pub async fn run(
+	address: String,
+	port: u16,
+	context: SessionContext,
+	config: SessionConfig,
+) -> Result<(), ()> {
 	let address = (address.clone(), port).to_socket_addrs()
 		.map_err(|e| log::error!("Failed to resolve address {}:{}: {}", address, port, e))?
 		.next()
@@ -25,7 +32,7 @@ pub async fn run(address: String, port: u16, config: SessionConfig) -> Result<()
 			.map_err(|e| log::error!("Failed to accept connection: {}", e))?;
 		log::debug!("Accepted connection from {}", address);
 
-		tokio::spawn(handle_connection(connection, address, session.clone()));
+		tokio::spawn(handle_connection(connection, address, session.clone(), context.clone()));
 	}
 }
 
@@ -33,26 +40,40 @@ async fn handle_connection(
 	mut connection: TcpStream,
 	address: SocketAddr,
 	session: Arc<Mutex<Session>>,
+	context: SessionContext,
 ) -> Result<(), ()> {
-	let mut buffer = [0u8; 2048];
-	let bytes_read = connection.read(&mut buffer).await
-		.map_err(|e| log::error!("Failed to read from connection '{}': {}", address, e))?;
-	if bytes_read == 0 {
-		log::warn!("Received empty RTSP request.");
-		return Ok(());
-	}
+	let mut message_buffer = String::new();
 
-	let buffer = &buffer[..bytes_read];
-	let buffer = String::from_utf8(buffer.to_vec())
-		.map_err(|e| log::error!("Failed to convert message to string: {e}"))?;
+	let message = loop {
+		let mut buffer = [0u8; 2048];
+		let bytes_read = connection.read(&mut buffer).await
+			.map_err(|e| log::error!("Failed to read from connection '{}': {}", address, e))?;
+		if bytes_read == 0 {
+			log::warn!("Received empty RTSP request.");
+			return Ok(());
+		}
+		message_buffer.push_str(std::str::from_utf8(&buffer[..bytes_read])
+			.map_err(|e| log::error!("Failed to convert message to string: {e}"))?);
 
-	// Hacky workaround to fix rtsp_types parsing SETUP/PLAY requests from Moonlight.
-	let buffer = buffer.replace("streamid", "rtsp://localhost?streamid");
-	let buffer = buffer.replace("PLAY /", "PLAY rtsp://localhost/");
+		// Hacky workaround to fix rtsp_types parsing SETUP/PLAY requests from Moonlight.
+		let message_buffer = message_buffer.replace("streamid", "rtsp://localhost?streamid");
+		let message_buffer = message_buffer.replace("PLAY /", "PLAY rtsp://localhost/");
 
-	log::trace!("Request: {}", buffer);
-	let (message, _consumed): (rtsp_types::Message<Vec<u8>>, _) = rtsp_types::Message::parse(&buffer)
-		.map_err(|e| log::error!("Failed to parse request as RTSP message: {}", e))?;
+		log::trace!("Request: {}", message_buffer);
+		let result = rtsp_types::Message::parse(&message_buffer);
+
+		break match result {
+			Ok((message, _consumed)) => message,
+			Err(rtsp_types::ParseError::Incomplete) => {
+				log::debug!("Incomplete RTSP message received, waiting for more data.");
+				continue;
+			},
+			Err(e) => {
+				log::error!("Failed to parse request as RTSP message: {}", e);
+				return Err(());
+			}
+		};
+	};
 
 	// log::trace!("Consumed {} bytes into RTSP request: {:#?}", consumed, message);
 
@@ -71,7 +92,7 @@ async fn handle_connection(
 				Method::Describe => handle_describe_request(request, cseq, session.clone()).await,
 				Method::Options => handle_options_request(request, cseq),
 				Method::Setup => handle_setup_request(request, cseq),
-				Method::Play => handle_play_request(request, cseq, session.clone()),
+				Method::Play => handle_play_request(request, cseq, session.clone(), context.clone()),
 				method => {
 					log::error!("Received request with unsupported method {:?}", method);
 					Err(())
@@ -143,6 +164,7 @@ async fn handle_announce_request(
 		.trim()
 		.parse()
 		.map_err(|e| log::error!("Bitrate attribute is not an integer: {e}"))?;
+	session.video_stream_config.bitrate *= 1024; // Convert from kbps to bps.
 	session.video_stream_config.minimum_fec_packets = sdp_session.get_first_attribute_value("x-nv-vqos[0].fec.minRequiredFecPackets")
 		.map_err(|e| log::error!("Failed to get minimum required FEC packets attribute from announce request: {e}"))?
 		.ok_or_else(|| log::error!("No minimum required FEC packets attribute in announce request"))?
@@ -266,12 +288,13 @@ fn handle_play_request(
 	request: &rtsp_types::Request<Vec<u8>>,
 	cseq: i32,
 	session: Arc<Mutex<Session>>,
+	context: SessionContext,
 ) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
 	// TODO: Think of a better way to prevent double running.
 	let locked = session.try_lock().is_err();
 	if !locked {
 		tokio::task::spawn(async move {
-			session.lock().await.run().await
+			session.lock().await.run(context).await
 		});
 	}
 

@@ -1,16 +1,16 @@
-mod control_stream;
-use control_stream::ControlStream;
+mod control;
+use control::ControlStream;
 
-mod video_stream;
+mod video;
 use tokio::sync::mpsc;
-use video_stream::{VideoStream, VideoStreamConfig};
+use video::{VideoStream, VideoStreamConfig};
 
-mod audio_stream;
-use audio_stream::AudioStream;
+mod audio;
+use audio::AudioStream;
 
-use crate::config::SessionConfig;
+use crate::{config::SessionConfig, session::SessionContext};
 
-use self::audio_stream::AudioStreamConfig;
+use self::audio::AudioStreamConfig;
 
 mod rtp;
 
@@ -43,18 +43,28 @@ a=control:streamid=0")
 			.map_err(|e| log::error!("Failed to parse SDP session: {e}"))
 	}
 
-	pub(super) async fn run(&self) -> Result<(), ()> {
+	pub(super) async fn run(
+		&self,
+		context: SessionContext,
+	) -> Result<(), ()> {
 		let (video_command_tx, video_command_rx) = mpsc::channel(10);
 
-		let video_stream = VideoStream::new("127.0.0.1", 47998, self.video_stream_config.clone()).await?;
+		let video_stream = VideoStream::new("0.0.0.0", 47998, self.video_stream_config.clone()).await?;
 		let video_task = tokio::spawn(video_stream.run(video_command_rx));
 
-		let audio_stream = AudioStream::new("127.0.0.1", 48000, self.audio_stream_config.clone()).await?;
+		let audio_stream = AudioStream::new(
+			"0.0.0.0",
+			48000,
+			self.audio_stream_config.clone(),
+		).await?;
 		let audio_task = tokio::spawn(audio_stream.run());
 
-		let control_stream = ControlStream::new("127.0.0.1", 47999)?;
+		let control_stream = ControlStream::new("0.0.0.0", 47999)?;
 		let control_task = tokio::spawn(async move {
-			control_stream.run(video_command_tx).await
+			control_stream.run(
+				video_command_tx,
+				context,
+			).await
 		});
 
 		if let Err(e) = tokio::try_join!(
