@@ -134,44 +134,44 @@ async fn handle_announce_request(
 	log::trace!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
 
 	let mut session = session.lock().await;
-	session.video_stream_config.width = sdp_session.get_first_attribute_value("x-nv-video[0].clientViewportWd")
+	session.video_stream_context.width = sdp_session.get_first_attribute_value("x-nv-video[0].clientViewportWd")
 		.map_err(|e| log::error!("Failed to get width attribute from announce request: {e}"))?
 		.ok_or_else(|| log::error!("No width attribute in announce request"))?
 		.trim()
 		.parse()
 		.map_err(|e| log::error!("Width attribute is not an integer: {e}"))?;
-	session.video_stream_config.height = sdp_session.get_first_attribute_value("x-nv-video[0].clientViewportHt")
+	session.video_stream_context.height = sdp_session.get_first_attribute_value("x-nv-video[0].clientViewportHt")
 		.map_err(|e| log::error!("Failed to get height attribute from announce request: {e}"))?
 		.ok_or_else(|| log::error!("No height attribute in announce request"))?
 		.trim()
 		.parse()
 		.map_err(|e| log::error!("Height attribute is not an integer: {e}"))?;
-	session.video_stream_config.fps = sdp_session.get_first_attribute_value("x-nv-video[0].maxFPS")
+	session.video_stream_context.fps = sdp_session.get_first_attribute_value("x-nv-video[0].maxFPS")
 		.map_err(|e| log::error!("Failed to get FPS attribute from announce request: {e}"))?
 		.ok_or_else(|| log::error!("No FPS attribute in announce request"))?
 		.trim()
 		.parse()
 		.map_err(|e| log::error!("FPS attribute is not an integer: {e}"))?;
-	session.video_stream_config.packet_size = sdp_session.get_first_attribute_value("x-nv-video[0].packetSize")
+	session.video_stream_context.packet_size = sdp_session.get_first_attribute_value("x-nv-video[0].packetSize")
 		.map_err(|e| log::error!("Failed to get packet size attribute from announce request: {e}"))?
 		.ok_or_else(|| log::error!("No packet size attribute in announce request"))?
 		.trim()
 		.parse()
 		.map_err(|e| log::error!("Packet size attribute is not an integer: {e}"))?;
-	session.video_stream_config.bitrate = sdp_session.get_first_attribute_value("x-nv-vqos[0].bw.maximumBitrateKbps")
+	session.video_stream_context.bitrate = sdp_session.get_first_attribute_value("x-nv-vqos[0].bw.maximumBitrateKbps")
 		.map_err(|e| log::error!("Failed to get bitrate attribute from announce request: {e}"))?
 		.ok_or_else(|| log::error!("No bitrate attribute in announce request"))?
 		.trim()
 		.parse()
 		.map_err(|e| log::error!("Bitrate attribute is not an integer: {e}"))?;
-	session.video_stream_config.bitrate *= 1024; // Convert from kbps to bps.
-	session.video_stream_config.minimum_fec_packets = sdp_session.get_first_attribute_value("x-nv-vqos[0].fec.minRequiredFecPackets")
+	session.video_stream_context.bitrate *= 1024; // Convert from kbps to bps.
+	session.video_stream_context.minimum_fec_packets = sdp_session.get_first_attribute_value("x-nv-vqos[0].fec.minRequiredFecPackets")
 		.map_err(|e| log::error!("Failed to get minimum required FEC packets attribute from announce request: {e}"))?
 		.ok_or_else(|| log::error!("No minimum required FEC packets attribute in announce request"))?
 		.trim()
 		.parse()
 		.map_err(|e| log::error!("Minimum required FEC packets attribute is not an integer: {e}"))?;
-	session.audio_stream_config.packet_duration = sdp_session.get_first_attribute_value("x-nv-aqos.packetDuration")
+	session.audio_stream_context.packet_duration = sdp_session.get_first_attribute_value("x-nv-aqos.packetDuration")
 		.map_err(|e| log::error!("Failed to get packet duration attribute from announce request: {e}"))?
 		.ok_or_else(|| log::error!("No packet duration attribute in announce request"))?
 		.trim()

@@ -1,22 +1,21 @@
-mod control;
-use control::ControlStream;
-
-mod video;
 use tokio::sync::mpsc;
-use video::VideoStreamContext;
-
-mod audio;
-use audio::AudioStream;
 
 use crate::{config::SessionConfig, session::SessionContext};
 
-use self::{audio::AudioStreamConfig, video::run_video_stream};
+use self::{
+	audio::{run_audio_stream, AudioStreamContext},
+	video::{run_video_stream, VideoStreamContext},
+	control::run_control_stream,
+};
 
-mod rtp;
+
+mod audio;
+mod control;
+mod video;
 
 pub struct Session {
-	pub video_stream_config: VideoStreamContext,
-	pub audio_stream_config: AudioStreamConfig,
+	pub video_stream_context: VideoStreamContext,
+	pub audio_stream_context: AudioStreamContext,
 }
 
 impl Session {
@@ -24,8 +23,8 @@ impl Session {
 		let video_stream_config = VideoStreamContext { codec_name: config.codec, fec_percentage: config.fec_percentage, ..Default::default() };
 
 		Ok(Self {
-			video_stream_config,
-			audio_stream_config: AudioStreamConfig::default(),
+			video_stream_context: video_stream_config,
+			audio_stream_context: Default::default(),
 		})
 	}
 
@@ -52,19 +51,19 @@ a=control:streamid=0")
 		let video_task = tokio::spawn(run_video_stream(
 			"0.0.0.0",
 			47998,
-			self.video_stream_config.clone(),
+			self.video_stream_context.clone(),
 			video_command_rx,
 		));
 
-		let audio_stream = AudioStream::new(
+		let audio_task = tokio::spawn(run_audio_stream(
 			"0.0.0.0",
 			48000,
-			self.audio_stream_config.clone(),
-		).await?;
-		let audio_task = tokio::spawn(audio_stream.run());
+			self.audio_stream_context.clone(),
+		));
 
-		let control_stream = ControlStream::new("0.0.0.0", 47999)?;
-		let control_task = tokio::spawn(control_stream.run(
+		let control_task = tokio::spawn(run_control_stream(
+			"0.0.0.0",
+			47999,
 			video_command_tx,
 			context,
 		));

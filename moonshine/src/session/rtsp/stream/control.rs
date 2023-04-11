@@ -4,7 +4,6 @@ use enet::{
 	ChannelLimit,
 	Enet,
 	Event,
-	Host,
 };
 use openssl::symm::Cipher;
 use tokio::sync::mpsc;
@@ -122,43 +121,35 @@ struct EncryptedControlMessage {
 	payload: Vec<u8>,
 }
 
-pub(super) struct ControlStream {
-	host: Host<()>,
-}
+pub(super) async fn run_control_stream(
+	address: &str,
+	port: u16,
+	video_command_tx: mpsc::Sender<VideoCommand>,
+	context: SessionContext,
+) -> Result<(), ()> {
+	let enet = Enet::new()
+		.map_err(|e| log::error!("Failed to initialize Enet session: {e}"))?;
 
-impl ControlStream {
-	pub(super) fn new(address: &str, port: u16) -> Result<Self, ()> {
-		let enet = Enet::new()
-			.map_err(|e| log::error!("Failed to initialize Enet session: {e}"))?;
+	let local_addr = Address::new(
+		address.parse()
+		.map_err(|e| log::error!("Failed to parse address: {e}"))?,
+		port,
+	);
+	let mut host = enet
+		.create_host::<()>(
+			Some(&local_addr),
+			10,
+			ChannelLimit::Maximum,
+			BandwidthLimit::Unlimited,
+			BandwidthLimit::Unlimited,
+		)
+		.unwrap();
 
-		let local_addr = Address::new(
-			address.parse()
-				.map_err(|e| log::error!("Failed to parse address: {e}"))?,
-			port,
-		);
-		let host = enet
-			.create_host::<()>(
-				Some(&local_addr),
-				10,
-				ChannelLimit::Maximum,
-				BandwidthLimit::Unlimited,
-				BandwidthLimit::Unlimited,
-			)
-			.unwrap();
+	log::info!("Listening for control messages on {:?}", host.address());
 
-		Ok(Self { host })
-	}
-
-	pub(super) async fn run(
-		mut self,
-		video_command_tx: mpsc::Sender<VideoCommand>,
-		context: SessionContext,
-	) -> Result<(), ()> {
-		log::info!("Listening for control messages on {:?}", self.host.address());
-
-		loop {
-			match self.host.service(1000)
-				.map_err(|e| log::error!("Failure in enet host: {e}"))? {
+	loop {
+		match host.service(1000)
+			.map_err(|e| log::error!("Failure in enet host: {e}"))? {
 				Some(Event::Connect(_)) => {}, //println!("new connection!"),
 				Some(Event::Disconnect(..)) => {}, //println!("disconnect!"),
 				Some(Event::Receive {
@@ -206,23 +197,17 @@ impl ControlStream {
 						ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
 							video_command_tx.send(VideoCommand::RequestIdrFrame).await
 								.map_err(|e| log::error!("Failed to send video command: {e}"))?;
-						},
+							},
 						ControlMessage::StartB => {
 							video_command_tx.send(VideoCommand::StartStreaming).await
 								.map_err(|e| log::error!("Failed to send video command: {e}"))?;
-						},
+							},
 						skipped_message => {
 							log::trace!("Skipped control message: {skipped_message:?}");
 						},
 					};
-					// println!(
-					// 	"got packet on channel {}, content: '{:?}'",
-					// 	channel_id,
-					// 	std::str::from_utf8(packet.data())
-					// );
 				}
 				_ => (),
 			}
-		}
 	}
 }
