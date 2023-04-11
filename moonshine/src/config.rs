@@ -56,9 +56,6 @@ pub struct ApplicationConfig {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct SessionConfig {
-	/// Target frames per second for the stream.
-	pub fps: u32,
-
 	/// Type of codec to use.
 	pub codec: String,
 

@@ -20,7 +20,11 @@ pub struct Session {
 
 impl Session {
 	pub(super) async fn new(config: SessionConfig) -> Result<Self, ()> {
-		let video_stream_config = VideoStreamContext { codec_name: config.codec, fec_percentage: config.fec_percentage, ..Default::default() };
+		let video_stream_config = VideoStreamContext {
+			codec_name: config.codec,
+			fec_percentage: config.fec_percentage,
+			..Default::default()
+		};
 
 		Ok(Self {
 			video_stream_context: video_stream_config,

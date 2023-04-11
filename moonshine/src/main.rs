@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use async_shutdown::Shutdown;
 use clap::Parser;
 use config::Config;
-use session::{clients::ClientManager, SessionManager};
+use session::{clients::ClientManager, run_session_manager};
 use tokio::{sync::mpsc, try_join};
 
 use crate::util::flatten;
@@ -24,10 +24,10 @@ struct Args {
 async fn run(config: Config, shutdown: Shutdown) -> Result<(), ()> {
 	// Run the session manager.
 	let (session_command_tx, session_command_rx) = mpsc::channel(10);
-	let session_manager = SessionManager::new(session_command_rx);
-	let session_manager_task = tokio::spawn(shutdown.wrap_vital(session_manager.run(
+	let session_manager_task = tokio::spawn(shutdown.wrap_vital(run_session_manager(
 		config.rtsp.port,
 		config.session,
+		session_command_rx,
 		shutdown.clone(),
 	)));
 

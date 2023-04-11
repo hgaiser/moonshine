@@ -26,38 +26,34 @@ pub struct SessionContext {
 	pub remote_input_key_id: String,
 }
 
-pub struct SessionManager {
-	command_rx: mpsc::Receiver<SessionManagerCommand>,
-}
+pub async fn run_session_manager(
+	rtsp_port: u16,
+	config: SessionConfig,
+	mut command_rx: mpsc::Receiver<SessionManagerCommand>,
+	shutdown: Shutdown,
+) -> Result<(), ()> {
 
-impl SessionManager {
-	pub fn new(command_rx: mpsc::Receiver<SessionManagerCommand>) -> Self {
-		Self { command_rx }
+	loop {
+		let command = shutdown.wrap_cancel(command_rx.recv())
+			.await
+			.ok_or(())?;
+
+		match command {
+			Some(SessionManagerCommand::LaunchSession(session_context)) => {
+				log::info!("Launching session with arguments: {session_context:?}");
+				tokio::spawn(rtsp::run(
+					"0.0.0.0".to_string(),
+					rtsp_port,
+					session_context,
+					config.clone(),
+				));
+			},
+
+			None => {
+				break;
+			},
+		};
 	}
 
-	pub async fn run(mut self, rtsp_port: u16, config: SessionConfig, shutdown: Shutdown) -> Result<(), ()> {
-		loop {
-			let command = shutdown.wrap_cancel(self.command_rx.recv())
-				.await
-				.ok_or(())?;
-
-			match command {
-				Some(SessionManagerCommand::LaunchSession(session_context)) => {
-					log::info!("Launching session with arguments: {session_context:?}");
-					tokio::spawn(rtsp::run(
-						"0.0.0.0".to_string(),
-						rtsp_port,
-						session_context,
-						config.clone(),
-					));
-				},
-
-				None => {
-					break;
-				},
-			};
-		}
-
-		Ok(())
-	}
+	Ok(())
 }
