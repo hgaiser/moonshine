@@ -10,10 +10,16 @@ port_https = 47984
 certificate_chain = "./cert/cert.pem"
 private_key = "./cert/key.pem"
 
-[session]
-fps = 60
+[stream]
+port = 48010
+
+[stream.video]
+port = 47998
 codec = "libx264"
 fec_percentage = 20
 
-[rtsp]
-port = 48010
+[stream.audio]
+port = 48000
+
+[stream.control]
+port = 47999

@@ -1,6 +1,6 @@
 use tokio::sync::mpsc;
 
-use crate::{config::SessionConfig, session::SessionContext};
+use crate::{config::Config, session::SessionContext};
 
 use self::{
 	audio::{run_audio_stream, AudioStreamContext},
@@ -14,20 +14,16 @@ mod control;
 mod video;
 
 pub struct Session {
+	config: Config,
 	pub video_stream_context: VideoStreamContext,
 	pub audio_stream_context: AudioStreamContext,
 }
 
 impl Session {
-	pub(super) async fn new(config: SessionConfig) -> Result<Self, ()> {
-		let video_stream_config = VideoStreamContext {
-			codec_name: config.codec,
-			fec_percentage: config.fec_percentage,
-			..Default::default()
-		};
-
+	pub(super) async fn new(config: Config) -> Result<Self, ()> {
 		Ok(Self {
-			video_stream_context: video_stream_config,
+			config,
+			video_stream_context: Default::default(),
 			audio_stream_context: Default::default(),
 		})
 	}
@@ -53,21 +49,18 @@ a=control:streamid=0")
 		let (video_command_tx, video_command_rx) = mpsc::channel(10);
 
 		let video_task = tokio::spawn(run_video_stream(
-			"0.0.0.0",
-			47998,
+			self.config.clone(),
 			self.video_stream_context.clone(),
 			video_command_rx,
 		));
 
 		let audio_task = tokio::spawn(run_audio_stream(
-			"0.0.0.0",
-			48000,
+			self.config.clone(),
 			self.audio_stream_context.clone(),
 		));
 
 		let control_task = tokio::spawn(run_control_stream(
-			"0.0.0.0",
-			47999,
+			self.config.clone(),
 			video_command_tx,
 			context,
 		));

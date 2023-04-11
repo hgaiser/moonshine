@@ -3,7 +3,7 @@ use serde::Deserialize;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
-	/// Name of the service.
+	/// Name of the Moonshine host.
 	pub name: String,
 
 	/// Address to bind to.
@@ -12,14 +12,11 @@ pub struct Config {
 	/// Configuration for the webserver.
 	pub webserver: WebserverConfig,
 
-	/// Configuration for the RTSP server.
-	pub rtsp: RtspConfig,
+	/// Configuration for the streams.
+	pub stream: StreamConfig,
 
 	/// List of applications to expose to clients.
 	pub applications: Vec<ApplicationConfig>,
-
-	/// Configuration for sessions with clients.
-	pub session: SessionConfig,
 }
 
 impl Config {
@@ -55,7 +52,25 @@ pub struct ApplicationConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct SessionConfig {
+pub struct StreamConfig {
+	/// Port to bind the RTSP server to.
+	pub port: u16,
+
+	/// Configuration for the video stream.
+	pub video: VideoStreamConfig,
+
+	/// Configuration for the audio stream.
+	pub audio: AudioStreamConfig,
+
+	/// Configuration for the control stream.
+	pub control: ControlStreamConfig,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct VideoStreamConfig {
+	/// Port to use for streaming video data.
+	pub port: u16,
+
 	/// Type of codec to use.
 	pub codec: String,
 
@@ -64,7 +79,13 @@ pub struct SessionConfig {
 }
 
 #[derive(Clone, Debug, Deserialize)]
-pub struct RtspConfig {
-	/// Port to bind the RTSP server to.
+pub struct AudioStreamConfig {
+	/// Port to use for streaming audio data.
+	pub port: u16,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct ControlStreamConfig {
+	/// Port to use for streaming control data.
 	pub port: u16,
 }

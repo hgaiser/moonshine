@@ -1,7 +1,7 @@
 use async_shutdown::Shutdown;
 use tokio::sync::mpsc;
 
-use crate::{session::rtsp, config::SessionConfig};
+use crate::{session::rtsp, config::Config};
 
 pub enum SessionManagerCommand {
 	LaunchSession(SessionContext),
@@ -27,8 +27,7 @@ pub struct SessionContext {
 }
 
 pub async fn run_session_manager(
-	rtsp_port: u16,
-	config: SessionConfig,
+	config: Config,
 	mut command_rx: mpsc::Receiver<SessionManagerCommand>,
 	shutdown: Shutdown,
 ) -> Result<(), ()> {
@@ -42,10 +41,8 @@ pub async fn run_session_manager(
 			Some(SessionManagerCommand::LaunchSession(session_context)) => {
 				log::info!("Launching session with arguments: {session_context:?}");
 				tokio::spawn(rtsp::run(
-					"0.0.0.0".to_string(),
-					rtsp_port,
-					session_context,
 					config.clone(),
+					session_context,
 				));
 			},
 

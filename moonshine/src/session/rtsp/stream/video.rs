@@ -4,6 +4,8 @@ use ffmpeg::{Packet, Codec, CodecContextBuilder, FrameBuilder};
 use ffmpeg_sys::AV_PKT_FLAG_KEY;
 use tokio::{net::UdpSocket, sync::mpsc};
 
+use crate::config::Config;
+
 #[repr(u8)]
 pub(super) enum RtpFlag {
 	ContainsPicData = 0x1,
@@ -82,20 +84,17 @@ pub struct VideoStreamContext {
 	pub packet_size: usize,
 	pub bitrate: u64,
 	pub minimum_fec_packets: u32,
-	pub codec_name: String,
-	pub fec_percentage: u32,
 }
 
 pub(super) async fn run_video_stream(
-	address: &str,
-	port: u16,
+	config: Config,
 	context: VideoStreamContext,
 	mut video_command_rx: mpsc::Receiver<VideoCommand>,
 ) -> Result<(), ()> {
-	let socket = UdpSocket::bind((address, port)).await
+	let socket = UdpSocket::bind((config.address, config.stream.video.port)).await
 		.map_err(|e| log::error!("Failed to bind to UDP socket: {e}"))?;
 
-	let codec = Codec::new("libx264")
+	let codec = Codec::new(&config.stream.video.codec)
 		.map_err(|e| log::error!("Failed to create codec: {e}"))?;
 
 	let mut codec_context_builder = CodecContextBuilder::new(&codec)
@@ -221,6 +220,7 @@ pub(super) async fn run_video_stream(
 						&packet,
 						&socket,
 						&context,
+						config.stream.video.fec_percentage,
 						frame_number,
 						&mut sequence_number,
 						&client_address,
@@ -257,6 +257,7 @@ async fn send_packet(
 	packet: &Packet,
 	socket: &UdpSocket,
 	context: &VideoStreamContext,
+	fec_percentage: u32,
 	frame_number: u32,
 	sequence_number: &mut u16,
 	client_address: &SocketAddr,
@@ -277,7 +278,7 @@ async fn send_packet(
 
 	let payload_size = context.packet_size - std::mem::size_of::<NvVideoPacket>();
 	let nr_data_shards = (packet_data.len() + payload_size - 1) / payload_size;
-	let nr_parity_shards = (nr_data_shards * context.fec_percentage as usize / 100)
+	let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
 		.max(context.minimum_fec_packets as usize);
 	let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
 	log::trace!("Number of packets: {nr_data_shards}, number of parity packets: {nr_parity_shards}");

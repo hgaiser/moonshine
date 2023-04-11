@@ -3,44 +3,49 @@ use rtsp_types::{headers::{self, Transport}, Method};
 use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}, sync::Mutex};
 use stream::Session;
 
-use crate::config::SessionConfig;
+use crate::config::Config;
 
 use super::SessionContext;
 
 mod stream;
 
 pub async fn run(
-	address: String,
-	port: u16,
+	config: Config,
 	context: SessionContext,
-	config: SessionConfig,
 ) -> Result<(), ()> {
-	let address = (address.clone(), port).to_socket_addrs()
-		.map_err(|e| log::error!("Failed to resolve address {}:{}: {}", address, port, e))?
+	let address = (config.address.as_str(), config.stream.port).to_socket_addrs()
+		.map_err(|e| log::error!("Failed to resolve address {}:{}: {}", config.address, config.stream.port, e))?
 		.next()
-		.ok_or_else(|| log::error!("Failed to resolve address {}:{}", address, port))?;
+		.ok_or_else(|| log::error!("Failed to resolve address {}:{}", config.address, config.stream.port))?;
 	let listener = TcpListener::bind(address)
 		.await
 		.map_err(|e| log::error!("Failed to bind to address {}: {}", address, e))?;
 
 	log::info!("RTSP server listening on {}", address);
 
-	let session = Arc::new(Mutex::new(Session::new(config).await?));
+	let session = Arc::new(Mutex::new(Session::new(config.clone()).await?));
 	loop {
 		let (connection, address) = listener.accept()
 			.await
 			.map_err(|e| log::error!("Failed to accept connection: {}", e))?;
 		log::debug!("Accepted connection from {}", address);
 
-		tokio::spawn(handle_connection(connection, address, session.clone(), context.clone()));
+		tokio::spawn(handle_connection(
+			connection,
+			address,
+			config.clone(),
+			context.clone(),
+			session.clone(),
+		));
 	}
 }
 
 async fn handle_connection(
 	mut connection: TcpStream,
 	address: SocketAddr,
-	session: Arc<Mutex<Session>>,
+	config: Config,
 	context: SessionContext,
+	session: Arc<Mutex<Session>>,
 ) -> Result<(), ()> {
 	let mut message_buffer = String::new();
 
@@ -91,8 +96,8 @@ async fn handle_connection(
 				Method::Announce => handle_announce_request(request, cseq, session.clone()).await,
 				Method::Describe => handle_describe_request(request, cseq, session.clone()).await,
 				Method::Options => handle_options_request(request, cseq),
-				Method::Setup => handle_setup_request(request, cseq),
-				Method::Play => handle_play_request(request, cseq, session.clone(), context.clone()),
+				Method::Setup => handle_setup_request(request, cseq, &config),
+				Method::Play => handle_play_request(request, cseq, context.clone(), session.clone()),
 				method => {
 					log::error!("Received request with unsupported method {:?}", method);
 					Err(())
@@ -212,6 +217,7 @@ async fn handle_describe_request(
 fn handle_setup_request(
 	request: &rtsp_types::Request<Vec<u8>>,
 	cseq: i32,
+	config: &Config,
 ) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
 	let transports = request
 		.typed_header::<rtsp_types::headers::Transports>()
@@ -220,25 +226,6 @@ fn handle_setup_request(
 
 	if let Some(transport) = (*transports).first() {
 		match transport {
-			// // This transport is to support `ffplay`, useful for debugging.
-			// Transport::Rtp(transport) => {
-			// 	let (rtp_port, rtcp_port) = transport.params.client_port
-			// 		.ok_or_else(|| log::error!("No client_port in SETUP request."))?;
-			// 	let rtcp_port = rtcp_port.ok_or_else(|| log::error!("No RTC port in SETUP request."))?;
-
-			// 	log::info!("Setting up session with client port: {}-{}", rtp_port, rtcp_port);
-
-			// 	let (local_rtp_port, local_rtcp_port) = session.lock().unwrap().setup(rtp_port, rtcp_port)?;
-
-			// 	return Ok(rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
-			// 		.header(headers::CSEQ, cseq.to_string())
-			// 		.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
-			// 		.header(headers::TRANSPORT, format!(
-			// 			"RTP/AVP/UDP;unicast;client_port={rtp_port}-{rtcp_port};server_port={local_rtp_port}-{local_rtcp_port}"
-			// 		))
-			// 		.build(Vec::new())
-			// 	);
-			// },
 			Transport::Other(_transport) => {
 				let request_uri = request.request_uri()
 					.ok_or_else(|| log::error!("No request URI in SETUP request."))?;
@@ -251,9 +238,9 @@ fn handle_setup_request(
 
 				// Example query: streamid=control/13/0
 				let (stream_id, port) = match query.1.split('/').next() {
-					Some("control") => ("control", 47999u16),
-					Some("audio") => ("audio", 48000u16),
-					Some("video") => ("video", 47998u16),
+					Some("video") => ("video", config.stream.video.port),
+					Some("audio") => ("audio", config.stream.audio.port),
+					Some("control") => ("control", config.stream.control.port),
 					Some(stream) => {
 						log::error!("Unknown stream '{stream}'");
 						return Err(());
@@ -287,8 +274,8 @@ fn handle_setup_request(
 fn handle_play_request(
 	request: &rtsp_types::Request<Vec<u8>>,
 	cseq: i32,
-	session: Arc<Mutex<Session>>,
 	context: SessionContext,
+	session: Arc<Mutex<Session>>,
 ) -> Result<rtsp_types::Response<Vec<u8>>, ()> {
 	// TODO: Think of a better way to prevent double running.
 	let locked = session.try_lock().is_err();

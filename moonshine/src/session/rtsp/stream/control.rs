@@ -8,7 +8,7 @@ use enet::{
 use openssl::symm::Cipher;
 use tokio::sync::mpsc;
 
-use crate::session::SessionContext;
+use crate::{session::SessionContext, config::Config};
 
 use super::video::VideoCommand;
 
@@ -122,8 +122,7 @@ struct EncryptedControlMessage {
 }
 
 pub(super) async fn run_control_stream(
-	address: &str,
-	port: u16,
+	config: Config,
 	video_command_tx: mpsc::Sender<VideoCommand>,
 	context: SessionContext,
 ) -> Result<(), ()> {
@@ -131,9 +130,9 @@ pub(super) async fn run_control_stream(
 		.map_err(|e| log::error!("Failed to initialize Enet session: {e}"))?;
 
 	let local_addr = Address::new(
-		address.parse()
+		config.address.parse()
 		.map_err(|e| log::error!("Failed to parse address: {e}"))?,
-		port,
+		config.stream.control.port,
 	);
 	let mut host = enet
 		.create_host::<()>(

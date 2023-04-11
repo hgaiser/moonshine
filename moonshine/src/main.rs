@@ -25,8 +25,7 @@ async fn run(config: Config, shutdown: Shutdown) -> Result<(), ()> {
 	// Run the session manager.
 	let (session_command_tx, session_command_rx) = mpsc::channel(10);
 	let session_manager_task = tokio::spawn(shutdown.wrap_vital(run_session_manager(
-		config.rtsp.port,
-		config.session,
+		config.clone(),
 		session_command_rx,
 		shutdown.clone(),
 	)));

@@ -1,16 +1,17 @@
 use tokio::net::UdpSocket;
 
+use crate::config::Config;
+
 #[derive(Clone, Default)]
 pub struct AudioStreamContext {
 	pub packet_duration: u32,
 }
 
 pub(super) async fn run_audio_stream(
-	address: &str,
-	port: u16,
+	config: Config,
 	_context: AudioStreamContext,
 ) -> Result<(), ()> {
-	let socket = UdpSocket::bind((address, port)).await
+	let socket = UdpSocket::bind((config.address, config.stream.audio.port)).await
 		.map_err(|e| log::error!("Failed to bind to UDP socket: {e}"))?;
 
 	log::info!(
