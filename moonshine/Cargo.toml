@@ -12,12 +12,15 @@ enet = "0.3.0"
 env_logger = "0.10.0"
 ffmpeg = { path = "../ffmpeg" }
 ffmpeg-sys = { path = "../ffmpeg-sys" }
+filedesc = "0.6.1"
 hex = "0.4.3"
 hyper = { version = "0.14.25", features = ["server", "http1", "tcp"] }
 image = "0.24.5"
 log = "0.4.17"
+memmap = "0.7.0"
 nvfbc = "0.1.2"
 openssl = "0.10.48"
+png = "0.17.8"
 reed-solomon = { version = "0.1.0", path = "../reed-solomon" }
 rtsp-types = "0.0.5"
 sdp-types = "0.1.5"
@@ -26,5 +29,6 @@ tokio = { version = "1.26.0", features = ["rt-multi-thread", "macros", "net", "i
 tokio-openssl = "0.6.3"
 toml = "0.7.2"
 url = "2.3.1"
+xcb = { version = "1.2.0", features = ["shm"] }
 xml-rs = "0.8.4"
 zeroconf = "0.10.5"

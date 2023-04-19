@@ -4,6 +4,8 @@
 
 mod generated;
 
+const DATA_SHARDS_MAX: usize = 255;
+
 pub struct ReedSolomon {
 	inner: *mut generated::reed_solomon,
 }
@@ -12,6 +14,10 @@ impl ReedSolomon {
 	pub fn new(data_shards: usize, parity_shards: usize) -> Result<Self, String> {
 		if data_shards == 0 || parity_shards == 0 {
 			return Err(format!("expected data_shards > 0 and parity_shards > 0, but got {data_shards} and {parity_shards}"));
+		}
+
+		if data_shards + parity_shards > DATA_SHARDS_MAX {
+			return Err(format!("number of shards ({}) exceeds maximum of {}", data_shards + parity_shards, DATA_SHARDS_MAX));
 		}
 
 		unsafe { generated::reed_solomon_init() };

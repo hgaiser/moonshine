@@ -195,11 +195,11 @@ pub(super) async fn run_control_stream(
 						ControlMessage::Encrypted(_) => unreachable!("Encrypted control messages should be decrypted already."),
 						ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
 							video_command_tx.send(VideoCommand::RequestIdrFrame).await
-								.map_err(|e| log::error!("Failed to send video command: {e}"))?;
+								.map_err(|e| log::warn!("Failed to send video command: {e}"))?;
 							},
 						ControlMessage::StartB => {
 							video_command_tx.send(VideoCommand::StartStreaming).await
-								.map_err(|e| log::error!("Failed to send video command: {e}"))?;
+								.map_err(|e| log::warn!("Failed to send video command: {e}"))?;
 							},
 						skipped_message => {
 							log::trace!("Skipped control message: {skipped_message:?}");

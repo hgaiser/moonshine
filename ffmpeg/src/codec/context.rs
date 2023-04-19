@@ -1,6 +1,6 @@
 use std::ptr::{null_mut, null};
 
-use crate::{util::check_ret, FfmpegError, Frame, Packet};
+use crate::{util::check_ret, FfmpegError, Frame, Packet, to_c_str};
 
 use super::Codec;
 
@@ -121,6 +121,30 @@ impl CodecContextBuilder {
 
 	pub fn set_flags2(&mut self, flags: u32) -> &mut Self {
 		self.as_raw_mut().flags2 = flags as i32;
+		self
+	}
+
+	pub fn set_preset(&mut self, preset: &str) -> &mut Self {
+		let preset_key = to_c_str("preset").unwrap();
+		let preset_value = to_c_str(preset).unwrap();
+		unsafe { ffmpeg_sys::av_opt_set(
+			self.as_raw_mut().priv_data,
+			preset_key.as_ptr(),
+			preset_value.as_ptr(),
+			0,
+		) };
+		self
+	}
+
+	pub fn set_tune(&mut self, tune: &str) -> &mut Self {
+		let tune_key = to_c_str("tune").unwrap();
+		let tune_value = to_c_str(tune).unwrap();
+		unsafe { ffmpeg_sys::av_opt_set(
+			self.as_raw_mut().priv_data,
+			tune_key.as_ptr(),
+			tune_value.as_ptr(),
+			0,
+		) };
 		self
 	}
 

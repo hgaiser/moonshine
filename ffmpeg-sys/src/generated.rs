@@ -21028,6 +21028,257 @@ extern "C" {
 		height: ::std::os::raw::c_int,
 	) -> ::std::os::raw::c_int;
 }
+extern "C" {
+	pub fn swscale_version() -> ::std::os::raw::c_uint;
+}
+extern "C" {
+	pub fn swscale_configuration() -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn swscale_license() -> *const ::std::os::raw::c_char;
+}
+extern "C" {
+	pub fn sws_getCoefficients(colorspace: ::std::os::raw::c_int) -> *const ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct SwsVector {
+	pub coeff: *mut f64,
+	pub length: ::std::os::raw::c_int,
+}
+#[test]
+fn bindgen_test_layout_SwsVector() {
+	const UNINIT: ::std::mem::MaybeUninit<SwsVector> = ::std::mem::MaybeUninit::uninit();
+	let ptr = UNINIT.as_ptr();
+	assert_eq!(
+		::std::mem::size_of::<SwsVector>(),
+		16usize,
+		concat!("Size of: ", stringify!(SwsVector))
+	);
+	assert_eq!(
+		::std::mem::align_of::<SwsVector>(),
+		8usize,
+		concat!("Alignment of ", stringify!(SwsVector))
+	);
+	assert_eq!(
+		unsafe { ::std::ptr::addr_of!((*ptr).coeff) as usize - ptr as usize },
+		0usize,
+		concat!("Offset of field: ", stringify!(SwsVector), "::", stringify!(coeff))
+	);
+	assert_eq!(
+		unsafe { ::std::ptr::addr_of!((*ptr).length) as usize - ptr as usize },
+		8usize,
+		concat!("Offset of field: ", stringify!(SwsVector), "::", stringify!(length))
+	);
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct SwsFilter {
+	pub lumH: *mut SwsVector,
+	pub lumV: *mut SwsVector,
+	pub chrH: *mut SwsVector,
+	pub chrV: *mut SwsVector,
+}
+#[test]
+fn bindgen_test_layout_SwsFilter() {
+	const UNINIT: ::std::mem::MaybeUninit<SwsFilter> = ::std::mem::MaybeUninit::uninit();
+	let ptr = UNINIT.as_ptr();
+	assert_eq!(
+		::std::mem::size_of::<SwsFilter>(),
+		32usize,
+		concat!("Size of: ", stringify!(SwsFilter))
+	);
+	assert_eq!(
+		::std::mem::align_of::<SwsFilter>(),
+		8usize,
+		concat!("Alignment of ", stringify!(SwsFilter))
+	);
+	assert_eq!(
+		unsafe { ::std::ptr::addr_of!((*ptr).lumH) as usize - ptr as usize },
+		0usize,
+		concat!("Offset of field: ", stringify!(SwsFilter), "::", stringify!(lumH))
+	);
+	assert_eq!(
+		unsafe { ::std::ptr::addr_of!((*ptr).lumV) as usize - ptr as usize },
+		8usize,
+		concat!("Offset of field: ", stringify!(SwsFilter), "::", stringify!(lumV))
+	);
+	assert_eq!(
+		unsafe { ::std::ptr::addr_of!((*ptr).chrH) as usize - ptr as usize },
+		16usize,
+		concat!("Offset of field: ", stringify!(SwsFilter), "::", stringify!(chrH))
+	);
+	assert_eq!(
+		unsafe { ::std::ptr::addr_of!((*ptr).chrV) as usize - ptr as usize },
+		24usize,
+		concat!("Offset of field: ", stringify!(SwsFilter), "::", stringify!(chrV))
+	);
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct SwsContext {
+	_unused: [u8; 0],
+}
+extern "C" {
+	pub fn sws_isSupportedInput(pix_fmt: AVPixelFormat) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_isSupportedOutput(pix_fmt: AVPixelFormat) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_isSupportedEndiannessConversion(pix_fmt: AVPixelFormat) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_alloc_context() -> *mut SwsContext;
+}
+extern "C" {
+	pub fn sws_init_context(
+		sws_context: *mut SwsContext,
+		srcFilter: *mut SwsFilter,
+		dstFilter: *mut SwsFilter,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_freeContext(swsContext: *mut SwsContext);
+}
+extern "C" {
+	pub fn sws_getContext(
+		srcW: ::std::os::raw::c_int,
+		srcH: ::std::os::raw::c_int,
+		srcFormat: AVPixelFormat,
+		dstW: ::std::os::raw::c_int,
+		dstH: ::std::os::raw::c_int,
+		dstFormat: AVPixelFormat,
+		flags: ::std::os::raw::c_int,
+		srcFilter: *mut SwsFilter,
+		dstFilter: *mut SwsFilter,
+		param: *const f64,
+	) -> *mut SwsContext;
+}
+extern "C" {
+	pub fn sws_scale(
+		c: *mut SwsContext,
+		srcSlice: *const *const u8,
+		srcStride: *const ::std::os::raw::c_int,
+		srcSliceY: ::std::os::raw::c_int,
+		srcSliceH: ::std::os::raw::c_int,
+		dst: *const *mut u8,
+		dstStride: *const ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_scale_frame(c: *mut SwsContext, dst: *mut AVFrame, src: *const AVFrame) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_frame_start(c: *mut SwsContext, dst: *mut AVFrame, src: *const AVFrame) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_frame_end(c: *mut SwsContext);
+}
+extern "C" {
+	pub fn sws_send_slice(
+		c: *mut SwsContext,
+		slice_start: ::std::os::raw::c_uint,
+		slice_height: ::std::os::raw::c_uint,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_receive_slice(
+		c: *mut SwsContext,
+		slice_start: ::std::os::raw::c_uint,
+		slice_height: ::std::os::raw::c_uint,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_receive_slice_alignment(c: *const SwsContext) -> ::std::os::raw::c_uint;
+}
+extern "C" {
+	pub fn sws_setColorspaceDetails(
+		c: *mut SwsContext,
+		inv_table: *const ::std::os::raw::c_int,
+		srcRange: ::std::os::raw::c_int,
+		table: *const ::std::os::raw::c_int,
+		dstRange: ::std::os::raw::c_int,
+		brightness: ::std::os::raw::c_int,
+		contrast: ::std::os::raw::c_int,
+		saturation: ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_getColorspaceDetails(
+		c: *mut SwsContext,
+		inv_table: *mut *mut ::std::os::raw::c_int,
+		srcRange: *mut ::std::os::raw::c_int,
+		table: *mut *mut ::std::os::raw::c_int,
+		dstRange: *mut ::std::os::raw::c_int,
+		brightness: *mut ::std::os::raw::c_int,
+		contrast: *mut ::std::os::raw::c_int,
+		saturation: *mut ::std::os::raw::c_int,
+	) -> ::std::os::raw::c_int;
+}
+extern "C" {
+	pub fn sws_allocVec(length: ::std::os::raw::c_int) -> *mut SwsVector;
+}
+extern "C" {
+	pub fn sws_getGaussianVec(variance: f64, quality: f64) -> *mut SwsVector;
+}
+extern "C" {
+	pub fn sws_scaleVec(a: *mut SwsVector, scalar: f64);
+}
+extern "C" {
+	pub fn sws_normalizeVec(a: *mut SwsVector, height: f64);
+}
+extern "C" {
+	pub fn sws_freeVec(a: *mut SwsVector);
+}
+extern "C" {
+	pub fn sws_getDefaultFilter(
+		lumaGBlur: f32,
+		chromaGBlur: f32,
+		lumaSharpen: f32,
+		chromaSharpen: f32,
+		chromaHShift: f32,
+		chromaVShift: f32,
+		verbose: ::std::os::raw::c_int,
+	) -> *mut SwsFilter;
+}
+extern "C" {
+	pub fn sws_freeFilter(filter: *mut SwsFilter);
+}
+extern "C" {
+	pub fn sws_getCachedContext(
+		context: *mut SwsContext,
+		srcW: ::std::os::raw::c_int,
+		srcH: ::std::os::raw::c_int,
+		srcFormat: AVPixelFormat,
+		dstW: ::std::os::raw::c_int,
+		dstH: ::std::os::raw::c_int,
+		dstFormat: AVPixelFormat,
+		flags: ::std::os::raw::c_int,
+		srcFilter: *mut SwsFilter,
+		dstFilter: *mut SwsFilter,
+		param: *const f64,
+	) -> *mut SwsContext;
+}
+extern "C" {
+	pub fn sws_convertPalette8ToPacked32(
+		src: *const u8,
+		dst: *mut u8,
+		num_pixels: ::std::os::raw::c_int,
+		palette: *const u8,
+	);
+}
+extern "C" {
+	pub fn sws_convertPalette8ToPacked24(
+		src: *const u8,
+		dst: *mut u8,
+		num_pixels: ::std::os::raw::c_int,
+		palette: *const u8,
+	);
+}
+extern "C" {
+	pub fn sws_get_class() -> *const AVClass;
+}
 pub type __builtin_va_list = [__va_list_tag; 1usize];
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]

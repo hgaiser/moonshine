@@ -66,6 +66,8 @@ fn main() -> Result<(), ()> {
 		.set_gop_size(30)
 		.set_flags(ffmpeg_sys::AV_CODEC_FLAG_CLOSED_GOP | ffmpeg_sys::AV_CODEC_FLAG_LOW_DELAY)
 		.set_flags2(ffmpeg_sys::AV_CODEC_FLAG2_FAST)
+		.set_preset("ultrafast")
+		.set_tune("zerolatency")
 	;
 
 	let mut codec_context = codec_context_builder

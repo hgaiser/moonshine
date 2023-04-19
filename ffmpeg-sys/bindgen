@@ -23,6 +23,8 @@ main() {
 		--allowlist-type "AV.*" \
 		--allowlist-function "do_fflush" \
 		--allowlist-var "stdout" \
+		--allowlist-function "sws.*" \
+		--allowlist-var "Sws*" \
 		./wrapper.h \
 		-- \
 		$(pkg-config --cflags cuda)

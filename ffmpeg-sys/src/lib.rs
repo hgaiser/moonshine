@@ -171,5 +171,47 @@ pub const AV_CHANNEL_LAYOUT_HEXADECAGONAL: AVChannelLayout     = av_channel_layo
 pub const AV_CHANNEL_LAYOUT_STEREO_DOWNMIX: AVChannelLayout    = av_channel_layout_mask(2,  AV_CH_LAYOUT_STEREO_DOWNMIX);
 pub const AV_CHANNEL_LAYOUT_22POINT2: AVChannelLayout          = av_channel_layout_mask(24, AV_CH_LAYOUT_22POINT2);
 
+// libsws definitions
+
+pub const SWS_FAST_BILINEAR: i32 =     1;
+pub const SWS_BILINEAR: i32      =     2;
+pub const SWS_BICUBIC: i32       =     4;
+pub const SWS_X: i32             =     8;
+pub const SWS_POINT: i32         =  0x10;
+pub const SWS_AREA: i32          =  0x20;
+pub const SWS_BICUBLIN: i32      =  0x40;
+pub const SWS_GAUSS: i32         =  0x80;
+pub const SWS_SINC: i32          = 0x100;
+pub const SWS_LANCZOS: i32       = 0x200;
+pub const SWS_SPLINE: i32        = 0x400;
+
+pub const SWS_SRC_V_CHR_DROP_MASK: i32    = 0x30000;
+pub const SWS_SRC_V_CHR_DROP_SHIFT: i32   = 16;
+
+pub const SWS_PARAM_DEFAULT: i32          = 123456;
+
+pub const SWS_PRINT_INFO: i32             = 0x1000;
+
+//the following 3 flags are not completely implemented
+//internal chrominance subsampling info
+pub const SWS_FULL_CHR_H_INT: i32  = 0x2000;
+//input subsampling info
+pub const SWS_FULL_CHR_H_INP: i32  = 0x4000;
+pub const SWS_DIRECT_BGR: i32      = 0x8000;
+pub const SWS_ACCURATE_RND: i32    = 0x40000;
+pub const SWS_BITEXACT: i32        = 0x80000;
+pub const SWS_ERROR_DIFFUSION: i32 = 0x800000;
+
+pub const SWS_MAX_REDUCE_CUTOFF: f32 = 0.002;
+
+pub const SWS_CS_ITU709: i32         = 1;
+pub const SWS_CS_FCC: i32            = 4;
+pub const SWS_CS_ITU601: i32         = 5;
+pub const SWS_CS_ITU624: i32         = 5;
+pub const SWS_CS_SMPTE170M: i32      = 5;
+pub const SWS_CS_SMPTE240M: i32      = 7;
+pub const SWS_CS_DEFAULT: i32        = 5;
+pub const SWS_CS_BT2020: i32         = 9;
+
 unsafe impl Sync for AVPacket {}
 unsafe impl Send for AVPacket {}

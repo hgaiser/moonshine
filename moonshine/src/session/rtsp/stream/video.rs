@@ -1,8 +1,10 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, fs::File, os::fd::FromRawFd};
 
 use ffmpeg::{Packet, Codec, CodecContextBuilder, FrameBuilder};
 use ffmpeg_sys::AV_PKT_FLAG_KEY;
+use memmap::MmapOptions;
 use tokio::{net::UdpSocket, sync::mpsc};
+use xcb::{x, shm};
 
 use crate::config::Config;
 
@@ -106,11 +108,23 @@ pub(super) async fn run_video_stream(
 		.set_max_b_frames(0)
 		.set_pix_fmt(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P)
 		.set_bit_rate(context.bitrate)
-		.set_gop_size(i32::max_value() as u32);
+		.set_gop_size(i32::max_value() as u32)
+		.set_preset("ultrafast")
+		.set_tune("zerolatency")
+	;
 	codec_context_builder.as_raw_mut().refs = 1;
 
 	let mut codec_context = codec_context_builder.open()
 		.map_err(|e| log::error!("Failed to open codec context: {e}"))?;
+
+	let mut frame_builder = FrameBuilder::new()
+		.map_err(|e| log::error!("Failed to create frame builder: {e}"))?;
+	frame_builder
+		.set_format(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_BGRA)
+		.set_width(codec_context.as_raw().width as u32)
+		.set_height(codec_context.as_raw().height as u32);
+	let raw_frame = frame_builder.allocate(0)
+		.map_err(|e| log::error!("Failed to allocate frame: {e}"))?;
 
 	let mut frame_builder = FrameBuilder::new()
 		.map_err(|e| log::error!("Failed to create frame builder: {e}"))?;
@@ -130,12 +144,34 @@ pub(super) async fn run_video_stream(
 		.map_err(|e| log::error!("Failed to get local address associated with control socket: {e}"))?
 	);
 
+	let (conn, screen_num) = xcb::Connection::connect(None).unwrap();
+	let setup = conn.get_setup();
+	let screen = setup.roots().nth(screen_num as usize).unwrap();
+
+	let width = screen.width_in_pixels();
+	let height = screen.height_in_pixels();
+
+	let shmseg = conn.generate_id();
+	let cookie = conn.send_request(&shm::CreateSegment {
+		shmseg,
+		size: width as u32 * height as u32 * 4,
+		read_only: false,
+	});
+	let segment = conn.wait_for_reply(cookie).unwrap();
+	let shared_file = unsafe { File::from_raw_fd(segment.shm_fd()) };
+	let mmap = unsafe { MmapOptions::new().map(&shared_file).unwrap() };
+
 	let stream_start_time = std::time::Instant::now();
 	let mut start_streaming = true;
 	let mut buf = [0; 1024];
 	let mut client_address = None;
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u16;
+	let sws_context = ffmpeg::SwsContext::new(
+		(width as u32, height as u32), raw_frame.as_raw().format,
+		(context.width, context.height), codec_context.as_raw().pix_fmt,
+		ffmpeg_sys::SWS_FAST_BILINEAR,
+	);
 	for _ in 0.. {
 		match socket.try_recv_from(&mut buf) {
 			Ok((len, addr)) => {
@@ -178,29 +214,48 @@ pub(super) async fn run_video_stream(
 			continue;
 		}
 
+		raw_frame.make_writable()
+			.map_err(|e| println!("Failed to make frame writable: {e}"))?;
 		frame.make_writable()
 			.map_err(|e| println!("Failed to make frame writable: {e}"))?;
 
-		unsafe {
-			// Y
-			let y_data = std::slice::from_raw_parts_mut(frame.as_raw().data[0], frame.as_raw().linesize[0] as usize * codec_context.as_raw().height as usize);
-			for y in 0..codec_context.as_raw().height {
-				for x in 0..codec_context.as_raw().width {
-					y_data[(y * frame.as_raw().linesize[0] + x) as usize] = (x + y + sequence_number as i32 * 3) as u8;
-				}
-			}
+		let cookie = conn.send_request(&shm::GetImage {
+			format: x::ImageFormat::ZPixmap as u8,
+			drawable: x::Drawable::Window(screen.root()),
+			x: 0,
+			y: 0,
+			width,
+			height,
+			plane_mask: u32::MAX,
+			shmseg,
+			offset: 0,
+		});
 
-			// Cb and Cr
-			let cb_data = std::slice::from_raw_parts_mut(frame.as_raw().data[1], frame.as_raw().linesize[1] as usize * codec_context.as_raw().height as usize);
-			let cr_data = std::slice::from_raw_parts_mut(frame.as_raw().data[2], frame.as_raw().linesize[2] as usize * codec_context.as_raw().height as usize);
-			for y in 0..codec_context.as_raw().height / 2 {
-				for x in 0..codec_context.as_raw().width / 2 {
-					cb_data[(y * frame.as_raw().linesize[1] + x) as usize] = (128 + y + sequence_number as i32 * 2) as u8;
-					cr_data[(y * frame.as_raw().linesize[2] + x) as usize] = (64 + x + sequence_number as i32 * 5) as u8;
-				}
-			}
-		}
+		conn.wait_for_reply(cookie).unwrap();
+		// unsafe {
+		// 	// B
+		// 	let data = std::slice::from_raw_parts_mut(
+		// 		raw_frame.as_raw().data[0],
+		// 		raw_frame.as_raw().linesize[0] as usize * codec_context.as_raw().height as usize * 4,
+		// 	);
+		// 	for y in 0..codec_context.as_raw().height {
+		// 		for x in 0..codec_context.as_raw().width {
+		// 			let index = (y as usize * frame.as_raw().linesize[0] as usize + x as usize) * 4;
+		// 			data[index + 0] = (x + y + sequence_number as i32 * 3) as u8;
+		// 			data[index + 1] = (x + y + sequence_number as i32 * 3) as u8;
+		// 			data[index + 2] = 255 - (x + y + sequence_number as i32 * 3) as u8;
+		// 			data[index + 3] = 255;
+		// 		}
+		// 	}
+		// }
 
+		sws_context.scale(
+			[mmap.as_ptr()].as_ptr(),
+			&[width as i32 * 4],
+			height as i32,
+			frame.as_raw_mut().data.as_mut_ptr(),
+			frame.as_raw().linesize.as_slice(),
+		);
 		frame.as_raw_mut().pts = frame_number as i64;
 
 		// We increase this value here, because the first value expected is a 1.
@@ -208,7 +263,7 @@ pub(super) async fn run_video_stream(
 
 		// Encode the image.
 		if let Some(client_address) = client_address {
-			log::trace!("Send frame {}", frame.as_raw().pts);
+			log::debug!("Encoding frame {}", frame.as_raw().pts);
 
 			// Send the frame to the encoder.
 			codec_context.send_frame(Some(&frame))
@@ -216,16 +271,19 @@ pub(super) async fn run_video_stream(
 
 			loop {
 				match codec_context.receive_packet(&mut packet) {
-					Ok(()) => send_packet(
-						&packet,
-						&socket,
-						&context,
-						config.stream.video.fec_percentage,
-						frame_number,
-						&mut sequence_number,
-						&client_address,
-						stream_start_time,
-					).await?,
+					Ok(()) => {
+						log::debug!("Sending frame {}", packet.as_raw().pts);
+						send_packet(
+							&packet,
+							&socket,
+							&context,
+							config.stream.video.fec_percentage,
+							frame_number,
+							&mut sequence_number,
+							&client_address,
+							stream_start_time,
+						).await?
+					},
 					Err(e) => {
 						if e.code == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) {
 							// log::info!("Need more frames for encoding...");
@@ -278,13 +336,16 @@ async fn send_packet(
 
 	let payload_size = context.packet_size - std::mem::size_of::<NvVideoPacket>();
 	let nr_data_shards = (packet_data.len() + payload_size - 1) / payload_size;
-	let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
+	let mut nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
 		.max(context.minimum_fec_packets as usize);
 	let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
-	log::trace!("Number of packets: {nr_data_shards}, number of parity packets: {nr_parity_shards}");
+	log::debug!("Number of packets: {nr_data_shards}, number of parity packets: {nr_parity_shards}");
 
-	let encoder = reed_solomon::ReedSolomon::new(nr_data_shards, nr_parity_shards)
-		.map_err(|e| log::error!("Failed to create FEC encoder: {e}"))?;
+	let encoder = reed_solomon::ReedSolomon::new(nr_data_shards, nr_parity_shards);
+	if let Err(e) = &encoder {
+		log::info!("Failed to create error correction: {e}");
+		nr_parity_shards = 0;
+	}
 
 	let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
 	for i in 0..nr_data_shards {
@@ -299,8 +360,10 @@ async fn send_packet(
 	for _ in 0..nr_parity_shards {
 		shards.push(vec![0u8; payload_size]);
 	}
-	encoder.encode(&mut shards)
-		.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
+	if let Ok(encoder) = encoder {
+		encoder.encode(&mut shards)
+			.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
+	}
 
 	for (index, shard) in shards.iter().enumerate() {
 		let rtp_header = RtpHeader {
