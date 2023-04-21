@@ -315,7 +315,7 @@ async fn send_packet(
 	packet: &Packet,
 	socket: &UdpSocket,
 	context: &VideoStreamContext,
-	fec_percentage: u32,
+	fec_percentage: u8,
 	frame_number: u32,
 	sequence_number: &mut u16,
 	client_address: &SocketAddr,

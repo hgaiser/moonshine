@@ -1,7 +1,5 @@
 use std::ptr::null_mut;
 
-use crate::{check_ret, FfmpegError};
-
 pub struct SwsContext {
 	context: *mut ffmpeg_sys::SwsContext,
 }

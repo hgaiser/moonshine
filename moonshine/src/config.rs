@@ -75,7 +75,7 @@ pub struct VideoStreamConfig {
 	pub codec: String,
 
 	/// What percentage of data packets should be parity packets.
-	pub fec_percentage: u32,
+	pub fec_percentage: u8,
 }
 
 #[derive(Clone, Debug, Deserialize)]
