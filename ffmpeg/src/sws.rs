@@ -51,3 +51,4 @@ impl Drop for SwsContext {
 }
 
 unsafe impl Send for SwsContext { }
+unsafe impl Sync for SwsContext { }

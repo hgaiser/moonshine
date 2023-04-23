@@ -73,9 +73,11 @@ async fn run(config: Config, shutdown: Shutdown) -> Result<(), ()> {
 	}
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), ()> {
-	env_logger::init();
+	env_logger::builder()
+		.format_timestamp_millis()
+		.init();
 
 	let args = Args::parse();
 

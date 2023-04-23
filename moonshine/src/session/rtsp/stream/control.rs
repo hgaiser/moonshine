@@ -147,66 +147,65 @@ pub(super) async fn run_control_stream(
 	log::info!("Listening for control messages on {:?}", host.address());
 
 	loop {
-		match host.service(1000)
-			.map_err(|e| log::error!("Failure in enet host: {e}"))? {
-				Some(Event::Connect(_)) => {}, //println!("new connection!"),
-				Some(Event::Disconnect(..)) => {}, //println!("disconnect!"),
-				Some(Event::Receive {
-					ref packet,
-					..
-				}) => {
-					let mut control_message = ControlMessage::from_bytes(packet.data())?;
-					log::debug!("Received control message: {control_message:?}");
+		match host.service(1000).map_err(|e| log::error!("Failure in enet host: {e}"))? {
+			Some(Event::Connect(_)) => {},
+			Some(Event::Disconnect(..)) => {},
+			Some(Event::Receive {
+				ref packet,
+				..
+			}) => {
+				let mut control_message = ControlMessage::from_bytes(packet.data())?;
+				log::debug!("Received control message: {control_message:?}");
 
-					// First check for encrypted control messages and decrypt them.
-					if let ControlMessage::Encrypted(message) = control_message {
-						let mut initialization_vector = [0u8; 16];
-						initialization_vector[0] = message.sequence_number as u8;
+				// First check for encrypted control messages and decrypt them.
+				if let ControlMessage::Encrypted(message) = control_message {
+					let mut initialization_vector = [0u8; 16];
+					initialization_vector[0] = message.sequence_number as u8;
 
-						let decrypted = openssl::symm::decrypt_aead(
-							Cipher::aes_128_gcm(),
-							&context.remote_input_key,
-							Some(&initialization_vector),
-							&[],
-							&message.payload,
-							&message.tag,
-						);
+					let decrypted = openssl::symm::decrypt_aead(
+						Cipher::aes_128_gcm(),
+						&context.remote_input_key,
+						Some(&initialization_vector),
+						&[],
+						&message.payload,
+						&message.tag,
+					);
 
-						let decrypted = match decrypted {
-							Ok(decrypted) => decrypted,
-							Err(e) => {
-								log::error!("Failed to decrypt control message: {:?}", e.errors());
-								continue;
-							}
-						};
+					let decrypted = match decrypted {
+						Ok(decrypted) => decrypted,
+						Err(e) => {
+							log::error!("Failed to decrypt control message: {:?}", e.errors());
+							continue;
+						}
+					};
 
-						control_message = match ControlMessage::from_bytes(&decrypted) {
-							Ok(decrypted_message) => decrypted_message,
-							Err(()) => {
-								log::warn!("Failed to parse decrypted control message.");
-								continue;
-							},
-						};
-
-						log::debug!("Decrypted control message: {control_message:?}");
-					}
-
-					match control_message {
-						ControlMessage::Encrypted(_) => unreachable!("Encrypted control messages should be decrypted already."),
-						ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
-							video_command_tx.send(VideoCommand::RequestIdrFrame).await
-								.map_err(|e| log::warn!("Failed to send video command: {e}"))?;
-							},
-						ControlMessage::StartB => {
-							video_command_tx.send(VideoCommand::StartStreaming).await
-								.map_err(|e| log::warn!("Failed to send video command: {e}"))?;
-							},
-						skipped_message => {
-							log::trace!("Skipped control message: {skipped_message:?}");
+					control_message = match ControlMessage::from_bytes(&decrypted) {
+						Ok(decrypted_message) => decrypted_message,
+						Err(()) => {
+							log::warn!("Failed to parse decrypted control message.");
+							continue;
 						},
 					};
+
+					log::debug!("Decrypted control message: {control_message:?}");
 				}
-				_ => (),
+
+				match control_message {
+					ControlMessage::Encrypted(_) => unreachable!("Encrypted control messages should be decrypted already."),
+					ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
+						video_command_tx.send(VideoCommand::RequestIdrFrame).await
+							.map_err(|e| log::warn!("Failed to send video command: {e}"))?;
+					},
+					ControlMessage::StartB => {
+						video_command_tx.send(VideoCommand::StartStreaming).await
+							.map_err(|e| log::warn!("Failed to send video command: {e}"))?;
+					},
+					skipped_message => {
+						log::trace!("Skipped control message: {skipped_message:?}");
+					},
+				};
 			}
+			_ => (),
+		}
 	}
 }
