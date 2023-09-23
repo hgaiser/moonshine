@@ -1,5 +1,6 @@
 [workspace]
 members = ["ffmpeg", "moonshine", "reed-solomon"]
+resolver = "2"
 
 [patch.crates-io]
 nvfbc = { path = "../nvfbc-rs/nvfbc" }
