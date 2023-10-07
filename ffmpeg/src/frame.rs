@@ -1,6 +1,6 @@
 use std::ptr::null_mut;
 
-use crate::{FfmpegError, check_ret};
+use crate::{FfmpegError, check_ret, HwFrameContext};
 
 pub struct Frame {
 	frame: *mut ffmpeg_sys::AVFrame,
@@ -54,6 +54,14 @@ impl FrameBuilder {
 		result
 	}
 
+	pub fn allocate_hwframe(mut self) -> Result<Frame, FfmpegError> {
+		check_ret(unsafe { ffmpeg_sys::av_hwframe_get_buffer(self.as_raw().hw_frames_ctx, self.as_raw_mut(), 0) })?;
+		let result = Ok(Frame::new(self.frame));
+		self.frame = null_mut();
+
+		result
+	}
+
 	pub fn set_format(&mut self, format: i32) -> &mut Self {
 		// TODO: Make format an enum.
 		self.as_raw_mut().format = format;
@@ -72,6 +80,11 @@ impl FrameBuilder {
 
 	pub fn set_nb_samples(&mut self, nb_samples: u32) -> &mut Self {
 		self.as_raw_mut().nb_samples = nb_samples as i32;
+		self
+	}
+
+	pub fn set_hw_frames_ctx(&mut self, context: &mut HwFrameContext) -> &mut Self {
+		self.as_raw_mut().hw_frames_ctx = context.as_raw_mut();
 		self
 	}
 

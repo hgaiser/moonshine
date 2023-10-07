@@ -2,17 +2,12 @@ use std::path::PathBuf;
 
 use async_shutdown::Shutdown;
 use clap::Parser;
-use config::Config;
-use session::{clients::ClientManager, run_session_manager};
+use moonshine::config::Config;
+use moonshine::session::{clients::ClientManager, run_session_manager};
+use moonshine::util::flatten;
+use moonshine::{webserver, service_publisher};
 use tokio::{sync::mpsc, try_join};
 
-use crate::util::flatten;
-
-mod config;
-mod session;
-mod service_publisher;
-mod util;
-mod webserver;
 
 #[derive(Parser, Debug)]
 #[clap(version)]
@@ -81,7 +76,7 @@ async fn main() -> Result<(), ()> {
 
 	let args = Args::parse();
 
-	let config = config::Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
+	let config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
 
 	log::debug!("Using configuration:\n{:#?}", config);
 

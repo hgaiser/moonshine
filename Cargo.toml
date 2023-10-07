@@ -5,3 +5,6 @@ resolver = "2"
 [patch.crates-io]
 nvfbc = { path = "../nvfbc-rs/nvfbc" }
 enet = { path = "../enet-rs" }
+
+# Fix outdated bindgen in avahi-sys.
+avahi-sys = { git = "https://github.com/maxjoehnk/avahi-sys", branch="update-bindgen-0.64" }

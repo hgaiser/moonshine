@@ -69,7 +69,7 @@ async fn handle_connection(
 
 		break match result {
 			Ok((message, _consumed)) => message,
-			Err(rtsp_types::ParseError::Incomplete) => {
+			Err(rtsp_types::ParseError::Incomplete(_)) => {
 				log::debug!("Incomplete RTSP message received, waiting for more data.");
 				continue;
 			},

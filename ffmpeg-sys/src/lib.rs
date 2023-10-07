@@ -215,3 +215,6 @@ pub const SWS_CS_BT2020: i32         = 9;
 
 unsafe impl Sync for AVPacket {}
 unsafe impl Send for AVPacket {}
+
+unsafe impl Sync for AVBufferRef {}
+unsafe impl Send for AVBufferRef {}

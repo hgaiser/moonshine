@@ -59,7 +59,7 @@ fn main() -> Result<(), ()> {
 	codec_context_builder
 		.set_width(2560)
 		.set_height(1600)
-		.set_framerate(30)
+		.set_fps(30)
 		.set_max_b_frames(0)
 		.set_pix_fmt(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P)
 		.set_bit_rate(1000000)

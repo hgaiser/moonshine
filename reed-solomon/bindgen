@@ -17,7 +17,7 @@ main() {
 		--allowlist-function "reed_solomon_release" \
 		--allowlist-function "reed_solomon_encode" \
 		--allowlist-function "reed_solomon_reconstruct" \
-		./rs.h
+		./src/rs.h
 
 	msg "Successfully generated bindings at '$PWD/src/generated.rs'"
 }

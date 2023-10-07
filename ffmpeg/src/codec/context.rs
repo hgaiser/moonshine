@@ -1,6 +1,6 @@
 use std::ptr::{null_mut, null};
 
-use crate::{util::check_ret, FfmpegError, Frame, Packet, to_c_str};
+use crate::{util::check_ret, FfmpegError, Frame, Packet, to_c_str, HwFrameContext};
 
 use super::Codec;
 
@@ -76,7 +76,7 @@ impl CodecContextBuilder {
 		self
 	}
 
-	pub fn set_framerate(&mut self, fps: u32) -> &mut Self {
+	pub fn set_fps(&mut self, fps: u32) -> &mut Self {
 		self.as_raw_mut().time_base = ffmpeg_sys::AVRational { num: 1, den: fps as i32 };
 		self.as_raw_mut().framerate = ffmpeg_sys::AVRational { num: fps as i32, den: 1 };
 		self
@@ -145,6 +145,11 @@ impl CodecContextBuilder {
 			tune_value.as_ptr(),
 			0,
 		) };
+		self
+	}
+
+	pub fn set_hw_frames_ctx(&mut self, frames: &mut HwFrameContext) -> &mut Self {
+		self.as_raw_mut().hw_frames_ctx = frames.as_raw_mut();
 		self
 	}
 

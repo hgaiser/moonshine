@@ -1,6 +1,9 @@
 use std::sync::{Arc, Mutex};
 
-use ffmpeg::{Codec, CodecContextBuilder, Frame, CodecContext, Packet};
+use ffmpeg::{Codec, CodecContextBuilder, Frame, CodecContext, Packet, HwFrameContextBuilder, HwFrameContext, CudaDeviceContextBuilder};
+use ffmpeg_sys::CUcontext;
+
+use crate::cuda::CudaContext;
 
 #[repr(u8)]
 enum RtpFlag {
@@ -69,16 +72,35 @@ impl NvVideoPacket {
 
 pub struct Encoder {
 	codec_context: CodecContext,
+	pub hw_frame_context: HwFrameContext,
 }
 
 impl Encoder {
 	pub fn new(
+		cuda_context: &CudaContext,
 		codec_name: &str,
 		width: u32,
 		height: u32,
 		framerate: u32,
 		bitrate: u64,
 	) -> Result<Self, ()> {
+		let cuda_device_context = CudaDeviceContextBuilder::new()
+			.map_err(|e| log::error!("Failed to create CUDA device context: {e}"))?
+			.set_cuda_context(cuda_context.as_raw())
+			.build()
+			.map_err(|e| log::error!("Failed to build CUDA device context: {e}"))?
+		;
+
+		let mut hw_frame_context = HwFrameContextBuilder::new(cuda_device_context)
+			.map_err(|e| log::error!("Failed to create CUDA frame context: {e}"))?
+			.set_width(width)
+			.set_height(height)
+			.set_sw_format(ffmpeg_sys::AV_PIX_FMT_0RGB32)
+			.set_format(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA)
+			.build()
+			.map_err(|e| log::error!("Failed to build CUDA frame context: {e}"))?
+		;
+
 		let codec = Codec::new(codec_name)
 			.map_err(|e| log::error!("Failed to create codec: {e}"))?;
 
@@ -87,13 +109,15 @@ impl Encoder {
 		codec_context_builder
 			.set_width(width)
 			.set_height(height)
-			.set_framerate(framerate)
+			.set_fps(framerate)
 			.set_max_b_frames(0)
-			.set_pix_fmt(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_YUV420P)
+			.set_pix_fmt(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA)
 			.set_bit_rate(bitrate)
 			.set_gop_size(i32::max_value() as u32)
-			.set_preset("ultrafast")
-			.set_tune("zerolatency");
+			.set_preset("fast")
+			.set_tune("ull")
+			.set_hw_frames_ctx(&mut hw_frame_context)
+		;
 		codec_context_builder.as_raw_mut().refs = 1;
 
 		let codec_context = codec_context_builder
@@ -102,10 +126,11 @@ impl Encoder {
 
 		Ok(Self {
 			codec_context,
+			hw_frame_context,
 		})
 	}
 
-	pub async fn run(
+	pub fn run(
 		mut self,
 		packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 		mut idr_frame_request_rx: tokio::sync::broadcast::Receiver<()>,
@@ -114,7 +139,7 @@ impl Encoder {
 		fec_percentage: u8,
 		mut encoder_buffer: Frame,
 		intermediate_buffer: Arc<Mutex<Frame>>,
-		notifier: Arc<tokio::sync::Notify>,
+		notifier: Arc<std::sync::Condvar>,
 	) -> Result<(), ()> {
 		let mut packet = Packet::new()
 			.map_err(|e| log::error!("Failed to create packet: {e}"))?;
@@ -123,16 +148,18 @@ impl Encoder {
 		let mut sequence_number = 0u32;
 		let stream_start_time = std::time::Instant::now();
 		loop {
-			// Wait for a new frame.
-			notifier.notified().await;
-
 			// Swap the intermediate buffer with the output buffer.
 			// Note that the lock is only held while swapping buffers, to minimize wait time for others locking the buffer.
 			{
-				let mut lock = intermediate_buffer.lock()
-				.map_err(|e| log::error!("Failed to lock intermediate buffer: {e}"))?;
+				log::trace!("Waiting for new frame.");
+				// Wait for a new frame.
+				let mut lock = notifier.wait(intermediate_buffer.lock().unwrap())
+					.map_err(|e| log::error!("Failed to wait for new frame: {e}"))?;
+				log::trace!("Received notification of new frame.");
+
 				std::mem::swap(&mut *lock, &mut encoder_buffer);
 			}
+			log::trace!("Swapped new frame with old frame.");
 			frame_number += 1;
 			encoder_buffer.as_raw_mut().pts = frame_number as i64;
 
@@ -174,7 +201,7 @@ impl Encoder {
 							frame_number,
 							&mut sequence_number,
 							stream_start_time,
-						).await?
+						)?
 					},
 					Err(e) => {
 						if e.code == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) {
@@ -194,7 +221,7 @@ impl Encoder {
 	}
 }
 
-async fn encode_packet(
+fn encode_packet(
 	packet: &Packet,
 	packet_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
 	packet_size: usize,
@@ -284,7 +311,7 @@ async fn encode_packet(
 		buffer.extend(shard);
 
 		log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
-		packet_tx.send(buffer).await
+		packet_tx.blocking_send(buffer)
 			.map_err(|e| log::error!("Failed to send packet: {e}"))?;
 
 		*sequence_number += 1;
