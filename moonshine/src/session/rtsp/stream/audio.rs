@@ -7,7 +7,7 @@ pub struct AudioStreamContext {
 	pub packet_duration: u32,
 }
 
-pub(super) async fn run_audio_stream(
+pub async fn run_audio_stream(
 	config: Config,
 	_context: AudioStreamContext,
 ) -> Result<(), ()> {

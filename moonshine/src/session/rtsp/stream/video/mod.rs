@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
+use async_shutdown::ShutdownManager;
 use ffmpeg::{FrameBuilder, Frame, HwFrameContext};
 use tokio::{net::UdpSocket, sync::mpsc};
 
-use crate::{config::Config, cuda};
+use crate::config::Config;
 
 mod capture;
 use capture::FrameCapturer;
@@ -12,7 +13,7 @@ mod encoder;
 use encoder::Encoder;
 
 #[derive(Debug)]
-pub(super) enum VideoCommand {
+pub enum VideoCommand {
 	StartStreaming,
 	RequestIdrFrame,
 }
@@ -50,10 +51,11 @@ fn create_frame(width: u32, height: u32, pixel_format: i32, context: &mut HwFram
 	Ok(frame)
 }
 
-pub(super) async fn run_video_stream(
+pub async fn run_video_stream(
 	config: Config,
 	context: VideoStreamContext,
 	mut video_command_rx: mpsc::Receiver<VideoCommand>,
+	stop_signal: ShutdownManager<()>,
 ) -> Result<(), ()> {
 	let socket = UdpSocket::bind((config.address, config.stream.video.port))
 		.await
@@ -142,6 +144,8 @@ pub(super) async fn run_video_stream(
 								std::thread::spawn({
 									let intermediate_buffer = intermediate_buffer.clone();
 									let notifier = notifier.clone();
+									let context = context.clone();
+									let stop_signal = stop_signal.clone();
 									move || {
 										cuda_context.set_current()
 											.map_err(|e| log::error!("Failed to bind CUDA context to thread: {e}"))?;
@@ -150,6 +154,7 @@ pub(super) async fn run_video_stream(
 											capture_buffer,
 											intermediate_buffer,
 											notifier,
+											stop_signal,
 										)
 									}
 								});
@@ -158,6 +163,8 @@ pub(super) async fn run_video_stream(
 									let packet_tx = packet_tx.clone();
 									let notifier = notifier.clone();
 									let idr_frame_request_rx = idr_frame_request_tx.subscribe();
+									let context = context.clone();
+									let stop_signal = stop_signal.clone();
 									move || {
 										encoder.run(
 											packet_tx,
@@ -168,6 +175,7 @@ pub(super) async fn run_video_stream(
 											encoder_buffer,
 											intermediate_buffer,
 											notifier,
+											stop_signal,
 										)
 									}
 								});

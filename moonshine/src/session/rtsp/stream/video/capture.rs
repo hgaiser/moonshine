@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex};
 
+use async_shutdown::ShutdownManager;
 use ffmpeg::Frame;
-use ffmpeg_sys::CUcontext;
 use nvfbc::{CudaCapturer, BufferFormat, cuda::CaptureMethod};
 
-use crate::cuda::{CudaContext, check_ret};
+use crate::cuda::check_ret;
 
 pub struct FrameCapturer {
 	capturer: CudaCapturer,
@@ -26,6 +26,7 @@ impl FrameCapturer {
 		mut capture_buffer: Frame,
 		intermediate_buffer: Arc<Mutex<Frame>>,
 		notifier: Arc<std::sync::Condvar>,
+		stop_signal: ShutdownManager<()>,
 	) -> Result<(), ()> {
 		self.capturer.bind_context()
 			.map_err(|e| log::error!("Failed to bind frame capturer CUDA context: {e}"))?;
@@ -33,12 +34,10 @@ impl FrameCapturer {
 			.map_err(|e| log::error!("Failed to start CUDA capture device: {e}"))?;
 		log::info!("Started frame capture.");
 
-		// let frame_time = std::time::Duration::from_millis(1000u64 / framerate as u64);
-		// log::info!("Time between frames is {}ms.", frame_time.as_millis());
-		loop {
+		while !stop_signal.is_shutdown_triggered() {
 			let frame_info = self.capturer.next_frame(CaptureMethod::NoWaitIfNewFrame)
 				.map_err(|e| log::error!("Failed to wait for new CUDA frame: {e}"))?;
-			log::debug!("Frame info: {:#?}", frame_info);
+			log::trace!("Frame info: {:#?}", frame_info);
 
 			// capture_buffer.as_raw_mut().data[0] = frame_info.device_buffer as *mut u8;
 			unsafe {
@@ -58,9 +57,10 @@ impl FrameCapturer {
 				std::mem::swap(&mut *lock, &mut capture_buffer);
 			}
 			notifier.notify_one();
-
-			// Sleep to approximately get the desired framerate.
-			// tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 		}
+
+		log::debug!("Received stop signal.");
+
+		Ok(())
 	}
 }

@@ -106,7 +106,7 @@ fn main() -> Result<(), ()> {
 	;
 
 	let mut capture_buffer = create_frame(width, height, ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA, &mut hw_frame_context)?;
-	let mut intermediate_buffer = Arc::new(Mutex::new(create_frame(width, height, ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA, &mut hw_frame_context)?));
+	let intermediate_buffer = Arc::new(Mutex::new(create_frame(width, height, ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA, &mut hw_frame_context)?));
 	let mut encoder_buffer = create_frame(width, height, ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA, &mut hw_frame_context)?;
 	let notifier = Arc::new(std::sync::Condvar::new());
 
@@ -139,7 +139,7 @@ fn main() -> Result<(), ()> {
 	let mut file = std::fs::File::create(filename)
 		.map_err(|e| println!("Failed to create output file: {e}"))?;
 
-	let capture_task = std::thread::spawn({
+	std::thread::spawn({
 		let intermediate_buffer = intermediate_buffer.clone();
 		let notifier = notifier.clone();
 		move || {
@@ -202,7 +202,7 @@ fn main() -> Result<(), ()> {
 			}
 
 			file.flush()
-				.map_err(|e| println!("Failed to flush file.")).unwrap();
+				.map_err(|e| println!("Failed to flush file: {e}")).unwrap();
 		}
 	});
 

@@ -1,3 +1,4 @@
+use async_shutdown::ShutdownManager;
 use enet::{
 	Address,
 	BandwidthLimit,
@@ -121,14 +122,13 @@ struct EncryptedControlMessage {
 	payload: Vec<u8>,
 }
 
-pub(super) async fn run_control_stream(
+pub async fn run_control_stream(
 	config: Config,
 	video_command_tx: mpsc::Sender<VideoCommand>,
 	context: SessionContext,
+	enet: Enet,
+	stop_signal: ShutdownManager<()>,
 ) -> Result<(), ()> {
-	let enet = Enet::new()
-		.map_err(|e| log::error!("Failed to initialize Enet session: {e}"))?;
-
 	let local_addr = Address::new(
 		config.address.parse()
 		.map_err(|e| log::error!("Failed to parse address: {e}"))?,
@@ -147,6 +147,11 @@ pub(super) async fn run_control_stream(
 	log::info!("Listening for control messages on {:?}", host.address());
 
 	loop {
+		if stop_signal.is_shutdown_triggered() {
+			log::debug!("Stopping due to shutdown triggered.");
+			break;
+		}
+
 		match host.service(1000).map_err(|e| log::error!("Failure in enet host: {e}"))? {
 			Some(Event::Connect(_)) => {},
 			Some(Event::Disconnect(..)) => {},
@@ -155,7 +160,7 @@ pub(super) async fn run_control_stream(
 				..
 			}) => {
 				let mut control_message = ControlMessage::from_bytes(packet.data())?;
-				log::debug!("Received control message: {control_message:?}");
+				log::trace!("Received control message: {control_message:?}");
 
 				// First check for encrypted control messages and decrypt them.
 				if let ControlMessage::Encrypted(message) = control_message {
@@ -187,7 +192,7 @@ pub(super) async fn run_control_stream(
 						},
 					};
 
-					log::debug!("Decrypted control message: {control_message:?}");
+					log::trace!("Decrypted control message: {control_message:?}");
 				}
 
 				match control_message {
@@ -208,4 +213,6 @@ pub(super) async fn run_control_stream(
 			_ => (),
 		}
 	}
+
+	Ok(())
 }

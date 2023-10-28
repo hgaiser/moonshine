@@ -24,6 +24,7 @@ impl SwsContext {
 		Self { context }
 	}
 
+	#[allow(clippy::not_unsafe_ptr_arg_deref)]
 	pub fn scale(
 		&self,
 		source: *const *const u8,

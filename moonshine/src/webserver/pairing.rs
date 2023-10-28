@@ -1,12 +1,11 @@
 use std::{collections::HashMap, sync::Arc};
 
-use hyper::{Response, Body, header};
-use tokio::sync::{Notify, mpsc, oneshot};
+use http_body_util::Full;
+use hyper::{Response, header, body::Bytes};
+use tokio::sync::Notify;
 use xml::{EmitterConfig, writer::XmlEvent};
 
-use crate::{session::clients::{PendingClient, ClientManagerCommand, StartPairingCommand, ClientChallengeCommand, ServerChallengeResponseCommand, AddClientCommand, CheckClientPairingSecretCommand}, webserver::bad_request};
-
-use super::WebserverError;
+use crate::{clients::PendingClient, webserver::bad_request, clients::ClientManager};
 
 /// Handle a pairing request from a client.
 ///
@@ -24,66 +23,102 @@ use super::WebserverError;
 /// After completing these steps, we have paired with the client.
 pub async fn handle_pair_request(
 	mut params: HashMap<String, String>,
-	server_pem: openssl::x509::X509,
-	client_command_tx: mpsc::Sender<ClientManagerCommand>
-) -> Result<Response<Body>, WebserverError> {
+	server_certs: &openssl::x509::X509,
+	client_manager: &ClientManager,
+) -> Response<Full<Bytes>> {
 	if params.contains_key("phrase") {
 		match params.remove("phrase").unwrap().as_str() {
-			"getservercert" => get_server_cert(params, server_pem, client_command_tx).await,
-			"pairchallenge" => pair_challenge(params, client_command_tx).await,
+			"getservercert" => get_server_cert(params, server_certs, client_manager).await,
+			"pairchallenge" => pair_challenge(params, client_manager).await,
 			unknown => {
-				log::error!("Unknown pair phrase received: {}", unknown);
-				bad_request()
+				let message = format!("Unknown pair phrase received: {}", unknown);
+				log::warn!("{message}");
+				bad_request(message)
 			}
 		}
 	} else if params.contains_key("clientchallenge") {
-		client_challenge(params, client_command_tx).await
+		client_challenge(params, client_manager).await
 	} else if params.contains_key("serverchallengeresp") {
-		server_challenge_response(params, client_command_tx).await
+		server_challenge_response(params, client_manager).await
 	} else if params.contains_key("clientpairingsecret") {
-		client_pairing_secret(params, client_command_tx).await
+		client_pairing_secret(params, client_manager).await
 	} else {
-		log::warn!("Unknown pair command with params: {:?}", params);
-		bad_request()
+		let message = format!("Unknown pair command with params: {:?}", params);
+		log::warn!("{message}");
+		bad_request(message)
 	}
 }
 
 async fn get_server_cert(
 	mut params: HashMap<String, String>,
-	server_pem: openssl::x509::X509,
-	client_command_tx: mpsc::Sender<ClientManagerCommand>,
-) -> Result<Response<Body>, WebserverError> {
+	server_pem: &openssl::x509::X509,
+	client_manager: &ClientManager,
+) -> Response<Full<Bytes>> {
 	let client_cert = match params.remove("clientcert") {
-		Some(client_cert) => hex::decode(client_cert).map_err(|e| WebserverError::Other(e.to_string()))?,
+		Some(client_cert) => client_cert,
 		None => {
-			log::error!("Expected 'clientcert' in get server cert request, got {:?}.", params.keys());
-			return bad_request();
+			let message = format!("Expected 'clientcert' in get server cert request, got {:?}.", params.keys());
+			log::warn!("{message}");
+			return bad_request(message);
 		}
 	};
-	let unique_id = match params.remove("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			log::error!("Expected 'uniqueid' in get server cert request, got {:?}.", params.keys());
-			return bad_request();
-		}
-	};
-	let salt = match params.remove("salt") {
-		Some(salt) => hex::decode(salt).map_err(|e| WebserverError::Other(e.to_string()))?,
-		None => {
-			log::error!("Expected 'salt' in get server cert request, got {:?}.", params.keys());
-			return bad_request();
+	let client_cert = match hex::decode(client_cert) {
+		Ok(cert) => cert,
+		Err(e) => {
+			let message = format!("{e}");
+			log::warn!("{message}");
+			return bad_request(message);
 		}
 	};
 
-	let pem = openssl::x509::X509::from_pem(client_cert.as_slice())
-		.map_err(|e| WebserverError::Other(e.to_string()))?;
+	let unique_id = match params.remove("uniqueid") {
+		Some(unique_id) => unique_id,
+		None => {
+			let message = format!("Expected 'uniqueid' in get server cert request, got {:?}.", params.keys());
+			log::warn!("{message}");
+			return bad_request(message);
+		}
+	};
+
+	let salt = match params.remove("salt") {
+		Some(salt) => salt,
+		None => {
+			let message = format!("Expected 'salt' in get server cert request, got {:?}.", params.keys());
+			log::warn!("{message}");
+			return bad_request(message);
+		}
+	};
+	let salt = match hex::decode(salt) {
+		Ok(salt) => salt,
+		Err(e) => {
+			let message = format!("{e}");
+			log::warn!("{message}");
+			return bad_request(message);
+		}
+	};
+	let salt: [u8; 16] = match salt.try_into() {
+		Ok(salt) => salt,
+		Err(e) => {
+			let message = format!("Failed to parse salt value, expected exactly 16 values but got {e:?}");
+			log::warn!("{message}");
+			return bad_request(message);
+		}
+	};
+
+	let pem = match openssl::x509::X509::from_pem(client_cert.as_slice()) {
+		Ok(pem) => pem,
+		Err(e) => {
+			let message = format!("{e}");
+			log::warn!("{message}");
+			return bad_request(message);
+		}
+	};
 
 	let pin_notifier = {
 		let pending_client = PendingClient {
 			id: unique_id.clone(),
 			pem,
-			salt: salt.clone().try_into()
-				.map_err(|e| WebserverError::Other(format!("failed to parse salt value, expected exactly 16 values but got {e:?}")))?,
+			salt,
 			pin_notify: Arc::new(Notify::new()),
 			key: None,
 			server_secret: None,
@@ -92,9 +127,14 @@ async fn get_server_cert(
 		};
 		let notify = pending_client.pin_notify.clone();
 
-		client_command_tx.send(ClientManagerCommand::StartPairing(StartPairingCommand { pending_client }))
-			.await
-			.map_err(|e| WebserverError::Other(format!("failed to send pairing command to client manager: {e}")))?;
+		match client_manager.start_pairing(pending_client).await {
+			Ok(()) => {},
+			Err(()) => {
+				let message = "Failed to start pairing client".to_string();
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
 
 		notify
 	};
@@ -115,8 +155,14 @@ async fn get_server_cert(
 	writer.write(XmlEvent::characters("1")).unwrap();
 	writer.write(XmlEvent::end_element()).unwrap();
 
-	let serialized_server_pem = server_pem.to_pem()
-		.map_err(|e| WebserverError::Other(e.to_string()))?;
+	let serialized_server_pem = match server_pem.to_pem() {
+		Ok(pem) => pem,
+		Err(e) => {
+			let message = format!("{e}");
+			log::warn!("{message}");
+			return bad_request(message);
+		}
+	};
 	writer.write(XmlEvent::start_element("plaincert")).unwrap();
 	writer.write(XmlEvent::characters(&hex::encode(serialized_server_pem))).unwrap();
 	writer.write(XmlEvent::end_element()).unwrap();
@@ -124,44 +170,46 @@ async fn get_server_cert(
 	// </root>
 	writer.write(XmlEvent::end_element()).unwrap();
 
-	let mut response = Response::new(Body::from(String::from_utf8(buffer)
-		.map_err(|e| WebserverError::Other(e.to_string()))?));
+	let mut response = Response::new(Full::new(Bytes::from(buffer)));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
-	Ok(response)
+	response
 }
 
 async fn client_challenge(
 	mut params: HashMap<String, String>,
-	client_command_tx: mpsc::Sender<ClientManagerCommand>,
-) -> Result<Response<Body>, WebserverError> {
+	client_manager: &ClientManager,
+) -> Response<Full<Bytes>> {
 	let unique_id = match params.remove("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			log::error!("Expected 'uniqueid' in get server cert request, got {:?}.", params.keys());
-			return bad_request();
+			let message = format!("Expected 'uniqueid' in get server cert request, got {:?}.", params.keys());
+			log::warn!("{message}");
+			return bad_request(message);
 		}
 	};
 	let challenge = match params.remove("clientchallenge") {
-		Some(challenge) => hex::decode(challenge).map_err(|e| WebserverError::Other(e.to_string()))?,
+		Some(challenge) => challenge,
 		None => {
-			log::error!("Expected 'clientchallenge' in get server cert request, got {:?}.", params.keys());
-			return bad_request();
+			let message = format!("Expected 'clientchallenge' in get server cert request, got {:?}.", params.keys());
+			log::warn!("{message}");
+			return bad_request(message);
+		}
+	};
+	let challenge = match hex::decode(challenge) {
+		Ok(challenge) => challenge,
+		Err(e) => {
+			let message = e.to_string();
+			log::error!("{message}");
+			return bad_request(message)
 		}
 	};
 
-	let (response_tx, response_rx) = oneshot::channel();
-	client_command_tx.send(ClientManagerCommand::ClientChallenge(ClientChallengeCommand {
-		id: unique_id,
-		challenge,
-		response: response_tx,
-	}))
-		.await
-		.map_err(|e| WebserverError::Other(format!("Failed to send client challenge to client manager: {e}")))?;
-
-	let challenge_response = match response_rx.await.map_err(|e| WebserverError::Other(format!("Failed to receive client challenge response from client manager: {e}")))? {
-		Ok(response) => response,
-		Err(e) => return Err(WebserverError::Other(e)),
+	let challenge_response = match client_manager.client_challenge(&unique_id, challenge).await {
+		Ok(challenge_response) => challenge_response,
+		Err(()) => {
+			return bad_request("Failed to process client challenge".to_string());
+		}
 	};
 
 	let mut buffer = Vec::new();
@@ -184,42 +232,47 @@ async fn client_challenge(
 	// </root>
 	writer.write(XmlEvent::end_element()).unwrap();
 
-	let mut response = Response::new(Body::from(String::from_utf8(buffer)
-		.map_err(|e| WebserverError::Other(e.to_string()))?));
+	let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
-	Ok(response)
+	response
 }
 
 async fn server_challenge_response(
 	mut params: HashMap<String, String>,
-	client_command_tx: mpsc::Sender<ClientManagerCommand>,
-) -> Result<Response<Body>, WebserverError> {
+	client_manager: &ClientManager,
+) -> Response<Full<Bytes>> {
 	let server_challenge_response = match params.remove("serverchallengeresp") {
-		Some(server_challenge_response) => hex::decode(server_challenge_response).map_err(|e| WebserverError::Other(e.to_string()))?,
+		Some(server_challenge_response) => server_challenge_response,
 		None => {
-			return Err(WebserverError::Other(format!("Expected 'serverchallengeresp' in server challenge response request, got {:?}.", params.keys())));
+			let message = format!("Expected 'serverchallengeresp' in server challenge response request, got {:?}.", params.keys());
+			log::error!("{message}");
+			return bad_request(message);
 		}
 	};
+	let server_challenge_response = match hex::decode(server_challenge_response) {
+		Ok(server_challenge_response) => server_challenge_response,
+		Err(e) => {
+			let message = e.to_string();
+			log::error!("{message}");
+			return bad_request(message);
+		}
+	};
+
 	let unique_id = match params.remove("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			return Err(WebserverError::Other(format!("Expected 'uniqueid' in server challenge response request, got {:?}.", params.keys())));
+			let message = format!("Expected 'uniqueid' in get server cert request, got {:?}.", params.keys());
+			log::warn!("{message}");
+			return bad_request(message);
 		}
 	};
 
-	let (response_tx, response_rx) = oneshot::channel();
-	client_command_tx.send(ClientManagerCommand::ServerChallengeResponse(ServerChallengeResponseCommand {
-		id: unique_id,
-		challenge_response: server_challenge_response,
-		response: response_tx,
-	}))
-		.await
-		.map_err(|e| WebserverError::Other(format!("Failed to send server challenge response to client manager: {e}")))?;
-
-	let pairing_secret = match response_rx.await.map_err(|e| WebserverError::Other(format!("Failed to receive server challenge response from client manager: {e}")))? {
-		Ok(response) => response,
-		Err(e) => return Err(WebserverError::Other(e)),
+	let pairing_secret = match client_manager.server_challenge_response(&unique_id, server_challenge_response).await {
+		Ok(pairing_secret) => pairing_secret,
+		Err(()) => {
+			return bad_request("Failed to process server challenge response".to_string());
+		}
 	};
 
 	let mut buffer = Vec::new();
@@ -242,37 +295,28 @@ async fn server_challenge_response(
 	// </root>
 	writer.write(XmlEvent::end_element()).unwrap();
 
-	let mut response = Response::new(Body::from(String::from_utf8(buffer)
-		.map_err(|e| WebserverError::Other(e.to_string()))?));
+	let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
-	Ok(response)
+	response
 }
 
 async fn pair_challenge(
 	mut params: HashMap<String, String>,
-	client_command_tx: mpsc::Sender<ClientManagerCommand>,
-) -> Result<Response<Body>, WebserverError> {
+	client_manager: &ClientManager,
+) -> Response<Full<Bytes>>{
 	let unique_id = match params.remove("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			log::error!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
-			return bad_request();
+			let message = format!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
+			log::warn!("{message}");
+			return bad_request(message);
 		}
 	};
 
-	let (response_tx, response_rx) = oneshot::channel();
-	client_command_tx.send(ClientManagerCommand::AddClient(AddClientCommand {
-		id: unique_id,
-		response: response_tx,
-	}))
-		.await
-		.map_err(|e| WebserverError::Other(format!("Failed to add client to client manager: {e}")))?;
-
-	match response_rx.await.map_err(|e| WebserverError::Other(format!("Failed to receive add client response from client manager: {e}")))? {
-		Ok(response) => response,
-		Err(e) => return Err(WebserverError::Other(e)),
-	};
+	if client_manager.add_client(&unique_id).await.is_err() {
+		return bad_request("Failed to add client".to_string());
+	}
 
 	let mut buffer = Vec::new();
 	let mut writer = EmitterConfig::new()
@@ -290,46 +334,45 @@ async fn pair_challenge(
 	// </root>
 	writer.write(XmlEvent::end_element()).unwrap();
 
-	let mut response = Response::new(Body::from(String::from_utf8(buffer)
-		.map_err(|e| WebserverError::Other(e.to_string()))?));
+	let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
-	Ok(response)
+	response
 }
 
 async fn client_pairing_secret(
 	mut params: HashMap<String, String>,
-	client_command_tx: mpsc::Sender<ClientManagerCommand>,
-) -> Result<Response<Body>, WebserverError> {
+	client_manager: &ClientManager,
+) -> Response<Full<Bytes>> {
 	let client_pairing_secret = match params.remove("clientpairingsecret") {
-		Some(client_pairing_secret) => hex::decode(client_pairing_secret).map_err(|e| WebserverError::Other(e.to_string()))?,
+		Some(client_pairing_secret) => client_pairing_secret,
 		None => {
-			log::error!("Expected 'clientpairingsecret' in client pairing secret request, got {:?}.", params.keys());
-			return bad_request();
+			let message = format!("Expected 'clientpairingsecret' in client pairing secret request, got {:?}.", params.keys());
+			log::warn!("{message}");
+			return bad_request(message);
+		}
+	};
+	let client_pairing_secret = match hex::decode(client_pairing_secret) {
+		Ok(client_pairing_secret) => client_pairing_secret,
+		Err(e) => {
+			let message = e.to_string();
+			log::error!("{message}");
+			return bad_request(message);
 		}
 	};
 
 	let unique_id = match params.remove("uniqueid") {
 		Some(unique_id) => unique_id,
 		None => {
-			log::error!("Expected 'uniqueid' in client pairing secret request, got {:?}.", params.keys());
-			return bad_request();
+			let message = format!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
+			log::warn!("{message}");
+			return bad_request(message);
 		}
 	};
 
-	let (response_tx, response_rx) = oneshot::channel();
-	client_command_tx.send(ClientManagerCommand::CheckClientPairingSecret(CheckClientPairingSecretCommand {
-		id: unique_id,
-		client_secret: client_pairing_secret,
-		response: response_tx,
-	}))
-		.await
-		.map_err(|e| WebserverError::Other(format!("Failed to check client pairing secret with client manager: {e}")))?;
-
-	match response_rx.await.map_err(|e| WebserverError::Other(format!("Failed to receive client pairing secret response from client manager: {e}")))? {
-		Ok(response) => response,
-		Err(e) => return Err(WebserverError::Other(e)),
-	};
+	if client_manager.check_client_pairing_secret(&unique_id, client_pairing_secret).await.is_err() {
+		return bad_request("Failed to check client pairing secret".to_string());
+	}
 
 	// TODO: Verify x509 cert.
 
@@ -349,9 +392,8 @@ async fn client_pairing_secret(
 	// </root>
 	writer.write(XmlEvent::end_element()).unwrap();
 
-	let mut response = Response::new(Body::from(String::from_utf8(buffer)
-		.map_err(|e| WebserverError::Other(e.to_string()))?));
+	let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
-	Ok(response)
+	response
 }

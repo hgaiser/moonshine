@@ -3,13 +3,13 @@ use std::ptr::null_mut;
 use crate::{check_ret, FfmpegError, CudaDeviceContext};
 
 pub struct HwFrameContext {
-	cuda_device_context: CudaDeviceContext,
+	_cuda_device_context: CudaDeviceContext,
 	buffer: *mut ffmpeg_sys::AVBufferRef,
 }
 
 impl HwFrameContext {
 	fn new(cuda_device_context: CudaDeviceContext, buffer: *mut ffmpeg_sys::AVBufferRef) -> Self {
-		Self { cuda_device_context, buffer }
+		Self { _cuda_device_context: cuda_device_context, buffer }
 	}
 
 	pub fn as_context_mut(&mut self) -> &mut ffmpeg_sys::AVHWFramesContext {

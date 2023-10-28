@@ -22,9 +22,9 @@ pub struct Config {
 impl Config {
 	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config, ()> {
 		let config = std::fs::read_to_string(file)
-			.map_err(|e| log::error!("Failed to open configuration file: {}", e))?;
+			.map_err(|e| log::error!("Failed to open configuration file: {e}"))?;
 		let config: Config = toml::from_str(&config)
-			.map_err(|e| log::error!("Failed to parse configuration file: {}", e))?;
+			.map_err(|e| log::error!("Failed to parse configuration file: {e}"))?;
 
 		Ok(config)
 	}
@@ -32,10 +32,10 @@ impl Config {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct WebserverConfig {
-	/// Port number of the webserver.
+	/// Port of the webserver.
 	pub port: u16,
 
-	/// Port number of the HTTPS webserver.
+	/// Port of the HTTPS webserver.
 	pub port_https: u16,
 
 	/// Path to the certificate chain for SSL encryption.
@@ -71,6 +71,7 @@ pub struct VideoStreamConfig {
 	/// Port to use for streaming video data.
 	pub port: u16,
 
+	// TODO: Make this an enum.
 	/// Type of codec to use.
 	pub codec: String,
 

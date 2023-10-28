@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
+use async_shutdown::ShutdownManager;
 use ffmpeg::{Codec, CodecContextBuilder, Frame, CodecContext, Packet, HwFrameContextBuilder, HwFrameContext, CudaDeviceContextBuilder};
-use ffmpeg_sys::CUcontext;
 
 use crate::cuda::CudaContext;
 
@@ -140,6 +140,7 @@ impl Encoder {
 		mut encoder_buffer: Frame,
 		intermediate_buffer: Arc<Mutex<Frame>>,
 		notifier: Arc<std::sync::Condvar>,
+		stop_signal: ShutdownManager<()>,
 	) -> Result<(), ()> {
 		let mut packet = Packet::new()
 			.map_err(|e| log::error!("Failed to create packet: {e}"))?;
@@ -147,7 +148,7 @@ impl Encoder {
 		let mut frame_number = 0u32;
 		let mut sequence_number = 0u32;
 		let stream_start_time = std::time::Instant::now();
-		loop {
+		while !stop_signal.is_shutdown_triggered() {
 			// Swap the intermediate buffer with the output buffer.
 			// Note that the lock is only held while swapping buffers, to minimize wait time for others locking the buffer.
 			{
@@ -163,7 +164,7 @@ impl Encoder {
 			frame_number += 1;
 			encoder_buffer.as_raw_mut().pts = frame_number as i64;
 
-			log::debug!("Encoding frame {}", encoder_buffer.as_raw().pts);
+			log::trace!("Encoding frame {}", encoder_buffer.as_raw().pts);
 
 			// TODO: Check if this is necessary?
 			// Reset possible previous request for keyframe.
@@ -178,9 +179,9 @@ impl Encoder {
 				},
 				Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {},
 				Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {},
-				Err(e) => {
-					log::error!("Failed to receive IDR frame request: {e}");
-					return Err(());
+				Err(_) => {
+					log::debug!("Channel closed, quitting encoder task.");
+					return Ok(());
 				}
 			}
 
@@ -191,7 +192,7 @@ impl Encoder {
 			loop {
 				match self.codec_context.receive_packet(&mut packet) {
 					Ok(()) => {
-						log::debug!("Sending frame {}", packet.as_raw().pts);
+						log::trace!("Sending frame {}", packet.as_raw().pts);
 						encode_packet(
 							&packet,
 							&packet_tx,
@@ -218,6 +219,10 @@ impl Encoder {
 				}
 			}
 		}
+
+		log::debug!("Received stop signal.");
+
+		Ok(())
 	}
 }
 
@@ -249,7 +254,7 @@ fn encode_packet(
 	let mut nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
 		.max(minimum_fec_packets as usize);
 	let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
-	log::debug!("Number of packets: {nr_data_shards}, number of parity packets: {nr_parity_shards}");
+	log::trace!("Number of packets: {nr_data_shards}, number of parity packets: {nr_parity_shards}");
 
 	let encoder = reed_solomon::ReedSolomon::new(nr_data_shards, nr_parity_shards);
 	if let Err(e) = &encoder {

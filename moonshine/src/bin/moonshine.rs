@@ -1,71 +1,15 @@
 use std::path::PathBuf;
 
-use async_shutdown::Shutdown;
+use async_shutdown::ShutdownManager;
 use clap::Parser;
 use moonshine::config::Config;
-use moonshine::session::{clients::ClientManager, run_session_manager};
-use moonshine::util::flatten;
-use moonshine::{webserver, service_publisher};
-use tokio::{sync::mpsc, try_join};
-
+use moonshine::{publisher, Moonshine};
 
 #[derive(Parser, Debug)]
 #[clap(version)]
 struct Args {
 	/// Path to configuration file.
 	config: PathBuf,
-}
-
-async fn run(config: Config, shutdown: Shutdown) -> Result<(), ()> {
-	// Run the session manager.
-	let (session_command_tx, session_command_rx) = mpsc::channel(10);
-	let session_manager_task = tokio::spawn(shutdown.wrap_vital(run_session_manager(
-		config.clone(),
-		session_command_rx,
-		shutdown.clone(),
-	)));
-
-	// Run the client manager.
-	let (client_command_tx, client_command_rx) = mpsc::channel(10);
-	let client_manager = ClientManager::from_state_or_default(
-		&config.webserver.certificate_chain,
-		&config.webserver.private_key,
-		client_command_rx,
-	)?;
-	let client_manager_task = tokio::spawn(shutdown.wrap_vital(client_manager.run(shutdown.clone())));
-
-	// Publish the Moonshine service using zeroconf.
-	let service_publisher_task = tokio::spawn(shutdown.wrap_vital({
-		let name = config.name.clone();
-		let port = config.webserver.port;
-		let shutdown = shutdown.clone();
-		async move {
-			service_publisher::run(port, name, shutdown)
-		}
-	}));
-
-	// Run the webserver that communicates with clients.
-	let webserver_task = tokio::spawn(shutdown.wrap_vital(webserver::run(
-		config.name.clone(),
-		(config.address.clone(), config.webserver.port),
-		(config.address.clone(), config.webserver.port_https),
-		config.webserver.certificate_chain.clone(),
-		config.webserver.private_key.clone(),
-		config.applications.clone(),
-		client_command_tx,
-		session_command_tx,
-		shutdown.clone(),
-	)));
-
-	match try_join!(
-		flatten(session_manager_task),
-		flatten(client_manager_task),
-		flatten(service_publisher_task),
-		flatten(webserver_task),
-	) {
-		Ok(_) => Ok(()),
-		Err(_) => Err(()),
-	}
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -81,28 +25,35 @@ async fn main() -> Result<(), ()> {
 	log::debug!("Using configuration:\n{:#?}", config);
 
 	// Spawn a task to wait for CTRL+C and trigger a shutdown.
-	let shutdown = Shutdown::new();
+	let shutdown = ShutdownManager::new();
 	tokio::spawn({
 		let shutdown = shutdown.clone();
 		async move {
 			if let Err(e) = tokio::signal::ctrl_c().await {
-				log::error!("Failed to wait for CTRL+C: {}", e);
+				log::error!("Failed to wait for CTRL+C: {e}");
 				std::process::exit(1);
 			} else {
 				log::info!("Received interrupt signal. Shutting down server...");
-				shutdown.shutdown();
+				shutdown.trigger_shutdown(1).ok();
 			}
 		}
 	});
 
-	let exit_code = match run(config, shutdown.clone()).await {
-		Ok(()) => 0,
-		Err(()) => 1,
-	};
+	// Publish the Moonshine service using zeroconf.
+	publisher::spawn(config.webserver.port, config.name.clone(), shutdown.clone());
 
-	shutdown.wait_shutdown_complete().await;
+	// Create the main application.
+	let moonshine = Moonshine::new(config, shutdown.clone())?;
 
+	// Wait until something causes a shutdown trigger.
+	shutdown.wait_shutdown_triggered().await;
+
+	// Drop the main moonshine object, triggering other systems to shutdown too.
+	let _ = moonshine.stop().await;
+	drop(moonshine);
+
+	// Wait until everything was shutdown.
+	let exit_code = shutdown.wait_shutdown_complete().await;
 	log::trace!("Successfully waited for shutdown to complete.");
-
 	std::process::exit(exit_code);
 }

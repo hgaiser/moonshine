@@ -1,7 +1,7 @@
-use std::{collections::BTreeMap, sync::Arc, path::Path};
+use std::{collections::BTreeMap, sync::Arc};
 
-use async_shutdown::Shutdown;
-use openssl::{hash::MessageDigest, cipher_ctx::CipherCtx, cipher::Cipher, pkey::{PKey, PKeyRef, Private}, md::Md, md_ctx::MdCtx};
+use async_shutdown::TriggerShutdownToken;
+use openssl::{hash::MessageDigest, cipher_ctx::CipherCtx, cipher::Cipher, pkey::{PKey, PKeyRef, Private}, md::Md, md_ctx::MdCtx, x509::X509};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, mpsc, Notify};
 
@@ -11,7 +11,7 @@ pub struct PendingClient {
 	pub id: String,
 
 	/// Client certificate used for secure communication.
-	pub pem: openssl::x509::X509,
+	pub pem: X509,
 
 	/// Salt provided by the client to use for encryption.
 	pub salt: [u8; 16],
@@ -146,32 +146,151 @@ pub struct RemoveClientCommand {
 	pub response: oneshot::Sender<Result<(), String>>,
 }
 
+#[derive(Clone)]
 pub struct ClientManager {
-	command_rx: mpsc::Receiver<ClientManagerCommand>,
-	clients: BTreeMap<String, Client>,
-	server_pem: openssl::x509::X509,
-	server_pkey: PKey<Private>,
+	command_tx: mpsc::Sender<ClientManagerCommand>,
 }
 
 impl ClientManager {
-	pub fn from_state_or_default<P: AsRef<Path>>(
-		cert_path: P,
-		pkey_path: P,
-		command_rx: mpsc::Receiver<ClientManagerCommand>,
+	pub fn new(
+		server_certs: X509,
+		server_pkey: PKey<Private>,
+		shutdown_token: TriggerShutdownToken<i32>,
 	) -> Result<Self, ()> {
-		// TODO: Remove duplication of reading this file (also read in webserver).
-		let server_pem = std::fs::read(cert_path.as_ref())
-			.map_err(|e| log::error!("Failed to read server certificate: {e}"))?;
-		let server_pem = openssl::x509::X509::from_pem(&server_pem)
-			.map_err(|e| log::error!("Failed to parse server certificate: {e}"))?;
+		let (command_tx, command_rx) = mpsc::channel(10);
+		let inner = ClientManagerInner::from_state_or_default(server_certs, server_pkey)?;
+		tokio::spawn(async move { inner.run(command_rx).await; drop(shutdown_token); });
 
-		let server_pkey = PKey::private_key_from_pem(&std::fs::read(pkey_path).unwrap()).unwrap();
+		Ok(Self { command_tx })
+	}
 
+	pub async fn is_paired(&self, id: String) -> Result<bool, ()> {
+		let (response_tx, response_rx) = oneshot::channel();
+		self.command_tx.send(ClientManagerCommand::IsPaired(IsPairedCommand { id, response: response_tx }))
+			.await
+			.map_err(|e| log::error!("Failed to check paired status: {e}"))?;
+
+		response_rx.await
+			.map_err(|e| log::error!("Failed to receive is-paired response: {e}"))
+	}
+
+	pub async fn start_pairing(&self, pending_client: PendingClient) -> Result<(), ()> {
+		self.command_tx.send(ClientManagerCommand::StartPairing(StartPairingCommand { pending_client }))
+			.await
+			.map_err(|e| log::error!("Failed to check paired status: {e}"))
+	}
+
+	pub async fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
+		let (response_tx, response_rx) = oneshot::channel();
+		self.command_tx.send(ClientManagerCommand::RegisterPin(RegisterPinCommand {
+			id: id.to_string(),
+			pin: pin.to_string(),
+			response: response_tx,
+		}))
+			.await
+			.map_err(|e| log::error!("Failed to send pin to client manager: {e}"))?;
+
+		response_rx
+			.await
+			.map_err(|e| log::error!("Failed to wait for response to pin command from client manager: {e}"))?
+			.map_err(|e| log::warn!("{e}"))
+	}
+
+	pub async fn add_client(&self, id: &str) -> Result<(), ()> {
+		let (response_tx, response_rx) = oneshot::channel();
+		self.command_tx.send(ClientManagerCommand::AddClient(AddClientCommand {
+			id: id.to_string(),
+			response: response_tx,
+		}))
+			.await
+			.map_err(|e| log::error!("Failed to send pin to client manager: {e}"))?;
+
+		response_rx
+			.await
+			.map_err(|e| log::error!("Failed to wait for response to pin command from client manager: {e}"))?
+			.map_err(|e| log::warn!("{e}"))
+	}
+
+	pub async fn client_challenge(&self, id: &str, challenge: Vec<u8>) -> Result<Vec<u8>, ()> {
+		let (response_tx, response_rx) = oneshot::channel();
+		self.command_tx.send(ClientManagerCommand::ClientChallenge(ClientChallengeCommand {
+			id: id.to_string(),
+			challenge,
+			response: response_tx,
+		}))
+			.await
+			.map_err(|e| log::error!("Failed to send client challenge to client manager: {e}"))?;
+
+		response_rx
+			.await
+			.map_err(|e| log::error!("Failed to wait for response to client challenge command from client manager: {e}"))?
+			.map_err(|e| log::warn!("{e}"))
+	}
+
+	pub async fn server_challenge_response(&self, id: &str, challenge_response: Vec<u8>) -> Result<Vec<u8>, ()> {
+		let (response_tx, response_rx) = oneshot::channel();
+		self.command_tx.send(ClientManagerCommand::ServerChallengeResponse(ServerChallengeResponseCommand {
+			id: id.to_string(),
+			challenge_response,
+			response: response_tx,
+		}))
+			.await
+			.map_err(|e| log::error!("Failed to send server challenge response to client manager: {e}"))?;
+
+		response_rx
+			.await
+			.map_err(|e| log::error!("Failed to wait for response to server challenge response command from client manager: {e}"))?
+			.map_err(|e| log::warn!("{e}"))
+	}
+
+	pub async fn check_client_pairing_secret(&self, id: &str, client_secret: Vec<u8>) -> Result<(), ()> {
+		let (response_tx, response_rx) = oneshot::channel();
+		self.command_tx.send(ClientManagerCommand::CheckClientPairingSecret(CheckClientPairingSecretCommand {
+			id: id.to_string(),
+			client_secret,
+			response: response_tx,
+		}))
+			.await
+			.map_err(|e| log::error!("Failed to send check client pairing secret response to client manager: {e}"))?;
+
+		response_rx
+			.await
+			.map_err(|e| log::error!("Failed to wait for response to check client pairing secret command from client manager: {e}"))?
+			.map_err(|e| log::warn!("{e}"))
+	}
+
+	pub async fn remove_client(&self, id: &str) -> Result<(), ()> {
+		let (response_tx, response_rx) = oneshot::channel();
+		self.command_tx.send(ClientManagerCommand::RemoveClient(RemoveClientCommand {
+			id: id.to_string(),
+			response: response_tx,
+		}))
+			.await
+			.map_err(|e| log::error!("Failed to send remove client command to client manager: {e}"))?;
+
+		response_rx
+			.await
+			.map_err(|e| log::error!("Failed to wait for response to remove client command from client manager: {e}"))?
+			.map_err(|e| log::warn!("{e}"))
+	}
+}
+
+struct ClientManagerInner {
+	clients: BTreeMap<String, Client>,
+	server_certs: X509,
+	server_pkey: PKey<Private>,
+}
+
+impl ClientManagerInner {
+	fn from_state_or_default(
+		server_certs: X509,
+		server_pkey: PKey<Private>,
+	) -> Result<Self, ()> {
 		let path = match dirs::state_dir() {
 			Some(path) => path.join("moonshine").join("clients.toml"),
 			None => {
 				log::warn!("Failed to get user state directory.");
-				return Ok(Self { server_pem, server_pkey, command_rx, clients: Default::default() });
+				return Ok(Self { server_certs, server_pkey, clients: Default::default() });
 			}
 		};
 
@@ -180,14 +299,14 @@ impl ClientManager {
 				Ok(serialized) => serialized,
 				Err(e) => {
 					log::warn!("Failed to read clients state file: {}", e);
-					return Ok(Self { server_pem, server_pkey, command_rx, clients: Default::default() });
+					return Ok(Self { server_certs, server_pkey, clients: Default::default() });
 				}
 			};
 			let clients: BTreeMap<String, Client> = match toml::from_str(&serialized) {
 				Ok(clients) => clients,
 				Err(e) => {
 					log::warn!("Failed to deserialize clients state: {}", e);
-					return Ok(Self { server_pem, server_pkey, command_rx, clients: Default::default() });
+					return Ok(Self { server_certs, server_pkey, clients: Default::default() });
 				}
 			};
 
@@ -195,35 +314,32 @@ impl ClientManager {
 			log::trace!("Clients: {clients:?}");
 
 			return Ok(Self {
-				server_pem,
+				server_certs,
 				server_pkey,
-				command_rx,
 				clients,
 			});
 		}
 
 		log::debug!("No clients state found, starting with an empty state.");
-		Ok(Self { server_pem, server_pkey, command_rx, clients: Default::default() })
+		Ok(Self { server_certs, server_pkey, clients: Default::default() })
 	}
 
-	pub async fn run(mut self, shutdown: Shutdown) -> Result<(), ()> {
-		let mut pending_clients = BTreeMap::new();
-		loop {
-			let command = shutdown.wrap_cancel(self.command_rx.recv())
-				.await
-				.ok_or(())?;
+	async fn run(mut self, mut command_rx: mpsc::Receiver<ClientManagerCommand>) {
+		log::debug!("Waiting for commands.");
 
+		let mut pending_clients = BTreeMap::new();
+		while let Some(command) = command_rx.recv().await {
 			match command {
-				Some(ClientManagerCommand::IsPaired(command)) => {
+				ClientManagerCommand::IsPaired(command) => {
 					command.response.send(self.has_client(&command.id))
 						.map_err(|_| log::error!("Failed to respond to IsPaired response.")).ok();
 				},
 
-				Some(ClientManagerCommand::StartPairing(command)) => {
+				ClientManagerCommand::StartPairing(command) => {
 					pending_clients.insert(command.pending_client.id.clone(), command.pending_client);
 				},
 
-				Some(ClientManagerCommand::RegisterPin(command)) => {
+				ClientManagerCommand::RegisterPin(command) => {
 					match pending_clients.get_mut(&command.id) {
 						Some(client) => {
 							let key = match create_key(&client.salt, &command.pin) {
@@ -247,7 +363,7 @@ impl ClientManager {
 					};
 				},
 
-				Some(ClientManagerCommand::ClientChallenge(command)) => {
+				ClientManagerCommand::ClientChallenge(command) => {
 					match pending_clients.get_mut(&command.id) {
 						Some(client) => {
 							match self.client_challenge(client, command.challenge).await {
@@ -270,7 +386,7 @@ impl ClientManager {
 					};
 				},
 
-				Some(ClientManagerCommand::ServerChallengeResponse(command)) => {
+				ClientManagerCommand::ServerChallengeResponse(command) => {
 					match pending_clients.get_mut(&command.id) {
 						Some(client) => {
 							match self.server_challenge_response(client, command.challenge_response).await {
@@ -293,7 +409,7 @@ impl ClientManager {
 					};
 				},
 
-				Some(ClientManagerCommand::CheckClientPairingSecret(command)) => {
+				ClientManagerCommand::CheckClientPairingSecret(command) => {
 					match pending_clients.get_mut(&command.id) {
 						Some(client) => {
 							match check_client_pairing_secret(client, command.client_secret).await {
@@ -316,11 +432,9 @@ impl ClientManager {
 					};
 				},
 
-				Some(ClientManagerCommand::AddClient(command)) => {
+				ClientManagerCommand::AddClient(command) => {
 					if self.has_client(&command.id) {
-						let message = "Client is already paired, can't add it again.";
-						log::warn!("{}", message);
-						command.response.send(Err(message.to_string()))
+						command.response.send(Err("Client is already paired, can't add it again.".to_string()))
 							.map_err(|_| log::error!("Failed to send add client command response.")).ok();
 						continue;
 					}
@@ -330,12 +444,10 @@ impl ClientManager {
 						.map_err(|_| log::error!("Failed to send add client command response.")).ok();
 				},
 
-				Some(ClientManagerCommand::RemoveClient(command)) => {
+				ClientManagerCommand::RemoveClient(command) => {
 					pending_clients.remove(&command.id);
 					if !self.remove_client(&command.id) {
-						let message = "Client is not known, can't remove it.";
-						log::warn!("{}", message);
-						command.response.send(Err(message.to_string()))
+						command.response.send(Err("Client is not known, can't remove it.".to_string()))
 							.map_err(|_| log::error!("Failed to send remove client command response.")).ok();
 						continue;
 					}
@@ -343,11 +455,10 @@ impl ClientManager {
 					command.response.send(Ok(()))
 						.map_err(|_| log::error!("Failed to send remove client command response.")).ok();
 				},
-				None => break,
 			}
 		}
 
-		Ok(())
+		log::debug!("Channel closed, stopped listening for commands.");
 	}
 
 	fn has_client(&self, key: &str) -> bool {
@@ -416,7 +527,7 @@ impl ClientManager {
 
 		let mut decrypted = decrypt(&challenge, key)
 			.map_err(|e| format!("Failed to decrypt client challenge: {e}"))?;
-		decrypted.extend_from_slice(self.server_pem.signature().as_slice());
+		decrypted.extend_from_slice(self.server_certs.signature().as_slice());
 		decrypted.extend_from_slice(&server_secret);
 
 		let mut server_challenge = [0u8; 16];
