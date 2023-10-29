@@ -6,10 +6,8 @@ use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}, sy
 
 use crate::{
 	config::Config,
-	session::rtsp::stream::{VideoStreamContext, AudioStreamContext, run_video_stream, run_control_stream}
+	session::rtsp::stream::{VideoStreamContext, AudioStreamContext, run_control_stream, VideoStream, AudioStream}
 };
-
-use self::stream::VideoCommand;
 
 use super::SessionContext;
 
@@ -33,7 +31,6 @@ struct RtspServerInner {
 	session_context: SessionContext,
 	video_stream_context: Option<VideoStreamContext>,
 	audio_stream_context: Option<AudioStreamContext>,
-	video_command_tx: Option<mpsc::Sender<VideoCommand>>,
 	stop_signal: ShutdownManager<()>,
 }
 
@@ -52,7 +49,6 @@ impl RtspServer {
 			session_context: session_context.clone(),
 			video_stream_context: None,
 			audio_stream_context: None,
-			video_command_tx: None,
 			stop_signal: stop_signal.clone(),
 		};
 		tokio::spawn(async move { inner.run(command_rx, enet).await; drop(stop_token); });
@@ -444,9 +440,6 @@ impl RtspServerInner {
 					self.audio_stream_context = Some(audio_stream_context);
 				},
 				RtspServerCommand::StartStream => {
-					let (video_command_tx, video_command_rx) = mpsc::channel(10);
-					self.video_command_tx = Some(video_command_tx.clone());
-
 					let video_stream_context = match self.video_stream_context.clone() {
 						Some(video_stream_context) => video_stream_context,
 						None => {
@@ -454,7 +447,7 @@ impl RtspServerInner {
 							continue
 						}
 					};
-					let _audio_stream_context = match &self.audio_stream_context.clone() {
+					let audio_stream_context = match self.audio_stream_context.clone() {
 						Some(audio_stream_context) => audio_stream_context,
 						None => {
 							log::warn!("Can't start stream without a stream context.");
@@ -462,19 +455,8 @@ impl RtspServerInner {
 						}
 					};
 
-					tokio::spawn(self.stop_signal.wrap_trigger_shutdown((), self.stop_signal.wrap_cancel(
-						run_video_stream(
-							self.config.clone(),
-							video_stream_context,
-							video_command_rx,
-							self.stop_signal.clone(),
-						)
-					)));
-
-					// let audio_task = tokio::spawn(run_audio_stream(
-					// 	self.config.clone(),
-					// 	self.audio_stream_context.clone(),
-					// ));
+					let video_stream = VideoStream::new(self.config.clone(), video_stream_context, self.stop_signal.clone());
+					let audio_stream = AudioStream::new(self.config.clone(), audio_stream_context, self.stop_signal.clone());
 
 					// TODO: Figure out a way to just use tokio::spawn.
 					//       This is not possible at the moment due to enet crate not being async.
@@ -482,11 +464,14 @@ impl RtspServerInner {
 						let config = self.config.clone();
 						let session_context = self.session_context.clone();
 						let enet = enet.clone();
+						let video_stream = video_stream.clone();
+						let audio_stream = audio_stream.clone();
 						let stop_signal = self.stop_signal.clone();
 						move || {
 							tokio::runtime::Handle::current().block_on(run_control_stream(
 								config,
-								video_command_tx,
+								video_stream,
+								audio_stream,
 								session_context,
 								enet,
 								stop_signal,

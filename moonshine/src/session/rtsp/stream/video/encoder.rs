@@ -316,8 +316,10 @@ fn encode_packet(
 		buffer.extend(shard);
 
 		log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
-		packet_tx.blocking_send(buffer)
-			.map_err(|e| log::error!("Failed to send packet: {e}"))?;
+		if packet_tx.blocking_send(buffer).is_err() {
+			log::info!("Channel closed, couldn't send packet.");
+			return Ok(());
+		}
 
 		*sequence_number += 1;
 	}

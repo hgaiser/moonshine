@@ -7,11 +7,10 @@ use enet::{
 	Event,
 };
 use openssl::symm::Cipher;
-use tokio::sync::mpsc;
 
-use crate::{session::SessionContext, config::Config};
+use crate::{session::{SessionContext, rtsp::stream::audio}, config::Config};
 
-use super::video::VideoCommand;
+use super::{VideoStream, AudioStream};
 
 const ENCRYPTION_TAG_LENGTH: usize = 16;
 // Sequence number + tag + control message id
@@ -124,7 +123,8 @@ struct EncryptedControlMessage {
 
 pub async fn run_control_stream(
 	config: Config,
-	video_command_tx: mpsc::Sender<VideoCommand>,
+	video_stream: VideoStream,
+	audio_stream: AudioStream,
 	context: SessionContext,
 	enet: Enet,
 	stop_signal: ShutdownManager<()>,
@@ -198,12 +198,11 @@ pub async fn run_control_stream(
 				match control_message {
 					ControlMessage::Encrypted(_) => unreachable!("Encrypted control messages should be decrypted already."),
 					ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
-						video_command_tx.send(VideoCommand::RequestIdrFrame).await
-							.map_err(|e| log::warn!("Failed to send video command: {e}"))?;
+						video_stream.request_idr_frame().await?;
 					},
 					ControlMessage::StartB => {
-						video_command_tx.send(VideoCommand::StartStreaming).await
-							.map_err(|e| log::warn!("Failed to send video command: {e}"))?;
+						audio_stream.start().await?;
+						video_stream.start().await?;
 					},
 					skipped_message => {
 						log::trace!("Skipped control message: {skipped_message:?}");

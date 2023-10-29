@@ -109,7 +109,7 @@ impl SessionManagerInner {
 						session.stop_stream();
 						self.session = None;
 					} else {
-						log::debug!("Can't cancel session, no session is currently active.");
+						log::debug!("Trying to cancel session, but no session is currently active.");
 					}
 				},
 			};
