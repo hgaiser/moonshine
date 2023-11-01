@@ -443,6 +443,14 @@ impl Webserver {
 				return bad_request(message);
 			}
 		};
+		let remote_input_key_id: i64 = match remote_input_key_id.parse() {
+			Ok(remote_input_key_id) => remote_input_key_id,
+			Err(e) => {
+				let message = format!("Couldn't parse 'rikey_id' in launch request, got '{remote_input_key_id}' with error: {e}");
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
 
 		let launch_result = self.session_manager.launch(SessionContext {
 			application_id,

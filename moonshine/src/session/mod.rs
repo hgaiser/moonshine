@@ -28,7 +28,7 @@ pub struct SessionContext {
 	pub remote_input_key: Vec<u8>,
 
 	/// AES GCM initialization vector for control messages.
-	pub remote_input_key_id: String,
+	pub remote_input_key_id: i64,
 }
 
 #[derive(Clone)]

@@ -1,9 +1,11 @@
 use std::{collections::BTreeMap, sync::Arc};
 
 use async_shutdown::TriggerShutdownToken;
-use openssl::{hash::MessageDigest, cipher_ctx::CipherCtx, cipher::Cipher, pkey::{PKey, PKeyRef, Private}, md::Md, md_ctx::MdCtx, x509::X509};
+use openssl::{hash::MessageDigest, pkey::{PKey, PKeyRef, Private}, md::Md, md_ctx::MdCtx, x509::X509, cipher::Cipher};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, mpsc, Notify};
+
+use crate::crypto::{encrypt, decrypt};
 
 /// A client that is not yet paired, but in the pairing process.
 pub struct PendingClient {
@@ -540,7 +542,8 @@ impl ClientManagerInner {
 			.to_vec();
 		challenge_response.extend(server_challenge);
 
-		let challenge_response = encrypt(&challenge_response, key)
+		let cipher = Cipher::aes_128_ecb();
+		let challenge_response = encrypt(cipher, &challenge_response, Some(key), None, false)
 			.map_err(|e| format!("Failed to encrypt client challenge response: {e}"))?;
 
 		Ok(challenge_response)
@@ -583,42 +586,6 @@ fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
 		.to_vec()[..16]
 		.try_into()
 		.map_err(|e| format!("Received unexpected key result: {e}"))
-}
-
-fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>, openssl::error::ErrorStack> {
-	let cipher = Cipher::aes_128_ecb();
-
-	let mut context = CipherCtx::new()?;
-	context.encrypt_init(Some(cipher), Some(key), None)?;
-	context.set_padding(false);
-
-	let mut ciphertext = Vec::with_capacity(plaintext.len());
-	context.cipher_update_vec(plaintext, &mut ciphertext)?;
-	context.cipher_final_vec(&mut ciphertext)?;
-
-	if plaintext.len() != ciphertext.len() {
-		panic!("Cipher and plaintext should be the same length, but are {} vs {}.", plaintext.len(), ciphertext.len());
-	}
-
-	Ok(ciphertext)
-}
-
-fn decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, openssl::error::ErrorStack> {
-	let cipher = Cipher::aes_128_ecb();
-
-	let mut context = CipherCtx::new()?;
-	context.decrypt_init(Some(cipher), Some(key), None)?;
-	context.set_padding(false);
-
-	let mut plaintext = Vec::with_capacity(ciphertext.len());
-	context.cipher_update_vec(ciphertext, &mut plaintext)?;
-	context.cipher_final_vec(&mut plaintext)?;
-
-	if plaintext.len() != ciphertext.len() {
-		panic!("Cipher and plaintext should be the same length, but are {} vs {}.", plaintext.len(), ciphertext.len());
-	}
-
-	Ok(plaintext)
 }
 
 fn sign<T>(data: &[u8], key: &PKeyRef<T>) -> Result<Vec<u8>, openssl::error::ErrorStack>

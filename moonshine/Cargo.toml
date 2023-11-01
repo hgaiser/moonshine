@@ -15,7 +15,6 @@ ffmpeg = { path = "../ffmpeg" }
 ffmpeg-sys = { path = "../ffmpeg-sys" }
 filedesc = "0.6.3"
 hex = "0.4.3"
-hound = "3.5.1"
 http-body-util = "0.1.0-rc.3"
 hyper = { version = "1.0.0-rc.4", features = ["server", "http1"] }
 hyper-util = { git = "https://github.com/hyperium/hyper-util.git" }
@@ -24,6 +23,7 @@ log = "0.4.20"
 memmap = "0.7.0"
 nvfbc = "0.1.2"
 openssl = "0.10.57"
+opus = "0.3.0"
 png = "0.17.10"
 reed-solomon = { version = "0.1.0", path = "../reed-solomon" }
 rtsp-types = "0.1.0"

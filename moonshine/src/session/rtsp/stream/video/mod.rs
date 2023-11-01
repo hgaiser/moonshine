@@ -74,7 +74,7 @@ impl VideoStreamInner {
 				.map_err(|e| log::error!("Failed to get local address associated with control socket: {e}"))?
 		);
 
-		let (packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+		let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(1024);
 		tokio::spawn(async move {
 			let mut buf = [0; 1024];
 			let mut client_address = None;
@@ -107,7 +107,7 @@ impl VideoStreamInner {
 						};
 
 						if &buf[..len] == b"PING" {
-							log::debug!("Received video stream PING message from {address}.");
+							log::trace!("Received video stream PING message from {address}.");
 							client_address = Some(address);
 						} else {
 							log::warn!("Received unknown message on video stream of length {len}.");

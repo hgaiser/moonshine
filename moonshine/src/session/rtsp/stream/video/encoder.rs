@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_shutdown::ShutdownManager;
 use ffmpeg::{Codec, CodecContextBuilder, Frame, CodecContext, Packet, HwFrameContextBuilder, HwFrameContext, CudaDeviceContextBuilder};
 
-use crate::cuda::CudaContext;
+use crate::{cuda::CudaContext, session::rtsp::stream::RtpHeader};
 
 #[repr(u8)]
 enum RtpFlag {
@@ -28,27 +28,8 @@ impl VideoFrameHeader {
 	}
 }
 
-struct RtpHeader {
-	header: u8,
-	packet_type: u8,
-	sequence_number: u16,
-	timestamp: u32,
-	ssrc: u32,
-	padding: u32,
-}
-
-impl RtpHeader {
-	fn serialize(&self, buffer: &mut Vec<u8>) {
-		buffer.extend(self.header.to_be_bytes());
-		buffer.extend(self.packet_type.to_be_bytes());
-		buffer.extend(self.sequence_number.to_be_bytes());
-		buffer.extend(self.timestamp.to_be_bytes());
-		buffer.extend(self.ssrc.to_be_bytes());
-		buffer.extend(self.padding.to_be_bytes());
-	}
-}
-
 struct NvVideoPacket {
+	padding: u32,
 	stream_packet_index: u32,
 	frame_index: u32,
 	flags: u8,
@@ -60,6 +41,7 @@ struct NvVideoPacket {
 
 impl NvVideoPacket {
 	fn serialize(&self, buffer: &mut Vec<u8>) {
+		buffer.extend(self.padding.to_le_bytes());
 		buffer.extend(self.stream_packet_index.to_le_bytes());
 		buffer.extend(self.frame_index.to_le_bytes());
 		buffer.extend(self.flags.to_le_bytes());
@@ -117,6 +99,7 @@ impl Encoder {
 			.set_preset("fast")
 			.set_tune("ull")
 			.set_hw_frames_ctx(&mut hw_frame_context)
+			.set_forced_idr(true)
 		;
 		codec_context_builder.as_raw_mut().refs = 1;
 
@@ -174,6 +157,7 @@ impl Encoder {
 			// Check if there was an IDR frame request.
 			match idr_frame_request_rx.try_recv() {
 				Ok(_) => {
+					log::debug!("Received request for IDR frame.");
 					encoder_buffer.as_raw_mut().pict_type = ffmpeg_sys::AVPictureType_AV_PICTURE_TYPE_I;
 					encoder_buffer.as_raw_mut().key_frame = 1;
 				},
@@ -287,10 +271,10 @@ fn encode_packet(
 			sequence_number: *sequence_number as u16,
 			timestamp,
 			ssrc: 0,
-			padding: 0,
 		};
 
 		let mut video_packet_header = NvVideoPacket {
+			padding: 0,
 			stream_packet_index: *sequence_number << 8,
 			frame_index: frame_number,
 			flags: RtpFlag::ContainsPicData as u8,

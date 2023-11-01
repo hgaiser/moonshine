@@ -7,6 +7,7 @@ use webserver::Webserver;
 
 pub mod clients;
 pub mod config;
+pub mod crypto;
 pub mod cuda;
 pub mod session;
 pub mod publisher;

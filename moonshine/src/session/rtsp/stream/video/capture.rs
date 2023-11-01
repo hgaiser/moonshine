@@ -41,12 +41,14 @@ impl FrameCapturer {
 
 			// capture_buffer.as_raw_mut().data[0] = frame_info.device_buffer as *mut u8;
 			unsafe {
-				check_ret(ffmpeg_sys::cuMemcpy(
+				if let Err(e) = check_ret(ffmpeg_sys::cuMemcpy(
 					capture_buffer.as_raw_mut().data[0] as u64,
 					frame_info.device_buffer as u64,
 					frame_info.device_buffer_len as usize,
-				))
-					.map_err(|e| println!("Failed to copy CUDA memory: {e}")).unwrap();
+				)) {
+					log::error!("Failed to copy CUDA memory: {e}");
+					continue;
+				}
 			}
 
 			// Swap the intermediate buffer with the output buffer and signal that we have a new frame.

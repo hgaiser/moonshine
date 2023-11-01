@@ -148,6 +148,18 @@ impl CodecContextBuilder {
 		self
 	}
 
+	pub fn set_forced_idr(&mut self, enabled: bool) -> &mut Self {
+		let forced_idr_key = to_c_str("forced-idr").unwrap();
+		let forced_idr_value = to_c_str(if enabled { "1" } else { "0" }).unwrap();
+		unsafe { ffmpeg_sys::av_opt_set(
+			self.as_raw_mut().priv_data,
+			forced_idr_key.as_ptr(),
+			forced_idr_value.as_ptr(),
+			0,
+		) };
+		self
+	}
+
 	pub fn set_hw_frames_ctx(&mut self, frames: &mut HwFrameContext) -> &mut Self {
 		self.as_raw_mut().hw_frames_ctx = frames.as_raw_mut();
 		self

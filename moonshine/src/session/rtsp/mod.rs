@@ -255,7 +255,7 @@ a=control:streamid=0")
 			}
 		};
 
-		log::trace!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
+		log::info!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
 
 		let width = match get_sdp_attribute(&sdp_session, "x-nv-video[0].clientViewportWd") {
 			Ok(width) => width,
@@ -310,7 +310,11 @@ a=control:streamid=0")
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
-		let audio_stream_context = AudioStreamContext { packet_duration };
+		let audio_stream_context = AudioStreamContext {
+			packet_duration,
+			remote_input_key: self.session_context.remote_input_key.clone(),
+			remote_input_key_id: self.session_context.remote_input_key_id,
+		};
 
 		if self.set_stream_context(video_stream_context, audio_stream_context).await.is_err() {
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError)

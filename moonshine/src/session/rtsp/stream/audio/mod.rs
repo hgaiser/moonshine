@@ -9,6 +9,8 @@ mod encoder;
 #[derive(Clone, Default)]
 pub struct AudioStreamContext {
 	pub packet_duration: u32,
+	pub remote_input_key: Vec<u8>,
+	pub remote_input_key_id: i64,
 }
 
 enum AudioStreamCommand {
@@ -50,7 +52,7 @@ impl AudioStreamInner {
 	async fn run(
 		mut self,
 		config: Config,
-		_context: AudioStreamContext,
+		context: AudioStreamContext,
 		mut command_rx: mpsc::Receiver<AudioStreamCommand>,
 		_stop_signal: ShutdownManager<()>,
 	) -> Result<(), ()> {
@@ -63,7 +65,7 @@ impl AudioStreamInner {
 			.map_err(|e| log::error!("Failed to get local address associated with control socket: {e}"))?
 		);
 
-		let (_packet_tx, mut packet_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(1024);
+		let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(10);
 		tokio::spawn(async move {
 			let mut buf = [0; 1024];
 			let mut client_address = None;
@@ -96,7 +98,7 @@ impl AudioStreamInner {
 						};
 
 						if &buf[..len] == b"PING" {
-							log::debug!("Received video stream PING message from {address}.");
+							log::trace!("Received video stream PING message from {address}.");
 							client_address = Some(address);
 						} else {
 							log::warn!("Received unknown message on video stream of length {len}.");
@@ -118,7 +120,13 @@ impl AudioStreamInner {
 						Err(()) => continue,
 					};
 
-					let encoder = match AudioEncoder::new(capture.stream_config(), audio_rx) {
+					let encoder = match AudioEncoder::new(
+						capture.stream_config(),
+						audio_rx,
+						context.remote_input_key.clone(),
+						context.remote_input_key_id,
+						packet_tx.clone()
+					) {
 						Ok(encoder) => encoder,
 						Err(()) => continue,
 					};
