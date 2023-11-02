@@ -26,6 +26,7 @@ pub struct VideoStreamContext {
 	pub packet_size: usize,
 	pub bitrate: u64,
 	pub minimum_fec_packets: u32,
+	pub qos: bool,
 }
 
 #[derive(Clone)]
@@ -67,6 +68,13 @@ impl VideoStreamInner {
 		let socket = UdpSocket::bind((config.address, config.stream.video.port))
 			.await
 			.map_err(|e| log::error!("Failed to bind to UDP socket: {e}"))?;
+
+		if context.qos {
+			// TODO: Check this value 160, what does it mean exactly?
+			log::debug!("Enabling QoS on video socket.");
+			socket.set_tos(160)
+				.map_err(|e| log::error!("Failed to set QoS on the video socket: {e}"))?;
+		}
 
 		log::info!(
 			"Listening for video messages on {}",

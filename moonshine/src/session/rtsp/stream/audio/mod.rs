@@ -11,6 +11,7 @@ pub struct AudioStreamContext {
 	pub packet_duration: u32,
 	pub remote_input_key: Vec<u8>,
 	pub remote_input_key_id: i64,
+	pub qos: bool,
 }
 
 enum AudioStreamCommand {
@@ -58,6 +59,13 @@ impl AudioStreamInner {
 	) -> Result<(), ()> {
 		let socket = UdpSocket::bind((config.address, config.stream.audio.port)).await
 			.map_err(|e| log::error!("Failed to bind to UDP socket: {e}"))?;
+
+		if context.qos {
+			// TODO: Check this value 224, what does it mean exactly?
+			log::debug!("Enabling QoS on audio socket.");
+			socket.set_tos(224)
+				.map_err(|e| log::error!("Failed to set QoS on the audio socket: {e}"))?;
+		}
 
 		log::info!(
 			"Listening for audio messages on {}",

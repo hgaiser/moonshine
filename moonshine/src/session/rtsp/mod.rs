@@ -255,35 +255,40 @@ a=control:streamid=0")
 			}
 		};
 
-		log::info!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
+		log::trace!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
 
 		let width = match get_sdp_attribute(&sdp_session, "x-nv-video[0].clientViewportWd") {
 			Ok(width) => width,
 			Err(()) => {
+				log::warn!("Failed to parse x-nv-video[0].clientViewportWd in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let height = match get_sdp_attribute(&sdp_session, "x-nv-video[0].clientViewportHt") {
 			Ok(height) => height,
 			Err(()) => {
+				log::warn!("Failed to parse x-nv-video[0].clientViewportHt in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let fps = match get_sdp_attribute(&sdp_session, "x-nv-video[0].maxFPS") {
 			Ok(fps) => fps,
 			Err(()) => {
+				log::warn!("Failed to parse xx-nv-video[0].maxFPS in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let packet_size = match get_sdp_attribute(&sdp_session, "x-nv-video[0].packetSize") {
 			Ok(packet_size) => packet_size,
 			Err(()) => {
+				log::warn!("Failed to parse x-nv-video[0].packetSize in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let mut bitrate = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].bw.maximumBitrateKbps") {
 			Ok(bitrate) => bitrate,
 			Err(()) => {
+				log::warn!("Failed to parse x-nv-vqos[0].bw.maximumBitrateKbps in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
@@ -291,6 +296,14 @@ a=control:streamid=0")
 		let minimum_fec_packets = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].fec.minRequiredFecPackets") {
 			Ok(minimum_fec_packets) => minimum_fec_packets,
 			Err(()) => {
+				log::warn!("Failed to parse x-nv-vqos[0].fec.minRequiredFecPackets in SDP session.");
+				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+			},
+		};
+		let video_qos_type: String = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].qosTrafficType") {
+			Ok(video_qos_type) => video_qos_type,
+			Err(()) => {
+				log::warn!("Failed to parse x-nv-vqos[0].qosTrafficType in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
@@ -302,21 +315,33 @@ a=control:streamid=0")
 			packet_size,
 			bitrate,
 			minimum_fec_packets,
+			qos: video_qos_type != "0",
 		};
 
 		let packet_duration = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
 			Ok(packet_duration) => packet_duration,
 			Err(()) => {
+				log::warn!("Failed to parse x-nv-video[0].clientViewportHt in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
+		let audio_qos_type: String = match get_sdp_attribute(&sdp_session, "x-nv-aqos.qosTrafficType") {
+			Ok(audio_qos_type) => audio_qos_type,
+			Err(()) => {
+				log::warn!("Failed to parse x-nv-aqos.qosTrafficType in SDP session.");
+				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+			},
+		};
+
 		let audio_stream_context = AudioStreamContext {
 			packet_duration,
 			remote_input_key: self.session_context.remote_input_key.clone(),
 			remote_input_key_id: self.session_context.remote_input_key_id,
+			qos: audio_qos_type != "0",
 		};
 
 		if self.set_stream_context(video_stream_context, audio_stream_context).await.is_err() {
+			log::warn!("Failed to parse x-nv-video[0].clientViewportHt in SDP session.");
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError)
 		}
 
