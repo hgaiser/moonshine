@@ -42,7 +42,7 @@ impl AudioEncoder {
 			.map_err(|e| log::error!("Failed to create audio encoder: {e}"))?;
 
 		tokio::spawn(async move {
-			let mut sequence_number = 0usize;
+			let mut sequence_number = 0u16;
 			let stream_start_time = std::time::Instant::now();
 
 			const NR_DATA_SHARDS: usize = 4;
@@ -60,7 +60,7 @@ impl AudioEncoder {
 			let mut fec_header = AudioFecHeader {
 				shard_index: 0u8,
 				payload_type: 97,
-				base_sequence_number: (sequence_number - NR_DATA_SHARDS) as u16,
+				base_sequence_number: 0u16,
 				base_timestamp: 0,
 				ssrc: 0,
 			};
@@ -89,7 +89,7 @@ impl AudioEncoder {
 				let rtp_header = RtpHeader {
 					header: 0x80, // What is this?
 					packet_type: 97, // RTP_PAYLOAD_TYPE_AUDIO
-					sequence_number: sequence_number as u16,
+					sequence_number,
 					timestamp: 0,
 					ssrc: 0,
 				};
@@ -109,15 +109,15 @@ impl AudioEncoder {
 				}
 
 				// For FEC, copy the sequence number and timestamp of the first of the sequence of audio packets.
-				if (sequence_number - 1) % NR_DATA_SHARDS == 0 {
-					fec_header.base_sequence_number = (sequence_number - 1) as u16;
+				if (sequence_number - 1) as usize % NR_DATA_SHARDS == 0 {
+					fec_header.base_sequence_number = sequence_number - 1;
 					fec_header.base_timestamp = timestamp;
 				}
 
 				// Copy the audio into the list of (data) shards.
-				shards[(sequence_number - 1) % NR_DATA_SHARDS][..payload.len()].copy_from_slice(&payload);
+				shards[(sequence_number - 1) as usize % NR_DATA_SHARDS][..payload.len()].copy_from_slice(&payload);
 
-				if sequence_number % NR_DATA_SHARDS == 0 {
+				if sequence_number as usize % NR_DATA_SHARDS == 0 {
 					if let Err(e) = fec_encoder.encode(&mut shards) {
 						log::error!("Failed to create FEC block for audio: {e}");
 						continue;
@@ -127,7 +127,7 @@ impl AudioEncoder {
 						let rtp_header = RtpHeader {
 							header: 0x80,
 							packet_type: 127,
-							sequence_number: (sequence_number + shard_index as usize) as u16,
+							sequence_number: sequence_number + shard_index as u16,
 							timestamp,
 							ssrc: 0,
 						};
