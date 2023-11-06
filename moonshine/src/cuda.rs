@@ -51,7 +51,7 @@ pub fn check_ret(error_code: CUresult) -> Result<(), CudaError> {
 	if error_code != cudaError_enum_CUDA_SUCCESS {
 		let error_message = get_error(error_code)
 			.map_err(|_| CudaError::new(error_code, "Unknown error".into()))?;
-		return Err(CudaError::new(error_code as u32, error_message));
+		return Err(CudaError::new(error_code, error_message));
 	}
 
 	Ok(())

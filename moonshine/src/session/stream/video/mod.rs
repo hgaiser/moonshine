@@ -18,7 +18,7 @@ enum VideoStreamCommand {
 	RequestIdrFrame,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct VideoStreamContext {
 	pub width: u32,
 	pub height: u32,
@@ -48,7 +48,7 @@ impl VideoStream {
 
 	pub async fn start(&self) -> Result<(), ()> {
 		self.command_tx.send(VideoStreamCommand::Start).await
-			.map_err(|e| log::warn!("Failed to send StartStreaming command: {e}"))
+			.map_err(|e| log::warn!("Failed to send Start command: {e}"))
 	}
 
 	pub async fn request_idr_frame(&self) -> Result<(), ()> {

@@ -2,6 +2,7 @@ use async_shutdown::ShutdownManager;
 use clients::ClientManager;
 use config::Config;
 use openssl::pkey::PKey;
+use rtsp::RtspServer;
 use session::SessionManager;
 use webserver::Webserver;
 
@@ -9,13 +10,17 @@ pub mod clients;
 pub mod config;
 pub mod crypto;
 pub mod cuda;
+pub mod rtsp;
 pub mod session;
 pub mod publisher;
 pub mod util;
 pub mod webserver;
 
 pub struct Moonshine {
-	webserver: Webserver,
+	_rtsp_server: RtspServer,
+	_session_manager: SessionManager,
+	_client_manager: ClientManager,
+	_webserver: Webserver,
 }
 
 impl Moonshine {
@@ -37,19 +42,26 @@ impl Moonshine {
 		// Create a manager for saving and loading client state.
 		let client_manager = ClientManager::new(server_certs.clone(), server_pkey, shutdown.trigger_shutdown_token(3))?;
 
+		// Run the RTSP server.
+		let rtsp_server = RtspServer::new(config.clone(), session_manager.clone(), shutdown.clone());
+
+		// Publish the Moonshine service using zeroconf.
+		publisher::spawn(config.webserver.port, config.name.clone(), shutdown.clone());
+
 		// Create a handler for the webserver.
 		let webserver = Webserver::new(
 			config,
 			server_certs,
-			client_manager,
-			session_manager,
+			client_manager.clone(),
+			session_manager.clone(),
 			shutdown,
 		)?;
 
-		Ok(Self { webserver })
-	}
-
-	pub async fn stop(&self) -> Result<(), ()> {
-		self.webserver.stop().await
+		Ok(Self {
+			_rtsp_server: rtsp_server,
+			_session_manager: session_manager,
+			_client_manager: client_manager,
+			_webserver: webserver,
+		})
 	}
 }

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use async_shutdown::ShutdownManager;
 use clap::Parser;
 use moonshine::config::Config;
-use moonshine::{publisher, Moonshine};
+use moonshine::Moonshine;
 
 #[derive(Parser, Debug)]
 #[clap(version)]
@@ -39,9 +39,6 @@ async fn main() -> Result<(), ()> {
 		}
 	});
 
-	// Publish the Moonshine service using zeroconf.
-	publisher::spawn(config.webserver.port, config.name.clone(), shutdown.clone());
-
 	// Create the main application.
 	let moonshine = Moonshine::new(config, shutdown.clone())?;
 
@@ -49,7 +46,6 @@ async fn main() -> Result<(), ()> {
 	shutdown.wait_shutdown_triggered().await;
 
 	// Drop the main moonshine object, triggering other systems to shutdown too.
-	let _ = moonshine.stop().await;
 	drop(moonshine);
 
 	// Wait until everything was shutdown.

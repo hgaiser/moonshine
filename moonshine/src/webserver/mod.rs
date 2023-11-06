@@ -8,7 +8,7 @@ use openssl::x509::X509;
 use tokio::net::TcpListener;
 use xml::{EmitterConfig, writer::XmlEvent};
 
-use crate::{config::Config, clients::ClientManager, session::{SessionManager, SessionContext}, webserver::tls::TlsAcceptor};
+use crate::{config::Config, clients::ClientManager, webserver::tls::TlsAcceptor, session::{manager::SessionManager, SessionContext, SessionKeys}};
 
 use self::pairing::handle_pair_request;
 
@@ -50,30 +50,37 @@ impl Webserver {
 
 		tokio::spawn({
 			let server = server.clone();
-			shutdown.wrap_cancel(shutdown.wrap_trigger_shutdown(1, async move {
-				let listener = TcpListener::bind(http_address).await
-					.map_err(|e| log::error!("Failed to bind to address {http_address}: {e}"))?;
+			let shutdown = shutdown.clone();
 
-				log::info!("Http server listening for connections on {http_address}");
-				loop {
-					let (connection, address) = listener.accept().await
-						.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
-					log::debug!("Accepted connection from {address}.");
+			async move {
+				let server = server.clone();
+				let _ = shutdown.wrap_cancel(shutdown.wrap_trigger_shutdown(1, async move {
+					let listener = TcpListener::bind(http_address).await
+						.map_err(|e| log::error!("Failed to bind to address {http_address}: {e}"))?;
 
-					let io = TokioIo::new(connection);
+					log::info!("HTTP server listening for connections on {http_address}");
+					loop {
+						let (connection, address) = listener.accept().await
+							.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
+						log::debug!("Accepted connection from {address}.");
 
-					tokio::spawn({
-						let server = server.clone();
-						async move {
-							let _ = hyper::server::conn::http1::Builder::new()
-								.serve_connection(io, service_fn(|request| {
-									server.serve(request)
-								})).await;
-						}
-					});
-				}
-				Ok::<(), ()>(())
-			}))
+						let io = TokioIo::new(connection);
+
+						tokio::spawn({
+							let server = server.clone();
+							async move {
+								let _ = hyper::server::conn::http1::Builder::new()
+									.serve_connection(io, service_fn(|request| {
+										server.serve(request)
+									})).await;
+							}
+						});
+					}
+					Ok::<(), ()>(())
+				})).await;
+
+				log::info!("HTTP server shutting down, likely due to shutdown.");
+			}
 		});
 
 		// Run HTTPS webserver.
@@ -84,35 +91,39 @@ impl Webserver {
 
 		tokio::spawn({
 			let server = server.clone();
-			shutdown.wrap_cancel(shutdown.wrap_trigger_shutdown(1, async move {
-				let listener = TcpListener::bind(https_address).await
-					.map_err(|e| log::error!("Failed to bind to address '{:?}': {e}", https_address))?;
-				let acceptor = TlsAcceptor::from_config(config.webserver.certificate_chain, config.webserver.private_key)?;
+			async move {
+				let _ = shutdown.wrap_cancel(shutdown.wrap_trigger_shutdown(2, async move {
+					let listener = TcpListener::bind(https_address).await
+						.map_err(|e| log::error!("Failed to bind to address '{:?}': {e}", https_address))?;
+					let acceptor = TlsAcceptor::from_config(config.webserver.certificate_chain, config.webserver.private_key)?;
 
-				log::info!("Https server listening for connections on {https_address}");
-				loop {
-					let (connection, address) = listener.accept().await
-						.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
-					let connection = match acceptor.accept(connection).await {
-						Ok(connection) => connection,
-						Err(()) => continue,
-					};
-					log::debug!("Accepted TLS connection from {address}.");
+					log::info!("HTTPS server listening for connections on {https_address}");
+					loop {
+						let (connection, address) = listener.accept().await
+							.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
+						let connection = match acceptor.accept(connection).await {
+							Ok(connection) => connection,
+							Err(()) => continue,
+						};
+						log::debug!("Accepted TLS connection from {address}.");
 
-					let io = TokioIo::new(connection);
+						let io = TokioIo::new(connection);
 
-					tokio::spawn({
-						let server = server.clone();
-						async move {
-							let _ = hyper::server::conn::http1::Builder::new()
-								.serve_connection(io, service_fn(|request| {
-									server.serve(request)
-								})).await;
-						}
-					});
-				}
-				Ok::<(), ()>(())
-			}))
+						tokio::spawn({
+							let server = server.clone();
+							async move {
+								let _ = hyper::server::conn::http1::Builder::new()
+									.serve_connection(io, service_fn(|request| {
+										server.serve(request)
+									})).await;
+							}
+						});
+					}
+					Ok::<(), ()>(())
+				})).await;
+
+				log::info!("HTTPS server shutting down, likely due to shutdown.");
+			}
 		});
 
 		Ok(server)
@@ -135,6 +146,7 @@ impl Webserver {
 			(&Method::GET, "/pin") => self.pin(params).await,
 			(&Method::GET, "/unpair") => self.unpair(params).await,
 			(&Method::GET, "/launch") => self.launch(params).await,
+			(&Method::GET, "/resume") => self.resume(params).await,
 			(&Method::GET, "/cancel") => self.cancel().await,
 			(method, uri) => {
 				log::warn!("Unhandled {method} request with URI '{uri}'");
@@ -196,10 +208,10 @@ impl Webserver {
 			}
 		};
 
-		let current_session = match self.session_manager.get_current_session().await {
-			Ok(current_session) => current_session,
+		let session_context = match self.session_manager.get_session_context().await {
+			Ok(session_context) => session_context,
 			Err(()) => {
-				let message = "Failed to get current session".to_string();
+				let message = "Failed to get session context".to_string();
 				log::warn!("{message}");
 				return bad_request(message);
 			},
@@ -273,11 +285,11 @@ impl Webserver {
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("currentgame")).unwrap();
-		writer.write(XmlEvent::characters(&current_session.clone().map(|s| s.context().application_id).unwrap_or(0).to_string())).unwrap();
+		writer.write(XmlEvent::characters(&session_context.clone().map(|s| s.application_id).unwrap_or(0).to_string())).unwrap();
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("state")).unwrap();
-		writer.write(XmlEvent::characters(current_session.map(|_| "MOONSHINE_SERVER_BUSY").unwrap_or("MOONSHINE_SERVER_FREE"))).unwrap();
+		writer.write(XmlEvent::characters(session_context.map(|_| "MOONSHINE_SERVER_BUSY").unwrap_or("MOONSHINE_SERVER_FREE"))).unwrap();
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		// </root>
@@ -452,16 +464,18 @@ impl Webserver {
 			}
 		};
 
-		let launch_result = self.session_manager.launch(SessionContext {
+		let initialize_result = self.session_manager.initialize_session(SessionContext {
 			application_id,
 			resolution: (width, height),
 			refresh_rate,
-			remote_input_key,
-			remote_input_key_id,
+			keys: SessionKeys {
+				remote_input_key,
+				remote_input_key_id,
+			}
 		}).await;
 
-		if launch_result.is_err() {
-			return bad_request("Failed to launch session".to_string());
+		if initialize_result.is_err() {
+			return bad_request("Failed to start session".to_string());
 		}
 
 		let mut buffer = Vec::new();
@@ -473,9 +487,87 @@ impl Webserver {
 		writer.write(XmlEvent::start_element("root")
 			.attr("status_code", "200")).unwrap();
 
-		writer.write(XmlEvent::start_element("paired")).unwrap();
-		writer.write(XmlEvent::characters("1")).unwrap();
+		// TODO: Return sessionUrl0.
+
+		// </root>
 		writer.write(XmlEvent::end_element()).unwrap();
+
+		let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+
+		response
+	}
+
+	async fn resume(
+		&self,
+		mut params: HashMap<String, String>,
+	) -> Response<Full<Bytes>> {
+		let unique_id = match params.remove("uniqueid") {
+			Some(unique_id) => unique_id,
+			None => {
+				let message = format!("Expected 'uniqueid' in resume request, got {:?}.", params.keys());
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+
+		match self.client_manager.is_paired(unique_id).await {
+			Ok(paired) => paired,
+			Err(()) => return bad_request("Failed to check client paired status".to_string()),
+		};
+
+		let remote_input_key = match params.remove("rikey") {
+			Some(remote_input_key) => remote_input_key,
+			None => {
+				let message = format!("Expected 'rikey' in resume request, got {:?}.", params.keys());
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+		let remote_input_key = match hex::decode(remote_input_key) {
+			Ok(remote_input_key) => remote_input_key,
+			Err(e) => {
+				let message = format!("Failed to decode remote input key: {e}");
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+
+		let remote_input_key_id: String = match params.remove("rikeyid") {
+			Some(remote_input_key_id) => remote_input_key_id,
+			None => {
+				let message = format!("Expected 'rikey_id' in resume request, got {:?}.", params.keys());
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+		let remote_input_key_id: i64 = match remote_input_key_id.parse() {
+			Ok(remote_input_key_id) => remote_input_key_id,
+			Err(e) => {
+				let message = format!("Couldn't parse 'rikey_id' in resume request, got '{remote_input_key_id}' with error: {e}");
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+
+		let update_result = self.session_manager.update_keys(SessionKeys {
+			remote_input_key,
+			remote_input_key_id,
+		}).await;
+		if update_result.is_err() {
+			return bad_request("Failed to update session keys".to_string());
+		}
+
+		let mut buffer = Vec::new();
+		let mut writer = EmitterConfig::new()
+			.write_document_declaration(true)
+			.perform_indent(true)
+			.create_writer(&mut buffer);
+
+		writer.write(XmlEvent::start_element("root")
+			.attr("status_code", "200")).unwrap();
+
+		// TODO: Return sessionUrl0.
 
 		// </root>
 		writer.write(XmlEvent::end_element()).unwrap();
@@ -513,10 +605,6 @@ impl Webserver {
 		let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 		response
-	}
-
-	pub async fn stop(&self) -> Result<(), ()> {
-		self.session_manager.stop_session().await
 	}
 }
 

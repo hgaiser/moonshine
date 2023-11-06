@@ -1,105 +1,63 @@
 use std::{net::{ToSocketAddrs, SocketAddr}, str::FromStr};
 use async_shutdown::ShutdownManager;
-use enet::Enet;
 use rtsp_types::{headers::{self, Transport}, Method};
-use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}, sync::mpsc};
+use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}};
 
-use crate::{
-	config::Config,
-	session::rtsp::stream::{VideoStreamContext, AudioStreamContext, run_control_stream, VideoStream, AudioStream}
-};
-
-use super::SessionContext;
-
-mod stream;
-
-enum RtspServerCommand {
-	SetStreamContext(VideoStreamContext, AudioStreamContext),
-	StartStream,
-}
+use crate::{config::Config, session::{stream::{AudioStreamContext, VideoStreamContext}, manager::SessionManager}};
 
 #[derive(Clone)]
 pub struct RtspServer {
 	config: Config,
-	command_tx: mpsc::Sender<RtspServerCommand>,
-	session_context: SessionContext,
-	stop_signal: ShutdownManager<()>,
-}
-
-struct RtspServerInner {
-	config: Config,
-	session_context: SessionContext,
-	video_stream_context: Option<VideoStreamContext>,
-	audio_stream_context: Option<AudioStreamContext>,
-	stop_signal: ShutdownManager<()>,
+	session_manager: SessionManager,
 }
 
 impl RtspServer {
 	pub fn new(
 		config: Config,
-		session_context: SessionContext,
-		enet: Enet,
-	) -> Result<Self, ()> {
-		let stop_signal = ShutdownManager::new();
-		let stop_token = stop_signal.trigger_shutdown_token(());
+		session_manager: SessionManager,
+		shutdown: ShutdownManager<i32>,
+	) -> Self {
+		let server = Self { config: config.clone(), session_manager };
 
-		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = RtspServerInner {
-			config: config.clone(),
-			session_context: session_context.clone(),
-			video_stream_context: None,
-			audio_stream_context: None,
-			stop_signal: stop_signal.clone(),
-		};
-		tokio::spawn(async move { inner.run(command_rx, enet).await; drop(stop_token); });
-
-		let server = Self { config: config.clone(), command_tx, session_context, stop_signal: stop_signal.clone() };
-
-		tokio::spawn(stop_signal.wrap_trigger_shutdown((), stop_signal.wrap_cancel({
+		tokio::spawn({
 			let server = server.clone();
-			let stop_signal = stop_signal.clone();
 			async move {
-				let address = (config.address.as_str(), config.stream.port).to_socket_addrs()
-					.map_err(|e| log::error!("Failed to resolve address {}:{}: {}", config.address, config.stream.port, e))?
-					.next()
-					.ok_or_else(|| log::error!("Failed to resolve address {}:{}", config.address, config.stream.port))?;
-				let listener = TcpListener::bind(address)
-					.await
-					.map_err(|e| log::error!("Failed to bind to address {}: {}", address, e))?;
+				let _ = shutdown.wrap_trigger_shutdown(3, shutdown.wrap_cancel({
+					let server = server.clone();
+					async move {
+						let address = (config.address.as_str(), config.stream.port).to_socket_addrs()
+							.map_err(|e| log::error!("Failed to resolve address {}:{}: {}", config.address, config.stream.port, e))?
+							.next()
+							.ok_or_else(|| log::error!("Failed to resolve address {}:{}", config.address, config.stream.port))?;
+						let listener = TcpListener::bind(address)
+							.await
+							.map_err(|e| log::error!("Failed to bind to address {}: {}", address, e))?;
 
-				log::info!("RTSP server listening on {}", address);
+						log::info!("RTSP server listening on {}", address);
 
-				loop {
-					let (connection, address) = listener.accept()
-						.await
-						.map_err(|e| log::error!("Failed to accept connection: {}", e))?;
-					log::debug!("Accepted connection from {}", address);
+						loop {
+							let (connection, address) = listener.accept()
+								.await
+								.map_err(|e| log::error!("Failed to accept connection: {}", e))?;
+							log::debug!("Accepted connection from {}", address);
 
-					tokio::spawn(stop_signal.wrap_cancel({
-						let server = server.clone();
-						async move {
-							let _ = server.handle_connection(
-								connection,
-								address,
-							).await;
+							tokio::spawn({
+								let server = server.clone();
+								async move {
+									let _ = server.handle_connection(connection, address).await;
+								}
+							});
 						}
-					}));
-				}
 
-				Ok::<(), ()>(())
+						Ok::<(), ()>(())
+					}
+				})).await;
+
+				log::debug!("RTSP server closing, likely due to shutdown.");
 			}
-		})));
+		});
 
-		Ok(server)
-	}
-
-	pub fn context(&self) -> &SessionContext {
-		&self.session_context
-	}
-
-	pub async fn set_stream_context(&self, video_stream_context: VideoStreamContext, audio_stream_context: AudioStreamContext) -> Result<(), ()> {
-		self.command_tx.send(RtspServerCommand::SetStreamContext(video_stream_context, audio_stream_context)).await
-			.map_err(|e| log::error!("Failed to send SetStreamContext command: {e}"))
+		server
 	}
 
 	pub fn description(&self) -> Result<sdp_types::Session, ()> {
@@ -115,16 +73,6 @@ a=rtpmap:96 H264/90000
 a=fmtp:96 packetization-mode=1
 a=control:streamid=0")
 			.map_err(|e| log::error!("Failed to parse SDP session: {e}"))
-	}
-
-	pub async fn start_stream(&self) -> Result<(), ()> {
-		self.command_tx.send(RtspServerCommand::StartStream).await
-			.map_err(|e| log::error!("Failed to send StartStream command: {e}"))
-	}
-
-	pub fn stop_stream(&self) {
-		log::debug!("Stopping stream.");
-		let _ = self.stop_signal.trigger_shutdown(());
 	}
 
 	fn handle_options_request(&self, request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
@@ -255,7 +203,7 @@ a=control:streamid=0")
 			}
 		};
 
-		log::trace!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
+		log::debug!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
 
 		let width = match get_sdp_attribute(&sdp_session, "x-nv-video[0].clientViewportWd") {
 			Ok(width) => width,
@@ -335,13 +283,10 @@ a=control:streamid=0")
 
 		let audio_stream_context = AudioStreamContext {
 			packet_duration,
-			remote_input_key: self.session_context.remote_input_key.clone(),
-			remote_input_key_id: self.session_context.remote_input_key_id,
 			qos: audio_qos_type != "0",
 		};
 
-		if self.set_stream_context(video_stream_context, audio_stream_context).await.is_err() {
-			log::warn!("Failed to parse x-nv-video[0].clientViewportHt in SDP session.");
+		if self.session_manager.set_stream_context(video_stream_context, audio_stream_context).await.is_err() {
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError)
 		}
 
@@ -355,7 +300,7 @@ a=control:streamid=0")
 		request: &rtsp_types::Request<Vec<u8>>,
 		cseq: i32,
 	) -> rtsp_types::Response<Vec<u8>> {
-		if self.start_stream().await.is_err() {
+		if self.session_manager.start_session().await.is_err() {
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError)
 		}
 
@@ -448,70 +393,6 @@ a=control:streamid=0")
 			.map_err(|e| log::error!("Failed to shutdown the connection: {e}"))?;
 
 		Ok(())
-	}
-}
-
-impl RtspServerInner {
-	async fn run(
-		mut self,
-		mut command_rx: mpsc::Receiver<RtspServerCommand>,
-		enet: Enet,
-	) {
-		while let Some(command) = command_rx.recv().await {
-			match command {
-				RtspServerCommand::SetStreamContext(video_stream_context, audio_stream_context) => {
-					if self.video_stream_context.is_some() || self.audio_stream_context.is_some() {
-						log::warn!("Can't set stream context when it is already set.");
-						continue;
-					}
-
-					self.video_stream_context = Some(video_stream_context);
-					self.audio_stream_context = Some(audio_stream_context);
-				},
-				RtspServerCommand::StartStream => {
-					let video_stream_context = match self.video_stream_context.clone() {
-						Some(video_stream_context) => video_stream_context,
-						None => {
-							log::warn!("Can't start stream without a stream context.");
-							continue
-						}
-					};
-					let audio_stream_context = match self.audio_stream_context.clone() {
-						Some(audio_stream_context) => audio_stream_context,
-						None => {
-							log::warn!("Can't start stream without a stream context.");
-							continue
-						}
-					};
-
-					let video_stream = VideoStream::new(self.config.clone(), video_stream_context, self.stop_signal.clone());
-					let audio_stream = AudioStream::new(self.config.clone(), audio_stream_context, self.stop_signal.clone());
-
-					// TODO: Figure out a way to just use tokio::spawn.
-					//       This is not possible at the moment due to enet crate not being async.
-					tokio::task::spawn_blocking({
-						let config = self.config.clone();
-						let session_context = self.session_context.clone();
-						let enet = enet.clone();
-						let video_stream = video_stream.clone();
-						let audio_stream = audio_stream.clone();
-						let stop_signal = self.stop_signal.clone();
-						move || {
-							tokio::runtime::Handle::current().block_on(run_control_stream(
-								config,
-								video_stream,
-								audio_stream,
-								session_context,
-								enet,
-								stop_signal,
-							))
-						}
-					});
-				},
-			}
-		}
-
-		log::debug!("Command channel closed.");
 	}
 }
 

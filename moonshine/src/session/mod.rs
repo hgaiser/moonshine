@@ -1,15 +1,23 @@
-use async_shutdown::{ShutdownManager, TriggerShutdownToken};
+use async_shutdown::ShutdownManager;
 use enet::Enet;
-use tokio::sync::{mpsc, oneshot};
+// use async_shutdown::ShutdownManager;
+use tokio::sync::mpsc;
 
-use crate::{config::Config, session::rtsp::RtspServer};
+use crate::{config::Config, session::stream::{VideoStream, AudioStream, ControlStream}};
 
-mod rtsp;
+use self::stream::{VideoStreamContext, AudioStreamContext};
+pub use manager::SessionManager;
 
-pub enum SessionManagerCommand {
-	LaunchSession(SessionContext),
-	GetCurrentSession(oneshot::Sender<Option<RtspServer>>),
-	StopSession,
+pub mod manager;
+pub mod stream;
+
+#[derive(Clone, Debug)]
+pub struct SessionKeys {
+	/// AES GCM key used for encoding control messages.
+	pub remote_input_key: Vec<u8>,
+
+	/// AES GCM initialization vector for control messages.
+	pub remote_input_key_id: i64,
 }
 
 /// Launch a session for a client.
@@ -24,97 +32,122 @@ pub struct SessionContext {
 	/// Refresh rate of the video stream.
 	pub refresh_rate: u32,
 
-	/// AES GCM key used for encoding control messages.
-	pub remote_input_key: Vec<u8>,
+	/// Encryption keys for encoding traffic.
+	pub keys: SessionKeys,
+}
 
-	/// AES GCM initialization vector for control messages.
-	pub remote_input_key_id: i64,
+enum SessionCommand {
+	StartStream(VideoStreamContext, AudioStreamContext),
+	StopStream,
+	UpdateKeys(SessionKeys),
 }
 
 #[derive(Clone)]
-pub struct SessionManager {
-	command_tx: mpsc::Sender<SessionManagerCommand>,
+pub struct Session {
+	command_tx: mpsc::Sender<SessionCommand>,
+	context: SessionContext,
+	running: bool,
 }
 
-struct SessionManagerInner {
-	session: Option<RtspServer>,
-}
-
-impl SessionManager {
-	pub fn new(config: Config, shutdown_token: TriggerShutdownToken<i32>) -> Result<Self, ()> {
-		// Preferably this gets constructed in control.rs, however it needs to stay
-		// alive throughout the entire application runtime.
-		// Once dropped, it cannot be initialized again.
-		let enet = Enet::new()
-			.map_err(|e| log::error!("Failed to initialize Enet session: {e}"))?;
-
+impl Session {
+	pub fn new(
+		config: Config,
+		context: SessionContext,
+		enet: Enet,
+	) -> Self {
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = SessionManagerInner { session: None };
-		tokio::spawn(async move { inner.run(config, command_rx, enet).await; drop(shutdown_token); });
-		Ok(Self { command_tx })
+		let inner = SessionInner { config, video_stream: None, audio_stream: None, control_stream: None };
+		tokio::spawn(inner.run(command_rx, context.clone(), enet));
+		Self { command_tx, context, running: false }
 	}
 
-	pub async fn launch(&self, context: SessionContext) -> Result<(), ()> {
-		self.command_tx.send(SessionManagerCommand::LaunchSession(context))
+	pub async fn start_stream(
+		&mut self,
+		video_stream_context: VideoStreamContext,
+		audio_stream_context: AudioStreamContext,
+	) -> Result <(), ()> {
+		self.running = true;
+		self.command_tx.send(SessionCommand::StartStream(video_stream_context, audio_stream_context))
 			.await
-			.map_err(|e| log::error!("Failed to launch session: {e}"))?;
-		Ok(())
+			.map_err(|e| log::error!("Failed to send StartStream command: {e}"))
 	}
 
-	pub async fn get_current_session(&self) -> Result<Option<RtspServer>, ()> {
-		let (session_tx, session_rx) = oneshot::channel();
-		self.command_tx.send(SessionManagerCommand::GetCurrentSession(session_tx))
+	pub async fn stop_stream(&mut self) -> Result<(), ()> {
+		self.running = false;
+		self.command_tx.send(SessionCommand::StopStream)
 			.await
-			.map_err(|e| log::error!("Failed to launch session: {e}"))?;
-		session_rx.await
-			.map_err(|e| log::error!("Failed to wait for get current session response: {e}"))
+			.map_err(|e| log::error!("Failed to send StopStream command: {e}"))
 	}
 
-	pub async fn stop_session(&self) -> Result<(), ()> {
-		self.command_tx.send(SessionManagerCommand::StopSession)
-			.await
-			.map_err(|e| log::error!("Failed to launch session: {e}"))
+	pub fn get_context(&self) -> &SessionContext {
+		&self.context
+	}
+
+	pub fn is_running(&self) -> bool {
+		self.running
+	}
+
+	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
+		self.command_tx.send(SessionCommand::UpdateKeys(keys)).await
+			.map_err(|e| log::error!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
-impl SessionManagerInner {
+struct SessionInner {
+	config: Config,
+	video_stream: Option<VideoStream>,
+	audio_stream: Option<AudioStream>,
+	control_stream: Option<ControlStream>,
+}
+
+impl SessionInner {
 	async fn run(
 		mut self,
-		config: Config,
-		mut command_rx: mpsc::Receiver<SessionManagerCommand>,
-		enet: Enet,
+		mut command_rx: mpsc::Receiver<SessionCommand>,
+		mut session_context: SessionContext,
+		enet: Enet
 	) {
-		log::debug!("Waiting for commands.");
-
+		let stop_signal = ShutdownManager::new();
 		while let Some(command) = command_rx.recv().await {
 			match command {
-				SessionManagerCommand::LaunchSession(session_context) => {
-					if self.session.is_some() {
-						log::warn!("Can't launch a session, there is already an active session running.");
-						continue;
-					}
+				SessionCommand::StartStream(video_stream_context, audio_stream_context) => {
+					let video_stream = VideoStream::new(self.config.clone(), video_stream_context, stop_signal.clone());
+					let audio_stream = AudioStream::new(self.config.clone(), audio_stream_context, stop_signal.clone());
+					let control_stream = ControlStream::new(
+						self.config.clone(),
+						video_stream.clone(),
+						audio_stream.clone(),
+						session_context.clone(),
+						enet.clone(),
+						stop_signal.clone()
+					);
 
-					log::info!("Launching session with arguments: {session_context:?}");
-					if let Ok(session) = RtspServer::new(config.clone(), session_context, enet.clone()) {
-						self.session = Some(session);
-					}
+					self.video_stream = Some(video_stream);
+					self.audio_stream = Some(audio_stream);
+					self.control_stream = Some(control_stream);
 				},
-				SessionManagerCommand::GetCurrentSession(session_tx) => {
-					if session_tx.send(self.session.clone()).is_err() {
-						log::error!("Failed to send current session");
-					}
-				}
-				SessionManagerCommand::StopSession => {
-					if let Some(session) = self.session {
-						session.stop_stream();
-						self.session = None;
-					} else {
-						log::debug!("Trying to cancel session, but no session is currently active.");
-					}
+
+				SessionCommand::StopStream => {
+					let _ = stop_signal.trigger_shutdown(());
 				},
-			};
+
+				SessionCommand::UpdateKeys(keys) => {
+					let Some(audio_stream) = &self.audio_stream else {
+						log::warn!("Can't update session keys without an audio stream.");
+						continue;
+					};
+					let Some(control_stream) = &self.control_stream else {
+						log::warn!("Can't update session keys without an control stream.");
+						continue;
+					};
+
+					session_context.keys = keys.clone();
+					let _ = audio_stream.update_keys(keys.clone()).await;
+					let _ = control_stream.update_keys(keys).await;
+				},
+			}
 		}
 
-		log::debug!("Channel closed, stopped listening for commands.");
+		log::debug!("Command channel closed.");
 	}
 }

@@ -3,7 +3,7 @@ use std::sync::{Arc, Mutex};
 use async_shutdown::ShutdownManager;
 use ffmpeg::{Codec, CodecContextBuilder, Frame, CodecContext, Packet, HwFrameContextBuilder, HwFrameContext, CudaDeviceContextBuilder};
 
-use crate::{cuda::CudaContext, session::rtsp::stream::RtpHeader};
+use crate::{cuda::CudaContext, session::stream::RtpHeader};
 
 #[repr(u8)]
 enum RtpFlag {

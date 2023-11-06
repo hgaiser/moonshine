@@ -460,7 +460,7 @@ impl ClientManagerInner {
 			}
 		}
 
-		log::debug!("Channel closed, stopped listening for commands.");
+		log::debug!("Command channel closed.");
 	}
 
 	fn has_client(&self, key: &str) -> bool {
