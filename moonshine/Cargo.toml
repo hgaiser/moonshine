@@ -33,6 +33,7 @@ tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros", "net", "i
 tokio-openssl = "0.6.3"
 toml = "0.8.0"
 url = "2.4.1"
+uuid = { version = "1.5.0", features = ["v4"] }
 xcb = { version = "1.2.2", features = ["shm"] }
 xml-rs = "0.8.19"
 zeroconf = "0.11.1"

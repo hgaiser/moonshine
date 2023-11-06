@@ -288,7 +288,7 @@ impl ClientManagerInner {
 		server_certs: X509,
 		server_pkey: PKey<Private>,
 	) -> Result<Self, ()> {
-		let path = match dirs::state_dir() {
+		let path = match dirs::data_dir() {
 			Some(path) => path.join("moonshine").join("clients.toml"),
 			None => {
 				log::warn!("Failed to get user state directory.");

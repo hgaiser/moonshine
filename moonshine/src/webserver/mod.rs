@@ -17,11 +17,11 @@ mod tls;
 
 const SERVERINFO_APP_VERSION: &str = "7.1.450.0";
 const SERVERINFO_GFE_VERSION: &str = "3.23.0.74";
-const SERVERINFO_UNIQUE_ID: &str = "7AD14F7C-2F8B-7329-AF86-42A06F6471FE"; // Should we generate / randomize this?
 
 #[derive(Clone)]
 pub struct Webserver {
 	config: Config,
+	unique_id: String,
 	client_manager: ClientManager,
 	session_manager: SessionManager,
 	server_certs: X509,
@@ -30,6 +30,7 @@ pub struct Webserver {
 impl Webserver {
 	pub fn new(
 		config: Config,
+		unique_id: &str,
 		server_certs: X509,
 		client_manager: ClientManager,
 		session_manager: SessionManager,
@@ -37,6 +38,7 @@ impl Webserver {
 	) -> Result<Self, ()> {
 		let server = Self {
 			config: config.clone(),
+			unique_id: unique_id.to_string(),
 			client_manager,
 			session_manager,
 			server_certs,
@@ -247,7 +249,7 @@ impl Webserver {
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("uniqueid")).unwrap();
-		writer.write(XmlEvent::characters(SERVERINFO_UNIQUE_ID)).unwrap();
+		writer.write(XmlEvent::characters(&self.unique_id)).unwrap();
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("HttpsPort")).unwrap();
