@@ -29,7 +29,6 @@ impl VideoFrameHeader {
 }
 
 struct NvVideoPacket {
-	padding: u32,
 	stream_packet_index: u32,
 	frame_index: u32,
 	flags: u8,
@@ -41,7 +40,6 @@ struct NvVideoPacket {
 
 impl NvVideoPacket {
 	fn serialize(&self, buffer: &mut Vec<u8>) {
-		buffer.extend(self.padding.to_le_bytes());
 		buffer.extend(self.stream_packet_index.to_le_bytes());
 		buffer.extend(self.frame_index.to_le_bytes());
 		buffer.extend(self.flags.to_le_bytes());
@@ -215,13 +213,23 @@ impl Encoder {
 fn encode_packet(
 	packet: &Packet,
 	packet_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
-	packet_size: usize,
+	requested_packet_size: usize,
 	minimum_fec_packets: u32,
 	fec_percentage: u8,
 	frame_number: u32,
 	sequence_number: &mut u32,
 	stream_start_time: std::time::Instant,
 ) -> Result<(), ()> {
+	// Random padding, because we need it.
+	const PADDING: usize = 4;
+
+	// Generating more than 100 data shards causes more than 255 parity shards if fec_percentage is 255.
+	// This is a problem for FEC, so we start splitting into multiple blocks at this threshold.
+	// The threshold represents a number of data shards that we will be sending.
+	const MULTI_FEC_THRESHOLD: usize = 90;
+
+	let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
+
 	// TODO: Figure out what this header means?
 	let video_frame_header = VideoFrameHeader {
 		header_type: 0x01, // Always 0x01 for short headers. What is this exactly?
@@ -229,85 +237,120 @@ fn encode_packet(
 		frame_type: if (packet.as_raw().flags & ffmpeg_sys::AV_PKT_FLAG_KEY as i32) != 0 { 2 } else { 1 },
 		padding2: 0,
 	};
-	let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
 
-	let mut buffer = Vec::new();
+	// Prefix the frame with a VideoFrameHeader.
+	let mut buffer = Vec::with_capacity(std::mem::size_of::<VideoFrameHeader>());
 	video_frame_header.serialize(&mut buffer);
 	let packet_data = [&buffer, packet.data()].concat();
 
-	let payload_size = packet_size - std::mem::size_of::<NvVideoPacket>();
-	let nr_data_shards = (packet_data.len() + payload_size - 1) / payload_size;
-	let mut nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-		.max(minimum_fec_packets as usize);
-	let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
-	log::trace!("Number of packets: {nr_data_shards}, number of parity packets: {nr_parity_shards}");
+	// The part of a data shard that contains the payload.
+	let requested_shard_payload_size = requested_packet_size - std::mem::size_of::<NvVideoPacket>();
 
-	let encoder = reed_solomon::ReedSolomon::new(nr_data_shards, nr_parity_shards);
-	if let Err(e) = &encoder {
-		log::debug!("Couldn't create error correction: {e}");
-		nr_parity_shards = 0;
+	// The total size of a shard.
+	let requested_shard_size = requested_shard_payload_size + std::mem::size_of::<RtpHeader>() + PADDING + std::mem::size_of::<NvVideoPacket>();
+
+	// Determine how many data shards we will be sending.
+	let nr_of_data_shards = packet_data.len() / requested_shard_payload_size + (packet_data.len() % requested_packet_size != 0) as usize; // TODO: Replace with div_ceil when it lands in stable (https://doc.rust-lang.org/std/primitive.i32.html#method.div_ceil).
+
+	// If the number of data shards exceeds the threshold, split it up into three groups.
+	let block_assignment;
+	let last_block_index: u8;
+	if nr_of_data_shards > MULTI_FEC_THRESHOLD {
+		let data_shards_per_block = nr_of_data_shards / 3;
+
+		// This defines the thresholds where data shards should be assigned.
+		block_assignment = vec![
+			data_shards_per_block,
+			data_shards_per_block * 2,
+			nr_of_data_shards, // Until the last data shard in this block.
+		];
+
+		last_block_index = 2 << 6; // TODO: What is this?
+	} else {
+		block_assignment = vec![nr_of_data_shards];
+
+		last_block_index = 0;
 	}
 
-	let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
-	for i in 0..nr_data_shards {
-		let start = i * payload_size;
-		let end = ((i + 1) * payload_size).min(packet_data.len());
+	let mut absolute_data_shard_index = 0usize;
+	for (block_index, block_threshold) in block_assignment.into_iter().enumerate() {
+		let nr_data_shards = block_threshold - absolute_data_shard_index;
+		let mut nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
+			.max(minimum_fec_packets as usize);
+		let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
+		let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
 
-		// TODO: Do this without cloning.
-		let mut shard = vec![0u8; payload_size];
-		shard[..(end - start)].copy_from_slice(&packet_data[start..end]);
-		shards.push(shard);
-	}
-	for _ in 0..nr_parity_shards {
-		shards.push(vec![0u8; payload_size]);
-	}
-	if let Ok(encoder) = encoder {
-		encoder.encode(&mut shards)
-			.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
-	}
-
-	for (index, shard) in shards.iter().enumerate() {
-		let rtp_header = RtpHeader {
-			header: 0x90, // What is this?
-			packet_type: 0,
-			sequence_number: *sequence_number as u16,
-			timestamp,
-			ssrc: 0,
-		};
-
-		let mut video_packet_header = NvVideoPacket {
-			padding: 0,
-			stream_packet_index: *sequence_number << 8,
-			frame_index: frame_number,
-			flags: RtpFlag::ContainsPicData as u8,
-			reserved: 0,
-			multi_fec_flags: 0x10,
-			multi_fec_blocks: 0, // TODO: Support multiple blocks
-			fec_info: (index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
-		};
-		if index == 0 {
-			video_packet_header.flags |= RtpFlag::StartOfFrame as u8;
-		}
-		if index == nr_data_shards - 1 {
-			video_packet_header.flags |= RtpFlag::EndOfFrame as u8;
+		let encoder = reed_solomon::ReedSolomon::new(nr_data_shards, nr_parity_shards);
+		if let Err(e) = &encoder {
+			log::debug!("Couldn't create error correction: {e}");
+			nr_parity_shards = 0;
 		}
 
-		let mut buffer = Vec::with_capacity(
-			std::mem::size_of::<RtpHeader>()
-			+ std::mem::size_of::<NvVideoPacket>()
-			+ shard.len(),
-		);
-		rtp_header.serialize(&mut buffer);
-		video_packet_header.serialize(&mut buffer);
-		buffer.extend(shard);
+		for data_shard_index in absolute_data_shard_index..block_threshold {
+			let start = data_shard_index * requested_shard_payload_size;
+			let end = ((data_shard_index + 1) * requested_shard_payload_size).min(packet_data.len());
 
-		log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
-		if packet_tx.blocking_send(buffer).is_err() {
-			log::info!("Channel closed, couldn't send packet.");
-			return Ok(());
+			// TODO: Do this without cloning.
+			let mut shard = vec![0u8; requested_shard_size];
+			shard[..(end - start)].copy_from_slice(&packet_data[start..end]);
+			shards.push(shard);
 		}
 
-		*sequence_number += 1;
+		for _ in 0..nr_parity_shards {
+			shards.push(vec![0u8; requested_shard_size]);
+		}
+
+		if let Ok(encoder) = encoder {
+			encoder.encode(&mut shards)
+				.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
+		}
+
+		for (index, shard) in shards.iter().enumerate() {
+			let rtp_header = RtpHeader {
+				header: 0x90, // What is this?
+				packet_type: 0,
+				sequence_number: *sequence_number as u16,
+				timestamp,
+				ssrc: 0,
+			};
+
+			let mut video_packet_header = NvVideoPacket {
+				stream_packet_index: *sequence_number << 8,
+				frame_index: frame_number,
+				flags: RtpFlag::ContainsPicData as u8,
+				reserved: 0,
+				multi_fec_flags: 0x10,
+				multi_fec_blocks: ((block_index as u8) << 4) | last_block_index,
+				fec_info: (index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
+			};
+			if index == 0 {
+				video_packet_header.flags |= RtpFlag::StartOfFrame as u8;
+			}
+			if index == nr_data_shards - 1 {
+				video_packet_header.flags |= RtpFlag::EndOfFrame as u8;
+			}
+
+			let mut buffer = Vec::with_capacity(
+				std::mem::size_of::<RtpHeader>()
+				+ PADDING
+				+ std::mem::size_of::<NvVideoPacket>()
+				+ shard.len(),
+			);
+			rtp_header.serialize(&mut buffer);
+			buffer.extend(0u32.to_le_bytes()); // PADDING
+			video_packet_header.serialize(&mut buffer);
+			buffer.extend(shard);
+
+			log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
+			if packet_tx.blocking_send(buffer).is_err() {
+				log::info!("Channel closed, couldn't send packet.");
+				return Ok(());
+			}
+
+			*sequence_number += 1;
+		}
+
+		absolute_data_shard_index += nr_data_shards;
 	}
 
 	Ok(())
