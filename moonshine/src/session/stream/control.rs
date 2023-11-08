@@ -198,7 +198,7 @@ impl ControlStreamInner {
 			)
 			.map_err(|e| log::error!("Failed to create Enet host: {e}"))?;
 
-		log::info!("Listening for control messages on {:?}", host.address());
+		log::debug!("Listening for control messages on {:?}", host.address());
 
 		loop {
 			if stop_signal.is_shutdown_triggered() {
@@ -218,7 +218,7 @@ impl ControlStreamInner {
 					}
 				},
 				Err(TryRecvError::Disconnected) => {
-					log::info!("Command channel closed.");
+					log::debug!("Command channel closed.");
 					break;
 				},
 				Err(TryRecvError::Empty) => { },

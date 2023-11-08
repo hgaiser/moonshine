@@ -73,7 +73,7 @@ impl AudioStreamInner {
 				.map_err(|e| log::error!("Failed to set QoS on the audio socket: {e}"))?;
 		}
 
-		log::info!(
+		log::debug!(
 			"Listening for audio messages on {}",
 			socket.local_addr()
 			.map_err(|e| log::error!("Failed to get local address associated with control socket: {e}"))?
@@ -96,7 +96,7 @@ impl AudioStreamInner {
 								}
 							},
 							None => {
-								log::info!("Failed to receive packets from encoder, channel closed.");
+								log::debug!("Packet channel closed.");
 								break;
 							},
 						}
@@ -159,7 +159,7 @@ impl AudioStreamInner {
 			}
 		}
 
-		log::info!("Command channel closed.");
+		log::debug!("Command channel closed.");
 		Ok(())
 	}
 

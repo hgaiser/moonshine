@@ -39,7 +39,7 @@ impl RtspServer {
 							let (connection, address) = listener.accept()
 								.await
 								.map_err(|e| log::error!("Failed to accept connection: {}", e))?;
-							log::debug!("Accepted connection from {}", address);
+							log::trace!("Accepted connection from {}", address);
 
 							tokio::spawn({
 								let server = server.clone();
@@ -206,7 +206,7 @@ a=control:streamid=0")
 			}
 		};
 
-		log::debug!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
+		log::trace!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
 
 		let width = match get_sdp_attribute(&sdp_session, "x-nv-video[0].clientViewportWd") {
 			Ok(width) => width,

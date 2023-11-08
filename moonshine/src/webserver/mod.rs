@@ -65,7 +65,7 @@ impl Webserver {
 					loop {
 						let (connection, address) = listener.accept().await
 							.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
-						log::debug!("Accepted connection from {address}.");
+						log::trace!("Accepted connection from {address}.");
 
 						let io = TokioIo::new(connection);
 
@@ -85,7 +85,7 @@ impl Webserver {
 					Ok::<(), ()>(())
 				})).await;
 
-				log::info!("HTTP server shutting down, likely due to shutdown.");
+				log::debug!("HTTP server shutting down, likely due to shutdown.");
 			}
 		});
 
@@ -111,7 +111,7 @@ impl Webserver {
 							Ok(connection) => connection,
 							Err(()) => continue,
 						};
-						log::debug!("Accepted TLS connection from {address}.");
+						log::trace!("Accepted TLS connection from {address}.");
 
 						let io = TokioIo::new(connection);
 
@@ -131,7 +131,7 @@ impl Webserver {
 					Ok::<(), ()>(())
 				})).await;
 
-				log::info!("HTTPS server shutting down, likely due to shutdown.");
+				log::debug!("HTTPS server shutting down, likely due to shutdown.");
 			}
 		});
 

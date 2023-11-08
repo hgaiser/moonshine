@@ -76,7 +76,7 @@ impl VideoStreamInner {
 				.map_err(|e| log::error!("Failed to set QoS on the video socket: {e}"))?;
 		}
 
-		log::info!(
+		log::debug!(
 			"Listening for video messages on {}",
 			socket.local_addr()
 				.map_err(|e| log::error!("Failed to get local address associated with control socket: {e}"))?
@@ -99,7 +99,7 @@ impl VideoStreamInner {
 								}
 							},
 							None => {
-								log::info!("Failed to receive packets from encoder, channel closed.");
+								log::debug!("Packet channel closed.");
 								break;
 							},
 						}
@@ -124,7 +124,7 @@ impl VideoStreamInner {
 				}
 			}
 
-			log::info!("Failed to receive UDP message, connection likely closed.");
+			log::debug!("Connection closed.");
 		});
 
 		let mut started_streaming = false;
@@ -205,7 +205,7 @@ impl VideoStreamInner {
 			}
 		}
 
-		log::info!("Command channel closed.");
+		log::debug!("Command channel closed.");
 		Ok(())
 	}
 }
