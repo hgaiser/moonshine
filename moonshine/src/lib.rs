@@ -1,12 +1,10 @@
-use std::path::Path;
-
 use async_shutdown::ShutdownManager;
 use clients::ClientManager;
 use config::Config;
 use openssl::pkey::PKey;
 use rtsp::RtspServer;
-use serde::{Deserialize, Serialize};
 use session::SessionManager;
+use state::State;
 use webserver::Webserver;
 
 pub mod clients;
@@ -15,38 +13,10 @@ pub mod crypto;
 pub mod cuda;
 pub mod rtsp;
 pub mod session;
+pub mod state;
 pub mod publisher;
 pub mod util;
 pub mod webserver;
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-struct State {
-	unique_id: String,
-}
-
-impl State {
-	fn new() -> Self {
-		Self { unique_id: uuid::Uuid::new_v4().to_string() }
-	}
-
-	fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Self, ()> {
-		let state = std::fs::read_to_string(file)
-			.map_err(|e| log::error!("Failed to open state file: {e}"))?;
-		let state: State = toml::from_str(&state)
-			.map_err(|e| log::error!("Failed to parse state file: {e}"))?;
-
-		Ok(state)
-	}
-
-	fn save<P: AsRef<Path>>(&self, file: P) -> Result<(), ()> {
-		let parent_dir = file.as_ref().parent().ok_or_else(|| log::error!("Failed to get state dir for file {:?}", file.as_ref()))?;
-		std::fs::create_dir_all(parent_dir)
-			.map_err(|e| log::error!("Failed to create state dir: {e}"))?;
-
-		std::fs::write(file, toml::to_string_pretty(self).map_err(|e| log::error!("Failed to serialize state: {e}"))?)
-			.map_err(|e| log::error!("Failed to save state file: {e}"))
-	}
-}
 
 pub struct Moonshine {
 	_rtsp_server: RtspServer,
@@ -56,22 +26,11 @@ pub struct Moonshine {
 }
 
 impl Moonshine {
-	pub fn new(
+	pub async fn new(
 		config: Config,
 		shutdown: ShutdownManager<i32>,
 	) -> Result<Self, ()> {
-		let state_path = dirs::data_dir()
-			.ok_or_else(|| log::error!("Failed to get state dir."))?
-			.join("moonshine")
-			.join("state.toml");
-
-		let state;
-		if state_path.exists() {
-			state = State::read_from_file(state_path)?;
-		} else {
-			state = State::new();
-			state.save(state_path)?;
-		}
+		let state = State::new().await?;
 
 		let server_certs = std::fs::read(&config.webserver.certificate_chain)
 			.map_err(|e| log::error!("Failed to read server certificate: {e}"))?;
@@ -85,7 +44,7 @@ impl Moonshine {
 		let session_manager = SessionManager::new(config.clone(), shutdown.trigger_shutdown_token(2))?;
 
 		// Create a manager for saving and loading client state.
-		let client_manager = ClientManager::new(server_certs.clone(), server_pkey, shutdown.trigger_shutdown_token(3))?;
+		let client_manager = ClientManager::new(state.clone(), server_certs.clone(), server_pkey, shutdown.trigger_shutdown_token(3));
 
 		// Run the RTSP server.
 		let rtsp_server = RtspServer::new(config.clone(), session_manager.clone(), shutdown.clone());
@@ -96,7 +55,7 @@ impl Moonshine {
 		// Create a handler for the webserver.
 		let webserver = Webserver::new(
 			config,
-			&state.unique_id,
+			state.get_uuid().await?,
 			server_certs,
 			client_manager.clone(),
 			session_manager.clone(),

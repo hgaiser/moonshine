@@ -28,9 +28,10 @@ pub struct Webserver {
 }
 
 impl Webserver {
+	#[allow(clippy::result_unit_err)]
 	pub fn new(
 		config: Config,
-		unique_id: &str,
+		unique_id: String,
 		server_certs: X509,
 		client_manager: ClientManager,
 		session_manager: SessionManager,
@@ -38,7 +39,7 @@ impl Webserver {
 	) -> Result<Self, ()> {
 		let server = Self {
 			config: config.clone(),
-			unique_id: unique_id.to_string(),
+			unique_id,
 			client_manager,
 			session_manager,
 			server_certs,
@@ -78,6 +79,9 @@ impl Webserver {
 							}
 						});
 					}
+
+					// Is there another way to define the return type of this function?
+					#[allow(unreachable_code)]
 					Ok::<(), ()>(())
 				})).await;
 
@@ -121,6 +125,9 @@ impl Webserver {
 							}
 						});
 					}
+
+					// Is there another way to define the return type of this function?
+					#[allow(unreachable_code)]
 					Ok::<(), ()>(())
 				})).await;
 
@@ -140,6 +147,8 @@ impl Webserver {
 					.collect()
 			})
 			.unwrap_or_default();
+
+		log::info!("Received {} request for {}.", request.method(), request.uri().path());
 
 		let response = match (request.method(), request.uri().path()) {
 			(&Method::GET, "/serverinfo") => self.server_info(params).await,

@@ -20,6 +20,7 @@ pub struct Config {
 }
 
 impl Config {
+	#[allow(clippy::result_unit_err)]
 	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config, ()> {
 		let config = std::fs::read_to_string(file)
 			.map_err(|e| log::error!("Failed to open configuration file: {e}"))?;

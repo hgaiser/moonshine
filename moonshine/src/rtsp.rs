@@ -49,6 +49,8 @@ impl RtspServer {
 							});
 						}
 
+						// Is there another way to define the return type of this function?
+						#[allow(unreachable_code)]
 						Ok::<(), ()>(())
 					}
 				})).await;
@@ -60,6 +62,7 @@ impl RtspServer {
 		server
 	}
 
+	#[allow(clippy::result_unit_err)]
 	pub fn description(&self) -> Result<sdp_types::Session, ()> {
 		// TODO: Generate this based on settings.
 		sdp_types::Session::parse(b"v=0

@@ -113,6 +113,7 @@ impl Encoder {
 		})
 	}
 
+	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
 	pub fn run(
 		mut self,
 		packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
@@ -210,6 +211,7 @@ impl Encoder {
 	}
 }
 
+#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
 fn encode_packet(
 	packet: &Packet,
 	packet_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,

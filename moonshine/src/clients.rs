@@ -1,11 +1,10 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{sync::Arc, collections::BTreeMap};
 
 use async_shutdown::TriggerShutdownToken;
 use openssl::{hash::MessageDigest, pkey::{PKey, PKeyRef, Private}, md::Md, md_ctx::MdCtx, x509::X509, cipher::Cipher};
-use serde::{Deserialize, Serialize};
 use tokio::sync::{oneshot, mpsc, Notify};
 
-use crate::crypto::{encrypt, decrypt};
+use crate::{crypto::{encrypt, decrypt}, state::State};
 
 /// A client that is not yet paired, but in the pairing process.
 pub struct PendingClient {
@@ -37,9 +36,6 @@ pub struct PendingClient {
 	///
 	pub client_hash: Option<Vec<u8>>,
 }
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Client {}
 
 pub enum ClientManagerCommand {
 	/// Check if a client is already paired.
@@ -73,7 +69,7 @@ pub struct IsPairedCommand {
 	pub id: String,
 
 	/// Channel used to provide a response.
-	pub response: oneshot::Sender<bool>,
+	pub response: oneshot::Sender<Result<bool, String>>,
 }
 
 /// Initiate a pairing process for a client.
@@ -155,15 +151,16 @@ pub struct ClientManager {
 
 impl ClientManager {
 	pub fn new(
+		state: State,
 		server_certs: X509,
 		server_pkey: PKey<Private>,
 		shutdown_token: TriggerShutdownToken<i32>,
-	) -> Result<Self, ()> {
+	) -> Self {
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = ClientManagerInner::from_state_or_default(server_certs, server_pkey)?;
-		tokio::spawn(async move { inner.run(command_rx).await; drop(shutdown_token); });
+		let inner = ClientManagerInner { server_certs, server_pkey };
+		tokio::spawn(async move { inner.run(command_rx, state).await; drop(shutdown_token); });
 
-		Ok(Self { command_tx })
+		Self { command_tx }
 	}
 
 	pub async fn is_paired(&self, id: String) -> Result<bool, ()> {
@@ -173,13 +170,14 @@ impl ClientManager {
 			.map_err(|e| log::error!("Failed to check paired status: {e}"))?;
 
 		response_rx.await
-			.map_err(|e| log::error!("Failed to receive is-paired response: {e}"))
+			.map_err(|e| log::error!("Failed to receive IsPaired response: {e}"))?
+			.map_err(|e| log::error!("Failed to check paired status: {e}"))
 	}
 
 	pub async fn start_pairing(&self, pending_client: PendingClient) -> Result<(), ()> {
 		self.command_tx.send(ClientManagerCommand::StartPairing(StartPairingCommand { pending_client }))
 			.await
-			.map_err(|e| log::error!("Failed to check paired status: {e}"))
+			.map_err(|e| log::error!("Failed to start pairing: {e}"))
 	}
 
 	pub async fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
@@ -194,7 +192,7 @@ impl ClientManager {
 
 		response_rx
 			.await
-			.map_err(|e| log::error!("Failed to wait for response to pin command from client manager: {e}"))?
+			.map_err(|e| log::error!("Failed to wait for response to RegisterPin command from client manager: {e}"))?
 			.map_err(|e| log::warn!("{e}"))
 	}
 
@@ -205,11 +203,11 @@ impl ClientManager {
 			response: response_tx,
 		}))
 			.await
-			.map_err(|e| log::error!("Failed to send pin to client manager: {e}"))?;
+			.map_err(|e| log::error!("Failed to send AddClient command to client manager: {e}"))?;
 
 		response_rx
 			.await
-			.map_err(|e| log::error!("Failed to wait for response to pin command from client manager: {e}"))?
+			.map_err(|e| log::error!("Failed to wait for response to AddClient command from client manager: {e}"))?
 			.map_err(|e| log::warn!("{e}"))
 	}
 
@@ -278,63 +276,28 @@ impl ClientManager {
 }
 
 struct ClientManagerInner {
-	clients: BTreeMap<String, Client>,
 	server_certs: X509,
 	server_pkey: PKey<Private>,
 }
 
 impl ClientManagerInner {
-	fn from_state_or_default(
-		server_certs: X509,
-		server_pkey: PKey<Private>,
-	) -> Result<Self, ()> {
-		let path = match dirs::data_dir() {
-			Some(path) => path.join("moonshine").join("clients.toml"),
-			None => {
-				log::warn!("Failed to get user state directory.");
-				return Ok(Self { server_certs, server_pkey, clients: Default::default() });
-			}
-		};
-
-		if path.exists() {
-			let serialized = match std::fs::read_to_string(&path) {
-				Ok(serialized) => serialized,
-				Err(e) => {
-					log::warn!("Failed to read clients state file: {}", e);
-					return Ok(Self { server_certs, server_pkey, clients: Default::default() });
-				}
-			};
-			let clients: BTreeMap<String, Client> = match toml::from_str(&serialized) {
-				Ok(clients) => clients,
-				Err(e) => {
-					log::warn!("Failed to deserialize clients state: {}", e);
-					return Ok(Self { server_certs, server_pkey, clients: Default::default() });
-				}
-			};
-
-			log::debug!("Successfully loaded clients state from {:?}", path);
-			log::trace!("Clients: {clients:?}");
-
-			return Ok(Self {
-				server_certs,
-				server_pkey,
-				clients,
-			});
-		}
-
-		log::debug!("No clients state found, starting with an empty state.");
-		Ok(Self { server_certs, server_pkey, clients: Default::default() })
-	}
-
-	async fn run(mut self, mut command_rx: mpsc::Receiver<ClientManagerCommand>) {
+	async fn run(self, mut command_rx: mpsc::Receiver<ClientManagerCommand>, state: State) {
 		log::debug!("Waiting for commands.");
 
 		let mut pending_clients = BTreeMap::new();
 		while let Some(command) = command_rx.recv().await {
 			match command {
 				ClientManagerCommand::IsPaired(command) => {
-					command.response.send(self.has_client(&command.id))
-						.map_err(|_| log::error!("Failed to respond to IsPaired response.")).ok();
+					match state.has_client(command.id).await {
+						Ok(result) => {
+							command.response.send(Ok(result))
+								.map_err(|_| log::error!("Failed to send IsPaired response.")).ok();
+						},
+						Err(()) => {
+							command.response.send(Err("Failed to check client paired status.".to_string()))
+								.map_err(|_| log::error!("Failed to send IsPaired response.")).ok();
+						},
+					}
 				},
 
 				ClientManagerCommand::StartPairing(command) => {
@@ -435,20 +398,36 @@ impl ClientManagerInner {
 				},
 
 				ClientManagerCommand::AddClient(command) => {
-					if self.has_client(&command.id) {
+					let Ok(has_client) = state.has_client(command.id.clone()).await else {
+						command.response.send(Err("Failed to check client paired status.".to_string()))
+							.map_err(|_| log::error!("Failed to send AddClient command response.")).ok();
+						continue;
+					};
+
+					if has_client {
 						command.response.send(Err("Client is already paired, can't add it again.".to_string()))
-							.map_err(|_| log::error!("Failed to send add client command response.")).ok();
+							.map_err(|_| log::error!("Failed to send AddClient command response.")).ok();
 						continue;
 					}
 
-					self.add_client(&command.id);
-					command.response.send(Ok(()))
-						.map_err(|_| log::error!("Failed to send add client command response.")).ok();
+					if let Err(()) = state.add_client(command.id).await {
+						command.response.send(Err("Failed to add client.".to_string()))
+							.map_err(|_| log::error!("Failed to send AddClient command response.")).ok();
+					} else {
+						command.response.send(Ok(()))
+							.map_err(|_| log::error!("Failed to send AddClient command response.")).ok();
+					}
 				},
 
 				ClientManagerCommand::RemoveClient(command) => {
 					pending_clients.remove(&command.id);
-					if !self.remove_client(&command.id) {
+					let Ok(result) = state.remove_client(command.id).await else {
+						command.response.send(Err("Failed to remove client.".to_string()))
+							.map_err(|_| log::error!("Failed to send RemoveClient command response.")).ok();
+						continue;
+					};
+
+					if !result {
 						command.response.send(Err("Client is not known, can't remove it.".to_string()))
 							.map_err(|_| log::error!("Failed to send remove client command response.")).ok();
 						continue;
@@ -461,56 +440,6 @@ impl ClientManagerInner {
 		}
 
 		log::debug!("Command channel closed.");
-	}
-
-	fn has_client(&self, key: &str) -> bool {
-		self.clients.contains_key(key)
-	}
-
-	fn add_client(&mut self, key: &str) {
-		self.clients.insert(key.to_string(), Client {});
-		self.save_state();
-	}
-
-	fn remove_client(&mut self, key: &str) -> bool {
-		if self.clients.remove(key).is_none() {
-			return false;
-		}
-		self.save_state();
-
-		true
-	}
-
-	fn save_state(&self) {
-		let mut path = match dirs::state_dir() {
-			Some(path) => path,
-			None => {
-				log::warn!("Failed to get user state directory.");
-				return;
-			}
-		};
-
-		path.push("moonshine");
-		if let Err(e) = std::fs::create_dir_all(&path) {
-			log::warn!("Failed to save clients state file: {}", e);
-			return;
-		}
-
-		path.push("clients.toml");
-
-		let serialized = match toml::to_string_pretty(&self.clients) {
-			Ok(serialized) => serialized,
-			Err(e) => {
-				log::warn!("Failed to serialize clients: {}", e);
-				return;
-			}
-		};
-
-		if let Err(e) = std::fs::write(&path, serialized) {
-			log::warn!("Failed to save serialized clients: {}", e);
-		}
-
-		log::debug!("Saved clients state to {:?}", path);
 	}
 
 	async fn client_challenge(&self, client: &mut PendingClient, challenge: Vec<u8>) -> Result<Vec<u8>, String> {

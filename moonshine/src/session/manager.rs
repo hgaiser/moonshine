@@ -34,6 +34,7 @@ struct SessionManagerInner {
 }
 
 impl SessionManager {
+	#[allow(clippy::result_unit_err)]
 	pub fn new(config: Config, shutdown_token: TriggerShutdownToken<i32>) -> Result<Self, ()> {
 		// Preferably this gets constructed in control.rs, however it needs to stay
 		// alive throughout the entire application runtime.

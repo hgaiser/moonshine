@@ -40,7 +40,7 @@ async fn main() -> Result<(), ()> {
 	});
 
 	// Create the main application.
-	let moonshine = Moonshine::new(config, shutdown.clone())?;
+	let moonshine = Moonshine::new(config, shutdown.clone()).await?;
 
 	// Wait until something causes a shutdown trigger.
 	shutdown.wait_shutdown_triggered().await;

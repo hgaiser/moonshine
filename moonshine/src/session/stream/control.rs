@@ -172,6 +172,7 @@ struct ControlStreamInner {
 }
 
 impl ControlStreamInner {
+	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
 	pub async fn run(
 		&self,
 		config: Config,
