@@ -34,6 +34,15 @@ impl ReedSolomon {
 		T: AsRef<[U]> + AsMut<[U]>,
 		U: AsRef<[u8]> + AsMut<[u8]>,
 	{
+		let shard_size = shards.as_ref()[0].as_ref().len();
+		self.encode_fixed_length(shards, shard_size)
+	}
+
+	pub fn encode_fixed_length<T, U>(&self, shards: &mut T, size: usize) -> Result<(), String>
+	where
+		T: AsRef<[U]> + AsMut<[U]>,
+		U: AsRef<[u8]> + AsMut<[u8]>,
+	{
 		let shards = shards.as_mut();
 		let inner = unsafe { &*self.inner };
 		if inner.data_shards as usize + inner.parity_shards as usize != shards.len() {
@@ -43,10 +52,9 @@ impl ReedSolomon {
 				shards.len(),
 			));
 		}
-		let shard_size = shards[0].as_ref().len();
-		for shard in &mut *shards {
-			if shard.as_ref().len() != shard_size {
-				return Err("not all shards have the same size".to_string());
+		for (shard_index, shard) in shards.as_ref().iter().enumerate() {
+			if shard.as_ref().len() < size {
+				return Err(format!("shard {shard_index} has size {}, but we expect at least {size} bytes", shard.as_ref().len()));
 			}
 		}
 
@@ -60,7 +68,7 @@ impl ReedSolomon {
 				self.inner,
 				shards.as_mut_ptr(),
 				shards.len() as i32,
-				shard_size as i32,
+				size as i32,
 			);
 		}
 

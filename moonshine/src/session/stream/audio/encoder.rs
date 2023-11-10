@@ -38,12 +38,16 @@ impl AudioEncoder {
 		packet_tx: mpsc::Sender<Vec<u8>>
 	) -> Result<Self, ()> {
 		log::debug!("Creating audio encoder with the following settings: {:?}", config);
-		let encoder = opus::Encoder::new(
+		let mut encoder = opus::Encoder::new(
 			config.sample_rate.0,
 			if config.channels > 1 { opus::Channels::Stereo } else { opus::Channels::Mono },
 			opus::Application::LowDelay,
 		)
 			.map_err(|e| log::error!("Failed to create audio encoder: {e}"))?;
+
+		// Moonlight expects a constant bitrate.
+		encoder.set_vbr(false)
+			.map_err(|e| log::error!("Failed to disable variable bitrate: {e}"))?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioEncoderInner { };
@@ -76,13 +80,13 @@ impl AudioEncoderInner {
 		const NR_DATA_SHARDS: usize = 4;
 		const NR_PARITY_SHARDS: usize = 2;
 		const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
-		const BLOCK_SIZE: usize = ((2048 + 15) / 16) * 16;
+		const MAX_BLOCK_SIZE: usize = ((2048 + 15) / 16) * 16; // Where does this come from?
 		let fec_encoder = reed_solomon::ReedSolomon::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
 			.map_err(|e| log::error!("Failed to create FEC encoder: {e}"))?;
 
 		let mut shards: [Vec<u8>; NR_TOTAL_SHARDS] = Default::default();
 		for shard in shards.iter_mut() {
-			shard.extend(std::iter::repeat(0).take(BLOCK_SIZE));
+			shard.extend(std::iter::repeat(0).take(MAX_BLOCK_SIZE));
 		}
 
 		let mut fec_header = AudioFecHeader {
@@ -137,7 +141,7 @@ impl AudioEncoderInner {
 						header: 0x80, // What is this?
 						packet_type: 97, // RTP_PAYLOAD_TYPE_AUDIO
 						sequence_number,
-						timestamp: 0,
+						timestamp,
 						ssrc: 0,
 					};
 					sequence_number += 1;
@@ -164,8 +168,9 @@ impl AudioEncoderInner {
 					// Copy the audio into the list of (data) shards.
 					shards[(sequence_number - 1) as usize % NR_DATA_SHARDS][..payload.len()].copy_from_slice(&payload);
 
+					// If the last packet, compute and send parity shards.
 					if sequence_number as usize % NR_DATA_SHARDS == 0 {
-						if let Err(e) = fec_encoder.encode(&mut shards) {
+						if let Err(e) = fec_encoder.encode_fixed_length(&mut shards, payload.len()) {
 							log::error!("Failed to create FEC block for audio: {e}");
 							continue;
 						}
@@ -175,20 +180,19 @@ impl AudioEncoderInner {
 								header: 0x80,
 								packet_type: 127,
 								sequence_number: sequence_number + shard_index as u16,
-								timestamp,
+								timestamp: 0,
 								ssrc: 0,
 							};
 
 							fec_header.shard_index = shard_index;
 
-							let mut buffer = Vec::with_capacity(
-								std::mem::size_of::<RtpHeader>()
+							let shard_size = std::mem::size_of::<RtpHeader>()
 								+ std::mem::size_of::<AudioFecHeader>()
-								+ payload.len()
-							);
+								+ payload.len();
+							let mut buffer = Vec::with_capacity(shard_size);
 							rtp_header.serialize(&mut buffer);
 							fec_header.serialize(&mut buffer);
-							buffer.extend(&shards[(NR_DATA_SHARDS as u8 + shard_index) as usize]);
+							buffer.extend(&shards[(NR_DATA_SHARDS as u8 + shard_index) as usize][..payload.len()]);
 
 							// log::debug!("Sending audio FEC packet of {} bytes.", buffer.len());
 							if packet_tx.send(buffer).await.is_err() {
