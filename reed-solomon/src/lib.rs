@@ -29,6 +29,21 @@ impl ReedSolomon {
 		Ok(Self { inner })
 	}
 
+	pub fn as_raw_mut(&mut self) -> &mut generated::reed_solomon {
+		unsafe { &mut *self.inner }
+	}
+
+	pub fn as_raw(&self) -> &generated::reed_solomon {
+		unsafe { &*self.inner }
+	}
+
+	pub fn set_parity_matrix(&mut self, parity_matrix: [u8; 8]) {
+		unsafe {
+			std::ptr::copy_nonoverlapping(parity_matrix.as_ptr(), self.as_raw_mut().m.offset(16), std::mem::size_of_val(&parity_matrix));
+			std::ptr::copy_nonoverlapping(parity_matrix.as_ptr(), self.as_raw_mut().parity, std::mem::size_of_val(&parity_matrix));
+		}
+	}
+
 	pub fn encode<T, U>(&self, shards: &mut T) -> Result<(), String>
 	where
 		T: AsRef<[U]> + AsMut<[U]>,

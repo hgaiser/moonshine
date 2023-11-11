@@ -330,19 +330,14 @@ fn encode_packet(
 				video_packet_header.flags |= RtpFlag::EndOfFrame as u8;
 			}
 
-			let mut buffer = Vec::with_capacity(
-				std::mem::size_of::<RtpHeader>()
-				+ PADDING
-				+ std::mem::size_of::<NvVideoPacket>()
-				+ shard.len(),
-			);
-			rtp_header.serialize(&mut buffer);
-			buffer.extend(0u32.to_le_bytes()); // PADDING
-			video_packet_header.serialize(&mut buffer);
-			buffer.extend(shard);
+			let mut packet = Vec::with_capacity(requested_packet_size);
+			rtp_header.serialize(&mut packet);
+			packet.extend(0u32.to_le_bytes()); // PADDING
+			video_packet_header.serialize(&mut packet);
+			packet.extend(&shard);
 
-			log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, shards.len(), buffer.len());
-			if packet_tx.blocking_send(buffer).is_err() {
+			log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, nr_data_shards + nr_parity_shards, packet.len());
+			if packet_tx.blocking_send(packet).is_err() {
 				log::info!("Channel closed, couldn't send packet.");
 				return Ok(());
 			}
