@@ -142,10 +142,6 @@ impl ControlStream {
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = ControlStreamInner { };
 		tokio::task::spawn_blocking({
-			let enet = enet.clone();
-			let video_stream = video_stream.clone();
-			let audio_stream = audio_stream.clone();
-			let stop_signal = stop_signal.clone();
 			move || {
 				tokio::runtime::Handle::current().block_on(inner.run(
 					config,

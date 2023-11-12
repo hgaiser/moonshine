@@ -12,6 +12,8 @@ enum RtpFlag {
 	StartOfFrame = 0x4,
 }
 
+#[derive(Debug)]
+#[repr(C)]
 struct VideoFrameHeader {
 	header_type: u8,
 	padding1: u16,
@@ -28,6 +30,8 @@ impl VideoFrameHeader {
 	}
 }
 
+#[derive(Debug)]
+#[repr(C)]
 struct NvVideoPacket {
 	stream_packet_index: u32,
 	frame_index: u32,
@@ -221,12 +225,7 @@ fn encode_packet(
 	stream_start_time: std::time::Instant,
 ) -> Result<(), ()> {
 	// Random padding, because we need it.
-	const PADDING: usize = 4;
-
-	// Generating more than 100 data shards causes more than 255 parity shards if fec_percentage is 255.
-	// This is a problem for FEC, so we start splitting into multiple blocks at this threshold.
-	// The threshold represents a number of data shards that we will be sending.
-	const MULTI_FEC_THRESHOLD: usize = 90;
+	const PADDING: u32 = 0;
 
 	let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
 
@@ -243,69 +242,77 @@ fn encode_packet(
 	video_frame_header.serialize(&mut buffer);
 	let packet_data = [&buffer, packet.data()].concat();
 
-	// The part of a data shard that contains the payload.
 	let requested_shard_payload_size = requested_packet_size - std::mem::size_of::<NvVideoPacket>();
 
 	// The total size of a shard.
-	let requested_shard_size = requested_shard_payload_size + std::mem::size_of::<RtpHeader>() + PADDING + std::mem::size_of::<NvVideoPacket>();
+	let requested_shard_size =
+		std::mem::size_of::<RtpHeader>()
+		+ std::mem::size_of_val(&PADDING)
+		+ std::mem::size_of::<NvVideoPacket>()
+		+ requested_shard_payload_size;
 
 	// Determine how many data shards we will be sending.
-	let nr_of_data_shards = packet_data.len() / requested_shard_payload_size + (packet_data.len() % requested_packet_size != 0) as usize; // TODO: Replace with div_ceil when it lands in stable (https://doc.rust-lang.org/std/primitive.i32.html#method.div_ceil).
+	let nr_data_shards = packet_data.len() / requested_shard_payload_size + (packet_data.len() % requested_shard_payload_size != 0) as usize; // TODO: Replace with div_ceil when it lands in stable (https://doc.rust-lang.org/std/primitive.i32.html#method.div_ceil).
+	assert!(nr_data_shards != 0);
 
-	// If the number of data shards exceeds the threshold, split it up into three groups.
-	let block_assignment;
-	let last_block_index: u8;
-	if nr_of_data_shards > MULTI_FEC_THRESHOLD {
-		let data_shards_per_block = nr_of_data_shards / 3;
+	// Determine how many parity and data shards are permitted per FEC block.
+	let nr_parity_shards_per_block = reed_solomon::MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
+	let nr_data_shards_per_block = reed_solomon::MAX_SHARDS - nr_parity_shards_per_block;
 
-		// This defines the thresholds where data shards should be assigned.
-		block_assignment = vec![
-			data_shards_per_block,
-			data_shards_per_block * 2,
-			nr_of_data_shards, // Until the last data shard in this block.
-		];
+	// We need to subtract number of data shards by 1, otherwise you can get a situation where
+	// there are for example 100 data shards allowed per block and also 100 data shards available.
+	// In this case, nr_blocks = 100 / 100 + 1 = 2, but we only need to send 1 block.
+	// Subtracting the value of nr_data_shards by 1 avoids this situation.
+	let nr_blocks = (nr_data_shards - 1) / nr_data_shards_per_block + 1;
+	let last_block_index = (nr_blocks.min(4) as u8 - 1) << 6; // TODO: Why the bit shift? To 'force' a limit of 4 blocks?
 
-		last_block_index = 2 << 6; // TODO: What is this?
-	} else {
-		block_assignment = vec![nr_of_data_shards];
+	log::trace!("Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block.");
+	log::trace!("Sending {nr_blocks} blocks of video data.");
 
-		last_block_index = 0;
-	}
+	for block_index in 0..nr_blocks {
+		// Determine what data shards are in this block.
+		let start = block_index * nr_data_shards_per_block;
+		let mut end = ((block_index + 1) * nr_data_shards_per_block)
+			.min(nr_data_shards);
 
-	let mut absolute_data_shard_index = 0usize;
-	for (block_index, block_threshold) in block_assignment.into_iter().enumerate() {
-		let nr_data_shards = block_threshold - absolute_data_shard_index;
-		let mut nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-			.max(minimum_fec_packets as usize);
-		let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
-		let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
-
-		let encoder = reed_solomon::ReedSolomon::new(nr_data_shards, nr_parity_shards);
-		if let Err(e) = &encoder {
-			log::debug!("Couldn't create error correction: {e}");
-			nr_parity_shards = 0;
+		if block_index >= 4 {
+			log::info!("Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC.");
+			end = nr_data_shards;
 		}
 
-		for data_shard_index in absolute_data_shard_index..block_threshold {
+		// Compute how many parity shards we will need (approximately) in this block.
+		let nr_data_shards = end - start;
+		assert!(nr_data_shards != 0);
+
+		let mut nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
+			.max(minimum_fec_packets as usize) // Lower limit by the minimum number of parity shards.
+			.min(reed_solomon::MAX_SHARDS.saturating_sub(nr_data_shards)); // But hard total upper limit in the number of shards.
+
+		// Create the FEC encoder for this amount of shards.
+		let encoder = if nr_parity_shards > 0 {
+			let encoder = reed_solomon::ReedSolomon::new(nr_data_shards, nr_parity_shards);
+			if let Err(e) = &encoder {
+				log::debug!("Couldn't create error correction for block {block_index}: {e}");
+				nr_parity_shards = 0;
+			}
+			encoder
+		} else {
+			Err("Can't create an FEC encoder for 0 parity shards.".to_string())
+		};
+
+		// Recompute the actual FEC percentage in case of a rounding error or when there are 0 parity shards.
+		let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
+
+		log::trace!("Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards.");
+
+		let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
+		for (block_shard_index, data_shard_index) in (start..end).enumerate() {
+			// Determine which part of the payload is in this shard.
 			let start = data_shard_index * requested_shard_payload_size;
 			let end = ((data_shard_index + 1) * requested_shard_payload_size).min(packet_data.len());
 
-			// TODO: Do this without cloning.
-			let mut shard = vec![0u8; requested_shard_size];
-			shard[..(end - start)].copy_from_slice(&packet_data[start..end]);
-			shards.push(shard);
-		}
+			let mut shard = Vec::with_capacity(requested_shard_size);
 
-		for _ in 0..nr_parity_shards {
-			shards.push(vec![0u8; requested_shard_size]);
-		}
-
-		if let Ok(encoder) = encoder {
-			encoder.encode(&mut shards)
-				.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
-		}
-
-		for (index, shard) in shards.iter().enumerate() {
 			let rtp_header = RtpHeader {
 				header: 0x90, // What is this?
 				packet_type: 0,
@@ -313,6 +320,8 @@ fn encode_packet(
 				timestamp,
 				ssrc: 0,
 			};
+			rtp_header.serialize(&mut shard);
+			shard.extend(PADDING.to_le_bytes());
 
 			let mut video_packet_header = NvVideoPacket {
 				stream_packet_index: *sequence_number << 8,
@@ -321,31 +330,66 @@ fn encode_packet(
 				reserved: 0,
 				multi_fec_flags: 0x10,
 				multi_fec_blocks: ((block_index as u8) << 4) | last_block_index,
-				fec_info: (index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
+				fec_info: (block_shard_index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
 			};
-			if index == 0 {
+			if block_shard_index == 0 {
 				video_packet_header.flags |= RtpFlag::StartOfFrame as u8;
 			}
-			if index == nr_data_shards - 1 {
+			if block_shard_index == nr_data_shards - 1 {
 				video_packet_header.flags |= RtpFlag::EndOfFrame as u8;
 			}
+			video_packet_header.serialize(&mut shard);
 
-			let mut packet = Vec::with_capacity(requested_packet_size);
-			rtp_header.serialize(&mut packet);
-			packet.extend(0u32.to_le_bytes()); // PADDING
-			video_packet_header.serialize(&mut packet);
-			packet.extend(&shard);
+			// Append the payload.
+			shard.extend(&packet_data[start..end]);
 
-			log::trace!("Sending packet {}/{} with size {} bytes.", index + 1, nr_data_shards + nr_parity_shards, packet.len());
-			if packet_tx.blocking_send(packet).is_err() {
-				log::info!("Channel closed, couldn't send packet.");
-				return Ok(());
+			// Pad with zeros at the end to make an equally sized shard.
+			if end - start < requested_shard_payload_size {
+				shard.extend(vec![0u8; requested_shard_payload_size - (end - start)]);
 			}
+
+			shards.push(shard);
 
 			*sequence_number += 1;
 		}
 
-		absolute_data_shard_index += nr_data_shards;
+		if let Ok(encoder) = encoder {
+			for _ in 0..nr_parity_shards {
+				shards.push(vec![0u8; requested_shard_size]);
+			}
+
+			encoder.encode(&mut shards)
+				.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
+
+			// Force these values for the parity shards, we don't need to reconstruct them, but Moonlight needs them to match with the frame they came from.
+			for (block_shard_index, shard) in shards[nr_data_shards..].iter_mut().enumerate() {
+				let rtp_header = unsafe { &mut *(shard.as_mut_ptr() as *mut RtpHeader) };
+				rtp_header.header = 0x90u8.to_be(); // The `.to_be` is redundant for u8, but is there to make it clear it should be big-endian.
+				rtp_header.sequence_number = (*sequence_number as u16).to_be();
+
+				let video_packet_header = unsafe {
+					&mut *(shard.as_mut_ptr().add(std::mem::size_of::<RtpHeader>() + std::mem::size_of_val(&PADDING)) as *mut NvVideoPacket)
+				};
+				video_packet_header.multi_fec_blocks = ((block_index as u8) << 4) | last_block_index;
+				video_packet_header.fec_info = ((nr_data_shards + block_shard_index) << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32;
+				video_packet_header.frame_index = frame_number;
+
+				*sequence_number += 1;
+			}
+		}
+
+		for (index, shard) in shards.into_iter().enumerate() {
+			log::trace!("Sending shard {}/{} with size {} bytes.", index + 1, nr_data_shards + nr_parity_shards, shard.len());
+			if packet_tx.blocking_send(shard).is_err() {
+				log::info!("Channel closed, couldn't send packet.");
+				return Ok(());
+			}
+		}
+
+		// At this point we should have sent all the data shards in the last block, so we can break the loop.
+		if block_index == 3 {
+			break;
+		}
 	}
 
 	Ok(())

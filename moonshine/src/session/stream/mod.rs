@@ -8,6 +8,8 @@ mod audio;
 mod control;
 mod video;
 
+#[derive(Debug)]
+#[repr(C)]
 struct RtpHeader {
 	header: u8,
 	packet_type: u8,

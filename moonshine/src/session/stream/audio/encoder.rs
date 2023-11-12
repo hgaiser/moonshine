@@ -4,22 +4,14 @@ use tokio::sync::mpsc;
 
 use crate::{session::{stream::RtpHeader, SessionKeys}, crypto::encrypt};
 
+#[derive(Debug)]
+#[repr(C)]
 struct AudioFecHeader {
 	pub shard_index: u8,
 	pub payload_type: u8,
 	pub base_sequence_number: u16,
 	pub base_timestamp: u32,
 	pub ssrc: u32,
-}
-
-impl AudioFecHeader {
-	fn serialize(&self, buffer: &mut Vec<u8>) {
-		buffer.extend(self.shard_index.to_be_bytes());
-		buffer.extend(self.payload_type.to_be_bytes());
-		buffer.extend(self.base_sequence_number.to_be_bytes());
-		buffer.extend(self.base_timestamp.to_be_bytes());
-		buffer.extend(self.ssrc.to_be_bytes());
-	}
 }
 
 enum AudioEncoderCommand {
@@ -80,7 +72,7 @@ impl AudioEncoderInner {
 		const NR_DATA_SHARDS: usize = 4;
 		const NR_PARITY_SHARDS: usize = 2;
 		const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
-		const MAX_BLOCK_SIZE: usize = ((2048 + 15) / 16) * 16; // Where does this come from?
+		const MAX_SHARD_SIZE: usize = ((2048 + 15) / 16) * 16; // Where does this come from?
 		let mut fec_encoder = reed_solomon::ReedSolomon::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
 			.map_err(|e| log::error!("Failed to create FEC encoder: {e}"))?;
 
@@ -92,18 +84,11 @@ impl AudioEncoderInner {
 		// Source: https://github.com/moonlight-stream/moonlight-common-c/blob/5de4a5b85a28d8d639482a1a105c3a06eb67a2fd/src/RtpAudioQueue.c#L57
 		fec_encoder.set_parity_matrix([0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c]);
 
-		let mut shards: [Vec<u8>; NR_TOTAL_SHARDS] = Default::default();
-		for shard in shards.iter_mut() {
-			shard.extend(std::iter::repeat(0).take(MAX_BLOCK_SIZE));
-		}
+		let mut shards = vec![vec![0u8; MAX_SHARD_SIZE]; NR_TOTAL_SHARDS];
 
-		let mut fec_header = AudioFecHeader {
-			shard_index: 0u8,
-			payload_type: 97,
-			base_sequence_number: 0u16,
-			base_timestamp: 0,
-			ssrc: 0,
-		};
+		// These values will be used for the parity shards, but they need to be copied from the first data shard.
+		let mut base_sequence_number = 0u16;
+		let mut base_timestamp = 0u32;
 
 		loop {
 			tokio::select! {
@@ -129,11 +114,14 @@ impl AudioEncoderInner {
 					let encoded = match encoder.encode_vec(&audio_fragment, 1_000_000) {
 						Ok(encoded) => encoded,
 						Err(e) => {
-							log::warn!("Failed to encode audio payload: {e}");
+							log::warn!("Failed to encode audio: {e}");
+							let _ = encoder.reset_state().map_err(|e| log::error!("Failed to reset Opus encoder state: {e}"));
 							continue;
 						}
 					};
 
+					// Encrypt the audio data.
+					// TODO: Check if we should, some clients (ie. Steam Link) don't support this.
 					let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
 					let mut iv = iv.to_be_bytes().to_vec();
 					iv.extend([0u8; 12]);
@@ -145,65 +133,83 @@ impl AudioEncoderInner {
 						},
 					};
 
-					let rtp_header = RtpHeader {
-						header: 0x80, // What is this?
-						packet_type: 97, // RTP_PAYLOAD_TYPE_AUDIO
-						sequence_number,
-						timestamp,
-						ssrc: 0,
-					};
+					let shard = &mut shards[sequence_number as usize % NR_DATA_SHARDS];
+
+					{
+						// Set the RTP header in the memory of the shard.
+						let mut rtp_header = unsafe { &mut *(shard.as_mut_ptr() as *mut RtpHeader) };
+						rtp_header.header = 0x80u8.to_be(); // What is this?
+						rtp_header.packet_type = 97u8.to_be(); // RTP_PAYLOAD_TYPE_AUDIO
+						rtp_header.sequence_number = sequence_number.to_be();
+						rtp_header.timestamp = timestamp.to_be();
+						rtp_header.ssrc = 0;
+
+						// For FEC, copy the sequence number and timestamp of the first of the sequence of audio packets.
+						if sequence_number as usize % NR_DATA_SHARDS == 0 {
+							// Copy some values, but note that they are big-endian (as expected by Moonlight).
+							base_sequence_number = rtp_header.sequence_number;
+							base_timestamp = rtp_header.timestamp;
+						}
+					}
+
 					sequence_number += 1;
 
-					let mut buffer = Vec::with_capacity(
-						std::mem::size_of::<RtpHeader>()
-						+ payload.len()
-					);
-					rtp_header.serialize(&mut buffer);
-					buffer.extend(payload.clone());
+					// Copy the payload to the shard.
+					unsafe {
+						std::ptr::copy_nonoverlapping(
+							payload.as_ptr(),
+							shard.as_mut_ptr().add(std::mem::size_of::<RtpHeader>()),
+							payload.len()
+						);
+					}
 
-					// log::debug!("Sending audio packet of {} bytes.", buffer.len());
-					if packet_tx.send(buffer).await.is_err() {
+					// Crop the shard to the length that we want to send it.
+					let data_shard_size = std::mem::size_of::<RtpHeader>() + payload.len();
+					let data_shard = shard[..data_shard_size].to_vec(); // TODO: Can we avoid this copy?
+
+					if packet_tx.send(data_shard).await.is_err() {
 						log::debug!("Failed to send packet over channel, channel is likely closed.");
 						return Ok::<(), ()>(());
 					}
 
-					// For FEC, copy the sequence number and timestamp of the first of the sequence of audio packets.
-					if (sequence_number - 1) as usize % NR_DATA_SHARDS == 0 {
-						fec_header.base_sequence_number = sequence_number - 1;
-						fec_header.base_timestamp = timestamp;
-					}
-
-					// Copy the audio into the list of (data) shards.
-					shards[(sequence_number - 1) as usize % NR_DATA_SHARDS][..payload.len()].copy_from_slice(&payload);
-
 					// If the last packet, compute and send parity shards.
 					if sequence_number as usize % NR_DATA_SHARDS == 0 {
-						if let Err(e) = fec_encoder.encode_fixed_length(&mut shards, payload.len()) {
+						if let Err(e) = fec_encoder.encode_fixed_length(&mut shards, data_shard_size) {
 							log::error!("Failed to create FEC block for audio: {e}");
 							continue;
 						}
 
-						for shard_index in 0u8..NR_PARITY_SHARDS as u8 {
-							let rtp_header = RtpHeader {
-								header: 0x80,
-								packet_type: 127,
-								sequence_number: sequence_number + shard_index as u16,
-								timestamp: 0,
-								ssrc: 0,
-							};
+						for (shard_index, shard) in shards[NR_DATA_SHARDS..].iter_mut().enumerate() {
+							{
+								let mut rtp_header = unsafe { &mut *(shard.as_mut_ptr() as *mut RtpHeader) };
+								rtp_header.sequence_number = (sequence_number + shard_index as u16).to_be();
+								rtp_header.packet_type = 127u8.to_be();
+								rtp_header.timestamp = 0u32.to_be();
+								rtp_header.ssrc = 0u32.to_be();
+							}
 
-							fec_header.shard_index = shard_index;
+							// Make room for the AudioFecHeader by moving the payload back.
+							unsafe {
+								std::ptr::copy(
+									shard.as_mut_ptr().add(std::mem::size_of::<RtpHeader>()),
+									shard.as_mut_ptr().add(std::mem::size_of::<RtpHeader>() + std::mem::size_of::<AudioFecHeader>()),
+									payload.len()
+								);
+							}
 
-							let shard_size = std::mem::size_of::<RtpHeader>()
-								+ std::mem::size_of::<AudioFecHeader>()
-								+ payload.len();
-							let mut buffer = Vec::with_capacity(shard_size);
-							rtp_header.serialize(&mut buffer);
-							fec_header.serialize(&mut buffer);
-							buffer.extend(&shards[(NR_DATA_SHARDS as u8 + shard_index) as usize][..payload.len()]);
+							{
+								let mut fec_header = unsafe { &mut *(shard.as_mut_ptr().add(std::mem::size_of::<RtpHeader>()) as *mut AudioFecHeader) };
+								fec_header.shard_index = (shard_index as u8).to_be();
+								fec_header.payload_type = 97u8.to_be();
+								fec_header.base_sequence_number = base_sequence_number; // Already in big-endian
+								fec_header.base_timestamp = base_timestamp; // Already in big-endian
+								fec_header.ssrc = 0u32;
+							}
 
-							// log::debug!("Sending audio FEC packet of {} bytes.", buffer.len());
-							if packet_tx.send(buffer).await.is_err() {
+							let parity_shard_size = std::mem::size_of::<RtpHeader>() + std::mem::size_of::<AudioFecHeader>() + payload.len();
+							let parity_shard = shard[..parity_shard_size].to_vec(); // TODO: Can we avoid this copy?
+
+							if packet_tx.send(parity_shard).await.is_err() {
 								log::debug!("Failed to send packet over channel, channel is likely closed.");
 								return Ok::<(), ()>(());
 							}
