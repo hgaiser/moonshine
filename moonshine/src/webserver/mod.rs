@@ -172,7 +172,6 @@ impl Webserver {
 		let mut buffer = Vec::new();
 		let mut writer = EmitterConfig::new()
 			.write_document_declaration(true)
-			.perform_indent(true)
 			.create_writer(&mut buffer);
 
 		writer.write(XmlEvent::start_element("root")
@@ -238,7 +237,6 @@ impl Webserver {
 		let mut buffer = Vec::new();
 		let mut writer = EmitterConfig::new()
 			.write_document_declaration(true)
-			.perform_indent(true)
 			.create_writer(&mut buffer);
 
 		// TODO: Check the use of some of these values, we leave most of them blank and Moonlight doesn't care.
@@ -492,7 +490,6 @@ impl Webserver {
 		let mut buffer = Vec::new();
 		let mut writer = EmitterConfig::new()
 			.write_document_declaration(true)
-			.perform_indent(true)
 			.create_writer(&mut buffer);
 
 		writer.write(XmlEvent::start_element("root")
@@ -572,7 +569,6 @@ impl Webserver {
 		let mut buffer = Vec::new();
 		let mut writer = EmitterConfig::new()
 			.write_document_declaration(true)
-			.perform_indent(true)
 			.create_writer(&mut buffer);
 
 		writer.write(XmlEvent::start_element("root")
@@ -599,7 +595,6 @@ impl Webserver {
 		let mut buffer = Vec::new();
 		let mut writer = EmitterConfig::new()
 			.write_document_declaration(true)
-			.perform_indent(true)
 			.create_writer(&mut buffer);
 
 		// TODO: Check the use of some of these values, we leave most of them blank and Moonlight doesn't care.

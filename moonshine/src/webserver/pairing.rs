@@ -145,7 +145,6 @@ async fn get_server_cert(
 	let mut buffer = Vec::new();
 	let mut writer = EmitterConfig::new()
 		.write_document_declaration(true)
-		.perform_indent(true)
 		.create_writer(&mut buffer);
 
 	writer.write(XmlEvent::start_element("root")
@@ -215,7 +214,6 @@ async fn client_challenge(
 	let mut buffer = Vec::new();
 	let mut writer = EmitterConfig::new()
 		.write_document_declaration(true)
-		.perform_indent(true)
 		.create_writer(&mut buffer);
 
 	writer.write(XmlEvent::start_element("root")
@@ -278,7 +276,6 @@ async fn server_challenge_response(
 	let mut buffer = Vec::new();
 	let mut writer = EmitterConfig::new()
 		.write_document_declaration(true)
-		.perform_indent(true)
 		.create_writer(&mut buffer);
 
 	writer.write(XmlEvent::start_element("root")
@@ -321,7 +318,6 @@ async fn pair_challenge(
 	let mut buffer = Vec::new();
 	let mut writer = EmitterConfig::new()
 		.write_document_declaration(true)
-		.perform_indent(true)
 		.create_writer(&mut buffer);
 
 	writer.write(XmlEvent::start_element("root")
@@ -379,7 +375,6 @@ async fn client_pairing_secret(
 	let mut buffer = Vec::new();
 	let mut writer = EmitterConfig::new()
 		.write_document_declaration(true)
-		.perform_indent(true)
 		.create_writer(&mut buffer);
 
 	writer.write(XmlEvent::start_element("root")
