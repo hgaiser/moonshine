@@ -260,7 +260,7 @@ impl Webserver {
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("HttpsPort")).unwrap();
-		writer.write(XmlEvent::characters("")).unwrap();
+		writer.write(XmlEvent::characters(&self.config.webserver.port_https.to_string())).unwrap();
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("ExternalPort")).unwrap();
@@ -494,6 +494,10 @@ impl Webserver {
 
 		writer.write(XmlEvent::start_element("root")
 			.attr("status_code", "200")).unwrap();
+
+		writer.write(XmlEvent::start_element("gamesession")).unwrap();
+		writer.write(XmlEvent::characters("1")).unwrap();
+		writer.write(XmlEvent::end_element()).unwrap();
 
 		// TODO: Return sessionUrl0.
 
