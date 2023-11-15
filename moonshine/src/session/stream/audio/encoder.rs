@@ -94,6 +94,7 @@ impl AudioEncoderInner {
 			tokio::select! {
 				command = command_rx.recv() => {
 					let Some(command) = command else {
+						log::debug!("Command channel closed.");
 						break;
 					};
 
@@ -107,6 +108,7 @@ impl AudioEncoderInner {
 
 				audio_fragment = audio_rx.recv() => {
 					let Some(audio_fragment) = audio_fragment else {
+						log::debug!("Audio fragment channel closed.");
 						break;
 					};
 
@@ -137,7 +139,7 @@ impl AudioEncoderInner {
 
 					{
 						// Set the RTP header in the memory of the shard.
-						let mut rtp_header = unsafe { &mut *(shard.as_mut_ptr() as *mut RtpHeader) };
+						let rtp_header = unsafe { &mut *(shard.as_mut_ptr() as *mut RtpHeader) };
 						rtp_header.header = 0x80u8.to_be(); // What is this?
 						rtp_header.packet_type = 97u8.to_be(); // RTP_PAYLOAD_TYPE_AUDIO
 						rtp_header.sequence_number = sequence_number.to_be();
@@ -169,7 +171,7 @@ impl AudioEncoderInner {
 
 					if packet_tx.send(data_shard).await.is_err() {
 						log::debug!("Failed to send packet over channel, channel is likely closed.");
-						return Ok::<(), ()>(());
+						break;
 					}
 
 					// If the last packet, compute and send parity shards.
@@ -181,7 +183,7 @@ impl AudioEncoderInner {
 
 						for (shard_index, shard) in shards[NR_DATA_SHARDS..].iter_mut().enumerate() {
 							{
-								let mut rtp_header = unsafe { &mut *(shard.as_mut_ptr() as *mut RtpHeader) };
+								let rtp_header = unsafe { &mut *(shard.as_mut_ptr() as *mut RtpHeader) };
 								rtp_header.sequence_number = (sequence_number + shard_index as u16).to_be();
 								rtp_header.packet_type = 127u8.to_be();
 								rtp_header.timestamp = 0u32.to_be();
@@ -198,7 +200,7 @@ impl AudioEncoderInner {
 							}
 
 							{
-								let mut fec_header = unsafe { &mut *(shard.as_mut_ptr().add(std::mem::size_of::<RtpHeader>()) as *mut AudioFecHeader) };
+								let fec_header = unsafe { &mut *(shard.as_mut_ptr().add(std::mem::size_of::<RtpHeader>()) as *mut AudioFecHeader) };
 								fec_header.shard_index = (shard_index as u8).to_be();
 								fec_header.payload_type = 97u8.to_be();
 								fec_header.base_sequence_number = base_sequence_number; // Already in big-endian
@@ -211,7 +213,7 @@ impl AudioEncoderInner {
 
 							if packet_tx.send(parity_shard).await.is_err() {
 								log::debug!("Failed to send packet over channel, channel is likely closed.");
-								return Ok::<(), ()>(());
+								break;
 							}
 						}
 					}

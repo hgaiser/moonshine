@@ -85,7 +85,7 @@ impl Webserver {
 					Ok::<(), ()>(())
 				})).await;
 
-				log::debug!("HTTP server shutting down, likely due to shutdown.");
+				log::debug!("HTTP server shutting down.");
 			}
 		});
 
@@ -131,7 +131,7 @@ impl Webserver {
 					Ok::<(), ()>(())
 				})).await;
 
-				log::debug!("HTTPS server shutting down, likely due to shutdown.");
+				log::debug!("HTTPS server shutting down.");
 			}
 		});
 

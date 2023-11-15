@@ -55,7 +55,7 @@ impl RtspServer {
 					}
 				})).await;
 
-				log::debug!("RTSP server closing, likely due to shutdown.");
+				log::debug!("RTSP server shutting down.");
 			}
 		});
 

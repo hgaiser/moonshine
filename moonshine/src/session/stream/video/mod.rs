@@ -124,7 +124,7 @@ impl VideoStreamInner {
 				}
 			}
 
-			log::debug!("Connection closed.");
+			log::debug!("Stopping video stream.");
 		});
 
 		let mut started_streaming = false;

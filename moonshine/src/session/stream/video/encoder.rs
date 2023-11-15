@@ -140,11 +140,17 @@ impl Encoder {
 			{
 				log::trace!("Waiting for new frame.");
 				// Wait for a new frame.
-				let mut lock = notifier.wait(intermediate_buffer.lock().unwrap())
+				let mut result = notifier.wait_timeout(intermediate_buffer.lock().unwrap(), std::time::Duration::from_millis(500))
 					.map_err(|e| log::error!("Failed to wait for new frame: {e}"))?;
+
+				// Didn't get a lock, let's check shutdown status and try again.
+				if result.1.timed_out() {
+					continue;
+				}
+
 				log::trace!("Received notification of new frame.");
 
-				std::mem::swap(&mut *lock, &mut encoder_buffer);
+				std::mem::swap(&mut *result.0, &mut encoder_buffer);
 			}
 			log::trace!("Swapped new frame with old frame.");
 			frame_number += 1;
@@ -208,7 +214,6 @@ impl Encoder {
 		}
 
 		log::debug!("Received stop signal.");
-
 		Ok(())
 	}
 }

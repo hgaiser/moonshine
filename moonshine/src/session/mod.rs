@@ -148,6 +148,7 @@ impl SessionInner {
 			}
 		}
 
+		let _ = stop_signal.trigger_shutdown(());
 		log::debug!("Command channel closed.");
 	}
 }
