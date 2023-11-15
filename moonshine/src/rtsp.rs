@@ -22,7 +22,7 @@ impl RtspServer {
 		tokio::spawn({
 			let server = server.clone();
 			async move {
-				let _ = shutdown.wrap_trigger_shutdown(3, shutdown.wrap_cancel({
+				let _ = shutdown.wrap_cancel(shutdown.wrap_trigger_shutdown(3, {
 					let server = server.clone();
 					async move {
 						let address = (config.address.as_str(), config.stream.port).to_socket_addrs()

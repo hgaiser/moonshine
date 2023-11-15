@@ -39,7 +39,12 @@ impl AudioStream {
 	) -> Self {
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioStreamInner { capture: None, encoder: None };
-		tokio::spawn(inner.run(config, context, command_rx, stop_signal));
+		tokio::spawn(stop_signal.wrap_cancel(stop_signal.wrap_trigger_shutdown((), inner.run(
+			config,
+			context,
+			command_rx,
+			stop_signal.clone(),
+		))));
 
 		AudioStream { command_tx }
 	}

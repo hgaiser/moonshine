@@ -41,7 +41,12 @@ impl VideoStream {
 	pub fn new(config: Config, context: VideoStreamContext, stop_signal: ShutdownManager<()>) -> Self {
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = VideoStreamInner { };
-		tokio::spawn(inner.run(config, context, command_rx, stop_signal));
+		tokio::spawn(stop_signal.wrap_cancel(stop_signal.wrap_trigger_shutdown((), inner.run(
+			config,
+			context,
+			command_rx,
+			stop_signal.clone()
+		))));
 
 		Self { command_tx }
 	}

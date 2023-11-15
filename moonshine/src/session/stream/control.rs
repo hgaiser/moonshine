@@ -143,15 +143,16 @@ impl ControlStream {
 		let inner = ControlStreamInner { };
 		tokio::task::spawn_blocking({
 			move || {
-				tokio::runtime::Handle::current().block_on(inner.run(
-					config,
-					command_rx,
-					video_stream,
-					audio_stream,
-					context,
-					enet,
-					stop_signal,
-				))
+				tokio::runtime::Handle::current().block_on(
+					stop_signal.wrap_cancel(stop_signal.wrap_trigger_shutdown((), inner.run(
+						config,
+						command_rx,
+						video_stream,
+						audio_stream,
+						context,
+						enet,
+					)))
+				)
 			}
 		});
 
@@ -177,7 +178,6 @@ impl ControlStreamInner {
 		audio_stream: AudioStream,
 		mut context: SessionContext,
 		enet: Enet,
-		stop_signal: ShutdownManager<()>,
 	) -> Result<(), ()> {
 		let local_addr = Address::new(
 			config.address.parse()
@@ -197,11 +197,6 @@ impl ControlStreamInner {
 		log::debug!("Listening for control messages on {:?}", host.address());
 
 		loop {
-			if stop_signal.is_shutdown_triggered() {
-				log::debug!("Stopping due to stop signal triggered.");
-				break;
-			}
-
 			// Check if we received a command.
 			let command = command_rx.try_recv();
 			match command {
@@ -281,6 +276,7 @@ impl ControlStreamInner {
 			}
 		}
 
+		log::debug!("Control stream closing.");
 		Ok(())
 	}
 }
