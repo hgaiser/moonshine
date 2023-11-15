@@ -20,6 +20,11 @@ impl FrameCapturer {
 		Ok(Self { capturer })
 	}
 
+	pub fn status(&self) -> Result<nvfbc::Status, ()>{
+		self.capturer.status()
+			.map_err(|e| log::error!("Failed to get NvFBC status: {e}"))
+	}
+
 	pub fn run(
 		mut self,
 		framerate: u32,

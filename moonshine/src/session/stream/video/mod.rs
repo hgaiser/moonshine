@@ -61,7 +61,7 @@ impl VideoStreamInner {
 	async fn run(
 		self,
 		config: Config,
-		context: VideoStreamContext,
+		mut context: VideoStreamContext,
 		mut command_rx: mpsc::Receiver<VideoStreamCommand>,
 		stop_signal: ShutdownManager<()>,
 	) -> Result<(), ()> {
@@ -147,6 +147,16 @@ impl VideoStreamInner {
 						.map_err(|e| log::error!("Failed to initialize CUDA context: {e}"))?;
 
 					let capturer = FrameCapturer::new()?;
+					let status = capturer.status()?;
+					if status.screen_size.w != context.width || status.screen_size.h != context.height {
+						// TODO: Resize the CUDA buffer to the requested size?
+						log::warn!(
+							"Client asked for resolution {}x{}, but we are generating a resolution of {}x{}.",
+							context.width, context.height, status.screen_size.w, status.screen_size.h
+						);
+						context.width = status.screen_size.w;
+						context.height = status.screen_size.h;
+					}
 
 					let mut encoder = Encoder::new(
 						&cuda_context,
