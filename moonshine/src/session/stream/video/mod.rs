@@ -161,7 +161,7 @@ impl VideoStreamInner {
 					let encoder_buffer = create_frame(context.width, context.height, ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA, &mut encoder.hw_frame_context)?;
 					let notifier = Arc::new(std::sync::Condvar::new());
 
-					std::thread::spawn({
+					let capture_thread = std::thread::Builder::new().name("video-capture".to_string()).spawn({
 						let intermediate_buffer = intermediate_buffer.clone();
 						let notifier = notifier.clone();
 						let context = context.clone();
@@ -178,8 +178,12 @@ impl VideoStreamInner {
 							)
 						}
 					});
+					if let Err(e) = capture_thread {
+						log::error!("Failed to start video capture thread: {e}");
+						continue;
+					}
 
-					std::thread::spawn({
+					let encode_thread = std::thread::Builder::new().name("video-encode".to_string()).spawn({
 						let packet_tx = packet_tx.clone();
 						let notifier = notifier.clone();
 						let idr_frame_request_rx = idr_frame_request_tx.subscribe();
@@ -199,6 +203,10 @@ impl VideoStreamInner {
 							)
 						}
 					});
+					if let Err(e) = encode_thread {
+						log::error!("Failed to video encoding thread: {e}");
+						continue;
+					}
 
 					started_streaming = true;
 				},

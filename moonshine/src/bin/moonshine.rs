@@ -18,6 +18,21 @@ async fn main() -> Result<(), ()> {
 		.format_timestamp_millis()
 		.init();
 
+	#[cfg(feature = "task-metrics")]
+	{
+		// Print runtime metrics every half second.
+		let metrics = tokio::runtime::Handle::current().metrics();
+
+		{
+			tokio::spawn(async move {
+				loop {
+					log::info!("Active tasks: {}, num workers: {}", metrics.active_tasks_count(), metrics.num_workers());
+					tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+				}
+			});
+		}
+	}
+
 	let args = Args::parse();
 
 	let config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
