@@ -595,6 +595,10 @@ impl Webserver {
 
 		// TODO: Return sessionUrl0.
 
+		writer.write(XmlEvent::start_element("resume")).unwrap();
+		writer.write(XmlEvent::characters("1")).unwrap();
+		writer.write(XmlEvent::end_element()).unwrap();
+
 		// </root>
 		writer.write(XmlEvent::end_element()).unwrap();
 
