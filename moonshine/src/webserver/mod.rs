@@ -1,9 +1,10 @@
-use std::{net::ToSocketAddrs, collections::HashMap, convert::Infallible};
+use std::{net::{ToSocketAddrs, IpAddr}, collections::HashMap, convert::Infallible};
 
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
 use hyper::{service::service_fn, Response, Request, body::Bytes, StatusCode, header, Method};
 use hyper_util::rt::TokioIo;
+use network_interface::NetworkInterfaceConfig;
 use openssl::x509::X509;
 use tokio::net::TcpListener;
 use xml::{EmitterConfig, writer::XmlEvent};
@@ -67,6 +68,12 @@ impl Webserver {
 							.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
 						log::trace!("Accepted connection from {address}.");
 
+						let mac_address = if let Ok(local_address) = connection.local_addr() {
+							get_mac_address(local_address.ip()).unwrap_or(None)
+						} else {
+							None
+						};
+
 						let io = TokioIo::new(connection);
 
 						tokio::spawn({
@@ -74,7 +81,7 @@ impl Webserver {
 							async move {
 								let _ = hyper::server::conn::http1::Builder::new()
 									.serve_connection(io, service_fn(|request| {
-										server.serve(request)
+										server.serve(request, mac_address.clone())
 									})).await;
 							}
 						});
@@ -107,11 +114,18 @@ impl Webserver {
 					loop {
 						let (connection, address) = listener.accept().await
 							.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
+						log::trace!("Accepted TLS connection from {address}.");
+
+						let mac_address = if let Ok(local_address) = connection.local_addr() {
+							get_mac_address(local_address.ip()).unwrap_or(None)
+						} else {
+							None
+						};
+
 						let connection = match acceptor.accept(connection).await {
 							Ok(connection) => connection,
 							Err(()) => continue,
 						};
-						log::trace!("Accepted TLS connection from {address}.");
 
 						let io = TokioIo::new(connection);
 
@@ -120,7 +134,7 @@ impl Webserver {
 							async move {
 								let _ = hyper::server::conn::http1::Builder::new()
 									.serve_connection(io, service_fn(|request| {
-										server.serve(request)
+										server.serve(request, mac_address.clone())
 									})).await;
 							}
 						});
@@ -138,7 +152,7 @@ impl Webserver {
 		Ok(server)
 	}
 
-	async fn serve(&self, request: Request<hyper::body::Incoming>) -> Result<Response<Full<Bytes>>, Infallible> {
+	async fn serve(&self, request: Request<hyper::body::Incoming>, mac_address: Option<String>) -> Result<Response<Full<Bytes>>, Infallible> {
 		let params = request.uri()
 			.query()
 			.map(|v| {
@@ -151,7 +165,7 @@ impl Webserver {
 		log::info!("Received {} request for {}.", request.method(), request.uri().path());
 
 		let response = match (request.method(), request.uri().path()) {
-			(&Method::GET, "/serverinfo") => self.server_info(params).await,
+			(&Method::GET, "/serverinfo") => self.server_info(params, mac_address).await,
 			(&Method::GET, "/applist") => self.app_list(),
 			(&Method::GET, "/pair") => handle_pair_request(params, &self.server_certs, &self.client_manager).await,
 			(&Method::GET, "/pin") => self.pin(params).await,
@@ -208,6 +222,7 @@ impl Webserver {
 	async fn server_info(
 		&self,
 		params: HashMap<String, String>,
+		mac_address: Option<String>,
 	) -> Response<Full<Bytes>> {
 		let unique_id = match params.get("uniqueid") {
 			Some(unique_id) => unique_id.clone(),
@@ -268,7 +283,7 @@ impl Webserver {
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("mac")).unwrap();
-		writer.write(XmlEvent::characters("")).unwrap();
+		writer.write(XmlEvent::characters(&mac_address.unwrap_or("".to_string()))).unwrap();
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("MaxLumaPixelsHEVC")).unwrap();
@@ -630,4 +645,21 @@ fn not_found() -> Response<Full<Bytes>> {
 		.status(StatusCode::NOT_FOUND)
 		.body(Full::new(Bytes::from("NOT FOUND")))
 		.unwrap()
+}
+
+fn get_mac_address(address: IpAddr) -> Result<Option<String>, ()> {
+	let interfaces = network_interface::NetworkInterface::show()
+		.map_err(|e| log::error!("Failed to retrieve network interfaces: {e}"))?;
+
+	for interface in interfaces {
+		for interface_address in interface.addr {
+			if interface_address.ip() == address {
+				log::debug!("Found MAC address for address {:?}: {:?}", address, interface.mac_addr.as_ref().unwrap_or(&"None".to_string()));
+				return Ok(interface.mac_addr);
+			}
+		}
+	}
+
+	log::warn!("No interface found matching address {:?}", address);
+	Ok(None)
 }

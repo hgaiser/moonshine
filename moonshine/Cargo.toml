@@ -21,6 +21,7 @@ hyper-util = { git = "https://github.com/hyperium/hyper-util.git" }
 image = "0.24.7"
 log = "0.4.20"
 memmap = "0.7.0"
+network-interface = "1.1.1"
 nvfbc = "0.1.2"
 openssl = "0.10.57"
 opus = "0.3.0"
