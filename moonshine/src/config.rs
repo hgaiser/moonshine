@@ -67,14 +67,50 @@ pub struct StreamConfig {
 	pub control: ControlStreamConfig,
 }
 
+// pub trait AsStr {
+// 	fn as_str(&self) -> &str;
+// }
+
+// /// Supported codecs for h264 encoding.
+// #[derive(Clone, Debug, Deserialize)]
+// #[serde(rename_all = "snake_case")]
+// pub enum H264Codec {
+// 	Nvenc,
+// }
+
+// impl AsStr for &H264Codec {
+// 	fn as_str(&self) -> &str {
+// 		match self {
+// 			H264Codec::Nvenc => "h264_nvenc",
+// 		}
+// 	}
+// }
+
+// /// Supported codecs for hevc encoding.
+// #[derive(Clone, Debug, Deserialize)]
+// #[serde(rename_all = "snake_case")]
+// pub enum HevcCodec {
+// 	Nvenc,
+// }
+
+// impl AsStr for &HevcCodec {
+// 	fn as_str(&self) -> &str {
+// 		match self {
+// 			HevcCodec::Nvenc => "hevc_nvenc",
+// 		}
+// 	}
+// }
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct VideoStreamConfig {
 	/// Port to use for streaming video data.
 	pub port: u16,
 
-	// TODO: Make this an enum.
-	/// Type of codec to use.
-	pub codec: String,
+	/// Type of codec to use for h264.
+	pub codec_h264: String,
+
+	/// Type of codec to use for h264.
+	pub codec_hevc: String,
 
 	/// What percentage of data packets should be parity packets.
 	pub fec_percentage: u8,

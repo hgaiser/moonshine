@@ -63,19 +63,16 @@ impl RtspServer {
 	}
 
 	#[allow(clippy::result_unit_err)]
-	pub fn description(&self) -> Result<sdp_types::Session, ()> {
-		// TODO: Generate this based on settings.
-		sdp_types::Session::parse(b"v=0
-o=- 0 0 IN IP4 127.0.0.1
-s=No Name
-t=0 0
-a=tool:libavformat LIBAVFORMAT_VERSION
-m=video 0 RTP/AVP 96
-b=AS:2000
-a=rtpmap:96 H264/90000
-a=fmtp:96 packetization-mode=1
-a=control:streamid=0")
-			.map_err(|e| log::error!("Failed to parse SDP session: {e}"))
+	pub fn description(&self) -> String {
+		// This is a very simple SDP description, the minimal that Moonlight requires.
+		// TODO: Fill this based on server settings.
+		// TODO: Use:
+		//       "a=x-ss-general.featureFlags: <FEATURE FLAGS>"
+		//       "x-nv-video[0].refPicInvalidation=1"
+		//       "a=rtpmap:98 AV1/90000" (For AV1 support)
+		//       "a=fmtp:97 surround-params=<SURROUND PARAMS>"
+		//       "<AUDIO STREAM MAPPING>"
+		"sprop-parameter-sets=AAAAAU\na=fmtp:96 packetization-mode=1".to_string()
 	}
 
 	fn handle_options_request(&self, request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
@@ -167,30 +164,11 @@ a=control:streamid=0")
 		request: &rtsp_types::Request<Vec<u8>>,
 		cseq: i32,
 	) -> rtsp_types::Response<Vec<u8>> {
-		let mut buffer = Vec::new();
-		let description = match self.description() {
-			Ok(description) => description,
-			Err(()) => {
-				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
-			}
-		};
-		if let Err(e) = description.write(&mut buffer) {
-			log::error!("Failed to write SDP data to buffer: {}", e);
-			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
-		}
-
-		let debug = match String::from_utf8(buffer.clone()) {
-			Ok(debug) => debug,
-			Err(e) => {
-				log::error!("Failed to write SDP debug string: {e}");
-				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
-			}
-		};
-		log::trace!("SDP session data: \n{}", debug.trim());
-
+		let description = self.description();
+		log::debug!("SDP session data: \n{}", description.trim());
 		rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 			.header(headers::CSEQ, cseq.to_string())
-			.build(buffer)
+			.build(description.into_bytes())
 	}
 
 	async fn handle_announce_request(
@@ -258,6 +236,13 @@ a=control:streamid=0")
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
+		let video_format: u32 = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].bitStreamFormat") {
+			Ok(video_format) => video_format,
+			Err(()) => {
+				log::warn!("Failed to parse x-nv-vqos[0].bitStreamFormat in SDP session.");
+				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+			},
+		};
 
 		let video_stream_context = VideoStreamContext {
 			width,
@@ -267,6 +252,7 @@ a=control:streamid=0")
 			bitrate,
 			minimum_fec_packets,
 			qos: video_qos_type != "0",
+			video_format,
 		};
 
 		let packet_duration = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {

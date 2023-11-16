@@ -136,11 +136,7 @@ impl SessionManagerInner {
 						continue;
 					}
 
-					self.session = Some(Session::new(
-						config.clone(),
-						session_context,
-						enet.clone()
-					));
+					self.session = Some(Session::new(config.clone(), session_context, enet.clone()));
 				},
 
 				SessionManagerCommand::GetCurrentSession(session_tx) => {

@@ -1,22 +1,23 @@
 use std::{path::Path, pin::Pin};
 
-use openssl::ssl::{SslMethod, SslFiletype, SslContext, SslAcceptor, Ssl};
+use openssl::ssl::{SslMethod, SslFiletype, SslAcceptor, Ssl};
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 
 pub struct TlsAcceptor {
-	context: SslContext,
+	acceptor: SslAcceptor,
 }
 
 impl TlsAcceptor {
 	pub fn from_config<P: AsRef<Path>>(certificate_chain: P, private_key: P) -> Result<Self, ()> {
-		let context = load_tls_files(certificate_chain, private_key)?;
-		Ok(Self { context })
+		let acceptor = load_tls_files(certificate_chain, private_key)?;
+		Ok(Self { acceptor })
 	}
 
 	pub async fn accept(&self, connection: TcpStream) -> Result<SslStream<TcpStream>, ()> {
-		let ssl = Ssl::new(&self.context)
+		let ssl = Ssl::new(self.acceptor.context())
 			.map_err(|e| log::error!("Failed to initialize TLS session: {}", e))?;
+
 		let mut stream = tokio_openssl::SslStream::new(ssl, connection)
 			.map_err(|e| log::error!("Failed to create TLS stream: {}", e))?;
 		Pin::new(&mut stream).accept()
@@ -26,7 +27,7 @@ impl TlsAcceptor {
 	}
 }
 
-fn load_tls_files<P: AsRef<Path>>(certificate_chain: P, private_key: P) -> Result<SslContext, ()> {
+fn load_tls_files<P: AsRef<Path>>(certificate_chain: P, private_key: P) -> Result<SslAcceptor, ()> {
 	let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls_server())
 		.map_err(|e| log::error!("Failed to initialize SSL acceptor: {}", e))?;
 	builder
@@ -36,5 +37,5 @@ fn load_tls_files<P: AsRef<Path>>(certificate_chain: P, private_key: P) -> Resul
 		.set_certificate_chain_file(&certificate_chain)
 		.map_err(|e| log::error!("Failed to set certificate chain file '{:?}': {}", certificate_chain.as_ref(), e))?;
 
-	Ok(builder.build().into_context())
+	Ok(builder.build())
 }

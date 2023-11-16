@@ -128,7 +128,6 @@ impl AudioStreamInner {
 		});
 
 		while let Some(command) = command_rx.recv().await {
-			#[allow(clippy::single_match)] // There will be more in the future.
 			match command {
 				AudioStreamCommand::Start(keys) => {
 					log::info!("Starting audio stream.");

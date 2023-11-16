@@ -287,7 +287,7 @@ impl Webserver {
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("MaxLumaPixelsHEVC")).unwrap();
-		writer.write(XmlEvent::characters("")).unwrap();
+		writer.write(XmlEvent::characters("1869449984")).unwrap(); // TODO: Check if HEVC is supported, set this to 0 if it is not.
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("LocalIP")).unwrap();
@@ -437,7 +437,7 @@ impl Webserver {
 				return bad_request(message);
 			}
 		};
-		let height: u32 = match mode_parts[0].parse() {
+		let height: u32 = match mode_parts[1].parse() {
 			Ok(height) => height,
 			Err(e) => {
 				let message = format!("Failed to parse height: {e}");
@@ -445,7 +445,7 @@ impl Webserver {
 				return bad_request(message);
 			}
 		};
-		let refresh_rate: u32 = match mode_parts[0].parse() {
+		let refresh_rate: u32 = match mode_parts[2].parse() {
 			Ok(refresh_rate) => refresh_rate,
 			Err(e) => {
 				let message = format!("Failed to parse refresh rate: {e}");

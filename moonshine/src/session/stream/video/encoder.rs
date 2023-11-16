@@ -85,6 +85,7 @@ impl Encoder {
 			.map_err(|e| log::error!("Failed to build CUDA frame context: {e}"))?
 		;
 
+		log::info!("Using codec with name '{codec_name}'.");
 		let codec = Codec::new(codec_name)
 			.map_err(|e| log::error!("Failed to create codec: {e}"))?;
 

@@ -15,7 +15,8 @@ port = 48010
 
 [stream.video]
 port = 47998
-codec = "h264_nvenc"
+codec_h264 = "h264_nvenc"
+codec_hevc = "hevc_nvenc"
 fec_percentage = 20
 
 [stream.audio]

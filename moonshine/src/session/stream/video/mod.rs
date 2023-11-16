@@ -27,6 +27,7 @@ pub struct VideoStreamContext {
 	pub bitrate: u64,
 	pub minimum_fec_packets: u32,
 	pub qos: bool,
+	pub video_format: u32,
 }
 
 #[derive(Clone)]
@@ -165,7 +166,7 @@ impl VideoStreamInner {
 
 					let mut encoder = Encoder::new(
 						&cuda_context,
-						&config.stream.video.codec,
+						if context.video_format == 0 { &config.stream.video.codec_h264 } else { &config.stream.video.codec_hevc },
 						context.width, context.height,
 						context.fps,
 						context.bitrate,
