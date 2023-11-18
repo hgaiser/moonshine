@@ -3,7 +3,7 @@ use std::{net::{ToSocketAddrs, IpAddr}, collections::HashMap, convert::Infallibl
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
 use hyper::{service::service_fn, Response, Request, body::Bytes, StatusCode, header, Method};
-use hyper_util::rt::TokioIo;
+use hyper_util::rt::tokio::TokioIo;
 use network_interface::NetworkInterfaceConfig;
 use openssl::x509::X509;
 use tokio::net::TcpListener;
