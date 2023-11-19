@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, process::Stdio};
 
 use async_shutdown::ShutdownManager;
 use enet::Enet;
@@ -204,6 +204,9 @@ fn run_command(command: &Vec<String>, context: &SessionContext) {
 	// Now run the command.
 	let _ = std::process::Command::new(&command[0])
 		.args(&command[1..])
-		.output()
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.stdin(Stdio::null())
+		.spawn()
 		.map_err(|e| log::error!("Failed to run command: {e}"));
 }
