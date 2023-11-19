@@ -1,4 +1,4 @@
-use async_shutdown::TriggerShutdownToken;
+use async_shutdown::{TriggerShutdownToken, ShutdownManager};
 use enet::Enet;
 use tokio::sync::{mpsc, oneshot};
 
@@ -110,84 +110,105 @@ impl SessionManagerInner {
 	) {
 		log::debug!("Waiting for commands.");
 
-		while let Some(command) = command_rx.recv().await {
-			match command {
-				SessionManagerCommand::SetStreamContext(video_stream_context, audio_stream_context) =>  {
-					if self.session.is_none() {
-						// Well we can, but it is not expected.
-						log::warn!("Can't set stream context without an active session.");
-						continue;
-					}
+		let mut stop_signal = ShutdownManager::new();
 
-					self.video_stream_context = Some(video_stream_context);
-					self.audio_stream_context = Some(audio_stream_context);
+		loop {
+			tokio::select! {
+				_ = stop_signal.wait_shutdown_triggered() => {
+					log::debug!("Closing session.");
+					self.session = None;
+					stop_signal = ShutdownManager::new();
 				},
 
-				SessionManagerCommand::GetSessionContext(session_context_tx) => {
-					let context = self.session.as_ref().map(|s| Some(s.get_context().clone())).unwrap_or(None);
-					if session_context_tx.send(context).is_err() {
-						log::error!("Failed to send current session context.");
-					}
-				},
+				command = command_rx.recv() => {
+					let command = match command {
+						Some(command) => command,
+						None => {
+							log::debug!("Command channel closed.");
+							break;
+						}
+					};
 
-				SessionManagerCommand::InitializeSession(session_context) => {
-					if self.session.is_some() {
-						log::warn!("Can't initialize a session, there is already an active session.");
-						continue;
-					}
+					match command {
+						SessionManagerCommand::SetStreamContext(video_stream_context, audio_stream_context) =>  {
+							if self.session.is_none() {
+								// Well we can, but it is not expected.
+								log::warn!("Can't set stream context without an active session.");
+								continue;
+							}
 
-					self.session = Some(Session::new(config.clone(), session_context, enet.clone()));
-				},
+							self.video_stream_context = Some(video_stream_context);
+							self.audio_stream_context = Some(audio_stream_context);
+						},
 
-				SessionManagerCommand::GetCurrentSession(session_tx) => {
-					if session_tx.send(self.session.clone()).is_err() {
-						log::error!("Failed to send current session.");
-					}
+						SessionManagerCommand::GetSessionContext(session_context_tx) => {
+							let context = self.session.as_ref().map(|s| Some(s.get_context().clone())).unwrap_or(None);
+							if session_context_tx.send(context).is_err() {
+								log::error!("Failed to send current session context.");
+							}
+						},
+
+						SessionManagerCommand::InitializeSession(session_context) => {
+							if self.session.is_some() {
+								log::warn!("Can't initialize a session, there is already an active session.");
+								continue;
+							}
+
+							self.session = match Session::new(config.clone(), session_context, enet.clone(), stop_signal.clone()) {
+								Ok(session) => Some(session),
+								Err(()) => continue,
+							};
+						},
+
+						SessionManagerCommand::GetCurrentSession(session_tx) => {
+							if session_tx.send(self.session.clone()).is_err() {
+								log::error!("Failed to send current session.");
+							}
+						}
+
+						SessionManagerCommand::StartSession => {
+							let Some(session) = &mut self.session else {
+								log::warn!("Can't launch a session, there is no session created yet.");
+								continue;
+							};
+
+							if session.is_running() {
+								log::info!("Can't start session, it is already running.");
+								continue;
+							}
+
+							let Some(video_stream_context) = self.video_stream_context.clone() else {
+								log::warn!("Can't start a stream without a video stream context.");
+								continue;
+							};
+							let Some(audio_stream_context) = self.audio_stream_context.clone() else {
+								log::warn!("Can't start a stream without a audio stream context.");
+								continue;
+							};
+
+							let _ = session.start_stream(video_stream_context, audio_stream_context).await;
+						},
+
+						SessionManagerCommand::StopSession => {
+							if let Some(session) = &mut self.session {
+								let _ = session.stop_stream().await;
+								self.session = None;
+							} else {
+								log::debug!("Trying to stop session, but no session is currently active.");
+							}
+						},
+
+						SessionManagerCommand::UpdateKeys(keys) => {
+							let Some(session) = &mut self.session else {
+								log::warn!("Can't update session keys, there is no session created yet.");
+								continue;
+							};
+
+							let _ = session.update_keys(keys).await;
+						},
+					};
 				}
-
-				SessionManagerCommand::StartSession => {
-					let Some(session) = &mut self.session else {
-						log::warn!("Can't launch a session, there is no session created yet.");
-						continue;
-					};
-
-					if session.is_running() {
-						log::info!("Can't start session, it is already running.");
-						continue;
-					}
-
-					let Some(video_stream_context) = self.video_stream_context.clone() else {
-						log::warn!("Can't start a stream without a video stream context.");
-						continue;
-					};
-					let Some(audio_stream_context) = self.audio_stream_context.clone() else {
-						log::warn!("Can't start a stream without a audio stream context.");
-						continue;
-					};
-
-					let _ = session.start_stream(video_stream_context, audio_stream_context).await;
-				},
-
-				SessionManagerCommand::StopSession => {
-					if let Some(session) = &mut self.session {
-						let _ = session.stop_stream().await;
-						self.session = None;
-					} else {
-						log::debug!("Trying to stop session, but no session is currently active.");
-					}
-				},
-
-				SessionManagerCommand::UpdateKeys(keys) => {
-					let Some(session) = &mut self.session else {
-						log::warn!("Can't update session keys, there is no session created yet.");
-						continue;
-					};
-
-					let _ = session.update_keys(keys).await;
-				},
-			};
+			}
 		}
-
-		log::debug!("Command channel closed.");
 	}
 }

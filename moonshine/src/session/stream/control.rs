@@ -196,6 +196,8 @@ impl ControlStreamInner {
 
 		log::debug!("Listening for control messages on {:?}", host.address());
 
+		let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
+
 		loop {
 			// Check if we received a command.
 			let command = command_rx.try_recv();
@@ -213,6 +215,12 @@ impl ControlStreamInner {
 					break;
 				},
 				Err(TryRecvError::Empty) => { },
+			}
+
+			// Check if the timeout has passed.
+			if std::time::Instant::now() > stop_deadline {
+				log::info!("Stopping because we haven't received a ping for {} seconds.", config.stream_timeout);
+				break;
 			}
 
 			match host.service(1000).map_err(|e| log::error!("Failure in enet host: {e}"))? {
@@ -266,6 +274,9 @@ impl ControlStreamInner {
 						ControlMessage::StartB => {
 							audio_stream.start(context.keys.clone()).await?;
 							video_stream.start().await?;
+						},
+						ControlMessage::Ping => {
+							stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 						},
 						skipped_message => {
 							log::trace!("Skipped control message: {skipped_message:?}");

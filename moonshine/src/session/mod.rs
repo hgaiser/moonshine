@@ -60,6 +60,7 @@ impl Session {
 		config: Config,
 		context: SessionContext,
 		enet: Enet,
+		stop_signal: ShutdownManager<()>,
 	) -> Result<Self, ()> {
 		for command in &context.application.run_before {
 			run_command(command, &context);
@@ -67,7 +68,7 @@ impl Session {
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner { config, video_stream: None, audio_stream: None, control_stream: None };
-		tokio::spawn(inner.run(command_rx, context.clone(), enet));
+		tokio::spawn(inner.run(command_rx, context.clone(), enet, stop_signal));
 		Ok(Self { command_tx, context, running: false })
 	}
 
@@ -123,9 +124,9 @@ impl SessionInner {
 		mut self,
 		mut command_rx: mpsc::Receiver<SessionCommand>,
 		mut session_context: SessionContext,
-		enet: Enet
+		enet: Enet,
+		stop_signal: ShutdownManager<()>,
 	) {
-		let stop_signal = ShutdownManager::new();
 		while let Some(command) = command_rx.recv().await {
 			match command {
 				SessionCommand::StartStream(video_stream_context, audio_stream_context) => {

@@ -17,6 +17,9 @@ pub struct Config {
 
 	/// List of applications to expose to clients.
 	pub applications: Vec<ApplicationConfig>,
+
+	/// Time in seconds since last ping after which the stream closes.
+	pub stream_timeout: u64,
 }
 
 impl Config {
