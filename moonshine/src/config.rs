@@ -57,6 +57,9 @@ pub struct ApplicationConfig {
 	/// Title of the application.
 	pub title: String,
 
+	/// Path to a boxart image.
+	pub boxart: Option<PathBuf>,
+
 	/// If provided, run this command before starting this application.
 	///
 	/// Note that multiple entries be provided, in which case they will be executed in that same order.

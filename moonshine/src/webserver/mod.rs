@@ -4,6 +4,7 @@ use async_shutdown::ShutdownManager;
 use http_body_util::Full;
 use hyper::{service::service_fn, Response, Request, body::Bytes, StatusCode, header, Method};
 use hyper_util::rt::tokio::TokioIo;
+use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
 use openssl::x509::X509;
 use tokio::net::TcpListener;
@@ -167,6 +168,7 @@ impl Webserver {
 		let response = match (request.method(), request.uri().path()) {
 			(&Method::GET, "/serverinfo") => self.server_info(params, mac_address).await,
 			(&Method::GET, "/applist") => self.app_list(),
+			(&Method::GET, "/appasset") => self.app_asset(params),
 			(&Method::GET, "/pair") => handle_pair_request(params, &self.server_certs, &self.client_manager).await,
 			(&Method::GET, "/pin") => self.pin(params).await,
 			(&Method::GET, "/unpair") => self.unpair(params).await,
@@ -214,8 +216,65 @@ impl Webserver {
 		// </root>
 		writer.write(XmlEvent::end_element()).unwrap();
 
-		let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+		let mut response = Response::new(Full::new(Bytes::from(buffer)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+		response
+	}
+
+	fn app_asset(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
+		let application_id = match params.remove("appid") {
+			Some(application_id) => application_id,
+			None => {
+				let message = format!("Expected 'appasset' in launch request, got {:?}.", params.keys());
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+		let application_id: u32 = match application_id.parse() {
+			Ok(application_id) => application_id,
+			Err(e) => {
+				let message = format!("Failed to parse application ID: {e}");
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+
+		let application = match self.config.applications.get((application_id - 1) as usize) {
+			Some(application) => application,
+			None => {
+				let message = format!("Couldn't find application with ID {}.", application_id - 1);
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+
+		let boxart_path = match &application.boxart {
+			Some(boxart) => boxart,
+			None => {
+				let message = format!("No boxart defined for app '{}'.", application.title);
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+
+		let asset = match image::open(boxart_path) {
+			Ok(asset) => asset,
+			Err(e) => {
+				let message = format!("Failed to load boxart: {e}");
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+
+		let mut buffer = std::io::Cursor::new(vec![]);
+		if let Err(e) = asset.write_to(&mut buffer, ImageFormat::Png) {
+			let message = format!("Failed to encode boxart: {e}");
+			log::warn!("{message}");
+			return bad_request(message);
+		}
+
+		let mut response = Response::new(Full::new(Bytes::from(buffer.into_inner())));
+		response.headers_mut().insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
 		response
 	}
 
@@ -319,7 +378,7 @@ impl Webserver {
 		// </root>
 		writer.write(XmlEvent::end_element()).unwrap();
 
-		let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+		let mut response = Response::new(Full::new(Bytes::from(buffer)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 		response
 	}
@@ -529,7 +588,7 @@ impl Webserver {
 		// </root>
 		writer.write(XmlEvent::end_element()).unwrap();
 
-		let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+		let mut response = Response::new(Full::new(Bytes::from(buffer)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
 		response
@@ -612,7 +671,7 @@ impl Webserver {
 		// </root>
 		writer.write(XmlEvent::end_element()).unwrap();
 
-		let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+		let mut response = Response::new(Full::new(Bytes::from(buffer)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
 		response
@@ -641,7 +700,7 @@ impl Webserver {
 		// </root>
 		writer.write(XmlEvent::end_element()).unwrap();
 
-		let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+		let mut response = Response::new(Full::new(Bytes::from(buffer)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 		response
 	}
