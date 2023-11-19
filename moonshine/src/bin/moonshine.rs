@@ -10,12 +10,34 @@ use moonshine::Moonshine;
 struct Args {
 	/// Path to configuration file.
 	config: PathBuf,
+
+	/// Show more log messages.
+	#[clap(long, short)]
+	#[clap(action = clap::ArgAction::Count)]
+	verbose: u8,
+
+	/// Show less log messages.
+	#[clap(long, short)]
+	#[clap(action = clap::ArgAction::Count)]
+	quiet: u8,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), ()> {
-	env_logger::builder()
+	let args = Args::parse();
+
+	let log_level = match i16::from(args.verbose) - i16::from(args.quiet) {
+		..= -2 => log::LevelFilter::Error,
+		-1 => log::LevelFilter::Warn,
+		0 => log::LevelFilter::Info,
+		1 => log::LevelFilter::Debug,
+		2.. => log::LevelFilter::Trace,
+	};
+
+	env_logger::Builder::new()
+		.filter_module(module_path!(), log_level)
 		.format_timestamp_millis()
+		.parse_default_env()
 		.init();
 
 	#[cfg(feature = "task-metrics")]
@@ -33,7 +55,6 @@ async fn main() -> Result<(), ()> {
 		}
 	}
 
-	let args = Args::parse();
 
 	let config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
 

@@ -1,9 +1,11 @@
+use std::collections::HashMap;
+
 use async_shutdown::ShutdownManager;
 use enet::Enet;
 // use async_shutdown::ShutdownManager;
 use tokio::sync::mpsc;
 
-use crate::{config::Config, session::stream::{VideoStream, AudioStream, ControlStream}};
+use crate::{config::{Config, ApplicationConfig}, session::stream::{VideoStream, AudioStream, ControlStream}};
 
 use self::stream::{VideoStreamContext, AudioStreamContext};
 pub use manager::SessionManager;
@@ -23,7 +25,10 @@ pub struct SessionKeys {
 /// Launch a session for a client.
 #[derive(Clone, Debug)]
 pub struct SessionContext {
-	/// Id of the application to launch.
+	/// Application to launch.
+	pub application: ApplicationConfig,
+
+	/// Id of the application as reported to the client.
 	pub application_id: u32,
 
 	/// Resolution of the video stream.
@@ -49,16 +54,21 @@ pub struct Session {
 	running: bool,
 }
 
+#[allow(clippy::result_unit_err)]
 impl Session {
 	pub fn new(
 		config: Config,
 		context: SessionContext,
 		enet: Enet,
-	) -> Self {
+	) -> Result<Self, ()> {
+		for command in &context.application.run_before {
+			run_command(command, &context);
+		}
+
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner { config, video_stream: None, audio_stream: None, control_stream: None };
 		tokio::spawn(inner.run(command_rx, context.clone(), enet));
-		Self { command_tx, context, running: false }
+		Ok(Self { command_tx, context, running: false })
 	}
 
 	pub async fn start_stream(
@@ -90,6 +100,14 @@ impl Session {
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
 		self.command_tx.send(SessionCommand::UpdateKeys(keys)).await
 			.map_err(|e| log::error!("Failed to send UpdateKeys command: {e}"))
+	}
+}
+
+impl Drop for Session {
+	fn drop(&mut self) {
+		for command in &self.context.application.run_after {
+			run_command(command, &self.context);
+		}
 	}
 }
 
@@ -151,4 +169,36 @@ impl SessionInner {
 		let _ = stop_signal.trigger_shutdown(());
 		log::debug!("Command channel closed.");
 	}
+}
+
+fn run_command(command: &Vec<String>, context: &SessionContext) {
+	// First format the string with the width and height values.
+	let mut vars = HashMap::new();
+	vars.insert("width".to_string(), context.resolution.0);
+	vars.insert("height".to_string(), context.resolution.1);
+
+	let command: Vec<String> = command.iter()
+		.map(|p| {
+			match strfmt::strfmt(p, &vars) {
+				Ok(p) => p,
+				Err(e) => {
+					log::warn!("Failed to format command '{command:?}': {e}");
+					p.to_string()
+				}
+			}
+		})
+		.collect();
+
+	if command.is_empty() {
+		log::warn!("Can't run an empty command.");
+		return;
+	}
+
+	log::info!("Running command: {command:?}");
+
+	// Now run the command.
+	let _ = std::process::Command::new(&command[0])
+		.args(&command[1..])
+		.output()
+		.map_err(|e| log::error!("Failed to run command: {e}"));
 }

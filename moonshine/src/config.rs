@@ -50,6 +50,16 @@ pub struct WebserverConfig {
 pub struct ApplicationConfig {
 	/// Title of the application.
 	pub title: String,
+
+	/// If provided, run this command before starting this application.
+	///
+	/// Note that multiple entries be provided, in which case they will be executed in that same order.
+	pub run_before: Vec<Vec<String>>,
+
+	/// If provided, run this command after stopping this application.
+	///
+	/// Note that multiple entries be provided, in which case they will be executed in that same order.
+	pub run_after: Vec<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

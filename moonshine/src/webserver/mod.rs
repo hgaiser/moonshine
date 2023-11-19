@@ -488,7 +488,17 @@ impl Webserver {
 			}
 		};
 
+		let application = match self.config.applications.get((application_id - 1) as usize) {
+			Some(application) => application,
+			None => {
+				let message = format!("Couldn't find application with ID {}.", application_id - 1);
+				log::warn!("{message}");
+				return bad_request(message);
+			}
+		};
+
 		let initialize_result = self.session_manager.initialize_session(SessionContext {
+			application: application.clone(),
 			application_id,
 			resolution: (width, height),
 			refresh_rate,
