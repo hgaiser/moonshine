@@ -100,9 +100,10 @@ impl Encoder {
 			.set_bit_rate(bitrate)
 			.set_gop_size(i32::max_value() as u32)
 			.set_preset("fast")
-			.set_tune("ull")
+			.set_tune("llhq")
 			.set_hw_frames_ctx(&mut hw_frame_context)
 			.set_forced_idr(true)
+			.set_delay(0)
 		;
 		codec_context_builder.as_raw_mut().refs = 1;
 
@@ -157,7 +158,7 @@ impl Encoder {
 			frame_number += 1;
 			encoder_buffer.as_raw_mut().pts = frame_number as i64;
 
-			log::trace!("Encoding frame {}", encoder_buffer.as_raw().pts);
+			log::trace!("Sending frame {} to encoder", encoder_buffer.as_raw().pts);
 
 			// TODO: Check if this is necessary?
 			// Reset possible previous request for keyframe.
@@ -186,7 +187,7 @@ impl Encoder {
 			loop {
 				match self.codec_context.receive_packet(&mut packet) {
 					Ok(()) => {
-						log::trace!("Sending frame {}", packet.as_raw().pts);
+						log::trace!("Received frame {} from encoder, converting frame to packets.", packet.as_raw().pts);
 						encode_packet(
 							&packet,
 							&packet_tx,
@@ -391,6 +392,8 @@ fn encode_packet(
 				return Ok(());
 			}
 		}
+
+		log::trace!("Finished sending frame {frame_number}.");
 
 		// At this point we should have sent all the data shards in the last block, so we can break the loop.
 		if block_index == 3 {

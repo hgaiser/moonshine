@@ -148,6 +148,18 @@ impl CodecContextBuilder {
 		self
 	}
 
+	pub fn set_delay(&mut self, delay: u32) -> &mut Self {
+		let delay_key = to_c_str("delay").unwrap();
+		let delay_value = to_c_str(&delay.to_string()).unwrap();
+		unsafe { ffmpeg_sys::av_opt_set(
+			self.as_raw_mut().priv_data,
+			delay_key.as_ptr(),
+			delay_value.as_ptr(),
+			0,
+		) };
+		self
+	}
+
 	pub fn set_forced_idr(&mut self, enabled: bool) -> &mut Self {
 		let forced_idr_key = to_c_str("forced-idr").unwrap();
 		let forced_idr_value = to_c_str(if enabled { "1" } else { "0" }).unwrap();
