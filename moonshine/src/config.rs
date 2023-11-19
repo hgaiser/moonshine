@@ -1,6 +1,8 @@
 use std::path::{PathBuf, Path};
 use serde::Deserialize;
 
+fn default_stream_timeout() -> u64 { 60 }
+
 #[derive(Clone, Debug, Deserialize)]
 pub struct Config {
 	/// Name of the Moonshine host.
@@ -19,6 +21,7 @@ pub struct Config {
 	pub applications: Vec<ApplicationConfig>,
 
 	/// Time in seconds since last ping after which the stream closes.
+	#[serde(default = "default_stream_timeout")]
 	pub stream_timeout: u64,
 }
 
@@ -57,12 +60,12 @@ pub struct ApplicationConfig {
 	/// If provided, run this command before starting this application.
 	///
 	/// Note that multiple entries be provided, in which case they will be executed in that same order.
-	pub run_before: Vec<Vec<String>>,
+	pub run_before: Option<Vec<Vec<String>>>,
 
 	/// If provided, run this command after stopping this application.
 	///
 	/// Note that multiple entries be provided, in which case they will be executed in that same order.
-	pub run_after: Vec<Vec<String>>,
+	pub run_after: Option<Vec<Vec<String>>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

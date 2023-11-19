@@ -62,8 +62,10 @@ impl Session {
 		enet: Enet,
 		stop_signal: ShutdownManager<()>,
 	) -> Result<Self, ()> {
-		for command in &context.application.run_before {
-			run_command(command, &context);
+		if let Some(run_before) = &context.application.run_before {
+			for command in run_before {
+				run_command(command, &context);
+			}
 		}
 
 		let (command_tx, command_rx) = mpsc::channel(10);
@@ -106,8 +108,10 @@ impl Session {
 
 impl Drop for Session {
 	fn drop(&mut self) {
-		for command in &self.context.application.run_after {
-			run_command(command, &self.context);
+		if let Some(run_after) = &self.context.application.run_after {
+			for command in run_after {
+				run_command(command, &self.context);
+			}
 		}
 	}
 }
