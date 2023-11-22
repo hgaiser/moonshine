@@ -456,7 +456,7 @@ impl ClientManagerInner {
 			.map_err(|e| format!("Failed to create random server secret: {e}"))?;
 		client.server_secret = Some(server_secret);
 
-		let mut decrypted = decrypt(&challenge, key)
+		let mut decrypted = decrypt(Cipher::aes_128_ecb(), &challenge, key)
 			.map_err(|e| format!("Failed to decrypt client challenge: {e}"))?;
 		decrypted.extend_from_slice(self.server_certs.signature().as_slice());
 		decrypted.extend_from_slice(&server_secret);
@@ -490,7 +490,7 @@ impl ClientManagerInner {
 			}
 		};
 
-		let decrypted = decrypt(&challenge_response, key)
+		let decrypted = decrypt(Cipher::aes_128_ecb(), &challenge_response, key)
 			.map_err(|e| format!("Failed to decrypt server challenge response: {e}"))?;
 		client.client_hash = Some(decrypted);
 

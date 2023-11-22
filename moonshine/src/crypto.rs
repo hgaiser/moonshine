@@ -12,9 +12,7 @@ pub fn encrypt(cipher: &CipherRef, plaintext: &[u8], key: Option<&[u8]>, iv: Opt
 	Ok(ciphertext)
 }
 
-pub fn decrypt(ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, openssl::error::ErrorStack> {
-	let cipher = Cipher::aes_128_ecb();
-
+pub fn decrypt(cipher: &CipherRef, ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, openssl::error::ErrorStack> {
 	let mut context = CipherCtx::new()?;
 	context.decrypt_init(Some(cipher), Some(key), None)?;
 	context.set_padding(false);
