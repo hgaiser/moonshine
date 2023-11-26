@@ -100,7 +100,7 @@ impl Encoder {
 			.set_bit_rate(bitrate)
 			.set_gop_size(i32::max_value() as u32)
 			.set_preset("fast")
-			.set_tune("llhq")
+			.set_tune("ull")
 			.set_hw_frames_ctx(&mut hw_frame_context)
 			.set_forced_idr(true)
 			.set_delay(0)
