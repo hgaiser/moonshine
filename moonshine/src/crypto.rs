@@ -1,4 +1,4 @@
-use openssl::{cipher::{Cipher, CipherRef}, cipher_ctx::CipherCtx};
+use openssl::{cipher::CipherRef, cipher_ctx::CipherCtx};
 
 pub fn encrypt(cipher: &CipherRef, plaintext: &[u8], key: Option<&[u8]>, iv: Option<&[u8]>, padding: bool) -> Result<Vec<u8>, openssl::error::ErrorStack> {
 	let mut context = CipherCtx::new()?;

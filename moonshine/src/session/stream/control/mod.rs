@@ -1,4 +1,5 @@
 use async_shutdown::ShutdownManager;
+use enigo::{Enigo, MouseControllable, KeyboardControllable};
 use enet::{
 	Address,
 	BandwidthLimit,
@@ -11,7 +12,11 @@ use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use crate::{session::{SessionContext, SessionKeys}, config::Config};
 
+use self::input::InputEvent;
+
 use super::{VideoStream, AudioStream};
+
+mod input;
 
 const ENCRYPTION_TAG_LENGTH: usize = 16;
 // Sequence number + tag + control message id
@@ -24,8 +29,8 @@ enum ControlMessageType {
 	Termination = 0x0100,
 	RumbleData = 0x010b,
 	LossStats = 0x0201,
-	FrameStats = 0x204,
-	InputData = 0x206,
+	FrameStats = 0x0204,
+	InputData = 0x0206,
 	InvalidateReferenceFrames = 0x0301,
 	RequestIdrFrame = 0x0302,
 	StartA = 0x0305,
@@ -61,7 +66,7 @@ enum ControlMessage {
 	RumbleData,
 	LossStats,
 	FrameStats,
-	InputData,
+	InputData(InputEvent),
 	InvalidateReferenceFrames,
 	RequestIdrFrame,
 	StartA,
@@ -70,13 +75,19 @@ enum ControlMessage {
 
 impl ControlMessage {
 	fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
-		if buffer.len() < 2 {
-			log::warn!("Expected control message to have at least two bytes, got {}", buffer.len());
+		if buffer.len() < 4 {
+			log::warn!("Expected control message to have at least 4 bytes, got {}", buffer.len());
 			return Err(());
 		}
 
-		match u16::from_le_bytes(buffer[..2].try_into().unwrap()).try_into() {
-			Ok(ControlMessageType::Encrypted) => {
+		let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
+		if length as usize != buffer.len() - 4 {
+			log::info!("Received incorrect packet length: expecting {length} bytes, but buffer says it should be {} bytes.", buffer.len() - 4);
+			return Err(());
+		}
+
+		match u16::from_le_bytes(buffer[..2].try_into().unwrap()).try_into()? {
+			ControlMessageType::Encrypted => {
 				if buffer.len() < MINIMUM_ENCRYPTED_LENGTH {
 					log::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
 					return Err(());
@@ -97,19 +108,25 @@ impl ControlMessage {
 					payload: buffer[8 + ENCRYPTION_TAG_LENGTH..].to_vec(),
 				}))
 			},
-			Ok(ControlMessageType::Ping) => Ok(Self::Ping),
-			Ok(ControlMessageType::Termination) => Ok(Self::Termination),
-			Ok(ControlMessageType::RumbleData) => Ok(Self::RumbleData),
-			Ok(ControlMessageType::LossStats) => Ok(Self::LossStats),
-			Ok(ControlMessageType::FrameStats) => Ok(Self::FrameStats),
-			Ok(ControlMessageType::InputData) => Ok(Self::InputData),
-			Ok(ControlMessageType::InvalidateReferenceFrames) => Ok(Self::InvalidateReferenceFrames),
-			Ok(ControlMessageType::RequestIdrFrame) => Ok(Self::RequestIdrFrame),
-			Ok(ControlMessageType::StartA) => Ok(Self::StartA),
-			Ok(ControlMessageType::StartB) => Ok(Self::StartB),
-			Err(()) => {
-				Err(())
+			ControlMessageType::Ping => Ok(Self::Ping),
+			ControlMessageType::Termination => Ok(Self::Termination),
+			ControlMessageType::RumbleData => Ok(Self::RumbleData),
+			ControlMessageType::LossStats => Ok(Self::LossStats),
+			ControlMessageType::FrameStats => Ok(Self::FrameStats),
+			ControlMessageType::InputData => {
+				// Length of the input event, excluding the length itself.
+				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
+				if length as usize != buffer.len() - 8 {
+					log::info!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8);
+					return Err(());
+				}
+
+				Ok(Self::InputData(InputEvent::from_bytes(&buffer[8..])?))
 			},
+			ControlMessageType::InvalidateReferenceFrames => Ok(Self::InvalidateReferenceFrames),
+			ControlMessageType::RequestIdrFrame => Ok(Self::RequestIdrFrame),
+			ControlMessageType::StartA => Ok(Self::StartA),
+			ControlMessageType::StartB => Ok(Self::StartB),
 		}
 	}
 }
@@ -181,7 +198,7 @@ impl ControlStreamInner {
 	) -> Result<(), ()> {
 		let local_addr = Address::new(
 			config.address.parse()
-			.map_err(|e| log::error!("Failed to parse address: {e}"))?,
+				.map_err(|e| log::error!("Failed to parse address: {e}"))?,
 			config.stream.control.port,
 		);
 		let mut host = enet
@@ -193,6 +210,8 @@ impl ControlStreamInner {
 				BandwidthLimit::Unlimited,
 			)
 			.map_err(|e| log::error!("Failed to create Enet host: {e}"))?;
+
+		let mut enigo = Enigo::new();
 
 		log::debug!("Listening for control messages on {:?}", host.address());
 
@@ -257,10 +276,7 @@ impl ControlStreamInner {
 
 						control_message = match ControlMessage::from_bytes(&decrypted) {
 							Ok(decrypted_message) => decrypted_message,
-							Err(()) => {
-								log::warn!("Failed to parse decrypted control message.");
-								continue;
-							},
+							Err(()) => continue,
 						};
 
 						log::trace!("Decrypted control message: {control_message:?}");
@@ -277,6 +293,35 @@ impl ControlStreamInner {
 						},
 						ControlMessage::Ping => {
 							stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
+						},
+						ControlMessage::InputData(message) => {
+							log::trace!("Received input event: {message:?}");
+							match message {
+								InputEvent::KeyDown(event) => {
+									enigo.key_down(enigo::Key::Raw(event.key));
+									log::info!("Key down event: {event:?}");
+								},
+								InputEvent::KeyUp(event) => {
+									enigo.key_up(enigo::Key::Raw(event.key));
+									log::info!("Key up event: {event:?}");
+								},
+								InputEvent::MouseMoveAbsolute(event) => {
+									let display_size = enigo.main_display_size();
+									enigo.mouse_move_to(
+										event.x as i32 * display_size.0 / event.width as i32,
+										event.y as i32 * display_size.1 / event.height as i32,
+									);
+								},
+								InputEvent::MouseMoveRelative(event) => {
+									enigo.mouse_move_relative(event.x as i32, event.y as i32);
+								},
+								InputEvent::MouseButtonDown(button) => {
+									enigo.mouse_down(button.into());
+								},
+								InputEvent::MouseButtonUp(button) => {
+									enigo.mouse_up(button.into());
+								},
+							}
 						},
 						skipped_message => {
 							log::trace!("Skipped control message: {skipped_message:?}");
