@@ -18,7 +18,12 @@ pub struct Config {
 	pub stream: StreamConfig,
 
 	/// List of applications to expose to clients.
+	#[serde(rename = "application")]
 	pub applications: Vec<ApplicationConfig>,
+
+	/// List of scanners that dynamically adds applications when started.
+	#[serde(rename = "application_scanner")]
+	pub application_scanners: Vec<ApplicationScannerConfig>,
 
 	/// Time in seconds since last ping after which the stream closes.
 	#[serde(default = "default_stream_timeout")]
@@ -52,7 +57,7 @@ pub struct WebserverConfig {
 	pub private_key: PathBuf,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct ApplicationConfig {
 	/// Title of the application.
 	pub title: String,
@@ -62,13 +67,38 @@ pub struct ApplicationConfig {
 
 	/// If provided, run this command before starting this application.
 	///
-	/// Note that multiple entries be provided, in which case they will be executed in that same order.
+	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
 	pub run_before: Option<Vec<Vec<String>>>,
 
 	/// If provided, run this command after stopping this application.
 	///
-	/// Note that multiple entries be provided, in which case they will be executed in that same order.
+	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
 	pub run_after: Option<Vec<Vec<String>>>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationScannerConfig {
+	/// Scans a 'libraryfolders.vdf' file from a Steam library directory.
+	Steam(SteamApplicationScannerConfig),
+}
+
+#[derive(Clone, Debug, Deserialize)]
+pub struct SteamApplicationScannerConfig {
+	/// Path to a Steam library (ie. `~/.local/share/Steam`).
+	pub library: PathBuf,
+
+	/// If provided, run this command before starting an application.
+	///
+	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
+	pub run_before: Option<Vec<Vec<String>>>,
+
+	/// If provided, run this command after stopping an application.
+	///
+	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
+	pub run_after: Option<Vec<Vec<String>>>,
+
 }
 
 #[derive(Clone, Debug, Deserialize)]

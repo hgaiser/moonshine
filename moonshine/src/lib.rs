@@ -7,6 +7,7 @@ use session::SessionManager;
 use state::State;
 use webserver::Webserver;
 
+pub mod app_scanner;
 pub mod clients;
 pub mod config;
 pub mod crypto;

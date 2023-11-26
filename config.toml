@@ -1,8 +1,19 @@
-name = "Moonshine PC"
+name = "Moonshine Grietje"
 address = "0.0.0.0"
 
-[[applications]]
+[[application]]
 title = "Desktop"
+
+[[application_scanner]]
+type = "steam"
+library = "$HOME/.local/share/Steam"
+run_before = [
+	["$HOME/.local/bin/resolution", "{width}", "{height}"],
+	["/usr/bin/steam", "steam://rungameid/{game_id}"],
+]
+run_after = [
+	["$HOME/.local/bin/resolution"],
+]
 
 [webserver]
 port = 47989

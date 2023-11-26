@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use async_shutdown::ShutdownManager;
 use clap::Parser;
 use moonshine::config::Config;
-use moonshine::Moonshine;
+use moonshine::{Moonshine, app_scanner};
 
 #[derive(Parser, Debug)]
 #[clap(version)]
@@ -56,9 +56,13 @@ async fn main() -> Result<(), ()> {
 	}
 
 
-	let config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
+	let mut config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
 
 	log::debug!("Using configuration:\n{:#?}", config);
+
+	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
+	log::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
+	config.applications.extend(scanned_applications);
 
 	// Spawn a task to wait for CTRL+C and trigger a shutdown.
 	let shutdown = ShutdownManager::new();
