@@ -1,3 +1,6 @@
+use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, RelativeAxisType, AttributeSet, AbsoluteAxisType, UinputAbsSetup};
+use tokio::sync::mpsc;
+
 #[repr(u32)]
 enum InputEventType {
 	KeyDown = 0x00000003,
@@ -100,18 +103,6 @@ impl TryFrom<u8> for MouseButton {
 	}
 }
 
-impl Into<enigo::MouseButton> for MouseButton {
-	fn into(self) -> enigo::MouseButton {
-		match self {
-			MouseButton::Left => enigo::MouseButton::Left,
-			MouseButton::Middle => enigo::MouseButton::Middle,
-			MouseButton::Right => enigo::MouseButton::Right,
-			MouseButton::X1 => enigo::MouseButton::Back,
-			MouseButton::X2 => enigo::MouseButton::Forward,
-		}
-	}
-}
-
 impl InputEvent {
 	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
 		if buffer.len() < 4 {
@@ -204,5 +195,73 @@ impl InputEvent {
 				Ok(InputEvent::MouseButtonUp(buffer[4].try_into()?))
 			},
 		}
+	}
+}
+
+pub struct InputHandler {
+	command_tx: mpsc::Sender<InputEvent>,
+}
+
+impl InputHandler {
+	pub fn new() -> Result<Self, ()> {
+		let mouse = VirtualDeviceBuilder::new()
+			.map_err(|e| log::error!("Failed to initiate virtual mouse: {e}"))?
+			.name("moonshine-mouse")
+			.with_relative_axes(&AttributeSet::from_iter([
+				RelativeAxisType::REL_X,
+				RelativeAxisType::REL_Y,
+				RelativeAxisType::REL_WHEEL,
+				RelativeAxisType::REL_HWHEEL,
+			]))
+			.map_err(|e| log::error!("Failed to enable relative axes for virtual mouse: {e}"))?
+			// .with_absolute_axis(UinputAbsSetup::)
+			// .map_err(|e| log::error!("Failed to enable absolute axes for virtual mouse: {e}"))?
+			.build()
+			.map_err(|e| log::error!("Failed to create virtual mouse: {e}"))?;
+
+		let (command_tx, command_rx) = mpsc::channel(10);
+		let inner = InputHandlerInner { mouse };
+		tokio::spawn(inner.run(command_rx));
+
+		Ok(Self { command_tx })
+	}
+
+	pub async fn handle_input(&self, event: InputEvent) -> Result<(), ()> {
+		self.command_tx.send(event).await
+			.map_err(|e| log::error!("Failed to send input event: {e}"))
+	}
+}
+
+struct InputHandlerInner {
+	mouse: VirtualDevice,
+}
+
+impl InputHandlerInner {
+	pub async fn run(mut self, mut command_rx: mpsc::Receiver<InputEvent>) {
+		while let Some(command) = command_rx.recv().await {
+			match command {
+				InputEvent::KeyDown(event) => todo!(),
+				InputEvent::KeyUp(event) => todo!(),
+				InputEvent::MouseMoveAbsolute(event) => todo!(),
+				InputEvent::MouseMoveRelative(event) => {
+					let event_x = evdev::InputEvent::new_now(
+						evdev::EventType::RELATIVE,
+						RelativeAxisType::REL_X.0,
+						event.x as i32,
+					);
+					let event_y = evdev::InputEvent::new_now(
+						evdev::EventType::RELATIVE,
+						RelativeAxisType::REL_Y.0,
+						event.y as i32,
+					);
+					let _ = self.mouse.emit(&[event_x, event_y])
+						.map_err(|e| log::error!("Failed to make relative mouse movement: {e}"));
+				},
+				InputEvent::MouseButtonDown(event) => todo!(),
+				InputEvent::MouseButtonUp(event) => todo!(),
+			}
+		}
+
+		log::debug!("Input handler closing.");
 	}
 }

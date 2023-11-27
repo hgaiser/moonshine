@@ -136,14 +136,20 @@ impl SessionInner {
 				SessionCommand::StartStream(video_stream_context, audio_stream_context) => {
 					let video_stream = VideoStream::new(self.config.clone(), video_stream_context, stop_signal.clone());
 					let audio_stream = AudioStream::new(self.config.clone(), audio_stream_context, stop_signal.clone());
-					let control_stream = ControlStream::new(
+					let control_stream = match ControlStream::new(
 						self.config.clone(),
 						video_stream.clone(),
 						audio_stream.clone(),
 						session_context.clone(),
 						enet.clone(),
 						stop_signal.clone()
-					);
+					) {
+						Ok(control_stream) => control_stream,
+						Err(()) => {
+							log::error!("Failed to create control stream, killing session.");
+							continue;
+						},
+					};
 
 					self.video_stream = Some(video_stream);
 					self.audio_stream = Some(audio_stream);

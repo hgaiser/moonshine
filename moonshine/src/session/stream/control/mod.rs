@@ -1,5 +1,4 @@
 use async_shutdown::ShutdownManager;
-use enigo::{Enigo, MouseControllable, KeyboardControllable};
 use enet::{
 	Address,
 	BandwidthLimit,
@@ -11,9 +10,7 @@ use openssl::symm::Cipher;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use crate::{session::{SessionContext, SessionKeys}, config::Config};
-
-use self::input::InputEvent;
-
+use self::input::{InputEvent, InputHandler};
 use super::{VideoStream, AudioStream};
 
 mod input;
@@ -155,7 +152,9 @@ impl ControlStream {
 		context: SessionContext,
 		enet: Enet,
 		stop_signal: ShutdownManager<()>,
-	) -> Self {
+	) -> Result<Self, ()> {
+		let input_handler = InputHandler::new()?;
+
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = ControlStreamInner { };
 		tokio::task::spawn_blocking({
@@ -168,12 +167,13 @@ impl ControlStream {
 						audio_stream,
 						context,
 						enet,
+						input_handler,
 					)))
 				)
 			}
 		});
 
-		Self { command_tx }
+		Ok(Self { command_tx })
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
@@ -195,6 +195,7 @@ impl ControlStreamInner {
 		audio_stream: AudioStream,
 		mut context: SessionContext,
 		enet: Enet,
+		input_handler: InputHandler,
 	) -> Result<(), ()> {
 		let local_addr = Address::new(
 			config.address.parse()
@@ -210,8 +211,6 @@ impl ControlStreamInner {
 				BandwidthLimit::Unlimited,
 			)
 			.map_err(|e| log::error!("Failed to create Enet host: {e}"))?;
-
-		let mut enigo = Enigo::new();
 
 		log::debug!("Listening for control messages on {:?}", host.address());
 
@@ -294,34 +293,35 @@ impl ControlStreamInner {
 						ControlMessage::Ping => {
 							stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 						},
-						ControlMessage::InputData(message) => {
-							log::trace!("Received input event: {message:?}");
-							match message {
-								InputEvent::KeyDown(event) => {
-									enigo.key_down(enigo::Key::Raw(event.key));
-									log::info!("Key down event: {event:?}");
-								},
-								InputEvent::KeyUp(event) => {
-									enigo.key_up(enigo::Key::Raw(event.key));
-									log::info!("Key up event: {event:?}");
-								},
-								InputEvent::MouseMoveAbsolute(event) => {
-									let display_size = enigo.main_display_size();
-									enigo.mouse_move_to(
-										event.x as i32 * display_size.0 / event.width as i32,
-										event.y as i32 * display_size.1 / event.height as i32,
-									);
-								},
-								InputEvent::MouseMoveRelative(event) => {
-									enigo.mouse_move_relative(event.x as i32, event.y as i32);
-								},
-								InputEvent::MouseButtonDown(button) => {
-									enigo.mouse_down(button.into());
-								},
-								InputEvent::MouseButtonUp(button) => {
-									enigo.mouse_up(button.into());
-								},
-							}
+						ControlMessage::InputData(event) => {
+							log::trace!("Received input event: {event:?}");
+							input_handler.handle_input(event);
+							// match message {
+							// 	InputEvent::KeyDown(event) => {
+							// 		enigo.key_down(enigo::Key::Raw(event.key));
+							// 		log::info!("Key down event: {event:?}");
+							// 	},
+							// 	InputEvent::KeyUp(event) => {
+							// 		enigo.key_up(enigo::Key::Raw(event.key));
+							// 		log::info!("Key up event: {event:?}");
+							// 	},
+							// 	InputEvent::MouseMoveAbsolute(event) => {
+							// 		let display_size = enigo.main_display_size();
+							// 		enigo.mouse_move_to(
+							// 			event.x as i32 * display_size.0 / event.width as i32,
+							// 			event.y as i32 * display_size.1 / event.height as i32,
+							// 		);
+							// 	},
+							// 	InputEvent::MouseMoveRelative(event) => {
+							// 		enigo.mouse_move_relative(event.x as i32, event.y as i32);
+							// 	},
+							// 	InputEvent::MouseButtonDown(button) => {
+							// 		enigo.mouse_down(button.into());
+							// 	},
+							// 	InputEvent::MouseButtonUp(button) => {
+							// 		enigo.mouse_up(button.into());
+							// 	},
+							// }
 						},
 						skipped_message => {
 							log::trace!("Skipped control message: {skipped_message:?}");
