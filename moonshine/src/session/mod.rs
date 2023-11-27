@@ -1,8 +1,7 @@
-use std::{collections::HashMap, process::Stdio};
+use std::process::Stdio;
 
 use async_shutdown::ShutdownManager;
 use enet::Enet;
-// use async_shutdown::ShutdownManager;
 use tokio::sync::mpsc;
 
 use crate::{config::{Config, ApplicationConfig}, session::stream::{VideoStream, AudioStream, ControlStream}};
@@ -183,27 +182,20 @@ impl SessionInner {
 }
 
 fn run_command(command: &Vec<String>, context: &SessionContext) {
-	// First format the string with the width and height values.
-	let mut vars = HashMap::new();
-	vars.insert("width".to_string(), context.resolution.0);
-	vars.insert("height".to_string(), context.resolution.1);
-
-	let command: Vec<String> = command.iter()
-		.map(|p| {
-			match strfmt::strfmt(p, &vars) {
-				Ok(p) => p,
-				Err(e) => {
-					log::warn!("Failed to format command '{command:?}': {e}");
-					p.to_string()
-				}
-			}
-		})
-		.collect();
-
 	if command.is_empty() {
 		log::warn!("Can't run an empty command.");
 		return;
 	}
+
+	let command: Vec<String> = command.clone()
+		.iter_mut()
+		.map(|c| {
+			let c = c
+				.replace("{width}", &context.resolution.0.to_string())
+				.replace("{height}", &context.resolution.1.to_string());
+			shellexpand::full(&c).map(|c| c.into()).unwrap_or(c)
+		})
+		.collect();
 
 	log::info!("Running command: {command:?}");
 

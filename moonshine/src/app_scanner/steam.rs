@@ -5,7 +5,7 @@ use crate::config::{SteamApplicationScannerConfig, ApplicationConfig};
 pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
 	let library_path = config.library.join("steamapps").join("libraryfolders.vdf").to_string_lossy().to_string();
 	let library_path = shellexpand::full(&library_path)
-		.map_err(|e| log::error!("Failed to expaned {library_path:?}: {e}"))?;
+		.map_err(|e| log::error!("Failed to expand {library_path:?}: {e}"))?;
 	let library = std::fs::read_to_string(library_path.as_ref())
 		.map_err(|e| log::warn!("Failed to open library: {e}"))?;
 
@@ -61,17 +61,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 					.map(|c| {
 						c
 							.iter_mut()
-							.map(|a| {
-								let a = a
-									.replace("{game_id}", &game_id.to_string());
-								match shellexpand::full(&a) {
-									Ok(a) => a.to_string(),
-									Err(e) => {
-										log::warn!("Failed to expand shell: {e}");
-										a
-									}
-								}
-							})
+							.map(|a| a.replace("{game_id}", &game_id.to_string()))
 							.collect()
 					})
 					.collect()
@@ -86,17 +76,8 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 					.map(|c| {
 						c
 							.iter_mut()
-							.map(|a| {
-								let a = a
-									.replace("{game_id}", &game_id.to_string());
-								match shellexpand::full(&a) {
-									Ok(a) => a.to_string(),
-									Err(e) => {
-										log::warn!("Failed to expand shell: {e}");
-										a
-									}
-								}
-							})							.collect()
+							.map(|a| a.replace("{game_id}", &game_id.to_string()))
+							.collect()
 					})
 					.collect()
 			);

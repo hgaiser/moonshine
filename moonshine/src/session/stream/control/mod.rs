@@ -295,7 +295,7 @@ impl ControlStreamInner {
 						},
 						ControlMessage::InputData(event) => {
 							log::trace!("Received input event: {event:?}");
-							input_handler.handle_input(event);
+							let _ = input_handler.handle_input(event).await;
 							// match message {
 							// 	InputEvent::KeyDown(event) => {
 							// 		enigo.key_down(enigo::Key::Raw(event.key));

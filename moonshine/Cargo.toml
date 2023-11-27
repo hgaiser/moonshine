@@ -32,7 +32,6 @@ rtsp-types = "0.1.0"
 sdp-types = "0.1.5"
 serde = "1.0.188"
 shellexpand = "3.1.0"
-strfmt = "0.2.4"
 tokio = { version = "1.32.0", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "tracing"] }
 tokio-openssl = "0.6.3"
 toml = "0.8.0"
