@@ -22,14 +22,14 @@ port = 48000
 [stream.control]
 port = 47999
 
-[[applications]]
+[[application]]
 title = "Desktop"
 run_before = [
 	["$HOME/.local/bin/resolution", "{width}", "{height}"],
 ]
 run_after = [["$HOME/.local/bin/resolution"]]
 
-[[applications]]
+[[application]]
 title = "Steam"
 run_before = [
 	["$HOME/.local/bin/resolution", "{width}", "{height}"],
