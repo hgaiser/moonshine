@@ -1,19 +1,5 @@
-name = "Moonshine Grietje"
+name = "Moonshine"
 address = "0.0.0.0"
-
-[[application]]
-title = "Desktop"
-
-[[application_scanner]]
-type = "steam"
-library = "$HOME/.local/share/Steam"
-run_before = [
-	["$HOME/.local/bin/resolution", "{width}", "{height}"],
-	["/usr/bin/steam", "steam://rungameid/{game_id}"],
-]
-run_after = [
-	["$HOME/.local/bin/resolution"],
-]
 
 [webserver]
 port = 47989
@@ -35,3 +21,29 @@ port = 48000
 
 [stream.control]
 port = 47999
+
+[[applications]]
+title = "Desktop"
+run_before = [
+	["$HOME/.local/bin/resolution", "{width}", "{height}"],
+]
+run_after = [["$HOME/.local/bin/resolution"]]
+
+[[applications]]
+title = "Steam"
+run_before = [
+	["$HOME/.local/bin/resolution", "{width}", "{height}"],
+	["/usr/bin/steam", "steam://open/bigpicture"],
+]
+run_after = [["$HOME/.local/bin/resolution"]]
+
+[[application_scanner]]
+type = "steam"
+library = "$HOME/.local/share/Steam"
+run_before = [
+	["$HOME/.local/bin/resolution", "{width}", "{height}"],
+	["/usr/bin/steam", "steam://rungameid/{game_id}"],
+]
+run_after = [
+	["$HOME/.local/bin/resolution"],
+]
