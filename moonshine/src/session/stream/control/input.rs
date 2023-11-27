@@ -1,4 +1,4 @@
-use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, RelativeAxisType, AttributeSet, AbsoluteAxisType, UinputAbsSetup};
+use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, RelativeAxisType, AttributeSet, Key};
 use tokio::sync::mpsc;
 
 #[repr(u32)]
@@ -56,13 +56,13 @@ pub struct MouseMoveRelative {
 	pub y: i16,
 }
 
-#[repr(u8)]
-pub enum KeyModifier {
-	Shift = 0x01,
-	Ctrl = 0x02,
-	Alt = 0x04,
-	Meta = 0x08,
-}
+// #[repr(u8)]
+// pub enum KeyModifier {
+// 	Shift = 0x01,
+// 	Ctrl = 0x02,
+// 	Alt = 0x04,
+// 	Meta = 0x08,
+// }
 
 #[derive(Debug)]
 pub struct KeyEvent {
@@ -84,8 +84,20 @@ pub enum MouseButton {
 	Left = 0x01,
 	Middle = 0x02,
 	Right = 0x03,
-	X1 = 0x04, // What are these?
-	X2 = 0x05, // What are these?
+	Side = 0x04,
+	Extra = 0x05,
+}
+
+impl From<MouseButton> for Key {
+	fn from(val: MouseButton) -> Self {
+		match val {
+			MouseButton::Left => Key::BTN_LEFT,
+			MouseButton::Middle => Key::BTN_MIDDLE,
+			MouseButton::Right => Key::BTN_RIGHT,
+			MouseButton::Side => Key::BTN_SIDE,
+			MouseButton::Extra => Key::BTN_EXTRA,
+		}
+	}
 }
 
 impl TryFrom<u8> for MouseButton {
@@ -96,8 +108,8 @@ impl TryFrom<u8> for MouseButton {
 			x if x == Self::Left as u8 => Ok(Self::Left),
 			x if x == Self::Middle as u8 => Ok(Self::Middle),
 			x if x == Self::Right as u8 => Ok(Self::Right),
-			x if x == Self::X1 as u8 => Ok(Self::X1),
-			x if x == Self::X2 as u8 => Ok(Self::X2),
+			x if x == Self::Side as u8 => Ok(Self::Side),
+			x if x == Self::Extra as u8 => Ok(Self::Extra),
 			_ => Err(()),
 		}
 	}
@@ -216,6 +228,14 @@ impl InputHandler {
 			.map_err(|e| log::error!("Failed to enable relative axes for virtual mouse: {e}"))?
 			// .with_absolute_axis(UinputAbsSetup::)
 			// .map_err(|e| log::error!("Failed to enable absolute axes for virtual mouse: {e}"))?
+			.with_keys(&AttributeSet::from_iter([
+				Key::BTN_LEFT,
+				Key::BTN_MIDDLE,
+				Key::BTN_RIGHT,
+				Key::BTN_FORWARD,
+				Key::BTN_BACK,
+			]))
+			.map_err(|e| log::error!("Failed to add keys to virtual mouse: {e}"))?
 			.build()
 			.map_err(|e| log::error!("Failed to create virtual mouse: {e}"))?;
 
@@ -240,10 +260,11 @@ impl InputHandlerInner {
 	pub async fn run(mut self, mut command_rx: mpsc::Receiver<InputEvent>) {
 		while let Some(command) = command_rx.recv().await {
 			match command {
-				InputEvent::KeyDown(event) => todo!(),
-				InputEvent::KeyUp(event) => todo!(),
-				InputEvent::MouseMoveAbsolute(event) => todo!(),
+				InputEvent::KeyDown(_event) => {},
+				InputEvent::KeyUp(_event) => {},
+				InputEvent::MouseMoveAbsolute(_event) => {},
 				InputEvent::MouseMoveRelative(event) => {
+					log::trace!("Moving mouse relative: {event:?}");
 					let event_x = evdev::InputEvent::new_now(
 						evdev::EventType::RELATIVE,
 						RelativeAxisType::REL_X.0,
@@ -257,8 +278,26 @@ impl InputHandlerInner {
 					let _ = self.mouse.emit(&[event_x, event_y])
 						.map_err(|e| log::error!("Failed to make relative mouse movement: {e}"));
 				},
-				InputEvent::MouseButtonDown(event) => todo!(),
-				InputEvent::MouseButtonUp(event) => todo!(),
+				InputEvent::MouseButtonDown(event) => {
+					log::trace!("Pressing mouse button: {event:?}");
+					let button_event = evdev::InputEvent::new_now(
+						evdev::EventType::KEY,
+						Into::<Key>::into(event).code(),
+						1
+					);
+					let _ = self.mouse.emit(&[button_event])
+						.map_err(|e| log::error!("Failed to press mouse button: {e}"));
+				},
+				InputEvent::MouseButtonUp(event) => {
+					log::trace!("Releasing mouse button: {event:?}");
+					let button_event = evdev::InputEvent::new_now(
+						evdev::EventType::KEY,
+						Into::<Key>::into(event).code(),
+						0
+					);
+					let _ = self.mouse.emit(&[button_event])
+						.map_err(|e| log::error!("Failed to release mouse button: {e}"));
+				},
 			}
 		}
 
