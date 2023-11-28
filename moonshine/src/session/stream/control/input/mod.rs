@@ -1,5 +1,9 @@
-use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, RelativeAxisType, AttributeSet, Key};
 use tokio::sync::mpsc;
+
+use self::{mouse::{Mouse, MouseButton}, keyboard::{Keyboard, Key}};
+
+mod keyboard;
+mod mouse;
 
 #[repr(u32)]
 enum InputEventType {
@@ -67,52 +71,9 @@ pub struct MouseMoveRelative {
 #[derive(Debug)]
 pub struct KeyEvent {
 	pub flags: u8,
-	pub key: u16,
+	pub key: Key,
 	pub modifiers: u8,
 	pub padding: u16,
-}
-
-// impl Into<enigo::Key> for KeyEvent {
-// 	fn into(self) -> enigo::Key {
-// 		enigo::Key::
-// 	}
-// }
-
-#[derive(Debug)]
-#[repr(u8)]
-pub enum MouseButton {
-	Left = 0x01,
-	Middle = 0x02,
-	Right = 0x03,
-	Side = 0x04,
-	Extra = 0x05,
-}
-
-impl From<MouseButton> for Key {
-	fn from(val: MouseButton) -> Self {
-		match val {
-			MouseButton::Left => Key::BTN_LEFT,
-			MouseButton::Middle => Key::BTN_MIDDLE,
-			MouseButton::Right => Key::BTN_RIGHT,
-			MouseButton::Side => Key::BTN_SIDE,
-			MouseButton::Extra => Key::BTN_EXTRA,
-		}
-	}
-}
-
-impl TryFrom<u8> for MouseButton {
-	type Error = ();
-
-	fn try_from(v: u8) -> Result<Self, Self::Error> {
-		match v {
-			x if x == Self::Left as u8 => Ok(Self::Left),
-			x if x == Self::Middle as u8 => Ok(Self::Middle),
-			x if x == Self::Right as u8 => Ok(Self::Right),
-			x if x == Self::Side as u8 => Ok(Self::Side),
-			x if x == Self::Extra as u8 => Ok(Self::Extra),
-			_ => Err(()),
-		}
-	}
 }
 
 impl InputEvent {
@@ -133,9 +94,17 @@ impl InputEvent {
 					return Err(());
 				}
 
+				let key = match Key::from_repr(buffer[6]) {
+					Some(key) => key,
+					None => {
+						log::warn!("Unknown keycode: {}", buffer[6]);
+						return Err(());
+					}
+				};
+
 				Ok(InputEvent::KeyDown(KeyEvent {
 					flags: buffer[4],
-					key: u16::from_le_bytes(buffer[5..7].try_into().unwrap()) & 0x00FF,
+					key,
 					modifiers: buffer[7],
 					padding: 0,
 				}))
@@ -146,12 +115,21 @@ impl InputEvent {
 						"Expected KeyUp message to have exactly {} bytes, got {}",
 						std::mem::size_of::<KeyEvent>() + 4,
 						buffer.len()
-					);						return Err(());
+					);
+					return Err(());
 				}
+
+				let key = match Key::from_repr(buffer[6]) {
+					Some(key) => key,
+					None => {
+						log::warn!("Unknown keycode: {}", buffer[6]);
+						return Err(());
+					}
+				};
 
 				Ok(InputEvent::KeyUp(KeyEvent {
 					flags: buffer[4],
-					key: u16::from_le_bytes(buffer[5..7].try_into().unwrap()) & 0x00FF,
+					key,
 					modifiers: buffer[7],
 					padding: 0,
 				}))
@@ -216,31 +194,11 @@ pub struct InputHandler {
 
 impl InputHandler {
 	pub fn new() -> Result<Self, ()> {
-		let mouse = VirtualDeviceBuilder::new()
-			.map_err(|e| log::error!("Failed to initiate virtual mouse: {e}"))?
-			.name("moonshine-mouse")
-			.with_relative_axes(&AttributeSet::from_iter([
-				RelativeAxisType::REL_X,
-				RelativeAxisType::REL_Y,
-				RelativeAxisType::REL_WHEEL,
-				RelativeAxisType::REL_HWHEEL,
-			]))
-			.map_err(|e| log::error!("Failed to enable relative axes for virtual mouse: {e}"))?
-			// .with_absolute_axis(UinputAbsSetup::)
-			// .map_err(|e| log::error!("Failed to enable absolute axes for virtual mouse: {e}"))?
-			.with_keys(&AttributeSet::from_iter([
-				Key::BTN_LEFT,
-				Key::BTN_MIDDLE,
-				Key::BTN_RIGHT,
-				Key::BTN_FORWARD,
-				Key::BTN_BACK,
-			]))
-			.map_err(|e| log::error!("Failed to add keys to virtual mouse: {e}"))?
-			.build()
-			.map_err(|e| log::error!("Failed to create virtual mouse: {e}"))?;
+		let mouse = Mouse::new()?;
+		let keyboard = Keyboard::new()?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = InputHandlerInner { mouse };
+		let inner = InputHandlerInner { mouse, keyboard };
 		tokio::spawn(inner.run(command_rx));
 
 		Ok(Self { command_tx })
@@ -253,50 +211,34 @@ impl InputHandler {
 }
 
 struct InputHandlerInner {
-	mouse: VirtualDevice,
+	mouse: Mouse,
+	keyboard: Keyboard,
 }
 
 impl InputHandlerInner {
 	pub async fn run(mut self, mut command_rx: mpsc::Receiver<InputEvent>) {
 		while let Some(command) = command_rx.recv().await {
 			match command {
-				InputEvent::KeyDown(_event) => {},
-				InputEvent::KeyUp(_event) => {},
+				InputEvent::KeyDown(event) => {
+					log::trace!("Pressing key: {event:?}");
+					let _ = self.keyboard.key_down(event.key);
+				},
+				InputEvent::KeyUp(event) => {
+					log::trace!("Releasing key: {event:?}");
+					let _ = self.keyboard.key_up(event.key);
+				},
 				InputEvent::MouseMoveAbsolute(_event) => {},
 				InputEvent::MouseMoveRelative(event) => {
 					log::trace!("Moving mouse relative: {event:?}");
-					let event_x = evdev::InputEvent::new_now(
-						evdev::EventType::RELATIVE,
-						RelativeAxisType::REL_X.0,
-						event.x as i32,
-					);
-					let event_y = evdev::InputEvent::new_now(
-						evdev::EventType::RELATIVE,
-						RelativeAxisType::REL_Y.0,
-						event.y as i32,
-					);
-					let _ = self.mouse.emit(&[event_x, event_y])
-						.map_err(|e| log::error!("Failed to make relative mouse movement: {e}"));
+					let _ = self.mouse.move_relative(event.x as i32, event.y as i32);
 				},
-				InputEvent::MouseButtonDown(event) => {
-					log::trace!("Pressing mouse button: {event:?}");
-					let button_event = evdev::InputEvent::new_now(
-						evdev::EventType::KEY,
-						Into::<Key>::into(event).code(),
-						1
-					);
-					let _ = self.mouse.emit(&[button_event])
-						.map_err(|e| log::error!("Failed to press mouse button: {e}"));
+				InputEvent::MouseButtonDown(button) => {
+					log::trace!("Pressing mouse button: {button:?}");
+					let _ = self.mouse.button_down(button);
 				},
-				InputEvent::MouseButtonUp(event) => {
-					log::trace!("Releasing mouse button: {event:?}");
-					let button_event = evdev::InputEvent::new_now(
-						evdev::EventType::KEY,
-						Into::<Key>::into(event).code(),
-						0
-					);
-					let _ = self.mouse.emit(&[button_event])
-						.map_err(|e| log::error!("Failed to release mouse button: {e}"));
+				InputEvent::MouseButtonUp(button) => {
+					log::trace!("Releasing mouse button: {button:?}");
+					let _ = self.mouse.button_up(button);
 				},
 			}
 		}

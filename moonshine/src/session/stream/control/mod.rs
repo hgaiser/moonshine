@@ -145,6 +145,7 @@ pub struct ControlStream {
 }
 
 impl ControlStream {
+	#[allow(clippy::result_unit_err)]
 	pub fn new(
 		config: Config,
 		video_stream: VideoStream,
