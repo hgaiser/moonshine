@@ -94,7 +94,7 @@ impl InputEvent {
 					return Err(());
 				}
 
-				let key = match Key::from_repr(buffer[6]) {
+				let key = match Key::from_repr(buffer[5]) {
 					Some(key) => key,
 					None => {
 						log::warn!("Unknown keycode: {}", buffer[6]);
@@ -119,7 +119,7 @@ impl InputEvent {
 					return Err(());
 				}
 
-				let key = match Key::from_repr(buffer[6]) {
+				let key = match Key::from_repr(buffer[5]) {
 					Some(key) => key,
 					None => {
 						log::warn!("Unknown keycode: {}", buffer[6]);
