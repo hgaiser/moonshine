@@ -39,7 +39,7 @@ enum GamepadCapability {
 	RgbLed = 0x80,
 }
 
-#[derive(Copy, Clone, Debug, EnumIter)]
+#[derive(Copy, Clone, Debug, EnumIter, PartialEq)]
 #[repr(u32)]
 enum GamepadButton {
 	// Button flags.
@@ -76,7 +76,7 @@ impl From<GamepadButton> for Key {
 			GamepadButton::Left => Key::BTN_DPAD_LEFT,
 			GamepadButton::Right => Key::BTN_DPAD_RIGHT,
 			GamepadButton::Start => Key::BTN_START,
-			GamepadButton::Select => Key::BTN_BACK,
+			GamepadButton::Select => Key::BTN_SELECT,
 			GamepadButton::LeftStickClick => Key::BTN_THUMBL,
 			GamepadButton::RightStickClick => Key::BTN_THUMBR,
 			GamepadButton::LB => Key::BTN_TL,
@@ -196,16 +196,27 @@ pub struct Gamepad {
 
 impl Gamepad {
 	pub fn new(info: GamepadInfo) -> Result<Self, ()> {
-		let mut buttons = AttributeSet::new();
-		for button in GamepadButton::iter() {
-			if info.has_button(&button) {
-				buttons.insert(button.into());
-			}
-		}
+		// Ideally we use info.supported_buttons, but this gives unexpected results.
+		// For example, the left and right joystick buttons would be mapped to SELECT / START for some reason..
+		let buttons = AttributeSet::from_iter([
+			evdev::Key::BTN_WEST,
+			evdev::Key::BTN_EAST,
+			evdev::Key::BTN_NORTH,
+			evdev::Key::BTN_SOUTH,
+			evdev::Key::BTN_THUMBL,
+			evdev::Key::BTN_THUMBR,
+			evdev::Key::BTN_TL,
+			evdev::Key::BTN_TR,
+			evdev::Key::BTN_TL2,
+			evdev::Key::BTN_TR2,
+			evdev::Key::BTN_START,
+			evdev::Key::BTN_SELECT,
+			evdev::Key::BTN_MODE,
+		]);
 
 		let device = VirtualDeviceBuilder::new()
 			.map_err(|e| log::error!("Failed to initiate virtual gamepad: {e}"))?
-			.input_id(InputId::new(evdev::BusType::BUS_USB, 0x45E, 0x28E, 0x110))
+			.input_id(InputId::new(evdev::BusType::BUS_BLUETOOTH, 0x54C, 0x5C4, 0x8100))
 			.name(format!("Moonshine Gamepad {}", info.index).as_str())
 			.with_keys(&buttons)
 			.map_err(|e| log::error!("Failed to add keys to virtual gamepad: {e}"))?
@@ -256,13 +267,14 @@ impl Gamepad {
 			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
 			// .with_ff(&AttributeSet::from_iter([
 			// 	evdev::FFEffectType::FF_RUMBLE,
-			// 	evdev::FFEffectType::FF_CONSTANT,
 			// 	evdev::FFEffectType::FF_PERIODIC,
+			// 	evdev::FFEffectType::FF_SQUARE,
+			// 	evdev::FFEffectType::FF_TRIANGLE,
 			// 	evdev::FFEffectType::FF_SINE,
-			// 	evdev::FFEffectType::FF_RAMP,
 			// 	evdev::FFEffectType::FF_GAIN,
 			// ]))
 			// .map_err(|e| log::error!("Failed to enable force feedback on virtual gamepad: {e}"))?
+			// .with_ff_effects_max(16) // TODO: What should this value be?
 			.build()
 			.map_err(|e| log::error!("Failed to create virtual gamepad: {e}"))?;
 
@@ -279,12 +291,39 @@ impl Gamepad {
 		// Check all buttons that have changed and emit their update.
 		for button in GamepadButton::iter() {
 			if self.button_changed(&button, update.button_flags) {
-				log::info!("Sending update for button {:?}, state: {}", button, (update.button_flags & button as u32) != 0);
-				events.push(evdev::InputEvent::new_now(
-					evdev::EventType::KEY,
-					Into::<Key>::into(button).code(),
-					((update.button_flags & button as u32) != 0) as i32,
-				));
+				log::trace!("Sending update for button {:?}, state: {}", button, (update.button_flags & button as u32) != 0);
+
+				match button {
+					GamepadButton::Down | GamepadButton::Up => {
+						let state;
+						if (update.button_flags & GamepadButton::Up as u32) != 0 {
+							state = -1;
+						} else if (update.button_flags & GamepadButton::Down as u32) != 0 {
+							state = 1;
+						} else {
+							state = 0;
+						}
+						events.push(evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_HAT0Y.0, state));
+					},
+					GamepadButton::Left | GamepadButton::Right => {
+						let state;
+						if (update.button_flags & GamepadButton::Left as u32) != 0 {
+							state = -1;
+						} else if (update.button_flags & GamepadButton::Right as u32) != 0 {
+							state = 1;
+						} else {
+							state = 0;
+						}
+						events.push(evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_HAT0X.0, state));
+					},
+					_ => {
+						events.push(evdev::InputEvent::new_now(
+							evdev::EventType::KEY,
+							Into::<Key>::into(button).code(),
+							((update.button_flags & button as u32) != 0) as i32,
+						));
+					}
+				}
 			}
 		}
 		self.button_state = update.button_flags;

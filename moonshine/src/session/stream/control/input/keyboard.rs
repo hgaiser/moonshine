@@ -138,9 +138,9 @@ pub enum Key {
 impl Key {
 	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
 		const EXPECTED_SIZE: usize =
-			std::mem::size_of::<u8>()   // flags
+			std::mem::size_of::<u8>()    // flags
 			+ std::mem::size_of::<u16>() // key
-			+ std::mem::size_of::<u8>() // modifiers
+			+ std::mem::size_of::<u8>()  // modifiers
 			+ std::mem::size_of::<u16>() // padding
 		;
 
@@ -149,7 +149,8 @@ impl Key {
 			return Err(());
 		}
 
-		Key::from_repr(buffer[5]).ok_or_else(|| log::warn!("Unknown keycode: {}", buffer[5]))
+
+		Key::from_repr(buffer[1]).ok_or_else(|| log::warn!("Unknown keycode: {}", buffer[5]))
 	}
 }
 
