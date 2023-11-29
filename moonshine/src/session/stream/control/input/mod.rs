@@ -1,10 +1,15 @@
+use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
-use self::{mouse::{Mouse, MouseButton}, keyboard::{Keyboard, Key}};
+use crate::session::stream::control::input::gamepad::Gamepad;
+
+use self::{mouse::{Mouse, MouseButton, MouseMoveRelative, MouseMoveAbsolute}, keyboard::{Keyboard, Key}, gamepad::{GamepadInfo, GamepadUpdate}};
 
 mod keyboard;
 mod mouse;
+mod gamepad;
 
+#[derive(FromRepr)]
 #[repr(u32)]
 enum InputEventType {
 	KeyDown = 0x00000003,
@@ -14,176 +19,44 @@ enum InputEventType {
 	MouseMoveRelative = 0x00000007,
 	MouseButtonDown = 0x00000008,
 	MouseButtonUp = 0x00000009,
-}
-
-impl TryFrom<u32> for InputEventType {
-	type Error = ();
-
-	fn try_from(v: u32) -> Result<Self, Self::Error> {
-		match v {
-			x if x == Self::KeyDown as u32 => Ok(Self::KeyDown),
-			x if x == Self::KeyUp as u32 => Ok(Self::KeyUp),
-			x if x == Self::MouseMoveAbsolute as u32 => Ok(Self::MouseMoveAbsolute),
-			x if x == Self::MouseMoveRelative as u32 => Ok(Self::MouseMoveRelative),
-			x if x == Self::MouseButtonDown as u32 => Ok(Self::MouseButtonDown),
-			x if x == Self::MouseButtonUp as u32 => Ok(Self::MouseButtonUp),
-			_ => {
-				log::warn!("Unknown event type: {v}");
-				Err(())
-			},
-		}
-	}
+	GamepadInfo = 0x55000004, // Called ControllerArrival in Moonlight.
+	GamepadUpdate = 0x0000000C,
 }
 
 #[derive(Debug)]
-pub enum InputEvent {
-	KeyDown(KeyEvent),
-	KeyUp(KeyEvent),
+#[repr(u32)]
+enum InputEvent {
+	KeyDown(Key),
+	KeyUp(Key),
 	MouseMoveAbsolute(MouseMoveAbsolute),
 	MouseMoveRelative(MouseMoveRelative),
 	MouseButtonDown(MouseButton),
 	MouseButtonUp(MouseButton),
-}
-
-#[derive(Debug)]
-pub struct MouseMoveAbsolute {
-	pub x: i16,
-	pub y: i16,
-	pub padding: u16,
-	pub width: i16,
-	pub height: i16,
-}
-
-#[derive(Debug)]
-pub struct MouseMoveRelative {
-	pub x: i16,
-	pub y: i16,
-}
-
-// #[repr(u8)]
-// pub enum KeyModifier {
-// 	Shift = 0x01,
-// 	Ctrl = 0x02,
-// 	Alt = 0x04,
-// 	Meta = 0x08,
-// }
-
-#[derive(Debug)]
-pub struct KeyEvent {
-	pub flags: u8,
-	pub key: Key,
-	pub modifiers: u8,
-	pub padding: u16,
+	GamepadInfo(GamepadInfo),
+	GamepadUpdate(GamepadUpdate),
 }
 
 impl InputEvent {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+	fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
 		if buffer.len() < 4 {
 			log::warn!("Expected control message to have at least 4 bytes, got {}", buffer.len());
 			return Err(());
 		}
 
-		match u32::from_le_bytes(buffer[..4].try_into().unwrap()).try_into()? {
-			InputEventType::KeyDown => {
-				if buffer.len() != std::mem::size_of::<KeyEvent>() + 4 {
-					log::warn!(
-						"Expected KeyDown message to have exactly {} bytes, got {}",
-						std::mem::size_of::<KeyEvent>() + 4,
-						buffer.len()
-					);
-					return Err(());
-				}
-
-				let key = match Key::from_repr(buffer[5]) {
-					Some(key) => key,
-					None => {
-						log::warn!("Unknown keycode: {}", buffer[6]);
-						return Err(());
-					}
-				};
-
-				Ok(InputEvent::KeyDown(KeyEvent {
-					flags: buffer[4],
-					key,
-					modifiers: buffer[7],
-					padding: 0,
-				}))
-			},
-			InputEventType::KeyUp => {
-				if buffer.len() != std::mem::size_of::<KeyEvent>() + 4 {
-					log::warn!(
-						"Expected KeyUp message to have exactly {} bytes, got {}",
-						std::mem::size_of::<KeyEvent>() + 4,
-						buffer.len()
-					);
-					return Err(());
-				}
-
-				let key = match Key::from_repr(buffer[5]) {
-					Some(key) => key,
-					None => {
-						log::warn!("Unknown keycode: {}", buffer[6]);
-						return Err(());
-					}
-				};
-
-				Ok(InputEvent::KeyUp(KeyEvent {
-					flags: buffer[4],
-					key,
-					modifiers: buffer[7],
-					padding: 0,
-				}))
-			},
-			InputEventType::MouseMoveAbsolute => {
-				if buffer.len() != std::mem::size_of::<MouseMoveAbsolute>() + 4 {
-					log::warn!(
-						"Expected absolute mouse movement message to have exactly {} bytes, got {}",
-						std::mem::size_of::<MouseMoveAbsolute>() + 4,
-						buffer.len()
-					);
-					return Err(());
-				}
-
-				// Moonlight seems to send { x, y, unused, width, height }.
-				// We don't seem to need the width and height?
-				Ok(InputEvent::MouseMoveAbsolute(MouseMoveAbsolute {
-					x: i16::from_be_bytes(buffer[4..6].try_into().unwrap()),
-					y: i16::from_be_bytes(buffer[6..8].try_into().unwrap()),
-					padding: 0,
-					width: i16::from_be_bytes(buffer[10..12].try_into().unwrap()),
-					height: i16::from_be_bytes(buffer[12..14].try_into().unwrap()),
-				}))
-			},
-			InputEventType::MouseMoveRelative => {
-				// Expect 2 i16's.
-				if buffer.len() != std::mem::size_of::<MouseMoveRelative>() + 4 {
-					log::warn!("Expected relative mouse movement message to have exactly 8 bytes, got {}", buffer.len());
-					return Err(());
-				}
-
-				Ok(InputEvent::MouseMoveRelative(MouseMoveRelative {
-					x: i16::from_be_bytes(buffer[4..6].try_into().unwrap()),
-					y: i16::from_be_bytes(buffer[6..8].try_into().unwrap()),
-				}))
-			},
-			InputEventType::MouseButtonDown => {
-				// Expect 1 u8.
-				if buffer.len() != 1 + 4 {
-					log::warn!("Expected mouse button down message to have exactly 5 bytes, got {}", buffer.len());
-					return Err(());
-				}
-
-				Ok(InputEvent::MouseButtonDown(buffer[4].try_into()?))
-			},
-			InputEventType::MouseButtonUp => {
-				// Expect 1 u8.
-				if buffer.len() != 1 + 4 {
-					log::warn!("Expected mouse button up message to have exactly 5 bytes, got {}", buffer.len());
-					return Err(());
-				}
-
-				Ok(InputEvent::MouseButtonUp(buffer[4].try_into()?))
-			},
+		let event_type = u32::from_le_bytes(buffer[..4].try_into().unwrap());
+		match InputEventType::from_repr(event_type) {
+			Some(InputEventType::KeyDown) => Ok(InputEvent::KeyDown(Key::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::KeyUp) => Ok(InputEvent::KeyUp(Key::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::MouseMoveAbsolute) => Ok(InputEvent::MouseMoveAbsolute(MouseMoveAbsolute::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::MouseMoveRelative) => Ok(InputEvent::MouseMoveRelative(MouseMoveRelative::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::MouseButtonDown) => Ok(InputEvent::MouseButtonDown(MouseButton::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::MouseButtonUp) => Ok(InputEvent::MouseButtonUp(MouseButton::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::GamepadInfo) => Ok(InputEvent::GamepadInfo(GamepadInfo::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::GamepadUpdate) => Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?)),
+			None => {
+				log::warn!("Received unknown event type: {event_type}");
+				Err(())
+			}
 		}
 	}
 }
@@ -204,9 +77,14 @@ impl InputHandler {
 		Ok(Self { command_tx })
 	}
 
-	pub async fn handle_input(&self, event: InputEvent) -> Result<(), ()> {
+	async fn handle_input(&self, event: InputEvent) -> Result<(), ()> {
 		self.command_tx.send(event).await
 			.map_err(|e| log::error!("Failed to send input event: {e}"))
+	}
+
+	pub async fn handle_raw_input<'a>(&self, event: &'a [u8]) -> Result<(), ()> {
+		let event = InputEvent::from_bytes(event)?;
+		self.handle_input(event).await
 	}
 }
 
@@ -217,15 +95,17 @@ struct InputHandlerInner {
 
 impl InputHandlerInner {
 	pub async fn run(mut self, mut command_rx: mpsc::Receiver<InputEvent>) {
+		let mut gamepads = Vec::new();
+
 		while let Some(command) = command_rx.recv().await {
 			match command {
-				InputEvent::KeyDown(event) => {
-					log::trace!("Pressing key: {event:?}");
-					let _ = self.keyboard.key_down(event.key);
+				InputEvent::KeyDown(key) => {
+					log::trace!("Pressing key: {key:?}");
+					let _ = self.keyboard.key_down(key);
 				},
-				InputEvent::KeyUp(event) => {
-					log::trace!("Releasing key: {event:?}");
-					let _ = self.keyboard.key_up(event.key);
+				InputEvent::KeyUp(key) => {
+					log::trace!("Releasing key: {key:?}");
+					let _ = self.keyboard.key_up(key);
 				},
 				InputEvent::MouseMoveAbsolute(_event) => {},
 				InputEvent::MouseMoveRelative(event) => {
@@ -239,6 +119,21 @@ impl InputHandlerInner {
 				InputEvent::MouseButtonUp(button) => {
 					log::trace!("Releasing mouse button: {button:?}");
 					let _ = self.mouse.button_up(button);
+				},
+				InputEvent::GamepadInfo(gamepad) => {
+					log::info!("Gamepad info: {gamepad:?}");
+					if let Ok(gamepad) = Gamepad::new(gamepad) {
+						gamepads.push(gamepad);
+					}
+				},
+				InputEvent::GamepadUpdate(gamepad_update) => {
+					log::trace!("Gamepad update: {gamepad_update:?}");
+					if gamepad_update.index as usize >= gamepads.len() {
+						log::warn!("Received update for gamepad {}, but we only have {} gamepads.", gamepad_update.index, gamepads.len());
+						continue;
+					}
+
+					let _ = gamepads[gamepad_update.index as usize].update(gamepad_update);
 				},
 			}
 		}

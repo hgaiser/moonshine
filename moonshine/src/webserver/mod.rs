@@ -17,7 +17,8 @@ use self::pairing::handle_pair_request;
 mod pairing;
 mod tls;
 
-const SERVERINFO_APP_VERSION: &str = "7.1.450.0";
+// The negative fourth value is to indicate that we are following the protocol introduced with Sunshine.
+const SERVERINFO_APP_VERSION: &str = "7.1.431.-1";
 const SERVERINFO_GFE_VERSION: &str = "3.23.0.74";
 
 #[derive(Clone)]

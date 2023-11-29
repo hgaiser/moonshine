@@ -23,6 +23,7 @@ pub struct Config {
 
 	/// List of scanners that dynamically adds applications when started.
 	#[serde(rename = "application_scanner")]
+	#[serde(skip_serializing_if = "Vec::is_empty", default)]
 	pub application_scanners: Vec<ApplicationScannerConfig>,
 
 	/// Time in seconds since last ping after which the stream closes.

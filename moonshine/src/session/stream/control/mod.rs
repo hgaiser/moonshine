@@ -10,7 +10,7 @@ use openssl::symm::Cipher;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use crate::{session::{SessionContext, SessionKeys}, config::Config};
-use self::input::{InputEvent, InputHandler};
+use self::input::InputHandler;
 use super::{VideoStream, AudioStream};
 
 mod input;
@@ -56,22 +56,22 @@ impl TryFrom<u16> for ControlMessageType {
 }
 
 #[derive(Debug)]
-enum ControlMessage {
+enum ControlMessage<'a> {
 	Encrypted(EncryptedControlMessage),
 	Ping,
 	Termination,
 	RumbleData,
 	LossStats,
 	FrameStats,
-	InputData(InputEvent),
+	InputData(&'a [u8]),
 	InvalidateReferenceFrames,
 	RequestIdrFrame,
 	StartA,
 	StartB,
 }
 
-impl ControlMessage {
-	fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+impl<'a> ControlMessage<'a> {
+	fn from_bytes(buffer: &'a [u8]) -> Result<Self, ()> {
 		if buffer.len() < 4 {
 			log::warn!("Expected control message to have at least 4 bytes, got {}", buffer.len());
 			return Err(());
@@ -118,7 +118,7 @@ impl ControlMessage {
 					return Err(());
 				}
 
-				Ok(Self::InputData(InputEvent::from_bytes(&buffer[8..])?))
+				Ok(Self::InputData(&buffer[8..]))
 			},
 			ControlMessageType::InvalidateReferenceFrames => Ok(Self::InvalidateReferenceFrames),
 			ControlMessageType::RequestIdrFrame => Ok(Self::RequestIdrFrame),
@@ -253,11 +253,12 @@ impl ControlStreamInner {
 					log::trace!("Received control message: {control_message:?}");
 
 					// First check for encrypted control messages and decrypt them.
+					let decrypted;
 					if let ControlMessage::Encrypted(message) = control_message {
 						let mut initialization_vector = [0u8; 16];
 						initialization_vector[0] = message.sequence_number as u8;
 
-						let decrypted = openssl::symm::decrypt_aead(
+						let decrypted_result = openssl::symm::decrypt_aead(
 							Cipher::aes_128_gcm(),
 							&context.keys.remote_input_key,
 							Some(&initialization_vector),
@@ -266,7 +267,7 @@ impl ControlStreamInner {
 							&message.tag,
 						);
 
-						let decrypted = match decrypted {
+						decrypted = match decrypted_result {
 							Ok(decrypted) => decrypted,
 							Err(e) => {
 								log::error!("Failed to decrypt control message: {:?}", e.errors());
@@ -295,34 +296,7 @@ impl ControlStreamInner {
 							stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 						},
 						ControlMessage::InputData(event) => {
-							log::trace!("Received input event: {event:?}");
-							let _ = input_handler.handle_input(event).await;
-							// match message {
-							// 	InputEvent::KeyDown(event) => {
-							// 		enigo.key_down(enigo::Key::Raw(event.key));
-							// 		log::info!("Key down event: {event:?}");
-							// 	},
-							// 	InputEvent::KeyUp(event) => {
-							// 		enigo.key_up(enigo::Key::Raw(event.key));
-							// 		log::info!("Key up event: {event:?}");
-							// 	},
-							// 	InputEvent::MouseMoveAbsolute(event) => {
-							// 		let display_size = enigo.main_display_size();
-							// 		enigo.mouse_move_to(
-							// 			event.x as i32 * display_size.0 / event.width as i32,
-							// 			event.y as i32 * display_size.1 / event.height as i32,
-							// 		);
-							// 	},
-							// 	InputEvent::MouseMoveRelative(event) => {
-							// 		enigo.mouse_move_relative(event.x as i32, event.y as i32);
-							// 	},
-							// 	InputEvent::MouseButtonDown(button) => {
-							// 		enigo.mouse_down(button.into());
-							// 	},
-							// 	InputEvent::MouseButtonUp(button) => {
-							// 		enigo.mouse_up(button.into());
-							// 	},
-							// }
+							let _ = input_handler.handle_raw_input(event).await;
 						},
 						skipped_message => {
 							log::trace!("Skipped control message: {skipped_message:?}");

@@ -1,6 +1,59 @@
 use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, AttributeSet, RelativeAxisType, Key};
+use strum_macros::FromRepr;
 
 #[derive(Debug)]
+pub struct MouseMoveAbsolute {
+	x: i16,
+	y: i16,
+	width: i16,
+	height: i16,
+}
+
+impl MouseMoveAbsolute {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+		const EXPECTED_SIZE: usize =
+			std::mem::size_of::<i16>()   // x
+			+ std::mem::size_of::<i16>() // y
+			+ std::mem::size_of::<i16>() // padding
+			+ std::mem::size_of::<i16>() // width
+			+ std::mem::size_of::<i16>() // height
+		;
+
+		if buffer.len() < EXPECTED_SIZE {
+			log::warn!("Expected at least {EXPECTED_SIZE} bytes for MouseMoveAbsolute, got {} bytes.", buffer.len());
+			return Err(());
+		}
+
+		Ok(Self {
+			x: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
+			y: i16::from_be_bytes(buffer[2..4].try_into().unwrap()),
+			width: i16::from_be_bytes(buffer[6..8].try_into().unwrap()),
+			height: i16::from_be_bytes(buffer[8..10].try_into().unwrap()),
+		})
+	}
+}
+
+#[derive(Debug)]
+pub struct MouseMoveRelative {
+	pub x: i16,
+	pub y: i16,
+}
+
+impl MouseMoveRelative {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+		if buffer.len() < std::mem::size_of::<Self>() {
+			log::warn!("Expected at least {} bytes for MouseMoveRelative, got {} bytes.", std::mem::size_of::<Self>(), buffer.len());
+			return Err(());
+		}
+
+		Ok(Self {
+			x: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
+			y: i16::from_be_bytes(buffer[2..4].try_into().unwrap()),
+		})
+	}
+}
+
+#[derive(Debug, Eq, PartialEq, FromRepr)]
 #[repr(u8)]
 pub enum MouseButton {
 	Left = 0x01,
@@ -8,6 +61,19 @@ pub enum MouseButton {
 	Right = 0x03,
 	Side = 0x04,
 	Extra = 0x05,
+}
+
+impl MouseButton {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+		const EXPECTED_SIZE: usize = std::mem::size_of::<u8>(); // button
+
+		if buffer.len() < EXPECTED_SIZE {
+			log::warn!("Expected at least {EXPECTED_SIZE} bytes for MouseButton, got {} bytes.", buffer.len());
+			return Err(());
+		}
+
+		MouseButton::from_repr(buffer[0]).ok_or_else(|| log::warn!("Unknown mouse button: {}", buffer[0]))
+	}
 }
 
 impl From<MouseButton> for Key {
@@ -22,21 +88,6 @@ impl From<MouseButton> for Key {
 	}
 }
 
-impl TryFrom<u8> for MouseButton {
-	type Error = ();
-
-	fn try_from(v: u8) -> Result<Self, Self::Error> {
-		match v {
-			x if x == Self::Left as u8 => Ok(Self::Left),
-			x if x == Self::Middle as u8 => Ok(Self::Middle),
-			x if x == Self::Right as u8 => Ok(Self::Right),
-			x if x == Self::Side as u8 => Ok(Self::Side),
-			x if x == Self::Extra as u8 => Ok(Self::Extra),
-			_ => Err(()),
-		}
-	}
-}
-
 pub struct Mouse {
 	device: VirtualDevice,
 }
@@ -45,7 +96,7 @@ impl Mouse {
 	pub fn new() -> Result<Self, ()> {
 		let device = VirtualDeviceBuilder::new()
 			.map_err(|e| log::error!("Failed to initiate virtual mouse: {e}"))?
-			.name("moonshine-mouse")
+			.name("Moonshine Mouse")
 			.with_relative_axes(&AttributeSet::from_iter([
 				RelativeAxisType::REL_X,
 				RelativeAxisType::REL_Y,
