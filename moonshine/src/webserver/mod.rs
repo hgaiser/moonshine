@@ -1,4 +1,4 @@
-use std::{net::{ToSocketAddrs, IpAddr}, collections::HashMap, convert::Infallible};
+use std::{net::{ToSocketAddrs, IpAddr}, collections::HashMap, convert::Infallible, path::PathBuf, str::FromStr};
 
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
@@ -256,6 +256,22 @@ impl Webserver {
 				log::warn!("{message}");
 				return bad_request(message);
 			}
+		};
+		let boxart_path = match shellexpand::full(boxart_path.to_str().unwrap()) {
+			Ok(boxart_path) => boxart_path,
+			Err(e) => {
+				let message = format!("Failed to expand boxart path: {e}");
+				log::warn!("{message}");
+				return bad_request(message);
+			},
+		};
+		let boxart_path = match PathBuf::from_str(&boxart_path) {
+			Ok(boxart_path) => boxart_path,
+			Err(e) => {
+				let message = format!("Failed to create boxart path: {e}");
+				log::warn!("{message}");
+				return bad_request(message);
+			},
 		};
 
 		let asset = match image::open(boxart_path) {

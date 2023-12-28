@@ -107,7 +107,10 @@ impl InputHandlerInner {
 					log::trace!("Releasing key: {key:?}");
 					let _ = self.keyboard.key_up(key);
 				},
-				InputEvent::MouseMoveAbsolute(_event) => {},
+				InputEvent::MouseMoveAbsolute(event) => {
+					log::trace!("Absolute mouse movement: {event:?}");
+					let _ = self.mouse.move_absolute(event.x as i32, event.y as i32);
+				},
 				InputEvent::MouseMoveRelative(event) => {
 					log::trace!("Moving mouse relative: {event:?}");
 					let _ = self.mouse.move_relative(event.x as i32, event.y as i32);

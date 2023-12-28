@@ -1,10 +1,10 @@
-use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, AttributeSet, RelativeAxisType, Key};
 use strum_macros::FromRepr;
+use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, AttributeSet, RelativeAxisType, Key, AbsoluteAxisType, UinputAbsSetup, AbsInfo};
 
 #[derive(Debug)]
 pub struct MouseMoveAbsolute {
-	x: i16,
-	y: i16,
+	pub x: i16,
+	pub y: i16,
 	width: i16,
 	height: i16,
 }
@@ -104,8 +104,14 @@ impl Mouse {
 				RelativeAxisType::REL_HWHEEL,
 			]))
 			.map_err(|e| log::error!("Failed to enable relative axes for virtual mouse: {e}"))?
-			// .with_absolute_axis(UinputAbsSetup::)
-			// .map_err(|e| log::error!("Failed to enable absolute axes for virtual mouse: {e}"))?
+			.with_absolute_axis(&UinputAbsSetup::new(
+				AbsoluteAxisType::ABS_X, AbsInfo::new(0, 0, 3000, 0, 0, 1)
+			))
+			.map_err(|e| log::error!("Failed to enable absolute axis for virtual mouse: {e}"))?
+			.with_absolute_axis(&UinputAbsSetup::new(
+				AbsoluteAxisType::ABS_Y, AbsInfo::new(0, 0, 3000, 0, 0, 1)
+			))
+			.map_err(|e| log::error!("Failed to enable absolute axis for virtual mouse: {e}"))?
 			.with_keys(&AttributeSet::from_iter([
 				Key::BTN_LEFT,
 				Key::BTN_MIDDLE,
@@ -121,18 +127,22 @@ impl Mouse {
 	}
 
 	pub fn move_relative(&mut self, x: i32, y: i32) -> Result<(), ()> {
-		let event_x = evdev::InputEvent::new_now(
-			evdev::EventType::RELATIVE,
-			RelativeAxisType::REL_X.0,
-			x,
-		);
-		let event_y = evdev::InputEvent::new_now(
-			evdev::EventType::RELATIVE,
-			RelativeAxisType::REL_Y.0,
-			y,
-		);
-		self.device.emit(&[event_x, event_y])
+		let events = [
+			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_X.0, x),
+			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_Y.0, y),
+		];
+		self.device.emit(&events)
 			.map_err(|e| log::error!("Failed to make relative mouse movement: {e}"))
+	}
+
+	pub fn move_absolute(&mut self, x: i32, y: i32) -> Result<(), ()> {
+		log::info!("x: {x}, y: {y}");
+		let events = [
+			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, x),
+			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, y),
+		];
+		self.device.emit(&events)
+			.map_err(|e| log::error!("Failed to make absolute mouse movement: {e}"))
 	}
 
 	pub fn button_down(&mut self, button: MouseButton) -> Result<(), ()> {

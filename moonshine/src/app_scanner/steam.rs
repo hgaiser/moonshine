@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::{path::{Path, PathBuf}, str::FromStr};
 
 use crate::config::{SteamApplicationScannerConfig, ApplicationConfig};
 
@@ -84,10 +84,13 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 		}
 
 		let boxart = config.library.join(format!("appcache/librarycache/{game_id}_library_600x900.jpg"));
-		if boxart.exists() {
-			application.boxart = Some(boxart);
-		} else {
-			log::warn!("No boxart for game '{}' at '{boxart:?}", application.title);
+		if let Ok(boxart) = shellexpand::full(boxart.to_str().unwrap()) {
+			let path = PathBuf::from_str(&boxart).unwrap();
+			if path.exists() {
+				application.boxart = Some(path);
+			} else {
+				log::warn!("No boxart for game '{}' at '{boxart}", application.title);
+			}
 		}
 
 		applications.push(application);
