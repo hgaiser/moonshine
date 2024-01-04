@@ -28,7 +28,7 @@ pub struct SessionContext {
 	pub application: ApplicationConfig,
 
 	/// Id of the application as reported to the client.
-	pub application_id: u32,
+	pub application_id: i32,
 
 	/// Resolution of the video stream.
 	pub resolution: (u32, u32),

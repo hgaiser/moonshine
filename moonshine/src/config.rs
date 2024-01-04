@@ -1,4 +1,4 @@
-use std::path::{PathBuf, Path};
+use std::{path::{PathBuf, Path}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}};
 use serde::Deserialize;
 
 fn default_stream_timeout() -> u64 { 60 }
@@ -75,6 +75,14 @@ pub struct ApplicationConfig {
 	///
 	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
 	pub run_after: Option<Vec<Vec<String>>>,
+}
+
+impl ApplicationConfig {
+	pub fn id(&self) -> i32 {
+		let mut hasher = DefaultHasher::new();
+		self.title.hash(&mut hasher);
+		hasher.finish() as i32
+	}
 }
 
 #[derive(Clone, Debug, Deserialize)]

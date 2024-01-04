@@ -194,7 +194,7 @@ impl Webserver {
 		writer.write(XmlEvent::start_element("root")
 			.attr("status_code", "200")).unwrap();
 
-		for (i, application) in self.config.applications.iter().enumerate() {
+		for application in self.config.applications.iter() {
 			writer.write(XmlEvent::start_element("App")).unwrap();
 
 			// TODO: Fix HDR support.
@@ -203,11 +203,11 @@ impl Webserver {
 			writer.write(XmlEvent::end_element()).unwrap();
 
 			writer.write(XmlEvent::start_element("AppTitle")).unwrap();
-			writer.write(XmlEvent::characters(&application.title)).unwrap();
+			let _ = writer.write(XmlEvent::characters(&application.title));
 			writer.write(XmlEvent::end_element()).unwrap();
 
 			writer.write(XmlEvent::start_element("ID")).unwrap();
-			writer.write(XmlEvent::characters(&(i + 1).to_string())).unwrap();
+			let _ = writer.write(XmlEvent::characters(&application.id().to_string()));
 			writer.write(XmlEvent::end_element()).unwrap();
 
 			// </App>
@@ -231,7 +231,7 @@ impl Webserver {
 				return bad_request(message);
 			}
 		};
-		let application_id: u32 = match application_id.parse() {
+		let application_id: i32 = match application_id.parse() {
 			Ok(application_id) => application_id,
 			Err(e) => {
 				let message = format!("Failed to parse application ID: {e}");
@@ -240,7 +240,7 @@ impl Webserver {
 			}
 		};
 
-		let application = match self.config.applications.get((application_id - 1) as usize) {
+		let application = match self.config.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
@@ -335,7 +335,7 @@ impl Webserver {
 			.attr("status_code", "200")).unwrap();
 
 		writer.write(XmlEvent::start_element("hostname")).unwrap();
-		writer.write(XmlEvent::characters(&self.config.name)).unwrap();
+		let _ = writer.write(XmlEvent::characters(&self.config.name));
 		writer.write(XmlEvent::end_element()).unwrap();
 
 		writer.write(XmlEvent::start_element("appversion")).unwrap();
@@ -482,7 +482,7 @@ impl Webserver {
 				return bad_request(message);
 			}
 		};
-		let application_id: u32 = match application_id.parse() {
+		let application_id: i32 = match application_id.parse() {
 			Ok(application_id) => application_id,
 			Err(e) => {
 				let message = format!("Failed to parse application ID: {e}");
@@ -564,7 +564,7 @@ impl Webserver {
 			}
 		};
 
-		let application = match self.config.applications.get((application_id - 1) as usize) {
+		let application = match self.config.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
