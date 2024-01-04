@@ -42,6 +42,7 @@ type = "steam"
 library = "$HOME/.local/share/Steam"
 run_before = [
 	["$HOME/.local/bin/resolution", "{width}", "{height}"],
+	["/usr/bin/steam", "steam://open/bigpicture"],
 	["/usr/bin/steam", "steam://rungameid/{game_id}"],
 ]
 run_after = [
