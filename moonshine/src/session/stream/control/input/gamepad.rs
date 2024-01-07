@@ -1,42 +1,53 @@
-use evdev::{uinput::{VirtualDevice, VirtualDeviceBuilder}, AttributeSet, Key, FFEffectType, UinputAbsSetup, AbsoluteAxisType, AbsInfo, InputId};
+use evdev::{
+	uinput::{
+		VirtualDevice,
+		VirtualDeviceBuilder
+	},
+	AttributeSet,
+	Key,
+	UinputAbsSetup,
+	AbsoluteAxisType,
+	AbsInfo,
+	InputId,
+};
 use strum::IntoEnumIterator;
 use strum_macros::{FromRepr, EnumIter};
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
 enum GamepadKind {
-	Unknown = 0x00,
-	Xbox = 0x01,
-	PlayStation = 0x02,
-	Nintendo = 0x03,
+	_Unknown = 0x00,
+	_Xbox = 0x01,
+	_PlayStation = 0x02,
+	_Nintendo = 0x03,
 }
 
 #[derive(Copy, Clone, Debug)]
 #[repr(u16)]
 enum GamepadCapability {
 	/// Reports values between 0x00 and 0xFF for trigger axes.
-	AnalogTriggers = 0x01,
+	_AnalogTriggers = 0x01,
 
 	/// Can rumble.
-	Rumble = 0x02,
+	_Rumble = 0x02,
 
 	/// Can rumble triggers.
-	TriggerRumble = 0x04,
+	_TriggerRumble = 0x04,
 
 	/// Reports touchpad events.
-	Touchpad = 0x08,
+	_Touchpad = 0x08,
 
 	/// Can report accelerometer events.
-	Acceleration = 0x10,
+	_Acceleration = 0x10,
 
 	/// Can report gyroscope events.
-	Gyro = 0x20,
+	_Gyro = 0x20,
 
 	/// Reports battery state.
-	BatteryState = 0x40,
+	_BatteryState = 0x40,
 
 	// Can set RGB LED state.
-	RgbLed = 0x80,
+	_RgbLed = 0x80,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, PartialEq)]
@@ -99,9 +110,9 @@ impl From<GamepadButton> for Key {
 #[derive(Debug)]
 pub struct GamepadInfo {
 	index: u8,
-	kind: GamepadKind,
-	capabilities: u16,
-	supported_buttons: u32,
+	// kind: GamepadKind,
+	// capabilities: u16,
+	// supported_buttons: u32,
 }
 
 impl GamepadInfo {
@@ -120,25 +131,25 @@ impl GamepadInfo {
 
 		Ok(Self {
 			index: buffer[0],
-			kind: GamepadKind::from_repr(buffer[1]).ok_or_else(|| log::warn!("Unknown gamepad kind: {}", buffer[1]))?,
-			capabilities: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
-			supported_buttons: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
+			// kind: GamepadKind::from_repr(buffer[1]).ok_or_else(|| log::warn!("Unknown gamepad kind: {}", buffer[1]))?,
+			// capabilities: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
+			// supported_buttons: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 		})
 	}
 
-	fn has_capability(&self, capability: &GamepadCapability) -> bool {
-		(self.capabilities & *capability as u16) != 0
-	}
+	// fn has_capability(&self, capability: &GamepadCapability) -> bool {
+	// 	(self.capabilities & *capability as u16) != 0
+	// }
 
-	fn has_button(&self, button: &GamepadButton) -> bool {
-		(self.supported_buttons & *button as u32) != 0
-	}
+	// fn has_button(&self, button: &GamepadButton) -> bool {
+	// 	(self.supported_buttons & *button as u32) != 0
+	// }
 }
 
 #[derive(Debug)]
 pub struct GamepadUpdate {
 	pub index: u16,
-	active_gamepad_mask: u16,
+	_active_gamepad_mask: u16,
 	button_flags: u32,
 	left_trigger: u8,
 	right_trigger: u8,
@@ -172,7 +183,7 @@ impl GamepadUpdate {
 
 		Ok(Self {
 			index: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
-			active_gamepad_mask: u16::from_le_bytes(buffer[4..6].try_into().unwrap()),
+			_active_gamepad_mask: u16::from_le_bytes(buffer[4..6].try_into().unwrap()),
 			button_flags: u16::from_le_bytes(buffer[8..10].try_into().unwrap()) as u32 | (u16::from_le_bytes(buffer[22..24].try_into().unwrap()) as u32) << 16,
 			left_trigger: buffer[10],
 			right_trigger: buffer[11],
@@ -189,7 +200,7 @@ impl GamepadUpdate {
 }
 
 pub struct Gamepad {
-	info: GamepadInfo,
+	_info: GamepadInfo,
 	device: VirtualDevice,
 	button_state: u32,
 }
@@ -278,7 +289,7 @@ impl Gamepad {
 			.build()
 			.map_err(|e| log::error!("Failed to create virtual gamepad: {e}"))?;
 
-		Ok(Self { info, device, button_state: 0 })
+		Ok(Self { _info: info, device, button_state: 0 })
 	}
 
 	fn button_changed(&self, button: &GamepadButton, new_state: u32) -> bool {

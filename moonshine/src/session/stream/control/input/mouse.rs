@@ -5,8 +5,8 @@ use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, AttributeSet, Relativ
 pub struct MouseMoveAbsolute {
 	pub x: i16,
 	pub y: i16,
-	width: i16,
-	height: i16,
+	// width: i16,
+	// height: i16,
 }
 
 impl MouseMoveAbsolute {
@@ -27,8 +27,8 @@ impl MouseMoveAbsolute {
 		Ok(Self {
 			x: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
 			y: i16::from_be_bytes(buffer[2..4].try_into().unwrap()),
-			width: i16::from_be_bytes(buffer[6..8].try_into().unwrap()),
-			height: i16::from_be_bytes(buffer[8..10].try_into().unwrap()),
+			// width: i16::from_be_bytes(buffer[6..8].try_into().unwrap()),
+			// height: i16::from_be_bytes(buffer[8..10].try_into().unwrap()),
 		})
 	}
 }
