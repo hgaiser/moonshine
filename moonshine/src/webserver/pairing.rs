@@ -311,9 +311,8 @@ async fn pair_challenge(
 		}
 	};
 
-	if client_manager.add_client(&unique_id).await.is_err() {
-		return bad_request("Failed to add client".to_string());
-	}
+	// All moonlight clients use the same uniqueid, so we ignore errors here.
+	let _ = client_manager.add_client(&unique_id).await;
 
 	let mut buffer = Vec::new();
 	let mut writer = EmitterConfig::new()

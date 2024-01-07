@@ -83,7 +83,7 @@ impl Webserver {
 							async move {
 								let _ = hyper::server::conn::http1::Builder::new()
 									.serve_connection(io, service_fn(|request| {
-										server.serve(request, mac_address.clone())
+										server.serve(request, mac_address.clone(), false)
 									})).await;
 							}
 						});
@@ -136,7 +136,7 @@ impl Webserver {
 							async move {
 								let _ = hyper::server::conn::http1::Builder::new()
 									.serve_connection(io, service_fn(|request| {
-										server.serve(request, mac_address.clone())
+										server.serve(request, mac_address.clone(), true)
 									})).await;
 							}
 						});
@@ -154,7 +154,7 @@ impl Webserver {
 		Ok(server)
 	}
 
-	async fn serve(&self, request: Request<hyper::body::Incoming>, mac_address: Option<String>) -> Result<Response<Full<Bytes>>, Infallible> {
+	async fn serve(&self, request: Request<hyper::body::Incoming>, mac_address: Option<String>, https: bool) -> Result<Response<Full<Bytes>>, Infallible> {
 		let params = request.uri()
 			.query()
 			.map(|v| {
@@ -166,19 +166,30 @@ impl Webserver {
 
 		log::info!("Received {} request for {}.", request.method(), request.uri().path());
 
-		let response = match (request.method(), request.uri().path()) {
-			(&Method::GET, "/serverinfo") => self.server_info(params, mac_address).await,
-			(&Method::GET, "/applist") => self.app_list(),
-			(&Method::GET, "/appasset") => self.app_asset(params),
-			(&Method::GET, "/pair") => handle_pair_request(params, &self.server_certs, &self.client_manager).await,
-			(&Method::GET, "/pin") => self.pin(params).await,
-			(&Method::GET, "/unpair") => self.unpair(params).await,
-			(&Method::GET, "/launch") => self.launch(params).await,
-			(&Method::GET, "/resume") => self.resume(params).await,
-			(&Method::GET, "/cancel") => self.cancel().await,
-			(method, uri) => {
-				log::warn!("Unhandled {method} request with URI '{uri}'");
-				not_found()
+		let response = if https {
+			match (request.method(), request.uri().path()) {
+				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
+				(&Method::GET, "/applist") => self.app_list(),
+				(&Method::GET, "/appasset") => self.app_asset(params),
+				(&Method::GET, "/pair") => handle_pair_request(params, &self.server_certs, &self.client_manager).await,
+				// (&Method::GET, "/unpair") => self.unpair(params).await,
+				(&Method::GET, "/launch") => self.launch(params).await,
+				(&Method::GET, "/resume") => self.resume(params).await,
+				(&Method::GET, "/cancel") => self.cancel().await,
+				(method, uri) => {
+					log::warn!("Unhandled {method} request with URI '{uri}'");
+					not_found()
+				}
+			}
+		} else {
+			match (request.method(), request.uri().path()) {
+				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
+				(&Method::GET, "/pair") => handle_pair_request(params, &self.server_certs, &self.client_manager).await,
+				(&Method::GET, "/pin") => self.pin(params).await,
+				(method, uri) => {
+					log::warn!("Unhandled {method} request with URI '{uri}'");
+					not_found()
+				}
 			}
 		};
 
@@ -299,6 +310,7 @@ impl Webserver {
 		&self,
 		params: HashMap<String, String>,
 		mac_address: Option<String>,
+		https: bool,
 	) -> Response<Full<Bytes>> {
 		let unique_id = match params.get("uniqueid") {
 			Some(unique_id) => unique_id.clone(),
@@ -318,12 +330,14 @@ impl Webserver {
 			},
 		};
 
-		let paired = self.client_manager.is_paired(unique_id).await.unwrap_or(false);
-		let paired = if paired {
-			"1"
-		} else {
-			"0"
-		};
+		// Seems we should only say we paired when using HTTPS.
+		let paired = if https {
+			if self.client_manager.is_paired(unique_id).await.unwrap_or(false) {
+				"1"
+			} else {
+				"0"
+			}
+		} else { "0" };
 
 		let mut buffer = Vec::new();
 		let mut writer = EmitterConfig::new()
@@ -433,28 +447,31 @@ impl Webserver {
 		}
 	}
 
-	async fn unpair(
-		&self,
-		mut params: HashMap<String, String>,
-	) -> Response<Full<Bytes>> {
-		let unique_id = match params.remove("uniqueid") {
-			Some(unique_id) => unique_id,
-			None => {
-				let message = format!("Expected 'uniqueid' in unpair request, got {:?}.", params.keys());
-				log::warn!("{message}");
-				return bad_request(message);
-			}
-		};
+	// This is disabled, because all moonlight clients seem to share the same uniqueid.
+	// This means that if we 'unpair', we unpair all moonlight clients.
+	// TODO: Collaborate with moonlight to give clients a truly unique ID.
+	// async fn unpair(
+	// 	&self,
+	// 	mut params: HashMap<String, String>,
+	// ) -> Response<Full<Bytes>> {
+	// 	let unique_id = match params.remove("uniqueid") {
+	// 		Some(unique_id) => unique_id,
+	// 		None => {
+	// 			let message = format!("Expected 'uniqueid' in unpair request, got {:?}.", params.keys());
+	// 			log::warn!("{message}");
+	// 			return bad_request(message);
+	// 		}
+	// 	};
 
-		match self.client_manager.remove_client(&unique_id).await {
-			Ok(()) =>
-				Response::builder()
-					.status(StatusCode::OK)
-					.body(Full::new(Bytes::from("Successfully unpaired.".to_string())))
-					.unwrap(),
-			Err(()) => bad_request("Failed to remove client".to_string()),
-		}
-	}
+	// 	match self.client_manager.remove_client(&unique_id).await {
+	// 		Ok(()) =>
+	// 			Response::builder()
+	// 				.status(StatusCode::OK)
+	// 				.body(Full::new(Bytes::from("Successfully unpaired.".to_string())))
+	// 				.unwrap(),
+	// 		Err(()) => bad_request("Failed to remove client".to_string()),
+	// 	}
+	// }
 
 	async fn launch(
 		&self,
