@@ -166,7 +166,12 @@ run_after = [
 
 ## FAQ
 
-1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?** Both Moonshine and Sunshine fulfill the same goal. Moonshine has a much narrower focus on supported platforms. Sunshine attempts to support many different platforms and many different encoders. If your software / hardware is not supported by Moonshine, then you are likely better off using Sunshine.
+1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?** Both Moonshine and Sunshine fulfill the same goal. Moonshine has a much narrower focus on supported platforms. Sunshine attempts to support many different platforms and many different encoders. If your software / hardware is not supported by Moonshine, then you are likely better off using Sunshine. If you just want something to stream your games, you should probably also use Sunshine.
+
+## Acknowledgement
+
+This wouldn't have been possible without the incredible work by the people behind both [Moonlight](https://moonlight-stream.org/) and [Sunshine](https://github.com/LizardByte/Sunshine).
+Thanks to their hard work it was possible for me to implement this protocol.
 
 ## TODO's
 
