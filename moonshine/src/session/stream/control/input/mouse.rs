@@ -88,6 +88,42 @@ impl From<MouseButton> for Key {
 	}
 }
 
+#[derive(Debug)]
+pub struct MouseScrollVertical {
+	pub amount: i16,
+}
+
+impl MouseScrollVertical {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+		if buffer.len() < std::mem::size_of::<Self>() {
+			log::warn!("Expected at least {} bytes for MouseScrollVertical, got {} bytes.", std::mem::size_of::<Self>(), buffer.len());
+			return Err(());
+		}
+
+		Ok(Self {
+			amount: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
+		})
+	}
+}
+
+#[derive(Debug)]
+pub struct MouseScrollHorizontal {
+	pub amount: i16,
+}
+
+impl MouseScrollHorizontal {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+		if buffer.len() < std::mem::size_of::<Self>() {
+			log::warn!("Expected at least {} bytes for MouseScrollHorizontal, got {} bytes.", std::mem::size_of::<Self>(), buffer.len());
+			return Err(());
+		}
+
+		Ok(Self {
+			amount: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
+		})
+	}
+}
+
 pub struct Mouse {
 	device: VirtualDevice,
 }
@@ -100,8 +136,8 @@ impl Mouse {
 			.with_relative_axes(&AttributeSet::from_iter([
 				RelativeAxisType::REL_X,
 				RelativeAxisType::REL_Y,
-				RelativeAxisType::REL_WHEEL,
-				RelativeAxisType::REL_HWHEEL,
+				RelativeAxisType::REL_WHEEL_HI_RES,
+				RelativeAxisType::REL_HWHEEL_HI_RES,
 			]))
 			.map_err(|e| log::error!("Failed to enable relative axes for virtual mouse: {e}"))?
 			.with_absolute_axis(&UinputAbsSetup::new(
@@ -165,5 +201,21 @@ impl Mouse {
 
 		self.device.emit(&[button_event])
 			.map_err(|e| log::error!("Failed to release mouse button: {e}"))
+	}
+
+	pub fn scroll_vertical(&mut self, amount: i16) -> Result<(), ()> {
+		let events = [
+			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_WHEEL_HI_RES.0, amount as i32),
+		];
+		self.device.emit(&events)
+			.map_err(|e| log::error!("Failed to scroll vertically: {e}"))
+	}
+
+	pub fn scroll_horizontal(&mut self, amount: i16) -> Result<(), ()> {
+		let events = [
+			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_HWHEEL_HI_RES.0, amount as i32),
+		];
+		self.device.emit(&events)
+			.map_err(|e| log::error!("Failed to scroll horizontally: {e}"))
 	}
 }

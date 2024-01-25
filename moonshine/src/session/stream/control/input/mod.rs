@@ -3,7 +3,18 @@ use tokio::sync::mpsc;
 
 use crate::session::stream::control::input::gamepad::Gamepad;
 
-use self::{mouse::{Mouse, MouseButton, MouseMoveRelative, MouseMoveAbsolute}, keyboard::{Keyboard, Key}, gamepad::{GamepadInfo, GamepadUpdate}};
+use self::{
+	mouse::{
+		Mouse,
+		MouseButton,
+		MouseMoveAbsolute,
+		MouseMoveRelative,
+		MouseScrollVertical,
+		MouseScrollHorizontal,
+	},
+	keyboard::{Keyboard, Key},
+	gamepad::{GamepadInfo, GamepadUpdate}
+};
 
 mod keyboard;
 mod mouse;
@@ -15,10 +26,11 @@ enum InputEventType {
 	KeyDown = 0x00000003,
 	KeyUp = 0x00000004,
 	MouseMoveAbsolute = 0x00000005,
-	// MouseMoveRelative = 0x00000006 (pre gen5)
 	MouseMoveRelative = 0x00000007,
 	MouseButtonDown = 0x00000008,
 	MouseButtonUp = 0x00000009,
+	MouseScrollVertical = 0x0000000A,
+	MouseScrollHorizontal = 0x55000001,
 	GamepadInfo = 0x55000004, // Called ControllerArrival in Moonlight.
 	GamepadUpdate = 0x0000000C,
 }
@@ -32,6 +44,8 @@ enum InputEvent {
 	MouseMoveRelative(MouseMoveRelative),
 	MouseButtonDown(MouseButton),
 	MouseButtonUp(MouseButton),
+	MouseScrollVertical(MouseScrollVertical),
+	MouseScrollHorizontal(MouseScrollHorizontal),
 	GamepadInfo(GamepadInfo),
 	GamepadUpdate(GamepadUpdate),
 }
@@ -51,6 +65,8 @@ impl InputEvent {
 			Some(InputEventType::MouseMoveRelative) => Ok(InputEvent::MouseMoveRelative(MouseMoveRelative::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::MouseButtonDown) => Ok(InputEvent::MouseButtonDown(MouseButton::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::MouseButtonUp) => Ok(InputEvent::MouseButtonUp(MouseButton::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::MouseScrollVertical) => Ok(InputEvent::MouseScrollVertical(MouseScrollVertical::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::MouseScrollHorizontal) => Ok(InputEvent::MouseScrollHorizontal(MouseScrollHorizontal::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadInfo) => Ok(InputEvent::GamepadInfo(GamepadInfo::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadUpdate) => Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?)),
 			None => {
@@ -123,8 +139,16 @@ impl InputHandlerInner {
 					log::trace!("Releasing mouse button: {button:?}");
 					let _ = self.mouse.button_up(button);
 				},
+				InputEvent::MouseScrollVertical(event) => {
+					log::trace!("Scrolling vertically: {event:?}");
+					let _ = self.mouse.scroll_vertical(event.amount);
+				},
+				InputEvent::MouseScrollHorizontal(event) => {
+					log::trace!("Scrolling horizontally: {event:?}");
+					let _ = self.mouse.scroll_horizontal(event.amount);
+				},
 				InputEvent::GamepadInfo(gamepad) => {
-					log::info!("Gamepad info: {gamepad:?}");
+					log::debug!("Gamepad info: {gamepad:?}");
 					if let Ok(gamepad) = Gamepad::new(gamepad) {
 						gamepads.push(gamepad);
 					}
