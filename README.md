@@ -7,7 +7,7 @@ This means you can play games on the client device, while rendering takes place 
 ## Requirements and limitations
 
 1. **NVIDIA GPU**. Moonshine uses NvFBC to capture the desktop, which is a NVIDIA library for retrieving the latest buffer from the GPU. There is currently no plan to support other hardware.
-1. **(Arch) Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux. Likewise, it should theoretically be possible to run this software on Windows, but that is even less likely to work out of the box. Perhaps in the future, more OS's will be supported. For now the focus is on Arch Linux.
+1. **(Arch) Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux. Likewise, it should be relatively simple to run this service on Windows, but at least the input (mouse / keyboard / gamepad) support won't work since that uses Linux specific libraries. Perhaps in the future, more OS's will be supported. For now the focus is on Arch Linux.
 1. **Steam Deck / PS4 / PS5 controller**. Similarly, this project is only tested on the mentioned controllers. It works well in those cases, other controllers might work, they might not work.
 
 ## Installation
