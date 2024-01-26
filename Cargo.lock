@@ -508,16 +508,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a81dae078cea95a014a339291cec439d2f232ebe854a9d672b796c6afafa9b7"
 
 [[package]]
-name = "cstr"
-version = "0.2.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8aa998c33a6d3271e3678950a22134cd7dd27cef86dee1b611b5b14207d1d90b"
-dependencies = [
- "proc-macro2",
- "quote",
-]
-
-[[package]]
 name = "darling"
 version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -741,7 +731,6 @@ name = "ffmpeg"
 version = "0.1.0"
 dependencies = [
  "ffmpeg-sys",
- "serde",
 ]
 
 [[package]]
@@ -749,15 +738,6 @@ name = "ffmpeg-sys"
 version = "0.1.0"
 dependencies = [
  "pkg-config",
-]
-
-[[package]]
-name = "filedesc"
-version = "0.6.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c4960c866d9cf4c48f64f11ef0020c98900d0cb32e9b019c000ed838470daa1d"
-dependencies = [
- "libc",
 ]
 
 [[package]]
@@ -1305,14 +1285,12 @@ dependencies = [
  "async-shutdown",
  "clap",
  "cpal",
- "cstr",
  "dirs",
  "enet",
  "env_logger",
  "evdev",
  "ffmpeg",
  "ffmpeg-sys",
- "filedesc",
  "hex",
  "http-body-util",
  "hyper",
@@ -1324,7 +1302,6 @@ dependencies = [
  "nvfbc",
  "openssl",
  "opus",
- "png",
  "reed-solomon",
  "rtsp-types",
  "sdp-types",
