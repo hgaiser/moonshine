@@ -17,7 +17,7 @@ This means you can play games on the client device, while rendering takes place 
 The simplest method is to install through the AUR:
 
 ```sh
-$ git clone https://aur.archlinux.org/moonshine-git
+$ git clone https://aur.archlinux.org/moonshine
 $ cd moonshine
 $ makepkg -si
 ```
