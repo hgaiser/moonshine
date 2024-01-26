@@ -16,7 +16,6 @@ pub mod rtsp;
 pub mod session;
 pub mod state;
 pub mod publisher;
-pub mod util;
 pub mod webserver;
 
 pub struct Moonshine {
