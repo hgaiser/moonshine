@@ -41,7 +41,4 @@ url = "2.4.1"
 uuid = { version = "1.5.0", features = ["v4"] }
 xcb = { version = "1.2.2", features = ["shm"] }
 xml-rs = "0.8.19"
-zeroconf = "0.11.1"
-
-[features]
-task-metrics = []
+zeroconf = "0.13.1"
