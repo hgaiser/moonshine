@@ -3,7 +3,6 @@ use std::{collections::HashMap, sync::Arc};
 use http_body_util::Full;
 use hyper::{Response, header, body::Bytes};
 use tokio::sync::Notify;
-use xml::{EmitterConfig, writer::XmlEvent};
 
 use crate::{clients::PendingClient, webserver::bad_request, clients::ClientManager};
 
@@ -142,17 +141,8 @@ async fn get_server_cert(
 	log::info!("Waiting for pin to be sent at /pin?uniqueid={}&pin=<PIN>", &unique_id);
 	pin_notifier.notified().await;
 
-	let mut buffer = Vec::new();
-	let mut writer = EmitterConfig::new()
-		.write_document_declaration(true)
-		.create_writer(&mut buffer);
-
-	writer.write(XmlEvent::start_element("root")
-		.attr("status_code", "200")).unwrap();
-
-	writer.write(XmlEvent::start_element("paired")).unwrap();
-	writer.write(XmlEvent::characters("1")).unwrap();
-	writer.write(XmlEvent::end_element()).unwrap();
+	let mut response = "<root status_code=\"200\">".to_string();
+	response += "<paired>1</paired>";
 
 	let serialized_server_pem = match server_pem.to_pem() {
 		Ok(pem) => pem,
@@ -162,14 +152,11 @@ async fn get_server_cert(
 			return bad_request(message);
 		}
 	};
-	writer.write(XmlEvent::start_element("plaincert")).unwrap();
-	writer.write(XmlEvent::characters(&hex::encode(serialized_server_pem))).unwrap();
-	writer.write(XmlEvent::end_element()).unwrap();
 
-	// </root>
-	writer.write(XmlEvent::end_element()).unwrap();
+	response += &format!("<plaincert>{}</plaincert>", hex::encode(serialized_server_pem));
+	response += "</root>";
 
-	let mut response = Response::new(Full::new(Bytes::from(buffer)));
+	let mut response = Response::new(Full::new(Bytes::from(response)));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
 	response
@@ -211,26 +198,12 @@ async fn client_challenge(
 		}
 	};
 
-	let mut buffer = Vec::new();
-	let mut writer = EmitterConfig::new()
-		.write_document_declaration(true)
-		.create_writer(&mut buffer);
+	let mut response = "<root status_code=\"200\">".to_string();
+	response += "<paired>1</paired>";
+	response += &format!("<challengeresponse>{}</challengeresponse>", hex::encode(challenge_response));
+	response += "</root>";
 
-	writer.write(XmlEvent::start_element("root")
-		.attr("status_code", "200")).unwrap();
-
-	writer.write(XmlEvent::start_element("paired")).unwrap();
-	writer.write(XmlEvent::characters("1")).unwrap();
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	writer.write(XmlEvent::start_element("challengeresponse")).unwrap();
-	writer.write(XmlEvent::characters(&hex::encode(challenge_response))).unwrap();
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	// </root>
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+	let mut response = Response::new(Full::new(Bytes::from(response)));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
 	response
@@ -273,26 +246,12 @@ async fn server_challenge_response(
 		}
 	};
 
-	let mut buffer = Vec::new();
-	let mut writer = EmitterConfig::new()
-		.write_document_declaration(true)
-		.create_writer(&mut buffer);
+	let mut response = "<root status_code=\"200\">".to_string();
+	response += "<paired>1</paired>";
+	response += &format!("<pairingsecret>{}</pairingsecret>", hex::encode(pairing_secret));
+	response += "</root>";
 
-	writer.write(XmlEvent::start_element("root")
-		.attr("status_code", "200")).unwrap();
-
-	writer.write(XmlEvent::start_element("paired")).unwrap();
-	writer.write(XmlEvent::characters("1")).unwrap();
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	writer.write(XmlEvent::start_element("pairingsecret")).unwrap();
-	writer.write(XmlEvent::characters(&hex::encode(pairing_secret))).unwrap();
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	// </root>
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+	let mut response = Response::new(Full::new(Bytes::from(response)));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
 	response
@@ -314,22 +273,12 @@ async fn pair_challenge(
 	// All moonlight clients use the same uniqueid, so we ignore errors here.
 	let _ = client_manager.add_client(&unique_id).await;
 
-	let mut buffer = Vec::new();
-	let mut writer = EmitterConfig::new()
-		.write_document_declaration(true)
-		.create_writer(&mut buffer);
 
-	writer.write(XmlEvent::start_element("root")
-		.attr("status_code", "200")).unwrap();
+	let mut response = "<root status_code=\"200\">".to_string();
+	response += "<paired>1</paired>";
+	response += "</root>";
 
-	writer.write(XmlEvent::start_element("paired")).unwrap();
-	writer.write(XmlEvent::characters("1")).unwrap();
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	// </root>
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+	let mut response = Response::new(Full::new(Bytes::from(response)));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
 	response
@@ -371,22 +320,11 @@ async fn client_pairing_secret(
 
 	// TODO: Verify x509 cert.
 
-	let mut buffer = Vec::new();
-	let mut writer = EmitterConfig::new()
-		.write_document_declaration(true)
-		.create_writer(&mut buffer);
+	let mut response = "<root status_code=\"200\">".to_string();
+	response += "<paired>1</paired>";
+	response += "</root>";
 
-	writer.write(XmlEvent::start_element("root")
-		.attr("status_code", "200")).unwrap();
-
-	writer.write(XmlEvent::start_element("paired")).unwrap();
-	writer.write(XmlEvent::characters("1")).unwrap();
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	// </root>
-	writer.write(XmlEvent::end_element()).unwrap();
-
-	let mut response = Response::new(Full::new(Bytes::from(String::from_utf8(buffer).unwrap())));
+	let mut response = Response::new(Full::new(Bytes::from(response)));
 	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
 	response

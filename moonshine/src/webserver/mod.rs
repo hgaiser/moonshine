@@ -8,7 +8,6 @@ use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
 use openssl::x509::X509;
 use tokio::net::TcpListener;
-use xml::{EmitterConfig, writer::XmlEvent};
 
 use crate::{config::Config, clients::ClientManager, webserver::tls::TlsAcceptor, session::{manager::SessionManager, SessionContext, SessionKeys}};
 
@@ -197,38 +196,21 @@ impl Webserver {
 	}
 
 	fn app_list(&self) -> Response<Full<Bytes>> {
-		let mut buffer = Vec::new();
-		let mut writer = EmitterConfig::new()
-			.write_document_declaration(true)
-			.create_writer(&mut buffer);
-
-		writer.write(XmlEvent::start_element("root")
-			.attr("status_code", "200")).unwrap();
-
+		let mut response = "<root status_code=\"200\">".to_string();
 		for application in self.config.applications.iter() {
-			writer.write(XmlEvent::start_element("App")).unwrap();
+			response += "<App>";
 
 			// TODO: Fix HDR support.
-			writer.write(XmlEvent::start_element("IsHdrSupported")).unwrap();
-			writer.write(XmlEvent::characters("0")).unwrap();
-			writer.write(XmlEvent::end_element()).unwrap();
+			response += "<IsHdrSupported>0</IsHdrSupported>";
+			response += format!("<AppTitle>{}</AppTitle>", application.title).as_ref();
+			response += format!("<ID>{}</ID>", application.id()).as_ref();
 
-			writer.write(XmlEvent::start_element("AppTitle")).unwrap();
-			let _ = writer.write(XmlEvent::characters(&application.title));
-			writer.write(XmlEvent::end_element()).unwrap();
-
-			writer.write(XmlEvent::start_element("ID")).unwrap();
-			let _ = writer.write(XmlEvent::characters(&application.id().to_string()));
-			writer.write(XmlEvent::end_element()).unwrap();
-
-			// </App>
-			writer.write(XmlEvent::end_element()).unwrap();
+			response += "</App>";
 		}
 
-		// </root>
-		writer.write(XmlEvent::end_element()).unwrap();
+		response += "</root>";
 
-		let mut response = Response::new(Full::new(Bytes::from(buffer)));
+		let mut response = Response::new(Full::new(Bytes::from(response)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 		response
 	}
@@ -339,77 +321,25 @@ impl Webserver {
 			}
 		} else { "0" };
 
-		let mut buffer = Vec::new();
-		let mut writer = EmitterConfig::new()
-			.write_document_declaration(true)
-			.create_writer(&mut buffer);
-
 		// TODO: Check the use of some of these values, we leave most of them blank and Moonlight doesn't care.
-		writer.write(XmlEvent::start_element("root")
-			.attr("status_code", "200")).unwrap();
+		let mut response = "<root status_code=\"200\">".to_string();
+		response += &format!("<hostname>{}</hostname>", self.config.name);
+		response += &format!("<appversion>{}</appversion>", SERVERINFO_APP_VERSION);
+		response += &format!("<GfeVersion>{}</GfeVersion>", SERVERINFO_GFE_VERSION);
+		response += &format!("<uniqueid>{}</uniqueid>", self.unique_id);
+		response += &format!("<HttpsPort>{}</HttpsPort>", self.config.webserver.port_https);
+		response += "<ExternalPort></ExternalPort>";
+		response += &format!("<mac>{}</mac>", mac_address.unwrap_or("".to_string()));
+		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
+		response += "<LocalIP></LocalIP>";
+		response += "<ServerCodecModeSupport>259</ServerCodecModeSupport>";
+		response += "<SupportedDisplayMode></SupportedDisplayMode>";
+		response += &format!("<PairStatus>{paired}</PairStatus>");
+		response += &format!("<currentgame>{}</currentgame>", session_context.clone().map(|s| s.application_id).unwrap_or(0));
+		response += &format!("<state>{}</state>", session_context.map(|_| "MOONSHINE_SERVER_BUSY").unwrap_or("MOONSHINE_SERVER_FREE"));
+		response += "</root>";
 
-		writer.write(XmlEvent::start_element("hostname")).unwrap();
-		let _ = writer.write(XmlEvent::characters(&self.config.name));
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("appversion")).unwrap();
-		writer.write(XmlEvent::characters(SERVERINFO_APP_VERSION)).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("GfeVersion")).unwrap();
-		writer.write(XmlEvent::characters(SERVERINFO_GFE_VERSION)).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("uniqueid")).unwrap();
-		writer.write(XmlEvent::characters(&self.unique_id)).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("HttpsPort")).unwrap();
-		writer.write(XmlEvent::characters(&self.config.webserver.port_https.to_string())).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("ExternalPort")).unwrap();
-		writer.write(XmlEvent::characters("")).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("mac")).unwrap();
-		writer.write(XmlEvent::characters(&mac_address.unwrap_or("".to_string()))).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("MaxLumaPixelsHEVC")).unwrap();
-		writer.write(XmlEvent::characters("1869449984")).unwrap(); // TODO: Check if HEVC is supported, set this to 0 if it is not.
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("LocalIP")).unwrap();
-		writer.write(XmlEvent::characters("")).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("ServerCodecModeSupport")).unwrap();
-		writer.write(XmlEvent::characters("259")).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("SupportedDisplayMode")).unwrap();
-
-		// for display_mode in display_modes { ... }
-
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("PairStatus")).unwrap();
-		writer.write(XmlEvent::characters(paired)).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("currentgame")).unwrap();
-		writer.write(XmlEvent::characters(&session_context.clone().map(|s| s.application_id).unwrap_or(0).to_string())).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		writer.write(XmlEvent::start_element("state")).unwrap();
-		writer.write(XmlEvent::characters(session_context.map(|_| "MOONSHINE_SERVER_BUSY").unwrap_or("MOONSHINE_SERVER_FREE"))).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		// </root>
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		let mut response = Response::new(Full::new(Bytes::from(buffer)));
+		let mut response = Response::new(Full::new(Bytes::from(response)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 		response
 	}
@@ -605,24 +535,13 @@ impl Webserver {
 			return bad_request("Failed to start session".to_string());
 		}
 
-		let mut buffer = Vec::new();
-		let mut writer = EmitterConfig::new()
-			.write_document_declaration(true)
-			.create_writer(&mut buffer);
-
-		writer.write(XmlEvent::start_element("root")
-			.attr("status_code", "200")).unwrap();
-
-		writer.write(XmlEvent::start_element("gamesession")).unwrap();
-		writer.write(XmlEvent::characters("1")).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
+		let mut response = "<root status_code=\"200\">".to_string();
+		response += "<gamesession>1</gamesession>";
+		response += "</root>";
 
 		// TODO: Return sessionUrl0.
 
-		// </root>
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		let mut response = Response::new(Full::new(Bytes::from(buffer)));
+		let mut response = Response::new(Full::new(Bytes::from(response)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
 		response
@@ -688,24 +607,14 @@ impl Webserver {
 			return bad_request("Failed to update session keys".to_string());
 		}
 
-		let mut buffer = Vec::new();
-		let mut writer = EmitterConfig::new()
-			.write_document_declaration(true)
-			.create_writer(&mut buffer);
-
-		writer.write(XmlEvent::start_element("root")
-			.attr("status_code", "200")).unwrap();
+		let mut response = "<root status_code=\"200\">".to_string();
 
 		// TODO: Return sessionUrl0.
 
-		writer.write(XmlEvent::start_element("resume")).unwrap();
-		writer.write(XmlEvent::characters("1")).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
+		response += "<resume>1</resume>";
+		response += "</root>";
 
-		// </root>
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		let mut response = Response::new(Full::new(Bytes::from(buffer)));
+		let mut response = Response::new(Full::new(Bytes::from(response)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 
 		response
@@ -718,23 +627,11 @@ impl Webserver {
 			return bad_request(message);
 		}
 
-		let mut buffer = Vec::new();
-		let mut writer = EmitterConfig::new()
-			.write_document_declaration(true)
-			.create_writer(&mut buffer);
+		let mut response = "<root status_code=\"200\">".to_string();
+		response += "<cancel>1</cancel>";
+		response += "</root>";
 
-		// TODO: Check the use of some of these values, we leave most of them blank and Moonlight doesn't care.
-		writer.write(XmlEvent::start_element("root")
-			.attr("status_code", "200")).unwrap();
-
-		writer.write(XmlEvent::start_element("cancel")).unwrap();
-		writer.write(XmlEvent::characters("1")).unwrap();
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		// </root>
-		writer.write(XmlEvent::end_element()).unwrap();
-
-		let mut response = Response::new(Full::new(Bytes::from(buffer)));
+		let mut response = Response::new(Full::new(Bytes::from(response)));
 		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
 		response
 	}
