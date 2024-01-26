@@ -7,14 +7,12 @@ edition = "2021"
 async-shutdown = "0.2.1"
 clap = { version = "4.4.4", features = ["derive"] }
 cpal = { version = "0.15.2", features = ["jack"] }
-cstr = "0.2.11"
 dirs = "5.0.1"
 enet = "0.3.0"
 env_logger = "0.10.0"
 evdev = "0.12.1"
 ffmpeg = { path = "../ffmpeg" }
 ffmpeg-sys = { path = "../ffmpeg-sys" }
-filedesc = "0.6.3"
 hex = "0.4.3"
 http-body-util = "0.1.0-rc.3"
 hyper = { version = "1.0.1", features = ["server", "http1"] }
@@ -26,7 +24,6 @@ network-interface = "1.1.1"
 nvfbc = "0.1.5"
 openssl = "0.10.57"
 opus = "0.3.0"
-png = "0.17.10"
 reed-solomon = { version = "0.1.0", path = "../reed-solomon" }
 rtsp-types = "0.1.0"
 sdp-types = "0.1.5"
