@@ -2,7 +2,7 @@ use std::{net::{ToSocketAddrs, IpAddr}, collections::HashMap, convert::Infallibl
 
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
-use hyper::{service::service_fn, Response, Request, body::Bytes, StatusCode, header, Method};
+use hyper::{service::service_fn, Response, Request, body::Bytes, StatusCode, header::{self, HeaderValue}, Method};
 use hyper_util::rt::tokio::TokioIo;
 use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
@@ -211,7 +211,7 @@ impl Webserver {
 		response += "</root>";
 
 		let mut response = Response::new(Full::new(Bytes::from(response)));
-		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+		response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 		response
 	}
 
@@ -250,7 +250,8 @@ impl Webserver {
 				return bad_request(message);
 			}
 		};
-		let boxart_path = match shellexpand::full(boxart_path.to_str().unwrap()) {
+		let boxart_path = boxart_path.to_string_lossy();
+		let boxart_path = match shellexpand::full(&boxart_path) {
 			Ok(boxart_path) => boxart_path,
 			Err(e) => {
 				let message = format!("Failed to expand boxart path: {e}");
@@ -284,7 +285,7 @@ impl Webserver {
 		}
 
 		let mut response = Response::new(Full::new(Bytes::from(buffer.into_inner())));
-		response.headers_mut().insert(header::CONTENT_TYPE, "image/png".parse().unwrap());
+		response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("image/png"));
 		response
 	}
 
@@ -340,7 +341,7 @@ impl Webserver {
 		response += "</root>";
 
 		let mut response = Response::new(Full::new(Bytes::from(response)));
-		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+		response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 		response
 	}
 
@@ -369,9 +370,16 @@ impl Webserver {
 		let response = self.client_manager.register_pin(unique_id, pin).await;
 		match response {
 			Ok(()) =>
-				Response::builder()
-					.status(StatusCode::OK)
-					.body(Full::new(Bytes::from(format!("Successfully received pin '{}' for unique id '{}'.", pin, unique_id)))).unwrap(),
+				match Response::builder().status(StatusCode::OK)
+					.body(Full::new(Bytes::from(format!("Successfully received pin '{}' for unique id '{}'.", pin, unique_id))))
+				{
+					Ok(response) => response,
+					Err(e) => {
+						let message = format!("Failed to create '/pin' response: {e}");
+						log::warn!("{message}");
+						bad_request(message)
+					}
+				}
 			Err(()) =>
 				bad_request("Failed to register pin".to_string()),
 		}
@@ -542,7 +550,7 @@ impl Webserver {
 		// TODO: Return sessionUrl0.
 
 		let mut response = Response::new(Full::new(Bytes::from(response)));
-		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+		response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
 		response
 	}
@@ -615,7 +623,7 @@ impl Webserver {
 		response += "</root>";
 
 		let mut response = Response::new(Full::new(Bytes::from(response)));
-		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+		response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
 		response
 	}
@@ -632,7 +640,7 @@ impl Webserver {
 		response += "</root>";
 
 		let mut response = Response::new(Full::new(Bytes::from(response)));
-		response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+		response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 		response
 	}
 }

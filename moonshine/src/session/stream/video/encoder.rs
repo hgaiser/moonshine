@@ -142,7 +142,9 @@ impl Encoder {
 			{
 				log::trace!("Waiting for new frame.");
 				// Wait for a new frame.
-				let mut result = notifier.wait_timeout(intermediate_buffer.lock().unwrap(), std::time::Duration::from_millis(500))
+				let lock = intermediate_buffer.lock()
+					.map_err(|e| log::error!("Failed to acquire buffer lock: {e}"))?;
+				let mut result = notifier.wait_timeout(lock, std::time::Duration::from_millis(500))
 					.map_err(|e| log::error!("Failed to wait for new frame: {e}"))?;
 
 				// Didn't get a lock, let's check shutdown status and try again.

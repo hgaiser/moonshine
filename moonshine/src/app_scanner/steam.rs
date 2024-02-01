@@ -84,12 +84,18 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 		}
 
 		let boxart = config.library.join(format!("appcache/librarycache/{game_id}_library_600x900.jpg"));
-		if let Ok(boxart) = shellexpand::full(boxart.to_str().unwrap()) {
-			let path = PathBuf::from_str(&boxart).unwrap();
-			if path.exists() {
-				application.boxart = Some(path);
-			} else {
-				log::warn!("No boxart for game '{}' at '{boxart}", application.title);
+		if let Ok(boxart) = shellexpand::full(&boxart.to_string_lossy()) {
+			match PathBuf::from_str(&boxart) {
+				Ok(path) => {
+					if path.exists() {
+						application.boxart = Some(path);
+					} else {
+						log::warn!("No boxart for game '{}' at '{boxart}", application.title);
+					}
+				},
+				Err(e) => {
+					log::warn!("Failed to parse boxart path: {e}");
+				}
 			}
 		}
 

@@ -26,7 +26,9 @@ fn run(port: u16, name: String, shutdown: &ShutdownManager<i32>) -> Result<(), (
 
 	while !shutdown.is_shutdown_triggered() {
 		// Calling `poll()` will keep this service alive.
-		event_loop.poll(std::time::Duration::from_secs(0)).unwrap();
+		if let Err(e) = event_loop.poll(std::time::Duration::from_secs(0)) {
+			log::warn!("Failed to publish service: {e}");
+		}
 		std::thread::sleep(std::time::Duration::from_secs(1));
 	}
 

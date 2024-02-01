@@ -533,6 +533,13 @@ fn sign<T>(data: &[u8], key: &PKeyRef<T>) -> Result<Vec<u8>, openssl::error::Err
 }
 
 async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> Result<(), String> {
+	let client_hash = match &client.client_hash {
+		Some(client_hash) => client_hash,
+		None => {
+			return Err("We did not yet receive a client hash.".to_string());
+		}
+	};
+
 	if client_secret.len() != 256 + 16 {
 		return Err(format!("Expected client pairing secret to be of size {}, but got {} bytes.", 256 + 16, client_secret.len()));
 	}
@@ -548,7 +555,14 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 	data.extend(client.pem.signature().as_slice());
 	data.extend(client_secret);
 
-	if !openssl::hash::hash(MessageDigest::sha256(), &data).unwrap().to_vec().eq(client.client_hash.as_ref().unwrap()) {
+	let data = match openssl::hash::hash(MessageDigest::sha256(), &data) {
+		Ok(data) => data,
+		Err(e) => {
+			return Err(format!("Failed to hash secret: {e}"));
+		}
+	};
+
+	if !data.to_vec().eq(client_hash) {
 		return Err("Client hash is not as expected, MITM?".to_string());
 	}
 

@@ -1,7 +1,7 @@
 use std::{collections::HashMap, sync::Arc};
 
 use http_body_util::Full;
-use hyper::{Response, header, body::Bytes};
+use hyper::{Response, header::{self, HeaderValue}, body::Bytes};
 use tokio::sync::Notify;
 
 use crate::{clients::PendingClient, webserver::bad_request, clients::ClientManager};
@@ -157,7 +157,7 @@ async fn get_server_cert(
 	response += "</root>";
 
 	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+	response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
 	response
 }
@@ -204,7 +204,7 @@ async fn client_challenge(
 	response += "</root>";
 
 	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+	response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
 	response
 }
@@ -252,7 +252,7 @@ async fn server_challenge_response(
 	response += "</root>";
 
 	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+	response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
 	response
 }
@@ -279,7 +279,7 @@ async fn pair_challenge(
 	response += "</root>";
 
 	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+	response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
 	response
 }
@@ -325,7 +325,7 @@ async fn client_pairing_secret(
 	response += "</root>";
 
 	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response.headers_mut().insert(header::CONTENT_TYPE, "application/xml".parse().unwrap());
+	response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
 	response
 }
