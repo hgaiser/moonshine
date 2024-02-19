@@ -76,6 +76,28 @@ Mostly this comes down to the following:
 1. Check that the path to the certificate is correct.
 1. Add applications that you want to run from the client (more on that below).
 
+### Audio capture
+
+Moonshine uses the monitoring functionality of PulseAudio to capture outgoing audio.
+This can be achieved through `pavucontrol` in the "Input Devices" tab, by choosing the monitor device as the default device.
+Alternatively this can be done through commandline:
+
+```sh
+$ pactl list sources short | grep monitor | awk '{print $2}'
+```
+
+This command will print all known monitoring input sources.
+If there's multiple, choose the one that matches your output device (for example `alsa_output.pci-0000_01_00.1.hdmi-stereo.monitor` in my system where I output audio over HDMI) and set it as a default like so:
+
+```sh
+$ pactl set-default-source <monitor input name>
+```
+
+NOTE: If you are using a microphone, applications like Discord will now use your output audio as microphone by default.
+You can probably specify in Discord which microphone to use explicitly (untested).
+
+NOTE: I am open to suggestions on how to improve audio capture functionality so that this is not an issue.
+
 ### Applications
 
 It is important to note that each application that is defined in the config simply starts streaming the entire desktop.
@@ -158,13 +180,13 @@ Thanks to their hard work it was possible for me to implement this protocol.
 
 ## TODO's
 
-1. [ ] Document required setup for audio.
+1. [x] Document required setup for audio.
 1. [ ] Document pairing process.
 1. [ ] Move crates to their own repository and publish on crates.io.
-1. [ ] Automatically create certificate when no certificate is found.
+1. [x] Automatically create certificate when no certificate is found.
 1. [ ] AV1 support.
 1. [ ] Gyro support for controllers that support it.
-1. [ ] Mouse scrolling support.
+1. [x] Mouse scrolling support.
 1. [ ] Change controller ID based on what the client registers (this should correctly show Xbox buttons in some games when using Xbox controllers, for example).
 1. [ ] Web interface.
 1. [ ] Configure Github Actions for testing.
