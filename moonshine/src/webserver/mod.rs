@@ -109,7 +109,7 @@ impl Webserver {
 				let _ = shutdown.wrap_cancel(shutdown.wrap_trigger_shutdown(2, async move {
 					let listener = TcpListener::bind(https_address).await
 						.map_err(|e| log::error!("Failed to bind to address '{:?}': {e}", https_address))?;
-					let acceptor = TlsAcceptor::from_config(config.webserver.certificate_chain, config.webserver.private_key)?;
+					let acceptor = TlsAcceptor::from_config(config.webserver.certificate, config.webserver.private_key)?;
 
 					log::info!("HTTPS server listening for connections on {https_address}");
 					loop {

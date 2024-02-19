@@ -51,8 +51,8 @@ pub struct WebserverConfig {
 	/// Port of the HTTPS webserver.
 	pub port_https: u16,
 
-	/// Path to the certificate chain for SSL encryption.
-	pub certificate_chain: PathBuf,
+	/// Path to the certificate for SSL encryption.
+	pub certificate: PathBuf,
 
 	/// Path to the private key for SSL encryption.
 	pub private_key: PathBuf,
