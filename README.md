@@ -66,23 +66,6 @@ Then compile and run:
 $ cargo run --release -- /path/to/config.toml
 ```
 
-## Preparation
-
-Communication with clients is handled over HTTPS.
-The certificate for this communication is self-signed, which we need to create first:
-
-```sh
-$ cd cert
-$ ./make-cert
-```
-
-This produces a `cert.pem` and `key.pem` file.
-Place these somewhere (for example in `/etc/moonshine/`).
-
-It is also recommended to modify the [`scripts/resolution`](./scripts/resolution) script and place it in `$HOME/.local/bin`.
-Specifically the display output name (as reported by `xrandr`) and the default resolution need to be configured.
-This will be used later to adjust resolution to the requested resolution when a stream starts.
-
 ## Configuration
 
 A sample configuration file is provided in `config.toml`.
