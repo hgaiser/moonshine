@@ -6,7 +6,6 @@ edition = "2021"
 [dependencies]
 async-shutdown = "0.2.1"
 clap = { version = "4.4.4", features = ["derive"] }
-cpal = { version = "0.15.2", features = ["jack"] }
 dirs = "5.0.1"
 enet = "0.3.0"
 env_logger = "0.10.0"
@@ -16,7 +15,7 @@ ffmpeg-sys = { path = "../ffmpeg-sys" }
 hex = "0.4.3"
 http-body-util = "0.1.0-rc.3"
 hyper = { version = "1.0.1", features = ["server", "http1"] }
-hyper-util = { version= "0.1.1", features = ["tokio"] }
+hyper-util = { version = "0.1.1", features = ["tokio"] }
 image = "0.24.7"
 log = "0.4.20"
 memmap = "0.7.0"
@@ -24,6 +23,7 @@ network-interface = "1.1.1"
 nvfbc = "0.1.5"
 openssl = "0.10.57"
 opus = "0.3.0"
+pulse = { version = "2.0", package = "libpulse-binding" }
 reed-solomon = { version = "0.1.0", path = "../reed-solomon" }
 rtsp-types = "0.1.0"
 sdp-types = "0.1.5"
@@ -37,3 +37,4 @@ toml = "0.8.0"
 url = "2.4.1"
 uuid = { version = "1.5.0", features = ["v4"] }
 zeroconf = "0.13.1"
+hound = "3.5.1"

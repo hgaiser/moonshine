@@ -181,13 +181,13 @@ impl SessionInner {
 	}
 }
 
-fn run_command(command: &Vec<String>, context: &SessionContext) {
+fn run_command(command: &[String], context: &SessionContext) {
 	if command.is_empty() {
 		log::warn!("Can't run an empty command.");
 		return;
 	}
 
-	let command: Vec<String> = command.clone()
+	let command: Vec<String> = command.to_vec()
 		.iter_mut()
 		.map(|c| {
 			let c = c

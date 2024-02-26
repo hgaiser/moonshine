@@ -84,7 +84,7 @@ impl AudioStreamInner {
 			.map_err(|e| log::error!("Failed to get local address associated with control socket: {e}"))?
 		);
 
-		let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(1024);
+		let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(10);
 		tokio::spawn(async move {
 			let mut buf = [0; 1024];
 			let mut client_address = None;
@@ -133,13 +133,14 @@ impl AudioStreamInner {
 					log::info!("Starting audio stream.");
 
 					let (audio_tx, audio_rx) = mpsc::channel(10);
-					let capture = match AudioCapture::new(audio_tx) {
+					let capture = match AudioCapture::new(audio_tx).await {
 						Ok(capture) => capture,
 						Err(()) => continue,
 					};
 
 					let encoder = match AudioEncoder::new(
-						capture.stream_config(),
+						capture.sample_rate(),
+						capture.channels(),
 						audio_rx,
 						keys.clone(),
 						packet_tx.clone()

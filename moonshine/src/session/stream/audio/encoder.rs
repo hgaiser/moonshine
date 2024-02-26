@@ -1,8 +1,7 @@
-use cpal::StreamConfig;
 use openssl::cipher::Cipher;
 use tokio::sync::mpsc;
 
-use crate::{session::{stream::RtpHeader, SessionKeys}, crypto::encrypt};
+use crate::{crypto::encrypt, session::{stream::RtpHeader, SessionKeys}};
 
 #[derive(Debug)]
 #[repr(C)]
@@ -24,15 +23,16 @@ pub struct AudioEncoder {
 
 impl AudioEncoder {
 	pub fn new(
-		config: StreamConfig,
+		sample_rate: u32,
+		channels: u8,
 		audio_rx: mpsc::Receiver<Vec<i16>>,
 		keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>
 	) -> Result<Self, ()> {
-		log::debug!("Creating audio encoder with the following settings: {:?}", config);
+		log::debug!("Creating audio encoder with sample rate {} and {} channels.", sample_rate, channels);
 		let mut encoder = opus::Encoder::new(
-			config.sample_rate.0,
-			if config.channels > 1 { opus::Channels::Stereo } else { opus::Channels::Mono },
+			sample_rate,
+			if channels > 1 { opus::Channels::Stereo } else { opus::Channels::Mono },
 			opus::Application::LowDelay,
 		)
 			.map_err(|e| log::error!("Failed to create audio encoder: {e}"))?;
@@ -113,7 +113,7 @@ impl AudioEncoderInner {
 					};
 
 					let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
-					let encoded = match encoder.encode_vec(&audio_fragment, 1_000_000) {
+					let encoded = match encoder.encode_vec(&audio_fragment, audio_fragment.len()) {
 						Ok(encoded) => encoded,
 						Err(e) => {
 							log::warn!("Failed to encode audio: {e}");
