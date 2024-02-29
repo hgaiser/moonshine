@@ -38,3 +38,4 @@ url = "2.4.1"
 uuid = { version = "1.5.0", features = ["v4"] }
 zeroconf = "0.13.1"
 hound = "3.5.1"
+cudarc = "0.10.0"

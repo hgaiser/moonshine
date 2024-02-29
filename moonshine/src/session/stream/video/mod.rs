@@ -149,8 +149,8 @@ impl VideoStreamInner {
 					}
 
 					// TODO: Make the GPU index configurable.
-					let cuda_context = crate::cuda::CudaContext::new(0)
-						.map_err(|e| log::error!("Failed to initialize CUDA context: {e}"))?;
+					let cuda_device = cudarc::driver::CudaDevice::new(0)
+						.map_err(|e| log::error!("Failed to initialize CUDA: {e}"))?;
 
 					let capturer = FrameCapturer::new()?;
 					let status = capturer.status()?;
@@ -165,7 +165,7 @@ impl VideoStreamInner {
 					}
 
 					let mut encoder = Encoder::new(
-						&cuda_context,
+						&cuda_device,
 						if context.video_format == 0 { &config.stream.video.codec_h264 } else { &config.stream.video.codec_hevc },
 						context.width, context.height,
 						context.fps,
@@ -183,8 +183,8 @@ impl VideoStreamInner {
 						let context = context.clone();
 						let stop_signal = stop_signal.clone();
 						move || {
-							cuda_context.set_current()
-								.map_err(|e| log::error!("Failed to bind CUDA context to thread: {e}"))?;
+							cuda_device.bind_to_thread()
+								.map_err(|e| log::error!("Failed to bind CUDA device to thread: {e}"))?;
 							capturer.run(
 								context.fps,
 								capture_buffer,

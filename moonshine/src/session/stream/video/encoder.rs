@@ -1,9 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use async_shutdown::ShutdownManager;
+use cudarc::driver::CudaDevice;
 use ffmpeg::{Codec, CodecContextBuilder, Frame, CodecContext, Packet, HwFrameContextBuilder, HwFrameContext, CudaDeviceContextBuilder};
 
-use crate::{cuda::CudaContext, session::stream::RtpHeader};
+use crate::session::stream::RtpHeader;
 
 #[repr(u8)]
 enum RtpFlag {
@@ -61,7 +62,7 @@ pub struct Encoder {
 
 impl Encoder {
 	pub fn new(
-		cuda_context: &CudaContext,
+		cuda_device: &CudaDevice,
 		codec_name: &str,
 		width: u32,
 		height: u32,
@@ -70,7 +71,7 @@ impl Encoder {
 	) -> Result<Self, ()> {
 		let cuda_device_context = CudaDeviceContextBuilder::new()
 			.map_err(|e| log::error!("Failed to create CUDA device context: {e}"))?
-			.set_cuda_context(cuda_context.as_raw())
+			.set_cuda_context((*cuda_device.cu_primary_ctx()) as *mut _)
 			.build()
 			.map_err(|e| log::error!("Failed to build CUDA device context: {e}"))?
 		;

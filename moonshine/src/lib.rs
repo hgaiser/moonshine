@@ -21,7 +21,6 @@ pub mod app_scanner;
 pub mod clients;
 pub mod config;
 pub mod crypto;
-pub mod cuda;
 pub mod rtsp;
 pub mod session;
 pub mod state;

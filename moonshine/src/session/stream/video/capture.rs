@@ -4,7 +4,6 @@ use async_shutdown::ShutdownManager;
 use ffmpeg::Frame;
 use nvfbc::{CudaCapturer, BufferFormat, cuda::CaptureMethod};
 
-use crate::cuda::check_ret;
 
 pub struct FrameCapturer {
 	capturer: CudaCapturer,
@@ -46,11 +45,11 @@ impl FrameCapturer {
 
 			// capture_buffer.as_raw_mut().data[0] = frame_info.device_buffer as *mut u8;
 			unsafe {
-				if let Err(e) = check_ret(ffmpeg_sys::cuMemcpy(
-					capture_buffer.as_raw_mut().data[0] as u64,
-					frame_info.device_buffer as u64,
-					frame_info.device_buffer_len as usize,
-				)) {
+				if let Err(e) = cudarc::driver::result::memcpy_dtod_sync(
+					capture_buffer.as_raw_mut().data[0] as cudarc::driver::sys::CUdeviceptr,
+					frame_info.device_buffer as cudarc::driver::sys::CUdeviceptr,
+					frame_info.device_buffer_len as usize
+				) {
 					log::error!("Failed to copy CUDA memory: {e}");
 					continue;
 				}
