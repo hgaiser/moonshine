@@ -2,9 +2,15 @@ use std::sync::{Arc, Mutex};
 
 use async_shutdown::ShutdownManager;
 use cudarc::driver::CudaDevice;
-use ffmpeg::{Codec, CodecContextBuilder, Frame, CodecContext, Packet, HwFrameContextBuilder, HwFrameContext, CudaDeviceContextBuilder};
+use ffmpeg::{
+	codec::packet::flag::Flags,
+	format::Pixel,
+	option::Settable,
+	Frame,
+	Packet,
+};
 
-use crate::session::stream::RtpHeader;
+use crate::{ffmpeg::{hwdevice::CudaDeviceContextBuilder, hwframe::{HwFrameContext, HwFrameContextBuilder}}, session::stream::RtpHeader};
 
 #[repr(u8)]
 enum RtpFlag {
@@ -56,7 +62,7 @@ impl NvVideoPacket {
 }
 
 pub struct Encoder {
-	codec_context: CodecContext,
+	encoder: ffmpeg::encoder::Video,
 	pub hw_frame_context: HwFrameContext,
 }
 
@@ -67,7 +73,7 @@ impl Encoder {
 		width: u32,
 		height: u32,
 		framerate: u32,
-		bitrate: u64,
+		bitrate: usize,
 	) -> Result<Self, ()> {
 		let cuda_device_context = CudaDeviceContextBuilder::new()
 			.map_err(|e| log::error!("Failed to create CUDA device context: {e}"))?
@@ -80,40 +86,46 @@ impl Encoder {
 			.map_err(|e| log::error!("Failed to create CUDA frame context: {e}"))?
 			.set_width(width)
 			.set_height(height)
-			.set_sw_format(ffmpeg::sys::AV_PIX_FMT_0RGB32)
-			.set_format(ffmpeg::sys::AVPixelFormat_AV_PIX_FMT_CUDA)
+			.set_sw_format(Pixel::ZRGB32)
+			.set_format(Pixel::CUDA)
 			.build()
 			.map_err(|e| log::error!("Failed to build CUDA frame context: {e}"))?
 		;
 
 		log::info!("Using codec with name '{codec_name}'.");
-		let codec = Codec::new(codec_name)
-			.map_err(|e| log::error!("Failed to create codec: {e}"))?;
+		let codec = ffmpeg::encoder::find_by_name(codec_name)
+			.ok_or_else(|| log::error!("Failed to find codec by name '{codec_name}'."))?;
 
-		let mut codec_context_builder = CodecContextBuilder::new(&codec)
-			.map_err(|e| log::error!("Failed to create codec context builder: {e}"))?;
-		codec_context_builder
-			.set_width(width)
-			.set_height(height)
-			.set_fps(framerate)
-			.set_max_b_frames(0)
-			.set_pix_fmt(ffmpeg::sys::AVPixelFormat_AV_PIX_FMT_CUDA)
-			.set_bit_rate(bitrate)
-			.set_gop_size(i32::max_value() as u32)
-			.set_preset("fast")
-			.set_tune("ull")
-			.set_hw_frames_ctx(&mut hw_frame_context)
-			.set_forced_idr(true)
-			.set_delay(0)
-		;
-		codec_context_builder.as_raw_mut().refs = 1;
+		let mut encoder = ffmpeg::codec::context::Context::new_with_codec(&codec)
+			.encoder()
+			.video()
+			.map_err(|e| log::error!("Failed to create video encoder: {e}"))?;
 
-		let codec_context = codec_context_builder
-			.open()
-			.map_err(|e| log::error!("Failed to create codec context: {e}"))?;
+		encoder.set_width(width);
+		encoder.set_height(height);
+		encoder.set_frame_rate(Some((framerate as i32, 1)));
+		encoder.set_time_base((framerate as i32, 1));
+		encoder.set_max_b_frames(0);
+		encoder.set_bit_rate(bitrate);
+		encoder.set_gop(i32::max_value() as u32);
+		unsafe {
+			(*encoder.as_mut_ptr()).pix_fmt = Pixel::CUDA.into();
+			(*encoder.as_mut_ptr()).hw_frames_ctx = hw_frame_context.as_raw_mut();
+			(*encoder.as_mut_ptr()).delay = 0;
+			(*encoder.as_mut_ptr()).refs = 1;
+		}
+		encoder.set_str("preset", "fast")
+			.map_err(|e| log::error!("Failed to set preset for encoder: {e}"))?;
+		encoder.set_str("tune", "ull")
+			.map_err(|e| log::error!("Failed to set tuning option for encoder: {e}"))?;
+		encoder.set_str("forced-idr", "1")
+			.map_err(|e| log::error!("Failed to set forced-idr for encoder: {e}"))?;
+
+		let encoder = encoder.open()
+			.map_err(|e| log::error!("Failed to start encoder: {e}"))?;
 
 		Ok(Self {
-			codec_context,
+			encoder,
 			hw_frame_context,
 		})
 	}
@@ -131,8 +143,7 @@ impl Encoder {
 		notifier: Arc<std::sync::Condvar>,
 		stop_signal: ShutdownManager<()>,
 	) -> Result<(), ()> {
-		let mut packet = Packet::new()
-			.map_err(|e| log::error!("Failed to create packet: {e}"))?;
+		let mut packet = Packet::empty();
 
 		let mut frame_number = 0u32;
 		let mut sequence_number = 0u32;
@@ -159,21 +170,25 @@ impl Encoder {
 			}
 			log::trace!("Swapped new frame with old frame.");
 			frame_number += 1;
-			encoder_buffer.as_raw_mut().pts = frame_number as i64;
+			encoder_buffer.set_pts(Some(frame_number as i64));
 
-			log::trace!("Sending frame {} to encoder", encoder_buffer.as_raw().pts);
+			log::trace!("Sending frame {} to encoder", frame_number);
 
 			// TODO: Check if this is necessary?
 			// Reset possible previous request for keyframe.
-			encoder_buffer.as_raw_mut().pict_type = ffmpeg::sys::AVPictureType_AV_PICTURE_TYPE_NONE;
-			encoder_buffer.as_raw_mut().key_frame = 0;
+			unsafe {
+				(*encoder_buffer.as_mut_ptr()).pict_type = ffmpeg::picture::Type::None.into();
+				(*encoder_buffer.as_mut_ptr()).key_frame = 0;
+			}
 
 			// Check if there was an IDR frame request.
 			match idr_frame_request_rx.try_recv() {
 				Ok(_) => {
 					log::debug!("Received request for IDR frame.");
-					encoder_buffer.as_raw_mut().pict_type = ffmpeg::sys::AVPictureType_AV_PICTURE_TYPE_I;
-					encoder_buffer.as_raw_mut().key_frame = 1;
+					unsafe {
+						(*encoder_buffer.as_mut_ptr()).pict_type = ffmpeg::picture::Type::I.into();
+						(*encoder_buffer.as_mut_ptr()).key_frame = 1;
+					}
 				},
 				Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {},
 				Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {},
@@ -184,13 +199,13 @@ impl Encoder {
 			}
 
 			// Send the frame to the encoder.
-			self.codec_context.send_frame(Some(&encoder_buffer))
+			self.encoder.send_frame(&encoder_buffer)
 				.map_err(|e| log::error!("Error sending frame for encoding: {e}"))?;
 
 			loop {
-				match self.codec_context.receive_packet(&mut packet) {
+				match self.encoder.receive_packet(&mut packet) {
 					Ok(()) => {
-						log::trace!("Received frame {} from encoder, converting frame to packets.", packet.as_raw().pts);
+						log::trace!("Received frame {} from encoder, converting frame to packets.", packet.pts().unwrap_or(-1));
 						encode_packet(
 							&packet,
 							&packet_tx,
@@ -203,15 +218,19 @@ impl Encoder {
 						)?
 					},
 					Err(e) => {
-						if e.code == ffmpeg::sys::av_error(ffmpeg::sys::EAGAIN as i32) {
-							// log::info!("Need more frames for encoding...");
-							break;
-						} else if e.code == ffmpeg::sys::AVERROR_EOF {
-							log::info!("End of file");
-							break;
-						} else {
-							log::error!("Error while encoding: {e}");
-							break;
+						match e {
+							ffmpeg::Error::Eof => {
+								log::info!("End of file");
+								break;
+							},
+							ffmpeg::Error::Other { errno: ffmpeg::sys::EAGAIN } => {
+								// log::info!("Need more frames for encoding...");
+								break;
+							},
+							e => {
+								log::error!("Unexpected error while encoding: {e}");
+								break;
+							},
 						}
 					}
 				}
@@ -243,14 +262,16 @@ fn encode_packet(
 	let video_frame_header = VideoFrameHeader {
 		header_type: 0x01, // Always 0x01 for short headers. What is this exactly?
 		padding1: 0,
-		frame_type: if (packet.as_raw().flags & ffmpeg::sys::AV_PKT_FLAG_KEY as i32) != 0 { 2 } else { 1 },
+		frame_type: if packet.flags().contains(Flags::KEY) { 2 } else { 1 },
 		padding2: 0,
 	};
 
 	// Prefix the frame with a VideoFrameHeader.
 	let mut buffer = Vec::with_capacity(std::mem::size_of::<VideoFrameHeader>());
 	video_frame_header.serialize(&mut buffer);
-	let packet_data = [&buffer, packet.data()].concat();
+	let packet_data = packet.data()
+		.ok_or_else(|| log::error!("Packet is empty, but we expected it to be full."))?;
+	let packet_data = [&buffer, packet_data].concat();
 
 	let requested_shard_payload_size = requested_packet_size - std::mem::size_of::<NvVideoPacket>();
 

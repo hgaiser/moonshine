@@ -10,7 +10,7 @@ dirs = "5.0.1"
 enet = "0.3.0"
 env_logger = "0.10.0"
 evdev = "0.12.1"
-ffmpeg = { path = "../ffmpeg" }
+ffmpeg = { version = "6.1.1", package = "ffmpeg-next" }
 hex = "0.4.3"
 http-body-util = "0.1.0-rc.3"
 hyper = { version = "1.0.1", features = ["server", "http1"] }

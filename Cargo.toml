@@ -1,3 +1,7 @@
 [workspace]
-members = ["ffmpeg", "moonshine", "reed-solomon"]
+members = ["moonshine", "reed-solomon"]
 resolver = "2"
+
+[patch.crates-io]
+ffmpeg = { version = "6.1.1", package = "ffmpeg-next", git = "https://github.com/hgaiser/rust-ffmpeg", branch = "codec-context-settable" }
+ffmpeg-sys-next = { version = "6.1.0", git = "https://github.com/hgaiser/rust-ffmpeg-sys", branch = "cuda" }

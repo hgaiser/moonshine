@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use async_shutdown::ShutdownManager;
-use ffmpeg::{FrameBuilder, Frame, HwFrameContext};
+use ffmpeg::{format::Pixel, Frame};
 use tokio::{net::UdpSocket, sync::mpsc::{self, Sender}};
 
-use crate::config::Config;
+use crate::{config::Config, ffmpeg::{check_ret, hwframe::HwFrameContext}};
 
 mod capture;
 use capture::FrameCapturer;
@@ -24,7 +24,7 @@ pub struct VideoStreamContext {
 	pub height: u32,
 	pub fps: u32,
 	pub packet_size: usize,
-	pub bitrate: u64,
+	pub bitrate: usize,
 	pub minimum_fec_packets: u32,
 	pub qos: bool,
 	pub video_format: u32,
@@ -172,9 +172,9 @@ impl VideoStreamInner {
 						context.bitrate,
 					)?;
 
-					let capture_buffer = create_frame(context.width, context.height, ffmpeg::sys::AVPixelFormat_AV_PIX_FMT_CUDA, &mut encoder.hw_frame_context)?;
-					let intermediate_buffer = Arc::new(Mutex::new(create_frame(context.width, context.height, ffmpeg::sys::AVPixelFormat_AV_PIX_FMT_CUDA, &mut encoder.hw_frame_context)?));
-					let encoder_buffer = create_frame(context.width, context.height, ffmpeg::sys::AVPixelFormat_AV_PIX_FMT_CUDA, &mut encoder.hw_frame_context)?;
+					let capture_buffer = create_frame(context.width, context.height, Pixel::CUDA, &mut encoder.hw_frame_context)?;
+					let intermediate_buffer = Arc::new(Mutex::new(create_frame(context.width, context.height, Pixel::CUDA, &mut encoder.hw_frame_context)?));
+					let encoder_buffer = create_frame(context.width, context.height, Pixel::CUDA, &mut encoder.hw_frame_context)?;
 					let notifier = Arc::new(std::sync::Condvar::new());
 
 					let capture_thread = std::thread::Builder::new().name("video-capture".to_string()).spawn({
@@ -234,25 +234,20 @@ impl VideoStreamInner {
 	}
 }
 
-fn create_frame(width: u32, height: u32, pixel_format: i32, context: &mut HwFrameContext) -> Result<Frame, ()> {
-	let mut frame_builder = FrameBuilder::new()
-		.map_err(|e| log::error!("Failed to create frame builder: {e}"))?;
-	frame_builder
-		.set_format(pixel_format)
-		.set_width(width)
-		.set_height(height)
-		.set_hw_frames_ctx(context);
-	let mut frame = frame_builder.allocate_hwframe()
-		.map_err(|e| log::error!("Failed to allocate frame: {e}"))?;
-
-	// frame.make_writable()
-	// 	.map_err(|e| log::error!("Failed to make frame writable: {e}"))?;
-
+fn create_frame(width: u32, height: u32, pixel_format: Pixel, context: &mut HwFrameContext) -> Result<Frame, ()> {
 	unsafe {
-		ffmpeg::check_ret(ffmpeg::sys::av_hwframe_get_buffer(frame.as_raw_mut().hw_frames_ctx, frame.as_raw_mut(), 0))
-			.map_err(|e| println!("Failed to allocate hardware frame: {e}"))?;
-		frame.as_raw_mut().linesize[0] = frame.as_raw().width * 4
-	}
+		let mut frame = Frame::empty();
+		(*frame.as_mut_ptr()).format = pixel_format as i32;
+		(*frame.as_mut_ptr()).width = width as i32;
+		(*frame.as_mut_ptr()).height = height as i32;
+		(*frame.as_mut_ptr()).hw_frames_ctx = context.as_raw_mut();
 
-	Ok(frame)
+		check_ret(ffmpeg::sys::av_hwframe_get_buffer(context.as_raw_mut(), frame.as_mut_ptr(), 0))
+			.map_err(|e| log::error!("Failed to create CUDA frame: {e}"))?;
+		check_ret(ffmpeg::sys::av_hwframe_get_buffer(context.as_raw_mut(), frame.as_mut_ptr(), 0))
+			.map_err(|e| println!("Failed to allocate hardware frame: {e}"))?;
+		(*frame.as_mut_ptr()).linesize[0] = (*frame.as_ptr()).width * 4;
+
+		Ok(frame)
+	}
 }
