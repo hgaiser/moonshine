@@ -80,8 +80,8 @@ impl Encoder {
 			.map_err(|e| log::error!("Failed to create CUDA frame context: {e}"))?
 			.set_width(width)
 			.set_height(height)
-			.set_sw_format(ffmpeg_sys::AV_PIX_FMT_0RGB32)
-			.set_format(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA)
+			.set_sw_format(ffmpeg::sys::AV_PIX_FMT_0RGB32)
+			.set_format(ffmpeg::sys::AVPixelFormat_AV_PIX_FMT_CUDA)
 			.build()
 			.map_err(|e| log::error!("Failed to build CUDA frame context: {e}"))?
 		;
@@ -97,7 +97,7 @@ impl Encoder {
 			.set_height(height)
 			.set_fps(framerate)
 			.set_max_b_frames(0)
-			.set_pix_fmt(ffmpeg_sys::AVPixelFormat_AV_PIX_FMT_CUDA)
+			.set_pix_fmt(ffmpeg::sys::AVPixelFormat_AV_PIX_FMT_CUDA)
 			.set_bit_rate(bitrate)
 			.set_gop_size(i32::max_value() as u32)
 			.set_preset("fast")
@@ -165,14 +165,14 @@ impl Encoder {
 
 			// TODO: Check if this is necessary?
 			// Reset possible previous request for keyframe.
-			encoder_buffer.as_raw_mut().pict_type = ffmpeg_sys::AVPictureType_AV_PICTURE_TYPE_NONE;
+			encoder_buffer.as_raw_mut().pict_type = ffmpeg::sys::AVPictureType_AV_PICTURE_TYPE_NONE;
 			encoder_buffer.as_raw_mut().key_frame = 0;
 
 			// Check if there was an IDR frame request.
 			match idr_frame_request_rx.try_recv() {
 				Ok(_) => {
 					log::debug!("Received request for IDR frame.");
-					encoder_buffer.as_raw_mut().pict_type = ffmpeg_sys::AVPictureType_AV_PICTURE_TYPE_I;
+					encoder_buffer.as_raw_mut().pict_type = ffmpeg::sys::AVPictureType_AV_PICTURE_TYPE_I;
 					encoder_buffer.as_raw_mut().key_frame = 1;
 				},
 				Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {},
@@ -203,10 +203,10 @@ impl Encoder {
 						)?
 					},
 					Err(e) => {
-						if e.code == ffmpeg_sys::av_error(ffmpeg_sys::EAGAIN as i32) {
+						if e.code == ffmpeg::sys::av_error(ffmpeg::sys::EAGAIN as i32) {
 							// log::info!("Need more frames for encoding...");
 							break;
-						} else if e.code == ffmpeg_sys::AVERROR_EOF {
+						} else if e.code == ffmpeg::sys::AVERROR_EOF {
 							log::info!("End of file");
 							break;
 						} else {
@@ -243,7 +243,7 @@ fn encode_packet(
 	let video_frame_header = VideoFrameHeader {
 		header_type: 0x01, // Always 0x01 for short headers. What is this exactly?
 		padding1: 0,
-		frame_type: if (packet.as_raw().flags & ffmpeg_sys::AV_PKT_FLAG_KEY as i32) != 0 { 2 } else { 1 },
+		frame_type: if (packet.as_raw().flags & ffmpeg::sys::AV_PKT_FLAG_KEY as i32) != 0 { 2 } else { 1 },
 		padding2: 0,
 	};
 

@@ -22,3 +22,5 @@ pub use sws::*;
 
 mod util;
 pub use util::*;
+
+pub use ffmpeg_sys as sys;

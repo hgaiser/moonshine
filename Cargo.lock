@@ -1138,7 +1138,6 @@ dependencies = [
  "env_logger",
  "evdev",
  "ffmpeg",
- "ffmpeg-sys",
  "hex",
  "hound",
  "http-body-util",
