@@ -4,7 +4,8 @@
 		{
 			"type": "lldb",
 			"request": "launch",
-			"name": "Moonshine",
+			"name": "Moonshine (Debug)",
+			"cwd": "${workspaceFolder}",
 			"cargo": {
 				"args": [
 					"build",
@@ -13,5 +14,19 @@
 			},
 			"args": ["./config.toml", "-v"]
 		},
+		{
+			"type": "lldb",
+			"request": "launch",
+			"name": "Moonshine (Release)",
+			"cwd": "${workspaceFolder}",
+			"cargo": {
+				"args": [
+					"build",
+					"--release",
+					"--bin", "moonshine"
+				]
+			},
+			"args": ["./config.toml", "-v"]
+		}
 	]
 }
