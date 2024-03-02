@@ -10,7 +10,7 @@ pub enum SessionManagerCommand {
 	SetStreamContext(VideoStreamContext, AudioStreamContext),
 	GetSessionContext(oneshot::Sender<Option<SessionContext>>),
 	InitializeSession(SessionContext),
-	GetCurrentSession(oneshot::Sender<Option<Session>>),
+	// GetCurrentSession(oneshot::Sender<Option<Session>>),
 	StartSession,
 	StopSession,
 	UpdateKeys(SessionKeys),
@@ -73,14 +73,14 @@ impl SessionManager {
 		Ok(())
 	}
 
-	pub async fn current_session(&self) -> Result<Option<Session>, ()> {
-		let (session_tx, session_rx) = oneshot::channel();
-		self.command_tx.send(SessionManagerCommand::GetCurrentSession(session_tx))
-			.await
-			.map_err(|e| log::error!("Failed to get current session: {e}"))?;
-		session_rx.await
-			.map_err(|e| log::error!("Failed to wait for GetCurrentSession response: {e}"))
-	}
+	// pub async fn current_session(&self) -> Result<Option<Session>, ()> {
+	// 	let (session_tx, session_rx) = oneshot::channel();
+	// 	self.command_tx.send(SessionManagerCommand::GetCurrentSession(session_tx))
+	// 		.await
+	// 		.map_err(|e| log::error!("Failed to get current session: {e}"))?;
+	// 	session_rx.await
+	// 		.map_err(|e| log::error!("Failed to wait for GetCurrentSession response: {e}"))
+	// }
 
 	pub async fn start_session(&self) -> Result<(), ()> {
 		self.command_tx.send(SessionManagerCommand::StartSession)
@@ -160,11 +160,11 @@ impl SessionManagerInner {
 							};
 						},
 
-						SessionManagerCommand::GetCurrentSession(session_tx) => {
-							if session_tx.send(self.session.clone()).is_err() {
-								log::error!("Failed to send current session.");
-							}
-						}
+						// SessionManagerCommand::GetCurrentSession(session_tx) => {
+						// 	if session_tx.send(self.session.clone()).is_err() {
+						// 		log::error!("Failed to send current session.");
+						// 	}
+						// }
 
 						SessionManagerCommand::StartSession => {
 							let Some(session) = &mut self.session else {

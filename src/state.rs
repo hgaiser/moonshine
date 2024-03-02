@@ -8,7 +8,7 @@ enum StateCommand {
 	Save(PathBuf, oneshot::Sender<Result<(), ()>>),
 	HasClient(String, oneshot::Sender<bool>),
 	AddClient(String),
-	RemoveClient(String, oneshot::Sender<bool>),
+	// RemoveClient(String, oneshot::Sender<bool>),
 }
 
 #[derive(Clone)]
@@ -79,16 +79,16 @@ impl State {
 			.map_err(|e| log::error!("Failed to send AddClient command: {e}"))
 	}
 
-	pub async fn remove_client(&self, client: String) -> Result<bool, ()> {
-		let (result_tx, result_rx) = oneshot::channel();
-		self.command_tx.send(StateCommand::RemoveClient(client, result_tx)).await
-			.map_err(|e| log::error!("Failed to send RemoveClient command: {e}"))?;
-		let result = result_rx.await.map_err(|e| log::error!("Failed to receive RemoveClient response: {e}"))?;
+	// pub async fn remove_client(&self, client: String) -> Result<bool, ()> {
+	// 	let (result_tx, result_rx) = oneshot::channel();
+	// 	self.command_tx.send(StateCommand::RemoveClient(client, result_tx)).await
+	// 		.map_err(|e| log::error!("Failed to send RemoveClient command: {e}"))?;
+	// 	let result = result_rx.await.map_err(|e| log::error!("Failed to receive RemoveClient response: {e}"))?;
 
-		self.save().await?;
+	// 	self.save().await?;
 
-		Ok(result)
-	}
+	// 	Ok(result)
+	// }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -129,11 +129,11 @@ impl StateInner {
 					let _ = self.add_client(client);
 				},
 
-				StateCommand::RemoveClient(client, result_tx) => {
-					if result_tx.send(self.remove_client(client)).is_err() {
-						log::error!("Failed to send RemoveClient result.");
-					}
-				},
+				// StateCommand::RemoveClient(client, result_tx) => {
+				// 	if result_tx.send(self.remove_client(client)).is_err() {
+				// 		log::error!("Failed to send RemoveClient result.");
+				// 	}
+				// },
 			}
 		}
 	}
@@ -161,13 +161,13 @@ impl StateInner {
 		}
 	}
 
-	fn remove_client(&mut self, key: String) -> bool {
-		if !self.clients.contains(&key) {
-			log::error!("Failed to remove client ('{key}'), client doesn't exist.");
-			false
-		} else {
-			self.clients.retain(|c| c != &key);
-			true
-		}
-	}
+	// fn remove_client(&mut self, key: String) -> bool {
+	// 	if !self.clients.contains(&key) {
+	// 		log::error!("Failed to remove client ('{key}'), client doesn't exist.");
+	// 		false
+	// 	} else {
+	// 		self.clients.retain(|c| c != &key);
+	// 		true
+	// 	}
+	// }
 }

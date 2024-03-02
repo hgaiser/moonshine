@@ -11,21 +11,21 @@ impl CudaDeviceContext {
 		Self { buffer }
 	}
 
-	pub fn as_device_mut(&mut self) -> &mut ffmpeg::sys::AVHWDeviceContext {
-		unsafe { &mut *((*self.buffer).data as *mut ffmpeg::sys::AVHWDeviceContext) }
-	}
+	// pub fn as_device_mut(&mut self) -> &mut ffmpeg::sys::AVHWDeviceContext {
+	// 	unsafe { &mut *((*self.buffer).data as *mut ffmpeg::sys::AVHWDeviceContext) }
+	// }
 
-	pub fn as_device(&self) -> &ffmpeg::sys::AVHWDeviceContext {
-		unsafe { &*((*self.buffer).data as *const ffmpeg::sys::AVHWDeviceContext) }
-	}
+	// pub fn as_device(&self) -> &ffmpeg::sys::AVHWDeviceContext {
+	// 	unsafe { &*((*self.buffer).data as *const ffmpeg::sys::AVHWDeviceContext) }
+	// }
 
 	pub fn as_raw_mut(&mut self) -> &mut ffmpeg::sys::AVBufferRef {
 		unsafe { &mut *self.buffer }
 	}
 
-	pub fn as_raw(&self) -> &ffmpeg::sys::AVBufferRef {
-		unsafe { &*self.buffer }
-	}
+	// pub fn as_raw(&self) -> &ffmpeg::sys::AVBufferRef {
+	// 	unsafe { &*self.buffer }
+	// }
 }
 
 pub struct CudaDeviceContextBuilder {
@@ -62,15 +62,15 @@ impl CudaDeviceContextBuilder {
 		unsafe { &mut *((*self.buffer).data as *mut ffmpeg::sys::AVHWDeviceContext) }
 	}
 
-	pub fn as_device(&self) -> &ffmpeg::sys::AVHWDeviceContext {
-		unsafe { &*((*self.buffer).data as *const ffmpeg::sys::AVHWDeviceContext) }
-	}
+	// pub fn as_device(&self) -> &ffmpeg::sys::AVHWDeviceContext {
+	// 	unsafe { &*((*self.buffer).data as *const ffmpeg::sys::AVHWDeviceContext) }
+	// }
 
-	pub fn as_raw_mut(&mut self) -> &mut ffmpeg::sys::AVBufferRef {
-		unsafe { &mut *self.buffer }
-	}
+	// pub fn as_raw_mut(&mut self) -> &mut ffmpeg::sys::AVBufferRef {
+	// 	unsafe { &mut *self.buffer }
+	// }
 
-	pub fn as_raw(&self) -> &ffmpeg::sys::AVBufferRef {
-		unsafe { &*self.buffer }
-	}
+	// pub fn as_raw(&self) -> &ffmpeg::sys::AVBufferRef {
+	// 	unsafe { &*self.buffer }
+	// }
 }

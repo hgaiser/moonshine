@@ -3,15 +3,25 @@ use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
 use clap::Parser;
-use moonshine::clients::ClientManager;
-use moonshine::config::Config;
-use moonshine::{app_scanner, publisher};
-use moonshine::crypto::create_certificate;
-use moonshine::rtsp::RtspServer;
-use moonshine::session::SessionManager;
-use moonshine::state::State;
-use moonshine::webserver::Webserver;
+use crate::clients::ClientManager;
+use crate::config::Config;
+use crate::crypto::create_certificate;
+use crate::rtsp::RtspServer;
+use crate::session::SessionManager;
+use crate::state::State;
+use crate::webserver::Webserver;
 use openssl::pkey::PKey;
+
+mod app_scanner;
+mod clients;
+mod config;
+mod crypto;
+mod ffmpeg;
+mod rtsp;
+mod session;
+mod state;
+mod publisher;
+mod webserver;
 
 #[derive(Parser, Debug)]
 #[clap(version)]

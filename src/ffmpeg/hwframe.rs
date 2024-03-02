@@ -14,21 +14,21 @@ impl HwFrameContext {
 		Self { _cuda_device_context: cuda_device_context, buffer }
 	}
 
-	pub fn as_context_mut(&mut self) -> &mut ffmpeg::sys::AVHWFramesContext {
-		unsafe { &mut *((*self.buffer).data as *mut ffmpeg::sys::AVHWFramesContext) }
-	}
+	// pub fn as_context_mut(&mut self) -> &mut ffmpeg::sys::AVHWFramesContext {
+	// 	unsafe { &mut *((*self.buffer).data as *mut ffmpeg::sys::AVHWFramesContext) }
+	// }
 
-	pub fn as_context(&self) -> &ffmpeg::sys::AVHWFramesContext {
-		unsafe { &*((*self.buffer).data as *const ffmpeg::sys::AVHWFramesContext) }
-	}
+	// pub fn as_context(&self) -> &ffmpeg::sys::AVHWFramesContext {
+	// 	unsafe { &*((*self.buffer).data as *const ffmpeg::sys::AVHWFramesContext) }
+	// }
 
 	pub fn as_raw_mut(&mut self) -> &mut ffmpeg::sys::AVBufferRef {
 		unsafe { &mut *self.buffer }
 	}
 
-	pub fn as_raw(&self) -> &ffmpeg::sys::AVBufferRef {
-		unsafe { &*self.buffer }
-	}
+	// pub fn as_raw(&self) -> &ffmpeg::sys::AVBufferRef {
+	// 	unsafe { &*self.buffer }
+	// }
 }
 
 unsafe impl Send for HwFrameContext { }
@@ -80,7 +80,7 @@ impl HwFrameContextBuilder {
 		unsafe { &mut *((*self.buffer).data as *mut ffmpeg::sys::AVHWFramesContext) }
 	}
 
-	pub fn as_frame(&self) -> &ffmpeg::sys::AVHWFramesContext {
-		unsafe { &*((*self.buffer).data as *const ffmpeg::sys::AVHWFramesContext) }
-	}
+	// pub fn as_frame(&self) -> &ffmpeg::sys::AVHWFramesContext {
+	// 	unsafe { &*((*self.buffer).data as *const ffmpeg::sys::AVHWFramesContext) }
+	// }
 }

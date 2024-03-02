@@ -59,8 +59,8 @@ pub enum ClientManagerCommand {
 	/// Add a client to the list of paired clients.
 	AddClient(AddClientCommand),
 
-	/// Remove client from the list of paired clients.
-	RemoveClient(RemoveClientCommand),
+	// /// Remove client from the list of paired clients.
+	// RemoveClient(RemoveClientCommand),
 }
 
 /// Query the manager to check if this unique id is paired or not.
@@ -135,14 +135,14 @@ pub struct AddClientCommand {
 	pub response: oneshot::Sender<Result<(), String>>,
 }
 
-/// Remove client from the list of paired clients.
-pub struct RemoveClientCommand {
-	/// Id of the client.
-	pub id: String,
+// /// Remove client from the list of paired clients.
+// pub struct RemoveClientCommand {
+// 	/// Id of the client.
+// 	pub id: String,
 
-	/// Channel used to provide a response.
-	pub response: oneshot::Sender<Result<(), String>>,
-}
+// 	/// Channel used to provide a response.
+// 	pub response: oneshot::Sender<Result<(), String>>,
+// }
 
 #[derive(Clone)]
 pub struct ClientManager {
@@ -259,20 +259,20 @@ impl ClientManager {
 			.map_err(|e| log::warn!("{e}"))
 	}
 
-	pub async fn remove_client(&self, id: &str) -> Result<(), ()> {
-		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx.send(ClientManagerCommand::RemoveClient(RemoveClientCommand {
-			id: id.to_string(),
-			response: response_tx,
-		}))
-			.await
-			.map_err(|e| log::error!("Failed to send remove client command to client manager: {e}"))?;
+	// pub async fn remove_client(&self, id: &str) -> Result<(), ()> {
+	// 	let (response_tx, response_rx) = oneshot::channel();
+	// 	self.command_tx.send(ClientManagerCommand::RemoveClient(RemoveClientCommand {
+	// 		id: id.to_string(),
+	// 		response: response_tx,
+	// 	}))
+	// 		.await
+	// 		.map_err(|e| log::error!("Failed to send remove client command to client manager: {e}"))?;
 
-		response_rx
-			.await
-			.map_err(|e| log::error!("Failed to wait for response to remove client command from client manager: {e}"))?
-			.map_err(|e| log::warn!("{e}"))
-	}
+	// 	response_rx
+	// 		.await
+	// 		.map_err(|e| log::error!("Failed to wait for response to remove client command from client manager: {e}"))?
+	// 		.map_err(|e| log::warn!("{e}"))
+	// }
 }
 
 struct ClientManagerInner {
@@ -419,23 +419,23 @@ impl ClientManagerInner {
 					}
 				},
 
-				ClientManagerCommand::RemoveClient(command) => {
-					pending_clients.remove(&command.id);
-					let Ok(result) = state.remove_client(command.id).await else {
-						command.response.send(Err("Failed to remove client.".to_string()))
-							.map_err(|_| log::error!("Failed to send RemoveClient command response.")).ok();
-						continue;
-					};
+				// ClientManagerCommand::RemoveClient(command) => {
+				// 	pending_clients.remove(&command.id);
+				// 	let Ok(result) = state.remove_client(command.id).await else {
+				// 		command.response.send(Err("Failed to remove client.".to_string()))
+				// 			.map_err(|_| log::error!("Failed to send RemoveClient command response.")).ok();
+				// 		continue;
+				// 	};
 
-					if !result {
-						command.response.send(Err("Client is not known, can't remove it.".to_string()))
-							.map_err(|_| log::error!("Failed to send remove client command response.")).ok();
-						continue;
-					}
+				// 	if !result {
+				// 		command.response.send(Err("Client is not known, can't remove it.".to_string()))
+				// 			.map_err(|_| log::error!("Failed to send remove client command response.")).ok();
+				// 		continue;
+				// 	}
 
-					command.response.send(Ok(()))
-						.map_err(|_| log::error!("Failed to send remove client command response.")).ok();
-				},
+				// 	command.response.send(Ok(()))
+				// 		.map_err(|_| log::error!("Failed to send remove client command response.")).ok();
+				// },
 			}
 		}
 
