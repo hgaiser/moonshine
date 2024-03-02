@@ -23,7 +23,6 @@ nvfbc = "0.1.5"
 openssl = "0.10.57"
 opus = "0.3.0"
 pulse = { version = "2.0", package = "libpulse-binding" }
-reed-solomon = { version = "0.1.0", path = "../reed-solomon" }
 rtsp-types = "0.1.0"
 sdp-types = "0.1.5"
 serde = "1.0.188"
@@ -38,3 +37,4 @@ uuid = { version = "1.5.0", features = ["v4"] }
 zeroconf = "0.13.1"
 hound = "3.5.1"
 cudarc = "0.10.0"
+reed-solomon-erasure = "6.0.0"

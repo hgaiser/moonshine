@@ -9,8 +9,12 @@ use ffmpeg::{
 	Frame,
 	Packet,
 };
+use reed_solomon_erasure::{galois_8, ReedSolomon};
 
 use crate::{ffmpeg::{hwdevice::CudaDeviceContextBuilder, hwframe::{HwFrameContext, HwFrameContextBuilder}}, session::stream::RtpHeader};
+
+/// Maximum allowed number of shards in the encoder (data + parity).
+pub const MAX_SHARDS: usize = 255;
 
 #[repr(u8)]
 enum RtpFlag {
@@ -287,8 +291,8 @@ fn encode_packet(
 	assert!(nr_data_shards != 0);
 
 	// Determine how many parity and data shards are permitted per FEC block.
-	let nr_parity_shards_per_block = reed_solomon::MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-	let nr_data_shards_per_block = reed_solomon::MAX_SHARDS - nr_parity_shards_per_block;
+	let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
+	let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
 
 	// We need to subtract number of data shards by 1, otherwise you can get a situation where
 	// there are for example 100 data shards allowed per block and also 100 data shards available.
@@ -317,16 +321,17 @@ fn encode_packet(
 
 		let mut nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
 			.max(minimum_fec_packets as usize) // Lower limit by the minimum number of parity shards.
-			.min(reed_solomon::MAX_SHARDS.saturating_sub(nr_data_shards)); // But hard total upper limit in the number of shards.
+			.min(MAX_SHARDS.saturating_sub(nr_data_shards)); // But hard total upper limit in the number of shards.
 
 		// Create the FEC encoder for this amount of shards.
 		let encoder = if nr_parity_shards > 0 {
-			let encoder = reed_solomon::ReedSolomon::new(nr_data_shards, nr_parity_shards);
-			if let Err(e) = &encoder {
-				log::debug!("Couldn't create error correction for block {block_index}: {e}");
-				nr_parity_shards = 0;
+			match ReedSolomon::<galois_8::Field>::new(nr_data_shards, nr_parity_shards) {
+				Ok(encoder) => Ok(encoder),
+				Err(e) => {
+					nr_parity_shards = 0;
+					Err(format!("Couldn't create error correction for block {block_index}: {e}"))
+				}
 			}
-			encoder
 		} else {
 			Err("Can't create an FEC encoder for 0 parity shards.".to_string())
 		};

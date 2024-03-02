@@ -1,4 +1,5 @@
 use openssl::cipher::Cipher;
+use reed_solomon_erasure::{galois_8, ReedSolomon};
 use tokio::sync::mpsc;
 
 use crate::{crypto::encrypt, session::{stream::RtpHeader, SessionKeys}};
@@ -73,7 +74,7 @@ impl AudioEncoderInner {
 		const NR_PARITY_SHARDS: usize = 2;
 		const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
 		const MAX_SHARD_SIZE: usize = ((2048 + 15) / 16) * 16; // Where does this come from?
-		let mut fec_encoder = reed_solomon::ReedSolomon::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
+		let mut fec_encoder = ReedSolomon::<galois_8::Field>::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
 			.map_err(|e| log::error!("Failed to create FEC encoder: {e}"))?;
 
 		// For unknown reasons, the RS parity matrix computed by our RS implementation
@@ -82,7 +83,9 @@ impl AudioEncoderInner {
 		// works correctly. This is possible because the data and FEC shard count is
 		// constant and known in advance.
 		// Source: https://github.com/moonlight-stream/moonlight-common-c/blob/5de4a5b85a28d8d639482a1a105c3a06eb67a2fd/src/RtpAudioQueue.c#L57
-		fec_encoder.set_parity_matrix([0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c]);
+		// TODO: Find a way to fix this, it is very ugly..
+		fec_encoder.set_parity_matrix(&[0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c]);
+		let mut fec_encoder = reed_solomon_erasure::ShardByShard::new(&fec_encoder);
 
 		let mut shards = vec![vec![0u8; MAX_SHARD_SIZE]; NR_TOTAL_SHARDS];
 
@@ -174,10 +177,19 @@ impl AudioEncoderInner {
 						break;
 					}
 
+					{
+						// Create a view of just the data itself for encoding.
+						let mut shards: Vec<&mut [u8]> = shards.iter_mut().map(|s| &mut s[..data_shard_size]).collect();
+						if let Err(e) = fec_encoder.encode(&mut shards) {
+							log::warn!("Failed to encode data shard in FEC block: {e}");
+						}
+					}
+
 					// If the last packet, compute and send parity shards.
 					if sequence_number as usize % NR_DATA_SHARDS == 0 {
-						if let Err(e) = fec_encoder.encode_fixed_length(&mut shards, data_shard_size) {
-							log::error!("Failed to create FEC block for audio: {e}");
+						if fec_encoder.reset().is_err() {
+							log::warn!("Parity is not ready, but we were expecting it to be ready.");
+							fec_encoder.reset_force();
 							continue;
 						}
 
