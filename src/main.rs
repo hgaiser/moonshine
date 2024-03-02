@@ -1,68 +1,89 @@
 use std::io::Write;
+use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
-use clients::ClientManager;
-use config::Config;
-use openssl::{
-	asn1::Asn1Time,
-	bn::{BigNum, MsbOption},
-	error::ErrorStack,
-	hash::MessageDigest,
-	pkey::{PKey, Private},
-	rsa::Rsa,
-	x509::{extension::{BasicConstraints, KeyUsage, SubjectKeyIdentifier}, X509}
-};
-use rtsp::RtspServer;
-use session::SessionManager;
-use state::State;
-use webserver::Webserver;
+use clap::Parser;
+use moonshine::clients::ClientManager;
+use moonshine::config::Config;
+use moonshine::{app_scanner, publisher};
+use moonshine::crypto::create_certificate;
+use moonshine::rtsp::RtspServer;
+use moonshine::session::SessionManager;
+use moonshine::state::State;
+use moonshine::webserver::Webserver;
+use openssl::pkey::PKey;
 
-pub mod app_scanner;
-pub mod clients;
-pub mod config;
-pub mod crypto;
-pub mod ffmpeg;
-pub mod rtsp;
-pub mod session;
-pub mod state;
-pub mod publisher;
-pub mod webserver;
+#[derive(Parser, Debug)]
+#[clap(version)]
+struct Args {
+	/// Path to configuration file.
+	config: PathBuf,
 
-fn create_certificate() -> Result<(X509, PKey<Private>), ErrorStack> {
-	let rsa = Rsa::generate(2048)?;
-	let key_pair = PKey::from_rsa(rsa)?;
+	/// Show more log messages.
+	#[clap(long, short)]
+	#[clap(action = clap::ArgAction::Count)]
+	verbose: u8,
 
-	let mut cert_builder = X509::builder()?;
-	cert_builder.set_version(2)?;
-	let serial_number = {
-		let mut serial = BigNum::new()?;
-		serial.rand(159, MsbOption::MAYBE_ZERO, false)?;
-		serial.to_asn1_integer()?
+	/// Show less log messages.
+	#[clap(long, short)]
+	#[clap(action = clap::ArgAction::Count)]
+	quiet: u8,
+}
+
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<(), ()> {
+	let args = Args::parse();
+
+	let log_level = match i16::from(args.verbose) - i16::from(args.quiet) {
+		..= -2 => log::LevelFilter::Error,
+		-1 => log::LevelFilter::Warn,
+		0 => log::LevelFilter::Info,
+		1 => log::LevelFilter::Debug,
+		2.. => log::LevelFilter::Trace,
 	};
-	cert_builder.set_serial_number(&serial_number)?;
-	cert_builder.set_pubkey(&key_pair)?;
-	let not_before = Asn1Time::days_from_now(0)?;
-	cert_builder.set_not_before(&not_before)?;
-	let not_after = Asn1Time::days_from_now(3650)?;
-	cert_builder.set_not_after(&not_after)?;
 
-	cert_builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
-	cert_builder.append_extension(
-		KeyUsage::new()
-			.critical()
-			.key_cert_sign()
-			.crl_sign()
-			.build()?,
-	)?;
+	env_logger::Builder::new()
+		.filter_module(module_path!(), log_level)
+		.format_timestamp_millis()
+		.parse_default_env()
+		.init();
 
-	let subject_key_identifier =
-		SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(None, None))?;
-	cert_builder.append_extension(subject_key_identifier)?;
+	let mut config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
 
-	cert_builder.sign(&key_pair, MessageDigest::sha256())?;
-	let cert = cert_builder.build();
+	log::debug!("Using configuration:\n{:#?}", config);
 
-	Ok((cert, key_pair))
+	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
+	log::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
+	config.applications.extend(scanned_applications);
+
+	// Spawn a task to wait for CTRL+C and trigger a shutdown.
+	let shutdown = ShutdownManager::new();
+	tokio::spawn({
+		let shutdown = shutdown.clone();
+		async move {
+			if let Err(e) = tokio::signal::ctrl_c().await {
+				log::error!("Failed to wait for CTRL+C: {e}");
+				std::process::exit(1);
+			} else {
+				log::info!("Received interrupt signal. Shutting down server...");
+				shutdown.trigger_shutdown(1).ok();
+			}
+		}
+	});
+
+	// Create the main application.
+	let moonshine = Moonshine::new(config, shutdown.clone()).await?;
+
+	// Wait until something causes a shutdown trigger.
+	shutdown.wait_shutdown_triggered().await;
+
+	// Drop the main moonshine object, triggering other systems to shutdown too.
+	drop(moonshine);
+
+	// Wait until everything was shutdown.
+	let exit_code = shutdown.wait_shutdown_complete().await;
+	log::trace!("Successfully waited for shutdown to complete.");
+	std::process::exit(exit_code);
 }
 
 pub struct Moonshine {
