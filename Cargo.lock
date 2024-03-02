@@ -624,9 +624,11 @@ checksum = "2bed59fcc8cfd6b190814a509018388462d3b203cf6dd10db5c00087e72a83f3"
 dependencies = [
  "bitvec",
  "cfg-if",
+ "futures-core",
  "libc",
  "nix",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
@@ -865,12 +867,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "hound"
-version = "3.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "62adaabb884c94955b19907d60019f4e145d091c75345379e70d1ee696f7854f"
-
-[[package]]
 name = "http"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1095,6 +1091,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "libpulse-simple-binding"
+version = "2.28.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "05fd6b68f33f6a251265e6ed1212dc3107caad7c5c6fdcd847b2e65ef58c308d"
+dependencies = [
+ "libpulse-binding",
+ "libpulse-simple-sys",
+ "libpulse-sys",
+]
+
+[[package]]
+name = "libpulse-simple-sys"
+version = "1.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ea6613b4199d8b9f0edcfb623e020cb17bbd0bee8dd21f3c7cc938de561c4152"
+dependencies = [
+ "libpulse-sys",
+ "pkg-config",
+]
+
+[[package]]
 name = "libpulse-sys"
 version = "1.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1212,12 +1229,12 @@ dependencies = [
  "evdev",
  "ffmpeg-next",
  "hex",
- "hound",
  "http-body-util",
  "hyper",
  "hyper-util",
  "image",
  "libpulse-binding",
+ "libpulse-simple-binding",
  "log",
  "memmap",
  "network-interface",
@@ -1578,13 +1595,6 @@ dependencies = [
  "getrandom",
  "redox_syscall",
  "thiserror",
-]
-
-[[package]]
-name = "reed-solomon"
-version = "0.1.0"
-dependencies = [
- "cc",
 ]
 
 [[package]]
