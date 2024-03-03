@@ -153,6 +153,16 @@ run_after = [
 
 1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?** Both Moonshine and Sunshine fulfill the same goal. Moonshine has a much narrower focus on supported platforms. Sunshine attempts to support many different platforms and many different encoders. If your software / hardware is not supported by Moonshine, then you are likely better off using Sunshine. If you just want something to stream your games, you should probably also use Sunshine.
 
+    In terms of efficiency, playing the same 7 minute video and recording the average CPU and memory usage (using `ps -p $(pgrep sunshine) $(pgrep moonshine) -o %cpu,%mem,cmd`, on an Intel i9-12900K, 3440x1440 resolution, 60FPS, 51Mbps max bitrate) I get the following results:
+
+    ```
+    %CPU %MEM CMD
+    19.5  0.7 /usr/bin/sunshine
+
+    %CPU %MEM CMD
+    6.5  0.5 /usr/bin/moonshine /etc/moonshine/config.toml -v
+    ```
+
 ## Acknowledgement
 
 This wouldn't have been possible without the incredible work by the people behind both [Moonlight](https://moonlight-stream.org/) and [Sunshine](https://github.com/LizardByte/Sunshine).
