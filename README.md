@@ -9,6 +9,7 @@ This means you can play games on the client device, while rendering takes place 
 1. **NVIDIA GPU**. Moonshine uses NvFBC to capture the desktop, which is a NVIDIA library for retrieving the latest buffer from the GPU. There is currently no plan to support other hardware.
 1. **(Arch) Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux. Windows is currently not supported. It should be relatively simple to add Windows compatibility, but at least the input (mouse / keyboard / gamepad) and audio won't work since these use Linux specific libraries. Perhaps in the future, more OS's will be supported (contributions are welcome). For now the focus is on Arch Linux.
 1. **Steam Deck / PS4 / PS5 controller**. Similarly, this project is only tested on the mentioned controllers. It works well in those cases, other controllers might work, they might not work.
+1. **Moonlight v5.0.0 or higher**. This is untested and likely not working for older Moonlight versions.
 
 ## Installation
 
@@ -86,6 +87,22 @@ $ curl -Lo ~/.local/bin/resolution https://github.com/hgaiser/moonshine/raw/main
 ```
 
 And modify the values to match your setup.
+
+### Client pairing
+
+When a client attempts to pair through Moonlight, they are presented with a PIN number.
+This number must be provided to Moonshine through a HTTP request.
+The easiest method is to use your browser and navigate to the following URL:
+
+```
+http://localhost:47989/pin?uniqueid=0123456789ABCDEF&pin=<PIN>
+```
+
+Alternatively, you can also do this in commandline:
+
+```sh
+$ curl "http://localhost:47989/pin?uniqueid=0123456789ABCDEF&pin=<PIN>"
+```
 
 ### Applications
 
@@ -180,7 +197,7 @@ Thanks to their hard work it was possible for me to implement this protocol.
 ## TODO's
 
 1. [x] Document required setup for audio.
-1. [ ] Document pairing process.
+1. [x] Document pairing process.
 1. [x] Automatically create certificate when no certificate is found.
 1. [ ] AV1 support.
 1. [ ] Gyro support for controllers that support it.
