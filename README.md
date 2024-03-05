@@ -24,7 +24,7 @@ $ makepkg -si
 
 Or, simply `yay -S moonshine` if `yay` is installed.
 
-Assuming the configuration is placed in `/etc/moonshine/config.toml`, you can start the server by starting the system service:
+You can start the server by starting the user service:
 
 ```sh
 $ systemctl --user start moonshine
@@ -70,13 +70,9 @@ $ cargo run --release -- /path/to/config.toml
 
 ## Configuration
 
-A sample configuration file is provided in `config.toml`.
-It is useful to go through this file to check if anything needs to be adjusted.
-Mostly this comes down to the following:
-
-1. (optional) Change the name of the server.
-1. Check that the path to the certificate is correct.
-1. Add applications that you want to run from the client (more on that below).
+A configuration file is generated if the provided path does not exist.
+By default it will be created in `$XDG_CONFIG_HOME/moonshine/config.toml` when using the AUR package.
+It is possible to add applications that you want to run (more on that below).
 
 ### Applications
 
@@ -107,7 +103,7 @@ The following values are replaced in the commands, before they are executed:
 
 By combining the `run_before` and `run_after` configuration fields, we can change resolution and launch a game when the application starts and reset to the default resolution when the application ends.
 
-A simple example is given in `config.toml`:
+A simple example is given below:
 
 ```toml
 [[application]]
@@ -160,7 +156,7 @@ run_after = [
     19.5  0.7 /usr/bin/sunshine
 
     %CPU %MEM CMD
-    6.5  0.5 /usr/bin/moonshine /etc/moonshine/config.toml -v
+    6.5  0.5 /usr/bin/moonshine
     ```
 
 ## Acknowledgement
