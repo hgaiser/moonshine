@@ -1,0 +1,32 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+- Certificate creation through code. This creates a certificate if none exists yet.
+- Github workflow.
+- VSCode launch.json file.
+
+### Removed
+- Unused dependencies.
+- Removed many unwrap calls.
+- Removed xml crate (replaced by simple String formatting).
+- Removed `make-cert` script (as this is now handled in code).
+
+### Changed
+- Replaced custom ffmpeg binding with [ffmpeg-next](https://github.com/zmwangx/rust-ffmpeg).
+- Replaced CUDA from ffmpeg binding with [cudarc](https://github.com/coreylowman/cudarc).
+- Replaced [cpal](https://github.com/RustAudio/cpal/) with [libpulse_binding](https://github.com/jnqnfe/pulse-binding-rust).
+- Replaced custom Reed Solomon encoding with [reed-solomon-erasure](https://github.com/rust-rse/reed-solomon-erasure).
+
+
+## [v0.1.0] - 2024-01-25
+
+### Added
+
+- Initial release.
