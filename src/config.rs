@@ -130,8 +130,8 @@ impl Default for WebserverConfig {
 		Self {
 			port: 47989,
 			port_https: 47984,
-			certificate: "./cert.pem".into(),
-			private_key: "./key.pem".into(),
+			certificate: "$HOME/.config/moonshine/cert.pem".into(),
+			private_key: "$HOME/.config/moonshine/key.pem".into(),
 		}
 	}
 }

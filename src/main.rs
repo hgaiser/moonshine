@@ -76,6 +76,17 @@ async fn main() -> Result<(), ()> {
 			.map_err(|e| log::error!("Failed to save config file: {e}"))?;
 	}
 
+	// Resolve these paths so that the rest of the code doesn't need to.
+	let cert_path = config.webserver.certificate.to_string_lossy().to_string();
+	let cert_path = shellexpand::full(&cert_path)
+		.map_err(|e| log::error!("Failed to expand certificate path: {e}"))?;
+	config.webserver.certificate = cert_path.to_string().into();
+
+	let private_key_path = config.webserver.private_key.to_string_lossy().to_string();
+	let private_key_path = shellexpand::full(&private_key_path)
+		.map_err(|e| log::error!("Failed to expand private key path: {e}"))?;
+	config.webserver.private_key = private_key_path.to_string().into();
+
 	log::debug!("Using configuration:\n{:#?}", config);
 
 	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
@@ -133,17 +144,25 @@ impl Moonshine {
 				.map_err(|e| log::error!("Failed to create certificate: {e}"))?;
 
 			// Write certificate to file
+			let cert_dir = config.webserver.certificate.parent()
+				.ok_or_else(|| log::error!("Failed to find parent directory for certificate file."))?;
+			std::fs::create_dir_all(cert_dir)
+				.map_err(|e| log::error!("Failed to create certificate directory: {e}"))?;
 			let mut certfile = std::fs::File::create(&config.webserver.certificate).unwrap();
 			certfile.write(&cert.to_pem().map_err(|e| log::error!("Failed to serialize PEM: {e}"))?)
 				.map_err(|e| log::error!("Failed to write PEM to file: {e}"))?;
 
 			// Write private key to file
+			let private_key_dir = config.webserver.private_key.parent()
+				.ok_or_else(|| log::error!("Failed to find parent directory for private key file."))?;
+			std::fs::create_dir_all(private_key_dir)
+				.map_err(|e| log::error!("Failed to create private key directory: {e}"))?;
 			let mut keyfile = std::fs::File::create(&config.webserver.private_key).unwrap();
 			keyfile.write(&pkey.private_key_to_pem_pkcs8().map_err(|e| log::error!("Failed to serialize private key: {e}"))?)
 				.map_err(|e| log::error!("Failed to write private key to file: {e}"))?;
 
-			log::debug!("Saved private key to {}", config.webserver.private_key.display());
-			log::debug!("Saved certificate to {}", config.webserver.certificate.display());
+			log::debug!("Saved private key to {}", config.webserver.certificate.display());
+			log::debug!("Saved certificate to {}", config.webserver.private_key.display());
 
 			(cert, pkey)
 		} else {
@@ -151,6 +170,7 @@ impl Moonshine {
 				.map_err(|e| log::error!("Failed to read server certificate: {e}"))?;
 			let cert = openssl::x509::X509::from_pem(&cert)
 				.map_err(|e| log::error!("Failed to parse server certificate: {e}"))?;
+
 			let pkey = PKey::private_key_from_pem(&std::fs::read(&config.webserver.private_key)
 				.map_err(|e| log::error!("Failed to read private key: {e}"))?)
 				.map_err(|e| log::error!("Failed to parse private key: {e}"))?;
