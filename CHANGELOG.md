@@ -21,7 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Replaced custom ffmpeg binding with [ffmpeg-next](https://github.com/zmwangx/rust-ffmpeg).
 - Replaced CUDA from ffmpeg binding with [cudarc](https://github.com/coreylowman/cudarc).
-- Replaced [cpal](https://github.com/RustAudio/cpal/) with [libpulse_binding](https://github.com/jnqnfe/pulse-binding-rust).
+- Replaced [cpal](https://github.com/RustAudio/cpal/) with [libpulse_binding](https://github.com/jnqnfe/pulse-binding-rust). Because of this change, Moonshine will automatically pick up the right pulseaudio monitor for capturing desktop audio.
 - Replaced custom Reed Solomon encoding with [reed-solomon-erasure](https://github.com/rust-rse/reed-solomon-erasure).
 
 
