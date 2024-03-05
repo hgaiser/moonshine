@@ -4,8 +4,8 @@ address = "0.0.0.0"
 [webserver]
 port = 47989
 port_https = 47984
-certificate = "./cert/cert.pem"
-private_key = "./cert/key.pem"
+certificate = "./cert.pem"
+private_key = "./key.pem"
 
 [stream]
 port = 48010
