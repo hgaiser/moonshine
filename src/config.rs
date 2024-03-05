@@ -1,9 +1,7 @@
 use std::{path::{PathBuf, Path}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
-fn default_stream_timeout() -> u64 { 60 }
-
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
 	/// Name of the Moonshine host.
 	pub name: String,
@@ -27,7 +25,6 @@ pub struct Config {
 	pub application_scanners: Vec<ApplicationScannerConfig>,
 
 	/// Time in seconds since last ping after which the stream closes.
-	#[serde(default = "default_stream_timeout")]
 	pub stream_timeout: u64,
 }
 
@@ -43,7 +40,77 @@ impl Config {
 	}
 }
 
-#[derive(Clone, Debug, Deserialize)]
+impl Default for Config {
+	fn default() -> Self {
+		Self {
+			name: "Moonshine".to_string(),
+			address: "0.0.0.0".to_string(),
+			webserver: Default::default(),
+			stream: Default::default(),
+			applications: vec![
+				ApplicationConfig {
+					title: "Desktop".to_string(),
+					run_before: Some(vec![
+						vec![
+							"$HOME/.local/bin/resolution".to_string(),
+							"{width}".to_string(),
+							"{height}".to_string(),
+						],
+					]),
+					run_after: Some(vec![
+						vec!["$HOME/.local/bin/resolution".to_string()],
+					]),
+					boxart: None,
+				},
+
+				ApplicationConfig {
+					title: "Steam".to_string(),
+					run_before: Some(vec![
+						vec![
+							"$HOME/.local/bin/resolution".to_string(),
+							"{width}".to_string(),
+							"{height}".to_string(),
+						],
+						vec![
+							"/usr/bin/steam".to_string(),
+							"steam://open/bigpicture".to_string(),
+						],
+					]),
+					run_after: Some(vec![
+						vec!["$HOME/.local/bin/resolution".to_string()],
+					]),
+					boxart: None,
+				},
+			],
+			application_scanners: vec![
+				ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
+					library: "$HOME/.local/share/Steam".into(),
+					run_before: Some(vec![
+						vec![
+							"$HOME/.local/bin/resolution".to_string(),
+							"{width}".to_string(),
+							"{height}".to_string(),
+						],
+						vec![
+							"/usr/bin/steam".to_string(),
+							"steam://open/bigpicture".to_string(),
+						],
+						vec![
+							"/usr/bin/steam".to_string(),
+							"steam://rungameid/{game_id}".to_string(),
+						],
+					]),
+					run_after: Some(vec![
+						vec!["$HOME/.local/bin/resolution".to_string()],
+					]),
+				}),
+			],
+			stream_timeout: 60,
+		}
+	}
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct WebserverConfig {
 	/// Port of the webserver.
 	pub port: u16,
@@ -58,7 +125,18 @@ pub struct WebserverConfig {
 	pub private_key: PathBuf,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+impl Default for WebserverConfig {
+	fn default() -> Self {
+		Self {
+			port: 47989,
+			port_https: 47984,
+			certificate: "./cert.pem".into(),
+			private_key: "./key.pem".into(),
+		}
+	}
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ApplicationConfig {
 	/// Title of the application.
 	pub title: String,
@@ -85,7 +163,7 @@ impl ApplicationConfig {
 	}
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 pub enum ApplicationScannerConfig {
@@ -93,7 +171,7 @@ pub enum ApplicationScannerConfig {
 	Steam(SteamApplicationScannerConfig),
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SteamApplicationScannerConfig {
 	/// Path to a Steam library (ie. `~/.local/share/Steam`).
 	pub library: PathBuf,
@@ -110,7 +188,7 @@ pub struct SteamApplicationScannerConfig {
 
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StreamConfig {
 	/// Port to bind the RTSP server to.
 	pub port: u16,
@@ -125,41 +203,18 @@ pub struct StreamConfig {
 	pub control: ControlStreamConfig,
 }
 
-// pub trait AsStr {
-// 	fn as_str(&self) -> &str;
-// }
+impl Default for StreamConfig {
+	fn default() -> Self {
+		Self {
+			port: 48010,
+			video: Default::default(),
+			audio: Default::default(),
+			control: Default::default(),
+		}
+	}
+}
 
-// /// Supported codecs for h264 encoding.
-// #[derive(Clone, Debug, Deserialize)]
-// #[serde(rename_all = "snake_case")]
-// pub enum H264Codec {
-// 	Nvenc,
-// }
-
-// impl AsStr for &H264Codec {
-// 	fn as_str(&self) -> &str {
-// 		match self {
-// 			H264Codec::Nvenc => "h264_nvenc",
-// 		}
-// 	}
-// }
-
-// /// Supported codecs for hevc encoding.
-// #[derive(Clone, Debug, Deserialize)]
-// #[serde(rename_all = "snake_case")]
-// pub enum HevcCodec {
-// 	Nvenc,
-// }
-
-// impl AsStr for &HevcCodec {
-// 	fn as_str(&self) -> &str {
-// 		match self {
-// 			HevcCodec::Nvenc => "hevc_nvenc",
-// 		}
-// 	}
-// }
-
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VideoStreamConfig {
 	/// Port to use for streaming video data.
 	pub port: u16,
@@ -174,14 +229,37 @@ pub struct VideoStreamConfig {
 	pub fec_percentage: u8,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+impl Default for VideoStreamConfig {
+	fn default() -> Self {
+		Self {
+			port: 47998,
+			codec_h264: "h264_nvenc".to_string(),
+			codec_hevc: "hevc_nvenc".to_string(),
+			fec_percentage: 20,
+		}
+	}
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AudioStreamConfig {
 	/// Port to use for streaming audio data.
 	pub port: u16,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+impl Default for AudioStreamConfig {
+	fn default() -> Self {
+		Self { port: 48000 }
+	}
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ControlStreamConfig {
 	/// Port to use for streaming control data.
 	pub port: u16,
+}
+
+impl Default for ControlStreamConfig {
+	fn default() -> Self {
+		Self { port: 47999 }
+	}
 }

@@ -58,7 +58,23 @@ async fn main() -> Result<(), ()> {
 		.parse_default_env()
 		.init();
 
-	let mut config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
+	let mut config;
+	if args.config.exists() {
+		config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
+	} else {
+		log::info!("No config file found at {}, creating a default config file.", args.config.display());
+		config = Config::default();
+
+		let serialized_config = toml::to_string_pretty(&config)
+			.map_err(|e| log::error!("Failed to serialize config: {e}"))?;
+
+		let config_dir = args.config.parent()
+			.ok_or_else(|| log::error!("Failed to get parent directory of config file."))?;
+		std::fs::create_dir_all(config_dir)
+			.map_err(|e| log::error!("Failed to create config directory: {e}"))?;
+		std::fs::write(args.config, serialized_config)
+			.map_err(|e| log::error!("Failed to save config file: {e}"))?;
+	}
 
 	log::debug!("Using configuration:\n{:#?}", config);
 
