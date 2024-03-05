@@ -74,6 +74,19 @@ A configuration file is generated if the provided path does not exist.
 By default it will be created in `$XDG_CONFIG_HOME/moonshine/config.toml` when using the AUR package.
 It is possible to add applications that you want to run (more on that below).
 
+There is also a [resolution](./scripts/resolution) script provided which automatically changes the resolution to the requested resolution.
+Note that this file should be modified to refer to the correct display and standard resolution.
+
+The default configuration assumes this `resolution` script is placed in `$HOME/.local/bin`.
+If you want to use this functionality, you should copy this script in that location:
+
+```sh
+$ mkdir ~/.local/bin
+$ curl -Lo ~/.local/bin/resolution https://github.com/hgaiser/moonshine/raw/main/scripts/resolution
+```
+
+And modify the values to match your setup.
+
 ### Applications
 
 It is important to note that each application that is defined in the config simply starts streaming the entire desktop.
