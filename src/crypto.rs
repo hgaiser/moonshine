@@ -36,9 +36,9 @@ pub fn create_certificate() -> Result<(X509, PKey<Private>), ErrorStack> {
 	cert_builder.append_extension(BasicConstraints::new().critical().ca().build()?)?;
 	cert_builder.append_extension(
 		KeyUsage::new()
-			.critical()
-			.key_cert_sign()
-			.crl_sign()
+			.digital_signature()
+			.key_encipherment()
+			.key_agreement()
 			.build()?,
 	)?;
 
