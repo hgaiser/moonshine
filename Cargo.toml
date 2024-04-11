@@ -11,7 +11,7 @@ dirs = "5.0.1"
 enet = "0.3.0"
 env_logger = "0.10.0"
 evdev = "0.12.1"
-ffmpeg = { version = "6.1.1", package = "ffmpeg-next" }
+ffmpeg = { version = "7.0.0", package = "ffmpeg-next" }
 hex = "0.4.3"
 http-body-util = "0.1.0-rc.3"
 hyper = { version = "1.0.1", features = ["server", "http1"] }
@@ -40,6 +40,6 @@ uuid = { version = "1.5.0", features = ["v4"] }
 zeroconf = "0.13.1"
 
 [patch.crates-io]
-ffmpeg = { version = "6.1.1", package = "ffmpeg-next", git = "https://github.com/hgaiser/rust-ffmpeg", branch = "codec-context-settable" }
-ffmpeg-sys-next = { version = "6.1.0", git = "https://github.com/hgaiser/rust-ffmpeg-sys", branch = "cuda" }
+ffmpeg = { version = "7.0.0", package = "ffmpeg-next", git = "https://github.com/hgaiser/rust-ffmpeg", branch = "codec-context-settable" }
+ffmpeg-sys-next = { version = "7.0.0", git = "https://github.com/hgaiser/rust-ffmpeg-sys", branch = "cuda" }
 reed-solomon-erasure = { version = "6.0.0", git = "https://github.com/hgaiser/reed-solomon-erasure", branch = "moonshine" }

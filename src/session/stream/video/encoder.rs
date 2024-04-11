@@ -100,7 +100,7 @@ impl Encoder {
 		let codec = ffmpeg::encoder::find_by_name(codec_name)
 			.ok_or_else(|| log::error!("Failed to find codec by name '{codec_name}'."))?;
 
-		let mut encoder = ffmpeg::codec::context::Context::new_with_codec(&codec)
+		let mut encoder = ffmpeg::codec::context::Context::new_with_codec(codec)
 			.encoder()
 			.video()
 			.map_err(|e| log::error!("Failed to create video encoder: {e}"))?;
