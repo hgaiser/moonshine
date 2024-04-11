@@ -205,3 +205,4 @@ Thanks to their hard work it was possible for me to implement this protocol.
 1. [ ] Change controller ID based on what the client registers (this should correctly show Xbox buttons in some games when using Xbox controllers, for example).
 1. [ ] Web interface.
 1. [x] Configure Github Actions for testing.
+1. [ ] Reject clients based on provided certificate.
