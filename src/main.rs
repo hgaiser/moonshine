@@ -101,10 +101,10 @@ async fn main() -> Result<(), ()> {
 			if let Err(e) = tokio::signal::ctrl_c().await {
 				log::error!("Failed to wait for CTRL+C: {e}");
 				std::process::exit(1);
-			} else {
-				log::info!("Received interrupt signal. Shutting down server...");
-				shutdown.trigger_shutdown(1).ok();
 			}
+
+			log::info!("Received interrupt signal. Shutting down server...");
+			shutdown.trigger_shutdown(1).ok();
 		}
 	});
 
