@@ -196,13 +196,13 @@ Thanks to their hard work it was possible for me to implement this protocol.
 
 ## TODO's
 
-Below are improvements that I'd like to make at some point.
-If you are interesting in contributing, feel free to create an issue or send me a message on the [Moonlight Discord](https://discord.com/invite/moonlight-stream-352065098472488960) server.
+Below are improvements intended for Moonshine.
+If you are interesting in contributing, feel free to create an issue or send a message on the [Moonlight Discord](https://discord.com/invite/moonlight-stream-352065098472488960) server.
 
 1. [ ] Replace openssl with [rustls](https://crates.io/crates/rustls).
 1. [ ] Investigate replacing ffmpeg with gstreamer as it seems to have better Rust support.
 1. [ ] Replace NvFBC with DRM-KMS for hardware agnostic frame capture (however at the time of writing it seems NVIDIA cards do not support this through the proprietary NVIDIA driver).
-1. [ ] Replace NVENC with [Vulkan Video Extensions](https://www.khronos.org/blog/khronos-finalizes-vulkan-video-extensions-for-accelerated-h.264-and-h.265-encode). This only really makes sense if NvFBC is replaced as well.
+1. [ ] Replace NVENC with [Vulkan Video Extensions](https://www.khronos.org/blog/khronos-finalizes-vulkan-video-extensions-for-accelerated-h.264-and-h.265-encode). This only really makes sense if NvFBC is replaced as well, otherwise there is still a vendor lock-in.
 1. [ ] AV1 support.
 1. [ ] HDR support.
 1. [ ] 5.1 / 7.1 audio support.
