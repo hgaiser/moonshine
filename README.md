@@ -191,7 +191,7 @@ run_after = [
 ## Acknowledgement
 
 This wouldn't have been possible without the incredible work by the people behind both [Moonlight](https://moonlight-stream.org/) and [Sunshine](https://github.com/LizardByte/Sunshine).
-Thanks to their hard work it was possible for me to implement this protocol.
+Without their hard work this wouldn't have been possible.
 
 ## TODO's
 
