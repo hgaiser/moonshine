@@ -2,7 +2,7 @@ use std::{net::{ToSocketAddrs, IpAddr}, collections::HashMap, convert::Infallibl
 
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
-use hyper::{service::service_fn, Response, Request, body::Bytes, StatusCode, header::{self, HeaderValue}, Method};
+use hyper::{body::Bytes, header::{self, HeaderValue}, service::service_fn, Method, Request, Response, StatusCode};
 use hyper_util::rt::tokio::TokioIo;
 use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
@@ -184,7 +184,8 @@ impl Webserver {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
 				(&Method::GET, "/pair") => handle_pair_request(params, &self.server_certs, &self.client_manager).await,
-				(&Method::GET, "/pin") => self.pin(params).await,
+				(&Method::GET, "/pin") => self.pin().await,
+				(&Method::GET, "/submit-pin") => self.submit_pin(params).await,
 				(method, uri) => {
 					log::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
@@ -346,6 +347,16 @@ impl Webserver {
 	}
 
 	async fn pin(
+		&self,
+	) -> Response<Full<Bytes>> {
+		let content = include_bytes!("../../assets/pin.html");
+		let mut response = Response::new(Full::new(Bytes::from_static(content)));
+		response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=UTF-8"));
+
+		response
+	}
+
+	async fn submit_pin(
 		&self,
 		params: HashMap<String, String>,
 	) -> Response<Full<Bytes>> {

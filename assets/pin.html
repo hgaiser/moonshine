@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+	<title>Moonshine PIN</title>
+	<style>
+		/* Reset some default styles */
+		* {
+			margin: 0;
+			padding: 0;
+			box-sizing: border-box;
+		}
+
+		body {
+			font-family: Arial, sans-serif;
+			background-color: #1a1a1a;
+			color: #f2f2f2;
+			display: flex;
+			justify-content: center;
+			align-items: center;
+			height: 100vh;
+		}
+
+		#container {
+			background-color: #2b2b2b;
+			padding: 2rem;
+			border-radius: 8px;
+			box-shadow: 0 0 20px rgba(0, 0, 0, 0.3);
+		}
+
+		#pin-instructions {
+			text-align: center;
+			margin-bottom: 1rem;
+			font-size: 1.1rem;
+		}
+
+		#pin-fields {
+			display: flex;
+			justify-content: center;
+			margin-bottom: 1.5rem;
+		}
+
+		.pin-field {
+			width: 3rem;
+			height: 3rem;
+			font-size: 2rem;
+			text-align: center;
+			margin: 0 0.5rem;
+			padding: 0.5rem;
+			border: none;
+			border-radius: 4px;
+			background-color: #3b3b3b;
+			color: #f2f2f2;
+			caret-color: transparent;
+		}
+
+		button {
+			display: block;
+			width: 100%;
+			padding: 0.75rem 1.5rem;
+			font-size: 1rem;
+			background-color: #2166b5;
+			color: #fff;
+			border: none;
+			border-radius: 4px;
+			cursor: pointer;
+		}
+
+		button:hover {
+			background-color: #3d7fca;
+		}
+
+
+		button:disabled {
+			background-color: #ccc;
+			color: #515151;
+			cursor: default;
+		}
+
+		#error-message {
+			color: #ff6b6b;
+			text-align: center;
+			margin-top: 1rem;
+			display: none;
+		}
+
+		#success-message {
+			color: #60ed7a;
+			text-align: center;
+			margin-top: 1rem;
+			display: none;
+		}
+
+	</style>
+</head>
+
+<body>
+	<div id="container">
+		<div id="pin-instructions">Please fill in the PIN from Moonlight</div>
+
+		<form autocomplete="off" id="pin-form" action="pin" method="post">
+			<div id="pin-fields">
+				<input name="pin1" type="text" oninput="this.value=this.value.replace(/[^0-9]/g, '');" maxlength="1" class="pin-field" autofocus>
+				<input name="pin2" type="text" oninput="this.value=this.value.replace(/[^0-9]/g, '');" maxlength="1" class="pin-field">
+				<input name="pin3" type="text" oninput="this.value=this.value.replace(/[^0-9]/g, '');" maxlength="1" class="pin-field">
+				<input name="pin4" type="text" oninput="this.value=this.value.replace(/[^0-9]/g, '');" maxlength="1" class="pin-field">
+			</div>
+			<button id="submit" type="submit" disabled>Submit</button>
+		</form>
+
+		<div id="error-message">Error submitting PIN. Please try again or check the server logs.</div>
+		<div id="success-message">Successfully paired.</div>
+	</div>
+
+	<script>
+		const pin_instructions = document.getElementById("pin-instructions");
+		const pin_fields = document.querySelectorAll(".pin-field");
+		const pin_form = document.getElementById("pin-form");
+		const submit_button = document.getElementById("submit");
+		const error_message = document.getElementById("error-message");
+		const success_message = document.getElementById("success-message");
+
+		pin_form.addEventListener("submit", async (event) => {
+			event.preventDefault();
+
+			let pin = "";
+			for (const field of pin_fields) {
+				pin += field.value;
+			}
+
+			const response = await fetch(`/submit-pin?uniqueid=0123456789ABCDEF&pin=${pin}`, { method: 'GET' });
+
+			if (response.ok) {
+				error_message.style.display = "none";
+				success_message.style.display = "block";
+			} else {
+				error_message.style.display = "block";
+				success_message.style.display = "none";
+			}
+		});
+
+		for (const [index, field] of pin_fields.entries()) {
+			// Select the content when receiving focus.
+			field.addEventListener("focus", () => field.select());
+
+			// Move focus to next input when a number is filled in.
+			field.addEventListener("input", (e) => {
+				e.target.value = e.target.value.slice(0, 1);
+				if (e.target.value) {
+					if (index < pin_fields.length - 1) {
+						pin_fields[index + 1].focus();
+					}
+				}
+
+				let disabled = false;
+				for (const field of pin_fields) {
+					if (field.value === "") {
+						disabled = true;
+					}
+				}
+				submit_button.disabled = disabled;
+			});
+		}
+	</script>
+</body>
+
+</html>
