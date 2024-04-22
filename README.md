@@ -18,12 +18,12 @@ This means you can play games on the client device, while rendering takes place 
 The simplest method is to install through the AUR:
 
 ```sh
-$ git clone https://aur.archlinux.org/moonshine
+$ git clone https://aur.archlinux.org/moonshine-bin
 $ cd moonshine
 $ makepkg -si
 ```
 
-Or, simply `yay -S moonshine` if `yay` is installed.
+Or, simply `yay -S moonshine-bin` if `yay` is installed.
 
 You can start the server by starting the user service:
 
@@ -91,17 +91,16 @@ And modify the values to match your setup.
 ### Client pairing
 
 When a client attempts to pair through Moonlight, they are presented with a PIN number.
-This number must be provided to Moonshine through a HTTP request.
 The easiest method is to use your browser and navigate to the following URL:
 
 ```
-http://localhost:47989/pin?uniqueid=0123456789ABCDEF&pin=<PIN>
+http://localhost:47989/pin
 ```
 
 Alternatively, you can also do this in commandline:
 
 ```sh
-$ curl "http://localhost:47989/pin?uniqueid=0123456789ABCDEF&pin=<PIN>"
+$ curl "http://localhost:47989/submit-pin?uniqueid=0123456789ABCDEF&pin=<PIN>"
 ```
 
 ### Applications
@@ -208,5 +207,5 @@ If you are interesting in contributing, feel free to create an issue or send a m
 1. [ ] 5.1 / 7.1 audio support.
 1. [ ] Gyro support for controllers that support it.
 1. [ ] Change controller ID based on what the client registers (this should correctly show Xbox buttons in some games when using Xbox controllers, for example).
-1. [ ] Web interface https://github.com/hgaiser/moonshine/issues/4 .
+1. [x] Web interface https://github.com/hgaiser/moonshine/issues/4 .
 1. [ ] Reject clients based on provided certificate.
