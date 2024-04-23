@@ -91,13 +91,14 @@ And modify the values to match your setup.
 ### Client pairing
 
 When a client attempts to pair through Moonlight, they are presented with a PIN number.
-The easiest method to provide this PIN number to Moonshine is to use your browser and navigate to the following URL:
+A notification will appear on the host (assuming your desktop environment supports notifications) that you can use to automatically go to the page where your PIN number can be filled in.
+Alternatively you can navigate to the following URL on the host:
 
 ```
 http://localhost:47989/pin
 ```
 
-Alternatively, you can also do this in commandline:
+Or, you can also do this in commandline:
 
 ```sh
 $ curl "http://localhost:47989/submit-pin?uniqueid=0123456789ABCDEF&pin=<PIN>"
