@@ -6,10 +6,10 @@ This means you can play games on the client device, while rendering takes place 
 
 ## Requirements and limitations
 
-1. **NVIDIA GPU**. Moonshine uses NvFBC to capture the desktop, which is a NVIDIA library for retrieving the latest buffer from the GPU. There is currently no plan to support other hardware.
+1. **NVIDIA GPU**. Moonshine uses NvFBC to capture the desktop and NVENC for video encoding, both are NVIDIA specific libraries and require an NVIDIA GPU. The goal is to support more hardware in the future, while maintaining a single and therefore simple pipeline. See the todo's at the bottom for more information.
 1. **(Arch) Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux. Windows is currently not supported. It should be relatively simple to add Windows compatibility, but at least the input (mouse / keyboard / gamepad) and audio won't work since these use Linux specific libraries. Perhaps in the future, more OS's will be supported (contributions are welcome). For now the focus is on Arch Linux.
-1. **Steam Deck / PS4 / PS5 controller**. Similarly, this project is only tested on the mentioned controllers. It works well in those cases, other controllers might work, they might not work.
-1. **Moonlight v5.0.0 or higher**. This is untested and likely not working for older Moonlight versions.
+1. **Steam Deck / PS4 / PS5 controller**. Similarly, this project is only tested on the mentioned controllers. Your mileage may vary with other controllers.
+1. **Moonlight v5.0.0 or higher**. Older versions are untested and might not work.
 
 ## Installation
 
@@ -72,7 +72,7 @@ $ cargo run --release -- /path/to/config.toml
 ## Configuration
 
 A configuration file is generated if the provided path does not exist.
-By default it will be created in `$XDG_CONFIG_HOME/moonshine/config.toml` when using the AUR package.
+By default it will be created in `$XDG_CONFIG_HOME/moonshine/config.toml` if you are using the AUR package.
 It is possible to add applications that you want to run (more on that below).
 
 There is also a [resolution](./scripts/resolution) script provided which automatically changes the resolution to the requested resolution.
@@ -91,7 +91,7 @@ And modify the values to match your setup.
 ### Client pairing
 
 When a client attempts to pair through Moonlight, they are presented with a PIN number.
-The easiest method is to use your browser and navigate to the following URL:
+The easiest method to provide this PIN number to Moonshine is to use your browser and navigate to the following URL:
 
 ```
 http://localhost:47989/pin
@@ -103,12 +103,14 @@ Alternatively, you can also do this in commandline:
 $ curl "http://localhost:47989/submit-pin?uniqueid=0123456789ABCDEF&pin=<PIN>"
 ```
 
+Where `<PIN>` should be replaced with the actual PIN number.
+
 ### Applications
 
 It is important to note that each application that is defined in the config simply starts streaming the entire desktop.
 It is the `run_before` part of an applications configuration that defines what to do when an application is started.
-Most commonly this will be used to first change the resolution and then launch a game.
-If no `run_before` is provided, then Moonshine will simply start to stream the desktop without launching anything.
+Most commonly this will be used to first change the resolution and then launch a game or application.
+If no `run_before` is provided, then Moonshine will simply start to stream the desktop without changing resolution or launching anything.
 
 In the `config.toml` file, each application has the following information:
 
@@ -148,6 +150,8 @@ This will first call the [`scripts/resolution`](./scripts/resolution) script in 
 This will cause the resolution to be changed to the resolution requested by the client.
 The next command will open Steam in big picture mode.
 
+When the stream has ended, the resolution is returned to the standard resolution by calling the `resolution` script without any arguments.
+
 ### Application scanners
 
 In addition to defining specific applications, it is also possible to define application scanners.
@@ -176,9 +180,9 @@ run_after = [
 
 ## FAQ
 
-1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?** Both Moonshine and Sunshine fulfill the same goal. Moonshine has a much narrower focus on supported platforms. Sunshine attempts to support many different platforms and many different encoders. If your software / hardware is not supported by Moonshine, then you are likely better off using Sunshine. If you just want something to stream your games, you should probably also use Sunshine.
+1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?** Both Moonshine and Sunshine fulfill the same goal. Moonshine has a much narrower focus on supported platforms. Sunshine attempts to support many different platforms. If your software / hardware is not supported by Moonshine, then you might want to try Sunshine.
 
-    In terms of efficiency, playing the same 7 minute video and recording the average CPU and memory usage (using `ps -p $(pgrep sunshine) $(pgrep moonshine) -o %cpu,%mem,cmd`, on an Intel i9-12900K, 3440x1440 resolution, 60FPS, 51Mbps max bitrate) I get the following results:
+    In terms of efficiency, playing the same 7 minute video and recording the average CPU and memory usage (using `ps -p $(pgrep sunshine) $(pgrep moonshine) -o %cpu,%mem,cmd`, on an Intel i9-12900K, 3440x1440 resolution, 60FPS, 51Mbps max bitrate) gives the following results:
 
     ```
     %CPU %MEM CMD
@@ -191,7 +195,6 @@ run_after = [
 ## Acknowledgement
 
 This wouldn't have been possible without the incredible work by the people behind both [Moonlight](https://moonlight-stream.org/) and [Sunshine](https://github.com/LizardByte/Sunshine).
-Without their hard work this wouldn't have been possible.
 
 ## TODO's
 
@@ -200,7 +203,7 @@ If you are interesting in contributing, feel free to create an issue or send a m
 
 1. [ ] Replace openssl with [rustls](https://crates.io/crates/rustls).
 1. [ ] Investigate replacing ffmpeg with gstreamer as it seems to have better Rust support.
-1. [ ] Replace NvFBC with DRM-KMS for hardware agnostic frame capture (however at the time of writing it seems NVIDIA cards do not support this through the proprietary NVIDIA driver).
+1. [ ] Replace NvFBC with DRM-KMS for hardware agnostic frame capture (however at the time of writing it seems NVIDIA cards do not support this through their proprietary NVIDIA driver).
 1. [ ] Replace NVENC with [Vulkan Video Extensions](https://www.khronos.org/blog/khronos-finalizes-vulkan-video-extensions-for-accelerated-h.264-and-h.265-encode). This only really makes sense if NvFBC is replaced as well, otherwise there is still a vendor lock-in.
 1. [ ] AV1 support.
 1. [ ] HDR support.
