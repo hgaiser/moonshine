@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add notification when PIN is expected.
 - Add interface for submitting a PIN from Moonlight.
 
 ## [v0.2.3] - 2024-04-21
