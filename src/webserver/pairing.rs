@@ -1,7 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use http_body_util::Full;
-use hyper::{Response, header::{self, HeaderValue}, body::Bytes};
+use hyper::{body::Bytes, header::{self, HeaderValue}, Request, Response};
+use notify_rust::Notification;
 use tokio::sync::Notify;
 
 use crate::{clients::PendingClient, webserver::bad_request, clients::ClientManager};
@@ -21,13 +22,15 @@ use crate::{clients::PendingClient, webserver::bad_request, clients::ClientManag
 ///
 /// After completing these steps, we have paired with the client.
 pub async fn handle_pair_request(
+	request: Request<hyper::body::Incoming>,
 	mut params: HashMap<String, String>,
+	local_address: Option<SocketAddr>,
 	server_certs: &openssl::x509::X509,
 	client_manager: &ClientManager,
 ) -> Response<Full<Bytes>> {
 	if params.contains_key("phrase") {
 		match params.remove("phrase").unwrap().as_str() {
-			"getservercert" => get_server_cert(params, server_certs, client_manager).await,
+			"getservercert" => get_server_cert(request, params, local_address, server_certs, client_manager).await,
 			"pairchallenge" => pair_challenge(params, client_manager).await,
 			unknown => {
 				let message = format!("Unknown pair phrase received: {}", unknown);
@@ -49,7 +52,9 @@ pub async fn handle_pair_request(
 }
 
 async fn get_server_cert(
+	request: Request<hyper::body::Incoming>,
 	mut params: HashMap<String, String>,
+	local_address: Option<SocketAddr>,
 	server_pem: &openssl::x509::X509,
 	client_manager: &ClientManager,
 ) -> Response<Full<Bytes>> {
@@ -137,6 +142,28 @@ async fn get_server_cert(
 
 		notify
 	};
+
+	// Emit a notification, allowing the user to automatically open the PIN page.
+	if let Some(local_address) = local_address {
+		let _ = std::thread::Builder::new().name("pin-notification".to_string()).spawn(move || {
+			let scheme = request.uri().scheme().map(|s| s.to_string()).unwrap_or("http".to_string());
+			let pin_url = format!("{}://{}:{}/pin", scheme, local_address.ip(), local_address.port());
+
+			Notification::new()
+				.appname("Moonshine")
+				.summary("Received a pairing request.")
+				.action("open", "Enter PIN")
+				.show()
+				.map_err(|e| log::warn!("Failed to show PIN notification: {e}"))?
+				.wait_for_action(|action| {
+					if action == "open" {
+						let _ = open::that(pin_url);
+					}
+				});
+
+				Ok::<(), ()>(())
+		});
+	}
 
 	log::info!("Waiting for pin to be sent at /pin?uniqueid={}&pin=<PIN>", &unique_id);
 	pin_notifier.notified().await;

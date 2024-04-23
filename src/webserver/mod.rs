@@ -1,4 +1,4 @@
-use std::{net::{ToSocketAddrs, IpAddr}, collections::HashMap, convert::Infallible, path::PathBuf, str::FromStr};
+use std::{collections::HashMap, convert::Infallible, net::{IpAddr, SocketAddr, ToSocketAddrs}, path::PathBuf, str::FromStr};
 
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
@@ -69,8 +69,9 @@ impl Webserver {
 							.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
 						log::trace!("Accepted connection from {address}.");
 
-						let mac_address = if let Ok(local_address) = connection.local_addr() {
-							get_mac_address(local_address.ip()).unwrap_or(None)
+						let address = connection.local_addr().ok();
+						let mac_address = if let Some(address) = address {
+							get_mac_address(address.ip()).unwrap_or(None)
 						} else {
 							None
 						};
@@ -82,7 +83,7 @@ impl Webserver {
 							async move {
 								let _ = hyper::server::conn::http1::Builder::new()
 									.serve_connection(io, service_fn(|request| {
-										server.serve(request, mac_address.clone(), false)
+										server.serve(request, address, mac_address.clone(), false)
 									})).await;
 							}
 						});
@@ -117,8 +118,9 @@ impl Webserver {
 							.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
 						log::trace!("Accepted TLS connection from {address}.");
 
-						let mac_address = if let Ok(local_address) = connection.local_addr() {
-							get_mac_address(local_address.ip()).unwrap_or(None)
+						let address = connection.local_addr().ok();
+						let mac_address = if let Some(address) = address {
+							get_mac_address(address.ip()).unwrap_or(None)
 						} else {
 							None
 						};
@@ -135,7 +137,7 @@ impl Webserver {
 							async move {
 								let _ = hyper::server::conn::http1::Builder::new()
 									.serve_connection(io, service_fn(|request| {
-										server.serve(request, mac_address.clone(), true)
+										server.serve(request, address, mac_address.clone(), true)
 									})).await;
 							}
 						});
@@ -153,7 +155,13 @@ impl Webserver {
 		Ok(server)
 	}
 
-	async fn serve(&self, request: Request<hyper::body::Incoming>, mac_address: Option<String>, https: bool) -> Result<Response<Full<Bytes>>, Infallible> {
+	async fn serve(
+		&self,
+		request: Request<hyper::body::Incoming>,
+		local_address: Option<SocketAddr>,
+		mac_address: Option<String>,
+		https: bool,
+	) -> Result<Response<Full<Bytes>>, Infallible> {
 		let params = request.uri()
 			.query()
 			.map(|v| {
@@ -170,7 +178,9 @@ impl Webserver {
 				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
 				(&Method::GET, "/applist") => self.app_list(),
 				(&Method::GET, "/appasset") => self.app_asset(params),
-				(&Method::GET, "/pair") => handle_pair_request(params, &self.server_certs, &self.client_manager).await,
+				(&Method::GET, "/pair") => {
+					handle_pair_request(request, params, local_address, &self.server_certs, &self.client_manager).await
+				}
 				// (&Method::GET, "/unpair") => self.unpair(params).await,
 				(&Method::GET, "/launch") => self.launch(params).await,
 				(&Method::GET, "/resume") => self.resume(params).await,
@@ -183,7 +193,9 @@ impl Webserver {
 		} else {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
-				(&Method::GET, "/pair") => handle_pair_request(params, &self.server_certs, &self.client_manager).await,
+				(&Method::GET, "/pair") => {
+					handle_pair_request(request, params, local_address, &self.server_certs, &self.client_manager).await
+				}
 				(&Method::GET, "/pin") => self.pin().await,
 				(&Method::GET, "/submit-pin") => self.submit_pin(params).await,
 				(method, uri) => {
