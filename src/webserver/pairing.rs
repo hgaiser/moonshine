@@ -145,9 +145,11 @@ async fn get_server_cert(
 
 	// Emit a notification, allowing the user to automatically open the PIN page.
 	if let Some(local_address) = local_address {
+		let scheme = request.uri().scheme().map(|s| s.to_string()).unwrap_or("http".to_string());
+		let pin_url = format!("{}://{}:{}/pin", scheme, local_address.ip(), local_address.port());
+		log::info!("Waiting for pin to be sent at {pin_url}");
+
 		let _ = std::thread::Builder::new().name("pin-notification".to_string()).spawn(move || {
-			let scheme = request.uri().scheme().map(|s| s.to_string()).unwrap_or("http".to_string());
-			let pin_url = format!("{}://{}:{}/pin", scheme, local_address.ip(), local_address.port());
 
 			Notification::new()
 				.appname("Moonshine")
@@ -165,7 +167,6 @@ async fn get_server_cert(
 		});
 	}
 
-	log::info!("Waiting for pin to be sent at /pin?uniqueid={}&pin=<PIN>", &unique_id);
 	pin_notifier.notified().await;
 
 	let mut response = "<root status_code=\"200\">".to_string();
