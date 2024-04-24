@@ -150,15 +150,15 @@ async fn get_server_cert(
 		log::info!("Waiting for pin to be sent at {pin_url}");
 
 		let _ = std::thread::Builder::new().name("pin-notification".to_string()).spawn(move || {
-
 			Notification::new()
 				.appname("Moonshine")
-				.summary("Received a pairing request.")
+				.summary("Received pairing request.")
+				.action("default", "default")
 				.action("open", "Enter PIN")
 				.show()
 				.map_err(|e| log::warn!("Failed to show PIN notification: {e}"))?
 				.wait_for_action(|action| {
-					if action == "open" {
+					if action != "__closed" {
 						let _ = open::that(pin_url);
 					}
 				});
