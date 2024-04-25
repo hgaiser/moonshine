@@ -1,21 +1,19 @@
+use anyhow::{bail, Result};
 use openssl::{
 	asn1::Asn1Time,
 	bn::{BigNum, MsbOption},
 	cipher::CipherRef,
 	cipher_ctx::CipherCtx,
-	error::ErrorStack,
 	hash::MessageDigest,
 	pkey::{PKey, Private},
 	rsa::Rsa,
 	x509::{
-		extension::{
-			BasicConstraints, KeyUsage, SubjectKeyIdentifier
-		},
-	 	X509
-	}
+		extension::{BasicConstraints, KeyUsage, SubjectKeyIdentifier},
+		X509,
+	},
 };
 
-pub fn create_certificate() -> Result<(X509, PKey<Private>), ErrorStack> {
+pub fn create_certificate() -> Result<(X509, PKey<Private>)> {
 	let rsa = Rsa::generate(2048)?;
 	let key_pair = PKey::from_rsa(rsa)?;
 
@@ -42,8 +40,7 @@ pub fn create_certificate() -> Result<(X509, PKey<Private>), ErrorStack> {
 			.build()?,
 	)?;
 
-	let subject_key_identifier =
-		SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(None, None))?;
+	let subject_key_identifier = SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(None, None))?;
 	cert_builder.append_extension(subject_key_identifier)?;
 
 	cert_builder.sign(&key_pair, MessageDigest::sha256())?;
@@ -52,7 +49,13 @@ pub fn create_certificate() -> Result<(X509, PKey<Private>), ErrorStack> {
 	Ok((cert, key_pair))
 }
 
-pub fn encrypt(cipher: &CipherRef, plaintext: &[u8], key: Option<&[u8]>, iv: Option<&[u8]>, padding: bool) -> Result<Vec<u8>, openssl::error::ErrorStack> {
+pub fn encrypt(
+	cipher: &CipherRef,
+	plaintext: &[u8],
+	key: Option<&[u8]>,
+	iv: Option<&[u8]>,
+	padding: bool,
+) -> Result<Vec<u8>> {
 	let mut context = CipherCtx::new()?;
 	context.encrypt_init(Some(cipher), key, iv)?;
 	context.set_padding(padding);
@@ -64,7 +67,7 @@ pub fn encrypt(cipher: &CipherRef, plaintext: &[u8], key: Option<&[u8]>, iv: Opt
 	Ok(ciphertext)
 }
 
-pub fn decrypt(cipher: &CipherRef, ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>, openssl::error::ErrorStack> {
+pub fn decrypt(cipher: &CipherRef, ciphertext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
 	let mut context = CipherCtx::new()?;
 	context.decrypt_init(Some(cipher), Some(key), None)?;
 	context.set_padding(false);
@@ -74,7 +77,11 @@ pub fn decrypt(cipher: &CipherRef, ciphertext: &[u8], key: &[u8]) -> Result<Vec<
 	context.cipher_final_vec(&mut plaintext)?;
 
 	if plaintext.len() != ciphertext.len() {
-		panic!("Cipher and plaintext should be the same length, but are {} vs {}.", plaintext.len(), ciphertext.len());
+		bail!(
+			"Cipher and plaintext should be the same length, but are {} vs {}.",
+			plaintext.len(),
+			ciphertext.len()
+		)
 	}
 
 	Ok(plaintext)

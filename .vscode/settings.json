@@ -1,0 +1,8 @@
+{
+    "rust-analyzer.runnables.extraEnv": {
+        "PKG_CONFIG_PATH": "/usr/lib64/pkgconfig"
+    },
+    "rust-analyzer.server.extraEnv": {
+        "PKG_CONFIG_PATH": "/usr/lib64/pkgconfig"
+    }
+}

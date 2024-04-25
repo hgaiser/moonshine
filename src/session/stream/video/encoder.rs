@@ -1,17 +1,18 @@
 use std::sync::{Arc, Mutex};
 
+use anyhow::{anyhow, Context, Result};
 use async_shutdown::ShutdownManager;
 use cudarc::driver::CudaDevice;
-use ffmpeg::{
-	codec::packet::flag::Flags,
-	format::Pixel,
-	option::Settable,
-	Frame,
-	Packet,
-};
+use ffmpeg::{codec::packet::flag::Flags, format::Pixel, option::Settable, Frame, Packet};
 use reed_solomon_erasure::{galois_8, ReedSolomon};
 
-use crate::{ffmpeg::{hwdevice::CudaDeviceContextBuilder, hwframe::{HwFrameContext, HwFrameContextBuilder}}, session::stream::RtpHeader};
+use crate::{
+	ffmpeg::{
+		hwdevice::CudaDeviceContextBuilder,
+		hwframe::{HwFrameContext, HwFrameContextBuilder},
+	},
+	session::stream::RtpHeader,
+};
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub const MAX_SHARDS: usize = 255;
@@ -78,32 +79,30 @@ impl Encoder {
 		height: u32,
 		framerate: u32,
 		bitrate: usize,
-	) -> Result<Self, ()> {
+	) -> Result<Self> {
 		let cuda_device_context = CudaDeviceContextBuilder::new()
-			.map_err(|e| log::error!("Failed to create CUDA device context: {e}"))?
+			.map_err(|e| anyhow!("Failed to create CUDA device context: {e}"))?
 			.set_cuda_context((*cuda_device.cu_primary_ctx()) as *mut _)
 			.build()
-			.map_err(|e| log::error!("Failed to build CUDA device context: {e}"))?
-		;
+			.context("Failed to build CUDA device context")?;
 
 		let mut hw_frame_context = HwFrameContextBuilder::new(cuda_device_context)
-			.map_err(|e| log::error!("Failed to create CUDA frame context: {e}"))?
+			.map_err(|e| anyhow!("Failed to create CUDA frame context: {e}"))?
 			.set_width(width)
 			.set_height(height)
 			.set_sw_format(Pixel::ZRGB32)
 			.set_format(Pixel::CUDA)
 			.build()
-			.map_err(|e| log::error!("Failed to build CUDA frame context: {e}"))?
-		;
+			.context("Failed to build CUDA frame context")?;
 
-		log::info!("Using codec with name '{codec_name}'.");
+		tracing::info!("Using codec with name '{codec_name}'.");
 		let codec = ffmpeg::encoder::find_by_name(codec_name)
-			.ok_or_else(|| log::error!("Failed to find codec by name '{codec_name}'."))?;
+			.with_context(|| format!("Failed to find codec by name '{codec_name}'."))?;
 
 		let mut encoder = ffmpeg::codec::context::Context::new_with_codec(codec)
 			.encoder()
 			.video()
-			.map_err(|e| log::error!("Failed to create video encoder: {e}"))?;
+			.context("Failed to create video encoder")?;
 
 		encoder.set_width(width);
 		encoder.set_height(height);
@@ -111,22 +110,24 @@ impl Encoder {
 		encoder.set_time_base((framerate as i32, 1));
 		encoder.set_max_b_frames(0);
 		encoder.set_bit_rate(bitrate);
-		encoder.set_gop(i32::max_value() as u32);
+		encoder.set_gop(i32::MAX as u32);
 		unsafe {
 			(*encoder.as_mut_ptr()).pix_fmt = Pixel::CUDA.into();
 			(*encoder.as_mut_ptr()).hw_frames_ctx = hw_frame_context.as_raw_mut();
 			(*encoder.as_mut_ptr()).delay = 0;
 			(*encoder.as_mut_ptr()).refs = 1;
 		}
-		encoder.set_str("preset", "fast")
-			.map_err(|e| log::error!("Failed to set preset for encoder: {e}"))?;
-		encoder.set_str("tune", "ull")
-			.map_err(|e| log::error!("Failed to set tuning option for encoder: {e}"))?;
-		encoder.set_str("forced-idr", "1")
-			.map_err(|e| log::error!("Failed to set forced-idr for encoder: {e}"))?;
+		encoder
+			.set_str("preset", "fast")
+			.context("Failed to set preset for encoder")?;
+		encoder
+			.set_str("tune", "ull")
+			.context("Failed to set tuning option for encoder")?;
+		encoder
+			.set_str("forced-idr", "1")
+			.context("Failed to set forced-idr for encoder")?;
 
-		let encoder = encoder.open()
-			.map_err(|e| log::error!("Failed to start encoder: {e}"))?;
+		let encoder = encoder.open().context("Failed to start encoder")?;
 
 		Ok(Self {
 			encoder,
@@ -146,7 +147,7 @@ impl Encoder {
 		intermediate_buffer: Arc<Mutex<Frame>>,
 		notifier: Arc<std::sync::Condvar>,
 		stop_signal: ShutdownManager<()>,
-	) -> Result<(), ()> {
+	) -> Result<()> {
 		let mut packet = Packet::empty();
 
 		let mut frame_number = 0u32;
@@ -156,27 +157,27 @@ impl Encoder {
 			// Swap the intermediate buffer with the output buffer.
 			// Note that the lock is only held while swapping buffers, to minimize wait time for others locking the buffer.
 			{
-				log::trace!("Waiting for new frame.");
+				tracing::trace!("Waiting for new frame.");
 				// Wait for a new frame.
-				let lock = intermediate_buffer.lock()
-					.map_err(|e| log::error!("Failed to acquire buffer lock: {e}"))?;
-				let mut result = notifier.wait_timeout(lock, std::time::Duration::from_millis(500))
-					.map_err(|e| log::error!("Failed to wait for new frame: {e}"))?;
+				let lock = intermediate_buffer.lock().expect("Failed to acquire buffer lock");
+				let mut result = notifier
+					.wait_timeout(lock, std::time::Duration::from_millis(500))
+					.expect("Failed to wait for new frame");
 
 				// Didn't get a lock, let's check shutdown status and try again.
 				if result.1.timed_out() {
 					continue;
 				}
 
-				log::trace!("Received notification of new frame.");
+				tracing::trace!("Received notification of new frame.");
 
 				std::mem::swap(&mut *result.0, &mut encoder_buffer);
 			}
-			log::trace!("Swapped new frame with old frame.");
+			tracing::trace!("Swapped new frame with old frame.");
 			frame_number += 1;
 			encoder_buffer.set_pts(Some(frame_number as i64));
 
-			log::trace!("Sending frame {} to encoder", frame_number);
+			tracing::trace!("Sending frame {} to encoder", frame_number);
 
 			// TODO: Check if this is necessary?
 			// Reset possible previous request for keyframe.
@@ -188,7 +189,7 @@ impl Encoder {
 			// Check if there was an IDR frame request.
 			match idr_frame_request_rx.try_recv() {
 				Ok(_) => {
-					log::debug!("Received request for IDR frame.");
+					tracing::debug!("Received request for IDR frame.");
 					unsafe {
 						(*encoder_buffer.as_mut_ptr()).pict_type = ffmpeg::picture::Type::I.into();
 						(*encoder_buffer.as_mut_ptr()).key_frame = 1;
@@ -197,19 +198,23 @@ impl Encoder {
 				Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {},
 				Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {},
 				Err(_) => {
-					log::debug!("Channel closed, quitting encoder task.");
+					tracing::debug!("Channel closed, quitting encoder task.");
 					return Ok(());
-				}
+				},
 			}
 
 			// Send the frame to the encoder.
-			self.encoder.send_frame(&encoder_buffer)
-				.map_err(|e| log::error!("Error sending frame for encoding: {e}"))?;
+			self.encoder
+				.send_frame(&encoder_buffer)
+				.context("Error sending frame for encoding")?;
 
 			loop {
 				match self.encoder.receive_packet(&mut packet) {
 					Ok(()) => {
-						log::trace!("Received frame {} from encoder, converting frame to packets.", packet.pts().unwrap_or(-1));
+						tracing::trace!(
+							"Received frame {} from encoder, converting frame to packets.",
+							packet.pts().unwrap_or(-1)
+						);
 						encode_packet(
 							&packet,
 							&packet_tx,
@@ -224,24 +229,26 @@ impl Encoder {
 					Err(e) => {
 						match e {
 							ffmpeg::Error::Eof => {
-								log::info!("End of file");
+								tracing::info!("End of file");
 								break;
 							},
-							ffmpeg::Error::Other { errno: ffmpeg::sys::EAGAIN } => {
-								// log::info!("Need more frames for encoding...");
+							ffmpeg::Error::Other {
+								errno: ffmpeg::sys::EAGAIN,
+							} => {
+								// tracing::info!("Need more frames for encoding...");
 								break;
 							},
 							e => {
-								log::error!("Unexpected error while encoding: {e}");
+								tracing::error!("Unexpected error while encoding: {e}");
 								break;
 							},
 						}
-					}
+					},
 				}
 			}
 		}
 
-		log::debug!("Received stop signal.");
+		tracing::debug!("Received stop signal.");
 		Ok(())
 	}
 }
@@ -256,7 +263,7 @@ fn encode_packet(
 	frame_number: u32,
 	sequence_number: &mut u32,
 	stream_start_time: std::time::Instant,
-) -> Result<(), ()> {
+) -> Result<()> {
 	// Random padding, because we need it.
 	const PADDING: u32 = 0;
 
@@ -273,21 +280,22 @@ fn encode_packet(
 	// Prefix the frame with a VideoFrameHeader.
 	let mut buffer = Vec::with_capacity(std::mem::size_of::<VideoFrameHeader>());
 	video_frame_header.serialize(&mut buffer);
-	let packet_data = packet.data()
-		.ok_or_else(|| log::error!("Packet is empty, but we expected it to be full."))?;
+	let packet_data = packet
+		.data()
+		.context("Packet is empty, but we expected it to be full.")?;
 	let packet_data = [&buffer, packet_data].concat();
 
 	let requested_shard_payload_size = requested_packet_size - std::mem::size_of::<NvVideoPacket>();
 
 	// The total size of a shard.
-	let requested_shard_size =
-		std::mem::size_of::<RtpHeader>()
+	let requested_shard_size = std::mem::size_of::<RtpHeader>()
 		+ std::mem::size_of_val(&PADDING)
 		+ std::mem::size_of::<NvVideoPacket>()
 		+ requested_shard_payload_size;
 
 	// Determine how many data shards we will be sending.
-	let nr_data_shards = packet_data.len() / requested_shard_payload_size + (packet_data.len() % requested_shard_payload_size != 0) as usize; // TODO: Replace with div_ceil when it lands in stable (https://doc.rust-lang.org/std/primitive.i32.html#method.div_ceil).
+	let nr_data_shards = packet_data.len() / requested_shard_payload_size
+		+ (packet_data.len() % requested_shard_payload_size != 0) as usize; // TODO: Replace with div_ceil when it lands in stable (https://doc.rust-lang.org/std/primitive.i32.html#method.div_ceil).
 	assert!(nr_data_shards != 0);
 
 	// Determine how many parity and data shards are permitted per FEC block.
@@ -301,17 +309,16 @@ fn encode_packet(
 	let nr_blocks = (nr_data_shards - 1) / nr_data_shards_per_block + 1;
 	let last_block_index = (nr_blocks.min(4) as u8 - 1) << 6; // TODO: Why the bit shift? To 'force' a limit of 4 blocks?
 
-	log::trace!("Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block.");
-	log::trace!("Sending {nr_blocks} blocks of video data.");
+	tracing::trace!("Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block.");
+	tracing::trace!("Sending {nr_blocks} blocks of video data.");
 
 	for block_index in 0..nr_blocks {
 		// Determine what data shards are in this block.
 		let start = block_index * nr_data_shards_per_block;
-		let mut end = ((block_index + 1) * nr_data_shards_per_block)
-			.min(nr_data_shards);
+		let mut end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
 
 		if block_index >= 4 {
-			log::info!("Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC.");
+			tracing::info!("Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC.");
 			end = nr_data_shards;
 		}
 
@@ -330,7 +337,7 @@ fn encode_packet(
 				Err(e) => {
 					nr_parity_shards = 0;
 					Err(format!("Couldn't create error correction for block {block_index}: {e}"))
-				}
+				},
 			}
 		} else {
 			Err("Can't create an FEC encoder for 0 parity shards.".to_string())
@@ -339,7 +346,9 @@ fn encode_packet(
 		// Recompute the actual FEC percentage in case of a rounding error or when there are 0 parity shards.
 		let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
 
-		log::trace!("Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards.");
+		tracing::trace!(
+			"Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards."
+		);
 
 		let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
 		for (block_shard_index, data_shard_index) in (start..end).enumerate() {
@@ -394,8 +403,9 @@ fn encode_packet(
 				shards.push(vec![0u8; requested_shard_size]);
 			}
 
-			encoder.encode(&mut shards)
-				.map_err(|e| log::error!("Failed to encode packet as FEC shards: {e}"))?;
+			encoder
+				.encode(&mut shards)
+				.context("Failed to encode packet as FEC shards")?;
 
 			// Force these values for the parity shards, we don't need to reconstruct them, but Moonlight needs them to match with the frame they came from.
 			for (block_shard_index, shard) in shards[nr_data_shards..].iter_mut().enumerate() {
@@ -404,10 +414,14 @@ fn encode_packet(
 				rtp_header.sequence_number = (*sequence_number as u16).to_be();
 
 				let video_packet_header = unsafe {
-					&mut *(shard.as_mut_ptr().add(std::mem::size_of::<RtpHeader>() + std::mem::size_of_val(&PADDING)) as *mut NvVideoPacket)
+					&mut *(shard
+						.as_mut_ptr()
+						.add(std::mem::size_of::<RtpHeader>() + std::mem::size_of_val(&PADDING))
+						as *mut NvVideoPacket)
 				};
 				video_packet_header.multi_fec_blocks = ((block_index as u8) << 4) | last_block_index;
-				video_packet_header.fec_info = ((nr_data_shards + block_shard_index) << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32;
+				video_packet_header.fec_info =
+					((nr_data_shards + block_shard_index) << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32;
 				video_packet_header.frame_index = frame_number;
 
 				*sequence_number += 1;
@@ -415,14 +429,19 @@ fn encode_packet(
 		}
 
 		for (index, shard) in shards.into_iter().enumerate() {
-			log::trace!("Sending shard {}/{} with size {} bytes.", index + 1, nr_data_shards + nr_parity_shards, shard.len());
+			tracing::trace!(
+				"Sending shard {}/{} with size {} bytes.",
+				index + 1,
+				nr_data_shards + nr_parity_shards,
+				shard.len()
+			);
 			if packet_tx.blocking_send(shard).is_err() {
-				log::info!("Channel closed, couldn't send packet.");
+				tracing::info!("Channel closed, couldn't send packet.");
 				return Ok(());
 			}
 		}
 
-		log::trace!("Finished sending frame {frame_number}.");
+		tracing::trace!("Finished sending frame {frame_number}.");
 
 		// At this point we should have sent all the data shards in the last block, so we can break the loop.
 		if block_index == 3 {

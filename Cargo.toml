@@ -4,12 +4,12 @@ version = "0.2.3"
 edition = "2021"
 
 [dependencies]
+anyhow = "1.0.82"
 async-shutdown = "0.2.2"
 clap = { version = "4.5.4", features = ["derive"] }
 cudarc = "0.10.0"
 dirs = "5.0.1"
 enet = "0.3.0"
-env_logger = "0.11.3"
 evdev = "0.12.1"
 ffmpeg = { version = "7.0.0", package = "ffmpeg-next" }
 hex = "0.4.3"
@@ -17,7 +17,6 @@ http-body-util = "0.1.1"
 hyper = { version = "1.2.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.3", features = ["tokio"] }
 image = "0.25.1"
-log = "0.4.21"
 network-interface = "1.1.3"
 nvfbc = "0.1.5"
 openssl = "0.10.64"
@@ -34,6 +33,8 @@ strum_macros = "0.26.2"
 tokio = { version = "1.37.0", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "tracing"] }
 tokio-openssl = "0.6.4"
 toml = "0.8.12"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt"] }
 url = "2.5.0"
 uuid = { version = "1.8.0", features = ["v4"] }
 zeroconf = "0.14.1"

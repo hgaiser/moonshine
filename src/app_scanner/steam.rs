@@ -1,20 +1,27 @@
-use std::{path::{Path, PathBuf}, str::FromStr};
+use anyhow::{bail, Context, Result};
+use std::{
+	path::{Path, PathBuf},
+	str::FromStr,
+};
 
-use crate::config::{SteamApplicationScannerConfig, ApplicationConfig};
+use crate::config::{ApplicationConfig, SteamApplicationScannerConfig};
 
-pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
-	let library_path = config.library.join("steamapps").join("libraryfolders.vdf").to_string_lossy().to_string();
-	let library_path = shellexpand::full(&library_path)
-		.map_err(|e| log::error!("Failed to expand {library_path:?}: {e}"))?;
-	let library = std::fs::read_to_string(library_path.as_ref())
-		.map_err(|e| log::warn!("Failed to open library: {e}"))?;
+pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>> {
+	let library_path = config
+		.library
+		.join("steamapps")
+		.join("libraryfolders.vdf")
+		.to_string_lossy()
+		.to_string();
+	let library_path = shellexpand::full(&library_path).context("Failed to expand {library_path:?}")?;
+	let library = std::fs::read_to_string(library_path.as_ref()).context("Failed to open library")?;
 
 	// Poor man's library parsing.
-	let start_apps = library.find("apps")
-		.ok_or_else(|| log::warn!("Failed to find 'apps' key in {library_path:?}."))?;
+	let start_apps = library
+		.find("apps")
+		.with_context(|| format!("Failed to find 'apps' key in {library_path:?}."))?;
 	let library = &library[start_apps..];
-	let stop_apps = library.find('}')
-		.ok_or_else(|| log::warn!("Failed to find end of 'apps' section."))?;
+	let stop_apps = library.find('}').context("Failed to find end of 'apps' section.")?;
 	let library = &library[..stop_apps];
 
 	let mut applications = Vec::new();
@@ -28,7 +35,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 		let game_id = match line.split('\"').nth(1) {
 			Some(game_id) => game_id,
 			None => {
-				log::warn!("Failed to parse library entry: '{line}'");
+				tracing::warn!("Failed to parse library entry: '{line}'");
 				continue;
 			},
 		};
@@ -36,20 +43,24 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 		let game_id: u32 = match game_id.parse() {
 			Ok(game_id) => game_id,
 			Err(e) => {
-				log::warn!("Failed to parse game id: {e}");
+				tracing::warn!("Failed to parse game id: {e}");
 				continue;
 			},
 		};
 
 		application.title = match get_game_name(game_id, library_path.as_ref()) {
 			Ok(title) => title,
-			Err(()) => continue,
+			Err(e) => {
+				tracing::error!("Error getting game name: {e}");
+				continue;
+			},
 		};
 
 		// Skip things that aren't really games.
 		if application.title.starts_with("Proton")
 			|| application.title.starts_with("Steam Linux Runtime")
-			|| application.title.starts_with("Steamworks Common Redistributables") {
+			|| application.title.starts_with("Steamworks Common Redistributables")
+		{
 			continue;
 		}
 
@@ -59,12 +70,11 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 					.clone()
 					.iter_mut()
 					.map(|c| {
-						c
-							.iter_mut()
+						c.iter_mut()
 							.map(|a| a.replace("{game_id}", &game_id.to_string()))
 							.collect()
 					})
-					.collect()
+					.collect(),
 			);
 		}
 
@@ -74,28 +84,29 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 					.clone()
 					.iter_mut()
 					.map(|c| {
-						c
-							.iter_mut()
+						c.iter_mut()
 							.map(|a| a.replace("{game_id}", &game_id.to_string()))
 							.collect()
 					})
-					.collect()
+					.collect(),
 			);
 		}
 
-		let boxart = config.library.join(format!("appcache/librarycache/{game_id}_library_600x900.jpg"));
+		let boxart = config
+			.library
+			.join(format!("appcache/librarycache/{game_id}_library_600x900.jpg"));
 		if let Ok(boxart) = shellexpand::full(&boxart.to_string_lossy()) {
 			match PathBuf::from_str(&boxart) {
 				Ok(path) => {
 					if path.exists() {
 						application.boxart = Some(path);
 					} else {
-						log::warn!("No boxart for game '{}' at '{boxart}", application.title);
+						tracing::warn!("No boxart for game '{}' at '{boxart}", application.title);
 					}
 				},
-				Err(e) => {
-					log::warn!("Failed to parse boxart path: {e}");
-				}
+				Err(_) => {
+					unreachable!("PathBuf FromStr is infailable");
+				},
 			}
 		}
 
@@ -105,29 +116,30 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 	Ok(applications)
 }
 
-fn get_game_name<P: AsRef<Path>>(game_id: u32, library: P) -> Result<String, ()> {
+fn get_game_name<P: AsRef<Path>>(game_id: u32, library: P) -> Result<String> {
 	let manifest_path = library
 		.as_ref()
 		.parent()
-		.ok_or_else(|| eprintln!("Expected '{:?}' to have a parent, but couldn't find one.", library.as_ref()))?
+		.with_context(|| {
+			format!(
+				"Expected '{:?}' to have a parent, but couldn't find one.",
+				library.as_ref()
+			)
+		})?
 		.join(format!("appmanifest_{}.acf", game_id));
 	let manifest = std::fs::read_to_string(&manifest_path)
-		.map_err(|e| eprintln!("Failed to open Steam game manifest ({manifest_path:?}): {e}"))?;
-	let name_line = manifest
-		.lines()
-		.find(|l| l.contains("\"name\""));
+		.with_context(|| format!("Failed to open Steam game manifest ({manifest_path:?})"))?;
+
+	let name_line = manifest.lines().find(|l| l.contains("\"name\""));
 
 	match name_line {
 		Some(line) => {
-			line
-				.split('\"')
-				.nth(3)
-				.ok_or_else(|| eprintln!("Line '{}' doesn't match expected format (expected: \"name\" \"<NAME>\").", line))
-				.map(|l| l.to_string())
+			line.split('\"').nth(3).map(|l| l.to_string()).with_context(|| {
+				format!("Line '{line}' doesn't match expected format (expected: \"name\" \"<NAME>\").")
+			})
 		},
 		None => {
-			eprintln!("Couldn't find name for game with ID '{game_id}'.");
-			Err(())
+			bail!("Couldn't find name for game with ID '{game_id}'.")
 		},
 	}
 }

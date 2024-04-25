@@ -1,17 +1,15 @@
+use anyhow::{anyhow, bail, Context, Result};
 use async_shutdown::ShutdownManager;
-use enet::{
-	Address,
-	BandwidthLimit,
-	ChannelLimit,
-	Enet,
-	Event,
-};
+use enet::{Address, BandwidthLimit, ChannelLimit, Enet, Event};
 use openssl::symm::Cipher;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
-use crate::{session::{SessionContext, SessionKeys}, config::Config};
 use self::input::InputHandler;
-use super::{VideoStream, AudioStream};
+use super::{AudioStream, VideoStream};
+use crate::{
+	config::Config,
+	session::{SessionContext, SessionKeys},
+};
 
 mod input;
 
@@ -71,37 +69,43 @@ enum ControlMessage<'a> {
 }
 
 impl<'a> ControlMessage<'a> {
-	fn from_bytes(buffer: &'a [u8]) -> Result<Self, ()> {
+	fn from_bytes(buffer: &'a [u8]) -> Result<Self> {
 		if buffer.len() < 4 {
-			log::warn!("Expected control message to have at least 4 bytes, got {}", buffer.len());
-			return Err(());
+			bail!(
+				"Expected control message to have at least 4 bytes, got {}",
+				buffer.len()
+			);
 		}
 
 		let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
 		if length as usize != buffer.len() - 4 {
-			log::info!("Received incorrect packet length: expecting {length} bytes, but buffer says it should be {} bytes.", buffer.len() - 4);
-			return Err(());
+			bail!(
+				"Received incorrect packet length: expecting {length} bytes, but buffer says it should be {} bytes.",
+				buffer.len() - 4
+			);
 		}
 
-		match u16::from_le_bytes(buffer[..2].try_into().unwrap()).try_into()? {
+		match u16::from_le_bytes(buffer[..2].try_into().unwrap())
+			.try_into()
+			.map_err(|_| anyhow!("Failed to parse bytes"))?
+		{
 			ControlMessageType::Encrypted => {
 				if buffer.len() < MINIMUM_ENCRYPTED_LENGTH {
-					log::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
-					return Err(());
+					bail!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len())
 				}
 
 				let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
 				if (length as usize) < MINIMUM_ENCRYPTED_LENGTH {
-					log::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
-					return Err(());
+					bail!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
 				}
 
 				let sequence_number = u32::from_le_bytes(buffer[4..8].try_into().unwrap());
 				Ok(Self::Encrypted(EncryptedControlMessage {
 					_length: length,
 					sequence_number,
-					tag: buffer[8..8 + ENCRYPTION_TAG_LENGTH].try_into()
-						.map_err(|e| log::warn!("Failed to get tag from encrypted control message: {e}"))?,
+					tag: buffer[8..8 + ENCRYPTION_TAG_LENGTH]
+						.try_into()
+						.context("Failed to get tag from encrypted control message")?,
 					payload: buffer[8 + ENCRYPTION_TAG_LENGTH..].to_vec(),
 				}))
 			},
@@ -114,8 +118,7 @@ impl<'a> ControlMessage<'a> {
 				// Length of the input event, excluding the length itself.
 				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 				if length as usize != buffer.len() - 8 {
-					log::info!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8);
-					return Err(());
+					bail!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8)
 				}
 
 				Ok(Self::InputData(&buffer[8..]))
@@ -145,7 +148,6 @@ pub struct ControlStream {
 }
 
 impl ControlStream {
-	#[allow(clippy::result_unit_err)]
 	pub fn new(
 		config: Config,
 		video_stream: VideoStream,
@@ -153,15 +155,16 @@ impl ControlStream {
 		context: SessionContext,
 		enet: Enet,
 		stop_signal: ShutdownManager<()>,
-	) -> Result<Self, ()> {
+	) -> Result<Self> {
 		let input_handler = InputHandler::new()?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = ControlStreamInner { };
+		let inner = ControlStreamInner {};
 		tokio::task::spawn_blocking({
 			move || {
-				tokio::runtime::Handle::current().block_on(
-					stop_signal.wrap_cancel(stop_signal.wrap_trigger_shutdown((), inner.run(
+				tokio::runtime::Handle::current().block_on(stop_signal.wrap_cancel(stop_signal.wrap_trigger_shutdown(
+					(),
+					inner.run(
 						config,
 						command_rx,
 						video_stream,
@@ -169,22 +172,23 @@ impl ControlStream {
 						context,
 						enet,
 						input_handler,
-					)))
-				)
+					),
+				)))
 			}
 		});
 
 		Ok(Self { command_tx })
 	}
 
-	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
-		self.command_tx.send(ControlStreamCommand::UpdateKeys(keys)).await
-			.map_err(|e| log::error!("Failed to send UpdateKeys command: {e}"))
+	pub async fn update_keys(&self, keys: SessionKeys) -> Result<()> {
+		self.command_tx
+			.send(ControlStreamCommand::UpdateKeys(keys))
+			.await
+			.context("Failed to send UpdateKeys command")
 	}
 }
 
-struct ControlStreamInner {
-}
+struct ControlStreamInner {}
 
 impl ControlStreamInner {
 	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
@@ -197,10 +201,9 @@ impl ControlStreamInner {
 		mut context: SessionContext,
 		enet: Enet,
 		input_handler: InputHandler,
-	) -> Result<(), ()> {
+	) -> Result<()> {
 		let local_addr = Address::new(
-			config.address.parse()
-				.map_err(|e| log::error!("Failed to parse address: {e}"))?,
+			config.address.parse().context("Failed to parse address")?,
 			config.stream.control.port,
 		);
 		let mut host = enet
@@ -211,9 +214,9 @@ impl ControlStreamInner {
 				BandwidthLimit::Unlimited,
 				BandwidthLimit::Unlimited,
 			)
-			.map_err(|e| log::error!("Failed to create Enet host: {e}"))?;
+			.context("Failed to create Enet host")?;
 
-		log::debug!("Listening for control messages on {:?}", host.address());
+		tracing::debug!("Listening for control messages on {:?}", host.address());
 
 		let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 
@@ -221,36 +224,34 @@ impl ControlStreamInner {
 			// Check if we received a command.
 			let command = command_rx.try_recv();
 			match command {
-				Ok(command) => {
-					match command {
-						ControlStreamCommand::UpdateKeys(keys) => {
-							log::debug!("Updating session keys.");
-							context.keys = keys;
-						},
-					}
+				Ok(command) => match command {
+					ControlStreamCommand::UpdateKeys(keys) => {
+						tracing::debug!("Updating session keys.");
+						context.keys = keys;
+					},
 				},
 				Err(TryRecvError::Disconnected) => {
-					log::debug!("Command channel closed.");
+					tracing::debug!("Command channel closed.");
 					break;
 				},
-				Err(TryRecvError::Empty) => { },
+				Err(TryRecvError::Empty) => {},
 			}
 
 			// Check if the timeout has passed.
 			if std::time::Instant::now() > stop_deadline {
-				log::info!("Stopping because we haven't received a ping for {} seconds.", config.stream_timeout);
+				tracing::info!(
+					"Stopping because we haven't received a ping for {} seconds.",
+					config.stream_timeout
+				);
 				break;
 			}
 
-			match host.service(1000).map_err(|e| log::error!("Failure in enet host: {e}"))? {
+			match host.service(1000).context("Failure in enet host")? {
 				Some(Event::Connect(_)) => {},
 				Some(Event::Disconnect(..)) => {},
-				Some(Event::Receive {
-					ref packet,
-					..
-				}) => {
+				Some(Event::Receive { ref packet, .. }) => {
 					let mut control_message = ControlMessage::from_bytes(packet.data())?;
-					log::trace!("Received control message: {control_message:?}");
+					tracing::trace!("Received control message: {control_message:?}");
 
 					// First check for encrypted control messages and decrypt them.
 					let decrypted;
@@ -270,21 +271,26 @@ impl ControlStreamInner {
 						decrypted = match decrypted_result {
 							Ok(decrypted) => decrypted,
 							Err(e) => {
-								log::error!("Failed to decrypt control message: {:?}", e.errors());
+								tracing::error!("Failed to decrypt control message: {:?}", e.errors());
 								continue;
-							}
+							},
 						};
 
 						control_message = match ControlMessage::from_bytes(&decrypted) {
 							Ok(decrypted_message) => decrypted_message,
-							Err(()) => continue,
+							Err(e) => {
+								tracing::error!("Error parsing control stream: {e}");
+								continue;
+							},
 						};
 
-						log::trace!("Decrypted control message: {control_message:?}");
+						tracing::trace!("Decrypted control message: {control_message:?}");
 					}
 
 					match control_message {
-						ControlMessage::Encrypted(_) => unreachable!("Encrypted control messages should be decrypted already."),
+						ControlMessage::Encrypted(_) => {
+							unreachable!("Encrypted control messages should be decrypted already.")
+						},
 						ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
 							video_stream.request_idr_frame().await?;
 						},
@@ -293,21 +299,22 @@ impl ControlStreamInner {
 							video_stream.start().await?;
 						},
 						ControlMessage::Ping => {
-							stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
+							stop_deadline =
+								std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 						},
 						ControlMessage::InputData(event) => {
 							let _ = input_handler.handle_raw_input(event).await;
 						},
 						skipped_message => {
-							log::trace!("Skipped control message: {skipped_message:?}");
+							tracing::trace!("Skipped control message: {skipped_message:?}");
 						},
 					};
-				}
+				},
 				_ => (),
 			}
 		}
 
-		log::debug!("Control stream closing.");
+		tracing::debug!("Control stream closing.");
 		Ok(())
 	}
 }

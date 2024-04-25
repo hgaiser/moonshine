@@ -11,7 +11,10 @@ pub struct HwFrameContext {
 
 impl HwFrameContext {
 	fn new(cuda_device_context: CudaDeviceContext, buffer: *mut ffmpeg::sys::AVBufferRef) -> Self {
-		Self { _cuda_device_context: cuda_device_context, buffer }
+		Self {
+			_cuda_device_context: cuda_device_context,
+			buffer,
+		}
 	}
 
 	// pub fn as_context_mut(&mut self) -> &mut ffmpeg::sys::AVHWFramesContext {
@@ -31,7 +34,7 @@ impl HwFrameContext {
 	// }
 }
 
-unsafe impl Send for HwFrameContext { }
+unsafe impl Send for HwFrameContext {}
 
 pub struct HwFrameContextBuilder {
 	cuda_device_context: CudaDeviceContext,
@@ -45,7 +48,10 @@ impl HwFrameContextBuilder {
 			return Err("could not allocate a hwframe".to_string());
 		}
 
-		Ok(Self { cuda_device_context, buffer })
+		Ok(Self {
+			cuda_device_context,
+			buffer,
+		})
 	}
 
 	pub fn build(mut self) -> Result<HwFrameContext, ffmpeg::Error> {

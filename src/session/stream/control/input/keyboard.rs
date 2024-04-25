@@ -1,6 +1,10 @@
-use evdev::{uinput::{VirtualDevice, VirtualDeviceBuilder}, AttributeSet};
+use anyhow::{bail, Context, Result};
+use evdev::{
+	uinput::{VirtualDevice, VirtualDeviceBuilder},
+	AttributeSet,
+};
 use strum::IntoEnumIterator;
-use strum_macros::{FromRepr, EnumIter};
+use strum_macros::{EnumIter, FromRepr};
 
 #[derive(Debug, Eq, PartialEq, FromRepr, EnumIter)]
 #[repr(u8)]
@@ -136,7 +140,7 @@ pub enum Key {
 }
 
 impl Key {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
 		const EXPECTED_SIZE: usize =
 			std::mem::size_of::<u8>()    // flags
 			+ std::mem::size_of::<u16>() // key
@@ -145,12 +149,13 @@ impl Key {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			log::warn!("Expected at least {EXPECTED_SIZE} bytes for Key, got {} bytes.", buffer.len());
-			return Err(());
+			bail!(
+				"Expected at least {EXPECTED_SIZE} bytes for Key, got {} bytes.",
+				buffer.len()
+			)
 		}
 
-
-		Key::from_repr(buffer[1]).ok_or_else(|| log::warn!("Unknown keycode: {}", buffer[5]))
+		Key::from_repr(buffer[1]).with_context(|| format!("Unknown keycode: {}", buffer[5]))
 	}
 }
 
@@ -294,42 +299,33 @@ pub struct Keyboard {
 }
 
 impl Keyboard {
-	pub fn new() -> Result<Self, ()> {
+	pub fn new() -> Result<Self> {
 		let mut attributes = AttributeSet::new();
 		for key in Key::iter() {
 			attributes.insert(key.into());
 		}
 
 		let device = VirtualDeviceBuilder::new()
-			.map_err(|e| log::error!("Failed to initiate virtual keyboard: {e}"))?
+			.context("Failed to initiate virtual keyboard")?
 			.name("Moonshine Keyboard")
 			.with_keys(&attributes)
-			.map_err(|e| log::error!("Failed to add keys to virtual keyboard: {e}"))?
+			.context("Failed to add keys to virtual keyboard")?
 			.build()
-			.map_err(|e| log::error!("Failed to create virtual keyboard: {e}"))?;
+			.context("Failed to create virtual keyboard")?;
 
 		Ok(Self { device })
 	}
 
-	pub fn key_down(&mut self, key: Key) -> Result<(), ()> {
-		let button_event = evdev::InputEvent::new_now(
-			evdev::EventType::KEY,
-			Into::<evdev::Key>::into(key).code(),
-			1
-		);
+	pub fn key_down(&mut self, key: Key) -> Result<()> {
+		let button_event = evdev::InputEvent::new_now(evdev::EventType::KEY, Into::<evdev::Key>::into(key).code(), 1);
 
-		self.device.emit(&[button_event])
-			.map_err(|e| log::error!("Failed to press key: {e}"))
+		self.device.emit(&[button_event]).context("Failed to press key")
 	}
 
-	pub fn key_up(&mut self, button: Key) -> Result<(), ()> {
-		let button_event = evdev::InputEvent::new_now(
-			evdev::EventType::KEY,
-			Into::<evdev::Key>::into(button).code(),
-			0
-		);
+	pub fn key_up(&mut self, button: Key) -> Result<()> {
+		let button_event =
+			evdev::InputEvent::new_now(evdev::EventType::KEY, Into::<evdev::Key>::into(button).code(), 0);
 
-		self.device.emit(&[button_event])
-			.map_err(|e| log::error!("Failed to release key: {e}"))
+		self.device.emit(&[button_event]).context("Failed to release key")
 	}
 }

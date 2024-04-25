@@ -1,12 +1,16 @@
 use std::process::Stdio;
 
+use anyhow::{bail, Context, Result};
 use async_shutdown::ShutdownManager;
 use enet::Enet;
 use tokio::sync::mpsc;
 
-use crate::{config::{Config, ApplicationConfig}, session::stream::{VideoStream, AudioStream, ControlStream}};
+use crate::{
+	config::{ApplicationConfig, Config},
+	session::stream::{AudioStream, ControlStream, VideoStream},
+};
 
-use self::stream::{VideoStreamContext, AudioStreamContext};
+use self::stream::{AudioStreamContext, VideoStreamContext};
 pub use manager::SessionManager;
 
 pub mod manager;
@@ -34,6 +38,7 @@ pub struct SessionContext {
 	pub resolution: (u32, u32),
 
 	/// Refresh rate of the video stream.
+    #[allow(dead_code)]
 	pub refresh_rate: u32,
 
 	/// Encryption keys for encoding traffic.
@@ -53,42 +58,49 @@ pub struct Session {
 	running: bool,
 }
 
-#[allow(clippy::result_unit_err)]
 impl Session {
-	pub fn new(
-		config: Config,
-		context: SessionContext,
-		enet: Enet,
-		stop_signal: ShutdownManager<()>,
-	) -> Result<Self, ()> {
+	pub fn new(config: Config, context: SessionContext, enet: Enet, stop_signal: ShutdownManager<()>) -> Result<Self> {
 		if let Some(run_before) = &context.application.run_before {
 			for command in run_before {
-				run_command(command, &context);
+				if let Err(e) = run_command(command, &context) {
+					tracing::error!("Error running run_before command: {e}");
+				}
 			}
 		}
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = SessionInner { config, video_stream: None, audio_stream: None, control_stream: None };
+		let inner = SessionInner {
+			config,
+			video_stream: None,
+			audio_stream: None,
+			control_stream: None,
+		};
 		tokio::spawn(inner.run(command_rx, context.clone(), enet, stop_signal));
-		Ok(Self { command_tx, context, running: false })
+		Ok(Self {
+			command_tx,
+			context,
+			running: false,
+		})
 	}
 
 	pub async fn start_stream(
 		&mut self,
 		video_stream_context: VideoStreamContext,
 		audio_stream_context: AudioStreamContext,
-	) -> Result <(), ()> {
+	) -> Result<()> {
 		self.running = true;
-		self.command_tx.send(SessionCommand::StartStream(video_stream_context, audio_stream_context))
+		self.command_tx
+			.send(SessionCommand::StartStream(video_stream_context, audio_stream_context))
 			.await
-			.map_err(|e| log::error!("Failed to send StartStream command: {e}"))
+			.context("Failed to send StartStream command")
 	}
 
-	pub async fn stop_stream(&mut self) -> Result<(), ()> {
+	pub async fn stop_stream(&mut self) -> Result<()> {
 		self.running = false;
-		self.command_tx.send(SessionCommand::StopStream)
+		self.command_tx
+			.send(SessionCommand::StopStream)
 			.await
-			.map_err(|e| log::error!("Failed to send StopStream command: {e}"))
+			.context("Failed to send StopStream command")
 	}
 
 	pub fn get_context(&self) -> &SessionContext {
@@ -99,9 +111,11 @@ impl Session {
 		self.running
 	}
 
-	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
-		self.command_tx.send(SessionCommand::UpdateKeys(keys)).await
-			.map_err(|e| log::error!("Failed to send UpdateKeys command: {e}"))
+	pub async fn update_keys(&self, keys: SessionKeys) -> Result<()> {
+		self.command_tx
+			.send(SessionCommand::UpdateKeys(keys))
+			.await
+			.context("Failed to send UpdateKeys command")
 	}
 }
 
@@ -109,7 +123,9 @@ impl Drop for Session {
 	fn drop(&mut self) {
 		if let Some(run_after) = &self.context.application.run_after {
 			for command in run_after {
-				run_command(command, &self.context);
+				if let Err(e) = run_command(command, &self.context) {
+					tracing::error!("Error running run_after command: {e}")
+				}
 			}
 		}
 	}
@@ -141,11 +157,11 @@ impl SessionInner {
 						audio_stream.clone(),
 						session_context.clone(),
 						enet.clone(),
-						stop_signal.clone()
+						stop_signal.clone(),
 					) {
 						Ok(control_stream) => control_stream,
-						Err(()) => {
-							log::error!("Failed to create control stream, killing session.");
+						Err(e) => {
+							tracing::error!("Failed to create control stream, killing session. {e}");
 							continue;
 						},
 					};
@@ -161,11 +177,11 @@ impl SessionInner {
 
 				SessionCommand::UpdateKeys(keys) => {
 					let Some(audio_stream) = &self.audio_stream else {
-						log::warn!("Can't update session keys without an audio stream.");
+						tracing::warn!("Can't update session keys without an audio stream.");
 						continue;
 					};
 					let Some(control_stream) = &self.control_stream else {
-						log::warn!("Can't update session keys without an control stream.");
+						tracing::warn!("Can't update session keys without an control stream.");
 						continue;
 					};
 
@@ -177,17 +193,17 @@ impl SessionInner {
 		}
 
 		let _ = stop_signal.trigger_shutdown(());
-		log::debug!("Command channel closed.");
+		tracing::debug!("Command channel closed.");
 	}
 }
 
-fn run_command(command: &[String], context: &SessionContext) {
+fn run_command(command: &[String], context: &SessionContext) -> Result<()> {
 	if command.is_empty() {
-		log::warn!("Can't run an empty command.");
-		return;
+		bail!("Can't run an empty command.")
 	}
 
-	let command: Vec<String> = command.to_vec()
+	let command: Vec<String> = command
+		.to_vec()
 		.iter_mut()
 		.map(|c| {
 			let c = c
@@ -197,7 +213,7 @@ fn run_command(command: &[String], context: &SessionContext) {
 		})
 		.collect();
 
-	log::info!("Running command: {command:?}");
+	tracing::info!("Running command: {command:?}");
 
 	// Now run the command.
 	let _ = std::process::Command::new(&command[0])
@@ -206,5 +222,6 @@ fn run_command(command: &[String], context: &SessionContext) {
 		.stderr(Stdio::null())
 		.stdin(Stdio::null())
 		.spawn()
-		.map_err(|e| log::error!("Failed to run command: {e}"));
+		.with_context(|| format!("Failed to run command: {command:?}"))?;
+	Ok(())
 }

@@ -1,5 +1,14 @@
+use anyhow::{bail, Context, Result};
+use evdev::{
+	uinput::{VirtualDevice, VirtualDeviceBuilder},
+	AbsInfo,
+	AbsoluteAxisType,
+	AttributeSet,
+	Key,
+	RelativeAxisType,
+	UinputAbsSetup,
+};
 use strum_macros::FromRepr;
-use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, AttributeSet, RelativeAxisType, Key, AbsoluteAxisType, UinputAbsSetup, AbsInfo};
 
 #[derive(Debug)]
 pub struct MouseMoveAbsolute {
@@ -10,7 +19,7 @@ pub struct MouseMoveAbsolute {
 }
 
 impl MouseMoveAbsolute {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
 		const EXPECTED_SIZE: usize =
 			std::mem::size_of::<i16>()   // x
 			+ std::mem::size_of::<i16>() // y
@@ -20,13 +29,15 @@ impl MouseMoveAbsolute {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			log::warn!("Expected at least {EXPECTED_SIZE} bytes for MouseMoveAbsolute, got {} bytes.", buffer.len());
-			return Err(());
+			bail!(
+				"Expected at least {EXPECTED_SIZE} bytes for MouseMoveAbsolute, got {} bytes.",
+				buffer.len()
+			)
 		}
 
 		Ok(Self {
-			x: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
-			y: i16::from_be_bytes(buffer[2..4].try_into().unwrap()),
+			x: i16::from_be_bytes(buffer[0..2].try_into()?),
+			y: i16::from_be_bytes(buffer[2..4].try_into()?),
 			// width: i16::from_be_bytes(buffer[6..8].try_into().unwrap()),
 			// height: i16::from_be_bytes(buffer[8..10].try_into().unwrap()),
 		})
@@ -40,15 +51,18 @@ pub struct MouseMoveRelative {
 }
 
 impl MouseMoveRelative {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
 		if buffer.len() < std::mem::size_of::<Self>() {
-			log::warn!("Expected at least {} bytes for MouseMoveRelative, got {} bytes.", std::mem::size_of::<Self>(), buffer.len());
-			return Err(());
+			bail!(
+				"Expected at least {} bytes for MouseMoveRelative, got {} bytes.",
+				std::mem::size_of::<Self>(),
+				buffer.len()
+			)
 		}
 
 		Ok(Self {
-			x: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
-			y: i16::from_be_bytes(buffer[2..4].try_into().unwrap()),
+			x: i16::from_be_bytes(buffer[0..2].try_into()?),
+			y: i16::from_be_bytes(buffer[2..4].try_into()?),
 		})
 	}
 }
@@ -64,15 +78,17 @@ pub enum MouseButton {
 }
 
 impl MouseButton {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
 		const EXPECTED_SIZE: usize = std::mem::size_of::<u8>(); // button
 
 		if buffer.len() < EXPECTED_SIZE {
-			log::warn!("Expected at least {EXPECTED_SIZE} bytes for MouseButton, got {} bytes.", buffer.len());
-			return Err(());
+			bail!(
+				"Expected at least {EXPECTED_SIZE} bytes for MouseButton, got {} bytes.",
+				buffer.len()
+			)
 		}
 
-		MouseButton::from_repr(buffer[0]).ok_or_else(|| log::warn!("Unknown mouse button: {}", buffer[0]))
+		MouseButton::from_repr(buffer[0]).with_context(|| format!("Unknown mouse button: {}", buffer[0]))
 	}
 }
 
@@ -94,14 +110,17 @@ pub struct MouseScrollVertical {
 }
 
 impl MouseScrollVertical {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
 		if buffer.len() < std::mem::size_of::<Self>() {
-			log::warn!("Expected at least {} bytes for MouseScrollVertical, got {} bytes.", std::mem::size_of::<Self>(), buffer.len());
-			return Err(());
+			bail!(
+				"Expected at least {} bytes for MouseScrollVertical, got {} bytes.",
+				std::mem::size_of::<Self>(),
+				buffer.len()
+			);
 		}
 
 		Ok(Self {
-			amount: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
+			amount: i16::from_be_bytes(buffer[0..2].try_into()?),
 		})
 	}
 }
@@ -112,14 +131,17 @@ pub struct MouseScrollHorizontal {
 }
 
 impl MouseScrollHorizontal {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
 		if buffer.len() < std::mem::size_of::<Self>() {
-			log::warn!("Expected at least {} bytes for MouseScrollHorizontal, got {} bytes.", std::mem::size_of::<Self>(), buffer.len());
-			return Err(());
+			bail!(
+				"Expected at least {} bytes for MouseScrollHorizontal, got {} bytes.",
+				std::mem::size_of::<Self>(),
+				buffer.len()
+			)
 		}
 
 		Ok(Self {
-			amount: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
+			amount: i16::from_be_bytes(buffer[0..2].try_into()?),
 		})
 	}
 }
@@ -129,9 +151,9 @@ pub struct Mouse {
 }
 
 impl Mouse {
-	pub fn new() -> Result<Self, ()> {
+	pub fn new() -> Result<Self> {
 		let device = VirtualDeviceBuilder::new()
-			.map_err(|e| log::error!("Failed to initiate virtual mouse: {e}"))?
+			.context("Failed to initiate virtual mouse")?
 			.name("Moonshine Mouse")
 			.with_relative_axes(&AttributeSet::from_iter([
 				RelativeAxisType::REL_X,
@@ -139,15 +161,17 @@ impl Mouse {
 				RelativeAxisType::REL_WHEEL_HI_RES,
 				RelativeAxisType::REL_HWHEEL_HI_RES,
 			]))
-			.map_err(|e| log::error!("Failed to enable relative axes for virtual mouse: {e}"))?
+			.context("Failed to enable relative axes for virtual mouse")?
 			.with_absolute_axis(&UinputAbsSetup::new(
-				AbsoluteAxisType::ABS_X, AbsInfo::new(0, 0, 3000, 0, 0, 1)
+				AbsoluteAxisType::ABS_X,
+				AbsInfo::new(0, 0, 3000, 0, 0, 1),
 			))
-			.map_err(|e| log::error!("Failed to enable absolute axis for virtual mouse: {e}"))?
+			.context("Failed to enable absolute axis for virtual mouse")?
 			.with_absolute_axis(&UinputAbsSetup::new(
-				AbsoluteAxisType::ABS_Y, AbsInfo::new(0, 0, 3000, 0, 0, 1)
+				AbsoluteAxisType::ABS_Y,
+				AbsInfo::new(0, 0, 3000, 0, 0, 1),
 			))
-			.map_err(|e| log::error!("Failed to enable absolute axis for virtual mouse: {e}"))?
+			.context("Failed to enable absolute axis for virtual mouse")?
 			.with_keys(&AttributeSet::from_iter([
 				Key::BTN_LEFT,
 				Key::BTN_MIDDLE,
@@ -155,67 +179,65 @@ impl Mouse {
 				Key::BTN_FORWARD,
 				Key::BTN_BACK,
 			]))
-			.map_err(|e| log::error!("Failed to add keys to virtual mouse: {e}"))?
+			.context("Failed to add keys to virtual mouse")?
 			.build()
-			.map_err(|e| log::error!("Failed to create virtual mouse: {e}"))?;
+			.context("Failed to create virtual mouse")?;
 
 		Ok(Self { device })
 	}
 
-	pub fn move_relative(&mut self, x: i32, y: i32) -> Result<(), ()> {
+	pub fn move_relative(&mut self, x: i32, y: i32) -> Result<()> {
 		let events = [
 			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_X.0, x),
 			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_Y.0, y),
 		];
-		self.device.emit(&events)
-			.map_err(|e| log::error!("Failed to make relative mouse movement: {e}"))
+		self.device
+			.emit(&events)
+			.context("Failed to make relative mouse movement")
 	}
 
-	pub fn move_absolute(&mut self, x: i32, y: i32) -> Result<(), ()> {
-		log::info!("x: {x}, y: {y}");
+	pub fn move_absolute(&mut self, x: i32, y: i32) -> Result<()> {
+		tracing::info!("x: {x}, y: {y}");
 		let events = [
 			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, x),
 			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, y),
 		];
-		self.device.emit(&events)
-			.map_err(|e| log::error!("Failed to make absolute mouse movement: {e}"))
+		self.device
+			.emit(&events)
+			.context("Failed to make absolute mouse movement")
 	}
 
-	pub fn button_down(&mut self, button: MouseButton) -> Result<(), ()> {
-		let button_event = evdev::InputEvent::new_now(
-			evdev::EventType::KEY,
-			Into::<Key>::into(button).code(),
-			1
-		);
+	pub fn button_down(&mut self, button: MouseButton) -> Result<()> {
+		let button_event = evdev::InputEvent::new_now(evdev::EventType::KEY, Into::<Key>::into(button).code(), 1);
 
-		self.device.emit(&[button_event])
-			.map_err(|e| log::error!("Failed to press mouse button: {e}"))
+		self.device
+			.emit(&[button_event])
+			.context("Failed to press mouse button")
 	}
 
-	pub fn button_up(&mut self, button: MouseButton) -> Result<(), ()> {
-		let button_event = evdev::InputEvent::new_now(
-			evdev::EventType::KEY,
-			Into::<Key>::into(button).code(),
-			0
-		);
+	pub fn button_up(&mut self, button: MouseButton) -> Result<()> {
+		let button_event = evdev::InputEvent::new_now(evdev::EventType::KEY, Into::<Key>::into(button).code(), 0);
 
-		self.device.emit(&[button_event])
-			.map_err(|e| log::error!("Failed to release mouse button: {e}"))
+		self.device
+			.emit(&[button_event])
+			.context("Failed to release mouse button")
 	}
 
-	pub fn scroll_vertical(&mut self, amount: i16) -> Result<(), ()> {
-		let events = [
-			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_WHEEL_HI_RES.0, amount as i32),
-		];
-		self.device.emit(&events)
-			.map_err(|e| log::error!("Failed to scroll vertically: {e}"))
+	pub fn scroll_vertical(&mut self, amount: i16) -> Result<()> {
+		let events = [evdev::InputEvent::new_now(
+			evdev::EventType::RELATIVE,
+			RelativeAxisType::REL_WHEEL_HI_RES.0,
+			amount as i32,
+		)];
+		self.device.emit(&events).context("Failed to scroll vertically")
 	}
 
-	pub fn scroll_horizontal(&mut self, amount: i16) -> Result<(), ()> {
-		let events = [
-			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_HWHEEL_HI_RES.0, amount as i32),
-		];
-		self.device.emit(&events)
-			.map_err(|e| log::error!("Failed to scroll horizontally: {e}"))
+	pub fn scroll_horizontal(&mut self, amount: i16) -> Result<()> {
+		let events = [evdev::InputEvent::new_now(
+			evdev::EventType::RELATIVE,
+			RelativeAxisType::REL_HWHEEL_HI_RES.0,
+			amount as i32,
+		)];
+		self.device.emit(&events).context("Failed to scroll horizontally")
 	}
 }

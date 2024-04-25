@@ -1,52 +1,53 @@
 use std::{cell::RefCell, ops::Deref, rc::Rc};
 
+use anyhow::{anyhow, bail, Context, Result};
 use pulse::{
-	context::{Context, FlagSet},
+	context::{Context as PulseContext, FlagSet},
 	def::BufferAttr,
 	mainloop::standard::{IterateResult, Mainloop},
 	proplist::Proplist,
-	sample::Spec
+	sample::Spec,
 };
 use tokio::sync::mpsc::Sender;
 
-fn get_default_sink_name() -> Result<String, ()> {
+fn get_default_sink_name() -> Result<String> {
 	// Create a new PulseAudio context
-	let mainloop = Rc::new(RefCell::new(Mainloop::new()
-
-		.ok_or_else(|| log::error!("Failed to create pulseaudio client."))?));
-
-	let mut proplist = Proplist::new()
-		.ok_or_else(|| log::error!("Failed to create pulseaudio proplist."))?;
-    proplist.set_str(pulse::proplist::properties::APPLICATION_NAME, "Moonshine")
-        .map_err(|()| log::error!("Failed to set pulseaudio application name."))?;
-	let context = Rc::new(RefCell::new(
-		Context::new_with_proplist(mainloop.borrow().deref(), "Moonshine context", &proplist)
-			.ok_or_else(|| log::error!("Failed to create pulseaudio context."))?
+	let mainloop = Rc::new(RefCell::new(
+		Mainloop::new().context("Failed to create pulseaudio client.")?,
 	));
 
-	context.borrow_mut().connect(None, FlagSet::NOFLAGS, None)
-		.map_err(|e| log::error!("Failed to connect to pulseaudio server: {e}"))?;
+	let mut proplist = Proplist::new().context("Failed to create pulseaudio proplist.")?;
+	proplist
+		.set_str(pulse::proplist::properties::APPLICATION_NAME, "Moonshine")
+		.map_err(|_| anyhow!("Failed to create pulseaudio proplist."))?;
+	let context = Rc::new(RefCell::new(
+		PulseContext::new_with_proplist(mainloop.borrow().deref(), "Moonshine context", &proplist)
+			.context("Failed to create pulseaudio context.")?,
+	));
+
+	context
+		.borrow_mut()
+		.connect(None, FlagSet::NOFLAGS, None)
+		.context("Failed to connect to pulseaudio server")?;
 
 	// Wait for context to be ready.
 	loop {
 		match mainloop.borrow_mut().iterate(false) {
 			IterateResult::Quit(_) | IterateResult::Err(_) => {
-				log::error!("Failed to run pulseaudio main loop.");
-				return Err(());
+				bail!("Failed to run pulseaudio main loop.");
 			},
-			IterateResult::Success(_) => {}
+			IterateResult::Success(_) => {},
 		}
 
 		match context.borrow().get_state() {
 			pulse::context::State::Unconnected
 			| pulse::context::State::Connecting
 			| pulse::context::State::Authorizing
-			| pulse::context::State::SettingName => {}
+			| pulse::context::State::SettingName => {},
 			pulse::context::State::Failed | pulse::context::State::Terminated => {
-				log::error!("Failed to run context.");
-				return Err(());
-			}
-			pulse::context::State::Ready => break
+				bail!("Failed to run context.");
+			},
+			pulse::context::State::Ready => break,
 		}
 	}
 
@@ -58,9 +59,9 @@ fn get_default_sink_name() -> Result<String, ()> {
 			let name = match info.default_sink_name.as_ref() {
 				Some(name) => name,
 				None => {
-					log::error!("Failed to receive default sink name.");
+					tracing::error!("Failed to receive default sink name.");
 					return;
-				}
+				},
 			};
 			*result.borrow_mut() = Some(name.to_string());
 		})
@@ -70,22 +71,20 @@ fn get_default_sink_name() -> Result<String, ()> {
 	loop {
 		match mainloop.borrow_mut().iterate(false) {
 			IterateResult::Quit(_) | IterateResult::Err(_) => {
-				log::error!("Failed to run pulseaudio main loop.");
-				return Err(());
+				bail!("Failed to run pulseaudio main loop.")
 			},
-			IterateResult::Success(_) => {}
+			IterateResult::Success(_) => {},
 		};
 		match operation.get_state() {
-			pulse::operation::State::Running => {}
+			pulse::operation::State::Running => {},
 			pulse::operation::State::Cancelled => {
-				log::error!("Failed to get default sink name.");
-				return Err(());
-			}
-			pulse::operation::State::Done => break
+				bail!("Failed to get default sink name.")
+			},
+			pulse::operation::State::Done => break,
 		}
 	}
 
-	result.take().ok_or_else(|| log::error!("Failed to get default sink name result."))
+	result.take().context("Failed to get default sink name result.")
 }
 
 pub struct AudioCapture {
@@ -94,16 +93,11 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-	pub async fn new(audio_tx: Sender<Vec<i16>>) -> Result<Self, ()> {
+	pub async fn new(audio_tx: Sender<Vec<i16>>) -> Result<Self> {
 		let channels = 2u8;
 		let sample_rate = 48000u32;
 
-		let default_sink_name = match get_default_sink_name() {
-			Ok(name) => name,
-			Err(()) => {
-				return Err(());
-			}
-		};
+		let default_sink_name = get_default_sink_name()?;
 		let monitor_name = format!("{default_sink_name}.monitor");
 
 		let sample_spec = Spec {
@@ -123,26 +117,18 @@ impl AudioCapture {
 			None,                             // Use default channel map.
 			Some(&BufferAttr {
 				maxlength: std::mem::size_of::<i16>() as u32 * sample_rate * channels as u32 * 5 / 1000,
-				tlength: std::u32::MAX,
-				prebuf: std::u32::MAX,
-				minreq: std::u32::MAX,
-				fragsize: std::u32::MAX,
+				tlength: u32::MAX,
+				prebuf: u32::MAX,
+				minreq: u32::MAX,
+				fragsize: u32::MAX,
 			}),
-		).map_err(|e| log::error!("Failed to create audio capture device: {e}"));
+		)
+		.context("Failed to create audio capture device")?;
 
-		let stream = match stream {
-			Ok(stream) => stream,
-			Err(()) => {
-				return Err(());
-			},
-		};
-
-		log::info!("Recording from source: {monitor_name}");
+		tracing::info!("Recording from source: {monitor_name}");
 
 		let inner = AudioCaptureInner { audio_tx };
-		tokio::task::spawn_blocking(move || {
-			tokio::runtime::Handle::current().block_on(inner.run(stream))
-		});
+		tokio::task::spawn_blocking(move || tokio::runtime::Handle::current().block_on(inner.run(stream)));
 
 		Ok(Self { sample_rate, channels })
 	}
@@ -162,7 +148,7 @@ struct AudioCaptureInner {
 }
 
 impl AudioCaptureInner {
-	async fn run(self, stream: pulse_simple::Simple) -> Result<(), ()> {
+	async fn run(self, stream: pulse_simple::Simple) -> Result<()> {
 		// Start recording.
 		loop {
 			// Allocate buffer for recording.
@@ -185,16 +171,14 @@ impl AudioCaptureInner {
 					match self.audio_tx.send(samples).await {
 						Ok(()) => {},
 						Err(e) => {
-							log::debug!("Received error while sending audio sample: {e}");
-							log::info!("Closing audio capture because the receiving end was dropped.");
-							return Err(());
+							tracing::info!("Closing audio capture because the receiving end was dropped.");
+							bail!("Received error while sending audio sample: {e}")
 						},
 					}
 				},
 				Err(e) => {
-					log::error!("Failed to read audio data: {}", e);
-					return Err(());
-				}
+					bail!("Failed to read audio data: {}", e)
+				},
 			}
 		}
 	}

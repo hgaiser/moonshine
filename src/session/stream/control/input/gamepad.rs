@@ -1,20 +1,19 @@
+use anyhow::{bail, Context, Result};
 use evdev::{
-	uinput::{
-		VirtualDevice,
-		VirtualDeviceBuilder
-	},
+	uinput::{VirtualDevice, VirtualDeviceBuilder},
+	AbsInfo,
+	AbsoluteAxisType,
 	AttributeSet,
+	InputId,
 	Key,
 	UinputAbsSetup,
-	AbsoluteAxisType,
-	AbsInfo,
-	InputId,
 };
 use strum::IntoEnumIterator;
-use strum_macros::{FromRepr, EnumIter};
+use strum_macros::{EnumIter, FromRepr};
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
+#[allow(dead_code)]
 enum GamepadKind {
 	_Unknown = 0x00,
 	_Xbox = 0x01,
@@ -24,9 +23,10 @@ enum GamepadKind {
 
 #[derive(Copy, Clone, Debug)]
 #[repr(u16)]
+#[allow(dead_code)]
 enum GamepadCapability {
 	/// Reports values between 0x00 and 0xFF for trigger axes.
-	_AnalogTriggers = 0x01,
+	_AnatracingTriggers = 0x01,
 
 	/// Can rumble.
 	_Rumble = 0x02,
@@ -54,29 +54,29 @@ enum GamepadCapability {
 #[repr(u32)]
 enum GamepadButton {
 	// Button flags.
-	Up              = 0x00000001,
-	Down            = 0x00000002,
-	Left            = 0x00000004,
-	Right           = 0x00000008,
-	Start           = 0x00000010,
-	Select          = 0x00000020,
-	LeftStickClick  = 0x00000040,
+	Up = 0x00000001,
+	Down = 0x00000002,
+	Left = 0x00000004,
+	Right = 0x00000008,
+	Start = 0x00000010,
+	Select = 0x00000020,
+	LeftStickClick = 0x00000040,
 	RightStickClick = 0x00000080,
-	LB              = 0x00000100,
-	RB              = 0x00000200,
-	Home            = 0x00000400,
-	A               = 0x00001000,
-	B               = 0x00002000,
-	X               = 0x00004000,
-	Y               = 0x00008000,
+	LB = 0x00000100,
+	RB = 0x00000200,
+	Home = 0x00000400,
+	A = 0x00001000,
+	B = 0x00002000,
+	X = 0x00004000,
+	Y = 0x00008000,
 
 	// Extended buttons (Sunshine / Moonshine only)
-	Paddle1  = 0x00010000,
-	Paddle2  = 0x00020000,
-	Paddle3  = 0x00040000,
-	Paddle4  = 0x00080000,
+	Paddle1 = 0x00010000,
+	Paddle2 = 0x00020000,
+	Paddle3 = 0x00040000,
+	Paddle4 = 0x00080000,
 	Touchpad = 0x00100000, // Touchpad buttons on Sony controllers.
-	Misc     = 0x00200000, // Share/Mic/Capture/Mute buttons on various controllers.
+	Misc = 0x00200000,     // Share/Mic/Capture/Mute buttons on various controllers.
 }
 
 impl From<GamepadButton> for Key {
@@ -116,7 +116,7 @@ pub struct GamepadInfo {
 }
 
 impl GamepadInfo {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
 		const EXPECTED_SIZE: usize =
 			std::mem::size_of::<u8>()    // index
 			+ std::mem::size_of::<u8>()  // kind
@@ -125,13 +125,15 @@ impl GamepadInfo {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			log::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadInfo, got {} bytes.", buffer.len());
-			return Err(());
+			bail!(
+				"Expected at least {EXPECTED_SIZE} bytes for GamepadInfo, got {} bytes.",
+				buffer.len()
+			)
 		}
 
 		Ok(Self {
 			index: buffer[0],
-			// kind: GamepadKind::from_repr(buffer[1]).ok_or_else(|| log::warn!("Unknown gamepad kind: {}", buffer[1]))?,
+			// kind: GamepadKind::from_repr(buffer[1]).ok_or_else(|| tracing::warn!("Unknown gamepad kind: {}", buffer[1]))?,
 			// capabilities: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			// supported_buttons: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 		})
@@ -158,7 +160,7 @@ pub struct GamepadUpdate {
 }
 
 impl GamepadUpdate {
-	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self> {
 		const EXPECTED_SIZE: usize =
 			std::mem::size_of::<u16>()   // header
 			+ std::mem::size_of::<u16>() // index
@@ -177,23 +179,26 @@ impl GamepadUpdate {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			log::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadUpdate, got {} bytes.", buffer.len());
-			return Err(());
+			bail!(
+				"Expected at least {EXPECTED_SIZE} bytes for GamepadUpdate, got {} bytes.",
+				buffer.len()
+			)
 		}
 
 		Ok(Self {
-			index: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
-			_active_gamepad_mask: u16::from_le_bytes(buffer[4..6].try_into().unwrap()),
-			button_flags: u16::from_le_bytes(buffer[8..10].try_into().unwrap()) as u32 | (u16::from_le_bytes(buffer[22..24].try_into().unwrap()) as u32) << 16,
+			index: u16::from_le_bytes(buffer[2..4].try_into()?),
+			_active_gamepad_mask: u16::from_le_bytes(buffer[4..6].try_into()?),
+			button_flags: u16::from_le_bytes(buffer[8..10].try_into()?) as u32
+				| (u16::from_le_bytes(buffer[22..24].try_into()?) as u32) << 16,
 			left_trigger: buffer[10],
 			right_trigger: buffer[11],
 			left_stick: (
-				i16::from_le_bytes(buffer[12..14].try_into().unwrap()),
-				i16::from_le_bytes(buffer[14..16].try_into().unwrap()),
+				i16::from_le_bytes(buffer[12..14].try_into()?),
+				i16::from_le_bytes(buffer[14..16].try_into()?),
 			),
 			right_stick: (
-				i16::from_le_bytes(buffer[16..18].try_into().unwrap()),
-				i16::from_le_bytes(buffer[18..20].try_into().unwrap())
+				i16::from_le_bytes(buffer[16..18].try_into()?),
+				i16::from_le_bytes(buffer[18..20].try_into()?),
 			),
 		})
 	}
@@ -206,7 +211,7 @@ pub struct Gamepad {
 }
 
 impl Gamepad {
-	pub fn new(info: GamepadInfo) -> Result<Self, ()> {
+	pub fn new(info: GamepadInfo) -> Result<Self> {
 		// Ideally we use info.supported_buttons, but this gives unexpected results.
 		// For example, the left and right joystick buttons would be mapped to SELECT / START for some reason..
 		let buttons = AttributeSet::from_iter([
@@ -226,56 +231,56 @@ impl Gamepad {
 		]);
 
 		let device = VirtualDeviceBuilder::new()
-			.map_err(|e| log::error!("Failed to initiate virtual gamepad: {e}"))?
+			.context("Failed to initiate virtual gamepad")?
 			.input_id(InputId::new(evdev::BusType::BUS_BLUETOOTH, 0x54C, 0x5C4, 0x8100))
 			.name(format!("Moonshine Gamepad {}", info.index).as_str())
 			.with_keys(&buttons)
-			.map_err(|e| log::error!("Failed to add keys to virtual gamepad: {e}"))?
+			.context("Failed to add keys to virtual gamepad")?
 			// Dpad.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_HAT0X,
-				AbsInfo::new(0, -1, 1, 0, 0, 0)
+				AbsInfo::new(0, -1, 1, 0, 0, 0),
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.context("Failed to enable gamepad axis")?
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_HAT0Y,
-				AbsInfo::new(0, -1, 1, 0, 0, 0)
+				AbsInfo::new(0, -1, 1, 0, 0, 0),
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.context("Failed to enable gamepad axis")?
 			// Left stick.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_X,
-				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0)
+				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0),
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.context("Failed to enable gamepad axis")?
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_Y,
-				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0)
+				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0),
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.context("Failed to enable gamepad axis")?
 			// Right stick.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_RX,
-				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0)
+				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0),
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.context("Failed to enable gamepad axis")?
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_RY,
-				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0)
+				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0),
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.context("Failed to enable gamepad axis")?
 			// Left trigger.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_Z,
-				AbsInfo::new(0, 0, u8::MAX as i32, 0, 0, 0)
+				AbsInfo::new(0, 0, u8::MAX as i32, 0, 0, 0),
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.context("Failed to enable gamepad axis")?
 			// Right trigger.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_RZ,
-				AbsInfo::new(0, 0, u8::MAX as i32, 0, 0, 0)
+				AbsInfo::new(0, 0, u8::MAX as i32, 0, 0, 0),
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.context("Failed to enable gamepad axis")?
 			// .with_ff(&AttributeSet::from_iter([
 			// 	evdev::FFEffectType::FF_RUMBLE,
 			// 	evdev::FFEffectType::FF_PERIODIC,
@@ -287,22 +292,30 @@ impl Gamepad {
 			// .map_err(|e| log::error!("Failed to enable force feedback on virtual gamepad: {e}"))?
 			// .with_ff_effects_max(16) // TODO: What should this value be?
 			.build()
-			.map_err(|e| log::error!("Failed to create virtual gamepad: {e}"))?;
+			.context("Failed to create virtual gamepad")?;
 
-		Ok(Self { _info: info, device, button_state: 0 })
+		Ok(Self {
+			_info: info,
+			device,
+			button_state: 0,
+		})
 	}
 
 	fn button_changed(&self, button: &GamepadButton, new_state: u32) -> bool {
 		(self.button_state & *button as u32) != (new_state & *button as u32)
 	}
 
-	pub fn update(&mut self, update: GamepadUpdate) -> Result<(), ()> {
+	pub fn update(&mut self, update: GamepadUpdate) -> Result<()> {
 		let mut events = Vec::new();
 
 		// Check all buttons that have changed and emit their update.
 		for button in GamepadButton::iter() {
 			if self.button_changed(&button, update.button_flags) {
-				log::trace!("Sending update for button {:?}, state: {}", button, (update.button_flags & button as u32) != 0);
+				tracing::trace!(
+					"Sending update for button {:?}, state: {}",
+					button,
+					(update.button_flags & button as u32) != 0
+				);
 
 				match button {
 					GamepadButton::Down | GamepadButton::Up => {
@@ -314,7 +327,11 @@ impl Gamepad {
 						} else {
 							state = 0;
 						}
-						events.push(evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_HAT0Y.0, state));
+						events.push(evdev::InputEvent::new_now(
+							evdev::EventType::ABSOLUTE,
+							AbsoluteAxisType::ABS_HAT0Y.0,
+							state,
+						));
 					},
 					GamepadButton::Left | GamepadButton::Right => {
 						let state;
@@ -325,7 +342,11 @@ impl Gamepad {
 						} else {
 							state = 0;
 						}
-						events.push(evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_HAT0X.0, state));
+						events.push(evdev::InputEvent::new_now(
+							evdev::EventType::ABSOLUTE,
+							AbsoluteAxisType::ABS_HAT0X.0,
+							state,
+						));
 					},
 					_ => {
 						events.push(evdev::InputEvent::new_now(
@@ -333,23 +354,46 @@ impl Gamepad {
 							Into::<Key>::into(button).code(),
 							((update.button_flags & button as u32) != 0) as i32,
 						));
-					}
+					},
 				}
 			}
 		}
 		self.button_state = update.button_flags;
 
-		// Send analog triggers.
+		// Send anatracing triggers.
 		events.extend([
-			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, update.left_stick.0 as i32),
-			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, -update.left_stick.1 as i32),
-			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_RX.0, update.right_stick.0 as i32),
-			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_RY.0, -update.right_stick.1 as i32),
-			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_Z.0, update.left_trigger as i32),
-			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_RZ.0, update.right_trigger as i32),
+			evdev::InputEvent::new_now(
+				evdev::EventType::ABSOLUTE,
+				AbsoluteAxisType::ABS_X.0,
+				update.left_stick.0 as i32,
+			),
+			evdev::InputEvent::new_now(
+				evdev::EventType::ABSOLUTE,
+				AbsoluteAxisType::ABS_Y.0,
+				-update.left_stick.1 as i32,
+			),
+			evdev::InputEvent::new_now(
+				evdev::EventType::ABSOLUTE,
+				AbsoluteAxisType::ABS_RX.0,
+				update.right_stick.0 as i32,
+			),
+			evdev::InputEvent::new_now(
+				evdev::EventType::ABSOLUTE,
+				AbsoluteAxisType::ABS_RY.0,
+				-update.right_stick.1 as i32,
+			),
+			evdev::InputEvent::new_now(
+				evdev::EventType::ABSOLUTE,
+				AbsoluteAxisType::ABS_Z.0,
+				update.left_trigger as i32,
+			),
+			evdev::InputEvent::new_now(
+				evdev::EventType::ABSOLUTE,
+				AbsoluteAxisType::ABS_RZ.0,
+				update.right_trigger as i32,
+			),
 		]);
 
-		self.device.emit(&events)
-			.map_err(|e| log::error!("Failed to send gamepad events: {e}"))
+		self.device.emit(&events).context("Failed to send gamepad events")
 	}
 }

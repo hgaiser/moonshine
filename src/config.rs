@@ -1,5 +1,10 @@
-use std::{path::{PathBuf, Path}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}};
+use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::{
+	collections::hash_map::DefaultHasher,
+	hash::{Hash, Hasher},
+	path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -29,12 +34,9 @@ pub struct Config {
 }
 
 impl Config {
-	#[allow(clippy::result_unit_err)]
-	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config, ()> {
-		let config = std::fs::read_to_string(file)
-			.map_err(|e| log::error!("Failed to open configuration file: {e}"))?;
-		let config: Config = toml::from_str(&config)
-			.map_err(|e| log::error!("Failed to parse configuration file: {e}"))?;
+	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config> {
+		let config = std::fs::read_to_string(file).context("Failed to open configuration file")?;
+		let config: Config = toml::from_str(&config).context("Failed to parse configuration file")?;
 
 		Ok(config)
 	}
@@ -50,19 +52,14 @@ impl Default for Config {
 			applications: vec![
 				ApplicationConfig {
 					title: "Desktop".to_string(),
-					run_before: Some(vec![
-						vec![
-							"$HOME/.local/bin/resolution".to_string(),
-							"{width}".to_string(),
-							"{height}".to_string(),
-						],
-					]),
-					run_after: Some(vec![
-						vec!["$HOME/.local/bin/resolution".to_string()],
-					]),
+					run_before: Some(vec![vec![
+						"$HOME/.local/bin/resolution".to_string(),
+						"{width}".to_string(),
+						"{height}".to_string(),
+					]]),
+					run_after: Some(vec![vec!["$HOME/.local/bin/resolution".to_string()]]),
 					boxart: None,
 				},
-
 				ApplicationConfig {
 					title: "Steam".to_string(),
 					run_before: Some(vec![
@@ -71,40 +68,25 @@ impl Default for Config {
 							"{width}".to_string(),
 							"{height}".to_string(),
 						],
-						vec![
-							"/usr/bin/steam".to_string(),
-							"steam://open/bigpicture".to_string(),
-						],
+						vec!["/usr/bin/steam".to_string(), "steam://open/bigpicture".to_string()],
 					]),
-					run_after: Some(vec![
-						vec!["$HOME/.local/bin/resolution".to_string()],
-					]),
+					run_after: Some(vec![vec!["$HOME/.local/bin/resolution".to_string()]]),
 					boxart: None,
 				},
 			],
-			application_scanners: vec![
-				ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
-					library: "$HOME/.local/share/Steam".into(),
-					run_before: Some(vec![
-						vec![
-							"$HOME/.local/bin/resolution".to_string(),
-							"{width}".to_string(),
-							"{height}".to_string(),
-						],
-						vec![
-							"/usr/bin/steam".to_string(),
-							"steam://open/bigpicture".to_string(),
-						],
-						vec![
-							"/usr/bin/steam".to_string(),
-							"steam://rungameid/{game_id}".to_string(),
-						],
-					]),
-					run_after: Some(vec![
-						vec!["$HOME/.local/bin/resolution".to_string()],
-					]),
-				}),
-			],
+			application_scanners: vec![ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
+				library: "$HOME/.local/share/Steam".into(),
+				run_before: Some(vec![
+					vec![
+						"$HOME/.local/bin/resolution".to_string(),
+						"{width}".to_string(),
+						"{height}".to_string(),
+					],
+					vec!["/usr/bin/steam".to_string(), "steam://open/bigpicture".to_string()],
+					vec!["/usr/bin/steam".to_string(), "steam://rungameid/{game_id}".to_string()],
+				]),
+				run_after: Some(vec![vec!["$HOME/.local/bin/resolution".to_string()]]),
+			})],
 			stream_timeout: 60,
 		}
 	}
@@ -185,7 +167,6 @@ pub struct SteamApplicationScannerConfig {
 	///
 	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
 	pub run_after: Option<Vec<Vec<String>>>,
-
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
