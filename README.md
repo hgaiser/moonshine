@@ -181,17 +181,15 @@ run_after = [
 
 ## FAQ
 
-1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?** Both Moonshine and Sunshine fulfill the same goal. Moonshine has a much narrower focus on supported platforms. Sunshine attempts to support many different platforms. If your software / hardware is not supported by Moonshine, then you might want to try Sunshine.
+1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**
+   Both Moonshine and Sunshine fulfill the same goal.
+   However, Moonshine has a much narrower focus on supported software and hardware, whereas Sunshine attempts to support many different combinations.
+   Sunshine supports everything that Moonshine supports and much more.
 
-    In terms of efficiency, playing the same 7 minute video and recording the average CPU and memory usage (using `ps -p $(pgrep sunshine) $(pgrep moonshine) -o %cpu,%mem,cmd`, on an Intel i9-12900K, 3440x1440 resolution, 60FPS, 51Mbps max bitrate) gives the following results:
-
-    ```
-    %CPU %MEM CMD
-    19.5  0.7 /usr/bin/sunshine
-
-    %CPU %MEM CMD
-    6.5  0.5 /usr/bin/moonshine
-    ```
+1. **So why should I use Moonshine?**
+   Realistically, you shouldn't.
+   If you're interested in how these applications work from a technical perspective, then I can recommend looking into the code.
+   Or if you think Sunshine has too many features and you want something simpler, give Moonshine a go ;).
 
 ## Acknowledgement
 
