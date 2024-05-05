@@ -1,16 +1,10 @@
-use async_shutdown::ShutdownManager;
 use zeroconf::prelude::*;
 
-pub fn spawn(port: u16, name: String, shutdown: ShutdownManager<i32>) {
-	tokio::task::spawn_blocking(move || {
-		if run(port, name, &shutdown).is_err() {
-			shutdown.trigger_shutdown(1)
-				.map_err(|e| log::error!("Failed to trigger shutdown: {e}")).ok();
-		}
-	});
+pub fn spawn(port: u16, name: String) {
+	tokio::task::spawn_blocking(move || { run(port, name) });
 }
 
-fn run(port: u16, name: String, shutdown: &ShutdownManager<i32>) -> Result<(), ()> {
+fn run(port: u16, name: String) -> Result<(), ()> {
 	let mut service = zeroconf::MdnsService::new(
 		zeroconf::ServiceType::new("nvstream", "tcp")
 			.map_err(|e| log::error!("Failed to publish: {e}"))?,
@@ -24,15 +18,13 @@ fn run(port: u16, name: String, shutdown: &ShutdownManager<i32>) -> Result<(), (
 	let event_loop = service.register()
 		.map_err(|e| log::error!("Failed to register service: {e}"))?;
 
-	while !shutdown.is_shutdown_triggered() {
+	loop {
 		// Calling `poll()` will keep this service alive.
 		if let Err(e) = event_loop.poll(std::time::Duration::from_secs(0)) {
 			log::warn!("Failed to publish service: {e}");
 		}
 		std::thread::sleep(std::time::Duration::from_secs(1));
 	}
-
-	Ok(())
 }
 
 fn on_service_registered(

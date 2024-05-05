@@ -188,7 +188,7 @@ impl Moonshine {
 		let rtsp_server = RtspServer::new(config.clone(), session_manager.clone(), shutdown.clone());
 
 		// Publish the Moonshine service using zeroconf.
-		publisher::spawn(config.webserver.port, config.name.clone(), shutdown.clone());
+		publisher::spawn(config.webserver.port, config.name.clone());
 
 		// Create a handler for the webserver.
 		let webserver = Webserver::new(
