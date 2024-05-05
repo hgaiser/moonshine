@@ -200,6 +200,8 @@ This wouldn't have been possible without the incredible work by the people behin
 Below are improvements intended for Moonshine.
 If you are interesting in contributing, feel free to create an issue or send a message on the [Moonlight Discord](https://discord.com/invite/moonlight-stream-352065098472488960) server.
 
+1. [ ] Add support for streaming (the same stream) to multiple clients simultaneously.
+1. [ ] Investigate replacing input handling with [inputtino](https://github.com/games-on-whales/inputtino) for better support.
 1. [ ] Replace openssl with [rustls](https://crates.io/crates/rustls).
 1. [ ] Investigate replacing ffmpeg with gstreamer as it seems to have better Rust support.
 1. [ ] Replace NvFBC with DRM-KMS for hardware agnostic frame capture (however at the time of writing it seems NVIDIA cards do not support this through their proprietary NVIDIA driver).
