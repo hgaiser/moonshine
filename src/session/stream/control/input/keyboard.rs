@@ -145,12 +145,12 @@ impl Key {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			log::warn!("Expected at least {EXPECTED_SIZE} bytes for Key, got {} bytes.", buffer.len());
+			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for Key, got {} bytes.", buffer.len());
 			return Err(());
 		}
 
 
-		Key::from_repr(buffer[1]).ok_or_else(|| log::warn!("Unknown keycode: {}", buffer[5]))
+		Key::from_repr(buffer[1]).ok_or_else(|| tracing::warn!("Unknown keycode: {}", buffer[5]))
 	}
 }
 
@@ -301,12 +301,12 @@ impl Keyboard {
 		}
 
 		let device = VirtualDeviceBuilder::new()
-			.map_err(|e| log::error!("Failed to initiate virtual keyboard: {e}"))?
+			.map_err(|e| tracing::error!("Failed to initiate virtual keyboard: {e}"))?
 			.name("Moonshine Keyboard")
 			.with_keys(&attributes)
-			.map_err(|e| log::error!("Failed to add keys to virtual keyboard: {e}"))?
+			.map_err(|e| tracing::error!("Failed to add keys to virtual keyboard: {e}"))?
 			.build()
-			.map_err(|e| log::error!("Failed to create virtual keyboard: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to create virtual keyboard: {e}"))?;
 
 		Ok(Self { device })
 	}
@@ -319,7 +319,7 @@ impl Keyboard {
 		);
 
 		self.device.emit(&[button_event])
-			.map_err(|e| log::error!("Failed to press key: {e}"))
+			.map_err(|e| tracing::error!("Failed to press key: {e}"))
 	}
 
 	pub fn key_up(&mut self, button: Key) -> Result<(), ()> {
@@ -330,6 +330,6 @@ impl Keyboard {
 		);
 
 		self.device.emit(&[button_event])
-			.map_err(|e| log::error!("Failed to release key: {e}"))
+			.map_err(|e| tracing::error!("Failed to release key: {e}"))
 	}
 }

@@ -32,9 +32,9 @@ impl Config {
 	#[allow(clippy::result_unit_err)]
 	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config, ()> {
 		let config = std::fs::read_to_string(file)
-			.map_err(|e| log::error!("Failed to open configuration file: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to open configuration file: {e}"))?;
 		let config: Config = toml::from_str(&config)
-			.map_err(|e| log::error!("Failed to parse configuration file: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to parse configuration file: {e}"))?;
 
 		Ok(config)
 	}

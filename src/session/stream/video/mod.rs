@@ -54,12 +54,12 @@ impl VideoStream {
 
 	pub async fn start(&self) -> Result<(), ()> {
 		self.command_tx.send(VideoStreamCommand::Start).await
-			.map_err(|e| log::warn!("Failed to send Start command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send Start command: {e}"))
 	}
 
 	pub async fn request_idr_frame(&self) -> Result<(), ()> {
 		self.command_tx.send(VideoStreamCommand::RequestIdrFrame).await
-			.map_err(|e| log::warn!("Failed to send RequestIdrFrame command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send RequestIdrFrame command: {e}"))
 	}
 }
 
@@ -73,19 +73,19 @@ impl VideoStreamInner {
 	) -> Result<(), ()> {
 		let socket = UdpSocket::bind((config.address, config.stream.video.port))
 			.await
-			.map_err(|e| log::error!("Failed to bind to UDP socket: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
 		if context.qos {
 			// TODO: Check this value 160, what does it mean exactly?
-			log::debug!("Enabling QoS on video socket.");
+			tracing::debug!("Enabling QoS on video socket.");
 			socket.set_tos(160)
-				.map_err(|e| log::error!("Failed to set QoS on the video socket: {e}"))?;
+				.map_err(|e| tracing::error!("Failed to set QoS on the video socket: {e}"))?;
 		}
 
-		log::debug!(
+		tracing::debug!(
 			"Listening for video messages on {}",
 			socket.local_addr()
-				.map_err(|e| log::error!("Failed to get local address associated with control socket: {e}"))?
+				.map_err(|e| tracing::error!("Failed to get local address associated with control socket: {e}"))?
 		);
 
 		let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(1024);
@@ -100,12 +100,12 @@ impl VideoStreamInner {
 							Some(packet) => {
 								if let Some(client_address) = client_address {
 									if let Err(e) = socket.send_to(packet.as_slice(), client_address).await {
-										log::warn!("Failed to send packet to client: {e}");
+										tracing::warn!("Failed to send packet to client: {e}");
 									}
 								}
 							},
 							None => {
-								log::debug!("Packet channel closed.");
+								tracing::debug!("Packet channel closed.");
 								break;
 							},
 						}
@@ -115,22 +115,22 @@ impl VideoStreamInner {
 						let (len, address) = match message {
 							Ok((len, address)) => (len, address),
 							Err(e) => {
-								log::warn!("Failed to receive message: {e}");
+								tracing::warn!("Failed to receive message: {e}");
 								break;
 							},
 						};
 
 						if &buf[..len] == b"PING" {
-							log::trace!("Received video stream PING message from {address}.");
+							tracing::trace!("Received video stream PING message from {address}.");
 							client_address = Some(address);
 						} else {
-							log::warn!("Received unknown message on video stream of length {len}.");
+							tracing::warn!("Received unknown message on video stream of length {len}.");
 						}
 					},
 				}
 			}
 
-			log::debug!("Stopping video stream.");
+			tracing::debug!("Stopping video stream.");
 		});
 
 		let mut started_streaming = false;
@@ -138,25 +138,25 @@ impl VideoStreamInner {
 		while let Some(command) = command_rx.recv().await {
 			match command {
 				VideoStreamCommand::RequestIdrFrame => {
-					log::info!("Received request for IDR frame, next frame will be an IDR frame.");
+					tracing::info!("Received request for IDR frame, next frame will be an IDR frame.");
 					idr_frame_request_tx.send(())
-						.map_err(|e| log::error!("Failed to send IDR frame request to encoder: {e}"))?;
+						.map_err(|e| tracing::error!("Failed to send IDR frame request to encoder: {e}"))?;
 				},
 				VideoStreamCommand::Start => {
 					if started_streaming {
-						log::warn!("Can't start streaming twice.");
+						tracing::warn!("Can't start streaming twice.");
 						continue;
 					}
 
 					// TODO: Make the GPU index configurable.
 					let cuda_device = cudarc::driver::CudaDevice::new(0)
-						.map_err(|e| log::error!("Failed to initialize CUDA: {e}"))?;
+						.map_err(|e| tracing::error!("Failed to initialize CUDA: {e}"))?;
 
 					let capturer = FrameCapturer::new()?;
 					let status = capturer.status()?;
 					if status.screen_size.w != context.width || status.screen_size.h != context.height {
 						// TODO: Resize the CUDA buffer to the requested size?
-						log::warn!(
+						tracing::warn!(
 							"Client asked for resolution {}x{}, but we are generating a resolution of {}x{}.",
 							context.width, context.height, status.screen_size.w, status.screen_size.h
 						);
@@ -184,7 +184,7 @@ impl VideoStreamInner {
 						let stop_signal = stop_signal.clone();
 						move || {
 							cuda_device.bind_to_thread()
-								.map_err(|e| log::error!("Failed to bind CUDA device to thread: {e}"))?;
+								.map_err(|e| tracing::error!("Failed to bind CUDA device to thread: {e}"))?;
 							capturer.run(
 								context.fps,
 								capture_buffer,
@@ -195,7 +195,7 @@ impl VideoStreamInner {
 						}
 					});
 					if let Err(e) = capture_thread {
-						log::error!("Failed to start video capture thread: {e}");
+						tracing::error!("Failed to start video capture thread: {e}");
 						continue;
 					}
 
@@ -220,7 +220,7 @@ impl VideoStreamInner {
 						}
 					});
 					if let Err(e) = encode_thread {
-						log::error!("Failed to start video encoding thread: {e}");
+						tracing::error!("Failed to start video encoding thread: {e}");
 						continue;
 					}
 
@@ -229,7 +229,7 @@ impl VideoStreamInner {
 			}
 		}
 
-		log::debug!("Command channel closed.");
+		tracing::debug!("Command channel closed.");
 		Ok(())
 	}
 }
@@ -243,7 +243,7 @@ fn create_frame(width: u32, height: u32, pixel_format: Pixel, context: &mut HwFr
 		(*frame.as_mut_ptr()).hw_frames_ctx = context.as_raw_mut();
 
 		check_ret(ffmpeg::sys::av_hwframe_get_buffer(context.as_raw_mut(), frame.as_mut_ptr(), 0))
-			.map_err(|e| log::error!("Failed to create CUDA frame: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to create CUDA frame: {e}"))?;
 		check_ret(ffmpeg::sys::av_hwframe_get_buffer(context.as_raw_mut(), frame.as_mut_ptr(), 0))
 			.map_err(|e| println!("Failed to allocate hardware frame: {e}"))?;
 		(*frame.as_mut_ptr()).linesize[0] = (*frame.as_ptr()).width * 4;

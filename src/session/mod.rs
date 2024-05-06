@@ -81,14 +81,14 @@ impl Session {
 		self.running = true;
 		self.command_tx.send(SessionCommand::StartStream(video_stream_context, audio_stream_context))
 			.await
-			.map_err(|e| log::error!("Failed to send StartStream command: {e}"))
+			.map_err(|e| tracing::error!("Failed to send StartStream command: {e}"))
 	}
 
 	pub async fn stop_stream(&mut self) -> Result<(), ()> {
 		self.running = false;
 		self.command_tx.send(SessionCommand::StopStream)
 			.await
-			.map_err(|e| log::error!("Failed to send StopStream command: {e}"))
+			.map_err(|e| tracing::error!("Failed to send StopStream command: {e}"))
 	}
 
 	pub fn get_context(&self) -> &SessionContext {
@@ -101,7 +101,7 @@ impl Session {
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
 		self.command_tx.send(SessionCommand::UpdateKeys(keys)).await
-			.map_err(|e| log::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -145,7 +145,7 @@ impl SessionInner {
 					) {
 						Ok(control_stream) => control_stream,
 						Err(()) => {
-							log::error!("Failed to create control stream, killing session.");
+							tracing::error!("Failed to create control stream, killing session.");
 							continue;
 						},
 					};
@@ -161,11 +161,11 @@ impl SessionInner {
 
 				SessionCommand::UpdateKeys(keys) => {
 					let Some(audio_stream) = &self.audio_stream else {
-						log::warn!("Can't update session keys without an audio stream.");
+						tracing::warn!("Can't update session keys without an audio stream.");
 						continue;
 					};
 					let Some(control_stream) = &self.control_stream else {
-						log::warn!("Can't update session keys without an control stream.");
+						tracing::warn!("Can't update session keys without an control stream.");
 						continue;
 					};
 
@@ -177,13 +177,13 @@ impl SessionInner {
 		}
 
 		let _ = stop_signal.trigger_shutdown(());
-		log::debug!("Command channel closed.");
+		tracing::debug!("Command channel closed.");
 	}
 }
 
 fn run_command(command: &[String], context: &SessionContext) {
 	if command.is_empty() {
-		log::warn!("Can't run an empty command.");
+		tracing::warn!("Can't run an empty command.");
 		return;
 	}
 
@@ -197,7 +197,7 @@ fn run_command(command: &[String], context: &SessionContext) {
 		})
 		.collect();
 
-	log::info!("Running command: {command:?}");
+	tracing::info!("Running command: {command:?}");
 
 	// Now run the command.
 	let _ = std::process::Command::new(&command[0])
@@ -206,5 +206,5 @@ fn run_command(command: &[String], context: &SessionContext) {
 		.stderr(Stdio::null())
 		.stdin(Stdio::null())
 		.spawn()
-		.map_err(|e| log::error!("Failed to run command: {e}"));
+		.map_err(|e| tracing::error!("Failed to run command: {e}"));
 }

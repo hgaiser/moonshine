@@ -125,13 +125,13 @@ impl GamepadInfo {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			log::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadInfo, got {} bytes.", buffer.len());
+			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadInfo, got {} bytes.", buffer.len());
 			return Err(());
 		}
 
 		Ok(Self {
 			index: buffer[0],
-			// kind: GamepadKind::from_repr(buffer[1]).ok_or_else(|| log::warn!("Unknown gamepad kind: {}", buffer[1]))?,
+			// kind: GamepadKind::from_repr(buffer[1]).ok_or_else(|| tracing::warn!("Unknown gamepad kind: {}", buffer[1]))?,
 			// capabilities: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			// supported_buttons: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 		})
@@ -177,7 +177,7 @@ impl GamepadUpdate {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			log::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadUpdate, got {} bytes.", buffer.len());
+			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadUpdate, got {} bytes.", buffer.len());
 			return Err(());
 		}
 
@@ -226,56 +226,56 @@ impl Gamepad {
 		]);
 
 		let device = VirtualDeviceBuilder::new()
-			.map_err(|e| log::error!("Failed to initiate virtual gamepad: {e}"))?
+			.map_err(|e| tracing::error!("Failed to initiate virtual gamepad: {e}"))?
 			.input_id(InputId::new(evdev::BusType::BUS_BLUETOOTH, 0x54C, 0x5C4, 0x8100))
 			.name(format!("Moonshine Gamepad {}", info.index).as_str())
 			.with_keys(&buttons)
-			.map_err(|e| log::error!("Failed to add keys to virtual gamepad: {e}"))?
+			.map_err(|e| tracing::error!("Failed to add keys to virtual gamepad: {e}"))?
 			// Dpad.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_HAT0X,
 				AbsInfo::new(0, -1, 1, 0, 0, 0)
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.map_err(|e| tracing::error!("Failed to enable gamepad axis: {e}"))?
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_HAT0Y,
 				AbsInfo::new(0, -1, 1, 0, 0, 0)
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.map_err(|e| tracing::error!("Failed to enable gamepad axis: {e}"))?
 			// Left stick.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_X,
 				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0)
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.map_err(|e| tracing::error!("Failed to enable gamepad axis: {e}"))?
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_Y,
 				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0)
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.map_err(|e| tracing::error!("Failed to enable gamepad axis: {e}"))?
 			// Right stick.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_RX,
 				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0)
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.map_err(|e| tracing::error!("Failed to enable gamepad axis: {e}"))?
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_RY,
 				AbsInfo::new(0, i16::MIN as i32, i16::MAX as i32, 16, 128, 0)
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.map_err(|e| tracing::error!("Failed to enable gamepad axis: {e}"))?
 			// Left trigger.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_Z,
 				AbsInfo::new(0, 0, u8::MAX as i32, 0, 0, 0)
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.map_err(|e| tracing::error!("Failed to enable gamepad axis: {e}"))?
 			// Right trigger.
 			.with_absolute_axis(&UinputAbsSetup::new(
 				AbsoluteAxisType::ABS_RZ,
 				AbsInfo::new(0, 0, u8::MAX as i32, 0, 0, 0)
 			))
-			.map_err(|e| log::error!("Failed to enable gamepad axis: {e}"))?
+			.map_err(|e| tracing::error!("Failed to enable gamepad axis: {e}"))?
 			// .with_ff(&AttributeSet::from_iter([
 			// 	evdev::FFEffectType::FF_RUMBLE,
 			// 	evdev::FFEffectType::FF_PERIODIC,
@@ -284,10 +284,10 @@ impl Gamepad {
 			// 	evdev::FFEffectType::FF_SINE,
 			// 	evdev::FFEffectType::FF_GAIN,
 			// ]))
-			// .map_err(|e| log::error!("Failed to enable force feedback on virtual gamepad: {e}"))?
+			// .map_err(|e| tracing::error!("Failed to enable force feedback on virtual gamepad: {e}"))?
 			// .with_ff_effects_max(16) // TODO: What should this value be?
 			.build()
-			.map_err(|e| log::error!("Failed to create virtual gamepad: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to create virtual gamepad: {e}"))?;
 
 		Ok(Self { _info: info, device, button_state: 0 })
 	}
@@ -302,7 +302,7 @@ impl Gamepad {
 		// Check all buttons that have changed and emit their update.
 		for button in GamepadButton::iter() {
 			if self.button_changed(&button, update.button_flags) {
-				log::trace!("Sending update for button {:?}, state: {}", button, (update.button_flags & button as u32) != 0);
+				tracing::trace!("Sending update for button {:?}, state: {}", button, (update.button_flags & button as u32) != 0);
 
 				match button {
 					GamepadButton::Down | GamepadButton::Up => {
@@ -350,6 +350,6 @@ impl Gamepad {
 		]);
 
 		self.device.emit(&events)
-			.map_err(|e| log::error!("Failed to send gamepad events: {e}"))
+			.map_err(|e| tracing::error!("Failed to send gamepad events: {e}"))
 	}
 }

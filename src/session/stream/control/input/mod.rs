@@ -53,7 +53,7 @@ enum InputEvent {
 impl InputEvent {
 	fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
 		if buffer.len() < 4 {
-			log::warn!("Expected control message to have at least 4 bytes, got {}", buffer.len());
+			tracing::warn!("Expected control message to have at least 4 bytes, got {}", buffer.len());
 			return Err(());
 		}
 
@@ -70,7 +70,7 @@ impl InputEvent {
 			Some(InputEventType::GamepadInfo) => Ok(InputEvent::GamepadInfo(GamepadInfo::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadUpdate) => Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?)),
 			None => {
-				log::warn!("Received unknown event type: {event_type}");
+				tracing::warn!("Received unknown event type: {event_type}");
 				Err(())
 			}
 		}
@@ -95,7 +95,7 @@ impl InputHandler {
 
 	async fn handle_input(&self, event: InputEvent) -> Result<(), ()> {
 		self.command_tx.send(event).await
-			.map_err(|e| log::error!("Failed to send input event: {e}"))
+			.map_err(|e| tracing::error!("Failed to send input event: {e}"))
 	}
 
 	pub async fn handle_raw_input<'a>(&self, event: &'a [u8]) -> Result<(), ()> {
@@ -116,47 +116,47 @@ impl InputHandlerInner {
 		while let Some(command) = command_rx.recv().await {
 			match command {
 				InputEvent::KeyDown(key) => {
-					log::trace!("Pressing key: {key:?}");
+					tracing::trace!("Pressing key: {key:?}");
 					let _ = self.keyboard.key_down(key);
 				},
 				InputEvent::KeyUp(key) => {
-					log::trace!("Releasing key: {key:?}");
+					tracing::trace!("Releasing key: {key:?}");
 					let _ = self.keyboard.key_up(key);
 				},
 				InputEvent::MouseMoveAbsolute(event) => {
-					log::trace!("Absolute mouse movement: {event:?}");
+					tracing::trace!("Absolute mouse movement: {event:?}");
 					let _ = self.mouse.move_absolute(event.x as i32, event.y as i32);
 				},
 				InputEvent::MouseMoveRelative(event) => {
-					log::trace!("Moving mouse relative: {event:?}");
+					tracing::trace!("Moving mouse relative: {event:?}");
 					let _ = self.mouse.move_relative(event.x as i32, event.y as i32);
 				},
 				InputEvent::MouseButtonDown(button) => {
-					log::trace!("Pressing mouse button: {button:?}");
+					tracing::trace!("Pressing mouse button: {button:?}");
 					let _ = self.mouse.button_down(button);
 				},
 				InputEvent::MouseButtonUp(button) => {
-					log::trace!("Releasing mouse button: {button:?}");
+					tracing::trace!("Releasing mouse button: {button:?}");
 					let _ = self.mouse.button_up(button);
 				},
 				InputEvent::MouseScrollVertical(event) => {
-					log::trace!("Scrolling vertically: {event:?}");
+					tracing::trace!("Scrolling vertically: {event:?}");
 					let _ = self.mouse.scroll_vertical(event.amount);
 				},
 				InputEvent::MouseScrollHorizontal(event) => {
-					log::trace!("Scrolling horizontally: {event:?}");
+					tracing::trace!("Scrolling horizontally: {event:?}");
 					let _ = self.mouse.scroll_horizontal(event.amount);
 				},
 				InputEvent::GamepadInfo(gamepad) => {
-					log::debug!("Gamepad info: {gamepad:?}");
+					tracing::debug!("Gamepad info: {gamepad:?}");
 					if let Ok(gamepad) = Gamepad::new(gamepad) {
 						gamepads.push(gamepad);
 					}
 				},
 				InputEvent::GamepadUpdate(gamepad_update) => {
-					log::trace!("Gamepad update: {gamepad_update:?}");
+					tracing::trace!("Gamepad update: {gamepad_update:?}");
 					if gamepad_update.index as usize >= gamepads.len() {
-						log::warn!("Received update for gamepad {}, but we only have {} gamepads.", gamepad_update.index, gamepads.len());
+						tracing::warn!("Received update for gamepad {}, but we only have {} gamepads.", gamepad_update.index, gamepads.len());
 						continue;
 					}
 
@@ -165,6 +165,6 @@ impl InputHandlerInner {
 			}
 		}
 
-		log::debug!("Input handler closing.");
+		tracing::debug!("Input handler closing.");
 	}
 }

@@ -51,12 +51,12 @@ impl AudioStream {
 
 	pub async fn start(&self, keys: SessionKeys) -> Result<(), ()> {
 		self.command_tx.send(AudioStreamCommand::Start(keys)).await
-			.map_err(|e| log::error!("Failed to send Start command: {e}"))
+			.map_err(|e| tracing::error!("Failed to send Start command: {e}"))
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
 		self.command_tx.send(AudioStreamCommand::UpdateKeys(keys)).await
-			.map_err(|e| log::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -69,19 +69,19 @@ impl AudioStreamInner {
 		_stop_signal: ShutdownManager<()>,
 	) -> Result<(), ()> {
 		let socket = UdpSocket::bind((config.address, config.stream.audio.port)).await
-			.map_err(|e| log::error!("Failed to bind to UDP socket: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
 		if audio_stream_context.qos {
 			// TODO: Check this value 224, what does it mean exactly?
-			log::debug!("Enabling QoS on audio socket.");
+			tracing::debug!("Enabling QoS on audio socket.");
 			socket.set_tos(224)
-				.map_err(|e| log::error!("Failed to set QoS on the audio socket: {e}"))?;
+				.map_err(|e| tracing::error!("Failed to set QoS on the audio socket: {e}"))?;
 		}
 
-		log::debug!(
+		tracing::debug!(
 			"Listening for audio messages on {}",
 			socket.local_addr()
-			.map_err(|e| log::error!("Failed to get local address associated with control socket: {e}"))?
+			.map_err(|e| tracing::error!("Failed to get local address associated with control socket: {e}"))?
 		);
 
 		let (packet_tx, mut packet_rx) = mpsc::channel::<Vec<u8>>(10);
@@ -96,12 +96,12 @@ impl AudioStreamInner {
 							Some(packet) => {
 								if let Some(client_address) = client_address {
 									if let Err(e) = socket.send_to(packet.as_slice(), client_address).await {
-										log::warn!("Failed to send packet to client: {e}");
+										tracing::warn!("Failed to send packet to client: {e}");
 									}
 								}
 							},
 							None => {
-								log::debug!("Packet channel closed.");
+								tracing::debug!("Packet channel closed.");
 								break;
 							},
 						}
@@ -111,16 +111,16 @@ impl AudioStreamInner {
 						let (len, address) = match message {
 							Ok((len, address)) => (len, address),
 							Err(e) => {
-								log::warn!("Failed to receive message: {e}");
+								tracing::warn!("Failed to receive message: {e}");
 								break;
 							},
 						};
 
 						if &buf[..len] == b"PING" {
-							log::trace!("Received video stream PING message from {address}.");
+							tracing::trace!("Received video stream PING message from {address}.");
 							client_address = Some(address);
 						} else {
-							log::warn!("Received unknown message on video stream of length {len}.");
+							tracing::warn!("Received unknown message on video stream of length {len}.");
 						}
 					},
 				}
@@ -130,7 +130,7 @@ impl AudioStreamInner {
 		while let Some(command) = command_rx.recv().await {
 			match command {
 				AudioStreamCommand::Start(keys) => {
-					log::info!("Starting audio stream.");
+					tracing::info!("Starting audio stream.");
 
 					let (audio_tx, audio_rx) = mpsc::channel(10);
 					let capture = match AudioCapture::new(audio_tx).await {
@@ -155,7 +155,7 @@ impl AudioStreamInner {
 
 				AudioStreamCommand::UpdateKeys(keys) => {
 					let Some(encoder) = &self.encoder else {
-						log::error!("Can't update session keys, there is no encoder to update.");
+						tracing::error!("Can't update session keys, there is no encoder to update.");
 						continue;
 					};
 
@@ -164,7 +164,7 @@ impl AudioStreamInner {
 			}
 		}
 
-		log::debug!("Command channel closed.");
+		tracing::debug!("Command channel closed.");
 		Ok(())
 	}
 

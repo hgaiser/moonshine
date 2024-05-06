@@ -49,9 +49,9 @@ impl Webserver {
 
 		// Run HTTP webserver.
 		let http_address = (config.address.clone(), config.webserver.port).to_socket_addrs()
-			.map_err(|e| log::error!("Failed to resolve address '{}:{}': {e}", config.address, config.webserver.port))?
+			.map_err(|e| tracing::error!("Failed to resolve address '{}:{}': {e}", config.address, config.webserver.port))?
 			.next()
-			.ok_or_else(|| log::error!("Failed to resolve address '{}:{}'", config.address, config.webserver.port))?;
+			.ok_or_else(|| tracing::error!("Failed to resolve address '{}:{}'", config.address, config.webserver.port))?;
 
 		tokio::spawn({
 			let server = server.clone();
@@ -61,13 +61,13 @@ impl Webserver {
 				let server = server.clone();
 				let _ = shutdown.wrap_cancel(shutdown.wrap_trigger_shutdown(1, async move {
 					let listener = TcpListener::bind(http_address).await
-						.map_err(|e| log::error!("Failed to bind to address {http_address}: {e}"))?;
+						.map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
 
-					log::info!("HTTP server listening for connections on {http_address}");
+					tracing::info!("HTTP server listening for connections on {http_address}");
 					loop {
 						let (connection, address) = listener.accept().await
-							.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
-						log::trace!("Accepted connection from {address}.");
+							.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
+						tracing::trace!("Accepted connection from {address}.");
 
 						let address = connection.local_addr().ok();
 						let mac_address = if let Some(address) = address {
@@ -94,29 +94,29 @@ impl Webserver {
 					Ok::<(), ()>(())
 				})).await;
 
-				log::debug!("HTTP server shutting down.");
+				tracing::debug!("HTTP server shutting down.");
 			}
 		});
 
 		// Run HTTPS webserver.
 		let https_address = (config.address.clone(), config.webserver.port_https).to_socket_addrs()
-			.map_err(|e| log::error!("Failed to resolve address '{}:{}': {e}", config.address, config.webserver.port_https))?
+			.map_err(|e| tracing::error!("Failed to resolve address '{}:{}': {e}", config.address, config.webserver.port_https))?
 			.next()
-			.ok_or_else(|| log::error!("Failed to resolve address '{}:{}'", config.address, config.webserver.port_https))?;
+			.ok_or_else(|| tracing::error!("Failed to resolve address '{}:{}'", config.address, config.webserver.port_https))?;
 
 		tokio::spawn({
 			let server = server.clone();
 			async move {
 				let _ = shutdown.wrap_cancel(shutdown.wrap_trigger_shutdown(2, async move {
 					let listener = TcpListener::bind(https_address).await
-						.map_err(|e| log::error!("Failed to bind to address '{:?}': {e}", https_address))?;
+						.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
 					let acceptor = TlsAcceptor::from_config(config.webserver.certificate, config.webserver.private_key)?;
 
-					log::info!("HTTPS server listening for connections on {https_address}");
+					tracing::info!("HTTPS server listening for connections on {https_address}");
 					loop {
 						let (connection, address) = listener.accept().await
-							.map_err(|e| log::error!("Failed to accept connection: {e}"))?;
-						log::trace!("Accepted TLS connection from {address}.");
+							.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
+						tracing::trace!("Accepted TLS connection from {address}.");
 
 						let address = connection.local_addr().ok();
 						let mac_address = if let Some(address) = address {
@@ -148,7 +148,7 @@ impl Webserver {
 					Ok::<(), ()>(())
 				})).await;
 
-				log::debug!("HTTPS server shutting down.");
+				tracing::debug!("HTTPS server shutting down.");
 			}
 		});
 
@@ -171,7 +171,7 @@ impl Webserver {
 			})
 			.unwrap_or_default();
 
-		log::info!("Received {} request for {}.", request.method(), request.uri().path());
+		tracing::info!("Received {} request for {}.", request.method(), request.uri().path());
 
 		let response = if https {
 			match (request.method(), request.uri().path()) {
@@ -186,7 +186,7 @@ impl Webserver {
 				(&Method::GET, "/resume") => self.resume(params).await,
 				(&Method::GET, "/cancel") => self.cancel().await,
 				(method, uri) => {
-					log::warn!("Unhandled {method} request with URI '{uri}'");
+					tracing::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
 				}
 			}
@@ -199,7 +199,7 @@ impl Webserver {
 				(&Method::GET, "/pin") => self.pin().await,
 				(&Method::GET, "/submit-pin") => self.submit_pin(params).await,
 				(method, uri) => {
-					log::warn!("Unhandled {method} request with URI '{uri}'");
+					tracing::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
 				}
 			}
@@ -233,7 +233,7 @@ impl Webserver {
 			Some(application_id) => application_id,
 			None => {
 				let message = format!("Expected 'appasset' in launch request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -241,7 +241,7 @@ impl Webserver {
 			Ok(application_id) => application_id,
 			Err(e) => {
 				let message = format!("Failed to parse application ID: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -250,7 +250,7 @@ impl Webserver {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -259,7 +259,7 @@ impl Webserver {
 			Some(boxart) => boxart,
 			None => {
 				let message = format!("No boxart defined for app '{}'.", application.title);
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -268,7 +268,7 @@ impl Webserver {
 			Ok(boxart_path) => boxart_path,
 			Err(e) => {
 				let message = format!("Failed to expand boxart path: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			},
 		};
@@ -276,7 +276,7 @@ impl Webserver {
 			Ok(boxart_path) => boxart_path,
 			Err(e) => {
 				let message = format!("Failed to create boxart path: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			},
 		};
@@ -285,7 +285,7 @@ impl Webserver {
 			Ok(asset) => asset,
 			Err(e) => {
 				let message = format!("Failed to load boxart: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -293,7 +293,7 @@ impl Webserver {
 		let mut buffer = std::io::Cursor::new(vec![]);
 		if let Err(e) = asset.write_to(&mut buffer, ImageFormat::Png) {
 			let message = format!("Failed to encode boxart: {e}");
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 
@@ -312,7 +312,7 @@ impl Webserver {
 			Some(unique_id) => unique_id.clone(),
 			None => {
 				let message = format!("Expected 'uniqueid' in /serverinfo request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -321,7 +321,7 @@ impl Webserver {
 			Ok(session_context) => session_context,
 			Err(()) => {
 				let message = "Failed to get session context".to_string();
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			},
 		};
@@ -376,7 +376,7 @@ impl Webserver {
 			Some(unique_id) => unique_id,
 			None => {
 				let message = format!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -385,7 +385,7 @@ impl Webserver {
 			Some(pin) => pin,
 			None => {
 				let message = format!("Expected 'pin' in pin request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -399,7 +399,7 @@ impl Webserver {
 					Ok(response) => response,
 					Err(e) => {
 						let message = format!("Failed to create '/pin' response: {e}");
-						log::warn!("{message}");
+						tracing::warn!("{message}");
 						bad_request(message)
 					}
 				}
@@ -419,7 +419,7 @@ impl Webserver {
 	// 		Some(unique_id) => unique_id,
 	// 		None => {
 	// 			let message = format!("Expected 'uniqueid' in unpair request, got {:?}.", params.keys());
-	// 			log::warn!("{message}");
+	// 			tracing::warn!("{message}");
 	// 			return bad_request(message);
 	// 		}
 	// 	};
@@ -442,7 +442,7 @@ impl Webserver {
 			Some(unique_id) => unique_id,
 			None => {
 				let message = format!("Expected 'uniqueid' in launch request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -456,7 +456,7 @@ impl Webserver {
 			Some(application_id) => application_id,
 			None => {
 				let message = format!("Expected 'appid' in launch request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -464,7 +464,7 @@ impl Webserver {
 			Ok(application_id) => application_id,
 			Err(e) => {
 				let message = format!("Failed to parse application ID: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -473,21 +473,21 @@ impl Webserver {
 			Some(mode) => mode,
 			None => {
 				let message = format!("Expected 'mode' in launch request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
 		let mode_parts: Vec<&str> = mode.split('x').collect();
 		if mode_parts.len() != 3 {
 			let message = format!("Expected mode in format WxHxR, but got '{mode}'.");
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 		let width: u32 = match mode_parts[0].parse() {
 			Ok(width) => width,
 			Err(e) => {
 				let message = format!("Failed to parse width: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -495,7 +495,7 @@ impl Webserver {
 			Ok(height) => height,
 			Err(e) => {
 				let message = format!("Failed to parse height: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -503,7 +503,7 @@ impl Webserver {
 			Ok(refresh_rate) => refresh_rate,
 			Err(e) => {
 				let message = format!("Failed to parse refresh rate: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -512,7 +512,7 @@ impl Webserver {
 			Some(remote_input_key) => remote_input_key,
 			None => {
 				let message = format!("Expected 'rikey' in launch request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -520,7 +520,7 @@ impl Webserver {
 			Ok(remote_input_key) => remote_input_key,
 			Err(e) => {
 				let message = format!("Failed to decode remote input key: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -529,7 +529,7 @@ impl Webserver {
 			Some(remote_input_key_id) => remote_input_key_id,
 			None => {
 				let message = format!("Expected 'rikey_id' in launch request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -537,7 +537,7 @@ impl Webserver {
 			Ok(remote_input_key_id) => remote_input_key_id,
 			Err(e) => {
 				let message = format!("Couldn't parse 'rikey_id' in launch request, got '{remote_input_key_id}' with error: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -546,7 +546,7 @@ impl Webserver {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -586,7 +586,7 @@ impl Webserver {
 			Some(unique_id) => unique_id,
 			None => {
 				let message = format!("Expected 'uniqueid' in resume request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -600,7 +600,7 @@ impl Webserver {
 			Some(remote_input_key) => remote_input_key,
 			None => {
 				let message = format!("Expected 'rikey' in resume request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -608,7 +608,7 @@ impl Webserver {
 			Ok(remote_input_key) => remote_input_key,
 			Err(e) => {
 				let message = format!("Failed to decode remote input key: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -617,7 +617,7 @@ impl Webserver {
 			Some(remote_input_key_id) => remote_input_key_id,
 			None => {
 				let message = format!("Expected 'rikey_id' in resume request, got {:?}.", params.keys());
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -625,7 +625,7 @@ impl Webserver {
 			Ok(remote_input_key_id) => remote_input_key_id,
 			Err(e) => {
 				let message = format!("Couldn't parse 'rikey_id' in resume request, got '{remote_input_key_id}' with error: {e}");
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -654,7 +654,7 @@ impl Webserver {
 	async fn cancel(&self) -> Response<Full<Bytes>> {
 		if self.session_manager.stop_session().await.is_err() {
 			let message = "Failed to stop session".to_string();
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 
@@ -684,17 +684,17 @@ fn not_found() -> Response<Full<Bytes>> {
 
 fn get_mac_address(address: IpAddr) -> Result<Option<String>, ()> {
 	let interfaces = network_interface::NetworkInterface::show()
-		.map_err(|e| log::error!("Failed to retrieve network interfaces: {e}"))?;
+		.map_err(|e| tracing::error!("Failed to retrieve network interfaces: {e}"))?;
 
 	for interface in interfaces {
 		for interface_address in interface.addr {
 			if interface_address.ip() == address {
-				log::debug!("Found MAC address for address {:?}: {:?}", address, interface.mac_addr.as_ref().unwrap_or(&"None".to_string()));
+				tracing::debug!("Found MAC address for address {:?}: {:?}", address, interface.mac_addr.as_ref().unwrap_or(&"None".to_string()));
 				return Ok(interface.mac_addr);
 			}
 		}
 	}
 
-	log::warn!("No interface found matching address {:?}", address);
+	tracing::warn!("No interface found matching address {:?}", address);
 	Ok(None)
 }

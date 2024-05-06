@@ -3,6 +3,10 @@ use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
 use clap::Parser;
+use tracing::level_filters::LevelFilter;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::{EnvFilter, Layer};
 use crate::clients::ClientManager;
 use crate::config::Config;
 use crate::crypto::create_certificate;
@@ -45,52 +49,56 @@ async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
 	let log_level = match i16::from(args.verbose) - i16::from(args.quiet) {
-		..= -2 => log::LevelFilter::Error,
-		-1 => log::LevelFilter::Warn,
-		0 => log::LevelFilter::Info,
-		1 => log::LevelFilter::Debug,
-		2.. => log::LevelFilter::Trace,
+		..= -2 => LevelFilter::ERROR,
+		-1 => LevelFilter::WARN,
+		0 => LevelFilter::INFO,
+		1 => LevelFilter::DEBUG,
+		2.. => LevelFilter::TRACE,
 	};
 
-	env_logger::Builder::new()
-		.filter_module(module_path!(), log_level)
-		.format_timestamp_millis()
-		.parse_default_env()
+	tracing_subscriber::registry()
+		.with(tracing_subscriber::fmt::layer()
+			.with_filter(log_level)
+		)
+		.with(EnvFilter::builder()
+			.with_default_directive(LevelFilter::INFO.into())
+			.from_env_lossy(),
+		)
 		.init();
 
 	let mut config;
 	if args.config.exists() {
 		config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
 	} else {
-		log::info!("No config file found at {}, creating a default config file.", args.config.display());
+		tracing::info!("No config file found at {}, creating a default config file.", args.config.display());
 		config = Config::default();
 
 		let serialized_config = toml::to_string_pretty(&config)
-			.map_err(|e| log::error!("Failed to serialize config: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to serialize config: {e}"))?;
 
 		let config_dir = args.config.parent()
-			.ok_or_else(|| log::error!("Failed to get parent directory of config file."))?;
+			.ok_or_else(|| tracing::error!("Failed to get parent directory of config file."))?;
 		std::fs::create_dir_all(config_dir)
-			.map_err(|e| log::error!("Failed to create config directory: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to create config directory: {e}"))?;
 		std::fs::write(args.config, serialized_config)
-			.map_err(|e| log::error!("Failed to save config file: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to save config file: {e}"))?;
 	}
 
 	// Resolve these paths so that the rest of the code doesn't need to.
 	let cert_path = config.webserver.certificate.to_string_lossy().to_string();
 	let cert_path = shellexpand::full(&cert_path)
-		.map_err(|e| log::error!("Failed to expand certificate path: {e}"))?;
+		.map_err(|e| tracing::error!("Failed to expand certificate path: {e}"))?;
 	config.webserver.certificate = cert_path.to_string().into();
 
 	let private_key_path = config.webserver.private_key.to_string_lossy().to_string();
 	let private_key_path = shellexpand::full(&private_key_path)
-		.map_err(|e| log::error!("Failed to expand private key path: {e}"))?;
+		.map_err(|e| tracing::error!("Failed to expand private key path: {e}"))?;
 	config.webserver.private_key = private_key_path.to_string().into();
 
-	log::debug!("Using configuration:\n{:#?}", config);
+	tracing::debug!("Using configuration:\n{:#?}", config);
 
 	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
-	log::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
+	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
 	config.applications.extend(scanned_applications);
 
 	// Spawn a task to wait for CTRL+C and trigger a shutdown.
@@ -99,11 +107,11 @@ async fn main() -> Result<(), ()> {
 		let shutdown = shutdown.clone();
 		async move {
 			if let Err(e) = tokio::signal::ctrl_c().await {
-				log::error!("Failed to wait for CTRL+C: {e}");
+				tracing::error!("Failed to wait for CTRL+C: {e}");
 				std::process::exit(1);
 			}
 
-			log::info!("Received interrupt signal. Shutting down server...");
+			tracing::info!("Received interrupt signal. Shutting down server...");
 			shutdown.trigger_shutdown(1).ok();
 		}
 	});
@@ -119,7 +127,7 @@ async fn main() -> Result<(), ()> {
 
 	// Wait until everything was shutdown.
 	let exit_code = shutdown.wait_shutdown_complete().await;
-	log::trace!("Successfully waited for shutdown to complete.");
+	tracing::trace!("Successfully waited for shutdown to complete.");
 	std::process::exit(exit_code);
 }
 
@@ -138,42 +146,42 @@ impl Moonshine {
 		let state = State::new().await?;
 
 		let (cert, pkey) = if !config.webserver.certificate.exists() && !config.webserver.private_key.exists() {
-			log::info!("No certificate found, creating a new one.");
+			tracing::info!("No certificate found, creating a new one.");
 
 			let (cert, pkey) = create_certificate()
-				.map_err(|e| log::error!("Failed to create certificate: {e}"))?;
+				.map_err(|e| tracing::error!("Failed to create certificate: {e}"))?;
 
 			// Write certificate to file
 			let cert_dir = config.webserver.certificate.parent()
-				.ok_or_else(|| log::error!("Failed to find parent directory for certificate file."))?;
+				.ok_or_else(|| tracing::error!("Failed to find parent directory for certificate file."))?;
 			std::fs::create_dir_all(cert_dir)
-				.map_err(|e| log::error!("Failed to create certificate directory: {e}"))?;
+				.map_err(|e| tracing::error!("Failed to create certificate directory: {e}"))?;
 			let mut certfile = std::fs::File::create(&config.webserver.certificate).unwrap();
-			certfile.write(&cert.to_pem().map_err(|e| log::error!("Failed to serialize PEM: {e}"))?)
-				.map_err(|e| log::error!("Failed to write PEM to file: {e}"))?;
+			certfile.write(&cert.to_pem().map_err(|e| tracing::error!("Failed to serialize PEM: {e}"))?)
+				.map_err(|e| tracing::error!("Failed to write PEM to file: {e}"))?;
 
 			// Write private key to file
 			let private_key_dir = config.webserver.private_key.parent()
-				.ok_or_else(|| log::error!("Failed to find parent directory for private key file."))?;
+				.ok_or_else(|| tracing::error!("Failed to find parent directory for private key file."))?;
 			std::fs::create_dir_all(private_key_dir)
-				.map_err(|e| log::error!("Failed to create private key directory: {e}"))?;
+				.map_err(|e| tracing::error!("Failed to create private key directory: {e}"))?;
 			let mut keyfile = std::fs::File::create(&config.webserver.private_key).unwrap();
-			keyfile.write(&pkey.private_key_to_pem_pkcs8().map_err(|e| log::error!("Failed to serialize private key: {e}"))?)
-				.map_err(|e| log::error!("Failed to write private key to file: {e}"))?;
+			keyfile.write(&pkey.private_key_to_pem_pkcs8().map_err(|e| tracing::error!("Failed to serialize private key: {e}"))?)
+				.map_err(|e| tracing::error!("Failed to write private key to file: {e}"))?;
 
-			log::debug!("Saved private key to {}", config.webserver.certificate.display());
-			log::debug!("Saved certificate to {}", config.webserver.private_key.display());
+			tracing::debug!("Saved private key to {}", config.webserver.certificate.display());
+			tracing::debug!("Saved certificate to {}", config.webserver.private_key.display());
 
 			(cert, pkey)
 		} else {
 			let cert = std::fs::read(&config.webserver.certificate)
-				.map_err(|e| log::error!("Failed to read server certificate: {e}"))?;
+				.map_err(|e| tracing::error!("Failed to read server certificate: {e}"))?;
 			let cert = openssl::x509::X509::from_pem(&cert)
-				.map_err(|e| log::error!("Failed to parse server certificate: {e}"))?;
+				.map_err(|e| tracing::error!("Failed to parse server certificate: {e}"))?;
 
 			let pkey = PKey::private_key_from_pem(&std::fs::read(&config.webserver.private_key)
-				.map_err(|e| log::error!("Failed to read private key: {e}"))?)
-				.map_err(|e| log::error!("Failed to parse private key: {e}"))?;
+				.map_err(|e| tracing::error!("Failed to read private key: {e}"))?)
+				.map_err(|e| tracing::error!("Failed to parse private key: {e}"))?;
 
 			(cert, pkey)
 		};

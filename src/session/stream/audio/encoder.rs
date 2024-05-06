@@ -30,31 +30,31 @@ impl AudioEncoder {
 		keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>
 	) -> Result<Self, ()> {
-		log::debug!("Creating audio encoder with sample rate {} and {} channels.", sample_rate, channels);
+		tracing::debug!("Creating audio encoder with sample rate {} and {} channels.", sample_rate, channels);
 		let mut encoder = opus::Encoder::new(
 			sample_rate,
 			if channels > 1 { opus::Channels::Stereo } else { opus::Channels::Mono },
 			opus::Application::LowDelay,
 		)
-			.map_err(|e| log::error!("Failed to create audio encoder: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to create audio encoder: {e}"))?;
 
 		// Moonlight expects a constant bitrate.
 		encoder.set_vbr(false)
-			.map_err(|e| log::error!("Failed to disable variable bitrate: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to disable variable bitrate: {e}"))?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioEncoderInner { };
 		std::thread::Builder::new().name("audio-encode".to_string()).spawn(move || {
 			inner.run(command_rx, audio_rx, encoder, keys, packet_tx)
 		})
-			.map_err(|e| log::error!("Failed to start audio encode thread: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to start audio encode thread: {e}"))?;
 
 		Ok(Self { command_tx })
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
 		self.command_tx.send(AudioEncoderCommand::UpdateKeys(keys)).await
-			.map_err(|e| log::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -78,7 +78,7 @@ impl AudioEncoderInner {
 		const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
 		const MAX_SHARD_SIZE: usize = ((2048 + 15) / 16) * 16; // Where does this come from?
 		let mut fec_encoder = ReedSolomon::<galois_8::Field>::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
-			.map_err(|e| log::error!("Failed to create FEC encoder: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to create FEC encoder: {e}"))?;
 
 		// For unknown reasons, the RS parity matrix computed by our RS implementation
 		// doesn't match the one Nvidia uses for audio data. I'm not exactly sure why,
@@ -106,13 +106,13 @@ impl AudioEncoderInner {
 				Ok(command) => {
 					match command {
 						AudioEncoderCommand::UpdateKeys(new_keys) => {
-							log::debug!("Updating session keys.");
+							tracing::debug!("Updating session keys.");
 							keys = new_keys;
 						}
 					}
 				},
 				Err(mpsc::error::TryRecvError::Disconnected) => {
-					log::debug!("Command channel closed.");
+					tracing::debug!("Command channel closed.");
 					break;
 				},
 				Err(mpsc::error::TryRecvError::Empty) => { },
@@ -120,7 +120,7 @@ impl AudioEncoderInner {
 
 			let audio_fragment = audio_rx.blocking_recv();
 			let Some(audio_fragment) = audio_fragment else {
-				log::debug!("Audio fragment channel closed.");
+				tracing::debug!("Audio fragment channel closed.");
 				break;
 			};
 
@@ -128,8 +128,8 @@ impl AudioEncoderInner {
 			let encoded_size = match encoder.encode(&audio_fragment, &mut encoded_audio) {
 				Ok(encoded_size) => encoded_size,
 				Err(e) => {
-					log::warn!("Failed to encode audio: {e}");
-					let _ = encoder.reset_state().map_err(|e| log::error!("Failed to reset Opus encoder state: {e}"));
+					tracing::warn!("Failed to encode audio: {e}");
+					let _ = encoder.reset_state().map_err(|e| tracing::error!("Failed to reset Opus encoder state: {e}"));
 					continue;
 				}
 			};
@@ -142,7 +142,7 @@ impl AudioEncoderInner {
 			let payload = match encrypt(Cipher::aes_128_cbc(), &encoded_audio[..encoded_size], Some(&keys.remote_input_key), Some(&iv), true) {
 				Ok(payload) => payload,
 				Err(e) => {
-					log::error!("Failed to encrypt audio: {e}");
+					tracing::error!("Failed to encrypt audio: {e}");
 					continue;
 				},
 			};
@@ -182,7 +182,7 @@ impl AudioEncoderInner {
 			let data_shard = shard[..data_shard_size].to_vec(); // TODO: Can we avoid this copy?
 
 			if packet_tx.blocking_send(data_shard).is_err() {
-				log::debug!("Failed to send packet over channel, channel is likely closed.");
+				tracing::debug!("Failed to send packet over channel, channel is likely closed.");
 				break;
 			}
 
@@ -190,14 +190,14 @@ impl AudioEncoderInner {
 				// Create a view of just the data itself for encoding.
 				let mut shards: Vec<&mut [u8]> = shards.iter_mut().map(|s| &mut s[..data_shard_size]).collect();
 				if let Err(e) = fec_encoder.encode(&mut shards) {
-					log::warn!("Failed to encode data shard in FEC block: {e}");
+					tracing::warn!("Failed to encode data shard in FEC block: {e}");
 				}
 			}
 
 			// If the last packet, compute and send parity shards.
 			if sequence_number as usize % NR_DATA_SHARDS == 0 {
 				if fec_encoder.reset().is_err() {
-					log::warn!("Parity is not ready, but we were expecting it to be ready.");
+					tracing::warn!("Parity is not ready, but we were expecting it to be ready.");
 					fec_encoder.reset_force();
 					continue;
 				}
@@ -233,14 +233,14 @@ impl AudioEncoderInner {
 					let parity_shard = shard[..parity_shard_size].to_vec(); // TODO: Can we avoid this copy?
 
 					if packet_tx.blocking_send(parity_shard).is_err() {
-						log::debug!("Failed to send packet over channel, channel is likely closed.");
+						tracing::debug!("Failed to send packet over channel, channel is likely closed.");
 						break;
 					}
 				}
 			}
 		}
 
-		log::debug!("Audio capture channel closed.");
+		tracing::debug!("Audio capture channel closed.");
 		Ok(())
 	}
 }
