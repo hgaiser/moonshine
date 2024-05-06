@@ -73,26 +73,26 @@ enum ControlMessage<'a> {
 impl<'a> ControlMessage<'a> {
 	fn from_bytes(buffer: &'a [u8]) -> Result<Self, ()> {
 		if buffer.len() < 4 {
-			log::warn!("Expected control message to have at least 4 bytes, got {}", buffer.len());
+			tracing::warn!("Expected control message to have at least 4 bytes, got {}", buffer.len());
 			return Err(());
 		}
 
 		let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
 		if length as usize != buffer.len() - 4 {
-			log::info!("Received incorrect packet length: expecting {length} bytes, but buffer says it should be {} bytes.", buffer.len() - 4);
+			tracing::info!("Received incorrect packet length: expecting {length} bytes, but buffer says it should be {} bytes.", buffer.len() - 4);
 			return Err(());
 		}
 
 		match u16::from_le_bytes(buffer[..2].try_into().unwrap()).try_into()? {
 			ControlMessageType::Encrypted => {
 				if buffer.len() < MINIMUM_ENCRYPTED_LENGTH {
-					log::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
+					tracing::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
 					return Err(());
 				}
 
 				let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
 				if (length as usize) < MINIMUM_ENCRYPTED_LENGTH {
-					log::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
+					tracing::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
 					return Err(());
 				}
 
@@ -101,7 +101,7 @@ impl<'a> ControlMessage<'a> {
 					_length: length,
 					sequence_number,
 					tag: buffer[8..8 + ENCRYPTION_TAG_LENGTH].try_into()
-						.map_err(|e| log::warn!("Failed to get tag from encrypted control message: {e}"))?,
+						.map_err(|e| tracing::warn!("Failed to get tag from encrypted control message: {e}"))?,
 					payload: buffer[8 + ENCRYPTION_TAG_LENGTH..].to_vec(),
 				}))
 			},
@@ -114,7 +114,7 @@ impl<'a> ControlMessage<'a> {
 				// Length of the input event, excluding the length itself.
 				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 				if length as usize != buffer.len() - 8 {
-					log::info!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8);
+					tracing::info!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8);
 					return Err(());
 				}
 
@@ -179,7 +179,7 @@ impl ControlStream {
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
 		self.command_tx.send(ControlStreamCommand::UpdateKeys(keys)).await
-			.map_err(|e| log::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -200,7 +200,7 @@ impl ControlStreamInner {
 	) -> Result<(), ()> {
 		let local_addr = Address::new(
 			config.address.parse()
-				.map_err(|e| log::error!("Failed to parse address: {e}"))?,
+				.map_err(|e| tracing::error!("Failed to parse address: {e}"))?,
 			config.stream.control.port,
 		);
 		let mut host = enet
@@ -211,9 +211,9 @@ impl ControlStreamInner {
 				BandwidthLimit::Unlimited,
 				BandwidthLimit::Unlimited,
 			)
-			.map_err(|e| log::error!("Failed to create Enet host: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to create Enet host: {e}"))?;
 
-		log::debug!("Listening for control messages on {:?}", host.address());
+		tracing::debug!("Listening for control messages on {:?}", host.address());
 
 		let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 
@@ -224,13 +224,13 @@ impl ControlStreamInner {
 				Ok(command) => {
 					match command {
 						ControlStreamCommand::UpdateKeys(keys) => {
-							log::debug!("Updating session keys.");
+							tracing::debug!("Updating session keys.");
 							context.keys = keys;
 						},
 					}
 				},
 				Err(TryRecvError::Disconnected) => {
-					log::debug!("Command channel closed.");
+					tracing::debug!("Command channel closed.");
 					break;
 				},
 				Err(TryRecvError::Empty) => { },
@@ -238,11 +238,11 @@ impl ControlStreamInner {
 
 			// Check if the timeout has passed.
 			if std::time::Instant::now() > stop_deadline {
-				log::info!("Stopping because we haven't received a ping for {} seconds.", config.stream_timeout);
+				tracing::info!("Stopping because we haven't received a ping for {} seconds.", config.stream_timeout);
 				break;
 			}
 
-			match host.service(1000).map_err(|e| log::error!("Failure in enet host: {e}"))? {
+			match host.service(1000).map_err(|e| tracing::error!("Failure in enet host: {e}"))? {
 				Some(Event::Connect(_)) => {},
 				Some(Event::Disconnect(..)) => {},
 				Some(Event::Receive {
@@ -250,7 +250,7 @@ impl ControlStreamInner {
 					..
 				}) => {
 					let mut control_message = ControlMessage::from_bytes(packet.data())?;
-					log::trace!("Received control message: {control_message:?}");
+					tracing::trace!("Received control message: {control_message:?}");
 
 					// First check for encrypted control messages and decrypt them.
 					let decrypted;
@@ -270,7 +270,7 @@ impl ControlStreamInner {
 						decrypted = match decrypted_result {
 							Ok(decrypted) => decrypted,
 							Err(e) => {
-								log::error!("Failed to decrypt control message: {:?}", e.errors());
+								tracing::error!("Failed to decrypt control message: {:?}", e.errors());
 								continue;
 							}
 						};
@@ -280,7 +280,7 @@ impl ControlStreamInner {
 							Err(()) => continue,
 						};
 
-						log::trace!("Decrypted control message: {control_message:?}");
+						tracing::trace!("Decrypted control message: {control_message:?}");
 					}
 
 					match control_message {
@@ -299,7 +299,7 @@ impl ControlStreamInner {
 							let _ = input_handler.handle_raw_input(event).await;
 						},
 						skipped_message => {
-							log::trace!("Skipped control message: {skipped_message:?}");
+							tracing::trace!("Skipped control message: {skipped_message:?}");
 						},
 					};
 				}
@@ -307,7 +307,7 @@ impl ControlStreamInner {
 			}
 		}
 
-		log::debug!("Control stream closing.");
+		tracing::debug!("Control stream closing.");
 		Ok(())
 	}
 }

@@ -5,16 +5,16 @@ use crate::config::{SteamApplicationScannerConfig, ApplicationConfig};
 pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
 	let library_path = config.library.join("steamapps").join("libraryfolders.vdf").to_string_lossy().to_string();
 	let library_path = shellexpand::full(&library_path)
-		.map_err(|e| log::error!("Failed to expand {library_path:?}: {e}"))?;
+		.map_err(|e| tracing::error!("Failed to expand {library_path:?}: {e}"))?;
 	let library = std::fs::read_to_string(library_path.as_ref())
-		.map_err(|e| log::warn!("Failed to open library: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to open library: {e}"))?;
 
 	// Poor man's library parsing.
 	let start_apps = library.find("apps")
-		.ok_or_else(|| log::warn!("Failed to find 'apps' key in {library_path:?}."))?;
+		.ok_or_else(|| tracing::warn!("Failed to find 'apps' key in {library_path:?}."))?;
 	let library = &library[start_apps..];
 	let stop_apps = library.find('}')
-		.ok_or_else(|| log::warn!("Failed to find end of 'apps' section."))?;
+		.ok_or_else(|| tracing::warn!("Failed to find end of 'apps' section."))?;
 	let library = &library[..stop_apps];
 
 	let mut applications = Vec::new();
@@ -28,7 +28,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 		let game_id = match line.split('\"').nth(1) {
 			Some(game_id) => game_id,
 			None => {
-				log::warn!("Failed to parse library entry: '{line}'");
+				tracing::warn!("Failed to parse library entry: '{line}'");
 				continue;
 			},
 		};
@@ -36,7 +36,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 		let game_id: u32 = match game_id.parse() {
 			Ok(game_id) => game_id,
 			Err(e) => {
-				log::warn!("Failed to parse game id: {e}");
+				tracing::warn!("Failed to parse game id: {e}");
 				continue;
 			},
 		};
@@ -90,11 +90,11 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 					if path.exists() {
 						application.boxart = Some(path);
 					} else {
-						log::warn!("No boxart for game '{}' at '{boxart}", application.title);
+						tracing::warn!("No boxart for game '{}' at '{boxart}", application.title);
 					}
 				},
 				Err(e) => {
-					log::warn!("Failed to parse boxart path: {e}");
+					tracing::warn!("Failed to parse boxart path: {e}");
 				}
 			}
 		}

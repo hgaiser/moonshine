@@ -34,7 +34,7 @@ pub async fn handle_pair_request(
 			"pairchallenge" => pair_challenge(params, client_manager).await,
 			unknown => {
 				let message = format!("Unknown pair phrase received: {}", unknown);
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				bad_request(message)
 			}
 		}
@@ -46,7 +46,7 @@ pub async fn handle_pair_request(
 		client_pairing_secret(params, client_manager).await
 	} else {
 		let message = format!("Unknown pair command with params: {:?}", params);
-		log::warn!("{message}");
+		tracing::warn!("{message}");
 		bad_request(message)
 	}
 }
@@ -62,7 +62,7 @@ async fn get_server_cert(
 		Some(client_cert) => client_cert,
 		None => {
 			let message = format!("Expected 'clientcert' in get server cert request, got {:?}.", params.keys());
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -70,7 +70,7 @@ async fn get_server_cert(
 		Ok(cert) => cert,
 		Err(e) => {
 			let message = format!("{e}");
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -79,7 +79,7 @@ async fn get_server_cert(
 		Some(unique_id) => unique_id,
 		None => {
 			let message = format!("Expected 'uniqueid' in get server cert request, got {:?}.", params.keys());
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -88,7 +88,7 @@ async fn get_server_cert(
 		Some(salt) => salt,
 		None => {
 			let message = format!("Expected 'salt' in get server cert request, got {:?}.", params.keys());
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -96,7 +96,7 @@ async fn get_server_cert(
 		Ok(salt) => salt,
 		Err(e) => {
 			let message = format!("{e}");
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -104,7 +104,7 @@ async fn get_server_cert(
 		Ok(salt) => salt,
 		Err(e) => {
 			let message = format!("Failed to parse salt value, expected exactly 16 values but got {e:?}");
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -113,7 +113,7 @@ async fn get_server_cert(
 		Ok(pem) => pem,
 		Err(e) => {
 			let message = format!("{e}");
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -135,7 +135,7 @@ async fn get_server_cert(
 			Ok(()) => {},
 			Err(()) => {
 				let message = "Failed to start pairing client".to_string();
-				log::warn!("{message}");
+				tracing::warn!("{message}");
 				return bad_request(message);
 			}
 		};
@@ -147,7 +147,7 @@ async fn get_server_cert(
 	if let Some(local_address) = local_address {
 		let scheme = request.uri().scheme().map(|s| s.to_string()).unwrap_or("http".to_string());
 		let pin_url = format!("{}://{}:{}/pin", scheme, local_address.ip(), local_address.port());
-		log::info!("Waiting for pin to be sent at {pin_url}");
+		tracing::info!("Waiting for pin to be sent at {pin_url}");
 
 		let _ = std::thread::Builder::new().name("pin-notification".to_string()).spawn(move || {
 			Notification::new()
@@ -156,7 +156,7 @@ async fn get_server_cert(
 				.action("default", "default")
 				.action("open", "Enter PIN")
 				.show()
-				.map_err(|e| log::warn!("Failed to show PIN notification: {e}"))?
+				.map_err(|e| tracing::warn!("Failed to show PIN notification: {e}"))?
 				.wait_for_action(|action| {
 					if action != "__closed" {
 						let _ = open::that(pin_url);
@@ -176,7 +176,7 @@ async fn get_server_cert(
 		Ok(pem) => pem,
 		Err(e) => {
 			let message = format!("{e}");
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -198,7 +198,7 @@ async fn client_challenge(
 		Some(unique_id) => unique_id,
 		None => {
 			let message = format!("Expected 'uniqueid' in get server cert request, got {:?}.", params.keys());
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -206,7 +206,7 @@ async fn client_challenge(
 		Some(challenge) => challenge,
 		None => {
 			let message = format!("Expected 'clientchallenge' in get server cert request, got {:?}.", params.keys());
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -214,7 +214,7 @@ async fn client_challenge(
 		Ok(challenge) => challenge,
 		Err(e) => {
 			let message = e.to_string();
-			log::error!("{message}");
+			tracing::error!("{message}");
 			return bad_request(message)
 		}
 	};
@@ -245,7 +245,7 @@ async fn server_challenge_response(
 		Some(server_challenge_response) => server_challenge_response,
 		None => {
 			let message = format!("Expected 'serverchallengeresp' in server challenge response request, got {:?}.", params.keys());
-			log::error!("{message}");
+			tracing::error!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -253,7 +253,7 @@ async fn server_challenge_response(
 		Ok(server_challenge_response) => server_challenge_response,
 		Err(e) => {
 			let message = e.to_string();
-			log::error!("{message}");
+			tracing::error!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -262,7 +262,7 @@ async fn server_challenge_response(
 		Some(unique_id) => unique_id,
 		None => {
 			let message = format!("Expected 'uniqueid' in get server cert request, got {:?}.", params.keys());
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -293,7 +293,7 @@ async fn pair_challenge(
 		Some(unique_id) => unique_id,
 		None => {
 			let message = format!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -320,7 +320,7 @@ async fn client_pairing_secret(
 		Some(client_pairing_secret) => client_pairing_secret,
 		None => {
 			let message = format!("Expected 'clientpairingsecret' in client pairing secret request, got {:?}.", params.keys());
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -328,7 +328,7 @@ async fn client_pairing_secret(
 		Ok(client_pairing_secret) => client_pairing_secret,
 		Err(e) => {
 			let message = e.to_string();
-			log::error!("{message}");
+			tracing::error!("{message}");
 			return bad_request(message);
 		}
 	};
@@ -337,7 +337,7 @@ async fn client_pairing_secret(
 		Some(unique_id) => unique_id,
 		None => {
 			let message = format!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
-			log::warn!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		}
 	};

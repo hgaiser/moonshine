@@ -26,20 +26,20 @@ impl RtspServer {
 					let server = server.clone();
 					async move {
 						let address = (config.address.as_str(), config.stream.port).to_socket_addrs()
-							.map_err(|e| log::error!("Failed to resolve address {}:{}: {}", config.address, config.stream.port, e))?
+							.map_err(|e| tracing::error!("Failed to resolve address {}:{}: {}", config.address, config.stream.port, e))?
 							.next()
-							.ok_or_else(|| log::error!("Failed to resolve address {}:{}", config.address, config.stream.port))?;
+							.ok_or_else(|| tracing::error!("Failed to resolve address {}:{}", config.address, config.stream.port))?;
 						let listener = TcpListener::bind(address)
 							.await
-							.map_err(|e| log::error!("Failed to bind to address {}: {}", address, e))?;
+							.map_err(|e| tracing::error!("Failed to bind to address {}: {}", address, e))?;
 
-						log::info!("RTSP server listening on {}", address);
+						tracing::info!("RTSP server listening on {}", address);
 
 						loop {
 							let (connection, address) = listener.accept()
 								.await
-								.map_err(|e| log::error!("Failed to accept connection: {}", e))?;
-							log::trace!("Accepted connection from {}", address);
+								.map_err(|e| tracing::error!("Failed to accept connection: {}", e))?;
+							tracing::trace!("Accepted connection from {}", address);
 
 							tokio::spawn({
 								let server = server.clone();
@@ -55,7 +55,7 @@ impl RtspServer {
 					}
 				})).await;
 
-				log::debug!("RTSP server shutting down.");
+				tracing::debug!("RTSP server shutting down.");
 			}
 		});
 
@@ -90,14 +90,14 @@ impl RtspServer {
 		let transports = match request.typed_header::<rtsp_types::headers::Transports>() {
 			Ok(transports) => transports,
 			Err(e) => {
-				log::warn!("Failed to parse transport information from SETUP request: {e}");
+				tracing::warn!("Failed to parse transport information from SETUP request: {e}");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			}
 		};
 		let transports = match transports {
 			Some(transports) => transports,
 			None => {
-				log::warn!("No transport information in SETUP request.");
+				tracing::warn!("No transport information in SETUP request.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			}
 		};
@@ -108,19 +108,19 @@ impl RtspServer {
 					let request_uri = match request.request_uri() {
 						Some(query) => query,
 						None => {
-							log::warn!("No request URI in SETUP request.");
+							tracing::warn!("No request URI in SETUP request.");
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)
 						}
 					};
 					let query = match request_uri.query_pairs().next() {
 						Some(query) => query,
 						None => {
-							log::warn!("No query in request URI in SETUP request.");
+							tracing::warn!("No query in request URI in SETUP request.");
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)
 						}
 					};
 					if query.0 != "streamid" {
-						log::warn!("Expected only one query parameter with 'streamid', but didn't find it.");
+						tracing::warn!("Expected only one query parameter with 'streamid', but didn't find it.");
 						return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 					}
 
@@ -130,16 +130,16 @@ impl RtspServer {
 						Some("audio") => ("audio", self.config.stream.audio.port),
 						Some("control") => ("control", self.config.stream.control.port),
 						Some(stream) => {
-							log::warn!("Unknown stream '{stream}'");
+							tracing::warn!("Unknown stream '{stream}'");
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 						}
 						None => {
-							log::warn!("Unexpected query format for query '{}'", query.1);
+							tracing::warn!("Unexpected query format for query '{}'", query.1);
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 						},
 					};
 
-					log::info!("Responding with server_port={port} for stream '{stream_id}'.");
+					tracing::info!("Responding with server_port={port} for stream '{stream_id}'.");
 
 					return rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 						.header(headers::CSEQ, cseq.to_string())
@@ -149,13 +149,13 @@ impl RtspServer {
 					;
 				}
 				t => {
-					log::warn!("Received request for unsupported transport: {:?}", t);
+					tracing::warn!("Received request for unsupported transport: {:?}", t);
 					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 				}
 			}
 		}
 
-		log::warn!("No transports found in SETUP request.");
+		tracing::warn!("No transports found in SETUP request.");
 		rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)
 	}
 
@@ -165,7 +165,7 @@ impl RtspServer {
 		cseq: i32,
 	) -> rtsp_types::Response<Vec<u8>> {
 		let description = self.description();
-		log::debug!("SDP session data: \n{}", description.trim());
+		tracing::debug!("SDP session data: \n{}", description.trim());
 		rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 			.header(headers::CSEQ, cseq.to_string())
 			.build(description.into_bytes())
@@ -179,45 +179,45 @@ impl RtspServer {
 		let sdp_session = match sdp_types::Session::parse(request.body()) {
 			Ok(sdp_session) => sdp_session,
 			Err(e) => {
-				log::warn!("Failed to parse ANNOUNCE request as SDP session: {e}");
+				tracing::warn!("Failed to parse ANNOUNCE request as SDP session: {e}");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			}
 		};
 
-		log::trace!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
+		tracing::trace!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
 
 		let width = match get_sdp_attribute(&sdp_session, "x-nv-video[0].clientViewportWd") {
 			Ok(width) => width,
 			Err(()) => {
-				log::warn!("Failed to parse x-nv-video[0].clientViewportWd in SDP session.");
+				tracing::warn!("Failed to parse x-nv-video[0].clientViewportWd in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let height = match get_sdp_attribute(&sdp_session, "x-nv-video[0].clientViewportHt") {
 			Ok(height) => height,
 			Err(()) => {
-				log::warn!("Failed to parse x-nv-video[0].clientViewportHt in SDP session.");
+				tracing::warn!("Failed to parse x-nv-video[0].clientViewportHt in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let fps = match get_sdp_attribute(&sdp_session, "x-nv-video[0].maxFPS") {
 			Ok(fps) => fps,
 			Err(()) => {
-				log::warn!("Failed to parse xx-nv-video[0].maxFPS in SDP session.");
+				tracing::warn!("Failed to parse xx-nv-video[0].maxFPS in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let packet_size = match get_sdp_attribute(&sdp_session, "x-nv-video[0].packetSize") {
 			Ok(packet_size) => packet_size,
 			Err(()) => {
-				log::warn!("Failed to parse x-nv-video[0].packetSize in SDP session.");
+				tracing::warn!("Failed to parse x-nv-video[0].packetSize in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let mut bitrate = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].bw.maximumBitrateKbps") {
 			Ok(bitrate) => bitrate,
 			Err(()) => {
-				log::warn!("Failed to parse x-nv-vqos[0].bw.maximumBitrateKbps in SDP session.");
+				tracing::warn!("Failed to parse x-nv-vqos[0].bw.maximumBitrateKbps in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
@@ -225,21 +225,21 @@ impl RtspServer {
 		let minimum_fec_packets = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].fec.minRequiredFecPackets") {
 			Ok(minimum_fec_packets) => minimum_fec_packets,
 			Err(()) => {
-				log::warn!("Failed to parse x-nv-vqos[0].fec.minRequiredFecPackets in SDP session.");
+				tracing::warn!("Failed to parse x-nv-vqos[0].fec.minRequiredFecPackets in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let video_qos_type: String = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].qosTrafficType") {
 			Ok(video_qos_type) => video_qos_type,
 			Err(()) => {
-				log::warn!("Failed to parse x-nv-vqos[0].qosTrafficType in SDP session.");
+				tracing::warn!("Failed to parse x-nv-vqos[0].qosTrafficType in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let video_format: u32 = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].bitStreamFormat") {
 			Ok(video_format) => video_format,
 			Err(()) => {
-				log::warn!("Failed to parse x-nv-vqos[0].bitStreamFormat in SDP session.");
+				tracing::warn!("Failed to parse x-nv-vqos[0].bitStreamFormat in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
@@ -258,14 +258,14 @@ impl RtspServer {
 		let packet_duration = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
 			Ok(packet_duration) => packet_duration,
 			Err(()) => {
-				log::warn!("Failed to parse x-nv-video[0].clientViewportHt in SDP session.");
+				tracing::warn!("Failed to parse x-nv-video[0].clientViewportHt in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
 		let audio_qos_type: String = match get_sdp_attribute(&sdp_session, "x-nv-aqos.qosTrafficType") {
 			Ok(audio_qos_type) => audio_qos_type,
 			Err(()) => {
-				log::warn!("Failed to parse x-nv-aqos.qosTrafficType in SDP session.");
+				tracing::warn!("Failed to parse x-nv-aqos.qosTrafficType in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
@@ -308,45 +308,45 @@ impl RtspServer {
 		let message = loop {
 			let mut buffer = [0u8; 2048];
 			let bytes_read = connection.read(&mut buffer).await
-				.map_err(|e| log::error!("Failed to read from connection '{}': {}", address, e))?;
+				.map_err(|e| tracing::error!("Failed to read from connection '{}': {}", address, e))?;
 			if bytes_read == 0 {
-				log::warn!("Received empty RTSP request.");
+				tracing::warn!("Received empty RTSP request.");
 				return Ok(());
 			}
 			message_buffer.push_str(std::str::from_utf8(&buffer[..bytes_read])
-				.map_err(|e| log::error!("Failed to convert message to string: {e}"))?);
+				.map_err(|e| tracing::error!("Failed to convert message to string: {e}"))?);
 
 			// Hacky workaround to fix rtsp_types parsing SETUP/PLAY requests from Moonlight.
 			let message_buffer = message_buffer.replace("streamid", "rtsp://localhost?streamid");
 			let message_buffer = message_buffer.replace("PLAY /", "PLAY rtsp://localhost/");
 
-			log::trace!("Request: {}", message_buffer);
+			tracing::trace!("Request: {}", message_buffer);
 			let result = rtsp_types::Message::parse(&message_buffer);
 
 			break match result {
 				Ok((message, _consumed)) => message,
 				Err(rtsp_types::ParseError::Incomplete(_)) => {
-					log::debug!("Incomplete RTSP message received, waiting for more data.");
+					tracing::debug!("Incomplete RTSP message received, waiting for more data.");
 					continue;
 				},
 				Err(e) => {
-					log::error!("Failed to parse request as RTSP message: {}", e);
+					tracing::error!("Failed to parse request as RTSP message: {}", e);
 					return Err(());
 				}
 			};
 		};
 
-		// log::trace!("Consumed {} bytes into RTSP request: {:#?}", consumed, message);
+		// tracing::trace!("Consumed {} bytes into RTSP request: {:#?}", consumed, message);
 
 		let response = match message {
 			rtsp_types::Message::Request(ref request) => {
-				log::debug!("Received RTSP {:?} request", request.method());
+				tracing::debug!("Received RTSP {:?} request", request.method());
 
 				let cseq: i32 = request.header(&headers::CSEQ)
-					.ok_or_else(|| log::error!("RTSP request has no CSeq header"))?
+					.ok_or_else(|| tracing::error!("RTSP request has no CSeq header"))?
 					.as_str()
 					.parse()
-					.map_err(|e| log::error!("Failed to parse CSeq header: {}", e))?;
+					.map_err(|e| tracing::error!("Failed to parse CSeq header: {}", e))?;
 
 				match request.method() {
 					Method::Announce => self.handle_announce_request(request, cseq).await,
@@ -355,31 +355,31 @@ impl RtspServer {
 					Method::Setup => self.handle_setup_request(request, cseq),
 					Method::Play => self.handle_play_request(request, cseq).await,
 					method => {
-						log::warn!("Received request with unsupported method {:?}", method);
+						tracing::warn!("Received request with unsupported method {:?}", method);
 						rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)
 					}
 				}
 			},
 			_ => {
-				log::warn!("Unknown RTSP message type received");
+				tracing::warn!("Unknown RTSP message type received");
 				rtsp_response(0, rtsp_types::Version::V2_0, rtsp_types::StatusCode::BadRequest)
 			}
 		};
 
-		log::debug!("Sending RTSP response");
-		log::trace!("{:#?}", response);
+		tracing::debug!("Sending RTSP response");
+		tracing::trace!("{:#?}", response);
 
 		let mut buffer = Vec::new();
 		response.write(&mut buffer)
-			.map_err(|e| log::error!("Failed to serialize RTSP response: {}", e))?;
+			.map_err(|e| tracing::error!("Failed to serialize RTSP response: {}", e))?;
 
 		connection.write_all(&buffer).await
-			.map_err(|e| log::error!("Failed to send RTSP response: {}", e))?;
+			.map_err(|e| tracing::error!("Failed to send RTSP response: {}", e))?;
 
 		// For some reason, Moonlight expects a connection per request, so we close the connection here.
 		connection.shutdown()
 			.await
-			.map_err(|e| log::error!("Failed to shutdown the connection: {e}"))?;
+			.map_err(|e| tracing::error!("Failed to shutdown the connection: {e}"))?;
 
 		Ok(())
 	}
@@ -393,9 +393,9 @@ fn rtsp_response(cseq: i32, version: rtsp_types::Version, status: rtsp_types::St
 
 fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Result<F, ()> {
 	sdp_session.get_first_attribute_value(attribute)
-		.map_err(|e| log::warn!("Failed to attribute {attribute} from request: {e}"))?
-		.ok_or_else(|| log::warn!("No {attribute} attribute in request"))?
+		.map_err(|e| tracing::warn!("Failed to attribute {attribute} from request: {e}"))?
+		.ok_or_else(|| tracing::warn!("No {attribute} attribute in request"))?
 		.trim()
 		.parse()
-		.map_err(|_| log::warn!("Attribute {attribute} can't be parsed."))
+		.map_err(|_| tracing::warn!("Attribute {attribute} can't be parsed."))
 }
