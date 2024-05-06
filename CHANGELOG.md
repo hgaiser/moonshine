@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Optimizations to audio buffer management.
 - Run audio encode & capture in a dedicated thread.
+- Use `tracing` instead of `env_logger`.
 
 ## [v0.3.0] - 2024-04-24
 
