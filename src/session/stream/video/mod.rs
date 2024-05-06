@@ -220,7 +220,7 @@ impl VideoStreamInner {
 						}
 					});
 					if let Err(e) = encode_thread {
-						log::error!("Failed to video encoding thread: {e}");
+						log::error!("Failed to start video encoding thread: {e}");
 						continue;
 					}
 

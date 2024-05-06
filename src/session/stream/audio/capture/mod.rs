@@ -1,4 +1,4 @@
-use std::{cell::RefCell, ops::Deref, rc::Rc};
+use std::{cell::RefCell, mem::MaybeUninit, ops::Deref, rc::Rc};
 
 use pulse::{
 	context::{Context, FlagSet},
@@ -140,9 +140,10 @@ impl AudioCapture {
 		log::info!("Recording from source: {monitor_name}");
 
 		let inner = AudioCaptureInner { audio_tx };
-		tokio::task::spawn_blocking(move || {
-			tokio::runtime::Handle::current().block_on(inner.run(stream))
-		});
+		std::thread::Builder::new().name("audio-capture".to_string()).spawn(move ||
+			inner.run(stream)
+		)
+			.map_err(|e| log::error!("Failed to start audio capture thread: {e}"))?;
 
 		Ok(Self { sample_rate, channels })
 	}
@@ -162,11 +163,12 @@ struct AudioCaptureInner {
 }
 
 impl AudioCaptureInner {
-	async fn run(self, stream: pulse_simple::Simple) -> Result<(), ()> {
+	fn run(self, stream: pulse_simple::Simple) -> Result<(), ()> {
 		// Start recording.
 		loop {
-			// Allocate buffer for recording.
-			let mut buffer = vec![0u8; 480];
+			// Allocate uninitialized buffer for recording.
+			let buffer: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); 480];
+			let mut buffer = unsafe { std::mem::transmute::<_, Vec<u8>>(buffer) };
 
 			match stream.read(&mut buffer) {
 				Ok(()) => {
@@ -182,7 +184,7 @@ impl AudioCaptureInner {
 					// Forget about our buffer, ownership has been transferred to samples.
 					std::mem::forget(buffer);
 
-					match self.audio_tx.send(samples).await {
+					match self.audio_tx.blocking_send(samples) {
 						Ok(()) => {},
 						Err(e) => {
 							log::debug!("Received error while sending audio sample: {e}");
