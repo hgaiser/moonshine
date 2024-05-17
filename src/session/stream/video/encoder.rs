@@ -117,7 +117,7 @@ impl Encoder {
 			(*encoder.as_mut_ptr()).pix_fmt = Pixel::CUDA.into();
 			(*encoder.as_mut_ptr()).hw_frames_ctx = hw_frame_context.as_raw_mut();
 			(*encoder.as_mut_ptr()).delay = 0;
-			(*encoder.as_mut_ptr()).refs = 1;
+			(*encoder.as_mut_ptr()).refs = 0;
 		}
 		encoder.set_str("preset", "fast")
 			.map_err(|e| tracing::error!("Failed to set preset for encoder: {e}"))?;
