@@ -30,10 +30,14 @@ jobs:
       run: cargo build --release
 
     - name: Compress
-      run: tar caf "./moonshine.tar.xz" -C ./target/release moonshine
+      run: |
+        mkdir "$RUNNER_TEMP/$GITHUB_REF_NAME"
+        cp -r ./target/release/moonshine README.md "$RUNNER_TEMP/$GITHUB_REF_NAME"
+        cp LICENSE "$RUNNER_TEMP/$GITHUB_REF_NAME/LICENSE"
+        tar caf "./moonshine-$GITHUB_REF_NAME-linux-amd64.tar.xz" -C "$RUNNER_TEMP" "$GITHUB_REF_NAME"
 
     - name: Release
       uses: softprops/action-gh-release@v2
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: "./moonshine.tar.xz"
+        files: "./moonshine-*.tar.xz"
