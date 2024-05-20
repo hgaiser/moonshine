@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add support for Turing and older NVIDIA cards.
+
 ### Changed
 
 - Optimizations to audio buffer management.
