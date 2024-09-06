@@ -18,12 +18,12 @@ This means you can play games on the client device, while rendering takes place 
 The simplest method is to install through the AUR:
 
 ```sh
-$ git clone https://aur.archlinux.org/moonshine-bin
+$ git clone https://aur.archlinux.org/moonshine
 $ cd moonshine
 $ makepkg -si
 ```
 
-Or, simply `yay -S moonshine-bin` if `yay` is installed.
+Or, simply `yay -S moonshine` if `yay` is installed.
 
 You can start the server by starting the user service:
 
