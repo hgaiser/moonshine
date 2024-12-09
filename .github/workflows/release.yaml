@@ -25,9 +25,14 @@ jobs:
     - name: Install dependencies
       run: |
         sudo pacman -Syyuu --noconfirm --needed clang cmake rust avahi cuda ffmpeg gcc-libs glibc libpulse nvidia-utils openssl opus
+        source /etc/profile
+      shell: bash
 
     - name: Build
-      run: cargo build --release
+      run: |
+        source /etc/profile
+        cargo build --release
+      shell: bash
 
     - name: Compress
       run: |
