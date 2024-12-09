@@ -94,9 +94,11 @@ pub struct AudioCapture {
 }
 
 impl AudioCapture {
-	pub async fn new(audio_tx: Sender<Vec<i16>>) -> Result<Self, ()> {
+	pub async fn new(audio_tx: Sender<Vec<f32>>) -> Result<Self, ()> {
+		// TODO: Make configurable.
 		let channels = 2u8;
 		let sample_rate = 48000u32;
+		let sample_time_ms = 5;
 
 		let default_sink_name = match get_default_sink_name() {
 			Ok(name) => name,
@@ -107,7 +109,7 @@ impl AudioCapture {
 		let monitor_name = format!("{default_sink_name}.monitor");
 
 		let sample_spec = Spec {
-			format: pulse::sample::Format::S16le,
+			format: pulse::sample::Format::F32le,
 			channels,
 			rate: sample_rate,
 		};
@@ -122,11 +124,11 @@ impl AudioCapture {
 			&sample_spec,                     // Sample specification.
 			None,                             // Use default channel map.
 			Some(&BufferAttr {
-				maxlength: std::mem::size_of::<i16>() as u32 * sample_rate * channels as u32 * 5 / 1000,
-				tlength: std::u32::MAX,
-				prebuf: std::u32::MAX,
-				minreq: std::u32::MAX,
-				fragsize: std::u32::MAX,
+				maxlength: u32::MAX,
+				tlength: u32::MAX,
+				prebuf: u32::MAX,
+				minreq: u32::MAX,
+				fragsize: std::mem::size_of::<f32>() as u32 * sample_rate * channels as u32 * sample_time_ms / 1000,
 			}),
 		).map_err(|e| tracing::error!("Failed to create audio capture device: {e}"));
 
@@ -159,25 +161,32 @@ impl AudioCapture {
 
 struct AudioCaptureInner {
 	/// Channel to communicate audio fragments over.
-	audio_tx: Sender<Vec<i16>>,
+	audio_tx: Sender<Vec<f32>>,
 }
 
 impl AudioCaptureInner {
 	fn run(self, stream: pulse_simple::Simple) -> Result<(), ()> {
+		// TODO: Make configurable.
+		const SAMPLE_RATE: usize = 48000;
+		const SAMPLE_TIME_MS: usize = 5;
+		const FRAME_SIZE: usize = std::mem::size_of::<f32>() * SAMPLE_RATE * SAMPLE_TIME_MS / 1000;
+
 		// Start recording.
 		loop {
 			// Allocate uninitialized buffer for recording.
-			let buffer: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); 480];
-			let mut buffer = unsafe { std::mem::transmute::<_, Vec<u8>>(buffer) };
+			let buffer: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); FRAME_SIZE];
+			let mut buffer = unsafe {
+				std::mem::transmute::<std::vec::Vec<std::mem::MaybeUninit<u8>>, std::vec::Vec<u8>>(buffer)
+			};
 
 			match stream.read(&mut buffer) {
 				Ok(()) => {
-					// Convert Vec<u8> to Vec<i16>.
+					// Convert Vec<u8> to Vec<f32>.
 					let samples = unsafe {
 						Vec::from_raw_parts(
-							buffer.as_ptr() as *mut i16,
-							buffer.len() / std::mem::size_of::<i16>(),
-							buffer.len() / std::mem::size_of::<i16>(),
+							buffer.as_ptr() as *mut f32,
+							buffer.len() / std::mem::size_of::<f32>(),
+							buffer.len() / std::mem::size_of::<f32>(),
 						)
 					};
 

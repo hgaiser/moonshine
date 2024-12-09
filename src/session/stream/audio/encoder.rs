@@ -26,10 +26,13 @@ impl AudioEncoder {
 	pub fn new(
 		sample_rate: u32,
 		channels: u8,
-		audio_rx: mpsc::Receiver<Vec<i16>>,
+		audio_rx: mpsc::Receiver<Vec<f32>>,
 		keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>
 	) -> Result<Self, ()> {
+		// TODO: Make this configurable.
+		let audio_bitrate = 512000;
+
 		tracing::debug!("Creating audio encoder with sample rate {} and {} channels.", sample_rate, channels);
 		let mut encoder = opus::Encoder::new(
 			sample_rate,
@@ -41,6 +44,8 @@ impl AudioEncoder {
 		// Moonlight expects a constant bitrate.
 		encoder.set_vbr(false)
 			.map_err(|e| tracing::error!("Failed to disable variable bitrate: {e}"))?;
+		encoder.set_bitrate(opus::Bitrate::Bits(audio_bitrate))
+			.map_err(|e| tracing::error!("Failed to set audio bitrate: {e}"))?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioEncoderInner { };
@@ -65,7 +70,7 @@ impl AudioEncoderInner {
 	fn run(
 		self,
 		mut command_rx: mpsc::Receiver<AudioEncoderCommand>,
-		mut audio_rx: mpsc::Receiver<Vec<i16>>,
+		mut audio_rx: mpsc::Receiver<Vec<f32>>,
 		mut encoder: opus::Encoder,
 		mut keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
@@ -98,7 +103,7 @@ impl AudioEncoderInner {
 
 		// A buffer for an audio sample after it has been encoded.
 		// TODO: Decide the correct size for this buffer.
-		let mut encoded_audio = vec![0u8; 1024];
+		let mut encoded_audio = vec![0u8; 1400];
 
 		loop {
 			// Check if there's a command.
@@ -124,8 +129,9 @@ impl AudioEncoderInner {
 				break;
 			};
 
+			// TODO: Figure out the 1000 / 90 value.
 			let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
-			let encoded_size = match encoder.encode(&audio_fragment, &mut encoded_audio) {
+			let encoded_size = match encoder.encode_float(&audio_fragment, &mut encoded_audio) {
 				Ok(encoded_size) => encoded_size,
 				Err(e) => {
 					tracing::warn!("Failed to encode audio: {e}");
@@ -133,6 +139,7 @@ impl AudioEncoderInner {
 					continue;
 				}
 			};
+
 
 			// Encrypt the audio data.
 			// TODO: Check if we should, some clients (ie. Steam Link) don't support this.

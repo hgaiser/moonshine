@@ -112,7 +112,7 @@ impl Encoder {
 		encoder.set_time_base((framerate as i32, 1));
 		encoder.set_max_b_frames(0);
 		encoder.set_bit_rate(bitrate);
-		encoder.set_gop(i32::max_value() as u32);
+		encoder.set_gop(i32::MAX as u32);
 		unsafe {
 			(*encoder.as_mut_ptr()).pix_fmt = Pixel::CUDA.into();
 			(*encoder.as_mut_ptr()).hw_frames_ctx = hw_frame_context.as_raw_mut();
