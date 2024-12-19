@@ -214,14 +214,14 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
-		let mut bitrate = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].bw.maximumBitrateKbps") {
+		let mut bitrate = match get_sdp_attribute(&sdp_session, "x-ml-video.configuredBitrateKbps") {
 			Ok(bitrate) => bitrate,
 			Err(()) => {
-				tracing::warn!("Failed to parse x-nv-vqos[0].bw.maximumBitrateKbps in SDP session.");
+				tracing::warn!("Failed to parse x-ml-video.configuredBitrateKbps in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
-		bitrate *= 1024; // Convert from kbps to bps.
+		bitrate *= 1000; // Convert from kbps to bps.
 		let minimum_fec_packets = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].fec.minRequiredFecPackets") {
 			Ok(minimum_fec_packets) => minimum_fec_packets,
 			Err(()) => {
