@@ -6,7 +6,7 @@ use clap::Parser;
 use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Layer};
+use tracing_subscriber::EnvFilter;
 use crate::clients::ClientManager;
 use crate::config::Config;
 use crate::crypto::create_certificate;
@@ -32,38 +32,15 @@ mod webserver;
 struct Args {
 	/// Path to configuration file.
 	config: PathBuf,
-
-	/// Show more log messages.
-	#[clap(long, short)]
-	#[clap(action = clap::ArgAction::Count)]
-	verbose: u8,
-
-	/// Show less log messages.
-	#[clap(long, short)]
-	#[clap(action = clap::ArgAction::Count)]
-	quiet: u8,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
-	let log_level = match i16::from(args.verbose) - i16::from(args.quiet) {
-		..= -2 => LevelFilter::ERROR,
-		-1 => LevelFilter::WARN,
-		0 => LevelFilter::INFO,
-		1 => LevelFilter::DEBUG,
-		2.. => LevelFilter::TRACE,
-	};
-
 	tracing_subscriber::registry()
-		.with(tracing_subscriber::fmt::layer()
-			.with_filter(log_level)
-		)
-		.with(EnvFilter::builder()
-			.with_default_directive(LevelFilter::INFO.into())
-			.from_env_lossy(),
-		)
+		.with(tracing_subscriber::fmt::layer())
+		.with(EnvFilter::from_default_env())
 		.init();
 
 	let mut config;
