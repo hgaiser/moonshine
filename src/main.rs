@@ -3,7 +3,6 @@ use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
 use clap::Parser;
-use tracing::level_filters::LevelFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;

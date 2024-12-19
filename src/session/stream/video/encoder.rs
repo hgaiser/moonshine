@@ -1,9 +1,9 @@
-use std::{collections::{hash_map::Entry, HashMap}, io::Write, sync::{atomic::Ordering, Arc, Mutex}, u32};
+use std::{collections::{hash_map::Entry, HashMap}, sync::{atomic::Ordering, Arc, Mutex}};
 
 use async_shutdown::ShutdownManager;
 use cudarc::driver::CudaDevice;
 use ffmpeg::{
-	codec::packet::flag::Flags, format::Pixel, option::Settable, packet::Ref, Frame, Packet
+	codec::packet::flag::Flags, format::Pixel, option::Settable, Frame, Packet
 };
 use reed_solomon_erasure::{galois_8, ReedSolomon};
 
