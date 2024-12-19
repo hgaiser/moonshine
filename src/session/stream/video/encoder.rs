@@ -342,8 +342,8 @@ impl Encoder {
 			let mut end = ((block_index + 1) * nr_data_shards_per_block)
 				.min(nr_data_shards);
 
-			if block_index >= 4 {
-				tracing::info!("Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC.");
+			if block_index == 3 {
+				tracing::debug!("Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC.");
 				end = nr_data_shards;
 			}
 
