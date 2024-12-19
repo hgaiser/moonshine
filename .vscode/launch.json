@@ -12,7 +12,7 @@
 					"--bin", "moonshine"
 				]
 			},
-			"args": ["./config.toml", "-v"]
+			"args": ["./config.toml"]
 		},
 		{
 			"type": "lldb",
@@ -26,7 +26,7 @@
 					"--bin", "moonshine"
 				]
 			},
-			"args": ["./config.toml", "-v"]
+			"args": ["./config.toml"]
 		}
 	]
 }
