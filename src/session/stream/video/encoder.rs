@@ -462,11 +462,16 @@ impl Encoder {
 	fn get_fec_encoder(&mut self, nr_data_shards: usize, nr_parity_shards: usize) -> Result<&mut ReedSolomon<galois_8::Field>, ()> {
 		Ok(match self.fec_encoders.entry((nr_data_shards, nr_parity_shards)) {
 			Entry::Occupied(e) => {
+				tracing::trace!("Found a FEC encoder for this combination of shards.");
 				e.into_mut()
 			},
 			Entry::Vacant(e) => {
-				e.insert(ReedSolomon::<galois_8::Field>::new(nr_data_shards, nr_parity_shards)
-					.map_err(|e| tracing::error!("Couldn't create error correction encoder: {e}"))?)
+				tracing::trace!("No FEC encoder for this combination of shards, creating a new one.");
+				let encoder = e.insert(ReedSolomon::<galois_8::Field>::new(nr_data_shards, nr_parity_shards)
+					.map_err(|e| tracing::error!("Couldn't create error correction encoder: {e}"))?);
+				tracing::trace!("Finished preparing FEC encoder.");
+
+				encoder
 			}
 		})
 	}
