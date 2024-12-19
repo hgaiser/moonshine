@@ -175,11 +175,13 @@ impl VideoStreamInner {
 					let capture_buffer = create_frame(context.width, context.height, Pixel::CUDA, &mut encoder.hw_frame_context)?;
 					let intermediate_buffer = Arc::new(Mutex::new(create_frame(context.width, context.height, Pixel::CUDA, &mut encoder.hw_frame_context)?));
 					let encoder_buffer = create_frame(context.width, context.height, Pixel::CUDA, &mut encoder.hw_frame_context)?;
-					let notifier = Arc::new(std::sync::Condvar::new());
+					let frame_number = Arc::new(std::sync::atomic::AtomicU32::new(0));
+					let frame_notifier = Arc::new(std::sync::Condvar::new());
 
 					let capture_thread = std::thread::Builder::new().name("video-capture".to_string()).spawn({
 						let intermediate_buffer = intermediate_buffer.clone();
-						let notifier = notifier.clone();
+						let frame_notifier = frame_notifier.clone();
+						let frame_number = frame_number.clone();
 						let context = context.clone();
 						let stop_signal = stop_signal.clone();
 						move || {
@@ -189,7 +191,8 @@ impl VideoStreamInner {
 								context.fps,
 								capture_buffer,
 								intermediate_buffer,
-								notifier,
+								frame_number,
+								frame_notifier,
 								stop_signal,
 							)
 						}
@@ -201,7 +204,8 @@ impl VideoStreamInner {
 
 					let encode_thread = std::thread::Builder::new().name("video-encode".to_string()).spawn({
 						let packet_tx = packet_tx.clone();
-						let notifier = notifier.clone();
+						let frame_number = frame_number.clone();
+						let frame_notifier = frame_notifier.clone();
 						let idr_frame_request_rx = idr_frame_request_tx.subscribe();
 						let context = context.clone();
 						let stop_signal = stop_signal.clone();
@@ -214,7 +218,8 @@ impl VideoStreamInner {
 								config.stream.video.fec_percentage,
 								encoder_buffer,
 								intermediate_buffer,
-								notifier,
+								frame_number,
+								frame_notifier,
 								stop_signal,
 							)
 						}

@@ -1,13 +1,9 @@
-use std::{collections::{hash_map::Entry, HashMap}, sync::{Arc, Mutex}};
+use std::{collections::{hash_map::Entry, HashMap}, io::Write, sync::{atomic::Ordering, Arc, Mutex}, u32};
 
 use async_shutdown::ShutdownManager;
 use cudarc::driver::CudaDevice;
 use ffmpeg::{
-	codec::packet::flag::Flags,
-	format::Pixel,
-	option::Settable,
-	Frame,
-	Packet,
+	codec::packet::flag::Flags, format::Pixel, option::Settable, packet::Ref, Frame, Packet
 };
 use reed_solomon_erasure::{galois_8, ReedSolomon};
 
@@ -116,7 +112,6 @@ impl Encoder {
 		unsafe {
 			(*encoder.as_mut_ptr()).pix_fmt = Pixel::CUDA.into();
 			(*encoder.as_mut_ptr()).hw_frames_ctx = hw_frame_context.as_raw_mut();
-			(*encoder.as_mut_ptr()).delay = 0;
 			(*encoder.as_mut_ptr()).refs = 0;
 		}
 		encoder.set_str("preset", "fast")
@@ -146,36 +141,66 @@ impl Encoder {
 		fec_percentage: u8,
 		mut encoder_buffer: Frame,
 		intermediate_buffer: Arc<Mutex<Frame>>,
-		notifier: Arc<std::sync::Condvar>,
+		captured_frame_number: Arc<std::sync::atomic::AtomicU32>,
+		frame_notifier: Arc<std::sync::Condvar>,
 		stop_signal: ShutdownManager<()>,
-	) -> Result<(), ()> {
+	) {
 		let mut packet = Packet::empty();
 
-		let mut frame_number = 0u32;
+		// The last frame number we used.
+		let mut current_captured_frame_number = 0;
+
+		// The sequential frame number for sending to the client.
+		let mut frame_number = 0;
+
 		let mut sequence_number = 0u32;
 		let stream_start_time = std::time::Instant::now();
 		while !stop_signal.is_shutdown_triggered() {
 			// Swap the intermediate buffer with the output buffer.
 			// Note that the lock is only held while swapping buffers, to minimize wait time for others locking the buffer.
 			{
-				tracing::trace!("Waiting for new frame.");
-				// Wait for a new frame.
-				let lock = intermediate_buffer.lock()
-					.map_err(|e| tracing::error!("Failed to acquire buffer lock: {e}"))?;
-				let mut result = notifier.wait_timeout(lock, std::time::Duration::from_millis(500))
-					.map_err(|e| tracing::error!("Failed to wait for new frame: {e}"))?;
+				tracing::trace!("Checking for new frame.");
 
-				// Didn't get a lock, let's check shutdown status and try again.
-				if result.1.timed_out() {
-					continue;
+				// Acquire the lock for a new frame.
+				let mut lock = match intermediate_buffer.lock() {
+					Ok(lock) => lock,
+					Err(e) => {
+						tracing::error!("Failed to acquire buffer lock: {e}");
+						continue;
+					},
+				};
+
+				// Check if we missed a frame, in that case we don't need to wait for a new frame notification.
+				let captured_frame_number = captured_frame_number.load(Ordering::Relaxed);
+				if captured_frame_number == 0 || captured_frame_number == current_captured_frame_number + 1 {
+					// Realistically we can wait indefinitely, but it feels safer to have a timeout just in case.
+					let mut lock = match frame_notifier.wait_timeout(lock, std::time::Duration::from_secs(5)) {
+						Ok(result) => result,
+						Err(e) => {
+							tracing::error!("Failed to wait for new frame: {e}");
+							continue;
+						},
+					};
+
+					// Didn't get a lock, let's check shutdown status and try again.
+					if lock.1.timed_out() {
+						tracing::warn!("Failed to acquire lock for frame buffer.");
+						continue;
+					}
+
+					tracing::trace!("Received notification for a new frame.");
+					std::mem::swap(&mut *lock.0, &mut encoder_buffer);
+				} else {
+					tracing::debug!("We missed {} frame notification(s), continuing with newest frame.", captured_frame_number - current_captured_frame_number);
+					std::mem::swap(&mut *lock, &mut encoder_buffer);
 				}
 
-				tracing::trace!("Received notification of new frame.");
-
-				std::mem::swap(&mut *result.0, &mut encoder_buffer);
+				current_captured_frame_number = captured_frame_number;
 			}
-			tracing::trace!("Swapped new frame with old frame.");
+
 			frame_number += 1;
+
+			tracing::trace!("Swapped new frame with old frame.");
 			encoder_buffer.set_pts(Some(frame_number as i64));
 
 			tracing::trace!("Sending frame {} to encoder", frame_number);
@@ -200,19 +225,22 @@ impl Encoder {
 				Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {},
 				Err(_) => {
 					tracing::debug!("Channel closed, quitting encoder task.");
-					return Ok(());
+					return;
 				}
 			}
 
 			// Send the frame to the encoder.
-			self.encoder.send_frame(&encoder_buffer)
-				.map_err(|e| tracing::error!("Error sending frame for encoding: {e}"))?;
+			tracing::trace!("Sending frame {}", frame_number);
+			if let Err(e) = self.encoder.send_frame(&encoder_buffer) {
+				tracing::error!("Error sending frame for encoding: {e}");
+				continue;
+			}
 
 			loop {
 				match self.encoder.receive_packet(&mut packet) {
 					Ok(()) => {
 						tracing::trace!("Received frame {} from encoder, converting frame to packets.", packet.pts().unwrap_or(-1));
-						self.encode_packet(
+						if self.encode_packet(
 							&packet,
 							&packet_tx,
 							packet_size,
@@ -221,7 +249,10 @@ impl Encoder {
 							frame_number,
 							&mut sequence_number,
 							stream_start_time,
-						)?
+						).is_err() {
+							continue;
+						}
+						tracing::trace!("Done converting frame {} to packets.", packet.pts().unwrap_or(-1));
 					},
 					Err(e) => {
 						match e {
@@ -244,7 +275,6 @@ impl Encoder {
 		}
 
 		tracing::debug!("Received stop signal.");
-		Ok(())
 	}
 
 	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..

@@ -1,4 +1,4 @@
-use std::sync::{Arc, Mutex};
+use std::sync::{atomic::Ordering, Arc, Mutex};
 
 use async_shutdown::ShutdownManager;
 use ffmpeg::Frame;
@@ -29,7 +29,8 @@ impl FrameCapturer {
 		framerate: u32,
 		mut capture_buffer: Frame,
 		intermediate_buffer: Arc<Mutex<Frame>>,
-		notifier: Arc<std::sync::Condvar>,
+		frame_number: Arc<std::sync::atomic::AtomicU32>,
+		frame_notifier: Arc<std::sync::Condvar>,
 		stop_signal: ShutdownManager<()>,
 	) -> Result<(), ()> {
 		self.capturer.bind_context()
@@ -43,7 +44,6 @@ impl FrameCapturer {
 				.map_err(|e| tracing::error!("Failed to wait for new CUDA frame: {e}"))?;
 			tracing::trace!("Frame info: {:#?}", frame_info);
 
-			// capture_buffer.as_raw_mut().data[0] = frame_info.device_buffer as *mut u8;
 			unsafe {
 				if let Err(e) = cudarc::driver::result::memcpy_dtod_sync(
 					(*capture_buffer.as_mut_ptr()).data[0] as cudarc::driver::sys::CUdeviceptr,
@@ -62,7 +62,10 @@ impl FrameCapturer {
 					.map_err(|e| tracing::error!("Failed to lock intermediate buffer: {e}"))?;
 				std::mem::swap(&mut *lock, &mut capture_buffer);
 			}
-			notifier.notify_one();
+
+			tracing::trace!("Current frame: {}", frame_info.current_frame);
+			frame_number.store(frame_info.current_frame, Ordering::Relaxed);
+			frame_notifier.notify_all();
 		}
 
 		tracing::debug!("Received stop signal.");
