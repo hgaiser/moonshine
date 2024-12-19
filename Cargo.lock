@@ -2595,6 +2595,8 @@ name = "reed-solomon-erasure"
 version = "6.0.0"
 source = "git+https://github.com/hgaiser/reed-solomon-erasure?branch=moonshine#74f8e12a8992cdd776c5976d0e85b09b6b82b4fc"
 dependencies = [
+ "cc",
+ "libc",
  "libm",
  "lru",
  "parking_lot",
