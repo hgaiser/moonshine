@@ -9,13 +9,13 @@ clap = { version = "4.5.23", features = ["derive"] }
 cudarc = { version = "0.12.1", features = ["cuda-version-from-build-system"] }
 dirs = "5.0.1"
 enet = "0.3.0"
-evdev = "0.12.2"
 ffmpeg = { version = "7.1.0", package = "ffmpeg-next" }
 hex = "0.4.3"
 http-body-util = "0.1.2"
 hyper = { version = "1.5.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.10", features = ["tokio"] }
 image = "0.25.5"
+inputtino = "2024.8.1"
 network-interface = "2.0.0"
 notify-rust = "4.11.3"
 nvfbc = "0.1.5"
@@ -29,7 +29,7 @@ rtsp-types = "0.1.3"
 sdp-types = "0.1.7"
 serde = "1.0.215"
 shellexpand = "3.1.0"
-strum = { version = "0.26.3", features = ["strum_macros"] }
+strum = "0.26.3"
 strum_macros = "0.26.4"
 tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "tracing"] }
 tokio-openssl = "0.6.5"
@@ -44,3 +44,4 @@ zeroconf = "0.15.0"
 ffmpeg = { version = "7.1.0", package = "ffmpeg-next", git = "https://github.com/hgaiser/rust-ffmpeg", branch = "codec-context-settable" }
 ffmpeg-sys-next = { version = "7.1.0", git = "https://github.com/hgaiser/rust-ffmpeg-sys", branch = "cuda" }
 reed-solomon-erasure = { version = "6.0.0", git = "https://github.com/hgaiser/reed-solomon-erasure", branch = "moonshine" }
+inputtino = { version = "2024.8.1", path = "../inputtino/bindings/rust" }

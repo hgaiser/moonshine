@@ -117,35 +117,40 @@ impl InputHandlerInner {
 			match command {
 				InputEvent::KeyDown(key) => {
 					tracing::trace!("Pressing key: {key:?}");
-					let _ = self.keyboard.key_down(key);
+					self.keyboard.key_down(key);
 				},
 				InputEvent::KeyUp(key) => {
 					tracing::trace!("Releasing key: {key:?}");
-					let _ = self.keyboard.key_up(key);
+					self.keyboard.key_up(key);
 				},
 				InputEvent::MouseMoveAbsolute(event) => {
 					tracing::trace!("Absolute mouse movement: {event:?}");
-					let _ = self.mouse.move_absolute(event.x as i32, event.y as i32);
+					self.mouse.move_absolute(
+						event.x as i32,
+						event.y as i32,
+						event.screen_width as i32,
+						event.screen_height as i32,
+					);
 				},
 				InputEvent::MouseMoveRelative(event) => {
 					tracing::trace!("Moving mouse relative: {event:?}");
-					let _ = self.mouse.move_relative(event.x as i32, event.y as i32);
+					self.mouse.move_relative(event.x as i32, event.y as i32);
 				},
 				InputEvent::MouseButtonDown(button) => {
 					tracing::trace!("Pressing mouse button: {button:?}");
-					let _ = self.mouse.button_down(button);
+					self.mouse.button_down(button);
 				},
 				InputEvent::MouseButtonUp(button) => {
 					tracing::trace!("Releasing mouse button: {button:?}");
-					let _ = self.mouse.button_up(button);
+					self.mouse.button_up(button);
 				},
 				InputEvent::MouseScrollVertical(event) => {
 					tracing::trace!("Scrolling vertically: {event:?}");
-					let _ = self.mouse.scroll_vertical(event.amount);
+					self.mouse.scroll_vertical(event.amount);
 				},
 				InputEvent::MouseScrollHorizontal(event) => {
 					tracing::trace!("Scrolling horizontally: {event:?}");
-					let _ = self.mouse.scroll_horizontal(event.amount);
+					self.mouse.scroll_horizontal(event.amount);
 				},
 				InputEvent::GamepadInfo(gamepad) => {
 					tracing::debug!("Gamepad info: {gamepad:?}");
@@ -160,7 +165,7 @@ impl InputHandlerInner {
 						continue;
 					}
 
-					let _ = gamepads[gamepad_update.index as usize].update(gamepad_update);
+					gamepads[gamepad_update.index as usize].update(gamepad_update);
 				},
 			}
 		}
