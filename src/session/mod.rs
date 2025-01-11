@@ -34,7 +34,7 @@ pub struct SessionContext {
 	pub resolution: (u32, u32),
 
 	/// Refresh rate of the video stream.
-	pub refresh_rate: u32,
+	pub _refresh_rate: u32,
 
 	/// Encryption keys for encoding traffic.
 	pub keys: SessionKeys,
