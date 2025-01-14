@@ -215,7 +215,7 @@ impl Webserver {
 
 			// TODO: Fix HDR support.
 			response += "<IsHdrSupported>0</IsHdrSupported>";
-			response += format!("<AppTitle>{}</AppTitle>", application.title).as_ref();
+			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&application.title)).as_ref();
 			response += format!("<ID>{}</ID>", application.id()).as_ref();
 
 			response += "</App>";
@@ -337,7 +337,7 @@ impl Webserver {
 
 		// TODO: Check the use of some of these values, we leave most of them blank and Moonlight doesn't care.
 		let mut response = "<root status_code=\"200\">".to_string();
-		response += &format!("<hostname>{}</hostname>", self.config.name);
+		response += &format!("<hostname>{}</hostname>", escape_xml(&self.config.name));
 		response += &format!("<appversion>{}</appversion>", SERVERINFO_APP_VERSION);
 		response += &format!("<GfeVersion>{}</GfeVersion>", SERVERINFO_GFE_VERSION);
 		response += &format!("<uniqueid>{}</uniqueid>", self.unique_id);
@@ -697,4 +697,14 @@ fn get_mac_address(address: IpAddr) -> Result<Option<String>, ()> {
 
 	tracing::warn!("No interface found matching address {:?}", address);
 	Ok(None)
+}
+
+fn escape_xml(input: impl AsRef<str>) -> String {
+    input
+		.as_ref()
+        .replace("&", "&amp;")
+        .replace("<", "&lt;")
+        .replace(">", "&gt;")
+        .replace("\"", "&quot;")
+        .replace("'", "&apos;")
 }
