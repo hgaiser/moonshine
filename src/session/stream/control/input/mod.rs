@@ -98,7 +98,7 @@ impl InputHandler {
 			.map_err(|e| tracing::error!("Failed to send input event: {e}"))
 	}
 
-	pub async fn handle_raw_input<'a>(&self, event: &'a [u8]) -> Result<(), ()> {
+	pub async fn handle_raw_input(&self, event: &[u8]) -> Result<(), ()> {
 		let event = InputEvent::from_bytes(event)?;
 		self.handle_input(event).await
 	}
