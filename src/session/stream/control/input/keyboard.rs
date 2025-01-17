@@ -1,8 +1,7 @@
-use evdev::{uinput::{VirtualDevice, VirtualDeviceBuilder}, AttributeSet};
-use strum::IntoEnumIterator;
-use strum_macros::{FromRepr, EnumIter};
+use inputtino::DeviceDefinition;
+use strum_macros::FromRepr;
 
-#[derive(Debug, Eq, PartialEq, FromRepr, EnumIter)]
+#[derive(Debug, Eq, PartialEq, FromRepr)]
 #[repr(u8)]
 pub enum Key {
 	Backspace = 0x08,
@@ -154,182 +153,31 @@ impl Key {
 	}
 }
 
-impl From<Key> for evdev::Key {
-	fn from(val: Key) -> Self {
-		match val {
-			Key::Backspace => evdev::Key::KEY_BACKSPACE,
-			Key::Tab => evdev::Key::KEY_TAB,
-			Key::Clear => evdev::Key::KEY_CLEAR,
-			Key::Return => evdev::Key::KEY_ENTER,
-			Key::Shift => evdev::Key::KEY_LEFTSHIFT,
-			Key::Control => evdev::Key::KEY_LEFTCTRL,
-			Key::Alt => evdev::Key::KEY_LEFTALT,
-			Key::Pause => evdev::Key::KEY_PAUSE,
-			Key::Capslock => evdev::Key::KEY_CAPSLOCK,
-			Key::Katakanahiragana => evdev::Key::KEY_KATAKANAHIRAGANA,
-			Key::Hangeul => evdev::Key::KEY_HANGEUL,
-			Key::Hanja => evdev::Key::KEY_HANJA,
-			Key::Katakana => evdev::Key::KEY_KATAKANA,
-			Key::Escape => evdev::Key::KEY_ESC,
-			Key::Space => evdev::Key::KEY_SPACE,
-			Key::PageUp => evdev::Key::KEY_PAGEUP,
-			Key::PageDown => evdev::Key::KEY_PAGEDOWN,
-			Key::End => evdev::Key::KEY_END,
-			Key::Home => evdev::Key::KEY_HOME,
-			Key::Left => evdev::Key::KEY_LEFT,
-			Key::Up => evdev::Key::KEY_UP,
-			Key::Right => evdev::Key::KEY_RIGHT,
-			Key::Down => evdev::Key::KEY_DOWN,
-			Key::Select => evdev::Key::KEY_SELECT,
-			Key::Print => evdev::Key::KEY_PRINT,
-			Key::SysRq => evdev::Key::KEY_SYSRQ,
-			Key::Insert => evdev::Key::KEY_INSERT,
-			Key::Delete => evdev::Key::KEY_DELETE,
-			Key::Help => evdev::Key::KEY_HELP,
-			Key::Num0 => evdev::Key::KEY_0,
-			Key::Num1 => evdev::Key::KEY_1,
-			Key::Num2 => evdev::Key::KEY_2,
-			Key::Num3 => evdev::Key::KEY_3,
-			Key::Num4 => evdev::Key::KEY_4,
-			Key::Num5 => evdev::Key::KEY_5,
-			Key::Num6 => evdev::Key::KEY_6,
-			Key::Num7 => evdev::Key::KEY_7,
-			Key::Num8 => evdev::Key::KEY_8,
-			Key::Num9 => evdev::Key::KEY_9,
-			Key::A => evdev::Key::KEY_A,
-			Key::B => evdev::Key::KEY_B,
-			Key::C => evdev::Key::KEY_C,
-			Key::D => evdev::Key::KEY_D,
-			Key::E => evdev::Key::KEY_E,
-			Key::F => evdev::Key::KEY_F,
-			Key::G => evdev::Key::KEY_G,
-			Key::H => evdev::Key::KEY_H,
-			Key::I => evdev::Key::KEY_I,
-			Key::J => evdev::Key::KEY_J,
-			Key::K => evdev::Key::KEY_K,
-			Key::L => evdev::Key::KEY_L,
-			Key::M => evdev::Key::KEY_M,
-			Key::N => evdev::Key::KEY_N,
-			Key::O => evdev::Key::KEY_O,
-			Key::P => evdev::Key::KEY_P,
-			Key::Q => evdev::Key::KEY_Q,
-			Key::R => evdev::Key::KEY_R,
-			Key::S => evdev::Key::KEY_S,
-			Key::T => evdev::Key::KEY_T,
-			Key::U => evdev::Key::KEY_U,
-			Key::V => evdev::Key::KEY_V,
-			Key::W => evdev::Key::KEY_W,
-			Key::X => evdev::Key::KEY_X,
-			Key::Y => evdev::Key::KEY_Y,
-			Key::Z => evdev::Key::KEY_Z,
-			Key::LeftMeta => evdev::Key::KEY_LEFTMETA,
-			Key::RightMeta => evdev::Key::KEY_RIGHTMETA,
-			Key::Sleep => evdev::Key::KEY_SLEEP,
-			Key::Numpad0 => evdev::Key::KEY_KP0,
-			Key::Numpad1 => evdev::Key::KEY_KP1,
-			Key::Numpad2 => evdev::Key::KEY_KP2,
-			Key::Numpad3 => evdev::Key::KEY_KP3,
-			Key::Numpad4 => evdev::Key::KEY_KP4,
-			Key::Numpad5 => evdev::Key::KEY_KP5,
-			Key::Numpad6 => evdev::Key::KEY_KP6,
-			Key::Numpad7 => evdev::Key::KEY_KP7,
-			Key::Numpad8 => evdev::Key::KEY_KP8,
-			Key::Numpad9 => evdev::Key::KEY_KP9,
-			Key::NumpadAsterisk => evdev::Key::KEY_KPASTERISK,
-			Key::NumpadPlus => evdev::Key::KEY_KPPLUS,
-			Key::NumpadComma => evdev::Key::KEY_KPCOMMA,
-			Key::NumpadMinus => evdev::Key::KEY_KPMINUS,
-			Key::NumpadDot => evdev::Key::KEY_KPDOT,
-			Key::NumpadSlash => evdev::Key::KEY_KPSLASH,
-			Key::F1 => evdev::Key::KEY_F1,
-			Key::F2 => evdev::Key::KEY_F2,
-			Key::F3 => evdev::Key::KEY_F3,
-			Key::F4 => evdev::Key::KEY_F4,
-			Key::F5 => evdev::Key::KEY_F5,
-			Key::F6 => evdev::Key::KEY_F6,
-			Key::F7 => evdev::Key::KEY_F7,
-			Key::F8 => evdev::Key::KEY_F8,
-			Key::F9 => evdev::Key::KEY_F9,
-			Key::F10 => evdev::Key::KEY_F10,
-			Key::F11 => evdev::Key::KEY_F11,
-			Key::F12 => evdev::Key::KEY_F12,
-			Key::F13 => evdev::Key::KEY_F13,
-			Key::F14 => evdev::Key::KEY_F14,
-			Key::F15 => evdev::Key::KEY_F15,
-			Key::F16 => evdev::Key::KEY_F16,
-			Key::F17 => evdev::Key::KEY_F17,
-			Key::F18 => evdev::Key::KEY_F18,
-			Key::F19 => evdev::Key::KEY_F19,
-			Key::F20 => evdev::Key::KEY_F20,
-			Key::F21 => evdev::Key::KEY_F21,
-			Key::F22 => evdev::Key::KEY_F22,
-			Key::F23 => evdev::Key::KEY_F23,
-			Key::F24 => evdev::Key::KEY_F24,
-			Key::Numlock => evdev::Key::KEY_NUMLOCK,
-			Key::Scroll => evdev::Key::KEY_SCROLLLOCK,
-			Key::LeftShift => evdev::Key::KEY_LEFTSHIFT,
-			Key::RightShift => evdev::Key::KEY_RIGHTSHIFT,
-			Key::LeftControl => evdev::Key::KEY_LEFTCTRL,
-			Key::RightControl => evdev::Key::KEY_RIGHTCTRL,
-			Key::LeftAlt => evdev::Key::KEY_LEFTALT,
-			Key::RightAlt => evdev::Key::KEY_RIGHTALT,
-			Key::Semicolon => evdev::Key::KEY_SEMICOLON,
-			Key::Equal => evdev::Key::KEY_EQUAL,
-			Key::Comma => evdev::Key::KEY_COMMA,
-			Key::Minus => evdev::Key::KEY_MINUS,
-			Key::Dot => evdev::Key::KEY_DOT,
-			Key::Slash => evdev::Key::KEY_SLASH,
-			Key::Grave => evdev::Key::KEY_GRAVE,
-			Key::LeftBrace => evdev::Key::KEY_LEFTBRACE,
-			Key::Backslash => evdev::Key::KEY_BACKSLASH,
-			Key::RightBrace => evdev::Key::KEY_RIGHTBRACE,
-			Key::Apostrophe => evdev::Key::KEY_APOSTROPHE,
-			Key::NonUsBackslash => evdev::Key::KEY_102ND,
-		}
-	}
-}
-
 pub struct Keyboard {
-	device: VirtualDevice,
+	keyboard: inputtino::Keyboard,
 }
 
 impl Keyboard {
 	pub fn new() -> Result<Self, ()> {
-		let mut attributes = AttributeSet::new();
-		for key in Key::iter() {
-			attributes.insert(key.into());
-		}
-
-		let device = VirtualDeviceBuilder::new()
-			.map_err(|e| tracing::error!("Failed to initiate virtual keyboard: {e}"))?
-			.name("Moonshine Keyboard")
-			.with_keys(&attributes)
-			.map_err(|e| tracing::error!("Failed to add keys to virtual keyboard: {e}"))?
-			.build()
+		let definition = DeviceDefinition::new(
+			"Moonshine Keyboard",
+			0xBEEF,
+			0xDEAD,
+			0x111,
+			"00:11:22:33:44",
+			"00:11:22:33:44",
+		);
+		let keyboard = inputtino::Keyboard::new(&definition)
 			.map_err(|e| tracing::error!("Failed to create virtual keyboard: {e}"))?;
 
-		Ok(Self { device })
+		Ok(Self { keyboard })
 	}
 
-	pub fn key_down(&mut self, key: Key) -> Result<(), ()> {
-		let button_event = evdev::InputEvent::new_now(
-			evdev::EventType::KEY,
-			Into::<evdev::Key>::into(key).code(),
-			1
-		);
-
-		self.device.emit(&[button_event])
-			.map_err(|e| tracing::error!("Failed to press key: {e}"))
+	pub fn key_down(&mut self, key: Key) {
+		self.keyboard.press_key(key as i16);
 	}
 
-	pub fn key_up(&mut self, button: Key) -> Result<(), ()> {
-		let button_event = evdev::InputEvent::new_now(
-			evdev::EventType::KEY,
-			Into::<evdev::Key>::into(button).code(),
-			0
-		);
-
-		self.device.emit(&[button_event])
-			.map_err(|e| tracing::error!("Failed to release key: {e}"))
+	pub fn key_up(&mut self, key: Key) {
+		self.keyboard.release_key(key as i16);
 	}
 }

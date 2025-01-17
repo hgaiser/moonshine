@@ -1,12 +1,12 @@
+use inputtino::DeviceDefinition;
 use strum_macros::FromRepr;
-use evdev::{uinput::{VirtualDeviceBuilder, VirtualDevice}, AttributeSet, RelativeAxisType, Key, AbsoluteAxisType, UinputAbsSetup, AbsInfo};
 
 #[derive(Debug)]
 pub struct MouseMoveAbsolute {
 	pub x: i16,
 	pub y: i16,
-	// width: i16,
-	// height: i16,
+	pub screen_width: i16,
+	pub screen_height: i16,
 }
 
 impl MouseMoveAbsolute {
@@ -27,8 +27,8 @@ impl MouseMoveAbsolute {
 		Ok(Self {
 			x: i16::from_be_bytes(buffer[0..2].try_into().unwrap()),
 			y: i16::from_be_bytes(buffer[2..4].try_into().unwrap()),
-			// width: i16::from_be_bytes(buffer[6..8].try_into().unwrap()),
-			// height: i16::from_be_bytes(buffer[8..10].try_into().unwrap()),
+			screen_width: i16::from_be_bytes(buffer[6..8].try_into().unwrap()),
+			screen_height: i16::from_be_bytes(buffer[8..10].try_into().unwrap()),
 		})
 	}
 }
@@ -76,14 +76,14 @@ impl MouseButton {
 	}
 }
 
-impl From<MouseButton> for Key {
+impl From<MouseButton> for inputtino::MouseButton {
 	fn from(val: MouseButton) -> Self {
 		match val {
-			MouseButton::Left => Key::BTN_LEFT,
-			MouseButton::Middle => Key::BTN_MIDDLE,
-			MouseButton::Right => Key::BTN_RIGHT,
-			MouseButton::Side => Key::BTN_SIDE,
-			MouseButton::Extra => Key::BTN_EXTRA,
+			MouseButton::Left => inputtino::MouseButton::LEFT,
+			MouseButton::Middle => inputtino::MouseButton::MIDDLE,
+			MouseButton::Right => inputtino::MouseButton::RIGHT,
+			MouseButton::Side => inputtino::MouseButton::SIDE,
+			MouseButton::Extra => inputtino::MouseButton::EXTRA,
 		}
 	}
 }
@@ -125,97 +125,46 @@ impl MouseScrollHorizontal {
 }
 
 pub struct Mouse {
-	device: VirtualDevice,
+	device: inputtino::Mouse,
 }
 
 impl Mouse {
 	pub fn new() -> Result<Self, ()> {
-		let device = VirtualDeviceBuilder::new()
-			.map_err(|e| tracing::error!("Failed to initiate virtual mouse: {e}"))?
-			.name("Moonshine Mouse")
-			.with_relative_axes(&AttributeSet::from_iter([
-				RelativeAxisType::REL_X,
-				RelativeAxisType::REL_Y,
-				RelativeAxisType::REL_WHEEL_HI_RES,
-				RelativeAxisType::REL_HWHEEL_HI_RES,
-			]))
-			.map_err(|e| tracing::error!("Failed to enable relative axes for virtual mouse: {e}"))?
-			.with_absolute_axis(&UinputAbsSetup::new(
-				AbsoluteAxisType::ABS_X, AbsInfo::new(0, 0, 3000, 0, 0, 1)
-			))
-			.map_err(|e| tracing::error!("Failed to enable absolute axis for virtual mouse: {e}"))?
-			.with_absolute_axis(&UinputAbsSetup::new(
-				AbsoluteAxisType::ABS_Y, AbsInfo::new(0, 0, 3000, 0, 0, 1)
-			))
-			.map_err(|e| tracing::error!("Failed to enable absolute axis for virtual mouse: {e}"))?
-			.with_keys(&AttributeSet::from_iter([
-				Key::BTN_LEFT,
-				Key::BTN_MIDDLE,
-				Key::BTN_RIGHT,
-				Key::BTN_FORWARD,
-				Key::BTN_BACK,
-			]))
-			.map_err(|e| tracing::error!("Failed to add keys to virtual mouse: {e}"))?
-			.build()
+		let definition = DeviceDefinition::new(
+			"Moonshine Mouse",
+			0xBEEF,
+			0xDEAD,
+			0x111,
+			"00:11:22:33:44",
+			"00:11:22:33:44",
+		);
+		let device = inputtino::Mouse::new(&definition)
 			.map_err(|e| tracing::error!("Failed to create virtual mouse: {e}"))?;
 
 		Ok(Self { device })
 	}
 
-	pub fn move_relative(&mut self, x: i32, y: i32) -> Result<(), ()> {
-		let events = [
-			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_X.0, x),
-			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_Y.0, y),
-		];
-		self.device.emit(&events)
-			.map_err(|e| tracing::error!("Failed to make relative mouse movement: {e}"))
+	pub fn move_relative(&mut self, x: i32, y: i32) {
+		self.device.move_rel(x, y);
 	}
 
-	pub fn move_absolute(&mut self, x: i32, y: i32) -> Result<(), ()> {
-		tracing::info!("x: {x}, y: {y}");
-		let events = [
-			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_X.0, x),
-			evdev::InputEvent::new_now(evdev::EventType::ABSOLUTE, AbsoluteAxisType::ABS_Y.0, y),
-		];
-		self.device.emit(&events)
-			.map_err(|e| tracing::error!("Failed to make absolute mouse movement: {e}"))
+	pub fn move_absolute(&mut self, x: i32, y: i32, screen_width: i32, screen_height: i32) {
+		self.device.move_abs(x, y, screen_width, screen_height);
 	}
 
-	pub fn button_down(&mut self, button: MouseButton) -> Result<(), ()> {
-		let button_event = evdev::InputEvent::new_now(
-			evdev::EventType::KEY,
-			Into::<Key>::into(button).code(),
-			1
-		);
-
-		self.device.emit(&[button_event])
-			.map_err(|e| tracing::error!("Failed to press mouse button: {e}"))
+	pub fn button_down(&mut self, button: MouseButton) {
+		self.device.press_button(button.into());
 	}
 
-	pub fn button_up(&mut self, button: MouseButton) -> Result<(), ()> {
-		let button_event = evdev::InputEvent::new_now(
-			evdev::EventType::KEY,
-			Into::<Key>::into(button).code(),
-			0
-		);
-
-		self.device.emit(&[button_event])
-			.map_err(|e| tracing::error!("Failed to release mouse button: {e}"))
+	pub fn button_up(&mut self, button: MouseButton) {
+		self.device.release_button(button.into());
 	}
 
-	pub fn scroll_vertical(&mut self, amount: i16) -> Result<(), ()> {
-		let events = [
-			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_WHEEL_HI_RES.0, amount as i32),
-		];
-		self.device.emit(&events)
-			.map_err(|e| tracing::error!("Failed to scroll vertically: {e}"))
+	pub fn scroll_vertical(&mut self, amount: i16) {
+		self.device.scroll_vertical(amount as i32);
 	}
 
-	pub fn scroll_horizontal(&mut self, amount: i16) -> Result<(), ()> {
-		let events = [
-			evdev::InputEvent::new_now(evdev::EventType::RELATIVE, RelativeAxisType::REL_HWHEEL_HI_RES.0, amount as i32),
-		];
-		self.device.emit(&events)
-			.map_err(|e| tracing::error!("Failed to scroll horizontally: {e}"))
+	pub fn scroll_horizontal(&mut self, amount: i16) {
+		self.device.scroll_horizontal(amount as i32);
 	}
 }
