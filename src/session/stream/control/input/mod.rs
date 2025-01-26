@@ -13,7 +13,7 @@ use self::{
 		MouseScrollHorizontal,
 	},
 	keyboard::{Keyboard, Key},
-	gamepad::{GamepadInfo, GamepadUpdate}
+	gamepad::{GamepadInfo, GamepadTouch, GamepadUpdate}
 };
 
 mod keyboard;
@@ -32,6 +32,7 @@ enum InputEventType {
 	MouseScrollVertical = 0x0000000A,
 	MouseScrollHorizontal = 0x55000001,
 	GamepadInfo = 0x55000004, // Called ControllerArrival in Moonlight.
+	GamepadTouch = 0x55000005,
 	GamepadUpdate = 0x0000000C,
 }
 
@@ -47,6 +48,7 @@ enum InputEvent {
 	MouseScrollVertical(MouseScrollVertical),
 	MouseScrollHorizontal(MouseScrollHorizontal),
 	GamepadInfo(GamepadInfo),
+	GamepadTouch(GamepadTouch),
 	GamepadUpdate(GamepadUpdate),
 }
 
@@ -68,6 +70,7 @@ impl InputEvent {
 			Some(InputEventType::MouseScrollVertical) => Ok(InputEvent::MouseScrollVertical(MouseScrollVertical::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::MouseScrollHorizontal) => Ok(InputEvent::MouseScrollHorizontal(MouseScrollHorizontal::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadInfo) => Ok(InputEvent::GamepadInfo(GamepadInfo::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::GamepadTouch) => Ok(InputEvent::GamepadTouch(GamepadTouch::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadUpdate) => Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?)),
 			None => {
 				tracing::warn!("Received unknown event type: {event_type}");
@@ -98,7 +101,7 @@ impl InputHandler {
 			.map_err(|e| tracing::error!("Failed to send input event: {e}"))
 	}
 
-	pub async fn handle_raw_input<'a>(&self, event: &'a [u8]) -> Result<(), ()> {
+	pub async fn handle_raw_input(&self, event: &[u8]) -> Result<(), ()> {
 		let event = InputEvent::from_bytes(event)?;
 		self.handle_input(event).await
 	}
@@ -117,41 +120,55 @@ impl InputHandlerInner {
 			match command {
 				InputEvent::KeyDown(key) => {
 					tracing::trace!("Pressing key: {key:?}");
-					let _ = self.keyboard.key_down(key);
+					self.keyboard.key_down(key);
 				},
 				InputEvent::KeyUp(key) => {
 					tracing::trace!("Releasing key: {key:?}");
-					let _ = self.keyboard.key_up(key);
+					self.keyboard.key_up(key);
 				},
 				InputEvent::MouseMoveAbsolute(event) => {
 					tracing::trace!("Absolute mouse movement: {event:?}");
-					let _ = self.mouse.move_absolute(event.x as i32, event.y as i32);
+					self.mouse.move_absolute(
+						event.x as i32,
+						event.y as i32,
+						event.screen_width as i32,
+						event.screen_height as i32,
+					);
 				},
 				InputEvent::MouseMoveRelative(event) => {
 					tracing::trace!("Moving mouse relative: {event:?}");
-					let _ = self.mouse.move_relative(event.x as i32, event.y as i32);
+					self.mouse.move_relative(event.x as i32, event.y as i32);
 				},
 				InputEvent::MouseButtonDown(button) => {
 					tracing::trace!("Pressing mouse button: {button:?}");
-					let _ = self.mouse.button_down(button);
+					self.mouse.button_down(button);
 				},
 				InputEvent::MouseButtonUp(button) => {
 					tracing::trace!("Releasing mouse button: {button:?}");
-					let _ = self.mouse.button_up(button);
+					self.mouse.button_up(button);
 				},
 				InputEvent::MouseScrollVertical(event) => {
 					tracing::trace!("Scrolling vertically: {event:?}");
-					let _ = self.mouse.scroll_vertical(event.amount);
+					self.mouse.scroll_vertical(event.amount);
 				},
 				InputEvent::MouseScrollHorizontal(event) => {
 					tracing::trace!("Scrolling horizontally: {event:?}");
-					let _ = self.mouse.scroll_horizontal(event.amount);
+					self.mouse.scroll_horizontal(event.amount);
 				},
 				InputEvent::GamepadInfo(gamepad) => {
 					tracing::debug!("Gamepad info: {gamepad:?}");
 					if let Ok(gamepad) = Gamepad::new(gamepad) {
 						gamepads.push(gamepad);
 					}
+				},
+				InputEvent::GamepadTouch(gamepad_touch) => {
+					tracing::trace!("Gamepad touch: {gamepad_touch:?}");
+					if gamepad_touch.index as usize >= gamepads.len() {
+						tracing::warn!("Received touch for gamepad {}, but we only have {} gamepads.", gamepad_touch.index, gamepads.len());
+						continue;
+					}
+
+					gamepads[gamepad_touch.index as usize].touch(gamepad_touch);
 				},
 				InputEvent::GamepadUpdate(gamepad_update) => {
 					tracing::trace!("Gamepad update: {gamepad_update:?}");
@@ -160,7 +177,7 @@ impl InputHandlerInner {
 						continue;
 					}
 
-					let _ = gamepads[gamepad_update.index as usize].update(gamepad_update);
+					gamepads[gamepad_update.index as usize].update(gamepad_update);
 				},
 			}
 		}

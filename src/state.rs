@@ -31,7 +31,7 @@ impl State {
 			let serialized = std::fs::read_to_string(&path)
 				.map_err(|e| tracing::error!("Failed to read state file: {e}"))?;
 			inner = toml::from_str(&serialized)
-				.map_err(|e| tracing::error!("Failed to parse state file: {e}"))?;
+				.map_err(|e| tracing::error!("Failed to parse state file at '{}': {e}", path.display()))?;
 
 			tracing::debug!("Successfully loaded state from {:?}", path);
 			tracing::trace!("State: {inner:?}");

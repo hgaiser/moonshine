@@ -148,6 +148,8 @@ impl VideoStreamInner {
 						continue;
 					}
 
+					tracing::info!("Starting video stream.");
+
 					// TODO: Make the GPU index configurable.
 					let cuda_device = cudarc::driver::CudaDevice::new(0)
 						.map_err(|e| tracing::error!("Failed to initialize CUDA: {e}"))?;
