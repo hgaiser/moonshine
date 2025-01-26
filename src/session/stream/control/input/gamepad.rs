@@ -56,13 +56,17 @@ impl GamepadInfo {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadInfo, got {} bytes.", buffer.len());
+			tracing::warn!(
+				"Expected at least {EXPECTED_SIZE} bytes for GamepadInfo, got {} bytes.",
+				buffer.len()
+			);
 			return Err(());
 		}
 
 		Ok(Self {
 			_index: buffer[0],
-			kind: GamepadKind::from_repr(buffer[1]).ok_or_else(|| tracing::warn!("Unknown gamepad kind: {}", buffer[1]))?,
+			kind: GamepadKind::from_repr(buffer[1])
+				.ok_or_else(|| tracing::warn!("Unknown gamepad kind: {}", buffer[1]))?,
 			capabilities: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			_supported_buttons: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 		})
@@ -98,7 +102,10 @@ impl GamepadTouch {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadTouch, got {} bytes.", buffer.len());
+			tracing::warn!(
+				"Expected at least {EXPECTED_SIZE} bytes for GamepadTouch, got {} bytes.",
+				buffer.len()
+			);
 			return Err(());
 		}
 
@@ -110,7 +117,6 @@ impl GamepadTouch {
 			x: f32::from_le_bytes(buffer[8..12].try_into().unwrap()),
 			y: f32::from_le_bytes(buffer[12..16].try_into().unwrap()),
 			pressure: f32::from_le_bytes(buffer[16..20].try_into().unwrap()),
-
 		})
 	}
 }
@@ -146,14 +152,18 @@ impl GamepadUpdate {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadUpdate, got {} bytes.", buffer.len());
+			tracing::warn!(
+				"Expected at least {EXPECTED_SIZE} bytes for GamepadUpdate, got {} bytes.",
+				buffer.len()
+			);
 			return Err(());
 		}
 
 		Ok(Self {
 			index: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			_active_gamepad_mask: u16::from_le_bytes(buffer[4..6].try_into().unwrap()),
-			button_flags: u16::from_le_bytes(buffer[8..10].try_into().unwrap()) as u32 | (u16::from_le_bytes(buffer[22..24].try_into().unwrap()) as u32) << 16,
+			button_flags: u16::from_le_bytes(buffer[8..10].try_into().unwrap()) as u32
+				| (u16::from_le_bytes(buffer[22..24].try_into().unwrap()) as u32) << 16,
 			left_trigger: buffer[10],
 			right_trigger: buffer[11],
 			left_stick: (
@@ -162,7 +172,7 @@ impl GamepadUpdate {
 			),
 			right_stick: (
 				i16::from_le_bytes(buffer[16..18].try_into().unwrap()),
-				i16::from_le_bytes(buffer[18..20].try_into().unwrap())
+				i16::from_le_bytes(buffer[18..20].try_into().unwrap()),
 			),
 		})
 	}
@@ -176,15 +186,42 @@ pub struct Gamepad {
 impl Gamepad {
 	pub fn new(info: GamepadInfo) -> Result<Self, ()> {
 		let definition = match info.kind {
-			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new("Moonshine XOne controller", 0x045e, 0x02dd, 0x0100, "00:11:22:33:44", "00:11:22:33:44"),
-			GamepadKind::PlayStation => DeviceDefinition::new("Moonshine PS5 controller", 0x054C, 0x0CE6, 0x8111, "00:11:22:33:44", "00:11:22:33:44"),
-			GamepadKind::Nintendo => DeviceDefinition::new("Moonshine Switch controller", 0x045e, 0x02DD, 0x0100, "00:11:22:33:44", "00:11:22:33:44"),
+			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
+				"Moonshine XOne controller",
+				0x045e,
+				0x02dd,
+				0x0100,
+				"00:11:22:33:44",
+				"00:11:22:33:44",
+			),
+			GamepadKind::PlayStation => DeviceDefinition::new(
+				"Moonshine PS5 controller",
+				0x054C,
+				0x0CE6,
+				0x8111,
+				"00:11:22:33:44",
+				"00:11:22:33:44",
+			),
+			GamepadKind::Nintendo => DeviceDefinition::new(
+				"Moonshine Switch controller",
+				0x045e,
+				0x02DD,
+				0x0100,
+				"00:11:22:33:44",
+				"00:11:22:33:44",
+			),
 		};
 
 		let gamepad = match info.kind {
-			GamepadKind::Unknown | GamepadKind::Xbox => Joypad::XboxOne(XboxOneJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?),
-			GamepadKind::PlayStation => Joypad::PS5(PS5Joypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?),
-			GamepadKind::Nintendo => Joypad::Switch(SwitchJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?),
+			GamepadKind::Unknown | GamepadKind::Xbox => Joypad::XboxOne(
+				XboxOneJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
+			),
+			GamepadKind::PlayStation => {
+				Joypad::PS5(PS5Joypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?)
+			},
+			GamepadKind::Nintendo => Joypad::Switch(
+				SwitchJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
+			),
 		};
 
 		Ok(Self { _info: info, gamepad })
