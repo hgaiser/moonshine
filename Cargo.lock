@@ -1559,10 +1559,15 @@ dependencies = [
 name = "inputtino"
 version = "0.1.0"
 dependencies = [
+ "inputtino-sys",
+]
+
+[[package]]
+name = "inputtino-sys"
+version = "0.1.0"
+dependencies = [
  "bindgen 0.69.5",
  "cmake",
- "pkg-config",
- "strum_macros",
 ]
 
 [[package]]

@@ -1,4 +1,14 @@
-use inputtino::{DeviceDefinition, Joypad, JoypadKind, JoypadStickPosition};
+use inputtino::{DeviceDefinition, Joypad, JoypadStickPosition, PS5Joypad, SwitchJoypad, XboxOneJoypad};
+use strum_macros::FromRepr;
+
+#[derive(Debug, FromRepr)]
+#[repr(u8)]
+pub enum GamepadKind {
+	Unknown = 0x00,
+	Xbox = 0x01,
+	PlayStation = 0x02,
+	Nintendo = 0x03,
+}
 
 #[derive(Copy, Clone, Debug)]
 #[repr(u16)]
@@ -31,7 +41,7 @@ enum GamepadCapability {
 #[derive(Debug)]
 pub struct GamepadInfo {
 	_index: u8,
-	kind: JoypadKind,
+	kind: GamepadKind,
 	capabilities: u16,
 	_supported_buttons: u32,
 }
@@ -52,7 +62,7 @@ impl GamepadInfo {
 
 		Ok(Self {
 			_index: buffer[0],
-			kind: JoypadKind::from_repr(buffer[1]).ok_or_else(|| tracing::warn!("Unknown gamepad kind: {}", buffer[1]))?,
+			kind: GamepadKind::from_repr(buffer[1]).ok_or_else(|| tracing::warn!("Unknown gamepad kind: {}", buffer[1]))?,
 			capabilities: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			_supported_buttons: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 		})
@@ -61,6 +71,47 @@ impl GamepadInfo {
 	#[allow(dead_code)]
 	fn has_capability(&self, capability: &GamepadCapability) -> bool {
 		(self.capabilities & *capability as u16) != 0
+	}
+}
+
+#[derive(Debug)]
+pub struct GamepadTouch {
+	pub index: u8,
+	_event_type: u8,
+	// zero: [u8; 2], // Alignment/reserved
+	pointer_id: u32,
+	pub x: f32,
+	pub y: f32,
+	pub pressure: f32,
+}
+
+impl GamepadTouch {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+		const EXPECTED_SIZE: usize =
+			std::mem::size_of::<u8>()    // index
+			+ std::mem::size_of::<u8>()  // event_type
+			+ std::mem::size_of::<u16>() // zero
+			+ std::mem::size_of::<u32>() // pointer_id
+			+ std::mem::size_of::<f32>() // x
+			+ std::mem::size_of::<f32>() // y
+			+ std::mem::size_of::<f32>() // pressure
+		;
+
+		if buffer.len() < EXPECTED_SIZE {
+			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for GamepadTouch, got {} bytes.", buffer.len());
+			return Err(());
+		}
+
+		Ok(Self {
+			index: buffer[0],
+			_event_type: buffer[1],
+			// zero: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
+			pointer_id: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
+			x: f32::from_le_bytes(buffer[8..12].try_into().unwrap()),
+			y: f32::from_le_bytes(buffer[12..16].try_into().unwrap()),
+			pressure: f32::from_le_bytes(buffer[16..20].try_into().unwrap()),
+
+		})
 	}
 }
 
@@ -125,12 +176,17 @@ pub struct Gamepad {
 impl Gamepad {
 	pub fn new(info: GamepadInfo) -> Result<Self, ()> {
 		let definition = match info.kind {
-			JoypadKind::Unknown | JoypadKind::Xbox => DeviceDefinition::new("Moonshine XOne controller", 0x045e, 0x02dd, 0x0100, "00:11:22:33:44", "00:11:22:33:44"),
-			JoypadKind::PlayStation => DeviceDefinition::new("Moonshine PS5 controller", 0x054C, 0x0CE6, 0x8111, "00:11:22:33:44", "00:11:22:33:44"),
-			JoypadKind::Nintendo => DeviceDefinition::new("Moonshine Switch controller", 0x045e, 0x02DD, 0x0100, "00:11:22:33:44", "00:11:22:33:44"),
+			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new("Moonshine XOne controller", 0x045e, 0x02dd, 0x0100, "00:11:22:33:44", "00:11:22:33:44"),
+			GamepadKind::PlayStation => DeviceDefinition::new("Moonshine PS5 controller", 0x054C, 0x0CE6, 0x8111, "00:11:22:33:44", "00:11:22:33:44"),
+			GamepadKind::Nintendo => DeviceDefinition::new("Moonshine Switch controller", 0x045e, 0x02DD, 0x0100, "00:11:22:33:44", "00:11:22:33:44"),
 		};
-		let gamepad = Joypad::new(&info.kind, &definition)
-			.map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?;
+
+		let gamepad = match info.kind {
+			GamepadKind::Unknown | GamepadKind::Xbox => Joypad::XboxOne(XboxOneJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?),
+			GamepadKind::PlayStation => Joypad::PS5(PS5Joypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?),
+			GamepadKind::Nintendo => Joypad::Switch(SwitchJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?),
+		};
+
 		Ok(Self { _info: info, gamepad })
 	}
 
@@ -142,5 +198,19 @@ impl Gamepad {
 		self.gamepad.set_stick(JoypadStickPosition::LS, update.left_stick.0, update.left_stick.1);
 		self.gamepad.set_stick(JoypadStickPosition::RS, update.right_stick.0, update.right_stick.1);
 		self.gamepad.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
+	}
+
+	pub fn touch(&mut self, touch: GamepadTouch) {
+		if let Joypad::PS5(gamepad) = &self.gamepad {
+			if touch.pressure > 0.5 {
+				gamepad.place_finger(
+					touch.pointer_id,
+					(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
+					(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
+				);
+			} else {
+				gamepad.release_finger(touch.pointer_id);
+			}
+		}
 	}
 }

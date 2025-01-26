@@ -13,7 +13,7 @@ use self::{
 		MouseScrollHorizontal,
 	},
 	keyboard::{Keyboard, Key},
-	gamepad::{GamepadInfo, GamepadUpdate}
+	gamepad::{GamepadInfo, GamepadTouch, GamepadUpdate}
 };
 
 mod keyboard;
@@ -32,6 +32,7 @@ enum InputEventType {
 	MouseScrollVertical = 0x0000000A,
 	MouseScrollHorizontal = 0x55000001,
 	GamepadInfo = 0x55000004, // Called ControllerArrival in Moonlight.
+	GamepadTouch = 0x55000005,
 	GamepadUpdate = 0x0000000C,
 }
 
@@ -47,6 +48,7 @@ enum InputEvent {
 	MouseScrollVertical(MouseScrollVertical),
 	MouseScrollHorizontal(MouseScrollHorizontal),
 	GamepadInfo(GamepadInfo),
+	GamepadTouch(GamepadTouch),
 	GamepadUpdate(GamepadUpdate),
 }
 
@@ -68,6 +70,7 @@ impl InputEvent {
 			Some(InputEventType::MouseScrollVertical) => Ok(InputEvent::MouseScrollVertical(MouseScrollVertical::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::MouseScrollHorizontal) => Ok(InputEvent::MouseScrollHorizontal(MouseScrollHorizontal::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadInfo) => Ok(InputEvent::GamepadInfo(GamepadInfo::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::GamepadTouch) => Ok(InputEvent::GamepadTouch(GamepadTouch::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadUpdate) => Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?)),
 			None => {
 				tracing::warn!("Received unknown event type: {event_type}");
@@ -157,6 +160,15 @@ impl InputHandlerInner {
 					if let Ok(gamepad) = Gamepad::new(gamepad) {
 						gamepads.push(gamepad);
 					}
+				},
+				InputEvent::GamepadTouch(gamepad_touch) => {
+					tracing::trace!("Gamepad touch: {gamepad_touch:?}");
+					if gamepad_touch.index as usize >= gamepads.len() {
+						tracing::warn!("Received touch for gamepad {}, but we only have {} gamepads.", gamepad_touch.index, gamepads.len());
+						continue;
+					}
+
+					gamepads[gamepad_touch.index as usize].touch(gamepad_touch);
 				},
 				InputEvent::GamepadUpdate(gamepad_update) => {
 					tracing::trace!("Gamepad update: {gamepad_update:?}");
