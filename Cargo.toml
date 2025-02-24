@@ -5,39 +5,39 @@ edition = "2021"
 
 [dependencies]
 async-shutdown = "0.2.2"
-clap = { version = "4.5.23", features = ["derive"] }
-cudarc = { version = "0.12.1", features = ["cuda-version-from-build-system"] }
-dirs = "5.0.1"
+clap = { version = "4.5.31", features = ["derive"] }
+cudarc = { version = "0.13.7", features = ["cuda-version-from-build-system"] }
+dirs = "6.0.0"
 enet = "0.3.0"
 evdev = "0.12.2"
 ffmpeg = { version = "7.1.0", package = "ffmpeg-next" }
 hex = "0.4.3"
 http-body-util = "0.1.2"
-hyper = { version = "1.5.1", features = ["server", "http1"] }
+hyper = { version = "1.6.0", features = ["server", "http1"] }
 hyper-util = { version = "0.1.10", features = ["tokio"] }
 image = "0.25.5"
 network-interface = "2.0.0"
-notify-rust = "4.11.3"
+notify-rust = "4.11.5"
 nvfbc = "0.1.5"
-open = "5.3.1"
-openssl = "0.10.68"
+open = "5.3.2"
+openssl = "0.10.71"
 opus = "0.3.0"
 pulse = { version = "2.28", package = "libpulse-binding" }
 pulse-simple = { version = "2.28", package = "libpulse-simple-binding" }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 rtsp-types = "0.1.3"
 sdp-types = "0.1.7"
-serde = "1.0.215"
+serde = "1.0.218"
 shellexpand = "3.1.0"
-strum = { version = "0.26.3", features = ["strum_macros"] }
-strum_macros = "0.26.4"
-tokio = { version = "1.42.0", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "tracing"] }
+strum = { version = "0.27.1", features = ["strum_macros"] }
+strum_macros = "0.27.1"
+tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "tracing"] }
 tokio-openssl = "0.6.5"
-toml = "0.8.19"
+toml = "0.8.20"
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 url = "2.5.4"
-uuid = { version = "1.11.0", features = ["v4"] }
+uuid = { version = "1.14.0", features = ["v4"] }
 zeroconf = "0.15.0"
 
 [patch.crates-io]
