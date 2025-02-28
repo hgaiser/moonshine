@@ -83,7 +83,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 			);
 		}
 
-		let boxart = config.library.join(format!("appcache/librarycache/{game_id}_library_600x900.jpg"));
+		let boxart = config.library.join(format!("appcache/librarycache/{game_id}/library_600x900.jpg"));
 		if let Ok(boxart) = shellexpand::full(&boxart.to_string_lossy()) {
 			match PathBuf::from_str(&boxart) {
 				Ok(path) => {
