@@ -140,6 +140,43 @@ pub struct ControlStream {
 	command_tx: mpsc::Sender<ControlStreamCommand>,
 }
 
+enum FeedbackCommand {
+	Rumble(RumbleCommand),
+}
+
+#[derive(Debug)]
+struct RumbleCommand {
+	id: u16,
+	low_frequency: u16,
+	high_frequency: u16,
+}
+
+impl RumbleCommand {
+	const HEADER_LENGTH: usize =
+		std::mem::size_of::<u16>() // Feedback type.
+		+ std::mem::size_of::<u16>() // Payload length.
+	;
+	const PAYLOAD_LENGTH: usize =
+		std::mem::size_of::<u32>() // Padding.
+		+ std::mem::size_of::<u16>() // ID of the gamepad.
+		+ std::mem::size_of::<u16>() // Low frequency.
+		+ std::mem::size_of::<u16>() // High frequency.
+	;
+
+	fn as_packet(&self) -> [u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH] {
+		let mut buffer = [0u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH];
+
+		buffer[0..2].copy_from_slice(&(ControlMessageType::RumbleData as u16).to_le_bytes());
+		buffer[2..4].copy_from_slice(&Self::PAYLOAD_LENGTH.to_le_bytes());
+		// buffer[4..8].copy_from_slice(&[0, 0, 0, 0]); // Padding.
+		buffer[8..10].copy_from_slice(&self.id.to_le_bytes());
+		buffer[10..12].copy_from_slice(&self.low_frequency.to_le_bytes());
+		buffer[12..14].copy_from_slice(&self.high_frequency.to_le_bytes());
+
+		buffer
+	}
+}
+
 impl ControlStream {
 	#[allow(clippy::result_unit_err)]
 	pub fn new(
@@ -213,6 +250,9 @@ impl ControlStreamInner {
 
 		let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 
+		// Create a channel over which we can receive feedback messages to send to the connected client.
+		let (feedback_tx, mut feedback_rx) = mpsc::channel(10);
+
 		loop {
 			// Check if we received a command.
 			let command = command_rx.try_recv();
@@ -236,6 +276,14 @@ impl ControlStreamInner {
 			if std::time::Instant::now() > stop_deadline {
 				tracing::info!("Stopping because we haven't received a ping for {} seconds.", config.stream_timeout);
 				break;
+			}
+
+			// Check for feedback messages.
+			if let Ok(FeedbackCommand::Rumble(command)) = feedback_rx.try_recv() {
+				for peer in host.connected_peers_mut() {
+					let _ = peer.send(0, &enet::Packet::reliable(&command.as_packet()))
+						.map_err(|e| tracing::warn!("Failed to send rumble to peer: {e}"));
+				}
 			}
 
 			match host.service().map_err(|e| tracing::error!("Failure in enet host: {e}"))? {
@@ -292,7 +340,7 @@ impl ControlStreamInner {
 							stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 						},
 						ControlMessage::InputData(event) => {
-							let _ = input_handler.handle_raw_input(event).await;
+							let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;
 						},
 						skipped_message => {
 							tracing::trace!("Skipped control message: {skipped_message:?}");

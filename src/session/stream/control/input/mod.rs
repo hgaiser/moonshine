@@ -16,6 +16,8 @@ use self::{
 	gamepad::{GamepadInfo, GamepadTouch, GamepadUpdate}
 };
 
+use super::FeedbackCommand;
+
 mod keyboard;
 mod mouse;
 mod gamepad;
@@ -81,7 +83,7 @@ impl InputEvent {
 }
 
 pub struct InputHandler {
-	command_tx: mpsc::Sender<InputEvent>,
+	command_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
 }
 
 impl InputHandler {
@@ -96,14 +98,14 @@ impl InputHandler {
 		Ok(Self { command_tx })
 	}
 
-	async fn handle_input(&self, event: InputEvent) -> Result<(), ()> {
-		self.command_tx.send(event).await
+	async fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
+		self.command_tx.send((event, feedback)).await
 			.map_err(|e| tracing::error!("Failed to send input event: {e}"))
 	}
 
-	pub async fn handle_raw_input(&self, event: &[u8]) -> Result<(), ()> {
+	pub async fn handle_raw_input(&self, event: &[u8], feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
 		let event = InputEvent::from_bytes(event)?;
-		self.handle_input(event).await
+		self.handle_input(event, feedback).await
 	}
 }
 
@@ -113,10 +115,10 @@ struct InputHandlerInner {
 }
 
 impl InputHandlerInner {
-	pub async fn run(mut self, mut command_rx: mpsc::Receiver<InputEvent>) {
+	pub async fn run(mut self, mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>) {
 		let mut gamepads = Vec::new();
 
-		while let Some(command) = command_rx.recv().await {
+		while let Some((command, feedback_tx)) = command_rx.recv().await {
 			match command {
 				InputEvent::KeyDown(key) => {
 					tracing::trace!("Pressing key: {key:?}");
@@ -157,7 +159,7 @@ impl InputHandlerInner {
 				},
 				InputEvent::GamepadInfo(gamepad) => {
 					tracing::debug!("Gamepad info: {gamepad:?}");
-					if let Ok(gamepad) = Gamepad::new(gamepad) {
+					if let Ok(gamepad) = Gamepad::new(gamepad, feedback_tx) {
 						gamepads.push(gamepad);
 					}
 				},

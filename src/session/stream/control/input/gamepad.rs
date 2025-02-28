@@ -1,5 +1,8 @@
 use inputtino::{DeviceDefinition, Joypad, JoypadStickPosition, PS5Joypad, SwitchJoypad, XboxOneJoypad};
 use strum_macros::FromRepr;
+use tokio::sync::mpsc;
+
+use crate::session::stream::control::{FeedbackCommand, RumbleCommand};
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
@@ -40,7 +43,7 @@ enum GamepadCapability {
 
 #[derive(Debug)]
 pub struct GamepadInfo {
-	_index: u8,
+	index: u8,
 	kind: GamepadKind,
 	capabilities: u16,
 	_supported_buttons: u32,
@@ -64,7 +67,7 @@ impl GamepadInfo {
 		}
 
 		Ok(Self {
-			_index: buffer[0],
+			index: buffer[0],
 			kind: GamepadKind::from_repr(buffer[1])
 				.ok_or_else(|| tracing::warn!("Unknown gamepad kind: {}", buffer[1]))?,
 			capabilities: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
@@ -179,12 +182,11 @@ impl GamepadUpdate {
 }
 
 pub struct Gamepad {
-	_info: GamepadInfo,
 	gamepad: inputtino::Joypad,
 }
 
 impl Gamepad {
-	pub fn new(info: GamepadInfo) -> Result<Self, ()> {
+	pub fn new(info: GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
@@ -212,19 +214,27 @@ impl Gamepad {
 			),
 		};
 
-		let gamepad = match info.kind {
+		let mut gamepad = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => Joypad::XboxOne(
 				XboxOneJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
 			),
-			GamepadKind::PlayStation => {
-				Joypad::PS5(PS5Joypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?)
-			},
+			GamepadKind::PlayStation => Joypad::PS5(
+				PS5Joypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?
+			),
 			GamepadKind::Nintendo => Joypad::Switch(
 				SwitchJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
 			),
 		};
 
-		Ok(Self { _info: info, gamepad })
+		gamepad.set_on_rumble(move |low_frequency, high_frequency| {
+			let _ = feedback_tx.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
+				id: info.index as u16,
+				low_frequency: low_frequency as u16,
+				high_frequency: high_frequency as u16,
+			}));
+		});
+
+		Ok(Self { gamepad })
 	}
 
 	pub fn update(&mut self, update: GamepadUpdate) {
