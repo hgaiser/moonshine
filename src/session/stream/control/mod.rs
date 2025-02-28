@@ -238,9 +238,7 @@ impl ControlStreamInner {
 			socket,
 			enet::HostSettings {
 				peer_limit: 1,
-				channel_limit: usize::MAX,
-				compressor: Some(Box::new(enet::RangeCoder::new())),
-				checksum: Some(Box::new(enet::crc32)),
+				channel_limit: 1,
 				..Default::default()
 			}
 		)
