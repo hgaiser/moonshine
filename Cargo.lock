@@ -344,29 +344,6 @@ dependencies = [
 
 [[package]]
 name = "bindgen"
-version = "0.65.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cfdf7b466f9a4903edc73f95d6d2bcd5baf8ae620638762244d3f60143643cc5"
-dependencies = [
- "bitflags 1.3.2",
- "cexpr",
- "clang-sys",
- "lazy_static",
- "lazycell",
- "log",
- "peeking_take_while",
- "prettyplease",
- "proc-macro2",
- "quote",
- "regex",
- "rustc-hash",
- "shlex",
- "syn 2.0.98",
- "which",
-]
-
-[[package]]
-name = "bindgen"
 version = "0.68.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "726e4313eb6ec35d2730258ad4e15b547ee75d6afaa1361a922e78e59b7d8078"
@@ -884,26 +861,6 @@ name = "endi"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a3d8a32ae18130a3c84dd492d4215c3d913c3b07c6b63c2eb3eb7ff1101ab7bf"
-
-[[package]]
-name = "enet"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd5c84ebdecb28194d15e063436a4b7863546a9dea268aee131ca23dbb2a21ac"
-dependencies = [
- "enet-sys",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "enet-sys"
-version = "1.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4580f5cb34ba20a73d05e26876f05fd3830a8959fb594b1ecb4d9ddac2eec77"
-dependencies = [
- "bindgen 0.65.1",
- "cmake",
-]
 
 [[package]]
 name = "enumflags2"
@@ -1641,6 +1598,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f5d4a7da358eff58addd2877a45865158f0d78c911d43a5784ceb7bbf52833b0"
 
 [[package]]
+name = "js-sys"
+version = "0.3.77"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1cfaf33c695fc6e08064efbc1f72ec937429614f25eef83af942d0e227c3a28f"
+dependencies = [
+ "once_cell",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1885,7 +1852,6 @@ dependencies = [
  "clap",
  "cudarc",
  "dirs 6.0.0",
- "enet",
  "ffmpeg-next",
  "hex",
  "http-body-util",
@@ -1903,6 +1869,7 @@ dependencies = [
  "opus",
  "reed-solomon-erasure",
  "rtsp-types",
+ "rusty_enet",
  "sdp-types",
  "serde",
  "shellexpand",
@@ -2650,6 +2617,15 @@ name = "rustversion"
 version = "1.0.19"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f7c45b9784283f1b2e7fb61b42047c2fd678ef0960d4f6f1eba131594cc369d4"
+
+[[package]]
+name = "rusty_enet"
+version = "0.3.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abcbd5cfb2174266409f5ef2235700fb7746ea388f703e25ffcfcff1988cada9"
+dependencies = [
+ "js-sys",
+]
 
 [[package]]
 name = "scopeguard"

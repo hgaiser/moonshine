@@ -1,7 +1,6 @@
 use std::process::Stdio;
 
 use async_shutdown::ShutdownManager;
-use enet::Enet;
 use tokio::sync::mpsc;
 
 use crate::{config::{Config, ApplicationConfig}, session::stream::{VideoStream, AudioStream, ControlStream}};
@@ -58,7 +57,6 @@ impl Session {
 	pub fn new(
 		config: Config,
 		context: SessionContext,
-		enet: Enet,
 		stop_signal: ShutdownManager<()>,
 	) -> Result<Self, ()> {
 		if let Some(run_before) = &context.application.run_before {
@@ -69,7 +67,7 @@ impl Session {
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner { config, video_stream: None, audio_stream: None, control_stream: None };
-		tokio::spawn(inner.run(command_rx, context.clone(), enet, stop_signal));
+		tokio::spawn(inner.run(command_rx, context.clone(), stop_signal));
 		Ok(Self { command_tx, context, running: false })
 	}
 
@@ -127,7 +125,6 @@ impl SessionInner {
 		mut self,
 		mut command_rx: mpsc::Receiver<SessionCommand>,
 		mut session_context: SessionContext,
-		enet: Enet,
 		stop_signal: ShutdownManager<()>,
 	) {
 		while let Some(command) = command_rx.recv().await {
@@ -140,7 +137,6 @@ impl SessionInner {
 						video_stream.clone(),
 						audio_stream.clone(),
 						session_context.clone(),
-						enet.clone(),
 						stop_signal.clone()
 					) {
 						Ok(control_stream) => control_stream,

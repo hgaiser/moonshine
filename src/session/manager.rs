@@ -1,5 +1,4 @@
 use async_shutdown::{TriggerShutdownToken, ShutdownManager};
-use enet::Enet;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
@@ -36,15 +35,9 @@ struct SessionManagerInner {
 impl SessionManager {
 	#[allow(clippy::result_unit_err)]
 	pub fn new(config: Config, shutdown_token: TriggerShutdownToken<i32>) -> Result<Self, ()> {
-		// Preferably this gets constructed in control.rs, however it needs to stay
-		// alive throughout the entire application runtime.
-		// Once dropped, it cannot be initialized again.
-		let enet = Enet::new()
-			.map_err(|e| tracing::error!("Failed to initialize Enet session: {e}"))?;
-
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner: SessionManagerInner = Default::default();
-		tokio::spawn(async move { inner.run(config, command_rx, enet).await; drop(shutdown_token); });
+		tokio::spawn(async move { inner.run(config, command_rx).await; drop(shutdown_token); });
 		Ok(Self { command_tx })
 	}
 
@@ -106,7 +99,6 @@ impl SessionManagerInner {
 		mut self,
 		config: Config,
 		mut command_rx: mpsc::Receiver<SessionManagerCommand>,
-		enet: Enet,
 	) {
 		tracing::debug!("Waiting for commands.");
 
@@ -154,7 +146,7 @@ impl SessionManagerInner {
 								continue;
 							}
 
-							self.session = match Session::new(config.clone(), session_context, enet.clone(), stop_signal.clone()) {
+							self.session = match Session::new(config.clone(), session_context, stop_signal.clone()) {
 								Ok(session) => Some(session),
 								Err(()) => continue,
 							};

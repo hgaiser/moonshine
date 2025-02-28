@@ -1,12 +1,8 @@
+use std::{net::{SocketAddr, UdpSocket}, usize};
+
 use async_shutdown::ShutdownManager;
-use enet::{
-	Address,
-	BandwidthLimit,
-	ChannelLimit,
-	Enet,
-	Event,
-};
 use openssl::symm::Cipher;
+use rusty_enet as enet;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use crate::{session::{SessionContext, SessionKeys}, config::Config};
@@ -151,7 +147,6 @@ impl ControlStream {
 		video_stream: VideoStream,
 		audio_stream: AudioStream,
 		context: SessionContext,
-		enet: Enet,
 		stop_signal: ShutdownManager<()>,
 	) -> Result<Self, ()> {
 		let input_handler = InputHandler::new()?;
@@ -167,7 +162,6 @@ impl ControlStream {
 						video_stream,
 						audio_stream,
 						context,
-						enet,
 						input_handler,
 					)))
 				)
@@ -183,8 +177,7 @@ impl ControlStream {
 	}
 }
 
-struct ControlStreamInner {
-}
+struct ControlStreamInner { }
 
 impl ControlStreamInner {
 	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
@@ -195,25 +188,28 @@ impl ControlStreamInner {
 		video_stream: VideoStream,
 		audio_stream: AudioStream,
 		mut context: SessionContext,
-		enet: Enet,
 		input_handler: InputHandler,
 	) -> Result<(), ()> {
-		let local_addr = Address::new(
+		let socket_address = SocketAddr::new(
 			config.address.parse()
-				.map_err(|e| tracing::error!("Failed to parse address: {e}"))?,
+				.map_err(|e| tracing::error!("Failed to parse address ({}): {e}", config.address))?,
 			config.stream.control.port,
 		);
-		let mut host = enet
-			.create_host::<()>(
-				Some(&local_addr),
-				10,
-				ChannelLimit::Maximum,
-				BandwidthLimit::Unlimited,
-				BandwidthLimit::Unlimited,
-			)
-			.map_err(|e| tracing::error!("Failed to create Enet host: {e}"))?;
+		let socket = UdpSocket::bind(socket_address)
+			.map_err(|e| tracing::error!("Failed to bind to socket address ({}): {e}", socket_address))?;
+		let mut host = rusty_enet::Host::new(
+			socket,
+			enet::HostSettings {
+				peer_limit: 1,
+				channel_limit: usize::MAX,
+				compressor: Some(Box::new(enet::RangeCoder::new())),
+				checksum: Some(Box::new(enet::crc32)),
+				..Default::default()
+			}
+		)
+			.map_err(|e| tracing::error!("Failed to create control host: {e}"))?;
 
-		tracing::debug!("Listening for control messages on {:?}", host.address());
+		tracing::debug!("Listening for control messages on {:?}", socket_address);
 
 		let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 
@@ -242,11 +238,11 @@ impl ControlStreamInner {
 				break;
 			}
 
-			match host.service(1000).map_err(|e| tracing::error!("Failure in enet host: {e}"))? {
-				Some(Event::Connect(_)) => {},
-				Some(Event::Disconnect(..)) => {},
-				Some(Event::Receive {
-					ref packet,
+			match host.service().map_err(|e| tracing::error!("Failure in enet host: {e}"))? {
+				Some(enet::Event::Connect { .. }) => {},
+				Some(enet::Event::Disconnect { .. }) => {},
+				Some(enet::Event::Receive {
+					packet,
 					..
 				}) => {
 					let mut control_message = ControlMessage::from_bytes(packet.data())?;
@@ -305,6 +301,8 @@ impl ControlStreamInner {
 				}
 				_ => (),
 			}
+
+			std::thread::sleep(std::time::Duration::from_millis(10));
 		}
 
 		tracing::debug!("Control stream closing.");
