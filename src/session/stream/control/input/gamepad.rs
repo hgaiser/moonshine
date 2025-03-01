@@ -206,9 +206,9 @@ impl Gamepad {
 			),
 			GamepadKind::Nintendo => DeviceDefinition::new(
 				"Moonshine Switch controller",
-				0x045e,
-				0x02DD,
-				0x0100,
+				0x057e,
+				0x2009,
+				0x8111,
 				"00:11:22:33:44",
 				"00:11:22:33:44",
 			),
