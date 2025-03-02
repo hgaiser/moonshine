@@ -472,7 +472,7 @@ impl ClientManagerInner {
 		challenge_response.extend(server_challenge);
 
 		let cipher = Cipher::aes_128_ecb();
-		let challenge_response = encrypt(cipher, &challenge_response, Some(key), None, false)
+		let challenge_response = encrypt(cipher, &challenge_response, Some(key), None, None, false)
 			.map_err(|e| format!("Failed to encrypt client challenge response: {e}"))?;
 
 		Ok(challenge_response)

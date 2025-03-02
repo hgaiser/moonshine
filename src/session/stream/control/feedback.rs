@@ -27,7 +27,7 @@ impl RumbleCommand {
 		let mut buffer = [0u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH];
 
 		buffer[0..2].copy_from_slice(&(ControlMessageType::RumbleData as u16).to_le_bytes());
-		buffer[2..4].copy_from_slice(&Self::PAYLOAD_LENGTH.to_le_bytes());
+		buffer[2..4].copy_from_slice(&(Self::PAYLOAD_LENGTH as u16).to_le_bytes());
 		// buffer[4..8].copy_from_slice(&[0, 0, 0, 0]); // Padding.
 		buffer[8..10].copy_from_slice(&self.id.to_le_bytes());
 		buffer[10..12].copy_from_slice(&self.low_frequency.to_le_bytes());

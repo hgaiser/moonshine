@@ -11,6 +11,13 @@ enum ServerCapabilities {
 	ControllerTouchEvents = 0x02,
 }
 
+#[repr(u8)]
+enum EncryptionFlags {
+	ControlV2 = 0x01,
+	_Video = 0x02,
+	_Audio = 0x04,
+}
+
 #[derive(Clone)]
 pub struct RtspServer {
 	config: Config,
@@ -72,6 +79,10 @@ impl RtspServer {
 		ServerCapabilities::ControllerTouchEvents as u8
 	}
 
+	fn encryption_flags_supported(&self) -> u8 {
+		EncryptionFlags::ControlV2 as u8
+	}
+
 	#[allow(clippy::result_unit_err)]
 	pub fn description(&self) -> String {
 		// This is a very simple SDP description, the minimal that Moonlight requires.
@@ -85,6 +96,7 @@ impl RtspServer {
 		let mut result = String::new();
 
 		result.push_str(&format!("a=x-ss-general.featureFlags:{}\n", self.capabilities()));
+		result.push_str(&format!("a=x-ss-general.encryptionSupported:{}\n", self.encryption_flags_supported()));
 		result.push_str("sprop-parameter-sets=AAAAAU\n");
 		result.push_str("a=fmtp:96 packetization-mode=1");
 

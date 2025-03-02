@@ -147,16 +147,27 @@ impl EncryptedControlMessage {
 	}
 }
 
-fn encode_control(sequence_number: u32, payload: &[u8]) -> Result<Vec<u8>, ()> {
-	let mut initialization_vector = [0u8; 16];
-	initialization_vector[0] = sequence_number as u8;
+fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Vec<u8>, ()> {
+	let mut initialization_vector = [0u8; 12];
+	openssl::rand::rand_bytes(&mut initialization_vector)
+		.map_err(|e| tracing::warn!("Failed to create control message initialization vector: {e}"))?;
+	initialization_vector[0..4].copy_from_slice(&sequence_number.to_le_bytes());
+	initialization_vector[10] = b'H';
+	initialization_vector[11] = b'C';
 
-	let cipher = cipher::Cipher::aes_256_gcm();
-	let payload = encrypt(cipher, payload, None, Some(&initialization_vector), false)
-		.map_err(|e| tracing::error!("Failed to encrypt control data: {e}"))?;
+	let cipher = cipher::Cipher::aes_128_gcm();
+
+	if key.len() != cipher.key_length() {
+		tracing::warn!("Key length has {} bytes, but expected {} bytes.", key.len(), cipher.key_length());
+		return Err(());
+	}
+
+	let mut tag = [0u8; 16];
+	let payload = encrypt(cipher, payload, Some(key), Some(&initialization_vector), Some(&mut tag), true)
+		.map_err(|e| tracing::warn!("Failed to encrypt control data: {e}"))?;
 
 	if payload.is_empty() {
-		tracing::error!("Failed to encrypt control data.");
+		tracing::warn!("Failed to encrypt control data.");
 		return Err(());
 	}
 
@@ -166,7 +177,7 @@ fn encode_control(sequence_number: u32, payload: &[u8]) -> Result<Vec<u8>, ()> {
 			 + ENCRYPTION_TAG_LENGTH as u16   // Tag.
 			 + payload.len() as u16,          // Payload.
 		sequence_number,
-		tag: [0u8; 16],
+		tag,
 		payload,
 	};
 
@@ -285,8 +296,9 @@ impl ControlStreamInner {
 
 			// Check for feedback messages.
 			if let Ok(FeedbackCommand::Rumble(command)) = feedback_rx.try_recv() {
+				tracing::info!("Sending rumble command: {command:?}");
 				let payload = command.as_packet();
-				let packet = encode_control(sequence_number, &payload);
+				let packet = encode_control(&context.keys.remote_input_key, sequence_number, &payload);
 
 				if let Ok(packet) = packet {
 					for peer in host.connected_peers_mut() {
@@ -311,8 +323,10 @@ impl ControlStreamInner {
 					// First check for encrypted control messages and decrypt them.
 					let decrypted;
 					if let ControlMessage::Encrypted(message) = control_message {
-						let mut initialization_vector = [0u8; 16];
-						initialization_vector[0] = message.sequence_number as u8;
+						let mut initialization_vector = [0u8; 12];
+						initialization_vector[0..4].copy_from_slice(&message.sequence_number.to_le_bytes());
+						initialization_vector[10] = b'C';
+						initialization_vector[11] = b'C';
 
 						let decrypted_result = openssl::symm::decrypt_aead(
 							symm::Cipher::aes_128_gcm(),
