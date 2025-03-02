@@ -1,15 +1,16 @@
-use std::{net::{SocketAddr, UdpSocket}, usize};
+use std::net::{SocketAddr, UdpSocket};
 
 use async_shutdown::ShutdownManager;
-use openssl::symm::Cipher;
+use openssl::{cipher, symm};
 use rusty_enet as enet;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
-use crate::{session::{SessionContext, SessionKeys}, config::Config};
-use self::input::InputHandler;
+use crate::{config::Config, crypto::encrypt, session::{SessionContext, SessionKeys}};
+use self::{input::InputHandler, feedback::FeedbackCommand};
 use super::{VideoStream, AudioStream};
 
 mod input;
+mod feedback;
 
 const ENCRYPTION_TAG_LENGTH: usize = 16;
 // Sequence number + tag + control message id
@@ -94,7 +95,7 @@ impl<'a> ControlMessage<'a> {
 
 				let sequence_number = u32::from_le_bytes(buffer[4..8].try_into().unwrap());
 				Ok(Self::Encrypted(EncryptedControlMessage {
-					_length: length,
+					length,
 					sequence_number,
 					tag: buffer[8..8 + ENCRYPTION_TAG_LENGTH].try_into()
 						.map_err(|e| tracing::warn!("Failed to get tag from encrypted control message: {e}"))?,
@@ -126,10 +127,50 @@ impl<'a> ControlMessage<'a> {
 
 #[derive(Debug)]
 struct EncryptedControlMessage {
-	_length: u16,
+	length: u16,
 	sequence_number: u32,
 	tag: [u8; 16],
 	payload: Vec<u8>,
+}
+
+impl EncryptedControlMessage {
+	fn as_bytes(&self) -> Vec<u8> {
+		let mut buffer = Vec::with_capacity(self.length as usize);
+
+		buffer.extend((ControlMessageType::Encrypted as u16).to_le_bytes());
+		buffer.extend(self.length.to_le_bytes());
+		buffer.extend(self.sequence_number.to_le_bytes());
+		buffer.extend(self.tag);
+		buffer.extend(&self.payload);
+
+		buffer
+	}
+}
+
+fn encode_control(sequence_number: u32, payload: &[u8]) -> Result<Vec<u8>, ()> {
+	let mut initialization_vector = [0u8; 16];
+	initialization_vector[0] = sequence_number as u8;
+
+	let cipher = cipher::Cipher::aes_256_gcm();
+	let payload = encrypt(cipher, payload, None, Some(&initialization_vector), false)
+		.map_err(|e| tracing::error!("Failed to encrypt control data: {e}"))?;
+
+	if payload.is_empty() {
+		tracing::error!("Failed to encrypt control data.");
+		return Err(());
+	}
+
+	let message = EncryptedControlMessage {
+		length:
+			std::mem::size_of::<u32>() as u16 // Sequence number.
+			 + ENCRYPTION_TAG_LENGTH as u16   // Tag.
+			 + payload.len() as u16,          // Payload.
+		sequence_number,
+		tag: [0u8; 16],
+		payload,
+	};
+
+	Ok(message.as_bytes())
 }
 
 enum ControlStreamCommand {
@@ -138,43 +179,6 @@ enum ControlStreamCommand {
 
 pub struct ControlStream {
 	command_tx: mpsc::Sender<ControlStreamCommand>,
-}
-
-enum FeedbackCommand {
-	Rumble(RumbleCommand),
-}
-
-#[derive(Debug)]
-struct RumbleCommand {
-	id: u16,
-	low_frequency: u16,
-	high_frequency: u16,
-}
-
-impl RumbleCommand {
-	const HEADER_LENGTH: usize =
-		std::mem::size_of::<u16>() // Feedback type.
-		+ std::mem::size_of::<u16>() // Payload length.
-	;
-	const PAYLOAD_LENGTH: usize =
-		std::mem::size_of::<u32>() // Padding.
-		+ std::mem::size_of::<u16>() // ID of the gamepad.
-		+ std::mem::size_of::<u16>() // Low frequency.
-		+ std::mem::size_of::<u16>() // High frequency.
-	;
-
-	fn as_packet(&self) -> [u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH] {
-		let mut buffer = [0u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH];
-
-		buffer[0..2].copy_from_slice(&(ControlMessageType::RumbleData as u16).to_le_bytes());
-		buffer[2..4].copy_from_slice(&Self::PAYLOAD_LENGTH.to_le_bytes());
-		// buffer[4..8].copy_from_slice(&[0, 0, 0, 0]); // Padding.
-		buffer[8..10].copy_from_slice(&self.id.to_le_bytes());
-		buffer[10..12].copy_from_slice(&self.low_frequency.to_le_bytes());
-		buffer[12..14].copy_from_slice(&self.high_frequency.to_le_bytes());
-
-		buffer
-	}
 }
 
 impl ControlStream {
@@ -251,6 +255,9 @@ impl ControlStreamInner {
 		// Create a channel over which we can receive feedback messages to send to the connected client.
 		let (feedback_tx, mut feedback_rx) = mpsc::channel(10);
 
+		// Sequence number of feedback messages.
+		let mut sequence_number = 0u32;
+
 		loop {
 			// Check if we received a command.
 			let command = command_rx.try_recv();
@@ -278,10 +285,17 @@ impl ControlStreamInner {
 
 			// Check for feedback messages.
 			if let Ok(FeedbackCommand::Rumble(command)) = feedback_rx.try_recv() {
-				for peer in host.connected_peers_mut() {
-					let _ = peer.send(0, &enet::Packet::reliable(&command.as_packet()))
-						.map_err(|e| tracing::warn!("Failed to send rumble to peer: {e}"));
+				let payload = command.as_packet();
+				let packet = encode_control(sequence_number, &payload);
+
+				if let Ok(packet) = packet {
+					for peer in host.connected_peers_mut() {
+						let _ = peer.send(0, &enet::Packet::reliable(&packet))
+							.map_err(|e| tracing::warn!("Failed to send rumble to peer: {e}"));
+					}
 				}
+
+				sequence_number += 1;
 			}
 
 			match host.service().map_err(|e| tracing::error!("Failure in enet host: {e}"))? {
@@ -301,7 +315,7 @@ impl ControlStreamInner {
 						initialization_vector[0] = message.sequence_number as u8;
 
 						let decrypted_result = openssl::symm::decrypt_aead(
-							Cipher::aes_128_gcm(),
+							symm::Cipher::aes_128_gcm(),
 							&context.keys.remote_input_key,
 							Some(&initialization_vector),
 							&[],
@@ -348,7 +362,7 @@ impl ControlStreamInner {
 				_ => (),
 			}
 
-			std::thread::sleep(std::time::Duration::from_millis(10));
+			std::thread::sleep(std::time::Duration::from_millis(1));
 		}
 
 		tracing::debug!("Control stream closing.");

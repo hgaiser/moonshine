@@ -2,7 +2,7 @@ use inputtino::{DeviceDefinition, Joypad, JoypadStickPosition, PS5Joypad, Switch
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
-use crate::session::stream::control::{FeedbackCommand, RumbleCommand};
+use crate::session::stream::control::{feedback::RumbleCommand, FeedbackCommand};
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
