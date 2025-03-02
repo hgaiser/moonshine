@@ -149,8 +149,6 @@ impl EncryptedControlMessage {
 
 fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Vec<u8>, ()> {
 	let mut initialization_vector = [0u8; 12];
-	openssl::rand::rand_bytes(&mut initialization_vector)
-		.map_err(|e| tracing::warn!("Failed to create control message initialization vector: {e}"))?;
 	initialization_vector[0..4].copy_from_slice(&sequence_number.to_le_bytes());
 	initialization_vector[10] = b'H';
 	initialization_vector[11] = b'C';
