@@ -294,7 +294,7 @@ impl ControlStreamInner {
 
 			// Check for feedback messages.
 			if let Ok(FeedbackCommand::Rumble(command)) = feedback_rx.try_recv() {
-				tracing::info!("Sending rumble command: {command:?}");
+				tracing::debug!("Sending rumble command: {command:?}");
 				let payload = command.as_packet();
 				let packet = encode_control(&context.keys.remote_input_key, sequence_number, &payload);
 

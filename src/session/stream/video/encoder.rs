@@ -148,7 +148,7 @@ impl Encoder {
 		let mut packet = Packet::empty();
 
 		// The last frame number we used.
-		let mut current_captured_frame_number = 0;
+		let mut processed_captured_frame_number = 0;
 
 		// The sequential frame number for sending to the client.
 		let mut frame_number = 0;
@@ -172,12 +172,13 @@ impl Encoder {
 
 				// Check if we missed a frame, in that case we don't need to wait for a new frame notification.
 				let captured_frame_number = captured_frame_number.load(Ordering::Relaxed);
-				if captured_frame_number == 0 || captured_frame_number == current_captured_frame_number + 1 {
+				// Check if we just started recording, or if we have not yet received a new frame.
+				if captured_frame_number == 0 || captured_frame_number == processed_captured_frame_number {
 					// Realistically we can wait indefinitely, but it feels safer to have a timeout just in case.
 					let mut lock = match frame_notifier.wait_timeout(lock, std::time::Duration::from_secs(5)) {
 						Ok(result) => result,
 						Err(e) => {
-							tracing::error!("Failed to wait for new frame: {e}");
+							tracing::warn!("Failed to wait for new frame: {e}");
 							continue;
 						},
 					};
@@ -190,12 +191,12 @@ impl Encoder {
 
 					tracing::trace!("Received notification for a new frame.");
 					std::mem::swap(&mut *lock.0, &mut encoder_buffer);
+					processed_captured_frame_number = captured_frame_number + 1;
 				} else {
-					tracing::debug!("We missed {} frame notification(s), continuing with newest frame.", captured_frame_number - current_captured_frame_number);
+					tracing::debug!("We missed {} frame notification(s), continuing with newest frame.", captured_frame_number - processed_captured_frame_number);
 					std::mem::swap(&mut *lock, &mut encoder_buffer);
+					processed_captured_frame_number = captured_frame_number;
 				}
-
-				current_captured_frame_number = captured_frame_number;
 			}
 
 			frame_number += 1;
