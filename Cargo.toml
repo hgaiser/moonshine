@@ -30,7 +30,6 @@ rusty_enet = "0.3.3"
 sdp-types = "0.1.7"
 serde = "1.0.218"
 shellexpand = "3.1.0"
-strum = { version = "0.27.1", features = ["strum_macros"] }
 strum_macros = "0.27.1"
 tokio = { version = "1.43.0", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "tracing"] }
 tokio-openssl = "0.6.5"

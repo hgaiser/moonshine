@@ -1919,7 +1919,6 @@ dependencies = [
  "sdp-types",
  "serde",
  "shellexpand",
- "strum",
  "strum_macros",
  "tokio",
  "tokio-openssl",
@@ -2820,15 +2819,6 @@ name = "strsim"
 version = "0.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
-
-[[package]]
-name = "strum"
-version = "0.27.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f64def088c51c9510a8579e3c5d67c65349dcf755e5479ad3d010aa6454e2c32"
-dependencies = [
- "strum_macros",
-]
 
 [[package]]
 name = "strum_macros"
