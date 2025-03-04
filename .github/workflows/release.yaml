@@ -24,7 +24,7 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo pacman -Syyuu --noconfirm --needed clang cmake rust avahi cuda ffmpeg gcc-libs glibc libpulse nvidia-utils openssl opus
+        sudo pacman -Syyuu --noconfirm --needed clang cmake rust avahi cuda ffmpeg gcc-libs glibc libevdev libpulse nvidia-utils openssl opus
         source /etc/profile
       shell: bash
 
