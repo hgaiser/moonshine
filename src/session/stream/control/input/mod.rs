@@ -120,7 +120,7 @@ struct InputHandlerInner {
 
 impl InputHandlerInner {
 	pub async fn run(mut self, mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>) {
-		let mut gamepads = Vec::new();
+		let mut gamepads: [Option<Gamepad>; 16] = Default::default();
 
 		while let Some((command, feedback_tx)) = command_rx.recv().await {
 			match command {
@@ -163,9 +163,17 @@ impl InputHandlerInner {
 				},
 				InputEvent::GamepadInfo(gamepad) => {
 					tracing::debug!("Gamepad info: {gamepad:?}");
-					if let Ok(gamepad) = Gamepad::new(gamepad, feedback_tx).await {
-						gamepads.push(gamepad);
+					if gamepad.index as usize >= gamepads.len() {
+						tracing::warn!("Received info for gamepad {}, but we only have {} slots.", gamepad.index, gamepads.len());
+						continue;
 					}
+
+					if gamepads[gamepad.index as usize].is_some() {
+						tracing::warn!("Gamepad {} is already connected.", gamepad.index);
+					} else if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
+     					gamepads[gamepad.index as usize] = Some(new_gamepad)
+						tracing::info!("Gamepad {} connected.", gamepad.index);
+     				}
 				},
 				InputEvent::GamepadTouch(gamepad_touch) => {
 					tracing::trace!("Gamepad touch: {gamepad_touch:?}");
@@ -174,7 +182,10 @@ impl InputHandlerInner {
 						continue;
 					}
 
-					gamepads[gamepad_touch.index as usize].touch(gamepad_touch);
+					match gamepads[gamepad_touch.index as usize].as_mut() {
+						Some(gamepad) => gamepad.touch(&gamepad_touch),
+						None => tracing::warn!("Received touch for gamepad {}, but no gamepad is connected.", gamepad_touch.index),
+					}
 				},
 				InputEvent::GamepadMotion(gamepad_motion) => {
 					tracing::trace!("Gamepad motion: {gamepad_motion:?}");
@@ -183,7 +194,10 @@ impl InputHandlerInner {
 						continue;
 					}
 
-					gamepads[gamepad_motion.index as usize].set_motion(gamepad_motion);
+					match gamepads[gamepad_motion.index as usize].as_mut() {
+						Some(gamepad) => gamepad.set_motion(&gamepad_motion),
+						None => tracing::warn!("Received motion for gamepad {}, but no gamepad is connected.", gamepad_motion.index),
+					}
 				},
 				InputEvent::GamepadUpdate(gamepad_update) => {
 					tracing::trace!("Gamepad update: {gamepad_update:?}");
@@ -192,7 +206,18 @@ impl InputHandlerInner {
 						continue;
 					}
 
-					gamepads[gamepad_update.index as usize].update(gamepad_update);
+					match gamepads[gamepad_update.index as usize].as_mut() {
+						Some(gamepad) => gamepad.update(&gamepad_update),
+						None => tracing::warn!("Received update for gamepad {}, but no gamepad is connected.", gamepad_update.index),
+					}
+
+					// Disconnect gamepads that are no longer active.
+					for (i, gamepad) in gamepads.iter_mut().enumerate() {
+						if gamepad.is_some() && gamepad_update.active_gamepad_mask & (1 << i) == 0 {
+							tracing::info!("Gamepad {} disconnected.", i);
+							*gamepad = None;
+						}
+					}
 				},
 			}
 		}

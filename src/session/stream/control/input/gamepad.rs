@@ -43,7 +43,7 @@ enum GamepadCapability {
 
 #[derive(Debug)]
 pub struct GamepadInfo {
-	index: u8,
+	pub index: u8,
 	kind: GamepadKind,
 	capabilities: u16,
 	_supported_buttons: u32,
@@ -127,7 +127,7 @@ impl GamepadTouch {
 #[derive(Debug)]
 pub struct GamepadUpdate {
 	pub index: u16,
-	_active_gamepad_mask: u16,
+	pub active_gamepad_mask: u16,
 	button_flags: u32,
 	left_trigger: u8,
 	right_trigger: u8,
@@ -164,7 +164,7 @@ impl GamepadUpdate {
 
 		Ok(Self {
 			index: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
-			_active_gamepad_mask: u16::from_le_bytes(buffer[4..6].try_into().unwrap()),
+			active_gamepad_mask: u16::from_le_bytes(buffer[4..6].try_into().unwrap()),
 			button_flags: u16::from_le_bytes(buffer[8..10].try_into().unwrap()) as u32
 				| (u16::from_le_bytes(buffer[22..24].try_into().unwrap()) as u32) << 16,
 			left_trigger: buffer[10],
@@ -233,7 +233,7 @@ pub struct Gamepad {
 }
 
 impl Gamepad {
-	pub async fn new(info: GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
+	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
@@ -271,9 +271,10 @@ impl Gamepad {
 
 				gamepad.set_on_led({
 					let feedback_tx = feedback_tx.clone();
+					let index = info.index;
 					move |r, g, b| {
 						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
-							id: info.index as u16,
+							id: index as u16,
 							rgb: (r as u8, g as u8, b as u8),
 						}));
 					}}
@@ -298,18 +299,21 @@ impl Gamepad {
 			),
 		};
 
-		gamepad.set_on_rumble(move |low_frequency, high_frequency| {
-			let _ = feedback_tx.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
-				id: info.index as u16,
-				low_frequency: low_frequency as u16,
-				high_frequency: high_frequency as u16,
-			}));
+		gamepad.set_on_rumble({
+			let index = info.index;
+			move |low_frequency, high_frequency| {
+				let _ = feedback_tx.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
+					id: index as u16,
+					low_frequency: low_frequency as u16,
+					high_frequency: high_frequency as u16,
+				}));
+			}
 		});
 
 		Ok(Self { gamepad })
 	}
 
-	pub fn update(&mut self, update: GamepadUpdate) {
+	pub fn update(&mut self, update: &GamepadUpdate) {
 		// Send button state.
 		self.gamepad.set_pressed(update.button_flags as i32);
 
@@ -319,7 +323,7 @@ impl Gamepad {
 		self.gamepad.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
 	}
 
-	pub fn touch(&mut self, touch: GamepadTouch) {
+	pub fn touch(&mut self, touch: &GamepadTouch) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
 			if touch.pressure > 0.5 {
 				gamepad.place_finger(
@@ -333,7 +337,7 @@ impl Gamepad {
 		}
 	}
 
-	pub fn set_motion(&self, motion: GamepadMotion) {
+	pub fn set_motion(&self, motion: &GamepadMotion) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
 			gamepad.set_motion(motion.motion_type, motion.x.to_radians(), motion.y.to_radians(), motion.z.to_radians());
 		}
