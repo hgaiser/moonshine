@@ -1,8 +1,8 @@
-use inputtino::{DeviceDefinition, Joypad, JoypadStickPosition, PS5Joypad, SwitchJoypad, XboxOneJoypad};
+use inputtino::{DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad, SwitchJoypad, XboxOneJoypad};
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
-use crate::session::stream::control::{feedback::{RumbleCommand, SetLedCommand}, FeedbackCommand};
+use crate::session::stream::control::{feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand}, FeedbackCommand};
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
@@ -117,9 +117,9 @@ impl GamepadTouch {
 			_event_type: buffer[1],
 			// zero: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			pointer_id: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
-			x: f32::from_le_bytes(buffer[8..12].try_into().unwrap()),
-			y: f32::from_le_bytes(buffer[12..16].try_into().unwrap()),
-			pressure: f32::from_le_bytes(buffer[16..20].try_into().unwrap()),
+			x: f32::from_le_bytes(buffer[8..12].try_into().unwrap()).clamp(0.0, 1.0),
+			y: f32::from_le_bytes(buffer[12..16].try_into().unwrap()).clamp(0.0, 1.0),
+			pressure: f32::from_le_bytes(buffer[16..20].try_into().unwrap()).clamp(0.0, 1.0),
 		})
 	}
 }
@@ -181,12 +181,59 @@ impl GamepadUpdate {
 	}
 }
 
+#[derive(Debug)]
+pub struct GamepadMotion {
+	pub index: u8,
+	motion_type: JoypadMotionType,
+	// zero: [u8; 2], // Alignment/reserved
+	x: f32,
+	y: f32,
+	z: f32,
+}
+
+impl GamepadMotion {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+		const EXPECTED_SIZE: usize =
+			std::mem::size_of::<u8>() // index
+			+ std::mem::size_of::<u8>() // motion type
+			+ std::mem::size_of::<u16>() // alignment/reserved
+			+ std::mem::size_of::<f32>() // x
+			+ std::mem::size_of::<f32>() // y
+			+ std::mem::size_of::<f32>() // z
+		;
+
+		if buffer.len() < EXPECTED_SIZE {
+			tracing::warn!(
+				"Expected at least {EXPECTED_SIZE} bytes for GamepadMotion, got {} bytes.",
+				buffer.len()
+			);
+			return Err(());
+		}
+
+		Ok(Self {
+			index: buffer[0],
+			motion_type: match buffer[1] {
+				1 => JoypadMotionType::ACCELERATION,
+				2 => JoypadMotionType::GYROSCOPE,
+				_ => {
+					tracing::warn!("Unknown gamepad motion type: {}", buffer[1]);
+					return Err(());
+				},
+			},
+			// zero: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
+			x: f32::from_le_bytes(buffer[4..8].try_into().unwrap()),
+			y: f32::from_le_bytes(buffer[8..12].try_into().unwrap()),
+			z: f32::from_le_bytes(buffer[12..16].try_into().unwrap()),
+		})
+	}
+}
+
 pub struct Gamepad {
 	gamepad: inputtino::Joypad,
 }
 
 impl Gamepad {
-	pub fn new(info: GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
+	pub async fn new(info: GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
@@ -232,6 +279,18 @@ impl Gamepad {
 					}}
 				);
 
+				// Enable gyro and accelerometer events.
+				let _ = feedback_tx.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
+					id: info.index as u16,
+					report_rate: 100,
+					motion_type: JoypadMotionType::ACCELERATION as u8,
+				})).await;
+				let _ = feedback_tx.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
+					id: info.index as u16,
+					report_rate: 100,
+					motion_type: JoypadMotionType::GYROSCOPE as u8,
+				})).await;
+
 				Joypad::PS5(gamepad)
 			}
 			GamepadKind::Nintendo => Joypad::Switch(
@@ -271,6 +330,12 @@ impl Gamepad {
 			} else {
 				gamepad.release_finger(touch.pointer_id);
 			}
+		}
+	}
+
+	pub fn set_motion(&self, motion: GamepadMotion) {
+		if let Joypad::PS5(gamepad) = &self.gamepad {
+			gamepad.set_motion(motion.motion_type, motion.x.to_radians(), motion.y.to_radians(), motion.z.to_radians());
 		}
 	}
 }

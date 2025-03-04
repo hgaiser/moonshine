@@ -1501,7 +1501,7 @@ dependencies = [
 [[package]]
 name = "inputtino"
 version = "0.1.0"
-source = "git+https://github.com/games-on-whales/inputtino#01b16d67c91667c424e8dc70947cdd7f7f03132d"
+source = "git+https://github.com/hgaiser/inputtino?branch=dualsense-motion#0d5169e0767f218c8fc95e5bd87f2068fd49778e"
 dependencies = [
  "inputtino-sys",
 ]
@@ -1509,7 +1509,7 @@ dependencies = [
 [[package]]
 name = "inputtino-sys"
 version = "0.1.0"
-source = "git+https://github.com/games-on-whales/inputtino#01b16d67c91667c424e8dc70947cdd7f7f03132d"
+source = "git+https://github.com/hgaiser/inputtino?branch=dualsense-motion#0d5169e0767f218c8fc95e5bd87f2068fd49778e"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",

@@ -1,3 +1,4 @@
+use gamepad::GamepadMotion;
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
@@ -35,6 +36,7 @@ enum InputEventType {
 	MouseScrollHorizontal = 0x55000001,
 	GamepadInfo = 0x55000004, // Called ControllerArrival in Moonlight.
 	GamepadTouch = 0x55000005,
+	GamepadMotion = 0x55000006,
 	GamepadUpdate = 0x0000000C,
 }
 
@@ -52,6 +54,7 @@ enum InputEvent {
 	GamepadInfo(GamepadInfo),
 	GamepadTouch(GamepadTouch),
 	GamepadUpdate(GamepadUpdate),
+	GamepadMotion(GamepadMotion),
 }
 
 impl InputEvent {
@@ -73,6 +76,7 @@ impl InputEvent {
 			Some(InputEventType::MouseScrollHorizontal) => Ok(InputEvent::MouseScrollHorizontal(MouseScrollHorizontal::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadInfo) => Ok(InputEvent::GamepadInfo(GamepadInfo::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadTouch) => Ok(InputEvent::GamepadTouch(GamepadTouch::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::GamepadMotion) => Ok(InputEvent::GamepadMotion(GamepadMotion::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadUpdate) => Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?)),
 			None => {
 				tracing::warn!("Received unknown event type: {event_type}");
@@ -159,7 +163,7 @@ impl InputHandlerInner {
 				},
 				InputEvent::GamepadInfo(gamepad) => {
 					tracing::debug!("Gamepad info: {gamepad:?}");
-					if let Ok(gamepad) = Gamepad::new(gamepad, feedback_tx) {
+					if let Ok(gamepad) = Gamepad::new(gamepad, feedback_tx).await {
 						gamepads.push(gamepad);
 					}
 				},
@@ -171,6 +175,15 @@ impl InputHandlerInner {
 					}
 
 					gamepads[gamepad_touch.index as usize].touch(gamepad_touch);
+				},
+				InputEvent::GamepadMotion(gamepad_motion) => {
+					tracing::trace!("Gamepad motion: {gamepad_motion:?}");
+					if gamepad_motion.index as usize >= gamepads.len() {
+						tracing::warn!("Received motion for gamepad {}, but we only have {} gamepads.", gamepad_motion.index, gamepads.len());
+						continue;
+					}
+
+					gamepads[gamepad_motion.index as usize].set_motion(gamepad_motion);
 				},
 				InputEvent::GamepadUpdate(gamepad_update) => {
 					tracing::trace!("Gamepad update: {gamepad_update:?}");
