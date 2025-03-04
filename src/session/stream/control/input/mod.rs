@@ -1,4 +1,3 @@
-use gamepad::GamepadMotion;
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
@@ -14,7 +13,7 @@ use self::{
 		MouseScrollHorizontal,
 	},
 	keyboard::{Keyboard, Key},
-	gamepad::{GamepadInfo, GamepadTouch, GamepadUpdate}
+	gamepad::{GamepadBattery, GamepadInfo, GamepadMotion, GamepadTouch, GamepadUpdate}
 };
 
 use super::FeedbackCommand;
@@ -37,6 +36,7 @@ enum InputEventType {
 	GamepadInfo = 0x55000004, // Called ControllerArrival in Moonlight.
 	GamepadTouch = 0x55000005,
 	GamepadMotion = 0x55000006,
+	GamepadBattery = 0x55000007,
 	GamepadUpdate = 0x0000000C,
 }
 
@@ -53,8 +53,9 @@ enum InputEvent {
 	MouseScrollHorizontal(MouseScrollHorizontal),
 	GamepadInfo(GamepadInfo),
 	GamepadTouch(GamepadTouch),
-	GamepadUpdate(GamepadUpdate),
 	GamepadMotion(GamepadMotion),
+	GamepadBattery(GamepadBattery),
+	GamepadUpdate(GamepadUpdate),
 }
 
 impl InputEvent {
@@ -77,6 +78,7 @@ impl InputEvent {
 			Some(InputEventType::GamepadInfo) => Ok(InputEvent::GamepadInfo(GamepadInfo::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadTouch) => Ok(InputEvent::GamepadTouch(GamepadTouch::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadMotion) => Ok(InputEvent::GamepadMotion(GamepadMotion::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::GamepadBattery) => Ok(InputEvent::GamepadBattery(GamepadBattery::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadUpdate) => Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?)),
 			None => {
 				tracing::warn!("Received unknown event type: {event_type}");
@@ -171,7 +173,7 @@ impl InputHandlerInner {
 					if gamepads[gamepad.index as usize].is_some() {
 						tracing::warn!("Gamepad {} is already connected.", gamepad.index);
 					} else if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
-     					gamepads[gamepad.index as usize] = Some(new_gamepad)
+     					gamepads[gamepad.index as usize] = Some(new_gamepad);
 						tracing::info!("Gamepad {} connected.", gamepad.index);
      				}
 				},
@@ -197,6 +199,18 @@ impl InputHandlerInner {
 					match gamepads[gamepad_motion.index as usize].as_mut() {
 						Some(gamepad) => gamepad.set_motion(&gamepad_motion),
 						None => tracing::warn!("Received motion for gamepad {}, but no gamepad is connected.", gamepad_motion.index),
+					}
+				},
+				InputEvent::GamepadBattery(gamepad_battery) => {
+					tracing::trace!("Gamepad battery: {gamepad_battery:?}");
+					if gamepad_battery.index as usize >= gamepads.len() {
+						tracing::warn!("Received battery for gamepad {}, but we only have {} gamepads.", gamepad_battery.index, gamepads.len());
+						continue;
+					}
+
+					match gamepads[gamepad_battery.index as usize].as_mut() {
+						Some(gamepad) => gamepad.set_battery(&gamepad_battery),
+						None => tracing::warn!("Received battery for gamepad {}, but no gamepad is connected.", gamepad_battery.index),
 					}
 				},
 				InputEvent::GamepadUpdate(gamepad_update) => {

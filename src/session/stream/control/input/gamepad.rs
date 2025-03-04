@@ -1,4 +1,13 @@
-use inputtino::{DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad, SwitchJoypad, XboxOneJoypad};
+use inputtino::{
+	BatteryState as InputtinoBatterState,
+	DeviceDefinition,
+	Joypad,
+	JoypadMotionType,
+	JoypadStickPosition,
+	PS5Joypad,
+	SwitchJoypad,
+	XboxOneJoypad
+};
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
@@ -228,6 +237,51 @@ impl GamepadMotion {
 	}
 }
 
+#[derive(Debug, FromRepr)]
+#[repr(u8)]
+enum BatteryState {
+	Unknown = 0x00,
+	NotPresent = 0x01,
+	Discharging = 0x02,
+	Charging = 0x03,
+	NotCharging = 0x04,
+	Full = 0x05,
+	PercentageUnknown = 0xFF,
+}
+
+#[derive(Debug)]
+pub struct GamepadBattery {
+	pub index: u8,
+	battery_state: BatteryState,
+	battery_percentage: u8,
+}
+
+impl GamepadBattery {
+	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
+		const EXPECTED_SIZE: usize =
+			std::mem::size_of::<u8>() // index
+			+ std::mem::size_of::<u8>() // battery state
+			+ std::mem::size_of::<u8>() // battery percentage
+			+ std::mem::size_of::<u8>() // padding
+		;
+
+		if buffer.len() < EXPECTED_SIZE {
+			tracing::warn!(
+				"Expected at least {EXPECTED_SIZE} bytes for GamepadBattery, got {} bytes.",
+				buffer.len()
+			);
+			return Err(());
+		}
+
+		Ok(Self {
+			index: buffer[0],
+			battery_state: BatteryState::from_repr(buffer[1])
+				.ok_or_else(|| tracing::warn!("Unknown battery state: {}", buffer[1]))?,
+			battery_percentage: buffer[2],
+		})
+	}
+}
+
 pub struct Gamepad {
 	gamepad: inputtino::Joypad,
 }
@@ -340,6 +394,25 @@ impl Gamepad {
 	pub fn set_motion(&self, motion: &GamepadMotion) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
 			gamepad.set_motion(motion.motion_type, motion.x.to_radians(), motion.y.to_radians(), motion.z.to_radians());
+		}
+	}
+
+	pub fn set_battery(&self, gamepad_battery: &GamepadBattery) {
+		if let Joypad::PS5(gamepad) = &self.gamepad {
+			let state = match gamepad_battery.battery_state {
+				BatteryState::Discharging => InputtinoBatterState::BATTERY_DISCHARGING,
+				BatteryState::Charging => InputtinoBatterState::BATTERY_CHARGHING,
+				BatteryState::Full => InputtinoBatterState::BATTERY_FULL,
+				BatteryState::NotPresent => return,
+				BatteryState::NotCharging => return,
+				BatteryState::Unknown => return,
+				_ => {
+					tracing::warn!("Unknown battery state: {:?}", gamepad_battery.battery_state);
+					return;
+				}
+			};
+
+			gamepad.set_battery(state, gamepad_battery.battery_percentage);
 		}
 	}
 }
