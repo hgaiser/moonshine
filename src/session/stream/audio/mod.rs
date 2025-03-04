@@ -10,7 +10,7 @@ mod encoder;
 
 #[derive(Clone, Default)]
 pub struct AudioStreamContext {
-	pub packet_duration: u32,
+	pub _packet_duration: u32,
 	pub qos: bool,
 }
 

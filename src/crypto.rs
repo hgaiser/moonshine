@@ -52,7 +52,14 @@ pub fn create_certificate() -> Result<(X509, PKey<Private>), ErrorStack> {
 	Ok((cert, key_pair))
 }
 
-pub fn encrypt(cipher: &CipherRef, plaintext: &[u8], key: Option<&[u8]>, iv: Option<&[u8]>, padding: bool) -> Result<Vec<u8>, openssl::error::ErrorStack> {
+pub fn encrypt(
+	cipher: &CipherRef,
+	plaintext: &[u8],
+	key: Option<&[u8]>,
+	iv: Option<&[u8]>,
+	tag: Option<&mut [u8]>,
+	padding: bool,
+) -> Result<Vec<u8>, openssl::error::ErrorStack> {
 	let mut context = CipherCtx::new()?;
 	context.encrypt_init(Some(cipher), key, iv)?;
 	context.set_padding(padding);
@@ -60,6 +67,9 @@ pub fn encrypt(cipher: &CipherRef, plaintext: &[u8], key: Option<&[u8]>, iv: Opt
 	let mut ciphertext = Vec::with_capacity(plaintext.len());
 	context.cipher_update_vec(plaintext, &mut ciphertext)?;
 	context.cipher_final_vec(&mut ciphertext)?;
+	if let Some(tag) = tag {
+		context.tag(tag)?;
+	}
 
 	Ok(ciphertext)
 }

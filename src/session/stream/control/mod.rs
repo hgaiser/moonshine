@@ -1,19 +1,16 @@
+use std::net::{SocketAddr, UdpSocket};
+
 use async_shutdown::ShutdownManager;
-use enet::{
-	Address,
-	BandwidthLimit,
-	ChannelLimit,
-	Enet,
-	Event,
-};
-use openssl::symm::Cipher;
+use openssl::{cipher, symm};
+use rusty_enet as enet;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
-use crate::{session::{SessionContext, SessionKeys}, config::Config};
-use self::input::InputHandler;
+use crate::{config::Config, crypto::encrypt, session::{SessionContext, SessionKeys}};
+use self::{input::InputHandler, feedback::FeedbackCommand};
 use super::{VideoStream, AudioStream};
 
 mod input;
+mod feedback;
 
 const ENCRYPTION_TAG_LENGTH: usize = 16;
 // Sequence number + tag + control message id
@@ -22,16 +19,19 @@ const MINIMUM_ENCRYPTED_LENGTH: usize = 4 + ENCRYPTION_TAG_LENGTH + 4;
 #[repr(u16)]
 enum ControlMessageType {
 	Encrypted = 0x0001,
+    TerminationExtended = 0x0109,
+    RumbleData = 0x010b,
+    HdrMode = 0x010e,
 	Ping = 0x0200,
-	Termination = 0x0100,
-	RumbleData = 0x010b,
-	LossStats = 0x0201,
-	FrameStats = 0x0204,
-	InputData = 0x0206,
-	InvalidateReferenceFrames = 0x0301,
-	RequestIdrFrame = 0x0302,
-	StartA = 0x0305,
-	StartB = 0x0307,
+    LossStats = 0x0201,
+    FrameStats = 0x0204,
+    InputData = 0x0206,
+    RequestIdrFrame = 0x0302,
+    InvalidateReferenceFrames = 0x0301,
+    StartB = 0x0307,
+    RumbleTriggers = 0x5500,
+    SetMotionEvent = 0x5501,
+    SetRgbLed = 0x5502,
 }
 
 impl TryFrom<u16> for ControlMessageType {
@@ -40,16 +40,19 @@ impl TryFrom<u16> for ControlMessageType {
 	fn try_from(v: u16) -> Result<Self, Self::Error> {
 		match v {
 			x if x == Self::Encrypted as u16 => Ok(Self::Encrypted),
-			x if x == Self::Ping as u16 => Ok(Self::Ping),
-			x if x == Self::Termination as u16 => Ok(Self::Termination),
+			x if x == Self::TerminationExtended as u16 => Ok(Self::TerminationExtended),
 			x if x == Self::RumbleData as u16 => Ok(Self::RumbleData),
+			x if x == Self::HdrMode as u16 => Ok(Self::HdrMode),
+			x if x == Self::Ping as u16 => Ok(Self::Ping),
 			x if x == Self::LossStats as u16 => Ok(Self::LossStats),
 			x if x == Self::FrameStats as u16 => Ok(Self::FrameStats),
 			x if x == Self::InputData as u16 => Ok(Self::InputData),
-			x if x == Self::InvalidateReferenceFrames as u16 => Ok(Self::InvalidateReferenceFrames),
 			x if x == Self::RequestIdrFrame as u16 => Ok(Self::RequestIdrFrame),
-			x if x == Self::StartA as u16 => Ok(Self::StartA),
+			x if x == Self::InvalidateReferenceFrames as u16 => Ok(Self::InvalidateReferenceFrames),
 			x if x == Self::StartB as u16 => Ok(Self::StartB),
+			x if x == Self::RumbleTriggers as u16 => Ok(Self::RumbleTriggers),
+			x if x == Self::SetMotionEvent as u16 => Ok(Self::SetMotionEvent),
+			x if x == Self::SetRgbLed as u16 => Ok(Self::SetRgbLed),
 			_ => Err(()),
 		}
 	}
@@ -58,16 +61,19 @@ impl TryFrom<u16> for ControlMessageType {
 #[derive(Debug)]
 enum ControlMessage<'a> {
 	Encrypted(EncryptedControlMessage),
-	Ping,
-	Termination,
+	TerminationExtended,
 	RumbleData,
+	HdrMode,
+	Ping,
 	LossStats,
 	FrameStats,
 	InputData(&'a [u8]),
-	InvalidateReferenceFrames,
 	RequestIdrFrame,
-	StartA,
+	InvalidateReferenceFrames,
 	StartB,
+	RumbleTriggers,
+	SetMotionEvent,
+	SetRgbLed,
 }
 
 impl<'a> ControlMessage<'a> {
@@ -98,7 +104,7 @@ impl<'a> ControlMessage<'a> {
 
 				let sequence_number = u32::from_le_bytes(buffer[4..8].try_into().unwrap());
 				Ok(Self::Encrypted(EncryptedControlMessage {
-					_length: length,
+					length,
 					sequence_number,
 					tag: buffer[8..8 + ENCRYPTION_TAG_LENGTH].try_into()
 						.map_err(|e| tracing::warn!("Failed to get tag from encrypted control message: {e}"))?,
@@ -106,7 +112,7 @@ impl<'a> ControlMessage<'a> {
 				}))
 			},
 			ControlMessageType::Ping => Ok(Self::Ping),
-			ControlMessageType::Termination => Ok(Self::Termination),
+			ControlMessageType::TerminationExtended => Ok(Self::TerminationExtended),
 			ControlMessageType::RumbleData => Ok(Self::RumbleData),
 			ControlMessageType::LossStats => Ok(Self::LossStats),
 			ControlMessageType::FrameStats => Ok(Self::FrameStats),
@@ -122,18 +128,70 @@ impl<'a> ControlMessage<'a> {
 			},
 			ControlMessageType::InvalidateReferenceFrames => Ok(Self::InvalidateReferenceFrames),
 			ControlMessageType::RequestIdrFrame => Ok(Self::RequestIdrFrame),
-			ControlMessageType::StartA => Ok(Self::StartA),
 			ControlMessageType::StartB => Ok(Self::StartB),
+			ControlMessageType::HdrMode => Ok(Self::HdrMode),
+			ControlMessageType::RumbleTriggers => Ok(Self::RumbleTriggers),
+			ControlMessageType::SetMotionEvent => Ok(Self::SetMotionEvent),
+			ControlMessageType::SetRgbLed => Ok(Self::SetRgbLed),
 		}
 	}
 }
 
 #[derive(Debug)]
 struct EncryptedControlMessage {
-	_length: u16,
+	length: u16,
 	sequence_number: u32,
 	tag: [u8; 16],
 	payload: Vec<u8>,
+}
+
+impl EncryptedControlMessage {
+	fn as_bytes(&self) -> Vec<u8> {
+		let mut buffer = Vec::with_capacity(self.length as usize);
+
+		buffer.extend((ControlMessageType::Encrypted as u16).to_le_bytes());
+		buffer.extend(self.length.to_le_bytes());
+		buffer.extend(self.sequence_number.to_le_bytes());
+		buffer.extend(self.tag);
+		buffer.extend(&self.payload);
+
+		buffer
+	}
+}
+
+fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Vec<u8>, ()> {
+	let mut initialization_vector = [0u8; 12];
+	initialization_vector[0..4].copy_from_slice(&sequence_number.to_le_bytes());
+	initialization_vector[10] = b'H';
+	initialization_vector[11] = b'C';
+
+	let cipher = cipher::Cipher::aes_128_gcm();
+
+	if key.len() != cipher.key_length() {
+		tracing::warn!("Key length has {} bytes, but expected {} bytes.", key.len(), cipher.key_length());
+		return Err(());
+	}
+
+	let mut tag = [0u8; 16];
+	let payload = encrypt(cipher, payload, Some(key), Some(&initialization_vector), Some(&mut tag), true)
+		.map_err(|e| tracing::warn!("Failed to encrypt control data: {e}"))?;
+
+	if payload.is_empty() {
+		tracing::warn!("Failed to encrypt control data.");
+		return Err(());
+	}
+
+	let message = EncryptedControlMessage {
+		length:
+			std::mem::size_of::<u32>() as u16 // Sequence number.
+			 + ENCRYPTION_TAG_LENGTH as u16   // Tag.
+			 + payload.len() as u16,          // Payload.
+		sequence_number,
+		tag,
+		payload,
+	};
+
+	Ok(message.as_bytes())
 }
 
 enum ControlStreamCommand {
@@ -151,7 +209,6 @@ impl ControlStream {
 		video_stream: VideoStream,
 		audio_stream: AudioStream,
 		context: SessionContext,
-		enet: Enet,
 		stop_signal: ShutdownManager<()>,
 	) -> Result<Self, ()> {
 		let input_handler = InputHandler::new()?;
@@ -167,7 +224,6 @@ impl ControlStream {
 						video_stream,
 						audio_stream,
 						context,
-						enet,
 						input_handler,
 					)))
 				)
@@ -183,8 +239,7 @@ impl ControlStream {
 	}
 }
 
-struct ControlStreamInner {
-}
+struct ControlStreamInner { }
 
 impl ControlStreamInner {
 	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
@@ -195,27 +250,34 @@ impl ControlStreamInner {
 		video_stream: VideoStream,
 		audio_stream: AudioStream,
 		mut context: SessionContext,
-		enet: Enet,
 		input_handler: InputHandler,
 	) -> Result<(), ()> {
-		let local_addr = Address::new(
+		let socket_address = SocketAddr::new(
 			config.address.parse()
-				.map_err(|e| tracing::error!("Failed to parse address: {e}"))?,
+				.map_err(|e| tracing::error!("Failed to parse address ({}): {e}", config.address))?,
 			config.stream.control.port,
 		);
-		let mut host = enet
-			.create_host::<()>(
-				Some(&local_addr),
-				10,
-				ChannelLimit::Maximum,
-				BandwidthLimit::Unlimited,
-				BandwidthLimit::Unlimited,
-			)
-			.map_err(|e| tracing::error!("Failed to create Enet host: {e}"))?;
+		let socket = UdpSocket::bind(socket_address)
+			.map_err(|e| tracing::error!("Failed to bind to socket address ({}): {e}", socket_address))?;
+		let mut host = rusty_enet::Host::new(
+			socket,
+			enet::HostSettings {
+				peer_limit: 1,
+				channel_limit: 1,
+				..Default::default()
+			}
+		)
+			.map_err(|e| tracing::error!("Failed to create control host: {e}"))?;
 
-		tracing::debug!("Listening for control messages on {:?}", host.address());
+		tracing::debug!("Listening for control messages on {:?}", socket_address);
 
 		let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
+
+		// Create a channel over which we can receive feedback messages to send to the connected client.
+		let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
+
+		// Sequence number of feedback messages.
+		let mut sequence_number = 0u32;
 
 		loop {
 			// Check if we received a command.
@@ -242,11 +304,27 @@ impl ControlStreamInner {
 				break;
 			}
 
-			match host.service(1000).map_err(|e| tracing::error!("Failure in enet host: {e}"))? {
-				Some(Event::Connect(_)) => {},
-				Some(Event::Disconnect(..)) => {},
-				Some(Event::Receive {
-					ref packet,
+			// Check for feedback messages.
+			if let Ok(command) = feedback_rx.try_recv() {
+				tracing::debug!("Sending control feedback command: {command:?}");
+				let payload = command.as_packet();
+				let packet = encode_control(&context.keys.remote_input_key, sequence_number, &payload);
+
+				if let Ok(packet) = packet {
+					for peer in host.connected_peers_mut() {
+						let _ = peer.send(0, &enet::Packet::reliable(&packet))
+							.map_err(|e| tracing::warn!("Failed to send rumble to peer: {e}"));
+					}
+				}
+
+				sequence_number += 1;
+			}
+
+			match host.service().map_err(|e| tracing::error!("Failure in enet host: {e}"))? {
+				Some(enet::Event::Connect { .. }) => {},
+				Some(enet::Event::Disconnect { .. }) => {},
+				Some(enet::Event::Receive {
+					packet,
 					..
 				}) => {
 					let mut control_message = ControlMessage::from_bytes(packet.data())?;
@@ -255,11 +333,13 @@ impl ControlStreamInner {
 					// First check for encrypted control messages and decrypt them.
 					let decrypted;
 					if let ControlMessage::Encrypted(message) = control_message {
-						let mut initialization_vector = [0u8; 16];
-						initialization_vector[0] = message.sequence_number as u8;
+						let mut initialization_vector = [0u8; 12];
+						initialization_vector[0..4].copy_from_slice(&message.sequence_number.to_le_bytes());
+						initialization_vector[10] = b'C';
+						initialization_vector[11] = b'C';
 
 						let decrypted_result = openssl::symm::decrypt_aead(
-							Cipher::aes_128_gcm(),
+							symm::Cipher::aes_128_gcm(),
 							&context.keys.remote_input_key,
 							Some(&initialization_vector),
 							&[],
@@ -296,7 +376,7 @@ impl ControlStreamInner {
 							stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 						},
 						ControlMessage::InputData(event) => {
-							let _ = input_handler.handle_raw_input(event).await;
+							let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;
 						},
 						skipped_message => {
 							tracing::trace!("Skipped control message: {skipped_message:?}");
@@ -305,6 +385,8 @@ impl ControlStreamInner {
 				}
 				_ => (),
 			}
+
+			std::thread::sleep(std::time::Duration::from_millis(1));
 		}
 
 		tracing::debug!("Control stream closing.");

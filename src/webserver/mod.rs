@@ -555,7 +555,7 @@ impl Webserver {
 			application: application.clone(),
 			application_id,
 			resolution: (width, height),
-			refresh_rate,
+			_refresh_rate: refresh_rate,
 			keys: SessionKeys {
 				remote_input_key,
 				remote_input_key_id,

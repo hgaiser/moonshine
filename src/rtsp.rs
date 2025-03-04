@@ -5,6 +5,19 @@ use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}};
 
 use crate::{config::Config, session::{stream::{AudioStreamContext, VideoStreamContext}, manager::SessionManager}};
 
+#[repr(u8)]
+enum ServerCapabilities {
+	_TouchEvents = 0x01,
+	ControllerTouchEvents = 0x02,
+}
+
+#[repr(u8)]
+enum EncryptionFlags {
+	ControlV2 = 0x01,
+	_Video = 0x02,
+	_Audio = 0x04,
+}
+
 #[derive(Clone)]
 pub struct RtspServer {
 	config: Config,
@@ -62,6 +75,14 @@ impl RtspServer {
 		server
 	}
 
+	fn capabilities(&self) -> u8 {
+		ServerCapabilities::ControllerTouchEvents as u8
+	}
+
+	fn encryption_flags_supported(&self) -> u8 {
+		EncryptionFlags::ControlV2 as u8
+	}
+
 	#[allow(clippy::result_unit_err)]
 	pub fn description(&self) -> String {
 		// This is a very simple SDP description, the minimal that Moonlight requires.
@@ -72,7 +93,14 @@ impl RtspServer {
 		//       "a=rtpmap:98 AV1/90000" (For AV1 support)
 		//       "a=fmtp:97 surround-params=<SURROUND PARAMS>"
 		//       "<AUDIO STREAM MAPPING>"
-		"sprop-parameter-sets=AAAAAU\na=fmtp:96 packetization-mode=1".to_string()
+		let mut result = String::new();
+
+		result.push_str(&format!("a=x-ss-general.featureFlags:{}\n", self.capabilities()));
+		result.push_str(&format!("a=x-ss-general.encryptionSupported:{}\n", self.encryption_flags_supported()));
+		result.push_str("sprop-parameter-sets=AAAAAU\n");
+		result.push_str("a=fmtp:96 packetization-mode=1");
+
+		result
 	}
 
 	fn handle_options_request(&self, request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
@@ -271,7 +299,7 @@ impl RtspServer {
 		};
 
 		let audio_stream_context = AudioStreamContext {
-			packet_duration,
+			_packet_duration: packet_duration,
 			qos: audio_qos_type != "0",
 		};
 
