@@ -201,7 +201,7 @@ Below are improvements intended for Moonshine.
 If you are interesting in contributing, feel free to create an issue or send a message on the [Moonlight Discord](https://discord.com/invite/moonlight-stream-352065098472488960) server.
 
 1. [ ] Add support for streaming (the same stream) to multiple clients simultaneously.
-1. [ ] Investigate replacing input handling with [inputtino](https://github.com/games-on-whales/inputtino) for better support.
+1. [x] Investigate replacing input handling with [inputtino](https://github.com/games-on-whales/inputtino) for better support.
 1. [ ] Replace openssl with [rustls](https://crates.io/crates/rustls).
 1. [ ] Investigate replacing ffmpeg with gstreamer as it seems to have better Rust support.
 1. [ ] Replace NvFBC with DRM-KMS for hardware agnostic frame capture (however at the time of writing it seems NVIDIA cards do not support this through their proprietary NVIDIA driver).
@@ -209,7 +209,7 @@ If you are interesting in contributing, feel free to create an issue or send a m
 1. [ ] AV1 support.
 1. [ ] HDR support.
 1. [ ] 5.1 / 7.1 audio support.
-1. [ ] Gyro support for controllers that support it.
-1. [ ] Change controller ID based on what the client registers (this should correctly show Xbox buttons in some games when using Xbox controllers, for example).
+1. [x] Gyro support for controllers that support it.
+1. [x] Change controller ID based on what the client registers (this should correctly show Xbox buttons in some games when using Xbox controllers, for example).
 1. [x] Web interface https://github.com/hgaiser/moonshine/issues/4 .
 1. [ ] Reject clients based on provided certificate.
