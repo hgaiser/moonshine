@@ -2,7 +2,7 @@ use inputtino::{DeviceDefinition, Joypad, JoypadStickPosition, PS5Joypad, Switch
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
-use crate::session::stream::control::{feedback::RumbleCommand, FeedbackCommand};
+use crate::session::stream::control::{feedback::{RumbleCommand, SetLedCommand}, FeedbackCommand};
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
@@ -218,9 +218,22 @@ impl Gamepad {
 			GamepadKind::Unknown | GamepadKind::Xbox => Joypad::XboxOne(
 				XboxOneJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
 			),
-			GamepadKind::PlayStation => Joypad::PS5(
-				PS5Joypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?
-			),
+			GamepadKind::PlayStation => {
+				let mut gamepad = PS5Joypad::new(&definition)
+					.map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?;
+
+				gamepad.set_on_led({
+					let feedback_tx = feedback_tx.clone();
+					move |r, g, b| {
+						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
+							id: info.index as u16,
+							rgb: (r as u8, g as u8, b as u8),
+						}));
+					}}
+				);
+
+				Joypad::PS5(gamepad)
+			}
 			GamepadKind::Nintendo => Joypad::Switch(
 				SwitchJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
 			),

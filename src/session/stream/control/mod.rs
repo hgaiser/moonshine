@@ -19,16 +19,19 @@ const MINIMUM_ENCRYPTED_LENGTH: usize = 4 + ENCRYPTION_TAG_LENGTH + 4;
 #[repr(u16)]
 enum ControlMessageType {
 	Encrypted = 0x0001,
+    TerminationExtended = 0x0109,
+    RumbleData = 0x010b,
+    HdrMode = 0x010e,
 	Ping = 0x0200,
-	Termination = 0x0100,
-	RumbleData = 0x010b,
-	LossStats = 0x0201,
-	FrameStats = 0x0204,
-	InputData = 0x0206,
-	InvalidateReferenceFrames = 0x0301,
-	RequestIdrFrame = 0x0302,
-	StartA = 0x0305,
-	StartB = 0x0307,
+    LossStats = 0x0201,
+    FrameStats = 0x0204,
+    InputData = 0x0206,
+    RequestIdrFrame = 0x0302,
+    InvalidateReferenceFrames = 0x0301,
+    StartB = 0x0307,
+    RumbleTriggers = 0x5500,
+    SetMotionEvent = 0x5501,
+    SetRgbLed = 0x5502,
 }
 
 impl TryFrom<u16> for ControlMessageType {
@@ -37,16 +40,19 @@ impl TryFrom<u16> for ControlMessageType {
 	fn try_from(v: u16) -> Result<Self, Self::Error> {
 		match v {
 			x if x == Self::Encrypted as u16 => Ok(Self::Encrypted),
-			x if x == Self::Ping as u16 => Ok(Self::Ping),
-			x if x == Self::Termination as u16 => Ok(Self::Termination),
+			x if x == Self::TerminationExtended as u16 => Ok(Self::TerminationExtended),
 			x if x == Self::RumbleData as u16 => Ok(Self::RumbleData),
+			x if x == Self::HdrMode as u16 => Ok(Self::HdrMode),
+			x if x == Self::Ping as u16 => Ok(Self::Ping),
 			x if x == Self::LossStats as u16 => Ok(Self::LossStats),
 			x if x == Self::FrameStats as u16 => Ok(Self::FrameStats),
 			x if x == Self::InputData as u16 => Ok(Self::InputData),
-			x if x == Self::InvalidateReferenceFrames as u16 => Ok(Self::InvalidateReferenceFrames),
 			x if x == Self::RequestIdrFrame as u16 => Ok(Self::RequestIdrFrame),
-			x if x == Self::StartA as u16 => Ok(Self::StartA),
+			x if x == Self::InvalidateReferenceFrames as u16 => Ok(Self::InvalidateReferenceFrames),
 			x if x == Self::StartB as u16 => Ok(Self::StartB),
+			x if x == Self::RumbleTriggers as u16 => Ok(Self::RumbleTriggers),
+			x if x == Self::SetMotionEvent as u16 => Ok(Self::SetMotionEvent),
+			x if x == Self::SetRgbLed as u16 => Ok(Self::SetRgbLed),
 			_ => Err(()),
 		}
 	}
@@ -55,16 +61,19 @@ impl TryFrom<u16> for ControlMessageType {
 #[derive(Debug)]
 enum ControlMessage<'a> {
 	Encrypted(EncryptedControlMessage),
-	Ping,
-	Termination,
+	TerminationExtended,
 	RumbleData,
+	HdrMode,
+	Ping,
 	LossStats,
 	FrameStats,
 	InputData(&'a [u8]),
-	InvalidateReferenceFrames,
 	RequestIdrFrame,
-	StartA,
+	InvalidateReferenceFrames,
 	StartB,
+	RumbleTriggers,
+	SetMotionEvent,
+	SetRgbLed,
 }
 
 impl<'a> ControlMessage<'a> {
@@ -103,7 +112,7 @@ impl<'a> ControlMessage<'a> {
 				}))
 			},
 			ControlMessageType::Ping => Ok(Self::Ping),
-			ControlMessageType::Termination => Ok(Self::Termination),
+			ControlMessageType::TerminationExtended => Ok(Self::TerminationExtended),
 			ControlMessageType::RumbleData => Ok(Self::RumbleData),
 			ControlMessageType::LossStats => Ok(Self::LossStats),
 			ControlMessageType::FrameStats => Ok(Self::FrameStats),
@@ -119,8 +128,11 @@ impl<'a> ControlMessage<'a> {
 			},
 			ControlMessageType::InvalidateReferenceFrames => Ok(Self::InvalidateReferenceFrames),
 			ControlMessageType::RequestIdrFrame => Ok(Self::RequestIdrFrame),
-			ControlMessageType::StartA => Ok(Self::StartA),
 			ControlMessageType::StartB => Ok(Self::StartB),
+			ControlMessageType::HdrMode => Ok(Self::HdrMode),
+			ControlMessageType::RumbleTriggers => Ok(Self::RumbleTriggers),
+			ControlMessageType::SetMotionEvent => Ok(Self::SetMotionEvent),
+			ControlMessageType::SetRgbLed => Ok(Self::SetRgbLed),
 		}
 	}
 }
@@ -262,7 +274,7 @@ impl ControlStreamInner {
 		let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 
 		// Create a channel over which we can receive feedback messages to send to the connected client.
-		let (feedback_tx, mut feedback_rx) = mpsc::channel(10);
+		let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
 
 		// Sequence number of feedback messages.
 		let mut sequence_number = 0u32;
@@ -293,8 +305,8 @@ impl ControlStreamInner {
 			}
 
 			// Check for feedback messages.
-			if let Ok(FeedbackCommand::Rumble(command)) = feedback_rx.try_recv() {
-				tracing::debug!("Sending rumble command: {command:?}");
+			if let Ok(command) = feedback_rx.try_recv() {
+				tracing::debug!("Sending control feedback command: {command:?}");
 				let payload = command.as_packet();
 				let packet = encode_control(&context.keys.remote_input_key, sequence_number, &payload);
 
