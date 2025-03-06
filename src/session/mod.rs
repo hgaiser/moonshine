@@ -1,7 +1,7 @@
 use std::process::Stdio;
 
 use async_shutdown::ShutdownManager;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{config::{Config, ApplicationConfig}, session::stream::{VideoStream, AudioStream, ControlStream}};
 
@@ -40,8 +40,8 @@ pub struct SessionContext {
 }
 
 enum SessionCommand {
-	StartStream(VideoStreamContext, AudioStreamContext),
-	StopStream,
+	Start(VideoStreamContext, AudioStreamContext),
+	Stop(oneshot::Sender<()>),
 	UpdateKeys(SessionKeys),
 }
 
@@ -57,8 +57,8 @@ impl Session {
 	pub fn new(
 		config: Config,
 		context: SessionContext,
-		stop_signal: ShutdownManager<()>,
 	) -> Result<Self, ()> {
+		// Run custom commands before starting the session.
 		if let Some(run_before) = &context.application.run_before {
 			for command in run_before {
 				run_command(command, &context);
@@ -67,29 +67,32 @@ impl Session {
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner { config, video_stream: None, audio_stream: None, control_stream: None };
-		tokio::spawn(inner.run(command_rx, context.clone(), stop_signal));
+		tokio::spawn(inner.run(command_rx, context.clone()));
 		Ok(Self { command_tx, context, running: false })
 	}
 
-	pub async fn start_stream(
+	pub async fn start(
 		&mut self,
 		video_stream_context: VideoStreamContext,
 		audio_stream_context: AudioStreamContext,
 	) -> Result <(), ()> {
 		self.running = true;
-		self.command_tx.send(SessionCommand::StartStream(video_stream_context, audio_stream_context))
+		self.command_tx.send(SessionCommand::Start(video_stream_context, audio_stream_context))
 			.await
-			.map_err(|e| tracing::error!("Failed to send StartStream command: {e}"))
+			.map_err(|e| tracing::error!("Failed to send Start command: {e}"))
 	}
 
-	pub async fn stop_stream(&mut self) -> Result<(), ()> {
+	pub async fn stop(&mut self) -> Result<(), ()> {
 		self.running = false;
-		self.command_tx.send(SessionCommand::StopStream)
+		let (result_tx, result_rx) = oneshot::channel();
+		self.command_tx.send(SessionCommand::Stop(result_tx))
 			.await
-			.map_err(|e| tracing::error!("Failed to send StopStream command: {e}"))
+			.map_err(|e| tracing::error!("Failed to send Stop command: {e}"))?;
+		result_rx.await
+			.map_err(|e| tracing::error!("Failed to wait for result from Stop command: {e}"))
 	}
 
-	pub fn get_context(&self) -> &SessionContext {
+	pub fn context(&self) -> &SessionContext {
 		&self.context
 	}
 
@@ -125,13 +128,20 @@ impl SessionInner {
 		mut self,
 		mut command_rx: mpsc::Receiver<SessionCommand>,
 		mut session_context: SessionContext,
-		stop_signal: ShutdownManager<()>,
 	) {
+		let stop_signal = ShutdownManager::new();
+
 		while let Some(command) = command_rx.recv().await {
 			match command {
-				SessionCommand::StartStream(video_stream_context, audio_stream_context) => {
-					let video_stream = VideoStream::new(self.config.clone(), video_stream_context, stop_signal.clone());
-					let audio_stream = AudioStream::new(self.config.clone(), audio_stream_context, stop_signal.clone());
+				SessionCommand::Start(video_stream_context, audio_stream_context) => {
+					let video_stream = match VideoStream::new(self.config.clone(), video_stream_context, stop_signal.clone()).await {
+						Ok(video_stream) => video_stream,
+						Err(()) => continue,
+					};
+					let audio_stream = match AudioStream::new(self.config.clone(), audio_stream_context, stop_signal.clone()).await {
+						Ok(audio_stream) => audio_stream,
+						Err(()) => continue,
+					};
 					let control_stream = match ControlStream::new(
 						self.config.clone(),
 						video_stream.clone(),
@@ -151,8 +161,19 @@ impl SessionInner {
 					self.control_stream = Some(control_stream);
 				},
 
-				SessionCommand::StopStream => {
-					let _ = stop_signal.trigger_shutdown(());
+				SessionCommand::Stop(result_tx) => {
+					if let Some(video_stream) = self.video_stream.take() {
+						let _ = video_stream.stop().await;
+					}
+					if let Some(audio_stream) = self.audio_stream.take() {
+						let _ = audio_stream.stop().await;
+					}
+					if let Some(control_stream) = self.control_stream.take() {
+						let _ = control_stream.stop().await;
+					}
+					let _ = result_tx.send(());
+
+					break;
 				},
 
 				SessionCommand::UpdateKeys(keys) => {
@@ -161,7 +182,7 @@ impl SessionInner {
 						continue;
 					};
 					let Some(control_stream) = &self.control_stream else {
-						tracing::warn!("Can't update session keys without an control stream.");
+						tracing::warn!("Can't update session keys without a control stream.");
 						continue;
 					};
 
@@ -172,8 +193,7 @@ impl SessionInner {
 			}
 		}
 
-		let _ = stop_signal.trigger_shutdown(());
-		tracing::debug!("Command channel closed.");
+		tracing::info!("Session stopped.");
 	}
 }
 

@@ -1,13 +1,13 @@
-use std::{collections::{hash_map::Entry, HashMap}, sync::{atomic::Ordering, Arc, Mutex}};
+use std::{collections::{hash_map::Entry, HashMap}, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc, Condvar, Mutex}, thread::JoinHandle};
 
-use async_shutdown::ShutdownManager;
-use cudarc::driver::CudaDevice;
+use async_shutdown::TriggerShutdownToken;
 use ffmpeg::{
 	codec::packet::flag::Flags, format::Pixel, option::Settable, Frame, Packet
 };
 use reed_solomon_erasure::{galois_8, ReedSolomon};
+use tokio::sync::{broadcast::{self, error::TryRecvError}, mpsc};
 
-use crate::{ffmpeg::{hwdevice::CudaDeviceContextBuilder, hwframe::{HwFrameContext, HwFrameContextBuilder}}, session::stream::RtpHeader};
+use crate::session::stream::RtpHeader;
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub const MAX_SHARDS: usize = 255;
@@ -61,37 +61,32 @@ impl NvVideoPacket {
 	}
 }
 
-pub struct Encoder {
-	encoder: ffmpeg::encoder::Video,
-	pub hw_frame_context: HwFrameContext,
-	fec_encoders: HashMap<(usize, usize), ReedSolomon<galois_8::Field>>,
+pub struct VideoEncoder {
+	stop_flag: Arc<AtomicBool>,
+	inner_handle: JoinHandle<()>,
 }
 
-impl Encoder {
+impl VideoEncoder {
+	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
 	pub fn new(
-		cuda_device: &CudaDevice,
+		encoder_buffer: Frame,
+		intermediate_buffer: Arc<Mutex<Frame>>,
+		hw_frame_context: *mut ffmpeg::sys::AVBufferRef,
 		codec_name: &str,
 		width: u32,
 		height: u32,
 		framerate: u32,
 		bitrate: usize,
+		packet_size: usize,
+		minimum_fec_packets: u32,
+		fec_percentage: u8,
+		packet_tx: mpsc::Sender<Vec<u8>>,
+		idr_frame_request_rx: broadcast::Receiver<()>,
+		frame_number: Arc<AtomicU32>,
+		frame_notifier: Arc<Condvar>,
+		session_stop_token: TriggerShutdownToken<()>,
 	) -> Result<Self, ()> {
-		let cuda_device_context = CudaDeviceContextBuilder::new()
-			.map_err(|e| tracing::error!("Failed to create CUDA device context: {e}"))?
-			.set_cuda_context((*cuda_device.cu_primary_ctx()) as *mut _)
-			.build()
-			.map_err(|e| tracing::error!("Failed to build CUDA device context: {e}"))?
-		;
-
-		let mut hw_frame_context = HwFrameContextBuilder::new(cuda_device_context)
-			.map_err(|e| tracing::error!("Failed to create CUDA frame context: {e}"))?
-			.set_width(width)
-			.set_height(height)
-			.set_sw_format(Pixel::ZRGB32)
-			.set_format(Pixel::CUDA)
-			.build()
-			.map_err(|e| tracing::error!("Failed to build CUDA frame context: {e}"))?
-		;
+		tracing::info!("Starting video encoder.");
 
 		tracing::info!("Using codec with name '{codec_name}'.");
 		let codec = ffmpeg::encoder::find_by_name(codec_name)
@@ -111,7 +106,7 @@ impl Encoder {
 		encoder.set_gop(i32::MAX as u32);
 		unsafe {
 			(*encoder.as_mut_ptr()).pix_fmt = Pixel::CUDA.into();
-			(*encoder.as_mut_ptr()).hw_frames_ctx = hw_frame_context.as_raw_mut();
+			(*encoder.as_mut_ptr()).hw_frames_ctx = hw_frame_context;
 			(*encoder.as_mut_ptr()).refs = 0;
 		}
 		encoder.set_str("preset", "fast")
@@ -124,13 +119,44 @@ impl Encoder {
 		let encoder = encoder.open()
 			.map_err(|e| tracing::error!("Failed to start encoder: {e}"))?;
 
-		Ok(Self {
-			encoder,
-			hw_frame_context,
-			fec_encoders: HashMap::new(),
+		let inner = VideoEncoderInner { encoder, fec_encoders: HashMap::new() };
+		let stop_flag = Arc::new(AtomicBool::new(false));
+		let inner_handle = std::thread::Builder::new().name("video-encode".to_string()).spawn({
+			let stop_flag = stop_flag.clone();
+			move || inner.run(
+				packet_tx,
+				idr_frame_request_rx,
+				packet_size,
+				minimum_fec_packets,
+				fec_percentage,
+				encoder_buffer,
+				intermediate_buffer,
+				frame_number,
+				frame_notifier,
+				stop_flag,
+				session_stop_token,
+			)
 		})
+			.map_err(|e| tracing::error!("Failed to start video encode thread: {e}"))?;
+
+		Ok(Self { stop_flag, inner_handle })
 	}
 
+	pub async fn stop(self) -> Result<(), ()> {
+		tracing::info!("Requesting video encoder to stop.");
+		self.stop_flag.store(true, Ordering::Relaxed);
+		self.inner_handle.join()
+			.map_err(|_| tracing::error!("Failed to join audio capture thread."))?;
+		Ok(())
+	}
+}
+
+struct VideoEncoderInner {
+	encoder: ffmpeg::encoder::Video,
+	fec_encoders: HashMap<(usize, usize), ReedSolomon<galois_8::Field>>,
+ }
+
+impl VideoEncoderInner {
 	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
 	pub fn run(
 		mut self,
@@ -143,7 +169,8 @@ impl Encoder {
 		intermediate_buffer: Arc<Mutex<Frame>>,
 		captured_frame_number: Arc<std::sync::atomic::AtomicU32>,
 		frame_notifier: Arc<std::sync::Condvar>,
-		stop_signal: ShutdownManager<()>,
+		stop_flag: Arc<AtomicBool>,
+		session_stop_token: TriggerShutdownToken<()>,
 	) {
 		let mut packet = Packet::empty();
 
@@ -155,7 +182,7 @@ impl Encoder {
 
 		let mut sequence_number = 0u32;
 		let stream_start_time = std::time::Instant::now();
-		while !stop_signal.is_shutdown_triggered() {
+		while !stop_flag.load(Ordering::Relaxed) {
 			// Swap the intermediate buffer with the output buffer.
 			// Note that the lock is only held while swapping buffers, to minimize wait time for others locking the buffer.
 			{
@@ -222,10 +249,10 @@ impl Encoder {
 						(*encoder_buffer.as_mut_ptr()).key_frame = 1;
 					}
 				},
-				Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {},
-				Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {},
-				Err(_) => {
-					tracing::debug!("Channel closed, quitting encoder task.");
+				Err(TryRecvError::Empty) => {},
+				Err(TryRecvError::Lagged(_)) => {},
+				Err(TryRecvError::Closed) => {
+					tracing::info!("IDR frame channel closed, stopping video encoder.");
 					return;
 				}
 			}
@@ -275,7 +302,12 @@ impl Encoder {
 			}
 		}
 
-		tracing::debug!("Received stop signal.");
+		// If we were asked to stop, ignore the stop token, no need to panic.
+		if stop_flag.load(Ordering::Relaxed) {
+			session_stop_token.forget();
+		}
+
+		tracing::debug!("Video encoder stopped.");
 	}
 
 	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
@@ -444,7 +476,7 @@ impl Encoder {
 			for (index, shard) in shards.into_iter().enumerate() {
 				tracing::trace!("Sending shard {}/{} with size {} bytes.", index + 1, nr_data_shards + nr_parity_shards, shard.len());
 				if packet_tx.blocking_send(shard).is_err() {
-					tracing::info!("Channel closed, couldn't send packet.");
+					tracing::info!("Couldn't send packet, video packet channel closed.");
 					return Ok(());
 				}
 			}

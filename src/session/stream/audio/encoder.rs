@@ -1,8 +1,16 @@
+use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread::JoinHandle};
+
+use async_shutdown::TriggerShutdownToken;
 use openssl::cipher::Cipher;
 use reed_solomon_erasure::{galois_8, ReedSolomon};
-use tokio::sync::mpsc;
+use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use crate::{crypto::encrypt, session::{stream::RtpHeader, SessionKeys}};
+
+const NR_DATA_SHARDS: usize = 4;
+const NR_PARITY_SHARDS: usize = 2;
+const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
+const MAX_SHARD_SIZE: usize = ((2048 + 15) / 16) * 16; // Where does this come from?
 
 #[derive(Debug)]
 #[repr(C)]
@@ -20,6 +28,8 @@ enum AudioEncoderCommand {
 
 pub struct AudioEncoder {
 	command_tx: mpsc::Sender<AudioEncoderCommand>,
+	stop_flag: Arc<AtomicBool>,
+	inner_handle: JoinHandle<()>,
 }
 
 impl AudioEncoder {
@@ -28,12 +38,15 @@ impl AudioEncoder {
 		channels: u8,
 		audio_rx: mpsc::Receiver<Vec<f32>>,
 		keys: SessionKeys,
-		packet_tx: mpsc::Sender<Vec<u8>>
+		packet_tx: mpsc::Sender<Vec<u8>>,
+		session_stop_token: TriggerShutdownToken<()>,
 	) -> Result<Self, ()> {
 		// TODO: Make this configurable.
 		let audio_bitrate = 512000;
 
+		tracing::info!("Starting audio encoder.");
 		tracing::debug!("Creating audio encoder with sample rate {} and {} channels.", sample_rate, channels);
+
 		let mut encoder = opus::Encoder::new(
 			sample_rate,
 			if channels > 1 { opus::Channels::Stereo } else { opus::Channels::Mono },
@@ -47,14 +60,36 @@ impl AudioEncoder {
 		encoder.set_bitrate(opus::Bitrate::Bits(audio_bitrate))
 			.map_err(|e| tracing::error!("Failed to set audio bitrate: {e}"))?;
 
+		let fec_encoder = ReedSolomon::<galois_8::Field>::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
+			.map_err(|e| tracing::error!("Failed to create FEC encoder: {e}"))?;
+
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioEncoderInner { };
-		std::thread::Builder::new().name("audio-encode".to_string()).spawn(move || {
-			inner.run(command_rx, audio_rx, encoder, keys, packet_tx)
+		let stop_flag = Arc::new(AtomicBool::new(false));
+		let inner_handle = std::thread::Builder::new().name("audio-encode".to_string()).spawn({
+			let stop_flag = stop_flag.clone();
+			move || inner.run(
+				command_rx,
+				audio_rx,
+				fec_encoder,
+				encoder,
+				keys,
+				packet_tx,
+				stop_flag,
+				session_stop_token,
+			)
 		})
 			.map_err(|e| tracing::error!("Failed to start audio encode thread: {e}"))?;
 
-		Ok(Self { command_tx })
+		Ok(Self { command_tx, stop_flag, inner_handle })
+	}
+
+	pub async fn stop(self) -> Result<(), ()> {
+		tracing::info!("Requesting audio encoder to stop.");
+		self.stop_flag.store(true, Ordering::Relaxed);
+		self.inner_handle.join()
+			.map_err(|_| tracing::error!("Failed to join audio capture thread."))?;
+		Ok(())
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
@@ -67,23 +102,20 @@ struct AudioEncoderInner {
 }
 
 impl AudioEncoderInner {
+	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
 	fn run(
 		self,
 		mut command_rx: mpsc::Receiver<AudioEncoderCommand>,
 		mut audio_rx: mpsc::Receiver<Vec<f32>>,
+		mut fec_encoder: ReedSolomon<galois_8::Field>,
 		mut encoder: opus::Encoder,
 		mut keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
-	) -> Result<(), ()> {
+		stop_flag: Arc<AtomicBool>,
+		session_stop_token: TriggerShutdownToken<()>,
+	) {
 		let mut sequence_number = 0u16;
 		let stream_start_time = std::time::Instant::now();
-
-		const NR_DATA_SHARDS: usize = 4;
-		const NR_PARITY_SHARDS: usize = 2;
-		const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
-		const MAX_SHARD_SIZE: usize = ((2048 + 15) / 16) * 16; // Where does this come from?
-		let mut fec_encoder = ReedSolomon::<galois_8::Field>::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
-			.map_err(|e| tracing::error!("Failed to create FEC encoder: {e}"))?;
 
 		// For unknown reasons, the RS parity matrix computed by our RS implementation
 		// doesn't match the one Nvidia uses for audio data. I'm not exactly sure why,
@@ -105,7 +137,7 @@ impl AudioEncoderInner {
 		// TODO: Decide the correct size for this buffer.
 		let mut encoded_audio = vec![0u8; 1400];
 
-		loop {
+		while !stop_flag.load(Ordering::Relaxed) {
 			// Check if there's a command.
 			match command_rx.try_recv() {
 				Ok(command) => {
@@ -116,11 +148,12 @@ impl AudioEncoderInner {
 						}
 					}
 				},
-				Err(mpsc::error::TryRecvError::Disconnected) => {
-					tracing::debug!("Command channel closed.");
+				Err(TryRecvError::Disconnected) => {
+					// If for whatever reason AudioStream is dropped, this channel is dropped unexpectedly.
+					tracing::debug!("Audio encoder command channel closed.");
 					break;
 				},
-				Err(mpsc::error::TryRecvError::Empty) => { },
+				Err(TryRecvError::Empty) => { },
 			};
 
 			let audio_fragment = audio_rx.blocking_recv();
@@ -247,7 +280,11 @@ impl AudioEncoderInner {
 			}
 		}
 
-		tracing::debug!("Audio capture channel closed.");
-		Ok(())
+		// If we were asked to stop, ignore the stop token, no need to panic.
+		if stop_flag.load(Ordering::Relaxed) {
+			session_stop_token.forget();
+		}
+
+		tracing::info!("Audio encoder stopped.");
 	}
 }

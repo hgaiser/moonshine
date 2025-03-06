@@ -439,7 +439,7 @@ impl ClientManagerInner {
 			}
 		}
 
-		tracing::debug!("Command channel closed.");
+		tracing::info!("Client manager stopped.");
 	}
 
 	async fn client_challenge(&self, client: &mut PendingClient, challenge: Vec<u8>) -> Result<Vec<u8>, String> {

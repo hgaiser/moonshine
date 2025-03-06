@@ -1,4 +1,4 @@
-use async_shutdown::{TriggerShutdownToken, ShutdownManager};
+use async_shutdown::TriggerShutdownToken;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
@@ -9,7 +9,6 @@ pub enum SessionManagerCommand {
 	SetStreamContext(VideoStreamContext, AudioStreamContext),
 	GetSessionContext(oneshot::Sender<Option<SessionContext>>),
 	InitializeSession(SessionContext),
-	// GetCurrentSession(oneshot::Sender<Option<Session>>),
 	StartSession,
 	StopSession,
 	UpdateKeys(SessionKeys),
@@ -21,16 +20,7 @@ pub struct SessionManager {
 }
 
 #[derive(Default)]
-struct SessionManagerInner {
-	/// The active session, or None if there is no active session.
-	session: Option<Session>,
-
-	/// The context within which the next video stream will be created.
-	video_stream_context: Option<VideoStreamContext>,
-
-	/// The context within which the next audio stream will be created.
-	audio_stream_context: Option<AudioStreamContext>,
-}
+struct SessionManagerInner { }
 
 impl SessionManager {
 	#[allow(clippy::result_unit_err)]
@@ -66,15 +56,6 @@ impl SessionManager {
 		Ok(())
 	}
 
-	// pub async fn current_session(&self) -> Result<Option<Session>, ()> {
-	// 	let (session_tx, session_rx) = oneshot::channel();
-	// 	self.command_tx.send(SessionManagerCommand::GetCurrentSession(session_tx))
-	// 		.await
-	// 		.map_err(|e| tracing::error!("Failed to get current session: {e}"))?;
-	// 	session_rx.await
-	// 		.map_err(|e| tracing::error!("Failed to wait for GetCurrentSession response: {e}"))
-	// }
-
 	pub async fn start_session(&self) -> Result<(), ()> {
 		self.command_tx.send(SessionManagerCommand::StartSession)
 			.await
@@ -96,111 +77,103 @@ impl SessionManager {
 
 impl SessionManagerInner {
 	async fn run(
-		mut self,
+		self,
 		config: Config,
 		mut command_rx: mpsc::Receiver<SessionManagerCommand>,
 	) {
-		tracing::debug!("Waiting for commands.");
+		// The active session, or None if there is no active session.
+		let mut active_session: Option<Session> = None;
 
-		let mut stop_signal = ShutdownManager::new();
+		// The context within which the next video stream will be created.
+		let mut video_stream_context = None;
 
-		loop {
-			tokio::select! {
-				_ = stop_signal.wait_shutdown_triggered() => {
-					tracing::debug!("Closing session.");
-					self.session = None;
-					stop_signal = ShutdownManager::new();
+		// The context within which the next audio stream will be created.
+		let mut audio_stream_context = None;
+
+		tracing::debug!("Session manager waiting for commands.");
+
+		while let Some(command) = command_rx.recv().await {
+			match command {
+				SessionManagerCommand::SetStreamContext(video, audio) =>  {
+					if active_session.is_none() {
+						// Well we can, but it is not expected.
+						tracing::warn!("Can't set stream context without an active session.");
+						continue;
+					}
+
+					video_stream_context = Some(video);
+					audio_stream_context = Some(audio);
 				},
 
-				command = command_rx.recv() => {
-					let command = match command {
-						Some(command) => command,
-						None => {
-							tracing::debug!("Command channel closed.");
-							break;
-						}
+				SessionManagerCommand::GetSessionContext(session_context_tx) => {
+					let context = active_session.as_ref().map(|s| Some(s.context().clone())).unwrap_or(None);
+					if session_context_tx.send(context).is_err() {
+						tracing::error!("Failed to send current session context.");
+					}
+				},
+
+				SessionManagerCommand::InitializeSession(session_context) => {
+					if active_session.is_some() {
+						tracing::warn!("Can't initialize a session, there is already an active session.");
+						continue;
+					}
+
+					active_session = match Session::new(config.clone(), session_context) {
+						Ok(session) => Some(session),
+						Err(()) => continue,
+					};
+				},
+
+				SessionManagerCommand::StartSession => {
+					tracing::info!("Starting session.");
+
+					let Some(session) = &mut active_session else {
+						tracing::warn!("Can't launch a session, there is no session created yet.");
+						continue;
 					};
 
-					match command {
-						SessionManagerCommand::SetStreamContext(video_stream_context, audio_stream_context) =>  {
-							if self.session.is_none() {
-								// Well we can, but it is not expected.
-								tracing::warn!("Can't set stream context without an active session.");
-								continue;
-							}
+					if session.is_running() {
+						tracing::info!("Can't start session, it is already running.");
+						continue;
+					}
 
-							self.video_stream_context = Some(video_stream_context);
-							self.audio_stream_context = Some(audio_stream_context);
-						},
-
-						SessionManagerCommand::GetSessionContext(session_context_tx) => {
-							let context = self.session.as_ref().map(|s| Some(s.get_context().clone())).unwrap_or(None);
-							if session_context_tx.send(context).is_err() {
-								tracing::error!("Failed to send current session context.");
-							}
-						},
-
-						SessionManagerCommand::InitializeSession(session_context) => {
-							if self.session.is_some() {
-								tracing::warn!("Can't initialize a session, there is already an active session.");
-								continue;
-							}
-
-							self.session = match Session::new(config.clone(), session_context, stop_signal.clone()) {
-								Ok(session) => Some(session),
-								Err(()) => continue,
-							};
-						},
-
-						// SessionManagerCommand::GetCurrentSession(session_tx) => {
-						// 	if session_tx.send(self.session.clone()).is_err() {
-						// 		tracing::error!("Failed to send current session.");
-						// 	}
-						// }
-
-						SessionManagerCommand::StartSession => {
-							let Some(session) = &mut self.session else {
-								tracing::warn!("Can't launch a session, there is no session created yet.");
-								continue;
-							};
-
-							if session.is_running() {
-								tracing::info!("Can't start session, it is already running.");
-								continue;
-							}
-
-							let Some(video_stream_context) = self.video_stream_context.clone() else {
-								tracing::warn!("Can't start a stream without a video stream context.");
-								continue;
-							};
-							let Some(audio_stream_context) = self.audio_stream_context.clone() else {
-								tracing::warn!("Can't start a stream without a audio stream context.");
-								continue;
-							};
-
-							let _ = session.start_stream(video_stream_context, audio_stream_context).await;
-						},
-
-						SessionManagerCommand::StopSession => {
-							if let Some(session) = &mut self.session {
-								let _ = session.stop_stream().await;
-								self.session = None;
-							} else {
-								tracing::debug!("Trying to stop session, but no session is currently active.");
-							}
-						},
-
-						SessionManagerCommand::UpdateKeys(keys) => {
-							let Some(session) = &mut self.session else {
-								tracing::warn!("Can't update session keys, there is no session created yet.");
-								continue;
-							};
-
-							let _ = session.update_keys(keys).await;
-						},
+					let Some(video_stream_context) = video_stream_context.clone() else {
+						tracing::warn!("Can't start a stream without a video stream context.");
+						continue;
 					};
-				}
-			}
+					let Some(audio_stream_context) = audio_stream_context.clone() else {
+						tracing::warn!("Can't start a stream without a audio stream context.");
+						continue;
+					};
+
+					let _ = session.start(video_stream_context, audio_stream_context).await;
+				},
+
+				SessionManagerCommand::StopSession => {
+					if let Some(session) = &mut active_session {
+						let _ = session.stop().await;
+						active_session = None;
+					} else {
+						tracing::debug!("Trying to stop session, but no session is currently active.");
+					}
+				},
+
+				SessionManagerCommand::UpdateKeys(keys) => {
+					let Some(session) = &mut active_session else {
+						tracing::warn!("Can't update session keys, there is no session created yet.");
+						continue;
+					};
+
+					let _ = session.update_keys(keys).await;
+				},
+			};
 		}
+
+		// Stop a session if there is one active.
+		if let Some(session) = &mut active_session {
+			let _ = session.stop().await;
+		}
+
+		tracing::debug!("Session manager stopped.");
 	}
 }

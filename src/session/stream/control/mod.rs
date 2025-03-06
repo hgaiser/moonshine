@@ -1,6 +1,6 @@
 use std::net::{SocketAddr, UdpSocket};
 
-use async_shutdown::ShutdownManager;
+use async_shutdown::{ShutdownManager, TriggerShutdownToken};
 use openssl::{cipher, symm};
 use rusty_enet as enet;
 use tokio::sync::mpsc::{self, error::TryRecvError};
@@ -196,6 +196,7 @@ fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Ve
 
 enum ControlStreamCommand {
 	UpdateKeys(SessionKeys),
+	Stop,
 }
 
 pub struct ControlStream {
@@ -225,6 +226,7 @@ impl ControlStream {
 						audio_stream,
 						context,
 						input_handler,
+						stop_signal.trigger_shutdown_token(()),
 					)))
 				)
 			}
@@ -233,7 +235,15 @@ impl ControlStream {
 		Ok(Self { command_tx })
 	}
 
+	pub async fn stop(&self) -> Result<(), ()> {
+		tracing::info!("Stopping control handling.");
+		self.command_tx.send(ControlStreamCommand::Stop)
+			.await
+			.map_err(|e| tracing::error!("Failed to send Stop command: {e}"))
+	}
+
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
+		tracing::debug!("Updating session keys.");
 		self.command_tx.send(ControlStreamCommand::UpdateKeys(keys)).await
 			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
 	}
@@ -251,6 +261,7 @@ impl ControlStreamInner {
 		audio_stream: AudioStream,
 		mut context: SessionContext,
 		input_handler: InputHandler,
+		session_stop_token: TriggerShutdownToken<()>,
 	) -> Result<(), ()> {
 		let socket_address = SocketAddr::new(
 			config.address.parse()
@@ -286,13 +297,16 @@ impl ControlStreamInner {
 				Ok(command) => {
 					match command {
 						ControlStreamCommand::UpdateKeys(keys) => {
-							tracing::debug!("Updating session keys.");
 							context.keys = keys;
+						},
+						ControlStreamCommand::Stop => {
+							session_stop_token.forget();
+							break;
 						},
 					}
 				},
 				Err(TryRecvError::Disconnected) => {
-					tracing::debug!("Command channel closed.");
+					tracing::debug!("Control command channel closed.");
 					break;
 				},
 				Err(TryRecvError::Empty) => { },

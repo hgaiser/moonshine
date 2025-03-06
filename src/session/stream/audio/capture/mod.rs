@@ -1,5 +1,6 @@
-use std::{cell::RefCell, mem::MaybeUninit, ops::Deref, rc::Rc};
+use std::{cell::RefCell, mem::MaybeUninit, ops::Deref, rc::Rc, sync::{atomic::{AtomicBool, Ordering}, Arc}, thread::JoinHandle};
 
+use async_shutdown::TriggerShutdownToken;
 use pulse::{
 	context::{Context, FlagSet},
 	def::BufferAttr,
@@ -91,10 +92,17 @@ fn get_default_sink_name() -> Result<String, ()> {
 pub struct AudioCapture {
 	sample_rate: u32,
 	channels: u8,
+	stop_flag: Arc<AtomicBool>,
+	inner_handle: JoinHandle<()>,
 }
 
 impl AudioCapture {
-	pub async fn new(audio_tx: Sender<Vec<f32>>) -> Result<Self, ()> {
+	pub async fn new(
+		audio_tx: Sender<Vec<f32>>,
+		session_stop_token: TriggerShutdownToken<()>,
+	) -> Result<Self, ()> {
+		tracing::info!("Starting audio capturer.");
+
 		// TODO: Make configurable.
 		let channels = 2u8;
 		let sample_rate = 48000u32;
@@ -142,12 +150,22 @@ impl AudioCapture {
 		tracing::info!("Recording from source: {monitor_name}");
 
 		let inner = AudioCaptureInner { audio_tx };
-		std::thread::Builder::new().name("audio-capture".to_string()).spawn(move ||
-			inner.run(stream)
-		)
+		let stop_flag = Arc::new(AtomicBool::new(false));
+		let inner_handle = std::thread::Builder::new().name("audio-capture".to_string()).spawn({
+			let stop_flag = stop_flag.clone();
+			move || inner.run(stream, stop_flag, session_stop_token)
+		})
 			.map_err(|e| tracing::error!("Failed to start audio capture thread: {e}"))?;
 
-		Ok(Self { sample_rate, channels })
+		Ok(Self { sample_rate, channels, stop_flag, inner_handle })
+	}
+
+	pub async fn stop(self) -> Result<(), ()> {
+		tracing::info!("Requesting audio capture to stop.");
+		self.stop_flag.store(true, Ordering::Relaxed);
+		self.inner_handle.join()
+			.map_err(|_| tracing::error!("Failed to join audio capture thread."))?;
+		Ok(())
 	}
 
 	pub fn sample_rate(&self) -> u32 {
@@ -165,14 +183,19 @@ struct AudioCaptureInner {
 }
 
 impl AudioCaptureInner {
-	fn run(self, stream: pulse_simple::Simple) -> Result<(), ()> {
+	fn run(
+		self,
+		stream: pulse_simple::Simple,
+		stop_flag: Arc<AtomicBool>,
+		session_stop_token: TriggerShutdownToken<()>,
+	) {
 		// TODO: Make configurable.
 		const SAMPLE_RATE: usize = 48000;
 		const SAMPLE_TIME_MS: usize = 5;
 		const FRAME_SIZE: usize = std::mem::size_of::<f32>() * SAMPLE_RATE * SAMPLE_TIME_MS / 1000;
 
 		// Start recording.
-		loop {
+		while !stop_flag.load(Ordering::Relaxed) {
 			// Allocate uninitialized buffer for recording.
 			let buffer: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); FRAME_SIZE];
 			let mut buffer = unsafe {
@@ -196,17 +219,25 @@ impl AudioCaptureInner {
 					match self.audio_tx.blocking_send(samples) {
 						Ok(()) => {},
 						Err(e) => {
+							// If AudioStream is dropped, then AudioEncoder is dropped, which closes this channel.
 							tracing::debug!("Received error while sending audio sample: {e}");
-							tracing::info!("Closing audio capture because the receiving end was dropped.");
-							return Err(());
+							tracing::info!("Closing audio capture because the channel was closed.");
+							break;
 						},
 					}
 				},
 				Err(e) => {
 					tracing::error!("Failed to read audio data: {}", e);
-					return Err(());
+					break;
 				}
 			}
 		}
+
+		// If we were asked to stop, ignore the stop token, no need to panic.
+		if stop_flag.load(Ordering::Relaxed) {
+			session_stop_token.forget();
+		}
+
+		tracing::info!("Audio capture stopped.");
 	}
 }

@@ -170,11 +170,11 @@ impl InputHandlerInner {
 						continue;
 					}
 
-					if gamepads[gamepad.index as usize].is_some() {
-						tracing::warn!("Gamepad {} is already connected.", gamepad.index);
-					} else if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
-     					gamepads[gamepad.index as usize] = Some(new_gamepad);
-						tracing::info!("Gamepad {} connected.", gamepad.index);
+					if gamepads[gamepad.index as usize].is_none() {
+						if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
+							gamepads[gamepad.index as usize] = Some(new_gamepad);
+							tracing::info!("Gamepad {} connected.", gamepad.index);
+						}
      				}
 				},
 				InputEvent::GamepadTouch(gamepad_touch) => {
