@@ -2,6 +2,7 @@ use inputtino::{
 	BatteryState as InputtinoBatterState,
 	DeviceDefinition,
 	Joypad,
+	JoypadButton,
 	JoypadMotionType,
 	JoypadStickPosition,
 	PS5Joypad,
@@ -368,13 +369,21 @@ impl Gamepad {
 	}
 
 	pub fn update(&mut self, update: &GamepadUpdate) {
-		// Send button state.
-		self.gamepad.set_pressed(update.button_flags as i32);
-
 		// Send analog triggers.
 		self.gamepad.set_stick(JoypadStickPosition::LS, update.left_stick.0, update.left_stick.1);
 		self.gamepad.set_stick(JoypadStickPosition::RS, update.right_stick.0, update.right_stick.1);
 		self.gamepad.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
+
+		let mut button_flags = update.button_flags;
+		if update.left_trigger > 0 {
+			button_flags |= JoypadButton::LEFT_TRIGGER as u32;
+		}
+		if update.right_trigger > 0 {
+			button_flags |= JoypadButton::RIGHT_TRIGGER as u32;
+		}
+
+		// Send button state.
+		self.gamepad.set_pressed(button_flags as i32);
 	}
 
 	pub fn touch(&mut self, touch: &GamepadTouch) {

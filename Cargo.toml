@@ -44,4 +44,4 @@ zeroconf = "0.15.0"
 ffmpeg = { version = "7.1.0", package = "ffmpeg-next", git = "https://github.com/hgaiser/rust-ffmpeg", branch = "codec-context-settable" }
 ffmpeg-sys-next = { version = "7.1.0", git = "https://github.com/hgaiser/rust-ffmpeg-sys", branch = "cuda" }
 reed-solomon-erasure = { version = "6.0.0", git = "https://github.com/hgaiser/reed-solomon-erasure", branch = "moonshine" }
-inputtino = { version = "0.1.0", git = "https://github.com/hgaiser/inputtino", branch = "dualsense-motion" }
+inputtino = { version = "0.1.0", git = "https://github.com/hgaiser/inputtino", branch = "l2r2" }

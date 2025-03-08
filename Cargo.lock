@@ -1544,7 +1544,7 @@ dependencies = [
 [[package]]
 name = "inputtino"
 version = "0.1.0"
-source = "git+https://github.com/hgaiser/inputtino?branch=dualsense-motion#09a83b0e80a9ffcae7bc60aaeb9588b601b458fe"
+source = "git+https://github.com/hgaiser/inputtino?branch=l2r2#a0842e73c2c6abe770a3948f74cc41a6a3aea57b"
 dependencies = [
  "inputtino-sys",
 ]
@@ -1552,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "inputtino-sys"
 version = "0.1.0"
-source = "git+https://github.com/hgaiser/inputtino?branch=dualsense-motion#09a83b0e80a9ffcae7bc60aaeb9588b601b458fe"
+source = "git+https://github.com/hgaiser/inputtino?branch=l2r2#a0842e73c2c6abe770a3948f74cc41a6a3aea57b"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
