@@ -38,6 +38,7 @@ enum InputEventType {
 	GamepadMotion = 0x55000006,
 	GamepadBattery = 0x55000007,
 	GamepadUpdate = 0x0000000C,
+	GamepadEnableHaptics = 0x0000000D,
 }
 
 #[derive(Debug)]
@@ -56,6 +57,7 @@ enum InputEvent {
 	GamepadMotion(GamepadMotion),
 	GamepadBattery(GamepadBattery),
 	GamepadUpdate(GamepadUpdate),
+	GamepadEnableHaptics,
 }
 
 impl InputEvent {
@@ -80,6 +82,7 @@ impl InputEvent {
 			Some(InputEventType::GamepadMotion) => Ok(InputEvent::GamepadMotion(GamepadMotion::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadBattery) => Ok(InputEvent::GamepadBattery(GamepadBattery::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadUpdate) => Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::GamepadEnableHaptics) => Ok(InputEvent::GamepadEnableHaptics),
 			None => {
 				tracing::warn!("Received unknown event type: {event_type}");
 				Err(())
@@ -232,6 +235,10 @@ impl InputHandlerInner {
 							*gamepad = None;
 						}
 					}
+				},
+				InputEvent::GamepadEnableHaptics => {
+					tracing::info!("Received request to enable haptics on gamepads.");
+					// We don't actually need to do anything.
 				},
 			}
 		}
