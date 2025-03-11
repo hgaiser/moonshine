@@ -94,8 +94,9 @@ impl FrameCaptureInner {
 
 			unsafe {
 				if (*capture_buffer.as_ptr()).width != frame_info.width as i32 || (*capture_buffer.as_ptr()).height != frame_info.height as i32 {
-					tracing::warn!("Frame size mismatch, expected ({}, {}), got ({}, {}), recreating capture session.", (*capture_buffer.as_ptr()).width, (*capture_buffer.as_ptr()).height, frame_info.width, frame_info.height);
-					break;
+					// TODO: Implement scaling?
+					tracing::warn!("Frame size mismatch, expected ({}, {}), got ({}, {}).", (*capture_buffer.as_ptr()).width, (*capture_buffer.as_ptr()).height, frame_info.width, frame_info.height);
+					continue;
 				}
 
 				if let Err(e) = cudarc::driver::result::memcpy_dtod_sync(
