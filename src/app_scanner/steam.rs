@@ -1,5 +1,7 @@
 use std::{path::{Path, PathBuf}, str::FromStr};
 
+use walkdir::WalkDir;
+
 use crate::config::{SteamApplicationScannerConfig, ApplicationConfig};
 
 pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
@@ -83,20 +85,15 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 			);
 		}
 
-		let boxart = config.library.join(format!("appcache/librarycache/{game_id}/library_600x900.jpg"));
-		if let Ok(boxart) = shellexpand::full(&boxart.to_string_lossy()) {
-			match PathBuf::from_str(&boxart) {
-				Ok(path) => {
-					if path.exists() {
-						application.boxart = Some(path);
-					} else {
-						tracing::warn!("No boxart for game '{}' at '{boxart}", application.title);
-					}
-				},
-				Err(e) => {
-					tracing::warn!("Failed to parse boxart path: {e}");
-				}
+		let game_dir = config.library.join(format!("appcache/librarycache/{game_id}/"));
+		if let Some(boxart) = search_file(&game_dir, "library_600x900.jpg") {
+			if boxart.exists() {
+				application.boxart = Some(boxart);
+			} else {
+				tracing::warn!("No boxart for game '{}' at '{}.", application.title, boxart.display());
 			}
+		} else {
+			tracing::info!("No boxart found for game '{}' in directory '{}'.", application.title, game_dir.display());
 		}
 
 		applications.push(application);
@@ -130,4 +127,30 @@ fn get_game_name<P: AsRef<Path>>(game_id: u32, library: P) -> Result<String, ()>
 			Err(())
 		},
 	}
+}
+
+fn search_file(directory: &Path, filename: &str) -> Option<PathBuf> {
+	let binding = directory.to_string_lossy();
+	let directory = match shellexpand::full(&binding) {
+		Ok(directory) => directory,
+		Err(_) => return None,
+	};
+
+	let directory = match PathBuf::from_str(&directory) {
+		Ok(directory) => directory,
+		Err(_) => return None,
+	};
+
+	for entry in WalkDir::new(&directory)
+			.follow_links(true)
+			.into_iter()
+			.filter_map(|e| e.ok()) {
+		let entry_filename = entry.file_name().to_string_lossy();
+
+		if entry_filename == filename {
+			return Some(entry.into_path());
+		}
+	}
+
+	None
 }

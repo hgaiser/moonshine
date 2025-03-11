@@ -281,10 +281,10 @@ impl Webserver {
 			},
 		};
 
-		let asset = match image::open(boxart_path) {
+		let asset = match image::open(&boxart_path) {
 			Ok(asset) => asset,
 			Err(e) => {
-				let message = format!("Failed to load boxart: {e}");
+				let message = format!("Failed to load boxart at '{}': {e}", boxart_path.display());
 				tracing::warn!("{message}");
 				return bad_request(message);
 			}

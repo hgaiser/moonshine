@@ -38,6 +38,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 url = "2.5.4"
 uuid = { version = "1.14.0", features = ["v4"] }
+walkdir = "2.5.0"
 zeroconf = "0.15.0"
 
 [patch.crates-io]
