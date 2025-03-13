@@ -87,13 +87,15 @@ async fn main() -> Result<(), ()> {
 				std::process::exit(1);
 			}
 
-			tracing::info!("Received interrupt signal. Shutting down server...");
+			tracing::info!("Shutting down server...");
 			shutdown.trigger_shutdown(1).ok();
 		}
 	});
 
 	// Create the main application.
 	let moonshine = Moonshine::new(config, shutdown.clone()).await?;
+
+	tracing::info!("Moonshine is ready and waiting for connections.");
 
 	// Wait until something causes a shutdown trigger.
 	shutdown.wait_shutdown_triggered().await;

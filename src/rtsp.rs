@@ -46,7 +46,7 @@ impl RtspServer {
 							.await
 							.map_err(|e| tracing::error!("Failed to bind to address {}: {}", address, e))?;
 
-						tracing::info!("RTSP server listening on {}", address);
+						tracing::debug!("RTSP server listening on {}", address);
 
 						loop {
 							let (connection, address) = listener.accept()
@@ -167,7 +167,7 @@ impl RtspServer {
 						},
 					};
 
-					tracing::info!("Responding with server_port={port} for stream '{stream_id}'.");
+					tracing::debug!("Responding with server_port={port} for stream '{stream_id}'.");
 
 					return rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 						.header(headers::CSEQ, cseq.to_string())

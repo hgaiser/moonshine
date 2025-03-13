@@ -1,13 +1,13 @@
-use std::{collections::{hash_map::Entry, HashMap}, sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc, Condvar, Mutex}, thread::JoinHandle};
+use std::{collections::{hash_map::Entry, HashMap}, sync::{atomic::{AtomicU32, Ordering}, Arc, Condvar, Mutex}};
 
-use async_shutdown::TriggerShutdownToken;
+use async_shutdown::ShutdownManager;
 use ffmpeg::{
 	codec::packet::flag::Flags, format::Pixel, option::Settable, Frame, Packet
 };
 use reed_solomon_erasure::{galois_8, ReedSolomon};
 use tokio::sync::{broadcast::{self, error::TryRecvError}, mpsc};
 
-use crate::session::stream::RtpHeader;
+use crate::session::{manager::SessionShutdownReason, stream::RtpHeader};
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub const MAX_SHARDS: usize = 255;
@@ -61,10 +61,7 @@ impl NvVideoPacket {
 	}
 }
 
-pub struct VideoEncoder {
-	stop_flag: Arc<AtomicBool>,
-	inner_handle: JoinHandle<()>,
-}
+pub struct VideoEncoder { }
 
 impl VideoEncoder {
 	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
@@ -84,11 +81,9 @@ impl VideoEncoder {
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		frame_number: Arc<AtomicU32>,
 		frame_notifier: Arc<Condvar>,
-		session_stop_token: TriggerShutdownToken<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		tracing::info!("Starting video encoder.");
-
-		tracing::info!("Using codec with name '{codec_name}'.");
+		tracing::debug!("Using codec with name '{codec_name}'.");
 		let codec = ffmpeg::encoder::find_by_name(codec_name)
 			.ok_or_else(|| tracing::error!("Failed to find codec by name '{codec_name}'."))?;
 
@@ -120,9 +115,7 @@ impl VideoEncoder {
 			.map_err(|e| tracing::error!("Failed to start encoder: {e}"))?;
 
 		let inner = VideoEncoderInner { encoder, fec_encoders: HashMap::new() };
-		let stop_flag = Arc::new(AtomicBool::new(false));
-		let inner_handle = std::thread::Builder::new().name("video-encode".to_string()).spawn({
-			let stop_flag = stop_flag.clone();
+		std::thread::Builder::new().name("video-encode".to_string()).spawn(
 			move || inner.run(
 				packet_tx,
 				idr_frame_request_rx,
@@ -133,21 +126,12 @@ impl VideoEncoder {
 				intermediate_buffer,
 				frame_number,
 				frame_notifier,
-				stop_flag,
-				session_stop_token,
+				stop_session_manager,
 			)
-		})
+		)
 			.map_err(|e| tracing::error!("Failed to start video encode thread: {e}"))?;
 
-		Ok(Self { stop_flag, inner_handle })
-	}
-
-	pub async fn stop(self) -> Result<(), ()> {
-		tracing::info!("Requesting video encoder to stop.");
-		self.stop_flag.store(true, Ordering::Relaxed);
-		self.inner_handle.join()
-			.map_err(|_| tracing::error!("Failed to join audio capture thread."))?;
-		Ok(())
+		Ok(Self { })
 	}
 }
 
@@ -169,9 +153,14 @@ impl VideoEncoderInner {
 		intermediate_buffer: Arc<Mutex<Frame>>,
 		captured_frame_number: Arc<std::sync::atomic::AtomicU32>,
 		frame_notifier: Arc<std::sync::Condvar>,
-		stop_flag: Arc<AtomicBool>,
-		session_stop_token: TriggerShutdownToken<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
+		tracing::debug!("Starting video encoder.");
+
+		// Trigger session shutdown if we exit unexpectedly.
+		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoEncoderStopped);
+		let _delay_stop = stop_session_manager.delay_shutdown_token();
+
 		let mut packet = Packet::empty();
 
 		// The last frame number we used.
@@ -182,7 +171,7 @@ impl VideoEncoderInner {
 
 		let mut sequence_number = 0u32;
 		let stream_start_time = std::time::Instant::now();
-		while !stop_flag.load(Ordering::Relaxed) {
+		while !stop_session_manager.is_shutdown_triggered() {
 			// Swap the intermediate buffer with the output buffer.
 			// Note that the lock is only held while swapping buffers, to minimize wait time for others locking the buffer.
 			{
@@ -252,8 +241,8 @@ impl VideoEncoderInner {
 				Err(TryRecvError::Empty) => {},
 				Err(TryRecvError::Lagged(_)) => {},
 				Err(TryRecvError::Closed) => {
-					tracing::info!("IDR frame channel closed, stopping video encoder.");
-					return;
+					tracing::debug!("IDR frame channel closed, stopping video encoder.");
+					break;
 				}
 			}
 
@@ -300,11 +289,6 @@ impl VideoEncoderInner {
 					}
 				}
 			}
-		}
-
-		// If we were asked to stop, ignore the stop token, no need to panic.
-		if stop_flag.load(Ordering::Relaxed) {
-			session_stop_token.forget();
 		}
 
 		tracing::debug!("Video encoder stopped.");

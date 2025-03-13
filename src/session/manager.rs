@@ -1,16 +1,46 @@
-use async_shutdown::TriggerShutdownToken;
+use async_shutdown::{ShutdownManager, TriggerShutdownToken};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 
 use super::{Session, stream::{AudioStreamContext, VideoStreamContext}, SessionContext, SessionKeys};
 
+#[derive(Clone, Debug)]
+pub enum SessionShutdownReason {
+	/// Session manager is shutting down.
+	ManagerShutdown,
+	/// The session was stopped by the user.
+	UserStopped,
+	/// Session stopped unexpectedly.
+	SessionStopped,
+	/// Video stream stopped unexpectedly.
+	VideoStreamStopped,
+	/// Video packet handler stopped unexpectedly.
+	VideoPacketHandlerStopped,
+	/// Video frame capture stopped unexpectedly.
+	VideoFrameCaptureStopped,
+	/// Video encoder stopped unexpectedly.
+	VideoEncoderStopped,
+	/// Audio stream stopped unexpectedly.
+	AudioStreamStopped,
+	/// Audio packet handler stopped unexpectedly.
+	AudioPacketHandlerStopped,
+	/// Audio capture stopped unexpectedly.
+	AudioCaptureStopped,
+	/// Audio encoder stopped unexpectedly.
+	AudioEncoderStopped,
+	/// Control stream stopped unexpectedly.
+	ControlStreamStopped,
+	/// Input handler stopped unexpectedly.
+	InputHandlerStopped,
+}
+
 pub enum SessionManagerCommand {
 	SetStreamContext(VideoStreamContext, AudioStreamContext),
 	GetSessionContext(oneshot::Sender<Option<SessionContext>>),
 	InitializeSession(SessionContext),
 	StartSession,
-	StopSession,
+	StopSession(oneshot::Sender<()>),
 	UpdateKeys(SessionKeys),
 }
 
@@ -63,9 +93,15 @@ impl SessionManager {
 	}
 
 	pub async fn stop_session(&self) -> Result<(), ()> {
-		self.command_tx.send(SessionManagerCommand::StopSession)
+		tracing::info!("Requesting session to be stopped.");
+		let (result_tx, result_rx) = oneshot::channel();
+		self.command_tx.send(SessionManagerCommand::StopSession(result_tx))
 			.await
-			.map_err(|e| tracing::error!("Failed to stop session: {e}"))
+			.map_err(|e| tracing::error!("Failed to stop session: {e}"))?;
+		result_rx.await
+			.map_err(|e| tracing::error!("Failed to wait for session to stop: {e}"))?;
+		tracing::info!("Session stopped, waiting for new session.");
+		Ok(())
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
@@ -92,7 +128,15 @@ impl SessionManagerInner {
 
 		tracing::debug!("Session manager waiting for commands.");
 
+		let mut stop_session_manager = ShutdownManager::new();
 		while let Some(command) = command_rx.recv().await {
+			if active_session.is_some() && stop_session_manager.is_shutdown_triggered() {
+				let reason = stop_session_manager.wait_shutdown_complete().await;
+				tracing::warn!("Session stopped unexpectedly, waiting for new session (reason: {reason:?}).");
+				active_session = None;
+				stop_session_manager = ShutdownManager::new();
+			}
+
 			match command {
 				SessionManagerCommand::SetStreamContext(video, audio) =>  {
 					if active_session.is_none() {
@@ -118,15 +162,13 @@ impl SessionManagerInner {
 						continue;
 					}
 
-					active_session = match Session::new(config.clone(), session_context) {
+					active_session = match Session::new(config.clone(), session_context, stop_session_manager.clone()) {
 						Ok(session) => Some(session),
 						Err(()) => continue,
 					};
 				},
 
 				SessionManagerCommand::StartSession => {
-					tracing::info!("Starting session.");
-
 					let Some(session) = &mut active_session else {
 						tracing::warn!("Can't launch a session, there is no session created yet.");
 						continue;
@@ -149,13 +191,16 @@ impl SessionManagerInner {
 					let _ = session.start(video_stream_context, audio_stream_context).await;
 				},
 
-				SessionManagerCommand::StopSession => {
-					if let Some(session) = &mut active_session {
-						let _ = session.stop().await;
+				SessionManagerCommand::StopSession(result_tx) => {
+					if active_session.is_some() {
+						let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::UserStopped);
+						stop_session_manager.wait_shutdown_complete().await;
+						stop_session_manager = ShutdownManager::new();
 						active_session = None;
 					} else {
-						tracing::debug!("Trying to stop session, but no session is currently active.");
+						tracing::warn!("Trying to stop session, but no session is currently active.");
 					}
+					let _ = result_tx.send(());
 				},
 
 				SessionManagerCommand::UpdateKeys(keys) => {
@@ -170,8 +215,9 @@ impl SessionManagerInner {
 		}
 
 		// Stop a session if there is one active.
-		if let Some(session) = &mut active_session {
-			let _ = session.stop().await;
+		if active_session.is_some() {
+			let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::ManagerShutdown);
+			stop_session_manager.wait_shutdown_complete().await;
 		}
 
 		tracing::debug!("Session manager stopped.");

@@ -1,7 +1,8 @@
+use async_shutdown::ShutdownManager;
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
-use crate::session::stream::control::input::gamepad::Gamepad;
+use crate::session::{manager::SessionShutdownReason, stream::control::input::gamepad::Gamepad};
 
 use self::{
 	mouse::{
@@ -96,13 +97,13 @@ pub struct InputHandler {
 }
 
 impl InputHandler {
-	pub fn new() -> Result<Self, ()> {
+	pub fn new(stop_session_manager: ShutdownManager<SessionShutdownReason>) -> Result<Self, ()> {
 		let mouse = Mouse::new()?;
 		let keyboard = Keyboard::new()?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = InputHandlerInner { mouse, keyboard };
-		tokio::spawn(inner.run(command_rx));
+		tokio::spawn(inner.run(command_rx, stop_session_manager));
 
 		Ok(Self { command_tx })
 	}
@@ -124,10 +125,18 @@ struct InputHandlerInner {
 }
 
 impl InputHandlerInner {
-	pub async fn run(mut self, mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>) {
+	pub async fn run(
+		mut self,
+		mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	) {
+		// Trigger session shutdown when the input handler stops.
+		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::InputHandlerStopped);
+		let _delay_stop = stop_session_manager.delay_shutdown_token();
+
 		let mut gamepads: [Option<Gamepad>; 16] = Default::default();
 
-		while let Some((command, feedback_tx)) = command_rx.recv().await {
+		while let Ok(Some((command, feedback_tx))) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				InputEvent::KeyDown(key) => {
 					tracing::trace!("Pressing key: {key:?}");
@@ -237,12 +246,12 @@ impl InputHandlerInner {
 					}
 				},
 				InputEvent::GamepadEnableHaptics => {
-					tracing::info!("Received request to enable haptics on gamepads.");
+					tracing::debug!("Received request to enable haptics on gamepads.");
 					// We don't actually need to do anything.
 				},
 			}
 		}
 
-		tracing::debug!("Input handler closing.");
+		tracing::debug!("Input handler stopped.");
 	}
 }

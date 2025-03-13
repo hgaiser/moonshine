@@ -1,7 +1,7 @@
-use async_shutdown::{ShutdownManager, TriggerShutdownToken};
-use tokio::{net::UdpSocket, sync::{mpsc, oneshot}};
+use async_shutdown::ShutdownManager;
+use tokio::{net::UdpSocket, sync::mpsc};
 
-use crate::{config::Config, session::SessionKeys};
+use crate::{config::Config, session::{manager::SessionShutdownReason, SessionKeys}};
 
 use self::{capture::AudioCapture, encoder::AudioEncoder};
 
@@ -16,7 +16,6 @@ pub struct AudioStreamContext {
 
 enum AudioStreamCommand {
 	Start(SessionKeys),
-	Stop(oneshot::Sender<()>),
 	UpdateKeys(SessionKeys),
 }
 
@@ -29,9 +28,9 @@ impl AudioStream {
 	pub async fn new(
 		config: Config,
 		context: AudioStreamContext,
-		stop_signal: ShutdownManager<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		tracing::info!("Starting audio stream.");
+		tracing::debug!("Initializing audio stream.");
 
 		let socket = UdpSocket::bind((config.address, config.stream.audio.port)).await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
@@ -51,31 +50,25 @@ impl AudioStream {
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioStreamInner { capture: None, encoder: None };
-		tokio::spawn(stop_signal.wrap_cancel(stop_signal.wrap_trigger_shutdown((), inner.run(
+		tokio::spawn(inner.run(
 			socket,
 			command_rx,
-			stop_signal.trigger_shutdown_token(()),
-		))));
+			stop_session_manager.clone(),
+		));
 
 		Ok(AudioStream { command_tx })
 	}
 
 	pub async fn start(&self, keys: SessionKeys) -> Result<(), ()> {
+		tracing::debug!("Starting audio stream.");
+
 		self.command_tx.send(AudioStreamCommand::Start(keys)).await
 			.map_err(|e| tracing::error!("Failed to send Start command: {e}"))
 	}
 
-	pub async fn stop(&self) -> Result<(), ()> {
-		tracing::info!("Stopping audio stream.");
-		let (result_tx, result_rx) = oneshot::channel();
-		self.command_tx.send(AudioStreamCommand::Stop(result_tx))
-			.await
-			.map_err(|e| tracing::error!("Failed to send Stop command: {e}"))?;
-		result_rx.await
-			.map_err(|e| tracing::error!("Failed to wait for result from Stop command: {e}"))
-	}
-
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
+		tracing::info!("Updating audio stream keys.");
+
 		self.command_tx.send(AudioStreamCommand::UpdateKeys(keys)).await
 			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
 	}
@@ -93,16 +86,26 @@ impl AudioStreamInner {
 		mut self,
 		socket: UdpSocket,
 		mut command_rx: mpsc::Receiver<AudioStreamCommand>,
-		stop_token: TriggerShutdownToken<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
-		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(10);
-		tokio::spawn(handle_audio_packets(packet_rx, socket));
+		// Trigger session shutdown when the audio stream stops.
+		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::AudioStreamStopped);
+		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
-		while let Some(command) = command_rx.recv().await {
+		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(10);
+		tokio::spawn(handle_audio_packets(packet_rx, socket, stop_session_manager.clone()));
+
+		let mut started_streaming = false;
+		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				AudioStreamCommand::Start(keys) => {
+					if started_streaming {
+						tracing::warn!("Can't start streaming twice.");
+						continue;
+					}
+
 					let (audio_tx, audio_rx) = mpsc::channel(10);
-					let capture = match AudioCapture::new(audio_tx, stop_token.clone()).await {
+					let capture = match AudioCapture::new(audio_tx, stop_session_manager.clone()).await {
 						Ok(capture) => capture,
 						Err(()) => break,
 					};
@@ -113,7 +116,7 @@ impl AudioStreamInner {
 						audio_rx,
 						keys.clone(),
 						packet_tx.clone(),
-						stop_token.clone(),
+						stop_session_manager.clone(),
 					) {
 						Ok(encoder) => encoder,
 						Err(()) => break,
@@ -121,19 +124,9 @@ impl AudioStreamInner {
 
 					self.capture = Some(capture);
 					self.encoder = Some(encoder);
-				},
 
-				AudioStreamCommand::Stop(result_tx) => {
-					if let Some(capture) = self.capture.take() {
-						let _ = capture.stop().await;
-					}
-					if let Some(encoder) = self.encoder.take() {
-						let _ = encoder.stop().await;
-					}
-					let _ = result_tx.send(());
-					stop_token.forget();
-					break;
-				}
+					started_streaming = true;
+				},
 
 				AudioStreamCommand::UpdateKeys(keys) => {
 					let Some(encoder) = &self.encoder else {
@@ -146,39 +139,48 @@ impl AudioStreamInner {
 			}
 		}
 
-		tracing::info!("Audio stream stopped.");
+		tracing::debug!("Audio stream stopped.");
 	}
 }
 
-async fn handle_audio_packets(mut packet_rx: mpsc::Receiver<Vec<u8>>, socket: UdpSocket) {
+async fn handle_audio_packets(
+	mut packet_rx: mpsc::Receiver<Vec<u8>>,
+	socket: UdpSocket,
+	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+) {
 	let mut buf = [0; 1024];
 	let mut client_address = None;
 
-	loop {
+	// Trigger session shutdown when the audio packet stream stops.
+	let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::AudioPacketHandlerStopped);
+	let _delay_stop = stop_session_manager.delay_shutdown_token();
+
+	while !stop_session_manager.is_shutdown_triggered() {
 		tokio::select! {
-			packet = packet_rx.recv() => {
+			packet = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 				match packet {
-					Some(packet) => {
+					Ok(Some(packet)) => {
 						if let Some(client_address) = client_address {
 							if let Err(e) = socket.send_to(packet.as_slice(), client_address).await {
 								tracing::warn!("Failed to send packet to client: {e}");
 							}
 						}
 					},
-					None => {
+					_ => {
 						tracing::debug!("Audio packet channel closed.");
 						break;
 					},
 				}
 			},
 
-			message = socket.recv_from(&mut buf) => {
+			message = stop_session_manager.wrap_cancel(socket.recv_from(&mut buf)) => {
 				let (len, address) = match message {
-					Ok((len, address)) => (len, address),
-					Err(e) => {
+					Ok(Ok((len, address))) => (len, address),
+					Ok(Err(e)) => {
 						tracing::warn!("Failed to receive message: {e}");
 						break;
 					},
+					Err(_) => break,
 				};
 
 				if &buf[..len] == b"PING" {
@@ -191,5 +193,5 @@ async fn handle_audio_packets(mut packet_rx: mpsc::Receiver<Vec<u8>>, socket: Ud
 		}
 	}
 
-	tracing::info!("Audio packet stream stopped.");
+	tracing::debug!("Audio packet stream stopped.");
 }

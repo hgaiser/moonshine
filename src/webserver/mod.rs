@@ -63,7 +63,7 @@ impl Webserver {
 					let listener = TcpListener::bind(http_address).await
 						.map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
 
-					tracing::info!("HTTP server listening for connections on {http_address}");
+					tracing::debug!("HTTP server listening for connections on {http_address}");
 					loop {
 						let (connection, address) = listener.accept().await
 							.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
@@ -112,7 +112,7 @@ impl Webserver {
 						.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
 					let acceptor = TlsAcceptor::from_config(config.webserver.certificate, config.webserver.private_key)?;
 
-					tracing::info!("HTTPS server listening for connections on {https_address}");
+					tracing::debug!("HTTPS server listening for connections on {https_address}");
 					loop {
 						let (connection, address) = listener.accept().await
 							.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
@@ -171,7 +171,7 @@ impl Webserver {
 			})
 			.unwrap_or_default();
 
-		tracing::info!("Received {} request for {}.", request.method(), request.uri().path());
+		tracing::debug!("Received {} request for {}.", request.method(), request.uri().path());
 
 		let response = if https {
 			match (request.method(), request.uri().path()) {

@@ -1,14 +1,13 @@
-use std::{sync::{atomic::{AtomicBool, AtomicU32, Ordering}, Arc, Condvar, Mutex}, thread::JoinHandle};
+use std::sync::{atomic::{AtomicU32, Ordering}, Arc, Condvar, Mutex};
 
-use async_shutdown::TriggerShutdownToken;
+use async_shutdown::ShutdownManager;
 use cudarc::driver::CudaDevice;
 use ffmpeg::Frame;
 use nvfbc::{CudaCapturer, BufferFormat, cuda::CaptureMethod};
 
-pub struct VideoFrameCapturer {
-	stop_flag: Arc<AtomicBool>,
-	inner_handle: JoinHandle<()>,
-}
+use crate::session::manager::SessionShutdownReason;
+
+pub struct VideoFrameCapturer { }
 
 impl VideoFrameCapturer {
 	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
@@ -20,14 +19,12 @@ impl VideoFrameCapturer {
 		framerate: u32,
 		frame_number: Arc<AtomicU32>,
 		frame_notifier: Arc<Condvar>,
-		session_stop_token: TriggerShutdownToken<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		tracing::info!("Starting frame capture.");
+		tracing::debug!("Initializing frame capture.");
 
 		let inner = FrameCaptureInner { capturer };
-		let stop_flag = Arc::new(AtomicBool::new(false));
-		let inner_handle = std::thread::Builder::new().name("video-capture".to_string()).spawn({
-			let stop_flag = stop_flag.clone();
+		std::thread::Builder::new().name("video-capture".to_string()).spawn(
 			move || {
 				let _ = cuda_device.bind_to_thread()
 					.map_err(|e| tracing::error!("Failed to bind CUDA device to thread: {e}"));
@@ -37,22 +34,13 @@ impl VideoFrameCapturer {
 					intermediate_buffer,
 					frame_number,
 					frame_notifier,
-					stop_flag,
-					session_stop_token,
+					stop_session_manager,
 				);
 			}
-		})
-			.map_err(|e| tracing::error!("Failed to start video capture thread: {e}"))?;
+		)
+			.map_err(|e| tracing::error!("Failed to start frame capture thread: {e}"))?;
 
-		Ok(Self { stop_flag, inner_handle })
-	}
-
-	pub async fn stop(self) -> Result<(), ()> {
-		tracing::info!("Requesting frame capture to stop.");
-		self.stop_flag.store(true, Ordering::Relaxed);
-		self.inner_handle.join()
-			.map_err(|_| tracing::error!("Failed to join audio capture thread."))?;
-		Ok(())
+		Ok(Self { })
 	}
 }
 
@@ -69,9 +57,14 @@ impl FrameCaptureInner {
 		intermediate_buffer: Arc<Mutex<Frame>>,
 		frame_number: Arc<std::sync::atomic::AtomicU32>,
 		frame_notifier: Arc<Condvar>,
-		stop_flag: Arc<AtomicBool>,
-		session_stop_token: TriggerShutdownToken<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
+		tracing::debug!("Starting frame capture.");
+
+		// Trigger session shutdown if we exit unexpectedly.
+		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoFrameCaptureStopped);
+		let _delay_stop = stop_session_manager.delay_shutdown_token();
+
 		if let Err(e) = self.capturer.bind_context() {
 			tracing::error!("Failed to bind frame capturer CUDA context: {e}");
 			return;
@@ -80,9 +73,8 @@ impl FrameCaptureInner {
 			tracing::error!("Failed to start CUDA capture device: {e}");
 			return;
 		}
-		tracing::info!("Started frame capture.");
 
-		while !stop_flag.load(Ordering::Relaxed) {
+		while !stop_session_manager.is_shutdown_triggered() {
 			let frame_info = match self.capturer.next_frame(CaptureMethod::NoWaitIfNewFrame) {
 				Ok(frame_info) => frame_info,
 				Err(e) => {
@@ -127,11 +119,6 @@ impl FrameCaptureInner {
 			frame_notifier.notify_all();
 		}
 
-		// If we were asked to stop, ignore the stop token, no need to panic.
-		if stop_flag.load(Ordering::Relaxed) {
-			session_stop_token.forget();
-		}
-
-		tracing::info!("Video capturer stopped.");
+		tracing::debug!("Frame capturer stopped.");
 	}
 }

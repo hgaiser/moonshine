@@ -1,11 +1,9 @@
-use std::{sync::{atomic::{AtomicBool, Ordering}, Arc}, thread::JoinHandle};
-
-use async_shutdown::TriggerShutdownToken;
+use async_shutdown::ShutdownManager;
 use openssl::cipher::Cipher;
 use reed_solomon_erasure::{galois_8, ReedSolomon};
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
-use crate::{crypto::encrypt, session::{stream::RtpHeader, SessionKeys}};
+use crate::{crypto::encrypt, session::{manager::SessionShutdownReason, stream::RtpHeader, SessionKeys}};
 
 const NR_DATA_SHARDS: usize = 4;
 const NR_PARITY_SHARDS: usize = 2;
@@ -28,8 +26,6 @@ enum AudioEncoderCommand {
 
 pub struct AudioEncoder {
 	command_tx: mpsc::Sender<AudioEncoderCommand>,
-	stop_flag: Arc<AtomicBool>,
-	inner_handle: JoinHandle<()>,
 }
 
 impl AudioEncoder {
@@ -39,12 +35,12 @@ impl AudioEncoder {
 		audio_rx: mpsc::Receiver<Vec<f32>>,
 		keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
-		session_stop_token: TriggerShutdownToken<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		// TODO: Make this configurable.
 		let audio_bitrate = 512000;
 
-		tracing::info!("Starting audio encoder.");
+		tracing::debug!("Starting audio encoder.");
 		tracing::debug!("Creating audio encoder with sample rate {} and {} channels.", sample_rate, channels);
 
 		let mut encoder = opus::Encoder::new(
@@ -65,9 +61,7 @@ impl AudioEncoder {
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioEncoderInner { };
-		let stop_flag = Arc::new(AtomicBool::new(false));
-		let inner_handle = std::thread::Builder::new().name("audio-encode".to_string()).spawn({
-			let stop_flag = stop_flag.clone();
+		std::thread::Builder::new().name("audio-encode".to_string()).spawn(
 			move || inner.run(
 				command_rx,
 				audio_rx,
@@ -75,21 +69,12 @@ impl AudioEncoder {
 				encoder,
 				keys,
 				packet_tx,
-				stop_flag,
-				session_stop_token,
+				stop_session_manager,
 			)
-		})
+		)
 			.map_err(|e| tracing::error!("Failed to start audio encode thread: {e}"))?;
 
-		Ok(Self { command_tx, stop_flag, inner_handle })
-	}
-
-	pub async fn stop(self) -> Result<(), ()> {
-		tracing::info!("Requesting audio encoder to stop.");
-		self.stop_flag.store(true, Ordering::Relaxed);
-		self.inner_handle.join()
-			.map_err(|_| tracing::error!("Failed to join audio capture thread."))?;
-		Ok(())
+		Ok(Self { command_tx })
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
@@ -111,9 +96,12 @@ impl AudioEncoderInner {
 		mut encoder: opus::Encoder,
 		mut keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
-		stop_flag: Arc<AtomicBool>,
-		session_stop_token: TriggerShutdownToken<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
+		// Trigger session shutdown when the audio encoder stops.
+		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::AudioEncoderStopped);
+		let _delay_stop = stop_session_manager.delay_shutdown_token();
+
 		let mut sequence_number = 0u16;
 		let stream_start_time = std::time::Instant::now();
 
@@ -137,7 +125,7 @@ impl AudioEncoderInner {
 		// TODO: Decide the correct size for this buffer.
 		let mut encoded_audio = vec![0u8; 1400];
 
-		while !stop_flag.load(Ordering::Relaxed) {
+		while !stop_session_manager.is_shutdown_triggered() {
 			// Check if there's a command.
 			match command_rx.try_recv() {
 				Ok(command) => {
@@ -280,11 +268,6 @@ impl AudioEncoderInner {
 			}
 		}
 
-		// If we were asked to stop, ignore the stop token, no need to panic.
-		if stop_flag.load(Ordering::Relaxed) {
-			session_stop_token.forget();
-		}
-
-		tracing::info!("Audio encoder stopped.");
+		tracing::debug!("Audio encoder stopped.");
 	}
 }

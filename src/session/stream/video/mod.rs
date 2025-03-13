@@ -1,11 +1,11 @@
 use std::sync::{Arc, Mutex};
 
-use async_shutdown::{ShutdownManager, TriggerShutdownToken};
+use async_shutdown::ShutdownManager;
 use ffmpeg::{format::Pixel, Frame};
 use nvfbc::CudaCapturer;
-use tokio::{net::UdpSocket, sync::{broadcast, mpsc, oneshot}};
+use tokio::{net::UdpSocket, sync::{broadcast, mpsc}};
 
-use crate::{config::Config, ffmpeg::{check_ret, hwdevice::CudaDeviceContextBuilder, hwframe::HwFrameContextBuilder}};
+use crate::{config::Config, ffmpeg::{check_ret, hwdevice::CudaDeviceContextBuilder, hwframe::HwFrameContextBuilder}, session::manager::SessionShutdownReason};
 
 mod capture;
 use capture::VideoFrameCapturer;
@@ -16,7 +16,6 @@ use encoder::VideoEncoder;
 #[derive(Debug)]
 enum VideoStreamCommand {
 	Start,
-	Stop(oneshot::Sender<()>),
 	RequestIdrFrame,
 }
 
@@ -38,8 +37,12 @@ pub struct VideoStream {
 }
 
 impl VideoStream {
-	pub async fn new(config: Config, context: VideoStreamContext, stop_signal: ShutdownManager<()>) -> Result<Self, ()> {
-		tracing::info!("Starting video stream.");
+	pub async fn new(
+		config: Config,
+		context: VideoStreamContext,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	) -> Result<Self, ()> {
+		tracing::debug!("Initializing video stream.");
 
 		let socket = UdpSocket::bind((config.address.as_str(), config.stream.video.port))
 			.await
@@ -60,30 +63,20 @@ impl VideoStream {
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = VideoStreamInner { context, config, capturer: None, encoder: None };
-		tokio::spawn(stop_signal.wrap_cancel(stop_signal.wrap_trigger_shutdown((), inner.run(
+		tokio::spawn(inner.run(
 			socket,
 			command_rx,
-			stop_signal.trigger_shutdown_token(()),
-		))));
+			stop_session_manager.clone(),
+		));
 
 		Ok(Self { command_tx })
 	}
 
 	pub async fn start(&self) -> Result<(), ()> {
-		tracing::info!("Starting video stream.");
+		tracing::debug!("Starting video stream.");
 
 		self.command_tx.send(VideoStreamCommand::Start).await
 			.map_err(|e| tracing::warn!("Failed to send Start command: {e}"))
-	}
-
-	pub async fn stop(&self) -> Result<(), ()> {
-		tracing::info!("Stopping video stream.");
-		let (result_tx, result_rx) = oneshot::channel();
-		self.command_tx.send(VideoStreamCommand::Stop(result_tx))
-			.await
-			.map_err(|e| tracing::error!("Failed to send Stop command: {e}"))?;
-		result_rx.await
-			.map_err(|e| tracing::error!("Failed to wait for result from Stop command: {e}"))
 	}
 
 	pub async fn request_idr_frame(&self) -> Result<(), ()> {
@@ -104,17 +97,21 @@ impl VideoStreamInner {
 		mut self,
 		socket: UdpSocket,
 		mut command_rx: mpsc::Receiver<VideoStreamCommand>,
-		session_stop_token: TriggerShutdownToken<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
+		// Trigger session shutdown if we exit unexpectedly.
+		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoStreamStopped);
+		let _delay_stop = stop_session_manager.delay_shutdown_token();
+
 		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(1024);
-		tokio::spawn(handle_video_packets(packet_rx, socket));
+		tokio::spawn(handle_video_packets(packet_rx, socket, stop_session_manager.clone()));
 
 		let mut started_streaming = false;
 		let (idr_frame_request_tx, _idr_frame_request_rx) = tokio::sync::broadcast::channel(1);
-		while let Some(command) = command_rx.recv().await {
+		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				VideoStreamCommand::RequestIdrFrame => {
-					tracing::info!("Received request for IDR frame, next frame will be an IDR frame.");
+					tracing::debug!("Received request for IDR frame, next frame will be an IDR frame.");
 					let _ = idr_frame_request_tx.send(())
 						.map_err(|e| tracing::error!("Failed to send IDR frame request to encoder: {e}"));
 				},
@@ -125,36 +122,25 @@ impl VideoStreamInner {
 					}
 
 					if self.start(
-							packet_tx.clone(),
-							idr_frame_request_tx.subscribe(),
-							session_stop_token.clone(),
-						).await.is_err() {
-						continue;
+						packet_tx.clone(),
+						idr_frame_request_tx.subscribe(),
+						stop_session_manager.clone(),
+					).await.is_err() {
+						break;
 					}
 					started_streaming = true;
-				},
-				VideoStreamCommand::Stop(result_tx) => {
-					if let Some(encoder) = self.encoder.take() {
-						let _ = encoder.stop().await;
-					}
-					if let Some(capturer) = self.capturer.take() {
-						let _ = capturer.stop().await;
-					}
-					let _ = result_tx.send(());
-					session_stop_token.forget();
-					break;
 				},
 			}
 		}
 
-		tracing::info!("Video stream stopped.");
+		tracing::debug!("Video stream stopped.");
 	}
 
 	async fn start(
 		&mut self,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
-		session_stop_token: TriggerShutdownToken<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
 		// TODO: Make the GPU index configurable.
 		let cuda_device = cudarc::driver::CudaDevice::new(0)
@@ -208,7 +194,7 @@ impl VideoStreamInner {
 			self.context.fps,
 			frame_number.clone(),
 			frame_notifier.clone(),
-			session_stop_token.clone(),
+			stop_session_manager.clone(),
 		)?;
 
 		let encoder = VideoEncoder::new(
@@ -226,7 +212,7 @@ impl VideoStreamInner {
 			idr_frame_request_rx,
 			frame_number,
 			frame_notifier,
-			session_stop_token,
+			stop_session_manager.clone(),
 		)?;
 
 		self.capturer = Some(capturer);
@@ -254,11 +240,19 @@ fn create_frame(width: u32, height: u32, pixel_format: Pixel, context: *mut ffmp
 	}
 }
 
-async fn handle_video_packets(mut packet_rx: mpsc::Receiver<Vec<u8>>, socket: UdpSocket) {
+async fn handle_video_packets(
+	mut packet_rx: mpsc::Receiver<Vec<u8>>,
+	socket: UdpSocket,
+	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+) {
 	let mut buf = [0; 1024];
 	let mut client_address = None;
 
-	loop {
+	// Trigger session shutdown if we exit unexpectedly.
+	let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
+	let _delay_stop = stop_session_manager.delay_shutdown_token();
+
+	while !stop_session_manager.is_shutdown_triggered() {
 		tokio::select! {
 			packet = packet_rx.recv() => {
 				match packet {
@@ -295,5 +289,5 @@ async fn handle_video_packets(mut packet_rx: mpsc::Receiver<Vec<u8>>, socket: Ud
 		}
 	}
 
-	tracing::info!("Video packet stream stopped.");
+	tracing::debug!("Video packet stream stopped.");
 }

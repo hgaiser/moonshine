@@ -1,11 +1,11 @@
 use std::net::{SocketAddr, UdpSocket};
 
-use async_shutdown::{ShutdownManager, TriggerShutdownToken};
+use async_shutdown::ShutdownManager;
 use openssl::{cipher, symm};
 use rusty_enet as enet;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
-use crate::{config::Config, crypto::encrypt, session::{SessionContext, SessionKeys}};
+use crate::{config::Config, crypto::encrypt, session::{manager::SessionShutdownReason, SessionContext, SessionKeys}};
 use self::{input::InputHandler, feedback::FeedbackCommand};
 use super::{VideoStream, AudioStream};
 
@@ -196,7 +196,6 @@ fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Ve
 
 enum ControlStreamCommand {
 	UpdateKeys(SessionKeys),
-	Stop,
 }
 
 pub struct ControlStream {
@@ -210,36 +209,47 @@ impl ControlStream {
 		video_stream: VideoStream,
 		audio_stream: AudioStream,
 		context: SessionContext,
-		stop_signal: ShutdownManager<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		let input_handler = InputHandler::new()?;
+		let input_handler = InputHandler::new(stop_session_manager.clone())?;
+
+		let socket_address = SocketAddr::new(
+			config.address.parse()
+				.map_err(|e| tracing::error!("Failed to parse address ({}): {e}", config.address))?,
+			config.stream.control.port,
+		);
+		let socket = UdpSocket::bind(socket_address)
+			.map_err(|e| tracing::error!("Failed to bind to socket address ({}): {e}", socket_address))?;
+		let host = rusty_enet::Host::new(
+			socket,
+			enet::HostSettings {
+				peer_limit: 1,
+				channel_limit: 1,
+				..Default::default()
+			}
+		)
+			.map_err(|e| tracing::error!("Failed to create control host: {e}"))?;
+
+		tracing::debug!("Listening for control messages on {:?}", socket_address);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = ControlStreamInner { };
-		tokio::task::spawn_blocking({
+		tokio::task::spawn_blocking(
 			move || {
-				tokio::runtime::Handle::current().block_on(
-					stop_signal.wrap_cancel(stop_signal.wrap_trigger_shutdown((), inner.run(
-						config,
-						command_rx,
-						video_stream,
-						audio_stream,
-						context,
-						input_handler,
-						stop_signal.trigger_shutdown_token(()),
-					)))
-				)
+				tokio::runtime::Handle::current().block_on(inner.run(
+					config,
+					host,
+					command_rx,
+					video_stream,
+					audio_stream,
+					context,
+					input_handler,
+					stop_session_manager.clone(),
+				))
 			}
-		});
+		);
 
 		Ok(Self { command_tx })
-	}
-
-	pub async fn stop(&self) -> Result<(), ()> {
-		tracing::info!("Stopping control handling.");
-		self.command_tx.send(ControlStreamCommand::Stop)
-			.await
-			.map_err(|e| tracing::error!("Failed to send Stop command: {e}"))
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
@@ -256,31 +266,17 @@ impl ControlStreamInner {
 	pub async fn run(
 		&self,
 		config: Config,
+		mut host: enet::Host<UdpSocket>,
 		mut command_rx: mpsc::Receiver<ControlStreamCommand>,
 		video_stream: VideoStream,
 		audio_stream: AudioStream,
 		mut context: SessionContext,
 		input_handler: InputHandler,
-		session_stop_token: TriggerShutdownToken<()>,
-	) -> Result<(), ()> {
-		let socket_address = SocketAddr::new(
-			config.address.parse()
-				.map_err(|e| tracing::error!("Failed to parse address ({}): {e}", config.address))?,
-			config.stream.control.port,
-		);
-		let socket = UdpSocket::bind(socket_address)
-			.map_err(|e| tracing::error!("Failed to bind to socket address ({}): {e}", socket_address))?;
-		let mut host = rusty_enet::Host::new(
-			socket,
-			enet::HostSettings {
-				peer_limit: 1,
-				channel_limit: 1,
-				..Default::default()
-			}
-		)
-			.map_err(|e| tracing::error!("Failed to create control host: {e}"))?;
-
-		tracing::debug!("Listening for control messages on {:?}", socket_address);
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	) {
+		// Trigger session shutdown when the control stream stops.
+		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::ControlStreamStopped);
+		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
 		let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
 
@@ -290,7 +286,7 @@ impl ControlStreamInner {
 		// Sequence number of feedback messages.
 		let mut sequence_number = 0u32;
 
-		loop {
+		while !stop_session_manager.is_shutdown_triggered() {
 			// Check if we received a command.
 			let command = command_rx.try_recv();
 			match command {
@@ -298,10 +294,6 @@ impl ControlStreamInner {
 					match command {
 						ControlStreamCommand::UpdateKeys(keys) => {
 							context.keys = keys;
-						},
-						ControlStreamCommand::Stop => {
-							session_stop_token.forget();
-							break;
 						},
 					}
 				},
@@ -334,14 +326,17 @@ impl ControlStreamInner {
 				sequence_number += 1;
 			}
 
-			match host.service().map_err(|e| tracing::error!("Failure in enet host: {e}"))? {
-				Some(enet::Event::Connect { .. }) => {},
-				Some(enet::Event::Disconnect { .. }) => {},
-				Some(enet::Event::Receive {
+			match host.service().map_err(|e| tracing::error!("Failure in enet host: {e}")) {
+				Ok(Some(enet::Event::Connect { .. })) => {},
+				Ok(Some(enet::Event::Disconnect { .. })) => {},
+				Ok(Some(enet::Event::Receive {
 					packet,
 					..
-				}) => {
-					let mut control_message = ControlMessage::from_bytes(packet.data())?;
+				})) => {
+					let mut control_message = match ControlMessage::from_bytes(packet.data()) {
+						Ok(control_message) => control_message,
+						Err(()) => break,
+					};
 					tracing::trace!("Received control message: {control_message:?}");
 
 					// First check for encrypted control messages and decrypt them.
@@ -380,11 +375,17 @@ impl ControlStreamInner {
 					match control_message {
 						ControlMessage::Encrypted(_) => unreachable!("Encrypted control messages should be decrypted already."),
 						ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
-							video_stream.request_idr_frame().await?;
+							if video_stream.request_idr_frame().await.is_err() {
+								break;
+							}
 						},
 						ControlMessage::StartB => {
-							audio_stream.start(context.keys.clone()).await?;
-							video_stream.start().await?;
+							if audio_stream.start(context.keys.clone()).await.is_err() {
+								break;
+							}
+							if video_stream.start().await.is_err() {
+								break;
+							}
 						},
 						ControlMessage::Ping => {
 							stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
@@ -397,13 +398,13 @@ impl ControlStreamInner {
 						},
 					};
 				}
-				_ => (),
+				Ok(None) => (),
+				Err(_) => break,
 			}
 
 			std::thread::sleep(std::time::Duration::from_millis(1));
 		}
 
-		tracing::debug!("Control stream closing.");
-		Ok(())
+		tracing::debug!("Control stream stopped.");
 	}
 }

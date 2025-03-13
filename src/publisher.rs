@@ -34,7 +34,7 @@ fn on_service_registered(
 	if let Err(e) = result {
 		tracing::error!("Failed to register service: {e}");
 	} else {
-		tracing::info!("Service successfully registered.");
+		tracing::debug!("Service successfully registered.");
 	}
 }
 
