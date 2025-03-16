@@ -100,7 +100,6 @@ impl SessionManager {
 			.map_err(|e| tracing::error!("Failed to stop session: {e}"))?;
 		result_rx.await
 			.map_err(|e| tracing::error!("Failed to wait for session to stop: {e}"))?;
-		tracing::info!("Session stopped, waiting for new session.");
 		Ok(())
 	}
 
@@ -194,13 +193,24 @@ impl SessionManagerInner {
 				SessionManagerCommand::StopSession(result_tx) => {
 					if active_session.is_some() {
 						let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::UserStopped);
-						stop_session_manager.wait_shutdown_complete().await;
+
+						// What to do in case of a timeout here?
+						if tokio::time::timeout(
+							std::time::Duration::from_secs(10),
+							stop_session_manager.wait_shutdown_complete()
+						).await.is_err() {
+							let _ = result_tx.send(());
+							tracing::error!("Timeout while waiting for session to stop.");
+							break;
+						}
+
 						stop_session_manager = ShutdownManager::new();
 						active_session = None;
 					} else {
 						tracing::warn!("Trying to stop session, but no session is currently active.");
 					}
 					let _ = result_tx.send(());
+					tracing::info!("Session stopped, waiting for new session.");
 				},
 
 				SessionManagerCommand::UpdateKeys(keys) => {

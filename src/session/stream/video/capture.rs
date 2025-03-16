@@ -1,4 +1,4 @@
-use std::sync::{atomic::{AtomicU32, Ordering}, Arc, Condvar, Mutex};
+use std::{sync::{atomic::{AtomicU32, Ordering}, Arc, Condvar, Mutex}, time::Duration};
 
 use async_shutdown::ShutdownManager;
 use cudarc::driver::CudaDevice;
@@ -75,7 +75,7 @@ impl FrameCaptureInner {
 		}
 
 		while !stop_session_manager.is_shutdown_triggered() {
-			let frame_info = match self.capturer.next_frame(CaptureMethod::NoWaitIfNewFrame) {
+			let frame_info = match self.capturer.next_frame(CaptureMethod::NoWaitIfNewFrame, Some(Duration::from_millis(1000))) {
 				Ok(frame_info) => frame_info,
 				Err(e) => {
 					tracing::warn!("Failed to wait for new CUDA frame: {e}");

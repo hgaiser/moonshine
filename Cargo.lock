@@ -2070,18 +2070,18 @@ dependencies = [
 
 [[package]]
 name = "nvfbc"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b339b5c554c55904a032ec03598191071b8fbead3b89a8aabc2465727803ecc2"
+checksum = "92781b6418f157251d615f9fefed9343f73b3767c515b2020a5998e7db10a038"
 dependencies = [
  "nvfbc-sys",
 ]
 
 [[package]]
 name = "nvfbc-sys"
-version = "0.1.5"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1312c329848acc8f07a288dac9ba67edddae2c222a018916c01e47dad1f14d5b"
+checksum = "1e5c977674e6a56da110fb4d6b82d7855ca84119a2df1718353a1b4913288526"
 
 [[package]]
 name = "objc"
