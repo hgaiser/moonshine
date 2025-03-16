@@ -214,7 +214,7 @@ impl AudioCaptureInner {
 						Err(e) => {
 							// If AudioStream is dropped, then AudioEncoder is dropped, which closes this channel.
 							tracing::debug!("Received error while sending audio sample: {e}");
-							tracing::info!("Closing audio capture because the channel was closed.");
+							tracing::debug!("Closing audio capture because the channel was closed.");
 							break;
 						},
 					}

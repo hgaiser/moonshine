@@ -1544,7 +1544,7 @@ dependencies = [
 [[package]]
 name = "inputtino"
 version = "0.1.0"
-source = "git+https://github.com/hgaiser/inputtino?branch=l2r2#7138c4afb3bbef119a7347a2329530ecf62dea53"
+source = "git+https://github.com/hgaiser/inputtino?branch=moonshine#956547a405263cc9fd289af629327043d86ad2aa"
 dependencies = [
  "inputtino-sys",
 ]
@@ -1552,7 +1552,7 @@ dependencies = [
 [[package]]
 name = "inputtino-sys"
 version = "0.1.0"
-source = "git+https://github.com/hgaiser/inputtino?branch=l2r2#7138c4afb3bbef119a7347a2329530ecf62dea53"
+source = "git+https://github.com/hgaiser/inputtino?branch=moonshine#956547a405263cc9fd289af629327043d86ad2aa"
 dependencies = [
  "bindgen 0.69.5",
  "cmake",
