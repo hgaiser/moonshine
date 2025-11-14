@@ -68,7 +68,7 @@ impl Session {
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner { config, video_stream: None, audio_stream: None, control_stream: None };
-		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal));
+		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal, context.application.run_after.clone()));
 		Ok(Self { command_tx, context, running: false })
 	}
 
@@ -98,16 +98,6 @@ impl Session {
 	}
 }
 
-impl Drop for Session {
-	fn drop(&mut self) {
-		if let Some(run_after) = &self.context.application.run_after {
-			for command in run_after {
-				run_command(command, &self.context);
-			}
-		}
-	}
-}
-
 struct SessionInner {
 	config: Config,
 	video_stream: Option<VideoStream>,
@@ -121,6 +111,7 @@ impl SessionInner {
 		mut command_rx: mpsc::Receiver<SessionCommand>,
 		mut session_context: SessionContext,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		run_after: Option<Vec<Vec<String>>>,
 	) {
 		// Create a token that will trigger the shutdown of the session when the token is dropped.
 		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::SessionStopped);
@@ -170,6 +161,12 @@ impl SessionInner {
 					let _ = audio_stream.update_keys(keys.clone()).await;
 					let _ = control_stream.update_keys(keys).await;
 				},
+			}
+		}
+
+		if let Some(run_after) = &run_after {
+			for command in run_after {
+				run_command(command, &session_context);
 			}
 		}
 
