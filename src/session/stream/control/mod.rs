@@ -19,19 +19,20 @@ const MINIMUM_ENCRYPTED_LENGTH: usize = 4 + ENCRYPTION_TAG_LENGTH + 4;
 #[repr(u16)]
 enum ControlMessageType {
 	Encrypted = 0x0001,
-    TerminationExtended = 0x0109,
-    RumbleData = 0x010b,
-    HdrMode = 0x010e,
+	TerminationExtended = 0x0109,
+	RumbleData = 0x010b,
+	HdrMode = 0x010e,
 	Ping = 0x0200,
-    LossStats = 0x0201,
-    FrameStats = 0x0204,
-    InputData = 0x0206,
-    RequestIdrFrame = 0x0302,
-    InvalidateReferenceFrames = 0x0301,
-    StartB = 0x0307,
-    RumbleTriggers = 0x5500,
-    SetMotionEvent = 0x5501,
-    SetRgbLed = 0x5502,
+	LossStats = 0x0201,
+	FrameStats = 0x0204,
+	InputData = 0x0206,
+	RequestIdrFrame = 0x0302,
+	InvalidateReferenceFrames = 0x0301,
+	StartB = 0x0307,
+	RumbleTriggers = 0x5500,
+	SetMotionEvent = 0x5501,
+	SetRgbLed = 0x5502,
+	SetTriggerEffect = 0x5503,
 }
 
 impl TryFrom<u16> for ControlMessageType {
@@ -53,6 +54,7 @@ impl TryFrom<u16> for ControlMessageType {
 			x if x == Self::RumbleTriggers as u16 => Ok(Self::RumbleTriggers),
 			x if x == Self::SetMotionEvent as u16 => Ok(Self::SetMotionEvent),
 			x if x == Self::SetRgbLed as u16 => Ok(Self::SetRgbLed),
+			x if x == Self::SetTriggerEffect as u16 => Ok(Self::SetTriggerEffect),
 			_ => Err(()),
 		}
 	}
@@ -74,6 +76,7 @@ enum ControlMessage<'a> {
 	RumbleTriggers,
 	SetMotionEvent,
 	SetRgbLed,
+	SetTriggerEffect,
 }
 
 impl<'a> ControlMessage<'a> {
@@ -133,6 +136,7 @@ impl<'a> ControlMessage<'a> {
 			ControlMessageType::RumbleTriggers => Ok(Self::RumbleTriggers),
 			ControlMessageType::SetMotionEvent => Ok(Self::SetMotionEvent),
 			ControlMessageType::SetRgbLed => Ok(Self::SetRgbLed),
+			ControlMessageType::SetTriggerEffect => Ok(Self::SetTriggerEffect),
 		}
 	}
 }

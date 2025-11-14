@@ -11,7 +11,7 @@ use inputtino::{
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
-use crate::session::stream::control::{feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand}, FeedbackCommand};
+use crate::session::stream::control::{feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand}, FeedbackCommand};
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
@@ -330,6 +330,37 @@ impl Gamepad {
 						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
 							id: index as u16,
 							rgb: (r as u8, g as u8, b as u8),
+						}));
+					}}
+				);
+
+				gamepad.set_on_trigger_effect({
+					let feedback_tx = feedback_tx.clone();
+					let index = info.index;
+					move |trigger_event_flags, type_left, type_right, left, right| {
+						let left: &[u8; 10] = if let Ok(left) = left.try_into() {
+							left
+						} else {
+							tracing::warn!("Couldn't convert left trigger effect.");
+							return;
+						};
+
+						let right: &[u8; 10] = if let Ok(right) = right.try_into() {
+							right
+						} else {
+							tracing::warn!("Couldn't convert right trigger effect.");
+							return;
+						};
+
+						// tracing::info!("Trigger effect: {:?} {:?} {:?} {:?}", type_left, type_right, left, right);
+
+						let _ = feedback_tx.blocking_send(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
+							id: index as u16,
+							trigger_event_flags,
+							type_left,
+							type_right,
+							left: left.to_owned(),
+							right: right.to_owned(),
 						}));
 					}}
 				);

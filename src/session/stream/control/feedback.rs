@@ -5,6 +5,7 @@ pub enum FeedbackCommand {
 	Rumble(RumbleCommand),
 	SetLed(SetLedCommand),
 	EnableMotionEvent(EnableMotionEventCommand),
+	TriggerEffect(TriggerEffectCommand),
 }
 
 impl FeedbackCommand {
@@ -13,6 +14,7 @@ impl FeedbackCommand {
 			FeedbackCommand::Rumble(command) => command.as_packet().to_vec(),
 			FeedbackCommand::SetLed(command) => command.as_packet().to_vec(),
 			FeedbackCommand::EnableMotionEvent(command) => command.as_packet().to_vec(),
+			FeedbackCommand::TriggerEffect(command) => command.as_packet().to_vec(),
 		}
 	}
 }
@@ -106,6 +108,48 @@ impl EnableMotionEventCommand {
 		buffer[4..6].copy_from_slice(&self.id.to_le_bytes());
 		buffer[6..8].copy_from_slice(&self.report_rate.to_le_bytes());
 		buffer[8] = self.motion_type;
+
+		buffer
+	}
+}
+
+#[derive(Debug)]
+pub struct TriggerEffectCommand {
+	pub id: u16,
+	pub trigger_event_flags: u8,
+	pub type_left: u8,
+	pub type_right: u8,
+	pub left: [u8; 10],
+	pub right: [u8; 10],
+}
+
+impl TriggerEffectCommand {
+	const HEADER_LENGTH: usize =
+		std::mem::size_of::<u16>() // Feedback type.
+		+ std::mem::size_of::<u16>(); // Payload length.
+
+	const PAYLOAD_LENGTH: usize =
+		std::mem::size_of::<u16>() // ID of the gamepad.
+		+ std::mem::size_of::<u8>() // Trigger event flags.
+		+ std::mem::size_of::<u8>() // Type left.
+		+ std::mem::size_of::<u8>() // Type right.
+		+ 10 * std::mem::size_of::<u8>() // Left trigger effect (10 bytes).
+		+ 10 * std::mem::size_of::<u8>(); // Right trigger effect (10 bytes).
+
+	pub fn as_packet(&self) -> [u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH] {
+		let mut buffer = [0u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH];
+
+		// Write the header.
+		buffer[0..2].copy_from_slice(&(ControlMessageType::SetTriggerEffect as u16).to_le_bytes());
+		buffer[2..4].copy_from_slice(&(Self::PAYLOAD_LENGTH as u16).to_le_bytes());
+
+		// Write the payload.
+		buffer[4..6].copy_from_slice(&self.id.to_le_bytes());
+		buffer[6] = self.trigger_event_flags;
+		buffer[7] = self.type_left;
+		buffer[8] = self.type_right;
+		buffer[9..19].copy_from_slice(&self.left);
+		buffer[19..29].copy_from_slice(&self.right);
 
 		buffer
 	}
