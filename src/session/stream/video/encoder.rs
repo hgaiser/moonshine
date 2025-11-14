@@ -223,10 +223,8 @@ impl VideoEncoderInner {
 			tracing::trace!("Sending frame {} to encoder", frame_number);
 
 			// TODO: Check if this is necessary?
-			// Reset possible previous request for keyframe.
 			unsafe {
 				(*encoder_buffer.as_mut_ptr()).pict_type = ffmpeg::picture::Type::None.into();
-				(*encoder_buffer.as_mut_ptr()).key_frame = 0;
 			}
 
 			// Check if there was an IDR frame request.
@@ -235,7 +233,6 @@ impl VideoEncoderInner {
 					tracing::debug!("Received request for IDR frame.");
 					unsafe {
 						(*encoder_buffer.as_mut_ptr()).pict_type = ffmpeg::picture::Type::I.into();
-						(*encoder_buffer.as_mut_ptr()).key_frame = 1;
 					}
 				},
 				Err(TryRecvError::Empty) => {},

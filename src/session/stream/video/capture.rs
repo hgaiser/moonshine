@@ -1,7 +1,7 @@
 use std::{sync::{atomic::{AtomicU32, Ordering}, Arc, Condvar, Mutex}, time::Duration};
 
 use async_shutdown::ShutdownManager;
-use cudarc::driver::CudaDevice;
+use cudarc::driver::CudaContext;
 use ffmpeg::Frame;
 use nvfbc::{CudaCapturer, BufferFormat, cuda::CaptureMethod};
 
@@ -15,7 +15,7 @@ impl VideoFrameCapturer {
 		capturer: CudaCapturer,
 		capture_buffer: Frame,
 		intermediate_buffer: Arc<Mutex<Frame>>,
-		cuda_device: Arc<CudaDevice>,
+		cuda_context: Arc<CudaContext>,
 		framerate: u32,
 		frame_number: Arc<AtomicU32>,
 		frame_notifier: Arc<Condvar>,
@@ -26,7 +26,7 @@ impl VideoFrameCapturer {
 		let inner = FrameCaptureInner { capturer };
 		std::thread::Builder::new().name("video-capture".to_string()).spawn(
 			move || {
-				let _ = cuda_device.bind_to_thread()
+				let _ = cuda_context.bind_to_thread()
 					.map_err(|e| tracing::error!("Failed to bind CUDA device to thread: {e}"));
 				inner.run(
 					framerate,

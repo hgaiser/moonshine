@@ -322,7 +322,7 @@ impl ControlStreamInner {
 
 				if let Ok(packet) = packet {
 					for peer in host.connected_peers_mut() {
-						let _ = peer.send(0, &enet::Packet::reliable(&packet))
+						let _ = peer.send(0, &enet::Packet::reliable(packet.as_slice()))
 							.map_err(|e| tracing::warn!("Failed to send rumble to peer: {e}"));
 					}
 				}

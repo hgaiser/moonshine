@@ -143,7 +143,7 @@ impl VideoStreamInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
 		// TODO: Make the GPU index configurable.
-		let cuda_device = cudarc::driver::CudaDevice::new(0)
+		let cuda_context = cudarc::driver::CudaContext::new(0)
 			.map_err(|e| tracing::error!("Failed to initialize CUDA: {e}"))?;
 
 		let capturer = CudaCapturer::new()
@@ -165,7 +165,7 @@ impl VideoStreamInner {
 
 		let cuda_device_context = CudaDeviceContextBuilder::new()
 			.map_err(|e| tracing::error!("Failed to create CUDA device context: {e}"))?
-			.set_cuda_context((*cuda_device.cu_primary_ctx()) as *mut _)
+			.set_cuda_context(cuda_context.cu_ctx() as *mut _)
 			.build()
 			.map_err(|e| tracing::error!("Failed to build CUDA device context: {e}"))?
 		;
@@ -190,7 +190,7 @@ impl VideoStreamInner {
 			capturer,
 			capture_buffer,
 			intermediate_buffer.clone(),
-			cuda_device,
+			cuda_context,
 			self.context.fps,
 			frame_number.clone(),
 			frame_notifier.clone(),
