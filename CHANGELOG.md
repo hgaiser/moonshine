@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.6.0] - 2025-11-18
+
+### Added
+
+- Steam library scanner now recursively searches Steam `librarycache` directories for box art, improving compatibility with different Steam layouts.
+- RTSP server now advertises server capabilities and supported encryption flags in the SDP, aligning better with Moonlight’s expectations.
+- Structured session shutdown reasons (`SessionShutdownReason`) added and wired through video, audio, control, and input components for clearer diagnostics.
+- Audio pipeline coordinated shutdown via `ShutdownManager`, and a dedicated audio packet handler task.
+- Control feedback commands (rumble, RGB LED, motion enable, trigger effects) and a feedback channel added to send encrypted feedback to clients.
+- Full support for gamepad motion (gyro/accel), touchpad input (PS5), battery status, and haptics using [`inputtino`](https://github.com/games-on-whales/inputtino) (thanks @ABeltramo!).
+- New `VideoFrameCapturer` and `VideoEncoder` components added to separate CUDA frame capture and encoding, coordinated via shared buffers and condition variables.
+
+### Changed
+
+- Input handling for keyboard, mouse, and gamepads migrated from `evdev` to `inputtino` virtual devices, simplifying mapping and improving cross-device behavior.
+- Session lifecycle refactored: `SessionManager` and `Session` now use explicit start/stop flows, `oneshot` channels for stop completion, and centralized shutdown management instead of ad-hoc flags.
+- Audio and video streams now use dedicated UDP packet handler tasks for send/receive (with QoS, PING discovery, and graceful shutdown) rather than ad-hoc loops inside stream logic.
+- Control stream rebuilt on `rusty_enet` with AES‑128‑GCM encrypted control messages (sequence-number–based IVs and explicit tags) and extended handling of Moonlight control message types (HDR mode (HDR not implemented yet), haptics, motion/LED/trigger control).
+- Video pipeline restructured to build CUDA device/frame contexts explicitly, validate capture resolution vs requested resolution, and coordinate frame flow via atomics and condition variables.
+- Logging levels and messages tuned across components (e.g. service registration, shutdown logs, command logs) to reduce noise and make lifecycle events clearer.
+
+### Fixed
+
+- Gamepad ID / kind now follow the client-provided controller type, improving correct button layouts and feature support for Xbox/PS5/Switch controllers.
+- More robust handling of closed channels and unexpected terminations in audio, video, control, and input threads, preventing silent failures and dangling sessions.
+- Session stop requests now wait (with timeout) for underlying streams to fully terminate, reducing the chance of partially torn-down sessions.
+- Escape XML characters in Steam game titles to prevent XML parsing issues in Moonlight client.
+
 ## [v0.5.0] - 2024-12-19
 
 ### Removed
