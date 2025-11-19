@@ -8,7 +8,7 @@ use crate::{crypto::encrypt, session::{manager::SessionShutdownReason, stream::R
 const NR_DATA_SHARDS: usize = 4;
 const NR_PARITY_SHARDS: usize = 2;
 const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
-const MAX_SHARD_SIZE: usize = ((2048 + 15) / 16) * 16; // Where does this come from?
+const MAX_SHARD_SIZE: usize = 2048_usize.div_ceil(16) * 16; // Where does this come from?
 
 #[derive(Debug)]
 #[repr(C)]
@@ -187,7 +187,7 @@ impl AudioEncoderInner {
 				rtp_header.ssrc = 0;
 
 				// For FEC, copy the sequence number and timestamp of the first of the sequence of audio packets.
-				if sequence_number as usize % NR_DATA_SHARDS == 0 {
+				if (sequence_number as usize).is_multiple_of(NR_DATA_SHARDS) {
 					// Copy some values, but note that they are big-endian (as expected by Moonlight).
 					base_sequence_number = rtp_header.sequence_number;
 					base_timestamp = rtp_header.timestamp;
@@ -223,7 +223,7 @@ impl AudioEncoderInner {
 			}
 
 			// If the last packet, compute and send parity shards.
-			if sequence_number as usize % NR_DATA_SHARDS == 0 {
+			if (sequence_number as usize).is_multiple_of(NR_DATA_SHARDS) {
 				if fec_encoder.reset().is_err() {
 					tracing::warn!("Parity is not ready, but we were expecting it to be ready.");
 					fec_encoder.reset_force();

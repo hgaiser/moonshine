@@ -10,7 +10,66 @@ use crate::{config::Config, session::manager::SessionShutdownReason, state::Stat
 
 mod packetizer;
 mod pipeline;
-use pipeline::{VideoPipeline, VideoFormat, VideoDynamicRange};
+use pipeline::VideoPipeline;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoFormat {
+	#[default]
+	H264,
+	Hevc,
+	Av1,
+}
+
+impl TryFrom<u32> for VideoFormat {
+	type Error = ();
+
+	fn try_from(value: u32) -> Result<Self, Self::Error> {
+		match value {
+			0 => Ok(Self::H264),
+			1 => Ok(Self::Hevc),
+			2 => Ok(Self::Av1),
+			_ => Err(()),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoDynamicRange {
+	#[default]
+	Sdr,
+	Hdr,
+}
+
+impl TryFrom<u32> for VideoDynamicRange {
+	type Error = ();
+
+	fn try_from(value: u32) -> Result<Self, Self::Error> {
+		match value {
+			0 => Ok(Self::Sdr),
+			1 => Ok(Self::Hdr),
+			_ => Err(()),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VideoChromaSampling {
+	#[default]
+	Yuv420,
+	Yuv444,
+}
+
+impl TryFrom<u32> for VideoChromaSampling {
+	type Error = ();
+
+	fn try_from(value: u32) -> Result<Self, Self::Error> {
+		match value {
+			0 => Ok(Self::Yuv420),
+			1 => Ok(Self::Yuv444),
+			_ => Err(()),
+		}
+	}
+}
 
 #[derive(Debug)]
 enum VideoStreamCommand {
@@ -27,8 +86,9 @@ pub struct VideoStreamContext {
 	pub bitrate: usize,
 	pub minimum_fec_packets: u32,
 	pub qos: bool,
-	pub video_format: u32,
-	pub dynamic_range: u32,
+	pub video_format: VideoFormat,
+	pub dynamic_range: VideoDynamicRange,
+	pub chroma_sampling_type: VideoChromaSampling,
 }
 
 #[derive(Clone)]
@@ -196,8 +256,9 @@ impl VideoStreamInner {
 			self.context.packet_size,
 			self.context.minimum_fec_packets,
 			self.config.stream.video.fec_percentage,
-			VideoFormat::try_from(self.context.video_format).map_err(|_| tracing::error!("Invalid video format"))?,
-			VideoDynamicRange::try_from(self.context.dynamic_range).map_err(|_| tracing::error!("Invalid dynamic range"))?,
+			self.context.video_format,
+			self.context.dynamic_range,
+			self.context.chroma_sampling_type,
 			packet_tx,
 			idr_frame_request_rx,
 			stop_session_manager.clone(),

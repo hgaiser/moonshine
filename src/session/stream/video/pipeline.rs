@@ -6,44 +6,7 @@ use tokio::sync::{broadcast, mpsc};
 use crate::session::manager::SessionShutdownReason;
 
 use super::packetizer::Packetizer;
-
-#[derive(Debug, Clone, Copy)]
-pub enum VideoFormat {
-	H264,
-	Hevc,
-	Av1,
-}
-
-impl TryFrom<u32> for VideoFormat {
-	type Error = ();
-
-	fn try_from(value: u32) -> Result<Self, Self::Error> {
-		match value {
-			0 => Ok(Self::H264),
-			1 => Ok(Self::Hevc),
-			2 => Ok(Self::Av1),
-			_ => Err(()),
-		}
-	}
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VideoDynamicRange {
-	Sdr,
-	Hdr,
-}
-
-impl TryFrom<u32> for VideoDynamicRange {
-	type Error = ();
-
-	fn try_from(value: u32) -> Result<Self, Self::Error> {
-		match value {
-			0 => Ok(Self::Sdr),
-			1 => Ok(Self::Hdr),
-			_ => Err(()),
-		}
-	}
-}
+use super::{VideoFormat, VideoDynamicRange, VideoChromaSampling};
 
 pub struct VideoPipeline { }
 
@@ -60,6 +23,7 @@ impl VideoPipeline {
 		fec_percentage: u8,
 		video_format: VideoFormat,
 		dynamic_range: VideoDynamicRange,
+		chroma_sampling: VideoChromaSampling,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
@@ -70,13 +34,14 @@ impl VideoPipeline {
 			node_id,
 			width,
 			height,
-			framerate,
+			_framerate: framerate,
 			bitrate,
 			packet_size,
 			minimum_fec_packets,
 			fec_percentage,
 			video_format,
 			dynamic_range,
+			chroma_sampling,
 		};
 
 		std::thread::Builder::new().name("video-pipeline".to_string()).spawn(
@@ -98,13 +63,14 @@ struct VideoPipelineInner {
 	node_id: u32,
 	width: u32,
 	height: u32,
-	framerate: u32,
+	_framerate: u32,
 	bitrate: usize,
 	packet_size: usize,
 	minimum_fec_packets: u32,
 	fec_percentage: u8,
 	video_format: VideoFormat,
 	dynamic_range: VideoDynamicRange,
+	chroma_sampling: VideoChromaSampling,
 }
 
 impl VideoPipelineInner {
@@ -128,14 +94,23 @@ impl VideoPipelineInner {
 		// Convert bitrate to kbit/sec for nvh264enc
 		let bitrate_kbit = self.bitrate / 1000;
 
-		let (encoder, parser, caps_filter) = match (self.video_format, self.dynamic_range) {
-			(VideoFormat::H264, _) => ("nvh264enc", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high"),
-			(VideoFormat::Hevc, VideoDynamicRange::Sdr) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream"),
-			(VideoFormat::Hevc, VideoDynamicRange::Hdr) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-10"),
-			(VideoFormat::Av1, _) => ("nvav1enc", "av1parse", "video/x-av1,profile=main"),
+		let (encoder, parser, caps_filter) = match (self.video_format, self.dynamic_range, self.chroma_sampling) {
+			(VideoFormat::H264, _, VideoChromaSampling::Yuv420) => ("nvh264enc", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high"),
+			(VideoFormat::H264, _, VideoChromaSampling::Yuv444) => ("nvh264enc", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high-444"),
+			(VideoFormat::Hevc, VideoDynamicRange::Sdr, VideoChromaSampling::Yuv420) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main"),
+			(VideoFormat::Hevc, VideoDynamicRange::Hdr, VideoChromaSampling::Yuv420) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-10"),
+			(VideoFormat::Hevc, VideoDynamicRange::Sdr, VideoChromaSampling::Yuv444) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-444"),
+			(VideoFormat::Hevc, VideoDynamicRange::Hdr, VideoChromaSampling::Yuv444) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-444-10"),
+			(VideoFormat::Av1, _, VideoChromaSampling::Yuv420) => ("nvav1enc", "av1parse", "video/x-av1,profile=main"),
+			(VideoFormat::Av1, _, VideoChromaSampling::Yuv444) => ("nvav1enc", "av1parse", "video/x-av1,profile=high"),
 		};
 
-		let format = if self.dynamic_range == VideoDynamicRange::Hdr { "P010_10LE" } else { "NV12" };
+		let format = match (self.dynamic_range, self.chroma_sampling) {
+			(VideoDynamicRange::Sdr, VideoChromaSampling::Yuv420) => "NV12",
+			(VideoDynamicRange::Hdr, VideoChromaSampling::Yuv420) => "P010_10LE",
+			(VideoDynamicRange::Sdr, VideoChromaSampling::Yuv444) => "Y444",
+			(VideoDynamicRange::Hdr, VideoChromaSampling::Yuv444) => "Y444_16LE",
+		};
 
 		// TODO: Make encoder configurable (nvh264enc, vaapih264enc, x264enc, etc.)
 		// For now, we target NVIDIA.

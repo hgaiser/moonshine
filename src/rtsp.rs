@@ -3,7 +3,7 @@ use async_shutdown::ShutdownManager;
 use rtsp_types::{headers::{self, Transport}, Method};
 use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}};
 
-use crate::{config::Config, session::{stream::{AudioStreamContext, VideoStreamContext}, manager::SessionManager}};
+use crate::{config::Config, session::{stream::{AudioStreamContext, VideoStreamContext, VideoFormat, VideoDynamicRange, VideoChromaSampling}, manager::SessionManager}};
 
 #[repr(u8)]
 enum ServerCapabilities {
@@ -272,7 +272,19 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
+		let video_format = match VideoFormat::try_from(video_format) {
+			Ok(video_format) => video_format,
+			Err(()) => {
+				tracing::warn!("Invalid video format: {}", video_format);
+				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+			}
+		};
+
 		let dynamic_range: u32 = get_sdp_attribute(&sdp_session, "x-nv-video[0].dynamicRangeMode").unwrap_or_default();
+		let dynamic_range = VideoDynamicRange::try_from(dynamic_range).unwrap_or_default();
+
+		let chroma_sampling_type: u32 = get_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
+		let chroma_sampling_type = VideoChromaSampling::try_from(chroma_sampling_type).unwrap_or_default();
 
 		let video_stream_context = VideoStreamContext {
 			width,
@@ -284,6 +296,7 @@ impl RtspServer {
 			qos: video_qos_type != "0",
 			video_format,
 			dynamic_range,
+			chroma_sampling_type,
 		};
 
 		let packet_duration = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
