@@ -4,7 +4,7 @@ use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
 use tokio::sync::mpsc;
 
-use crate::{config::{Config, ApplicationConfig}, session::stream::{VideoStream, AudioStream, ControlStream}};
+use crate::{config::{Config, ApplicationConfig}, session::stream::{VideoStream, AudioStream, ControlStream}, state::State};
 
 use self::stream::{VideoStreamContext, AudioStreamContext};
 pub use manager::SessionManager;
@@ -56,6 +56,7 @@ pub struct Session {
 impl Session {
 	pub fn new(
 		config: Config,
+		state: State,
 		context: SessionContext,
 		stop_session_signal: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
@@ -67,7 +68,7 @@ impl Session {
 		}
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = SessionInner { config, video_stream: None, audio_stream: None, control_stream: None };
+		let inner = SessionInner { config, state, video_stream: None, audio_stream: None, control_stream: None };
 		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal, context.application.run_after.clone()));
 		Ok(Self { command_tx, context, running: false })
 	}
@@ -100,6 +101,7 @@ impl Session {
 
 struct SessionInner {
 	config: Config,
+	state: State,
 	video_stream: Option<VideoStream>,
 	audio_stream: Option<AudioStream>,
 	control_stream: Option<ControlStream>,
@@ -120,7 +122,7 @@ impl SessionInner {
 		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				SessionCommand::Start(video_stream_context, audio_stream_context) => {
-					let video_stream = match VideoStream::new(self.config.clone(), video_stream_context, stop_session_manager.clone()).await {
+					let video_stream = match VideoStream::new(self.config.clone(), self.state.clone(), video_stream_context, stop_session_manager.clone()).await {
 						Ok(video_stream) => video_stream,
 						Err(()) => continue,
 					};

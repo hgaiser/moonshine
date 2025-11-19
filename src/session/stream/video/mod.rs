@@ -1,11 +1,15 @@
 use std::sync::{Arc, Mutex};
 
+use ashpd::desktop::{
+	screencast::{CursorMode, Screencast, SourceType},
+	PersistMode,
+	Session,
+};
 use async_shutdown::ShutdownManager;
 use ffmpeg::{format::Pixel, Frame};
-use nvfbc::CudaCapturer;
 use tokio::{net::UdpSocket, sync::{broadcast, mpsc}};
 
-use crate::{config::Config, ffmpeg::{check_ret, hwdevice::CudaDeviceContextBuilder, hwframe::HwFrameContextBuilder}, session::manager::SessionShutdownReason};
+use crate::{config::Config, ffmpeg::{check_ret, hwdevice::CudaDeviceContextBuilder, hwframe::HwFrameContextBuilder}, session::manager::SessionShutdownReason, state::State};
 
 mod capture;
 use capture::VideoFrameCapturer;
@@ -39,6 +43,7 @@ pub struct VideoStream {
 impl VideoStream {
 	pub async fn new(
 		config: Config,
+		state: State,
 		context: VideoStreamContext,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
@@ -62,7 +67,7 @@ impl VideoStream {
 		);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = VideoStreamInner { context, config, capturer: None, encoder: None };
+		let inner = VideoStreamInner { context, config, state, capturer: None, encoder: None, screencast: None, session: None };
 		tokio::spawn(inner.run(
 			socket,
 			command_rx,
@@ -88,8 +93,11 @@ impl VideoStream {
 struct VideoStreamInner {
 	context: VideoStreamContext,
 	config: Config,
+	state: State,
 	capturer: Option<VideoFrameCapturer>,
 	encoder: Option<VideoEncoder>,
+	screencast: Option<Screencast<'static>>,
+	session: Option<Session<'static, Screencast<'static>>>,
 }
 
 impl VideoStreamInner {
@@ -134,6 +142,10 @@ impl VideoStreamInner {
 		}
 
 		tracing::debug!("Video stream stopped.");
+
+		if let Some(session) = self.session {
+			let _ = session.close().await;
+		}
 	}
 
 	async fn start(
@@ -146,22 +158,37 @@ impl VideoStreamInner {
 		let cuda_context = cudarc::driver::CudaContext::new(0)
 			.map_err(|e| tracing::error!("Failed to initialize CUDA: {e}"))?;
 
-		let capturer = CudaCapturer::new()
-			.map_err(|e| tracing::error!("Failed to create NvFBC capture: {e}"))?;
-		capturer.release_context()
-			.map_err(|e| tracing::error!("Failed to release NvFBC CUDA context: {e}"))?;
-		let status = capturer.status()
-			.map_err(|e| tracing::error!("Failed to get NvFBC status: {e}"))?;
+		let proxy = Screencast::new().await
+			.map_err(|e| tracing::error!("Failed to create Screencast proxy: {e}"))?;
+		let session = proxy.create_session().await
+			.map_err(|e| tracing::error!("Failed to create Screencast session: {e}"))?;
 
-		if status.screen_size.w != self.context.width || status.screen_size.h != self.context.height {
-			// TODO: Resize the CUDA buffer to the requested size?
-			tracing::warn!(
-				"Client asked for resolution {}x{}, but we are generating a resolution of {}x{}.",
-				self.context.width, self.context.height, status.screen_size.w, status.screen_size.h
-			);
-			self.context.width = status.screen_size.w;
-			self.context.height = status.screen_size.h;
+		let restore_token = self.state.get_screencast_token().await
+			.map_err(|_| tracing::error!("Failed to get screencast token."))?;
+
+		proxy.select_sources(
+			&session,
+			CursorMode::Embedded,
+			SourceType::Monitor.into(),
+			false,
+			restore_token.as_deref(),
+			PersistMode::ExplicitlyRevoked,
+		).await
+			.map_err(|e| tracing::error!("Failed to select sources: {e}"))?;
+
+		let response = proxy.start(&session, None).await
+			.map_err(|e| tracing::error!("Failed to start session: {e}"))?
+			.response()
+			.map_err(|e| tracing::error!("Failed to get response: {e}"))?;
+
+		if let Some(token) = response.restore_token() {
+			self.state.set_screencast_token(token.to_string()).await
+				.map_err(|_| tracing::error!("Failed to save screencast token."))?;
 		}
+
+		let stream = response.streams().first()
+			.ok_or_else(|| tracing::error!("No streams selected"))?;
+		let node_id = stream.pipe_wire_node_id();
 
 		let cuda_device_context = CudaDeviceContextBuilder::new()
 			.map_err(|e| tracing::error!("Failed to create CUDA device context: {e}"))?
@@ -187,7 +214,7 @@ impl VideoStreamInner {
 		let frame_notifier = Arc::new(std::sync::Condvar::new());
 
 		let capturer = VideoFrameCapturer::new(
-			capturer,
+			node_id,
 			capture_buffer,
 			intermediate_buffer.clone(),
 			cuda_context,
@@ -217,6 +244,8 @@ impl VideoStreamInner {
 
 		self.capturer = Some(capturer);
 		self.encoder = Some(encoder);
+		self.screencast = Some(proxy);
+		self.session = Some(session);
 
 		Ok(())
 	}

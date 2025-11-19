@@ -165,7 +165,7 @@ impl Moonshine {
 		};
 
 		// Create a manager for interacting with sessions.
-		let session_manager = SessionManager::new(config.clone(), shutdown.trigger_shutdown_token(2))?;
+		let session_manager = SessionManager::new(config.clone(), state.clone(), shutdown.trigger_shutdown_token(2))?;
 
 		// Create a manager for saving and loading client state.
 		let client_manager = ClientManager::new(state.clone(), cert.clone(), pkey, shutdown.trigger_shutdown_token(3));
