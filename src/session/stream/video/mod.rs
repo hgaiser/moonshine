@@ -1,21 +1,16 @@
-use std::sync::{Arc, Mutex};
-
 use ashpd::desktop::{
 	screencast::{CursorMode, Screencast, SourceType},
 	PersistMode,
 	Session,
 };
 use async_shutdown::ShutdownManager;
-use ffmpeg::{format::Pixel, Frame};
 use tokio::{net::UdpSocket, sync::{broadcast, mpsc}};
 
-use crate::{config::Config, ffmpeg::{check_ret, hwdevice::CudaDeviceContextBuilder, hwframe::HwFrameContextBuilder}, session::manager::SessionShutdownReason, state::State};
+use crate::{config::Config, session::manager::SessionShutdownReason, state::State};
 
-mod capture;
-use capture::VideoFrameCapturer;
-
-mod encoder;
-use encoder::VideoEncoder;
+mod packetizer;
+mod pipeline;
+use pipeline::VideoPipeline;
 
 #[derive(Debug)]
 enum VideoStreamCommand {
@@ -54,7 +49,7 @@ impl VideoStream {
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
 		if context.qos {
-			// TODO: Check this value 160, what does it mean exactly?
+			// 160 corresponds to DSCP CS5 (Video)
 			tracing::debug!("Enabling QoS on video socket.");
 			socket.set_tos(160)
 				.map_err(|e| tracing::error!("Failed to set QoS on the video socket: {e}"))?;
@@ -67,7 +62,7 @@ impl VideoStream {
 		);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = VideoStreamInner { context, config, state, capturer: None, encoder: None, screencast: None, session: None };
+		let inner = VideoStreamInner { context, config, state, pipeline: None, screencast: None, session: None };
 		tokio::spawn(inner.run(
 			socket,
 			command_rx,
@@ -94,8 +89,7 @@ struct VideoStreamInner {
 	context: VideoStreamContext,
 	config: Config,
 	state: State,
-	capturer: Option<VideoFrameCapturer>,
-	encoder: Option<VideoEncoder>,
+	pipeline: Option<VideoPipeline>,
 	screencast: Option<Screencast<'static>>,
 	session: Option<Session<'static, Screencast<'static>>>,
 }
@@ -154,18 +148,17 @@ impl VideoStreamInner {
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
-		// TODO: Make the GPU index configurable.
-		let cuda_context = cudarc::driver::CudaContext::new(0)
-			.map_err(|e| tracing::error!("Failed to initialize CUDA: {e}"))?;
-
+		tracing::debug!("Creating Screencast proxy.");
 		let proxy = Screencast::new().await
 			.map_err(|e| tracing::error!("Failed to create Screencast proxy: {e}"))?;
+		tracing::debug!("Creating Screencast session.");
 		let session = proxy.create_session().await
 			.map_err(|e| tracing::error!("Failed to create Screencast session: {e}"))?;
 
 		let restore_token = self.state.get_screencast_token().await
 			.map_err(|_| tracing::error!("Failed to get screencast token."))?;
 
+		tracing::debug!("Selecting sources.");
 		proxy.select_sources(
 			&session,
 			CursorMode::Embedded,
@@ -176,10 +169,12 @@ impl VideoStreamInner {
 		).await
 			.map_err(|e| tracing::error!("Failed to select sources: {e}"))?;
 
+		tracing::debug!("Starting session (waiting for user input).");
 		let response = proxy.start(&session, None).await
 			.map_err(|e| tracing::error!("Failed to start session: {e}"))?
 			.response()
 			.map_err(|e| tracing::error!("Failed to get response: {e}"))?;
+		tracing::debug!("Session started.");
 
 		if let Some(token) = response.restore_token() {
 			self.state.set_screencast_token(token.to_string()).await
@@ -190,82 +185,27 @@ impl VideoStreamInner {
 			.ok_or_else(|| tracing::error!("No streams selected"))?;
 		let node_id = stream.pipe_wire_node_id();
 
-		let cuda_device_context = CudaDeviceContextBuilder::new()
-			.map_err(|e| tracing::error!("Failed to create CUDA device context: {e}"))?
-			.set_cuda_context(cuda_context.cu_ctx() as *mut _)
-			.build()
-			.map_err(|e| tracing::error!("Failed to build CUDA device context: {e}"))?
-		;
-
-		let mut hw_frame_context = HwFrameContextBuilder::new(cuda_device_context)
-			.map_err(|e| tracing::error!("Failed to create CUDA frame context: {e}"))?
-			.set_width(self.context.width)
-			.set_height(self.context.height)
-			.set_sw_format(Pixel::ZRGB32)
-			.set_format(Pixel::CUDA)
-			.build()
-			.map_err(|e| tracing::error!("Failed to build CUDA frame context: {e}"))?
-		;
-
-		let capture_buffer = create_frame(self.context.width, self.context.height, Pixel::CUDA, hw_frame_context.as_raw_mut())?;
-		let intermediate_buffer = Arc::new(Mutex::new(create_frame(self.context.width, self.context.height, Pixel::CUDA, hw_frame_context.as_raw_mut())?));
-		let encoder_buffer = create_frame(self.context.width, self.context.height, Pixel::CUDA, hw_frame_context.as_raw_mut())?;
-		let frame_number = Arc::new(std::sync::atomic::AtomicU32::new(0));
-		let frame_notifier = Arc::new(std::sync::Condvar::new());
-
-		let capturer = VideoFrameCapturer::new(
+		tracing::debug!("Creating pipeline with node_id: {}", node_id);
+		let pipeline = VideoPipeline::new(
 			node_id,
-			capture_buffer,
-			intermediate_buffer.clone(),
-			cuda_context,
-			self.context.fps,
-			frame_number.clone(),
-			frame_notifier.clone(),
-			stop_session_manager.clone(),
-		)?;
-
-		let encoder = VideoEncoder::new(
-			encoder_buffer,
-			intermediate_buffer,
-			hw_frame_context.as_raw_mut(),
-			if self.context.video_format == 0 { &self.config.stream.video.codec_h264 } else { &self.config.stream.video.codec_hevc },
-			self.context.width, self.context.height,
+			self.context.width,
+			self.context.height,
 			self.context.fps,
 			self.context.bitrate,
 			self.context.packet_size,
 			self.context.minimum_fec_packets,
 			self.config.stream.video.fec_percentage,
+			self.context.video_format,
 			packet_tx,
 			idr_frame_request_rx,
-			frame_number,
-			frame_notifier,
 			stop_session_manager.clone(),
 		)?;
 
-		self.capturer = Some(capturer);
-		self.encoder = Some(encoder);
+		self.pipeline = Some(pipeline);
 		self.screencast = Some(proxy);
 		self.session = Some(session);
 
 		Ok(())
-	}
-}
-
-fn create_frame(width: u32, height: u32, pixel_format: Pixel, context: *mut ffmpeg::sys::AVBufferRef) -> Result<Frame, ()> {
-	unsafe {
-		let mut frame = Frame::empty();
-		(*frame.as_mut_ptr()).format = pixel_format as i32;
-		(*frame.as_mut_ptr()).width = width as i32;
-		(*frame.as_mut_ptr()).height = height as i32;
-		(*frame.as_mut_ptr()).hw_frames_ctx = context;
-
-		check_ret(ffmpeg::sys::av_hwframe_get_buffer(context, frame.as_mut_ptr(), 0))
-			.map_err(|e| tracing::error!("Failed to create CUDA frame: {e}"))?;
-		check_ret(ffmpeg::sys::av_hwframe_get_buffer(context, frame.as_mut_ptr(), 0))
-			.map_err(|e| println!("Failed to allocate hardware frame: {e}"))?;
-		(*frame.as_mut_ptr()).linesize[0] = (*frame.as_ptr()).width * 4;
-
-		Ok(frame)
 	}
 }
 

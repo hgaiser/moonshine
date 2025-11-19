@@ -1,13 +1,7 @@
-use std::{collections::{hash_map::Entry, HashMap}, sync::{atomic::{AtomicU32, Ordering}, Arc, Condvar, Mutex}};
-
-use async_shutdown::ShutdownManager;
-use ffmpeg::{
-	codec::packet::flag::Flags, format::Pixel, option::Settable, Frame, Packet
-};
+use std::collections::{hash_map::Entry, HashMap};
 use reed_solomon_erasure::{galois_8, ReedSolomon};
-use tokio::sync::{broadcast::{self, error::TryRecvError}, mpsc};
-
-use crate::session::{manager::SessionShutdownReason, stream::RtpHeader};
+use tokio::sync::mpsc;
+use crate::session::stream::RtpHeader;
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub const MAX_SHARDS: usize = 255;
@@ -61,267 +55,47 @@ impl NvVideoPacket {
 	}
 }
 
-pub struct VideoEncoder { }
-
-impl VideoEncoder {
-	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
-	pub fn new(
-		encoder_buffer: Frame,
-		intermediate_buffer: Arc<Mutex<Frame>>,
-		hw_frame_context: *mut ffmpeg::sys::AVBufferRef,
-		codec_name: &str,
-		width: u32,
-		height: u32,
-		framerate: u32,
-		bitrate: usize,
-		packet_size: usize,
-		minimum_fec_packets: u32,
-		fec_percentage: u8,
-		packet_tx: mpsc::Sender<Vec<u8>>,
-		idr_frame_request_rx: broadcast::Receiver<()>,
-		frame_number: Arc<AtomicU32>,
-		frame_notifier: Arc<Condvar>,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-	) -> Result<Self, ()> {
-		tracing::debug!("Using codec with name '{codec_name}'.");
-		let codec = ffmpeg::encoder::find_by_name(codec_name)
-			.ok_or_else(|| tracing::error!("Failed to find codec by name '{codec_name}'."))?;
-
-		let mut encoder = ffmpeg::codec::context::Context::new_with_codec(codec)
-			.encoder()
-			.video()
-			.map_err(|e| tracing::error!("Failed to create video encoder: {e}"))?;
-
-		encoder.set_width(width);
-		encoder.set_height(height);
-		encoder.set_frame_rate(Some((framerate as i32, 1)));
-		encoder.set_time_base((framerate as i32, 1));
-		encoder.set_max_b_frames(0);
-		encoder.set_bit_rate(bitrate);
-		encoder.set_gop(i32::MAX as u32);
-		unsafe {
-			(*encoder.as_mut_ptr()).pix_fmt = Pixel::CUDA.into();
-			(*encoder.as_mut_ptr()).hw_frames_ctx = hw_frame_context;
-			(*encoder.as_mut_ptr()).refs = 0;
-		}
-		encoder.set_str("preset", "fast")
-			.map_err(|e| tracing::error!("Failed to set preset for encoder: {e}"))?;
-		encoder.set_str("tune", "ull")
-			.map_err(|e| tracing::error!("Failed to set tuning option for encoder: {e}"))?;
-		encoder.set_str("forced-idr", "1")
-			.map_err(|e| tracing::error!("Failed to set forced-idr for encoder: {e}"))?;
-
-		let encoder = encoder.open()
-			.map_err(|e| tracing::error!("Failed to start encoder: {e}"))?;
-
-		let inner = VideoEncoderInner { encoder, fec_encoders: HashMap::new() };
-		std::thread::Builder::new().name("video-encode".to_string()).spawn(
-			move || inner.run(
-				packet_tx,
-				idr_frame_request_rx,
-				packet_size,
-				minimum_fec_packets,
-				fec_percentage,
-				encoder_buffer,
-				intermediate_buffer,
-				frame_number,
-				frame_notifier,
-				stop_session_manager,
-			)
-		)
-			.map_err(|e| tracing::error!("Failed to start video encode thread: {e}"))?;
-
-		Ok(Self { })
-	}
+pub struct Packetizer {
+	fec_encoders: HashMap<(usize, usize), ReedSolomon<galois_8::Field>>,
 }
 
-struct VideoEncoderInner {
-	encoder: ffmpeg::encoder::Video,
-	fec_encoders: HashMap<(usize, usize), ReedSolomon<galois_8::Field>>,
- }
-
-impl VideoEncoderInner {
-	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
-	pub fn run(
-		mut self,
-		packet_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-		mut idr_frame_request_rx: tokio::sync::broadcast::Receiver<()>,
-		packet_size: usize,
-		minimum_fec_packets: u32,
-		fec_percentage: u8,
-		mut encoder_buffer: Frame,
-		intermediate_buffer: Arc<Mutex<Frame>>,
-		captured_frame_number: Arc<std::sync::atomic::AtomicU32>,
-		frame_notifier: Arc<std::sync::Condvar>,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-	) {
-		tracing::debug!("Starting video encoder.");
-
-		// Trigger session shutdown if we exit unexpectedly.
-		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoEncoderStopped);
-		let _delay_stop = stop_session_manager.delay_shutdown_token();
-
-		let mut packet = Packet::empty();
-
-		// The last frame number we used.
-		let mut processed_captured_frame_number = 0;
-
-		// The sequential frame number for sending to the client.
-		let mut frame_number = 0;
-
-		let mut sequence_number = 0u32;
-		let stream_start_time = std::time::Instant::now();
-		while !stop_session_manager.is_shutdown_triggered() {
-			// Swap the intermediate buffer with the output buffer.
-			// Note that the lock is only held while swapping buffers, to minimize wait time for others locking the buffer.
-			{
-				tracing::trace!("Checking for new frame.");
-
-				// Acquire the lock for a new frame.
-				let mut lock = match intermediate_buffer.lock() {
-					Ok(lock) => lock,
-					Err(e) => {
-						tracing::error!("Failed to acquire buffer lock: {e}");
-						continue;
-					},
-				};
-
-				// Check if we missed a frame, in that case we don't need to wait for a new frame notification.
-				let captured_frame_number = captured_frame_number.load(Ordering::Relaxed);
-				// Check if we just started recording, or if we have not yet received a new frame.
-				if captured_frame_number == 0 || captured_frame_number == processed_captured_frame_number {
-					// Realistically we can wait indefinitely, but it feels safer to have a timeout just in case.
-					let mut lock = match frame_notifier.wait_timeout(lock, std::time::Duration::from_secs(5)) {
-						Ok(result) => result,
-						Err(e) => {
-							tracing::warn!("Failed to wait for new frame: {e}");
-							continue;
-						},
-					};
-
-					// Didn't get a lock, let's check shutdown status and try again.
-					if lock.1.timed_out() {
-						tracing::warn!("Failed to acquire lock for frame buffer.");
-						continue;
-					}
-
-					tracing::trace!("Received notification for a new frame.");
-					std::mem::swap(&mut *lock.0, &mut encoder_buffer);
-					processed_captured_frame_number = captured_frame_number + 1;
-				} else {
-					tracing::debug!("We missed {} frame notification(s), continuing with newest frame.", captured_frame_number - processed_captured_frame_number);
-					std::mem::swap(&mut *lock, &mut encoder_buffer);
-					processed_captured_frame_number = captured_frame_number;
-				}
-			}
-
-			frame_number += 1;
-
-			tracing::trace!("Swapped new frame with old frame.");
-			encoder_buffer.set_pts(Some(frame_number as i64));
-
-			tracing::trace!("Sending frame {} to encoder", frame_number);
-
-			// TODO: Check if this is necessary?
-			unsafe {
-				(*encoder_buffer.as_mut_ptr()).pict_type = ffmpeg::picture::Type::None.into();
-			}
-
-			// Check if there was an IDR frame request.
-			match idr_frame_request_rx.try_recv() {
-				Ok(_) => {
-					tracing::debug!("Received request for IDR frame.");
-					unsafe {
-						(*encoder_buffer.as_mut_ptr()).pict_type = ffmpeg::picture::Type::I.into();
-					}
-				},
-				Err(TryRecvError::Empty) => {},
-				Err(TryRecvError::Lagged(_)) => {},
-				Err(TryRecvError::Closed) => {
-					tracing::debug!("IDR frame channel closed, stopping video encoder.");
-					break;
-				}
-			}
-
-			// Send the frame to the encoder.
-			tracing::trace!("Sending frame {}", frame_number);
-			if let Err(e) = self.encoder.send_frame(&encoder_buffer) {
-				tracing::error!("Error sending frame for encoding: {e}");
-				continue;
-			}
-
-			loop {
-				match self.encoder.receive_packet(&mut packet) {
-					Ok(()) => {
-						tracing::trace!("Received frame {} from encoder, converting frame to packets.", packet.pts().unwrap_or(-1));
-						if self.encode_packet(
-							&packet,
-							&packet_tx,
-							packet_size,
-							minimum_fec_packets,
-							fec_percentage,
-							frame_number,
-							&mut sequence_number,
-							stream_start_time,
-						).is_err() {
-							continue;
-						}
-						tracing::trace!("Done converting frame {} to packets.", packet.pts().unwrap_or(-1));
-					},
-					Err(e) => {
-						match e {
-							ffmpeg::Error::Eof => {
-								tracing::info!("End of file");
-								break;
-							},
-							ffmpeg::Error::Other { errno: ffmpeg::sys::EAGAIN } => {
-								// tracing::info!("Need more frames for encoding...");
-								break;
-							},
-							e => {
-								tracing::error!("Unexpected error while encoding: {e}");
-								break;
-							},
-						}
-					}
-				}
-			}
+impl Packetizer {
+	pub fn new() -> Self {
+		Self {
+			fec_encoders: HashMap::new(),
 		}
-
-		tracing::debug!("Video encoder stopped.");
 	}
 
-	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
-	fn encode_packet(
+	#[allow(clippy::too_many_arguments)]
+	pub fn packetize(
 		&mut self,
-		packet: &Packet,
-		packet_tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+		encoded_data: &[u8],
+		is_key_frame: bool,
+		packet_tx: &mpsc::Sender<Vec<u8>>,
 		requested_packet_size: usize,
 		minimum_fec_packets: u32,
 		fec_percentage: u8,
 		frame_number: u32,
 		sequence_number: &mut u32,
-		stream_start_time: std::time::Instant,
+		rtp_timestamp: u32,
 	) -> Result<(), ()> {
+		tracing::trace!("Packetizing frame {}, size={}, keyframe={}", frame_number, encoded_data.len(), is_key_frame);
+
 		// Random padding, because we need it.
 		const PADDING: u32 = 0;
-
-		let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
 
 		// TODO: Figure out what this header means?
 		let video_frame_header = VideoFrameHeader {
 			header_type: 0x01, // Always 0x01 for short headers. What is this exactly?
 			padding1: 0,
-			frame_type: if packet.flags().contains(Flags::KEY) { 2 } else { 1 },
+			frame_type: if is_key_frame { 2 } else { 1 },
 			padding2: 0,
 		};
 
 		// Prefix the frame with a VideoFrameHeader.
 		let mut buffer = Vec::with_capacity(std::mem::size_of::<VideoFrameHeader>());
 		video_frame_header.serialize(&mut buffer);
-		let packet_data = packet.data()
-			.ok_or_else(|| tracing::error!("Packet is empty, but we expected it to be full."))?;
-		let packet_data = [&buffer, packet_data].concat();
+		let packet_data = [&buffer, encoded_data].concat();
 
 		let requested_shard_payload_size = requested_packet_size - std::mem::size_of::<NvVideoPacket>();
 
@@ -333,7 +107,7 @@ impl VideoEncoderInner {
 			+ requested_shard_payload_size;
 
 		// Determine how many data shards we will be sending.
-		let nr_data_shards = packet_data.len() / requested_shard_payload_size + (packet_data.len() % requested_shard_payload_size != 0) as usize; // TODO: Replace with div_ceil when it lands in stable (https://doc.rust-lang.org/std/primitive.i32.html#method.div_ceil).
+		let nr_data_shards = packet_data.len().div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
 
 		// Determine how many parity and data shards are permitted per FEC block.
@@ -393,7 +167,7 @@ impl VideoEncoderInner {
 					header: 0x90, // What is this?
 					packet_type: 0,
 					sequence_number: *sequence_number as u16,
-					timestamp,
+					timestamp: rtp_timestamp,
 					ssrc: 0,
 				};
 				rtp_header.serialize(&mut shard);

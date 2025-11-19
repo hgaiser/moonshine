@@ -17,8 +17,6 @@ pub enum SessionShutdownReason {
 	VideoStreamStopped,
 	/// Video packet handler stopped unexpectedly.
 	VideoPacketHandlerStopped,
-	/// Video frame capture stopped unexpectedly.
-	VideoFrameCaptureStopped,
 	/// Video encoder stopped unexpectedly.
 	VideoEncoderStopped,
 	/// Audio stream stopped unexpectedly.

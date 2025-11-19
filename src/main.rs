@@ -19,7 +19,6 @@ mod app_scanner;
 mod clients;
 mod config;
 mod crypto;
-mod ffmpeg;
 mod rtsp;
 mod session;
 mod state;
