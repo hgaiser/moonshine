@@ -272,6 +272,7 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
+		let dynamic_range: u32 = get_sdp_attribute(&sdp_session, "x-nv-video[0].dynamicRangeMode").unwrap_or_default();
 
 		let video_stream_context = VideoStreamContext {
 			width,
@@ -282,6 +283,7 @@ impl RtspServer {
 			minimum_fec_packets,
 			qos: video_qos_type != "0",
 			video_format,
+			dynamic_range,
 		};
 
 		let packet_duration = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {

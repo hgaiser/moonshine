@@ -7,6 +7,44 @@ use crate::session::manager::SessionShutdownReason;
 
 use super::packetizer::Packetizer;
 
+#[derive(Debug, Clone, Copy)]
+pub enum VideoFormat {
+	H264,
+	Hevc,
+	Av1,
+}
+
+impl TryFrom<u32> for VideoFormat {
+	type Error = ();
+
+	fn try_from(value: u32) -> Result<Self, Self::Error> {
+		match value {
+			0 => Ok(Self::H264),
+			1 => Ok(Self::Hevc),
+			2 => Ok(Self::Av1),
+			_ => Err(()),
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VideoDynamicRange {
+	Sdr,
+	Hdr,
+}
+
+impl TryFrom<u32> for VideoDynamicRange {
+	type Error = ();
+
+	fn try_from(value: u32) -> Result<Self, Self::Error> {
+		match value {
+			0 => Ok(Self::Sdr),
+			1 => Ok(Self::Hdr),
+			_ => Err(()),
+		}
+	}
+}
+
 pub struct VideoPipeline { }
 
 impl VideoPipeline {
@@ -20,7 +58,8 @@ impl VideoPipeline {
 		packet_size: usize,
 		minimum_fec_packets: u32,
 		fec_percentage: u8,
-		video_format: u32,
+		video_format: VideoFormat,
+		dynamic_range: VideoDynamicRange,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
@@ -37,6 +76,7 @@ impl VideoPipeline {
 			minimum_fec_packets,
 			fec_percentage,
 			video_format,
+			dynamic_range,
 		};
 
 		std::thread::Builder::new().name("video-pipeline".to_string()).spawn(
@@ -63,7 +103,8 @@ struct VideoPipelineInner {
 	packet_size: usize,
 	minimum_fec_packets: u32,
 	fec_percentage: u8,
-	video_format: u32,
+	video_format: VideoFormat,
+	dynamic_range: VideoDynamicRange,
 }
 
 impl VideoPipelineInner {
@@ -87,22 +128,22 @@ impl VideoPipelineInner {
 		// Convert bitrate to kbit/sec for nvh264enc
 		let bitrate_kbit = self.bitrate / 1000;
 
-		let (encoder, parser, caps_filter) = match self.video_format {
-			0 => ("nvh264enc", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high"),
-			1 => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream"),
-			2 => ("nvav1enc", "av1parse", "video/x-av1,profile=main"),
-			_ => {
-				tracing::error!("Unsupported video format: {}", self.video_format);
-				return;
-			}
+		let (encoder, parser, caps_filter) = match (self.video_format, self.dynamic_range) {
+			(VideoFormat::H264, _) => ("nvh264enc", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high"),
+			(VideoFormat::Hevc, VideoDynamicRange::Sdr) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream"),
+			(VideoFormat::Hevc, VideoDynamicRange::Hdr) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-10"),
+			(VideoFormat::Av1, _) => ("nvav1enc", "av1parse", "video/x-av1,profile=main"),
 		};
+
+		let format = if self.dynamic_range == VideoDynamicRange::Hdr { "P010_10LE" } else { "NV12" };
 
 		// TODO: Make encoder configurable (nvh264enc, vaapih264enc, x264enc, etc.)
 		// For now, we target NVIDIA.
 		// We use `cudaupload` and `cudascale` to ensure the video frames stay in GPU memory.
+		// We use `cudaconvert` to ensure the video frames are in the correct format (NV12 or P010_10LE).
 		let pipeline_str = format!(
-			"pipewiresrc path={} ! cudaupload ! cudascale ! video/x-raw(memory:CUDAMemory),width={},height={} ! {} preset=p3 tune=ultra-low-latency rc-mode=cbr bitrate={} gop-size=-1 zerolatency=true bframes=0 ! {} ! {} ! appsink name=sink",
-			self.node_id, self.width, self.height, encoder, bitrate_kbit, parser, caps_filter
+			"pipewiresrc path={} ! cudaupload ! cudascale ! cudaconvert ! video/x-raw(memory:CUDAMemory),width={},height={},format={} ! {} preset=p3 tune=ultra-low-latency rc-mode=cbr bitrate={} gop-size=-1 zerolatency=true bframes=0 ! {} ! {} ! appsink name=sink",
+			self.node_id, self.width, self.height, format, encoder, bitrate_kbit, parser, caps_filter
 		);
 
 		tracing::debug!("Launching pipeline: {}", pipeline_str);

@@ -20,7 +20,6 @@ mod tls;
 const SERVERINFO_APP_VERSION: &str = "7.1.431.-1";
 const SERVERINFO_GFE_VERSION: &str = "3.23.0.74";
 
-// ServerCodecModeSupport values
 #[repr(u32)]
 #[allow(dead_code)]
 enum ServerCodecModeSupport {

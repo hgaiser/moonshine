@@ -10,7 +10,7 @@ use crate::{config::Config, session::manager::SessionShutdownReason, state::Stat
 
 mod packetizer;
 mod pipeline;
-use pipeline::VideoPipeline;
+use pipeline::{VideoPipeline, VideoFormat, VideoDynamicRange};
 
 #[derive(Debug)]
 enum VideoStreamCommand {
@@ -28,6 +28,7 @@ pub struct VideoStreamContext {
 	pub minimum_fec_packets: u32,
 	pub qos: bool,
 	pub video_format: u32,
+	pub dynamic_range: u32,
 }
 
 #[derive(Clone)]
@@ -195,7 +196,8 @@ impl VideoStreamInner {
 			self.context.packet_size,
 			self.context.minimum_fec_packets,
 			self.config.stream.video.fec_percentage,
-			self.context.video_format,
+			VideoFormat::try_from(self.context.video_format).map_err(|_| tracing::error!("Invalid video format"))?,
+			VideoDynamicRange::try_from(self.context.dynamic_range).map_err(|_| tracing::error!("Invalid dynamic range"))?,
 			packet_tx,
 			idr_frame_request_rx,
 			stop_session_manager.clone(),
