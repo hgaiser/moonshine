@@ -84,20 +84,24 @@ impl Packetizer {
 		// Random padding, because we need it.
 		const PADDING: u32 = 0;
 
+		let requested_shard_payload_size = requested_packet_size - std::mem::size_of::<NvVideoPacket>();
+		const VIDEO_FRAME_HEADER_SIZE: usize = 8;
+		let packet_data_len = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
+		let last_shard_size = packet_data_len % requested_shard_payload_size;
+		let last_shard_size = if last_shard_size == 0 { requested_shard_payload_size } else { last_shard_size };
+
 		// TODO: Figure out what this header means?
 		let video_frame_header = VideoFrameHeader {
 			header_type: 0x01, // Always 0x01 for short headers. What is this exactly?
 			padding1: 0,
 			frame_type: if is_key_frame { 2 } else { 1 },
-			padding2: 0,
+			padding2: last_shard_size as u32,
 		};
 
 		// Prefix the frame with a VideoFrameHeader.
-		let mut buffer = Vec::with_capacity(std::mem::size_of::<VideoFrameHeader>());
+		let mut buffer = Vec::with_capacity(VIDEO_FRAME_HEADER_SIZE);
 		video_frame_header.serialize(&mut buffer);
 		let packet_data = [&buffer, encoded_data].concat();
-
-		let requested_shard_payload_size = requested_packet_size - std::mem::size_of::<NvVideoPacket>();
 
 		// The total size of a shard.
 		let requested_shard_size =

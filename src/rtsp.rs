@@ -98,6 +98,7 @@ impl RtspServer {
 		result.push_str(&format!("a=x-ss-general.featureFlags:{}\n", self.capabilities()));
 		result.push_str(&format!("a=x-ss-general.encryptionSupported:{}\n", self.encryption_flags_supported()));
 		result.push_str("sprop-parameter-sets=AAAAAU\n");
+		result.push_str("a=rtpmap:98 AV1/90000\n");
 		result.push_str("a=fmtp:96 packetization-mode=1");
 
 		result

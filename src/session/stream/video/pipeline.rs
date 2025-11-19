@@ -88,8 +88,9 @@ impl VideoPipelineInner {
 		let bitrate_kbit = self.bitrate / 1000;
 
 		let (encoder, parser, caps_filter) = match self.video_format {
-			0 => ("nvh264enc", "h264parse", "video/x-h264,stream-format=byte-stream,profile=high"),
-			1 => ("nvh265enc", "h265parse", "video/x-h265,stream-format=byte-stream"),
+			0 => ("nvh264enc", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high"),
+			1 => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream"),
+			2 => ("nvav1enc", "av1parse", "video/x-av1,profile=main"),
 			_ => {
 				tracing::error!("Unsupported video format: {}", self.video_format);
 				return;
@@ -100,7 +101,7 @@ impl VideoPipelineInner {
 		// For now, we target NVIDIA.
 		// We use `cudaupload` and `cudascale` to ensure the video frames stay in GPU memory.
 		let pipeline_str = format!(
-			"pipewiresrc path={} ! cudaupload ! cudascale ! video/x-raw(memory:CUDAMemory),width={},height={} ! {} preset=p3 tune=ultra-low-latency rc-mode=cbr bitrate={} gop-size=-1 zerolatency=true bframes=0 ! {} config-interval=-1 ! {} ! appsink name=sink",
+			"pipewiresrc path={} ! cudaupload ! cudascale ! video/x-raw(memory:CUDAMemory),width={},height={} ! {} preset=p3 tune=ultra-low-latency rc-mode=cbr bitrate={} gop-size=-1 zerolatency=true bframes=0 ! {} ! {} ! appsink name=sink",
 			self.node_id, self.width, self.height, encoder, bitrate_kbit, parser, caps_filter
 		);
 

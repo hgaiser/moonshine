@@ -20,6 +20,22 @@ mod tls;
 const SERVERINFO_APP_VERSION: &str = "7.1.431.-1";
 const SERVERINFO_GFE_VERSION: &str = "3.23.0.74";
 
+// ServerCodecModeSupport values
+#[repr(u32)]
+#[allow(dead_code)]
+enum ServerCodecModeSupport {
+	H264 = 0x00000001,
+	Hevc = 0x00000100,
+	HevcMain10 = 0x00000200,
+	Av1Main8 = 0x00010000, // Sunshine extension
+	Av1Main10 = 0x00020000, // Sunshine extension
+	H264High8444 = 0x00040000, // Sunshine extension
+	HevcRext8444 = 0x00080000, // Sunshine extension
+	HevcRext10444 = 0x00100000, // Sunshine extension
+	Av1High8444 = 0x00200000, // Sunshine extension
+	Av1High10444 = 0x00400000, // Sunshine extension
+}
+
 #[derive(Clone)]
 pub struct Webserver {
 	config: Config,
@@ -346,7 +362,13 @@ impl Webserver {
 		response += &format!("<mac>{}</mac>", mac_address.unwrap_or("".to_string()));
 		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
 		response += "<LocalIP></LocalIP>";
-		response += "<ServerCodecModeSupport>259</ServerCodecModeSupport>";
+		let server_codec_mode_support =
+			(ServerCodecModeSupport::H264 as u32) |
+			(ServerCodecModeSupport::Hevc as u32) |
+			(ServerCodecModeSupport::HevcMain10 as u32) |
+			(ServerCodecModeSupport::Av1Main8 as u32) |
+			(ServerCodecModeSupport::Av1Main10 as u32);
+		response += &format!("<ServerCodecModeSupport>{}</ServerCodecModeSupport>", server_codec_mode_support);
 		response += "<SupportedDisplayMode></SupportedDisplayMode>";
 		response += &format!("<PairStatus>{paired}</PairStatus>");
 		response += &format!("<currentgame>{}</currentgame>", session_context.clone().map(|s| s.application_id).unwrap_or(0));
