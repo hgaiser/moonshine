@@ -23,7 +23,22 @@ jobs:
 
     - name: Install dependencies
       run: |
-        sudo pacman -Syyuu --noconfirm --needed clang cmake rust avahi cuda ffmpeg gcc-libs glibc libc++ libevdev libpulse jq nvidia-utils openssl opus
+        sudo pacman -Syyuu --noconfirm --needed \
+          avahi \
+          clang \
+          cmake \
+          gcc-libs \
+          glib2 \
+          glibc \
+          gstreamer \
+          gst-plugins-base-libs \
+          jq \
+          libc++ \
+          libevdev \
+          libpulse \
+          openssl \
+          opus \
+          rust
 
     - name: Build
       run: |
