@@ -34,7 +34,7 @@ impl VideoPipeline {
 			node_id,
 			width,
 			height,
-			_framerate: framerate,
+			framerate,
 			bitrate,
 			packet_size,
 			minimum_fec_packets,
@@ -63,7 +63,7 @@ struct VideoPipelineInner {
 	node_id: u32,
 	width: u32,
 	height: u32,
-	_framerate: u32,
+	framerate: u32,
 	bitrate: usize,
 	packet_size: usize,
 	minimum_fec_packets: u32,
@@ -117,8 +117,8 @@ impl VideoPipelineInner {
 		// We use `cudaupload` and `cudascale` to ensure the video frames stay in GPU memory.
 		// We use `cudaconvert` to ensure the video frames are in the correct format (NV12 or P010_10LE).
 		let pipeline_str = format!(
-			"pipewiresrc path={} ! cudaupload ! cudascale ! cudaconvert ! video/x-raw(memory:CUDAMemory),width={},height={},format={} ! {} preset=p3 tune=ultra-low-latency rc-mode=cbr bitrate={} gop-size=-1 zerolatency=true bframes=0 ! {} ! {} ! appsink name=sink",
-			self.node_id, self.width, self.height, format, encoder, bitrate_kbit, parser, caps_filter
+			"pipewiresrc path={} ! videorate ! video/x-raw,framerate={}/1 ! cudaupload ! cudascale ! cudaconvert ! video/x-raw(memory:CUDAMemory),width={},height={},format={} ! {} preset=p3 tune=ultra-low-latency rc-mode=cbr bitrate={} gop-size=-1 zerolatency=true bframes=0 ! {} ! {} ! appsink name=sink",
+			self.node_id, self.framerate, self.width, self.height, format, encoder, bitrate_kbit, parser, caps_filter
 		);
 
 		tracing::debug!("Launching pipeline: {}", pipeline_str);
