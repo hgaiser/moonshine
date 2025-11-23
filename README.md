@@ -6,10 +6,9 @@ This means you can play games on the client device, while rendering takes place 
 
 ## Requirements and limitations
 
-1. **NVIDIA GPU**. Moonshine uses NvFBC to capture the desktop and NVENC for video encoding, both are NVIDIA specific libraries and require an NVIDIA GPU. The goal is to support more hardware in the future, while maintaining a single and therefore simple pipeline. See the todo's at the bottom for more information.
+1. **NVIDIA GPU**. Moonshine uses `xdg-desktop-portal` to capture the desktop and `GStreamer` for video encoding. Currently this pipeline assumes an NVIDIA GPU is present. The goal is to support more hardware in the future, while maintaining a single and therefore simple pipeline. See the todo's at the bottom for more information.
 1. **(Arch) Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux. Windows is currently not supported. It should be relatively simple to add Windows compatibility, but at least the input (mouse / keyboard / gamepad) and audio won't work since these use Linux specific libraries. Perhaps in the future, more OS's will be supported (contributions are welcome). For now the focus is on Arch Linux.
-1. **Steam Deck / PS4 / PS5 controller**. Similarly, this project is only tested on the mentioned controllers. Your mileage may vary with other controllers.
-1. **Moonlight v5.0.0 or higher**. Older versions are untested and might not work.
+1. **Moonlight v6.0.0 or higher**. Older versions are untested and might not work.
 
 ## Installation
 
@@ -38,12 +37,13 @@ The following dependencies are required:
 
 ```
 avahi
-cuda
-ffmpeg
 gcc-libs
+glib2
 glibc
+gstreamer
+gst-plugins-base-libs
+libevdev
 libpulse
-nvidia-utils
 openssl
 opus
 ```
@@ -52,15 +52,16 @@ On systems with `pacman` these can be installed with the following command:
 
 ```sh
 $ sudo pacman -S \
-    avahi \
-    cuda \
-    ffmpeg \
-    gcc-libs \
-    glibc \
-    libpulse \
-    nvidia-utils \
-    openssl \
-    opus
+   avahi \
+   gcc-libs \
+   glib2 \
+   glibc \
+   gstreamer \
+   gst-plugins-base-libs \
+   libevdev \
+   libpulse \
+   openssl \
+   opus
 ```
 
 Then compile and run:
@@ -74,19 +75,6 @@ $ cargo run --release -- /path/to/config.toml
 A configuration file is generated if the provided path does not exist.
 By default it will be created in `$XDG_CONFIG_HOME/moonshine/config.toml` if you are using the AUR package.
 It is possible to add applications that you want to run (more on that below).
-
-There is also a [resolution](./scripts/resolution) script provided which automatically changes the resolution to the requested resolution.
-Note that this file should be modified to refer to the correct display and standard resolution.
-
-The default configuration assumes this `resolution` script is placed in `$HOME/.local/bin`.
-If you want to use this functionality, you should copy this script in that location:
-
-```sh
-$ mkdir ~/.local/bin
-$ curl -Lo ~/.local/bin/resolution https://github.com/hgaiser/moonshine/raw/main/scripts/resolution
-```
-
-And modify the values to match your setup.
 
 ### Client pairing
 
@@ -133,6 +121,8 @@ The following values are replaced in the commands, before they are executed:
 1. `{height}` is replaced with the requested stream height in pixels.
 1. Any environment variables, such as `$HOME`.
 
+Note: width and height was previously used to change the resolution when starting to stream, but this is removed since it did not work in Wayland. The script might be reintroduced in the future, but the width and height variables are still available if you want to use them.
+
 By combining the `run_before` and `run_after` configuration fields, we can change resolution and launch a game when the application starts and reset to the default resolution when the application ends.
 
 A simple example is given below:
@@ -141,17 +131,12 @@ A simple example is given below:
 [[application]]
 title = "Steam"
 run_before = [
-	["$HOME/.local/bin/resolution", "{width}", "{height}"],
 	["/usr/bin/steam", "steam://open/bigpicture"],
 ]
 run_after = [["$HOME/.local/bin/resolution"]]
 ```
 
-This will first call the [`scripts/resolution`](./scripts/resolution) script in `$HOME/.local/bin/resolution` with the requested width and height as arguments.
-This will cause the resolution to be changed to the resolution requested by the client.
-The next command will open Steam in big picture mode.
-
-When the stream has ended, the resolution is returned to the standard resolution by calling the `resolution` script without any arguments.
+This will open Steam in big picture mode.
 
 ### Application scanners
 
@@ -170,12 +155,8 @@ The following application scanner will first change resolution, then open steam,
 type = "steam"
 library = "$HOME/.local/share/Steam"
 run_before = [
-	["$HOME/.local/bin/resolution", "{width}", "{height}"],
 	["/usr/bin/steam", "steam://open/bigpicture"],
 	["/usr/bin/steam", "steam://rungameid/{game_id}"],
-]
-run_after = [
-	["$HOME/.local/bin/resolution"],
 ]
 ```
 
@@ -195,18 +176,19 @@ run_after = [
 
 This wouldn't have been possible without the incredible work by the people behind both [Moonlight](https://moonlight-stream.org/) and [Sunshine](https://github.com/LizardByte/Sunshine).
 
+A special shoutout to @ABeltramo for implementing [`inputtino`](https://github.com/games-on-whales/inputtino) and helping with the controller input implementation!
+
 ## TODO's
 
 Below are improvements intended for Moonshine.
-If you are interesting in contributing, feel free to create an issue or send a message on the [Moonlight Discord](https://discord.com/invite/moonlight-stream-352065098472488960) server.
+If you are interested in contributing, feel free to create an issue or send a message on the [Moonlight Discord](https://discord.com/invite/moonlight-stream-352065098472488960) server.
 
-1. [ ] Add support for streaming (the same stream) to multiple clients simultaneously.
 1. [x] Investigate replacing input handling with [inputtino](https://github.com/games-on-whales/inputtino) for better support.
 1. [ ] Replace openssl with [rustls](https://crates.io/crates/rustls).
-1. [ ] Investigate replacing ffmpeg with gstreamer as it seems to have better Rust support.
-1. [ ] Replace NvFBC with DRM-KMS for hardware agnostic frame capture (however at the time of writing it seems NVIDIA cards do not support this through their proprietary NVIDIA driver).
-1. [ ] Replace NVENC with [Vulkan Video Extensions](https://www.khronos.org/blog/khronos-finalizes-vulkan-video-extensions-for-accelerated-h.264-and-h.265-encode). This only really makes sense if NvFBC is replaced as well, otherwise there is still a vendor lock-in.
-1. [ ] AV1 support.
+1. [x] Investigate replacing ffmpeg with gstreamer as it seems to have better Rust support.
+1. [ ] Replace `xdg-desktop-portal` with some hardware agnostic frame capture (at the time of writing it seems this does not exist).
+1. [ ] Replace NVENC with [Vulkan Video Extensions](https://www.khronos.org/blog/khronos-finalizes-vulkan-video-extensions-for-accelerated-h.264-and-h.265-encode).
+1. [x] AV1 support.
 1. [ ] HDR support.
 1. [ ] 5.1 / 7.1 audio support.
 1. [x] Gyro support for controllers that support it.
