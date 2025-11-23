@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Support for AV1 encoding.
+- Support for 10 bit SDR (HDR untested).
+- Support for YUV444.
+
+### Changed
+
+- Switched to `xdg-desktop-portal` for screen capturing.
+- Switched to `gstreamer` for video encoding.
+
 ## [v0.6.0] - 2025-11-18
 
 ### Added
