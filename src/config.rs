@@ -49,60 +49,22 @@ impl Default for Config {
 			stream: Default::default(),
 			applications: vec![
 				ApplicationConfig {
-					title: "Desktop".to_string(),
-					run_before: Some(vec![
-						vec![
-							"$HOME/.local/bin/resolution".to_string(),
-							"{width}".to_string(),
-							"{height}".to_string(),
-						],
-					]),
-					run_after: Some(vec![
-						vec!["$HOME/.local/bin/resolution".to_string()],
-					]),
-					boxart: None,
-				},
-
-				ApplicationConfig {
 					title: "Steam".to_string(),
-					run_before: Some(vec![
-						vec![
-							"$HOME/.local/bin/resolution".to_string(),
-							"{width}".to_string(),
-							"{height}".to_string(),
-						],
-						vec![
-							"/usr/bin/steam".to_string(),
-							"steam://open/bigpicture".to_string(),
-						],
-					]),
-					run_after: Some(vec![
-						vec!["$HOME/.local/bin/resolution".to_string()],
-					]),
+					command: vec![
+						"/usr/bin/steam".to_string(),
+						"steam://open/bigpicture".to_string(),
+					],
 					boxart: None,
+					enable_steam_integration: true,
 				},
 			],
 			application_scanners: vec![
 				ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
 					library: "$HOME/.local/share/Steam".into(),
-					run_before: Some(vec![
-						vec![
-							"$HOME/.local/bin/resolution".to_string(),
-							"{width}".to_string(),
-							"{height}".to_string(),
-						],
-						vec![
-							"/usr/bin/steam".to_string(),
-							"steam://open/bigpicture".to_string(),
-						],
-						vec![
-							"/usr/bin/steam".to_string(),
-							"steam://rungameid/{game_id}".to_string(),
-						],
-					]),
-					run_after: Some(vec![
-						vec!["$HOME/.local/bin/resolution".to_string()],
-					]),
+					command: vec![
+						"/usr/bin/steam".to_string(),
+						"steam://rungameid/{game_id}".to_string(),
+					],
 				}),
 			],
 			stream_timeout: 60,
@@ -144,15 +106,12 @@ pub struct ApplicationConfig {
 	/// Path to a boxart image.
 	pub boxart: Option<PathBuf>,
 
-	/// If provided, run this command before starting this application.
-	///
-	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
-	pub run_before: Option<Vec<Vec<String>>>,
+	/// The command to run.
+	pub command: Vec<String>,
 
-	/// If provided, run this command after stopping this application.
-	///
-	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
-	pub run_after: Option<Vec<Vec<String>>>,
+	/// Enable Steam integration.
+	#[serde(default)]
+	pub enable_steam_integration: bool,
 }
 
 impl ApplicationConfig {
@@ -176,16 +135,8 @@ pub struct SteamApplicationScannerConfig {
 	/// Path to a Steam library (ie. `~/.local/share/Steam`).
 	pub library: PathBuf,
 
-	/// If provided, run this command before starting an application.
-	///
-	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
-	pub run_before: Option<Vec<Vec<String>>>,
-
-	/// If provided, run this command after stopping an application.
-	///
-	/// Note that multiple entries can be provided, in which case they will be executed in that same order.
-	pub run_after: Option<Vec<Vec<String>>>,
-
+	/// The command to run.
+	pub command: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -219,12 +170,6 @@ pub struct VideoStreamConfig {
 	/// Port to use for streaming video data.
 	pub port: u16,
 
-	/// Type of codec to use for h264.
-	pub codec_h264: String,
-
-	/// Type of codec to use for h264.
-	pub codec_hevc: String,
-
 	/// What percentage of data packets should be parity packets.
 	pub fec_percentage: u8,
 }
@@ -233,8 +178,6 @@ impl Default for VideoStreamConfig {
 	fn default() -> Self {
 		Self {
 			port: 47998,
-			codec_h264: "h264_nvenc".to_string(),
-			codec_hevc: "hevc_nvenc".to_string(),
 			fec_percentage: 20,
 		}
 	}

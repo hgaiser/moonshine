@@ -21,7 +21,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 
 	let mut applications = Vec::new();
 	for line in library.lines().skip(2) {
-		let mut application = ApplicationConfig::default();
+		let mut application = ApplicationConfig { enable_steam_integration: true, ..Default::default() };
 
 		if line.trim().is_empty() {
 			continue;
@@ -55,35 +55,11 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 			continue;
 		}
 
-		if let Some(run_before) = &config.run_before {
-			application.run_before = Some(
-				run_before
-					.clone()
-					.iter_mut()
-					.map(|c| {
-						c
-							.iter_mut()
-							.map(|a| a.replace("{game_id}", &game_id.to_string()))
-							.collect()
-					})
-					.collect()
-			);
-		}
-
-		if let Some(run_after) = &config.run_after {
-			application.run_after = Some(
-				run_after
-					.clone()
-					.iter_mut()
-					.map(|c| {
-						c
-							.iter_mut()
-							.map(|a| a.replace("{game_id}", &game_id.to_string()))
-							.collect()
-					})
-					.collect()
-			);
-		}
+		application.command = config.command
+			.clone()
+			.iter()
+			.map(|a| a.replace("{game_id}", &game_id.to_string()))
+			.collect();
 
 		let game_dir = config.library.join(format!("appcache/librarycache/{game_id}/"));
 		if let Some(boxart) = search_file(&game_dir, "library_600x900.jpg") {

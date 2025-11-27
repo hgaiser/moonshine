@@ -117,11 +117,11 @@ impl VideoPipelineInner {
 		// We use `cudaupload` and `cudascale` to ensure the video frames stay in GPU memory.
 		// We use `cudaconvert` to ensure the video frames are in the correct format (NV12 or P010_10LE).
 		let pipeline_str = format!(
-			"pipewiresrc path={} ! videorate ! video/x-raw,framerate={}/1 ! cudaupload ! cudascale ! cudaconvert ! video/x-raw(memory:CUDAMemory),width={},height={},format={} ! {} preset=p3 tune=ultra-low-latency rc-mode=cbr bitrate={} gop-size=-1 zerolatency=true bframes=0 ! {} ! {} ! appsink name=sink",
+			"pipewiresrc path={} ! videorate ! video/x-raw,framerate={}/1,format=BGRx ! cudaupload ! cudascale ! cudaconvert ! video/x-raw(memory:CUDAMemory),width={},height={},format={} ! {} preset=p3 tune=ultra-low-latency rc-mode=cbr bitrate={} gop-size=-1 zerolatency=true bframes=0 ! {} ! {} ! appsink name=sink",
 			self.node_id, self.framerate, self.width, self.height, format, encoder, bitrate_kbit, parser, caps_filter
 		);
 
-		tracing::debug!("Launching pipeline: {}", pipeline_str);
+		tracing::debug!("Launching GStreamer pipeline: {}", pipeline_str);
 
 		let pipeline = match gst::parse::launch(&pipeline_str) {
 			Ok(pipeline) => pipeline,

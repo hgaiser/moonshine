@@ -568,6 +568,11 @@ impl Webserver {
 			}
 		};
 
+		let host_audio = match params.remove("localAudioPlayMode") {
+			Some(host_audio) => host_audio == "1",
+			None => false,
+		};
+
 		let application = match self.config.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
 			None => {
@@ -585,7 +590,8 @@ impl Webserver {
 			keys: SessionKeys {
 				remote_input_key,
 				remote_input_key_id,
-			}
+			},
+			host_audio,
 		}).await;
 
 		if initialize_result.is_err() {

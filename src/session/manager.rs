@@ -1,7 +1,7 @@
 use async_shutdown::{ShutdownManager, TriggerShutdownToken};
 use tokio::sync::{mpsc, oneshot};
 
-use crate::{config::Config, state::State};
+use crate::config::Config;
 
 use super::{Session, stream::{AudioStreamContext, VideoStreamContext}, SessionContext, SessionKeys};
 
@@ -52,10 +52,10 @@ struct SessionManagerInner { }
 
 impl SessionManager {
 	#[allow(clippy::result_unit_err)]
-	pub fn new(config: Config, state: State, shutdown_token: TriggerShutdownToken<i32>) -> Result<Self, ()> {
+	pub fn new(config: Config, shutdown_token: TriggerShutdownToken<i32>) -> Result<Self, ()> {
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner: SessionManagerInner = Default::default();
-		tokio::spawn(async move { inner.run(config, state, command_rx).await; drop(shutdown_token); });
+		tokio::spawn(async move { inner.run(config, command_rx).await; drop(shutdown_token); });
 		Ok(Self { command_tx })
 	}
 
@@ -112,7 +112,6 @@ impl SessionManagerInner {
 	async fn run(
 		self,
 		config: Config,
-		state: State,
 		mut command_rx: mpsc::Receiver<SessionManagerCommand>,
 	) {
 		// The active session, or None if there is no active session.
@@ -160,7 +159,7 @@ impl SessionManagerInner {
 						continue;
 					}
 
-					active_session = match Session::new(config.clone(), state.clone(), session_context, stop_session_manager.clone()) {
+					active_session = match Session::new(config.clone(), session_context, stop_session_manager.clone()) {
 						Ok(session) => Some(session),
 						Err(()) => continue,
 					};
@@ -193,14 +192,13 @@ impl SessionManagerInner {
 					if active_session.is_some() {
 						let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::UserStopped);
 
-						// What to do in case of a timeout here?
 						if tokio::time::timeout(
 							std::time::Duration::from_secs(10),
 							stop_session_manager.wait_shutdown_complete()
 						).await.is_err() {
 							let _ = result_tx.send(());
 							tracing::error!("Timeout while waiting for session to stop.");
-							break;
+							continue;
 						}
 
 						stop_session_manager = ShutdownManager::new();

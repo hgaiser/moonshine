@@ -12,6 +12,7 @@ mod encoder;
 pub struct AudioStreamContext {
 	pub _packet_duration: u32,
 	pub qos: bool,
+	pub sink_name: Option<String>,
 }
 
 enum AudioStreamCommand {
@@ -49,7 +50,7 @@ impl AudioStream {
 		);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = AudioStreamInner { capture: None, encoder: None };
+		let inner = AudioStreamInner { capture: None, encoder: None, sink_name: context.sink_name };
 		tokio::spawn(inner.run(
 			socket,
 			command_rx,
@@ -77,6 +78,7 @@ impl AudioStream {
 struct AudioStreamInner {
 	capture: Option<AudioCapture>,
 	encoder: Option<AudioEncoder>,
+	sink_name: Option<String>,
 }
 
 unsafe impl Send for AudioStreamInner { }
@@ -105,7 +107,7 @@ impl AudioStreamInner {
 					}
 
 					let (audio_tx, audio_rx) = mpsc::channel(10);
-					let capture = match AudioCapture::new(audio_tx, stop_session_manager.clone()).await {
+					let capture = match AudioCapture::new(audio_tx, stop_session_manager.clone(), self.sink_name.clone()).await {
 						Ok(capture) => capture,
 						Err(()) => break,
 					};

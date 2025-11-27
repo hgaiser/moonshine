@@ -100,6 +100,7 @@ impl AudioCapture {
 	pub async fn new(
 		audio_tx: Sender<Vec<f32>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		sink_name: Option<String>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Starting audio capturer.");
 
@@ -108,13 +109,18 @@ impl AudioCapture {
 		let sample_rate = 48000u32;
 		let sample_time_ms = 5;
 
-		let default_sink_name = match get_default_sink_name() {
-			Ok(name) => name,
-			Err(()) => {
-				return Err(());
+		let monitor_name = match sink_name {
+			Some(name) => format!("{name}.monitor"),
+			None => {
+				let default_sink_name = match get_default_sink_name() {
+					Ok(name) => name,
+					Err(()) => {
+						return Err(());
+					}
+				};
+				format!("{default_sink_name}.monitor")
 			}
 		};
-		let monitor_name = format!("{default_sink_name}.monitor");
 
 		let sample_spec = Spec {
 			format: pulse::sample::Format::F32le,

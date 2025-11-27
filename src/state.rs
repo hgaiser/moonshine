@@ -5,8 +5,6 @@ use tokio::sync::{mpsc, oneshot};
 
 enum StateCommand {
 	GetUuid(oneshot::Sender<String>),
-	GetScreencastToken(oneshot::Sender<Option<String>>),
-	SetScreencastToken(String),
 	Save(PathBuf, oneshot::Sender<Result<(), ()>>),
 	HasClient(String, oneshot::Sender<bool>),
 	AddClient(String),
@@ -58,19 +56,6 @@ impl State {
 		uuid_rx.await.map_err(|e| tracing::error!("Failed to receive GetUuid response: {e}"))
 	}
 
-	pub async fn get_screencast_token(&self) -> Result<Option<String>, ()> {
-		let (token_tx, token_rx) = oneshot::channel();
-		self.command_tx.send(StateCommand::GetScreencastToken(token_tx)).await
-			.map_err(|e| tracing::error!("Failed to send GetScreencastToken command: {e}"))?;
-		token_rx.await.map_err(|e| tracing::error!("Failed to receive GetScreencastToken response: {e}"))
-	}
-
-	pub async fn set_screencast_token(&self, token: String) -> Result<(), ()> {
-		self.command_tx.send(StateCommand::SetScreencastToken(token)).await
-			.map_err(|e| tracing::error!("Failed to send SetScreencastToken command: {e}"))?;
-		self.save().await
-	}
-
 	pub async fn save(&self) -> Result<(), ()> {
 		let (result_tx, result_rx) = oneshot::channel();
 		self.command_tx.send(StateCommand::Save(self.path.clone(), result_tx)).await
@@ -109,13 +94,12 @@ impl State {
 #[derive(Debug, Serialize, Deserialize)]
 struct StateInner {
 	unique_id: String,
-	screencast_token: Option<String>,
 	clients: Vec<String>,
 }
 
 impl StateInner {
 	fn new() -> Self {
-		Self { unique_id: uuid::Uuid::new_v4().to_string(), screencast_token: None, clients: Default::default() }
+		Self { unique_id: uuid::Uuid::new_v4().to_string(), clients: Default::default() }
 	}
 
 	async fn run(mut self, mut command_rx: mpsc::Receiver<StateCommand>) {
@@ -125,16 +109,6 @@ impl StateInner {
 					if uuid_tx.send(self.unique_id.clone()).is_err() {
 						tracing::error!("Failed to send GetUuid result.");
 					}
-				},
-
-				StateCommand::GetScreencastToken(token_tx) => {
-					if token_tx.send(self.screencast_token.clone()).is_err() {
-						tracing::error!("Failed to send GetScreencastToken result.");
-					}
-				},
-
-				StateCommand::SetScreencastToken(token) => {
-					self.screencast_token = Some(token);
 				},
 
 				StateCommand::Save(file, result_tx) => {

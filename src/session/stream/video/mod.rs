@@ -1,12 +1,7 @@
-use ashpd::desktop::{
-	screencast::{CursorMode, Screencast, SourceType},
-	PersistMode,
-	Session,
-};
 use async_shutdown::ShutdownManager;
 use tokio::{net::UdpSocket, sync::{broadcast, mpsc}};
 
-use crate::{config::Config, session::manager::SessionShutdownReason, state::State};
+use crate::{config::Config, session::manager::SessionShutdownReason};
 
 mod packetizer;
 mod pipeline;
@@ -99,7 +94,6 @@ pub struct VideoStream {
 impl VideoStream {
 	pub async fn new(
 		config: Config,
-		state: State,
 		context: VideoStreamContext,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
@@ -123,7 +117,7 @@ impl VideoStream {
 		);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = VideoStreamInner { context, config, state, pipeline: None, screencast: None, session: None };
+		let inner = VideoStreamInner { context, config, pipeline: None };
 		tokio::spawn(inner.run(
 			socket,
 			command_rx,
@@ -149,10 +143,7 @@ impl VideoStream {
 struct VideoStreamInner {
 	context: VideoStreamContext,
 	config: Config,
-	state: State,
 	pipeline: Option<VideoPipeline>,
-	screencast: Option<Screencast<'static>>,
-	session: Option<Session<'static, Screencast<'static>>>,
 }
 
 impl VideoStreamInner {
@@ -197,10 +188,6 @@ impl VideoStreamInner {
 		}
 
 		tracing::debug!("Video stream stopped.");
-
-		if let Some(session) = self.session {
-			let _ = session.close().await;
-		}
 	}
 
 	async fn start(
@@ -209,42 +196,7 @@ impl VideoStreamInner {
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
-		tracing::debug!("Creating Screencast proxy.");
-		let proxy = Screencast::new().await
-			.map_err(|e| tracing::error!("Failed to create Screencast proxy: {e}"))?;
-		tracing::debug!("Creating Screencast session.");
-		let session = proxy.create_session().await
-			.map_err(|e| tracing::error!("Failed to create Screencast session: {e}"))?;
-
-		let restore_token = self.state.get_screencast_token().await
-			.map_err(|_| tracing::error!("Failed to get screencast token."))?;
-
-		tracing::debug!("Selecting sources.");
-		proxy.select_sources(
-			&session,
-			CursorMode::Embedded,
-			SourceType::Monitor.into(),
-			false,
-			restore_token.as_deref(),
-			PersistMode::ExplicitlyRevoked,
-		).await
-			.map_err(|e| tracing::error!("Failed to select sources: {e}"))?;
-
-		tracing::debug!("Starting session (waiting for user input).");
-		let response = proxy.start(&session, None).await
-			.map_err(|e| tracing::error!("Failed to start session: {e}"))?
-			.response()
-			.map_err(|e| tracing::error!("Failed to get response: {e}"))?;
-		tracing::debug!("Session started.");
-
-		if let Some(token) = response.restore_token() {
-			self.state.set_screencast_token(token.to_string()).await
-				.map_err(|_| tracing::error!("Failed to save screencast token."))?;
-		}
-
-		let stream = response.streams().first()
-			.ok_or_else(|| tracing::error!("No streams selected"))?;
-		let node_id = stream.pipe_wire_node_id();
+		let node_id = find_gamescope_node_id().await?;
 
 		tracing::debug!("Creating pipeline with node_id: {}", node_id);
 		let pipeline = VideoPipeline::new(
@@ -265,11 +217,36 @@ impl VideoStreamInner {
 		)?;
 
 		self.pipeline = Some(pipeline);
-		self.screencast = Some(proxy);
-		self.session = Some(session);
 
 		Ok(())
 	}
+}
+
+async fn find_gamescope_node_id() -> Result<u32, ()> {
+	for _ in 0..10 {
+		if let Ok(id) = find_node_id_by_name("gamescope") {
+			return Ok(id);
+		}
+		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+	}
+	tracing::error!("Failed to find gamescope node ID.");
+	Err(())
+}
+
+fn find_node_id_by_name(name: &str) -> Result<u32, ()> {
+	let output = std::process::Command::new("sh")
+		.arg("-c")
+		.arg(format!("pw-dump | jq '.[] | select(.info.props[\"node.name\"] == \"{}\") | select(.info.props[\"media.class\"] | test(\"Video/.*\")) | .id'", name))
+		.output()
+		.map_err(|e| tracing::error!("Failed to run pw-dump: {e}"))?;
+
+	if !output.status.success() {
+		return Err(());
+	}
+
+	let output_str = String::from_utf8_lossy(&output.stdout);
+	let id: u32 = output_str.trim().parse().map_err(|_| ())?;
+	Ok(id)
 }
 
 async fn handle_video_packets(

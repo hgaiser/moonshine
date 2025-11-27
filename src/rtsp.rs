@@ -317,6 +317,7 @@ impl RtspServer {
 		let audio_stream_context = AudioStreamContext {
 			_packet_duration: packet_duration,
 			qos: audio_qos_type != "0",
+			sink_name: None,
 		};
 
 		if self.session_manager.set_stream_context(video_stream_context, audio_stream_context).await.is_err() {
