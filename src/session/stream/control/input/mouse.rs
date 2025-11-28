@@ -1,4 +1,4 @@
-use inputtino::DeviceDefinition;
+use reis::ei::button::ButtonState;
 use strum_macros::FromRepr;
 
 #[derive(Debug)]
@@ -76,14 +76,14 @@ impl MouseButton {
 	}
 }
 
-impl From<MouseButton> for inputtino::MouseButton {
+impl From<MouseButton> for u32 {
 	fn from(val: MouseButton) -> Self {
 		match val {
-			MouseButton::Left => inputtino::MouseButton::LEFT,
-			MouseButton::Middle => inputtino::MouseButton::MIDDLE,
-			MouseButton::Right => inputtino::MouseButton::RIGHT,
-			MouseButton::Side => inputtino::MouseButton::SIDE,
-			MouseButton::Extra => inputtino::MouseButton::EXTRA,
+			MouseButton::Left => 0x110,
+			MouseButton::Middle => 0x112,
+			MouseButton::Right => 0x111,
+			MouseButton::Side => 0x113,
+			MouseButton::Extra => 0x114,
 		}
 	}
 }
@@ -125,46 +125,98 @@ impl MouseScrollHorizontal {
 }
 
 pub struct Mouse {
-	device: inputtino::Mouse,
+	device: Option<reis::ei::Device>,
+	pointer: Option<reis::ei::Pointer>,
+	pointer_absolute: Option<reis::ei::PointerAbsolute>,
+	button: Option<reis::ei::Button>,
+	scroll: Option<reis::ei::Scroll>,
 }
 
 impl Mouse {
 	pub fn new() -> Result<Self, ()> {
-		let definition = DeviceDefinition::new(
-			"Moonshine Mouse",
-			0xBEEF,
-			0xDEAD,
-			0x111,
-			"00:11:22:33:44",
-			"00:11:22:33:44",
-		);
-		let device = inputtino::Mouse::new(&definition)
-			.map_err(|e| tracing::error!("Failed to create virtual mouse: {e}"))?;
+		Ok(Self {
+			device: None,
+			pointer: None,
+			pointer_absolute: None,
+			button: None,
+			scroll: None,
+		})
+	}
 
-		Ok(Self { device })
+	pub fn set_device(&mut self, device: reis::ei::Device) {
+		self.device = Some(device);
+	}
+
+	pub fn set_pointer(&mut self, pointer: reis::ei::Pointer) {
+		self.pointer = Some(pointer);
+	}
+
+	pub fn set_pointer_absolute(&mut self, pointer_absolute: reis::ei::PointerAbsolute) {
+		self.pointer_absolute = Some(pointer_absolute);
+	}
+
+	pub fn set_button(&mut self, button: reis::ei::Button) {
+		self.button = Some(button);
+	}
+
+	pub fn set_scroll(&mut self, scroll: reis::ei::Scroll) {
+		self.scroll = Some(scroll);
 	}
 
 	pub fn move_relative(&mut self, x: i32, y: i32) {
-		self.device.move_rel(x, y);
+		if let Some(pointer) = &self.pointer {
+			pointer.motion_relative(x as f32, y as f32);
+		}
+		if let Some(device) = &self.device {
+			device.frame(0, 0);
+		}
 	}
 
-	pub fn move_absolute(&mut self, x: i32, y: i32, screen_width: i32, screen_height: i32) {
-		self.device.move_abs(x, y, screen_width, screen_height);
+	pub fn move_absolute(&mut self, x: i32, y: i32, _screen_width: i32, _screen_height: i32) {
+		if let Some(pointer_absolute) = &self.pointer_absolute {
+			// TODO: Map coordinates if needed, but libei expects absolute coordinates within the region.
+			// Assuming x, y are already correct for the region.
+			pointer_absolute.motion_absolute(x as f32, y as f32);
+		}
+		if let Some(device) = &self.device {
+			device.frame(0, 0);
+		}
 	}
 
 	pub fn button_down(&mut self, button: MouseButton) {
-		self.device.press_button(button.into());
+		if let Some(btn) = &self.button {
+			btn.button(button.into(), ButtonState::Press);
+		}
+		if let Some(device) = &self.device {
+			device.frame(0, 0);
+		}
 	}
 
 	pub fn button_up(&mut self, button: MouseButton) {
-		self.device.release_button(button.into());
+		if let Some(btn) = &self.button {
+			btn.button(button.into(), ButtonState::Released);
+		}
+		if let Some(device) = &self.device {
+			device.frame(0, 0);
+		}
 	}
 
 	pub fn scroll_vertical(&mut self, amount: i16) {
-		self.device.scroll_vertical(amount as i32);
+		if let Some(scroll) = &self.scroll {
+			scroll.scroll_discrete(0, -amount as i32);
+		}
+		if let Some(device) = &self.device {
+			device.frame(0, 0);
+		}
 	}
 
 	pub fn scroll_horizontal(&mut self, amount: i16) {
-		self.device.scroll_horizontal(amount as i32);
+		if let Some(scroll) = &self.scroll {
+			// let clicks = amount as f32 / 120.0;
+			scroll.scroll_discrete(amount as i32, 0);
+		}
+		if let Some(device) = &self.device {
+			device.frame(0, 0);
+		}
 	}
 }

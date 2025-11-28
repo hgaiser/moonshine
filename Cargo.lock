@@ -1978,6 +1978,7 @@ dependencies = [
  "clap",
  "dirs",
  "enet",
+ "futures",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-video",
@@ -1995,6 +1996,7 @@ dependencies = [
  "openssl",
  "opus",
  "reed-solomon-erasure",
+ "reis",
  "rtsp-types",
  "rusty_enet",
  "sdp-types",
@@ -2690,6 +2692,17 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "reis"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "827073dbe443c57fd72ae05491c6b94213218627ac6ac169850673b0cb7034f1"
+dependencies = [
+ "futures",
+ "rustix 0.38.44",
+ "tokio",
+]
 
 [[package]]
 name = "rgb"

@@ -14,14 +14,17 @@ use self::{
 		MouseScrollHorizontal,
 	},
 	keyboard::{Keyboard, Key},
-	gamepad::{GamepadBattery, GamepadInfo, GamepadMotion, GamepadTouch, GamepadUpdate}
+	gamepad::{GamepadBattery, GamepadInfo, GamepadMotion, GamepadTouch, GamepadUpdate},
+	reis::ReisClient,
 };
+use ::reis::event::{EiEvent, DeviceCapability};
 
 use super::FeedbackCommand;
 
 mod keyboard;
 mod mouse;
 mod gamepad;
+mod reis;
 
 #[derive(FromRepr)]
 #[repr(u32)]
@@ -98,12 +101,24 @@ pub struct InputHandler {
 
 impl InputHandler {
 	pub fn new(stop_session_manager: ShutdownManager<SessionShutdownReason>) -> Result<Self, ()> {
-		let mouse = Mouse::new()?;
-		let keyboard = Keyboard::new()?;
-
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = InputHandlerInner { mouse, keyboard };
-		tokio::spawn(inner.run(command_rx, stop_session_manager));
+
+		std::thread::spawn(move || {
+			let rt = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("Failed to create tokio runtime for input handler");
+
+			rt.block_on(async move {
+				let local = tokio::task::LocalSet::new();
+				local.run_until(async move {
+					let mouse = Mouse::new().expect("Failed to create mouse");
+					let keyboard = Keyboard::new().expect("Failed to create keyboard");
+					let inner = InputHandlerInner { mouse, keyboard };
+					inner.run(command_rx, stop_session_manager).await;
+				}).await;
+			});
+		});
 
 		Ok(Self { command_tx })
 	}
@@ -136,122 +151,236 @@ impl InputHandlerInner {
 
 		let mut gamepads: [Option<Gamepad>; 16] = Default::default();
 
-		while let Ok(Some((command, feedback_tx))) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
-			match command {
-				InputEvent::KeyDown(key) => {
-					tracing::trace!("Pressing key: {key:?}");
-					self.keyboard.key_down(key);
-				},
-				InputEvent::KeyUp(key) => {
-					tracing::trace!("Releasing key: {key:?}");
-					self.keyboard.key_up(key);
-				},
-				InputEvent::MouseMoveAbsolute(event) => {
-					tracing::trace!("Absolute mouse movement: {event:?}");
-					self.mouse.move_absolute(
-						event.x as i32,
-						event.y as i32,
-						event.screen_width as i32,
-						event.screen_height as i32,
-					);
-				},
-				InputEvent::MouseMoveRelative(event) => {
-					tracing::trace!("Moving mouse relative: {event:?}");
-					self.mouse.move_relative(event.x as i32, event.y as i32);
-				},
-				InputEvent::MouseButtonDown(button) => {
-					tracing::trace!("Pressing mouse button: {button:?}");
-					self.mouse.button_down(button);
-				},
-				InputEvent::MouseButtonUp(button) => {
-					tracing::trace!("Releasing mouse button: {button:?}");
-					self.mouse.button_up(button);
-				},
-				InputEvent::MouseScrollVertical(event) => {
-					tracing::trace!("Scrolling vertically: {event:?}");
-					self.mouse.scroll_vertical(event.amount);
-				},
-				InputEvent::MouseScrollHorizontal(event) => {
-					tracing::trace!("Scrolling horizontally: {event:?}");
-					self.mouse.scroll_horizontal(event.amount);
-				},
-				InputEvent::GamepadInfo(gamepad) => {
-					tracing::debug!("Gamepad info: {gamepad:?}");
-					if gamepad.index as usize >= gamepads.len() {
-						tracing::warn!("Received info for gamepad {}, but we only have {} slots.", gamepad.index, gamepads.len());
-						continue;
-					}
+		let mut reis_client = match ReisClient::new().await {
+			Ok(client) => Some(client),
+			Err(e) => {
+				tracing::debug!("Could not yet connect to libei: {e}");
+				None
+			}
+		};
 
-					if gamepads[gamepad.index as usize].is_none() {
-						if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
-							gamepads[gamepad.index as usize] = Some(new_gamepad);
-							tracing::info!("Gamepad {} connected.", gamepad.index);
-						}
-     				}
-				},
-				InputEvent::GamepadTouch(gamepad_touch) => {
-					tracing::trace!("Gamepad touch: {gamepad_touch:?}");
-					if gamepad_touch.index as usize >= gamepads.len() {
-						tracing::warn!("Received touch for gamepad {}, but we only have {} gamepads.", gamepad_touch.index, gamepads.len());
-						continue;
-					}
+		enum ReisWorkResult {
+			Event(Option<Result<EiEvent, ::reis::Error>>),
+			Connected(Box<ReisClient>),
+			ConnectError(std::io::Error),
+		}
 
-					match gamepads[gamepad_touch.index as usize].as_mut() {
-						Some(gamepad) => gamepad.touch(&gamepad_touch),
-						None => tracing::warn!("Received touch for gamepad {}, but no gamepad is connected.", gamepad_touch.index),
-					}
-				},
-				InputEvent::GamepadMotion(gamepad_motion) => {
-					tracing::trace!("Gamepad motion: {gamepad_motion:?}");
-					if gamepad_motion.index as usize >= gamepads.len() {
-						tracing::warn!("Received motion for gamepad {}, but we only have {} gamepads.", gamepad_motion.index, gamepads.len());
-						continue;
-					}
-
-					match gamepads[gamepad_motion.index as usize].as_mut() {
-						Some(gamepad) => gamepad.set_motion(&gamepad_motion),
-						None => tracing::warn!("Received motion for gamepad {}, but no gamepad is connected.", gamepad_motion.index),
-					}
-				},
-				InputEvent::GamepadBattery(gamepad_battery) => {
-					tracing::trace!("Gamepad battery: {gamepad_battery:?}");
-					if gamepad_battery.index as usize >= gamepads.len() {
-						tracing::warn!("Received battery for gamepad {}, but we only have {} gamepads.", gamepad_battery.index, gamepads.len());
-						continue;
-					}
-
-					match gamepads[gamepad_battery.index as usize].as_mut() {
-						Some(gamepad) => gamepad.set_battery(&gamepad_battery),
-						None => tracing::warn!("Received battery for gamepad {}, but no gamepad is connected.", gamepad_battery.index),
-					}
-				},
-				InputEvent::GamepadUpdate(gamepad_update) => {
-					tracing::trace!("Gamepad update: {gamepad_update:?}");
-					if gamepad_update.index as usize >= gamepads.len() {
-						tracing::warn!("Received update for gamepad {}, but we only have {} gamepads.", gamepad_update.index, gamepads.len());
-						continue;
-					}
-
-					match gamepads[gamepad_update.index as usize].as_mut() {
-						Some(gamepad) => gamepad.update(&gamepad_update),
-						None => tracing::warn!("Received update for gamepad {}, but no gamepad is connected.", gamepad_update.index),
-					}
-
-					// Disconnect gamepads that are no longer active.
-					for (i, gamepad) in gamepads.iter_mut().enumerate() {
-						if gamepad.is_some() && gamepad_update.active_gamepad_mask & (1 << i) == 0 {
-							tracing::info!("Gamepad {} disconnected.", i);
-							*gamepad = None;
+		loop {
+			tokio::select! {
+				res = async {
+					if let Some(client) = &mut reis_client {
+						let event = client.next_event().await;
+						ReisWorkResult::Event(event)
+					} else {
+						tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+						match ReisClient::new().await {
+							Ok(client) => ReisWorkResult::Connected(Box::new(client)),
+							Err(e) => ReisWorkResult::ConnectError(e),
 						}
 					}
-				},
-				InputEvent::GamepadEnableHaptics => {
-					tracing::debug!("Received request to enable haptics on gamepads.");
-					// We don't actually need to do anything.
-				},
+				} => {
+					match res {
+						ReisWorkResult::Event(Some(Ok(event))) => {
+							self.handle_reis_event(event);
+							if let Some(client) = &reis_client {
+								if let Err(e) = client.flush() {
+									tracing::error!("Failed to flush reis client: {e}");
+								}
+							}
+						}
+						ReisWorkResult::Event(Some(Err(e))) => {
+							tracing::error!("Reis error: {e}");
+							reis_client = None;
+						}
+						ReisWorkResult::Event(None) => {
+							tracing::debug!("Reis stream ended.");
+							reis_client = None;
+						}
+						ReisWorkResult::Connected(client) => {
+							tracing::info!("Connected to libei.");
+							reis_client = Some(*client);
+						}
+						ReisWorkResult::ConnectError(e) => {
+							tracing::debug!("Could not yet connect to libei: {e}");
+						}
+					}
+				}
+				cmd = stop_session_manager.wrap_cancel(command_rx.recv()) => {
+					match cmd {
+						Ok(Some((command, feedback_tx))) => {
+							match command {
+								InputEvent::KeyDown(key) => {
+									tracing::trace!("Pressing key: {key:?}");
+									self.keyboard.key_down(key);
+								},
+								InputEvent::KeyUp(key) => {
+									tracing::trace!("Releasing key: {key:?}");
+									self.keyboard.key_up(key);
+								},
+								InputEvent::MouseMoveAbsolute(event) => {
+									tracing::trace!("Absolute mouse movement: {event:?}");
+									self.mouse.move_absolute(
+										event.x as i32,
+										event.y as i32,
+										event.screen_width as i32,
+										event.screen_height as i32,
+									);
+								},
+								InputEvent::MouseMoveRelative(event) => {
+									tracing::trace!("Moving mouse relative: {event:?}");
+									self.mouse.move_relative(event.x as i32, event.y as i32);
+								},
+								InputEvent::MouseButtonDown(button) => {
+									tracing::trace!("Pressing mouse button: {button:?}");
+									self.mouse.button_down(button);
+								},
+								InputEvent::MouseButtonUp(button) => {
+									tracing::trace!("Releasing mouse button: {button:?}");
+									self.mouse.button_up(button);
+								},
+								InputEvent::MouseScrollVertical(event) => {
+									tracing::trace!("Scrolling vertically: {event:?}");
+									self.mouse.scroll_vertical(event.amount);
+								},
+								InputEvent::MouseScrollHorizontal(event) => {
+									tracing::trace!("Scrolling horizontally: {event:?}");
+									self.mouse.scroll_horizontal(event.amount);
+								},
+								InputEvent::GamepadInfo(gamepad) => {
+									tracing::debug!("Gamepad info: {gamepad:?}");
+									if gamepad.index as usize >= gamepads.len() {
+										tracing::warn!("Received info for gamepad {}, but we only have {} slots.", gamepad.index, gamepads.len());
+										continue;
+									}
+
+									if gamepads[gamepad.index as usize].is_none() {
+										if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
+											gamepads[gamepad.index as usize] = Some(new_gamepad);
+											tracing::info!("Gamepad {} connected.", gamepad.index);
+										}
+									}
+								},
+								InputEvent::GamepadTouch(gamepad_touch) => {
+									tracing::trace!("Gamepad touch: {gamepad_touch:?}");
+									if gamepad_touch.index as usize >= gamepads.len() {
+										tracing::warn!("Received touch for gamepad {}, but we only have {} gamepads.", gamepad_touch.index, gamepads.len());
+										continue;
+									}
+
+									match gamepads[gamepad_touch.index as usize].as_mut() {
+										Some(gamepad) => gamepad.touch(&gamepad_touch),
+										None => tracing::warn!("Received touch for gamepad {}, but no gamepad is connected.", gamepad_touch.index),
+									}
+								},
+								InputEvent::GamepadMotion(gamepad_motion) => {
+									tracing::trace!("Gamepad motion: {gamepad_motion:?}");
+									if gamepad_motion.index as usize >= gamepads.len() {
+										tracing::warn!("Received motion for gamepad {}, but we only have {} gamepads.", gamepad_motion.index, gamepads.len());
+										continue;
+									}
+
+									match gamepads[gamepad_motion.index as usize].as_mut() {
+										Some(gamepad) => gamepad.set_motion(&gamepad_motion),
+										None => tracing::warn!("Received motion for gamepad {}, but no gamepad is connected.", gamepad_motion.index),
+									}
+								},
+								InputEvent::GamepadBattery(gamepad_battery) => {
+									tracing::trace!("Gamepad battery: {gamepad_battery:?}");
+									if gamepad_battery.index as usize >= gamepads.len() {
+										tracing::warn!("Received battery for gamepad {}, but we only have {} gamepads.", gamepad_battery.index, gamepads.len());
+										continue;
+									}
+
+									match gamepads[gamepad_battery.index as usize].as_mut() {
+										Some(gamepad) => gamepad.set_battery(&gamepad_battery),
+										None => tracing::warn!("Received battery for gamepad {}, but no gamepad is connected.", gamepad_battery.index),
+									}
+								},
+								InputEvent::GamepadUpdate(gamepad_update) => {
+									tracing::trace!("Gamepad update: {gamepad_update:?}");
+									if gamepad_update.index as usize >= gamepads.len() {
+										tracing::warn!("Received update for gamepad {}, but we only have {} gamepads.", gamepad_update.index, gamepads.len());
+										continue;
+									}
+
+									match gamepads[gamepad_update.index as usize].as_mut() {
+										Some(gamepad) => gamepad.update(&gamepad_update),
+										None => tracing::warn!("Received update for gamepad {}, but no gamepad is connected.", gamepad_update.index),
+									}
+
+									// Disconnect gamepads that are no longer active.
+									for (i, gamepad) in gamepads.iter_mut().enumerate() {
+										if gamepad.is_some() && gamepad_update.active_gamepad_mask & (1 << i) == 0 {
+											tracing::info!("Gamepad {} disconnected.", i);
+											*gamepad = None;
+										}
+									}
+								},
+								InputEvent::GamepadEnableHaptics => {
+									tracing::debug!("Received request to enable haptics on gamepads.");
+									// We don't actually need to do anything.
+								},
+							}
+
+							if let Some(client) = &reis_client {
+								if let Err(e) = client.flush() {
+									tracing::error!("Failed to flush reis client: {e}");
+								}
+							}
+						}
+						_ => break,
+					}
+				}
 			}
 		}
 
 		tracing::debug!("Input handler stopped.");
+	}
+
+	fn handle_reis_event(&mut self, event: EiEvent) {
+		match event {
+			EiEvent::SeatAdded(e) => {
+				e.seat.bind_capabilities(&[
+					DeviceCapability::Pointer,
+					DeviceCapability::Keyboard,
+					DeviceCapability::Button,
+					DeviceCapability::Scroll,
+					DeviceCapability::PointerAbsolute,
+				]);
+			}
+			EiEvent::DeviceAdded(e) => {
+				let device = e.device;
+				if device.has_capability(DeviceCapability::Pointer) {
+					if let Some(pointer) = device.interface::<::reis::ei::Pointer>() {
+						self.mouse.set_pointer(pointer);
+					}
+					if let Some(pointer_absolute) = device.interface::<::reis::ei::PointerAbsolute>() {
+						self.mouse.set_pointer_absolute(pointer_absolute);
+					}
+					if let Some(button) = device.interface::<::reis::ei::Button>() {
+						self.mouse.set_button(button);
+					}
+					if let Some(scroll) = device.interface::<::reis::ei::Scroll>() {
+						self.mouse.set_scroll(scroll);
+					}
+					self.mouse.set_device(device.device().clone());
+				}
+				if device.has_capability(DeviceCapability::Keyboard) {
+					if let Some(keyboard) = device.interface::<::reis::ei::Keyboard>() {
+						self.keyboard.set_keyboard(keyboard);
+					}
+					self.keyboard.set_device(device.device().clone());
+				}
+			}
+			EiEvent::DeviceResumed(e) => {
+				let device = e.device;
+				device.device().start_emulating(e.serial, 1);
+			}
+			EiEvent::DevicePaused(e) => {
+				let device = e.device;
+				device.device().stop_emulating(e.serial);
+			}
+			_ => {}
+		}
 	}
 }
