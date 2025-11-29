@@ -95,14 +95,14 @@ impl VideoPipelineInner {
 		let bitrate_kbit = self.bitrate / 1000;
 
 		let (encoder, parser, caps_filter) = match (self.video_format, self.dynamic_range, self.chroma_sampling) {
-			(VideoFormat::H264, _, VideoChromaSampling::Yuv420) => ("nvh264enc", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high"),
-			(VideoFormat::H264, _, VideoChromaSampling::Yuv444) => ("nvh264enc", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high-444"),
-			(VideoFormat::Hevc, VideoDynamicRange::Sdr, VideoChromaSampling::Yuv420) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main"),
-			(VideoFormat::Hevc, VideoDynamicRange::Hdr, VideoChromaSampling::Yuv420) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-10"),
-			(VideoFormat::Hevc, VideoDynamicRange::Sdr, VideoChromaSampling::Yuv444) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-444"),
-			(VideoFormat::Hevc, VideoDynamicRange::Hdr, VideoChromaSampling::Yuv444) => ("nvh265enc", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-444-10"),
-			(VideoFormat::Av1, _, VideoChromaSampling::Yuv420) => ("nvav1enc", "av1parse", "video/x-av1,profile=main"),
-			(VideoFormat::Av1, _, VideoChromaSampling::Yuv444) => ("nvav1enc", "av1parse", "video/x-av1,profile=high"),
+			(VideoFormat::H264, _, VideoChromaSampling::Yuv420) => ("nvh264enc num-ref-l0=1", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high"),
+			(VideoFormat::H264, _, VideoChromaSampling::Yuv444) => ("nvh264enc num-ref-l0=1", "h264parse config-interval=-1", "video/x-h264,stream-format=byte-stream,profile=high-444"),
+			(VideoFormat::Hevc, VideoDynamicRange::Sdr, VideoChromaSampling::Yuv420) => ("nvh265enc num-ref-l0=1", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main"),
+			(VideoFormat::Hevc, VideoDynamicRange::Hdr, VideoChromaSampling::Yuv420) => ("nvh265enc num-ref-l0=1", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-10"),
+			(VideoFormat::Hevc, VideoDynamicRange::Sdr, VideoChromaSampling::Yuv444) => ("nvh265enc num-ref-l0=1", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-444"),
+			(VideoFormat::Hevc, VideoDynamicRange::Hdr, VideoChromaSampling::Yuv444) => ("nvh265enc num-ref-l0=1", "h265parse config-interval=-1", "video/x-h265,stream-format=byte-stream,profile=main-444-10"),
+			(VideoFormat::Av1, _, VideoChromaSampling::Yuv420) => ("nvav1enc num-fwd-refs=1", "av1parse", "video/x-av1,profile=main"),
+			(VideoFormat::Av1, _, VideoChromaSampling::Yuv444) => ("nvav1enc num-fwd-refs=1", "av1parse", "video/x-av1,profile=high"),
 		};
 
 		let format = match (self.dynamic_range, self.chroma_sampling) {
