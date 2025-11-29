@@ -29,7 +29,7 @@ fn run(port: u16, name: String) -> Result<(), ()> {
 
 fn on_service_registered(
 	result: zeroconf::Result<zeroconf::ServiceRegistration>,
-	_context: Option<std::sync::Arc<dyn std::any::Any>>,
+	_context: Option<std::sync::Arc<dyn std::any::Any + Send + Sync + 'static>>,
 ) {
 	if let Err(e) = result {
 		tracing::error!("Failed to register service: {e}");
