@@ -176,6 +176,8 @@ impl AudioCapture {
 struct AudioCaptureInner {
 	/// Channel to communicate audio fragments over.
 	audio_tx: Sender<Vec<f32>>,
+	sample_rate: u32,
+	channels: u8,
 }
 
 impl AudioCaptureInner {
@@ -185,9 +187,8 @@ impl AudioCaptureInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
 		// TODO: Make configurable.
-		const SAMPLE_RATE: usize = 48000;
-		const SAMPLE_TIME_MS: usize = 5;
-		const FRAME_SIZE: usize = std::mem::size_of::<f32>() * SAMPLE_RATE * SAMPLE_TIME_MS / 1000;
+		let sample_time_ms = 5;
+		let frame_size = std::mem::size_of::<f32>() * self.sample_rate as usize * self.channels as usize * sample_time_ms / 1000;
 
 		// Trigger session shutdown when the audio capture stops.
 		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::AudioCaptureStopped);
@@ -196,7 +197,7 @@ impl AudioCaptureInner {
 		// Start recording.
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Allocate uninitialized buffer for recording.
-			let buffer: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); FRAME_SIZE];
+			let buffer: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); frame_size];
 			let mut buffer = unsafe {
 				std::mem::transmute::<std::vec::Vec<std::mem::MaybeUninit<u8>>, std::vec::Vec<u8>>(buffer)
 			};
