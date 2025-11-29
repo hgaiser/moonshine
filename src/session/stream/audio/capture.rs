@@ -155,7 +155,7 @@ impl AudioCapture {
 
 		tracing::debug!("Recording from source: {monitor_name}");
 
-		let inner = AudioCaptureInner { audio_tx };
+		let inner = AudioCaptureInner { audio_tx, sample_rate, channels };
 		std::thread::Builder::new().name("audio-capture".to_string()).spawn(
 			move || inner.run(stream, stop_session_manager)
 		)

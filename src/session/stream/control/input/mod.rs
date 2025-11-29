@@ -197,11 +197,11 @@ impl InputHandlerInner {
 							reis_client = None;
 						}
 						ReisWorkResult::Connected(client) => {
-							tracing::info!("Connected to libei.");
+							tracing::debug!("Connected to libeis.");
 							reis_client = Some(*client);
 						}
 						ReisWorkResult::ConnectError(e) => {
-							tracing::debug!("Could not yet connect to libei: {e}");
+							tracing::debug!("Could not yet connect to libeis: {e}");
 						}
 					}
 				}

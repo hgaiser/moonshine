@@ -14,6 +14,7 @@ use crate::session::SessionManager;
 use crate::state::State;
 use crate::webserver::Webserver;
 use openssl::pkey::PKey;
+use tokio::signal::unix::{signal, SignalKind};
 
 mod app_scanner;
 mod clients;
@@ -81,12 +82,17 @@ async fn main() -> Result<(), ()> {
 	tokio::spawn({
 		let shutdown = shutdown.clone();
 		async move {
-			if let Err(e) = tokio::signal::ctrl_c().await {
-				tracing::error!("Failed to wait for CTRL+C: {e}");
-				std::process::exit(1);
+			let mut terminate = signal(SignalKind::terminate()).unwrap();
+
+			tokio::select! {
+				_ = tokio::signal::ctrl_c() => {
+					tracing::info!("Received CTRL+C, shutting down...");
+				},
+				_ = terminate.recv() => {
+					tracing::info!("Received SIGTERM, shutting down...");
+				}
 			}
 
-			tracing::info!("Shutting down server...");
 			shutdown.trigger_shutdown(1).ok();
 		}
 	});
@@ -164,7 +170,7 @@ impl Moonshine {
 		};
 
 		// Create a manager for interacting with sessions.
-		let session_manager = SessionManager::new(config.clone(), shutdown.trigger_shutdown_token(2))?;
+		let session_manager = SessionManager::new(config.clone(), shutdown.clone())?;
 
 		// Create a manager for saving and loading client state.
 		let client_manager = ClientManager::new(state.clone(), cert.clone(), pkey, shutdown.trigger_shutdown_token(3));

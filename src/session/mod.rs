@@ -115,6 +115,21 @@ fn get_default_sink() -> Result<String, ()> {
 	Ok(stdout.trim().to_string())
 }
 
+fn set_default_sink(name: &str) -> Result<(), ()> {
+	let output = Command::new("pactl")
+		.arg("set-default-sink")
+		.arg(name)
+		.output()
+		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
+
+	if !output.status.success() {
+		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+		return Err(());
+	}
+
+	Ok(())
+}
+
 #[allow(clippy::result_unit_err)]
 impl Session {
 	pub fn new(
@@ -126,12 +141,9 @@ impl Session {
 		let sink_name = "moonshine-sink".to_string();
 		let module_id = create_audio_sink(&sink_name)?;
 
-
-		// Set default sink
-		let _ = Command::new("pactl")
-			.arg("set-default-sink")
-			.arg(&sink_name)
-			.output();
+		if let Some(sink) = &default_sink {
+			let _ = set_default_sink(sink);
+		}
 
 		let loopback_module_id = if context.host_audio {
 			if let Some(default_sink) = default_sink {

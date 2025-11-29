@@ -187,11 +187,14 @@ impl Default for VideoStreamConfig {
 pub struct AudioStreamConfig {
 	/// Port to use for streaming audio data.
 	pub port: u16,
+
+	/// The name of the sink to capture audio from.
+	pub sink: Option<String>,
 }
 
 impl Default for AudioStreamConfig {
 	fn default() -> Self {
-		Self { port: 48000 }
+		Self { port: 48000, sink: None }
 	}
 }
 

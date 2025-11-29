@@ -1,4 +1,4 @@
-use async_shutdown::{ShutdownManager, TriggerShutdownToken};
+use async_shutdown::ShutdownManager;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
@@ -52,10 +52,16 @@ struct SessionManagerInner { }
 
 impl SessionManager {
 	#[allow(clippy::result_unit_err)]
-	pub fn new(config: Config, shutdown_token: TriggerShutdownToken<i32>) -> Result<Self, ()> {
+	pub fn new(config: Config, shutdown: ShutdownManager<i32>) -> Result<Self, ()> {
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner: SessionManagerInner = Default::default();
-		tokio::spawn(async move { inner.run(config, command_rx).await; drop(shutdown_token); });
+		let shutdown_token = shutdown.trigger_shutdown_token(2);
+		let delay_token = shutdown.delay_shutdown_token();
+		tokio::spawn(async move {
+			inner.run(config, command_rx).await;
+			drop(shutdown_token);
+			drop(delay_token);
+		});
 		Ok(Self { command_tx })
 	}
 
