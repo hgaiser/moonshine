@@ -6,8 +6,10 @@ This means you can play games on the client device, while rendering takes place 
 
 ## Requirements and limitations
 
-1. **NVIDIA GPU**. Moonshine uses `xdg-desktop-portal` to capture the desktop and `GStreamer` for video encoding. Currently this pipeline assumes an NVIDIA GPU is present. The goal is to support more hardware in the future, while maintaining a single and therefore simple pipeline. See the todo's at the bottom for more information.
-1. **(Arch) Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux. Windows is currently not supported. It should be relatively simple to add Windows compatibility, but at least the input (mouse / keyboard / gamepad) and audio won't work since these use Linux specific libraries. Perhaps in the future, more OS's will be supported (contributions are welcome). For now the focus is on Arch Linux.
+1. **NVIDIA GPU**. Moonshine currently assumes an NVIDIA GPU for its encoding pipeline. Ideally in the future this pipeline is adjusted to use Vulkan Video Extensions so that more hardware can be supported. In theory it should be easy to adjust the pipeline for other hardware encoders, but this is not implemented at the time of writing.
+1. **GStreamer**. Moonshine uses [GStreamer](https://gstreamer.freedesktop.org/) for encoding video streams. To reduce latency, a fix is required in GStreamer, which is available in [this fork](https://gitlab.freedesktop.org/hgaiser/gstreamer/-/tree/nvh264enc-add-max-num-ref-frames).
+1. **Gamescope**. Moonshine uses [Gamescope](https://github.com/ValveSoftware/gamescope) in headless mode to run and stream content. This means that Moonshine is independent from whatever runs on the host system (X11, Wayland, etc). This also means you can run Moonshine and stream games, while using the host system for other tasks. Currently this requires a few fixes in Gamescope, which are available in [this fork](https://github.com/hgaiser/gamescope/tree/moonshine).
+1. **(Arch) Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux. Windows is currently not supported.
 1. **Moonlight v6.0.0 or higher**. Older versions are untested and might not work.
 
 ## Installation
@@ -37,15 +39,20 @@ The following dependencies are required:
 
 ```
 avahi
+clang
+cmake
 gcc-libs
 glib2
 glibc
 gstreamer
 gst-plugins-base-libs
+jq
+libc++
 libevdev
 libpulse
 openssl
 opus
+rust
 ```
 
 On systems with `pacman` these can be installed with the following command:
@@ -53,15 +60,20 @@ On systems with `pacman` these can be installed with the following command:
 ```sh
 $ sudo pacman -S \
    avahi \
+   clang \
+   cmake \
    gcc-libs \
    glib2 \
    glibc \
    gstreamer \
    gst-plugins-base-libs \
+   jq \
+   libc++ \
    libevdev \
    libpulse \
    openssl \
-   opus
+   opus \
+   rust
 ```
 
 Then compile and run:
@@ -96,68 +108,42 @@ Where `<PIN>` should be replaced with the actual PIN number.
 
 ### Applications
 
-It is important to note that each application that is defined in the config simply starts streaming the entire desktop.
-It is the `run_before` part of an applications configuration that defines what to do when an application is started.
-Most commonly this will be used to first change the resolution and then launch a game or application.
-If no `run_before` is provided, then Moonshine will simply start to stream the desktop without changing resolution or launching anything.
+Each application defined in the configuration is executed within a [gamescope](https://github.com/ValveSoftware/gamescope) session.
+This ensures that the application runs in a headless environment, independent of the host's desktop session.
 
 In the `config.toml` file, each application has the following information:
 
 1. `title`. The title as reported in Moonlight.
 1. `boxart` (optional). A path to the boxart (image) for this title.
-1. `run_before` (optional). A list of commands to execute before starting the stream for this application. Each command is itself a list. The first entry in the list is the executable to run, the remaining entries are the arguments. For example this will simply print `"Hello World"`:
+1. `command`. A list of strings representing the command to run. The first entry is the executable, the remaining entries are the arguments. This command is executed within a `gamescope` session.
+1. `enable_steam_integration` (optional). Whether to enable Steam integration for this application. Defaults to `false`.
 
-   ```toml
-   [[application]]
-   title = "Test"
-   run_before = [["/usr/bin/echo", "Hello", "World"]]
-   ```
-
-1. `run_after` (optional). Similar to `run_before`, but these commands are run after a stream has ended.
-
-The following values are replaced in the commands, before they are executed:
-
-1. `{width}` is replaced with the requested stream width in pixels.
-1. `{height}` is replaced with the requested stream height in pixels.
-1. Any environment variables, such as `$HOME`.
-
-Note: width and height was previously used to change the resolution when starting to stream, but this is removed since it did not work in Wayland. The script might be reintroduced in the future, but the width and height variables are still available if you want to use them.
-
-By combining the `run_before` and `run_after` configuration fields, we can change resolution and launch a game when the application starts and reset to the default resolution when the application ends.
-
-A simple example is given below:
+Example:
 
 ```toml
 [[application]]
 title = "Steam"
-run_before = [
-	["/usr/bin/steam", "steam://open/bigpicture"],
-]
-run_after = [["$HOME/.local/bin/resolution"]]
+command = ["/usr/bin/steam", "steam://open/bigpicture"]
+enable_steam_integration = true
 ```
-
-This will open Steam in big picture mode.
 
 ### Application scanners
 
 In addition to defining specific applications, it is also possible to define application scanners.
 These scanners scan for applications on startup.
 Currently, only a `steam` scanner is implemented.
-This scanner searches for a Steam library, checks which games are installed in that library and adds applications with the configured `run_before` and `run_after` commands.
+This scanner searches for a Steam library, checks which games are installed in that library and adds applications with the configured `command`.
 
-These commands have an additional template value that gets substituted when executed, the `{game_id}`.
+The command has an additional template value that gets substituted when executed, the `{game_id}`.
 This is replaced with the Steam game id.
 
-The following application scanner will first change resolution, then open steam, then run a game. After running the application, the resolution is restored to its default value.
+The following application scanner will run the game through Steam:
 
 ```toml
 [[application_scanner]]
 type = "steam"
 library = "$HOME/.local/share/Steam"
-run_before = [
-	["/usr/bin/steam", "steam://open/bigpicture"],
-	["/usr/bin/steam", "steam://rungameid/{game_id}"],
-]
+command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
 ```
 
 ## FAQ
