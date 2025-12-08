@@ -63,6 +63,7 @@ impl Default for Config {
 					library: "$HOME/.local/share/Steam".into(),
 					command: vec![
 						"/usr/bin/steam".to_string(),
+						"-bigpicture".to_string(),
 						"steam://rungameid/{game_id}".to_string(),
 					],
 				}),
