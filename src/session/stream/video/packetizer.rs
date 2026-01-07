@@ -1,7 +1,7 @@
-use std::collections::{hash_map::Entry, HashMap};
-use reed_solomon_erasure::{galois_8, ReedSolomon};
-use tokio::sync::mpsc;
 use crate::session::stream::RtpHeader;
+use reed_solomon_erasure::{galois_8, ReedSolomon};
+use std::collections::{hash_map::Entry, HashMap};
+use tokio::sync::mpsc;
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub const MAX_SHARDS: usize = 255;
@@ -79,7 +79,12 @@ impl Packetizer {
 		sequence_number: &mut u32,
 		rtp_timestamp: u32,
 	) -> Result<(), ()> {
-		tracing::trace!("Packetizing frame {}, size={}, keyframe={}", frame_number, encoded_data.len(), is_key_frame);
+		tracing::trace!(
+			"Packetizing frame {}, size={}, keyframe={}",
+			frame_number,
+			encoded_data.len(),
+			is_key_frame
+		);
 
 		// Random padding, because we need it.
 		const PADDING: u32 = 0;
@@ -88,7 +93,11 @@ impl Packetizer {
 		const VIDEO_FRAME_HEADER_SIZE: usize = 8;
 		let packet_data_len = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
 		let last_shard_size = packet_data_len % requested_shard_payload_size;
-		let last_shard_size = if last_shard_size == 0 { requested_shard_payload_size } else { last_shard_size };
+		let last_shard_size = if last_shard_size == 0 {
+			requested_shard_payload_size
+		} else {
+			last_shard_size
+		};
 
 		// TODO: Figure out what this header means?
 		let video_frame_header = VideoFrameHeader {
@@ -104,8 +113,7 @@ impl Packetizer {
 		let packet_data = [&buffer, encoded_data].concat();
 
 		// The total size of a shard.
-		let requested_shard_size =
-			std::mem::size_of::<RtpHeader>()
+		let requested_shard_size = std::mem::size_of::<RtpHeader>()
 			+ std::mem::size_of_val(&PADDING)
 			+ std::mem::size_of::<NvVideoPacket>()
 			+ requested_shard_payload_size;
@@ -118,7 +126,7 @@ impl Packetizer {
 		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
 		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
 
-		// We need to subtract number of data shards by 1, otherwise you can get a situation where
+		// We need to subtract number of data shards by 1, otherwise you can get a situation where.
 		// there are for example 100 data shards allowed per block and also 100 data shards available.
 		// In this case, nr_blocks = 100 / 100 + 1 = 2, but we only need to send 1 block.
 		// Subtracting the value of nr_data_shards by 1 avoids this situation.
@@ -131,8 +139,7 @@ impl Packetizer {
 		for block_index in 0..nr_blocks {
 			// Determine what data shards are in this block.
 			let start = block_index * nr_data_shards_per_block;
-			let mut end = ((block_index + 1) * nr_data_shards_per_block)
-				.min(nr_data_shards);
+			let mut end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
 
 			if block_index == 3 {
 				tracing::debug!("Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC.");
@@ -157,7 +164,9 @@ impl Packetizer {
 			// Recompute the actual FEC percentage in case of a rounding error or when there are 0 parity shards.
 			let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
 
-			tracing::trace!("Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards.");
+			tracing::trace!(
+				"Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards."
+			);
 
 			let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
 			for (block_shard_index, data_shard_index) in (start..end).enumerate() {
@@ -212,7 +221,8 @@ impl Packetizer {
 					shards.push(vec![0u8; requested_shard_size]);
 				}
 
-				encoder.encode(&mut shards)
+				encoder
+					.encode(&mut shards)
 					.map_err(|e| tracing::error!("Failed to encode packet as FEC shards: {e}"))?;
 
 				// Force these values for the parity shards, we don't need to reconstruct them, but Moonlight needs them to match with the frame they came from.
@@ -222,10 +232,15 @@ impl Packetizer {
 					rtp_header.sequence_number = (*sequence_number as u16).to_be();
 
 					let video_packet_header = unsafe {
-						&mut *(shard.as_mut_ptr().add(std::mem::size_of::<RtpHeader>() + std::mem::size_of_val(&PADDING)) as *mut NvVideoPacket)
+						&mut *(shard
+							.as_mut_ptr()
+							.add(std::mem::size_of::<RtpHeader>() + std::mem::size_of_val(&PADDING))
+							as *mut NvVideoPacket)
 					};
 					video_packet_header.multi_fec_blocks = ((block_index as u8) << 4) | last_block_index;
-					video_packet_header.fec_info = ((nr_data_shards + block_shard_index) << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32;
+					video_packet_header.fec_info = ((nr_data_shards + block_shard_index) << 12
+						| nr_data_shards << 22
+						| fec_percentage << 4) as u32;
 					video_packet_header.frame_index = frame_number;
 
 					*sequence_number += 1;
@@ -233,7 +248,12 @@ impl Packetizer {
 			}
 
 			for (index, shard) in shards.into_iter().enumerate() {
-				tracing::trace!("Sending shard {}/{} with size {} bytes.", index + 1, nr_data_shards + nr_parity_shards, shard.len());
+				tracing::trace!(
+					"Sending shard {}/{} with size {} bytes.",
+					index + 1,
+					nr_data_shards + nr_parity_shards,
+					shard.len()
+				);
 				if packet_tx.blocking_send(shard).is_err() {
 					tracing::info!("Couldn't send packet, video packet channel closed.");
 					return Ok(());
@@ -251,7 +271,11 @@ impl Packetizer {
 		Ok(())
 	}
 
-	fn get_fec_encoder(&mut self, nr_data_shards: usize, nr_parity_shards: usize) -> Result<&mut ReedSolomon<galois_8::Field>, ()> {
+	fn get_fec_encoder(
+		&mut self,
+		nr_data_shards: usize,
+		nr_parity_shards: usize,
+	) -> Result<&mut ReedSolomon<galois_8::Field>, ()> {
 		Ok(match self.fec_encoders.entry((nr_data_shards, nr_parity_shards)) {
 			Entry::Occupied(e) => {
 				tracing::trace!("Found a FEC encoder for this combination of shards.");
@@ -259,12 +283,14 @@ impl Packetizer {
 			},
 			Entry::Vacant(e) => {
 				tracing::trace!("No FEC encoder for this combination of shards, creating a new one.");
-				let encoder = e.insert(ReedSolomon::<galois_8::Field>::new(nr_data_shards, nr_parity_shards)
-					.map_err(|e| tracing::error!("Couldn't create error correction encoder: {e}"))?);
+				let encoder = e.insert(
+					ReedSolomon::<galois_8::Field>::new(nr_data_shards, nr_parity_shards)
+						.map_err(|e| tracing::error!("Couldn't create error correction encoder: {e}"))?,
+				);
 				tracing::trace!("Finished preparing FEC encoder.");
 
 				encoder
-			}
+			},
 		})
 	}
 }

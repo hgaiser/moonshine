@@ -5,25 +5,18 @@ use tokio::sync::mpsc;
 use crate::session::{manager::SessionShutdownReason, stream::control::input::gamepad::Gamepad};
 
 use self::{
-	mouse::{
-		Mouse,
-		MouseButton,
-		MouseMoveAbsolute,
-		MouseMoveRelative,
-		MouseScrollVertical,
-		MouseScrollHorizontal,
-	},
-	keyboard::{Keyboard, Key},
 	gamepad::{GamepadBattery, GamepadInfo, GamepadMotion, GamepadTouch, GamepadUpdate},
+	keyboard::{Key, Keyboard},
+	mouse::{Mouse, MouseButton, MouseMoveAbsolute, MouseMoveRelative, MouseScrollHorizontal, MouseScrollVertical},
 	reis::ReisClient,
 };
-use ::reis::event::{EiEvent, DeviceCapability};
+use ::reis::event::{DeviceCapability, EiEvent};
 
 use super::FeedbackCommand;
 
+mod gamepad;
 mod keyboard;
 mod mouse;
-mod gamepad;
 mod reis;
 
 #[derive(FromRepr)]
@@ -67,7 +60,10 @@ enum InputEvent {
 impl InputEvent {
 	fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
 		if buffer.len() < 4 {
-			tracing::warn!("Expected control message to have at least 4 bytes, got {}", buffer.len());
+			tracing::warn!(
+				"Expected control message to have at least 4 bytes, got {}",
+				buffer.len()
+			);
 			return Err(());
 		}
 
@@ -75,22 +71,40 @@ impl InputEvent {
 		match InputEventType::from_repr(event_type) {
 			Some(InputEventType::KeyDown) => Ok(InputEvent::KeyDown(Key::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::KeyUp) => Ok(InputEvent::KeyUp(Key::from_bytes(&buffer[4..])?)),
-			Some(InputEventType::MouseMoveAbsolute) => Ok(InputEvent::MouseMoveAbsolute(MouseMoveAbsolute::from_bytes(&buffer[4..])?)),
-			Some(InputEventType::MouseMoveRelative) => Ok(InputEvent::MouseMoveRelative(MouseMoveRelative::from_bytes(&buffer[4..])?)),
-			Some(InputEventType::MouseButtonDown) => Ok(InputEvent::MouseButtonDown(MouseButton::from_bytes(&buffer[4..])?)),
-			Some(InputEventType::MouseButtonUp) => Ok(InputEvent::MouseButtonUp(MouseButton::from_bytes(&buffer[4..])?)),
-			Some(InputEventType::MouseScrollVertical) => Ok(InputEvent::MouseScrollVertical(MouseScrollVertical::from_bytes(&buffer[4..])?)),
-			Some(InputEventType::MouseScrollHorizontal) => Ok(InputEvent::MouseScrollHorizontal(MouseScrollHorizontal::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::MouseMoveAbsolute) => Ok(InputEvent::MouseMoveAbsolute(
+				MouseMoveAbsolute::from_bytes(&buffer[4..])?,
+			)),
+			Some(InputEventType::MouseMoveRelative) => Ok(InputEvent::MouseMoveRelative(
+				MouseMoveRelative::from_bytes(&buffer[4..])?,
+			)),
+			Some(InputEventType::MouseButtonDown) => {
+				Ok(InputEvent::MouseButtonDown(MouseButton::from_bytes(&buffer[4..])?))
+			},
+			Some(InputEventType::MouseButtonUp) => {
+				Ok(InputEvent::MouseButtonUp(MouseButton::from_bytes(&buffer[4..])?))
+			},
+			Some(InputEventType::MouseScrollVertical) => Ok(InputEvent::MouseScrollVertical(
+				MouseScrollVertical::from_bytes(&buffer[4..])?,
+			)),
+			Some(InputEventType::MouseScrollHorizontal) => Ok(InputEvent::MouseScrollHorizontal(
+				MouseScrollHorizontal::from_bytes(&buffer[4..])?,
+			)),
 			Some(InputEventType::GamepadInfo) => Ok(InputEvent::GamepadInfo(GamepadInfo::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadTouch) => Ok(InputEvent::GamepadTouch(GamepadTouch::from_bytes(&buffer[4..])?)),
-			Some(InputEventType::GamepadMotion) => Ok(InputEvent::GamepadMotion(GamepadMotion::from_bytes(&buffer[4..])?)),
-			Some(InputEventType::GamepadBattery) => Ok(InputEvent::GamepadBattery(GamepadBattery::from_bytes(&buffer[4..])?)),
-			Some(InputEventType::GamepadUpdate) => Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::GamepadMotion) => {
+				Ok(InputEvent::GamepadMotion(GamepadMotion::from_bytes(&buffer[4..])?))
+			},
+			Some(InputEventType::GamepadBattery) => {
+				Ok(InputEvent::GamepadBattery(GamepadBattery::from_bytes(&buffer[4..])?))
+			},
+			Some(InputEventType::GamepadUpdate) => {
+				Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?))
+			},
 			Some(InputEventType::GamepadEnableHaptics) => Ok(InputEvent::GamepadEnableHaptics),
 			None => {
 				tracing::warn!("Received unknown event type: {event_type}");
 				Err(())
-			}
+			},
 		}
 	}
 }
@@ -111,12 +125,14 @@ impl InputHandler {
 
 			rt.block_on(async move {
 				let local = tokio::task::LocalSet::new();
-				local.run_until(async move {
-					let mouse = Mouse::new().expect("Failed to create mouse");
-					let keyboard = Keyboard::new().expect("Failed to create keyboard");
-					let inner = InputHandlerInner { mouse, keyboard };
-					inner.run(command_rx, stop_session_manager).await;
-				}).await;
+				local
+					.run_until(async move {
+						let mouse = Mouse::new().expect("Failed to create mouse");
+						let keyboard = Keyboard::new().expect("Failed to create keyboard");
+						let inner = InputHandlerInner { mouse, keyboard };
+						inner.run(command_rx, stop_session_manager).await;
+					})
+					.await;
 			});
 		});
 
@@ -124,7 +140,9 @@ impl InputHandler {
 	}
 
 	async fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
-		self.command_tx.send((event, feedback)).await
+		self.command_tx
+			.send((event, feedback))
+			.await
 			.map_err(|e| tracing::error!("Failed to send input event: {e}"))
 	}
 
@@ -146,7 +164,8 @@ impl InputHandlerInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
 		// Trigger session shutdown when the input handler stops.
-		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::InputHandlerStopped);
+		let _session_stop_token =
+			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::InputHandlerStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
 		let mut gamepads: [Option<Gamepad>; 16] = Default::default();
@@ -156,7 +175,7 @@ impl InputHandlerInner {
 			Err(e) => {
 				tracing::debug!("Could not yet connect to libei: {e}");
 				None
-			}
+			},
 		};
 
 		enum ReisWorkResult {
@@ -347,7 +366,7 @@ impl InputHandlerInner {
 					DeviceCapability::Scroll,
 					DeviceCapability::PointerAbsolute,
 				]);
-			}
+			},
 			EiEvent::DeviceAdded(e) => {
 				let device = e.device;
 				if device.has_capability(DeviceCapability::Pointer) {
@@ -371,16 +390,16 @@ impl InputHandlerInner {
 					}
 					self.keyboard.set_device(device.device().clone());
 				}
-			}
+			},
 			EiEvent::DeviceResumed(e) => {
 				let device = e.device;
 				device.device().start_emulating(e.serial, 1);
-			}
+			},
 			EiEvent::DevicePaused(e) => {
 				let device = e.device;
 				device.device().stop_emulating(e.serial);
-			}
-			_ => {}
+			},
+			_ => {},
 		}
 	}
 }

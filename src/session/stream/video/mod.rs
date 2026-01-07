@@ -1,5 +1,8 @@
 use async_shutdown::ShutdownManager;
-use tokio::{net::UdpSocket, sync::{broadcast, mpsc}};
+use tokio::{
+	net::UdpSocket,
+	sync::{broadcast, mpsc},
+};
 
 use crate::{config::Config, session::manager::SessionShutdownReason};
 
@@ -84,11 +87,12 @@ pub struct VideoStreamContext {
 	pub video_format: VideoFormat,
 	pub dynamic_range: VideoDynamicRange,
 	pub chroma_sampling_type: VideoChromaSampling,
+	pub max_reference_frames: u32,
 }
 
 #[derive(Clone)]
 pub struct VideoStream {
-	command_tx: mpsc::Sender<VideoStreamCommand>
+	command_tx: mpsc::Sender<VideoStreamCommand>,
 }
 
 impl VideoStream {
@@ -106,23 +110,25 @@ impl VideoStream {
 		if context.qos {
 			// 160 corresponds to DSCP CS5 (Video)
 			tracing::debug!("Enabling QoS on video socket.");
-			socket.set_tos(160)
+			socket
+				.set_tos(160)
 				.map_err(|e| tracing::error!("Failed to set QoS on the video socket: {e}"))?;
 		}
 
 		tracing::debug!(
 			"Listening for video messages on {}",
-			socket.local_addr()
+			socket
+				.local_addr()
 				.map_err(|e| tracing::error!("Failed to get local address associated with control socket: {e}"))?
 		);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = VideoStreamInner { context, config, pipeline: None };
-		tokio::spawn(inner.run(
-			socket,
-			command_rx,
-			stop_session_manager.clone(),
-		));
+		let inner = VideoStreamInner {
+			context,
+			config,
+			pipeline: None,
+		};
+		tokio::spawn(inner.run(socket, command_rx, stop_session_manager.clone()));
 
 		Ok(Self { command_tx })
 	}
@@ -130,12 +136,16 @@ impl VideoStream {
 	pub async fn start(&self) -> Result<(), ()> {
 		tracing::debug!("Starting video stream.");
 
-		self.command_tx.send(VideoStreamCommand::Start).await
+		self.command_tx
+			.send(VideoStreamCommand::Start)
+			.await
 			.map_err(|e| tracing::warn!("Failed to send Start command: {e}"))
 	}
 
 	pub async fn request_idr_frame(&self) -> Result<(), ()> {
-		self.command_tx.send(VideoStreamCommand::RequestIdrFrame).await
+		self.command_tx
+			.send(VideoStreamCommand::RequestIdrFrame)
+			.await
 			.map_err(|e| tracing::warn!("Failed to send RequestIdrFrame command: {e}"))
 	}
 }
@@ -154,7 +164,8 @@ impl VideoStreamInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
 		// Trigger session shutdown if we exit unexpectedly.
-		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoStreamStopped);
+		let _session_stop_token =
+			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoStreamStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
 		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(1024);
@@ -166,7 +177,8 @@ impl VideoStreamInner {
 			match command {
 				VideoStreamCommand::RequestIdrFrame => {
 					tracing::debug!("Received request for IDR frame, next frame will be an IDR frame.");
-					let _ = idr_frame_request_tx.send(())
+					let _ = idr_frame_request_tx
+						.send(())
 						.map_err(|e| tracing::error!("Failed to send IDR frame request to encoder: {e}"));
 				},
 				VideoStreamCommand::Start => {
@@ -175,11 +187,15 @@ impl VideoStreamInner {
 						continue;
 					}
 
-					if self.start(
-						packet_tx.clone(),
-						idr_frame_request_tx.subscribe(),
-						stop_session_manager.clone(),
-					).await.is_err() {
+					if self
+						.start(
+							packet_tx.clone(),
+							idr_frame_request_tx.subscribe(),
+							stop_session_manager.clone(),
+						)
+						.await
+						.is_err()
+					{
 						break;
 					}
 					started_streaming = true;
@@ -211,6 +227,7 @@ impl VideoStreamInner {
 			self.context.video_format,
 			self.context.dynamic_range,
 			self.context.chroma_sampling_type,
+			self.context.max_reference_frames,
 			packet_tx,
 			idr_frame_request_rx,
 			stop_session_manager.clone(),

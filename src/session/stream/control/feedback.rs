@@ -124,12 +124,10 @@ pub struct TriggerEffectCommand {
 }
 
 impl TriggerEffectCommand {
-	const HEADER_LENGTH: usize =
-		std::mem::size_of::<u16>() // Feedback type.
+	const HEADER_LENGTH: usize = std::mem::size_of::<u16>() // Feedback type.
 		+ std::mem::size_of::<u16>(); // Payload length.
 
-	const PAYLOAD_LENGTH: usize =
-		std::mem::size_of::<u16>() // ID of the gamepad.
+	const PAYLOAD_LENGTH: usize = std::mem::size_of::<u16>() // ID of the gamepad.
 		+ std::mem::size_of::<u8>() // Trigger event flags.
 		+ std::mem::size_of::<u8>() // Type left.
 		+ std::mem::size_of::<u8>() // Type right.

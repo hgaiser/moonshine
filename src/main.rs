@@ -1,11 +1,6 @@
 use std::io::Write;
 use std::path::PathBuf;
 
-use async_shutdown::ShutdownManager;
-use clap::Parser;
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 use crate::clients::ClientManager;
 use crate::config::Config;
 use crate::crypto::create_certificate;
@@ -13,17 +8,22 @@ use crate::rtsp::RtspServer;
 use crate::session::SessionManager;
 use crate::state::State;
 use crate::webserver::Webserver;
+use async_shutdown::ShutdownManager;
+use clap::Parser;
 use openssl::pkey::PKey;
 use tokio::signal::unix::{signal, SignalKind};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
 mod app_scanner;
 mod clients;
 mod config;
 mod crypto;
+mod publisher;
 mod rtsp;
 mod session;
 mod state;
-mod publisher;
 mod webserver;
 
 #[derive(Parser, Debug)]
@@ -46,29 +46,33 @@ async fn main() -> Result<(), ()> {
 	if args.config.exists() {
 		config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
 	} else {
-		tracing::info!("No config file found at {}, creating a default config file.", args.config.display());
+		tracing::info!(
+			"No config file found at {}, creating a default config file.",
+			args.config.display()
+		);
 		config = Config::default();
 
-		let serialized_config = toml::to_string_pretty(&config)
-			.map_err(|e| tracing::error!("Failed to serialize config: {e}"))?;
+		let serialized_config =
+			toml::to_string_pretty(&config).map_err(|e| tracing::error!("Failed to serialize config: {e}"))?;
 
-		let config_dir = args.config.parent()
+		let config_dir = args
+			.config
+			.parent()
 			.ok_or_else(|| tracing::error!("Failed to get parent directory of config file."))?;
-		std::fs::create_dir_all(config_dir)
-			.map_err(|e| tracing::error!("Failed to create config directory: {e}"))?;
+		std::fs::create_dir_all(config_dir).map_err(|e| tracing::error!("Failed to create config directory: {e}"))?;
 		std::fs::write(args.config, serialized_config)
 			.map_err(|e| tracing::error!("Failed to save config file: {e}"))?;
 	}
 
 	// Resolve these paths so that the rest of the code doesn't need to.
 	let cert_path = config.webserver.certificate.to_string_lossy().to_string();
-	let cert_path = shellexpand::full(&cert_path)
-		.map_err(|e| tracing::error!("Failed to expand certificate path: {e}"))?;
+	let cert_path =
+		shellexpand::full(&cert_path).map_err(|e| tracing::error!("Failed to expand certificate path: {e}"))?;
 	config.webserver.certificate = cert_path.to_string().into();
 
 	let private_key_path = config.webserver.private_key.to_string_lossy().to_string();
-	let private_key_path = shellexpand::full(&private_key_path)
-		.map_err(|e| tracing::error!("Failed to expand private key path: {e}"))?;
+	let private_key_path =
+		shellexpand::full(&private_key_path).map_err(|e| tracing::error!("Failed to expand private key path: {e}"))?;
 	config.webserver.private_key = private_key_path.to_string().into();
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
@@ -122,34 +126,47 @@ pub struct Moonshine {
 }
 
 impl Moonshine {
-	pub async fn new(
-		config: Config,
-		shutdown: ShutdownManager<i32>,
-	) -> Result<Self, ()> {
+	pub async fn new(config: Config, shutdown: ShutdownManager<i32>) -> Result<Self, ()> {
 		let state = State::new().await?;
 
 		let (cert, pkey) = if !config.webserver.certificate.exists() && !config.webserver.private_key.exists() {
 			tracing::info!("No certificate found, creating a new one.");
 
-			let (cert, pkey) = create_certificate()
-				.map_err(|e| tracing::error!("Failed to create certificate: {e}"))?;
+			let (cert, pkey) =
+				create_certificate().map_err(|e| tracing::error!("Failed to create certificate: {e}"))?;
 
-			// Write certificate to file
-			let cert_dir = config.webserver.certificate.parent()
+			// Write certificate to file.
+			let cert_dir = config
+				.webserver
+				.certificate
+				.parent()
 				.ok_or_else(|| tracing::error!("Failed to find parent directory for certificate file."))?;
 			std::fs::create_dir_all(cert_dir)
 				.map_err(|e| tracing::error!("Failed to create certificate directory: {e}"))?;
 			let mut certfile = std::fs::File::create(&config.webserver.certificate).unwrap();
-			certfile.write(&cert.to_pem().map_err(|e| tracing::error!("Failed to serialize PEM: {e}"))?)
+			certfile
+				.write(
+					&cert
+						.to_pem()
+						.map_err(|e| tracing::error!("Failed to serialize PEM: {e}"))?,
+				)
 				.map_err(|e| tracing::error!("Failed to write PEM to file: {e}"))?;
 
-			// Write private key to file
-			let private_key_dir = config.webserver.private_key.parent()
+			// Write private key to file.
+			let private_key_dir = config
+				.webserver
+				.private_key
+				.parent()
 				.ok_or_else(|| tracing::error!("Failed to find parent directory for private key file."))?;
 			std::fs::create_dir_all(private_key_dir)
 				.map_err(|e| tracing::error!("Failed to create private key directory: {e}"))?;
 			let mut keyfile = std::fs::File::create(&config.webserver.private_key).unwrap();
-			keyfile.write(&pkey.private_key_to_pem_pkcs8().map_err(|e| tracing::error!("Failed to serialize private key: {e}"))?)
+			keyfile
+				.write(
+					&pkey
+						.private_key_to_pem_pkcs8()
+						.map_err(|e| tracing::error!("Failed to serialize private key: {e}"))?,
+				)
 				.map_err(|e| tracing::error!("Failed to write private key to file: {e}"))?;
 
 			tracing::debug!("Saved private key to {}", config.webserver.certificate.display());
@@ -162,9 +179,11 @@ impl Moonshine {
 			let cert = openssl::x509::X509::from_pem(&cert)
 				.map_err(|e| tracing::error!("Failed to parse server certificate: {e}"))?;
 
-			let pkey = PKey::private_key_from_pem(&std::fs::read(&config.webserver.private_key)
-				.map_err(|e| tracing::error!("Failed to read private key: {e}"))?)
-				.map_err(|e| tracing::error!("Failed to parse private key: {e}"))?;
+			let pkey = PKey::private_key_from_pem(
+				&std::fs::read(&config.webserver.private_key)
+					.map_err(|e| tracing::error!("Failed to read private key: {e}"))?,
+			)
+			.map_err(|e| tracing::error!("Failed to parse private key: {e}"))?;
 
 			(cert, pkey)
 		};

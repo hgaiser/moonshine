@@ -1,21 +1,21 @@
 use zeroconf::prelude::*;
 
 pub fn spawn(port: u16, name: String) {
-	tokio::task::spawn_blocking(move || { run(port, name) });
+	tokio::task::spawn_blocking(move || run(port, name));
 }
 
 fn run(port: u16, name: String) -> Result<(), ()> {
 	let mut service = zeroconf::MdnsService::new(
-		zeroconf::ServiceType::new("nvstream", "tcp")
-			.map_err(|e| tracing::error!("Failed to publish: {e}"))?,
-		port
+		zeroconf::ServiceType::new("nvstream", "tcp").map_err(|e| tracing::error!("Failed to publish: {e}"))?,
+		port,
 	);
 
 	service.set_registered_callback(Box::new(on_service_registered));
 	service.set_name(&name);
 	service.set_network_interface(zeroconf::NetworkInterface::Unspec);
 
-	let event_loop = service.register()
+	let event_loop = service
+		.register()
 		.map_err(|e| tracing::error!("Failed to register service: {e}"))?;
 
 	loop {
@@ -37,4 +37,3 @@ fn on_service_registered(
 		tracing::debug!("Service successfully registered.");
 	}
 }
-

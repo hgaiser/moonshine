@@ -20,7 +20,10 @@ impl MouseMoveAbsolute {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for MouseMoveAbsolute, got {} bytes.", buffer.len());
+			tracing::warn!(
+				"Expected at least {EXPECTED_SIZE} bytes for MouseMoveAbsolute, got {} bytes.",
+				buffer.len()
+			);
 			return Err(());
 		}
 
@@ -42,7 +45,11 @@ pub struct MouseMoveRelative {
 impl MouseMoveRelative {
 	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
 		if buffer.len() < std::mem::size_of::<Self>() {
-			tracing::warn!("Expected at least {} bytes for MouseMoveRelative, got {} bytes.", std::mem::size_of::<Self>(), buffer.len());
+			tracing::warn!(
+				"Expected at least {} bytes for MouseMoveRelative, got {} bytes.",
+				std::mem::size_of::<Self>(),
+				buffer.len()
+			);
 			return Err(());
 		}
 
@@ -68,7 +75,10 @@ impl MouseButton {
 		const EXPECTED_SIZE: usize = std::mem::size_of::<u8>(); // button
 
 		if buffer.len() < EXPECTED_SIZE {
-			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for MouseButton, got {} bytes.", buffer.len());
+			tracing::warn!(
+				"Expected at least {EXPECTED_SIZE} bytes for MouseButton, got {} bytes.",
+				buffer.len()
+			);
 			return Err(());
 		}
 
@@ -96,7 +106,11 @@ pub struct MouseScrollVertical {
 impl MouseScrollVertical {
 	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
 		if buffer.len() < std::mem::size_of::<Self>() {
-			tracing::warn!("Expected at least {} bytes for MouseScrollVertical, got {} bytes.", std::mem::size_of::<Self>(), buffer.len());
+			tracing::warn!(
+				"Expected at least {} bytes for MouseScrollVertical, got {} bytes.",
+				std::mem::size_of::<Self>(),
+				buffer.len()
+			);
 			return Err(());
 		}
 
@@ -114,7 +128,11 @@ pub struct MouseScrollHorizontal {
 impl MouseScrollHorizontal {
 	pub fn from_bytes(buffer: &[u8]) -> Result<Self, ()> {
 		if buffer.len() < std::mem::size_of::<Self>() {
-			tracing::warn!("Expected at least {} bytes for MouseScrollHorizontal, got {} bytes.", std::mem::size_of::<Self>(), buffer.len());
+			tracing::warn!(
+				"Expected at least {} bytes for MouseScrollHorizontal, got {} bytes.",
+				std::mem::size_of::<Self>(),
+				buffer.len()
+			);
 			return Err(());
 		}
 

@@ -5,9 +5,12 @@ use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
 use tokio::sync::mpsc;
 
-use crate::{config::{Config, ApplicationConfig}, session::stream::{VideoStream, AudioStream, ControlStream}};
+use crate::{
+	config::{ApplicationConfig, Config},
+	session::stream::{AudioStream, ControlStream, VideoStream},
+};
 
-use self::stream::{VideoStreamContext, AudioStreamContext};
+use self::stream::{AudioStreamContext, VideoStreamContext};
 pub use manager::SessionManager;
 
 pub mod manager;
@@ -76,10 +79,7 @@ fn create_audio_sink(name: &str) -> Result<String, ()> {
 }
 
 fn unload_audio_sink(module_id: &str) {
-	let _ = Command::new("pactl")
-		.arg("unload-module")
-		.arg(module_id)
-		.output();
+	let _ = Command::new("pactl").arg("unload-module").arg(module_id).output();
 }
 
 fn create_audio_loopback(source: &str, sink: &str) -> Result<String, ()> {
@@ -169,18 +169,24 @@ impl Session {
 			audio_loopback_module_id: loopback_module_id,
 		};
 		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal));
-		Ok(Self { command_tx, context, running: false, sink_name: Some(sink_name) })
+		Ok(Self {
+			command_tx,
+			context,
+			running: false,
+			sink_name: Some(sink_name),
+		})
 	}
 
 	pub async fn start(
 		&mut self,
 		video_stream_context: VideoStreamContext,
 		mut audio_stream_context: AudioStreamContext,
-	) -> Result <(), ()> {
+	) -> Result<(), ()> {
 		tracing::info!("Starting session.");
 		self.running = true;
 		audio_stream_context.sink_name = self.sink_name.clone();
-		self.command_tx.send(SessionCommand::Start(video_stream_context, audio_stream_context))
+		self.command_tx
+			.send(SessionCommand::Start(video_stream_context, audio_stream_context))
 			.await
 			.map_err(|e| tracing::error!("Failed to send Start command: {e}"))
 	}
@@ -194,7 +200,9 @@ impl Session {
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
-		self.command_tx.send(SessionCommand::UpdateKeys(keys)).await
+		self.command_tx
+			.send(SessionCommand::UpdateKeys(keys))
+			.await
 			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
 	}
 }
@@ -223,20 +231,26 @@ impl SessionInner {
 		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				SessionCommand::Start(video_stream_context, audio_stream_context) => {
-					let video_stream = match VideoStream::new(self.config.clone(), video_stream_context, stop_session_manager.clone()).await {
-						Ok(video_stream) => video_stream,
-						Err(()) => continue,
-					};
-					let audio_stream = match AudioStream::new(self.config.clone(), audio_stream_context, stop_session_manager.clone()).await {
-						Ok(audio_stream) => audio_stream,
-						Err(()) => continue,
-					};
+					let video_stream =
+						match VideoStream::new(self.config.clone(), video_stream_context, stop_session_manager.clone())
+							.await
+						{
+							Ok(video_stream) => video_stream,
+							Err(()) => continue,
+						};
+					let audio_stream =
+						match AudioStream::new(self.config.clone(), audio_stream_context, stop_session_manager.clone())
+							.await
+						{
+							Ok(audio_stream) => audio_stream,
+							Err(()) => continue,
+						};
 					let control_stream = match ControlStream::new(
 						self.config.clone(),
 						video_stream.clone(),
 						audio_stream.clone(),
 						session_context.clone(),
-						stop_session_manager.clone()
+						stop_session_manager.clone(),
 					) {
 						Ok(control_stream) => control_stream,
 						Err(()) => {
@@ -289,12 +303,18 @@ fn start_gamescope(context: &SessionContext, sink_name: &str) -> Result<Child, (
 	let refresh_rate = context._refresh_rate.to_string();
 
 	let mut command = vec![
-		"--backend".to_string(), "headless".to_string(),
-		"-w".to_string(), width.clone(),
-		"-h".to_string(), height.clone(),
-		"-W".to_string(), width,
-		"-H".to_string(), height,
-		"-r".to_string(), refresh_rate,
+		"--backend".to_string(),
+		"headless".to_string(),
+		"-w".to_string(),
+		width.clone(),
+		"-h".to_string(),
+		height.clone(),
+		"-W".to_string(),
+		width,
+		"-H".to_string(),
+		height,
+		"-r".to_string(),
+		refresh_rate,
 		"--immediate-flips".to_string(),
 		"--force-grab-cursor".to_string(),
 	];
@@ -317,7 +337,11 @@ fn start_gamescope(context: &SessionContext, sink_name: &str) -> Result<Child, (
 	Command::new("gamescope")
 		.args(command)
 		.env("PULSE_SINK", sink_name)
-		.stdout(log_file.try_clone().map_err(|e| tracing::error!("Failed to clone log file handle: {e}"))?)
+		.stdout(
+			log_file
+				.try_clone()
+				.map_err(|e| tracing::error!("Failed to clone log file handle: {e}"))?,
+		)
 		.stderr(log_file)
 		.stdin(Stdio::null())
 		.spawn()

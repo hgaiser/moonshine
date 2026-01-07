@@ -1,27 +1,40 @@
-use std::{path::{Path, PathBuf}, str::FromStr};
+use std::{
+	path::{Path, PathBuf},
+	str::FromStr,
+};
 
 use walkdir::WalkDir;
 
-use crate::config::{SteamApplicationScannerConfig, ApplicationConfig};
+use crate::config::{ApplicationConfig, SteamApplicationScannerConfig};
 
 pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
-	let library_path = config.library.join("steamapps").join("libraryfolders.vdf").to_string_lossy().to_string();
-	let library_path = shellexpand::full(&library_path)
-		.map_err(|e| tracing::error!("Failed to expand {library_path:?}: {e}"))?;
-	let library = std::fs::read_to_string(library_path.as_ref())
-		.map_err(|e| tracing::warn!("Failed to open library: {e}"))?;
+	let library_path = config
+		.library
+		.join("steamapps")
+		.join("libraryfolders.vdf")
+		.to_string_lossy()
+		.to_string();
+	let library_path =
+		shellexpand::full(&library_path).map_err(|e| tracing::error!("Failed to expand {library_path:?}: {e}"))?;
+	let library =
+		std::fs::read_to_string(library_path.as_ref()).map_err(|e| tracing::warn!("Failed to open library: {e}"))?;
 
 	// Poor man's library parsing.
-	let start_apps = library.find("apps")
+	let start_apps = library
+		.find("apps")
 		.ok_or_else(|| tracing::warn!("Failed to find 'apps' key in {library_path:?}."))?;
 	let library = &library[start_apps..];
-	let stop_apps = library.find('}')
+	let stop_apps = library
+		.find('}')
 		.ok_or_else(|| tracing::warn!("Failed to find end of 'apps' section."))?;
 	let library = &library[..stop_apps];
 
 	let mut applications = Vec::new();
 	for line in library.lines().skip(2) {
-		let mut application = ApplicationConfig { enable_steam_integration: true, ..Default::default() };
+		let mut application = ApplicationConfig {
+			enable_steam_integration: true,
+			..Default::default()
+		};
 
 		if line.trim().is_empty() {
 			continue;
@@ -51,11 +64,13 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 		// Skip things that aren't really games.
 		if application.title.starts_with("Proton")
 			|| application.title.starts_with("Steam Linux Runtime")
-			|| application.title.starts_with("Steamworks Common Redistributables") {
+			|| application.title.starts_with("Steamworks Common Redistributables")
+		{
 			continue;
 		}
 
-		application.command = config.command
+		application.command = config
+			.command
 			.clone()
 			.iter()
 			.map(|a| a.replace("{game_id}", &game_id.to_string()))
@@ -69,7 +84,11 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 				tracing::warn!("No boxart for game '{}' at '{}.", application.title, boxart.display());
 			}
 		} else {
-			tracing::info!("No boxart found for game '{}' in directory '{}'.", application.title, game_dir.display());
+			tracing::info!(
+				"No boxart found for game '{}' in directory '{}'.",
+				application.title,
+				game_dir.display()
+			);
 		}
 
 		applications.push(application);
@@ -82,22 +101,28 @@ fn get_game_name<P: AsRef<Path>>(game_id: u32, library: P) -> Result<String, ()>
 	let manifest_path = library
 		.as_ref()
 		.parent()
-		.ok_or_else(|| eprintln!("Expected '{:?}' to have a parent, but couldn't find one.", library.as_ref()))?
+		.ok_or_else(|| {
+			eprintln!(
+				"Expected '{:?}' to have a parent, but couldn't find one.",
+				library.as_ref()
+			)
+		})?
 		.join(format!("appmanifest_{}.acf", game_id));
 	let manifest = std::fs::read_to_string(&manifest_path)
 		.map_err(|e| eprintln!("Failed to open Steam game manifest ({manifest_path:?}): {e}"))?;
-	let name_line = manifest
-		.lines()
-		.find(|l| l.contains("\"name\""));
+	let name_line = manifest.lines().find(|l| l.contains("\"name\""));
 
 	match name_line {
-		Some(line) => {
-			line
-				.split('\"')
-				.nth(3)
-				.ok_or_else(|| eprintln!("Line '{}' doesn't match expected format (expected: \"name\" \"<NAME>\").", line))
-				.map(|l| l.to_string())
-		},
+		Some(line) => line
+			.split('\"')
+			.nth(3)
+			.ok_or_else(|| {
+				eprintln!(
+					"Line '{}' doesn't match expected format (expected: \"name\" \"<NAME>\").",
+					line
+				)
+			})
+			.map(|l| l.to_string()),
 		None => {
 			eprintln!("Couldn't find name for game with ID '{game_id}'.");
 			Err(())
@@ -118,9 +143,10 @@ fn search_file(directory: &Path, filename: &str) -> Option<PathBuf> {
 	};
 
 	for entry in WalkDir::new(&directory)
-			.follow_links(true)
-			.into_iter()
-			.filter_map(|e| e.ok()) {
+		.follow_links(true)
+		.into_iter()
+		.filter_map(|e| e.ok())
+	{
 		let entry_filename = entry.file_name().to_string_lossy();
 
 		if entry_filename == filename {

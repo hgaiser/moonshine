@@ -1,9 +1,24 @@
-use std::{net::{ToSocketAddrs, SocketAddr}, str::FromStr};
 use async_shutdown::ShutdownManager;
-use rtsp_types::{headers::{self, Transport}, Method};
-use tokio::{net::{TcpListener, TcpStream}, io::{AsyncReadExt, AsyncWriteExt}};
+use rtsp_types::{
+	headers::{self, Transport},
+	Method,
+};
+use std::{
+	net::{SocketAddr, ToSocketAddrs},
+	str::FromStr,
+};
+use tokio::{
+	io::{AsyncReadExt, AsyncWriteExt},
+	net::{TcpListener, TcpStream},
+};
 
-use crate::{config::Config, session::{stream::{AudioStreamContext, VideoStreamContext, VideoFormat, VideoDynamicRange, VideoChromaSampling}, manager::SessionManager}};
+use crate::{
+	config::Config,
+	session::{
+		manager::SessionManager,
+		stream::{AudioStreamContext, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamContext},
+	},
+};
 
 #[repr(u8)]
 enum ServerCapabilities {
@@ -25,48 +40,64 @@ pub struct RtspServer {
 }
 
 impl RtspServer {
-	pub fn new(
-		config: Config,
-		session_manager: SessionManager,
-		shutdown: ShutdownManager<i32>,
-	) -> Self {
-		let server = Self { config: config.clone(), session_manager };
+	pub fn new(config: Config, session_manager: SessionManager, shutdown: ShutdownManager<i32>) -> Self {
+		let server = Self {
+			config: config.clone(),
+			session_manager,
+		};
 
 		tokio::spawn({
 			let server = server.clone();
 			async move {
-				let _ = shutdown.wrap_cancel(shutdown.wrap_trigger_shutdown(3, {
-					let server = server.clone();
-					async move {
-						let address = (config.address.as_str(), config.stream.port).to_socket_addrs()
-							.map_err(|e| tracing::error!("Failed to resolve address {}:{}: {}", config.address, config.stream.port, e))?
-							.next()
-							.ok_or_else(|| tracing::error!("Failed to resolve address {}:{}", config.address, config.stream.port))?;
-						let listener = TcpListener::bind(address)
-							.await
-							.map_err(|e| tracing::error!("Failed to bind to address {}: {}", address, e))?;
-
-						tracing::debug!("RTSP server listening on {}", address);
-
-						loop {
-							let (connection, address) = listener.accept()
+				let _ = shutdown
+					.wrap_cancel(shutdown.wrap_trigger_shutdown(3, {
+						let server = server.clone();
+						async move {
+							let address = (config.address.as_str(), config.stream.port)
+								.to_socket_addrs()
+								.map_err(|e| {
+									tracing::error!(
+										"Failed to resolve address {}:{}: {}",
+										config.address,
+										config.stream.port,
+										e
+									)
+								})?
+								.next()
+								.ok_or_else(|| {
+									tracing::error!(
+										"Failed to resolve address {}:{}",
+										config.address,
+										config.stream.port
+									)
+								})?;
+							let listener = TcpListener::bind(address)
 								.await
-								.map_err(|e| tracing::error!("Failed to accept connection: {}", e))?;
-							tracing::trace!("Accepted connection from {}", address);
+								.map_err(|e| tracing::error!("Failed to bind to address {}: {}", address, e))?;
 
-							tokio::spawn({
-								let server = server.clone();
-								async move {
-									let _ = server.handle_connection(connection, address).await;
-								}
-							});
+							tracing::debug!("RTSP server listening on {}", address);
+
+							loop {
+								let (connection, address) = listener
+									.accept()
+									.await
+									.map_err(|e| tracing::error!("Failed to accept connection: {}", e))?;
+								tracing::trace!("Accepted connection from {}", address);
+
+								tokio::spawn({
+									let server = server.clone();
+									async move {
+										let _ = server.handle_connection(connection, address).await;
+									}
+								});
+							}
+
+							// Is there another way to define the return type of this function?
+							#[allow(unreachable_code)]
+							Ok::<(), ()>(())
 						}
-
-						// Is there another way to define the return type of this function?
-						#[allow(unreachable_code)]
-						Ok::<(), ()>(())
-					}
-				})).await;
+					}))
+					.await;
 
 				tracing::debug!("RTSP server shutting down.");
 			}
@@ -96,7 +127,10 @@ impl RtspServer {
 		let mut result = String::new();
 
 		result.push_str(&format!("a=x-ss-general.featureFlags:{}\n", self.capabilities()));
-		result.push_str(&format!("a=x-ss-general.encryptionSupported:{}\n", self.encryption_flags_supported()));
+		result.push_str(&format!(
+			"a=x-ss-general.encryptionSupported:{}\n",
+			self.encryption_flags_supported()
+		));
 		result.push_str("sprop-parameter-sets=AAAAAU\n");
 		result.push_str("a=rtpmap:98 AV1/90000\n");
 		result.push_str("a=fmtp:96 packetization-mode=1");
@@ -104,31 +138,31 @@ impl RtspServer {
 		result
 	}
 
-	fn handle_options_request(&self, request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
+	fn handle_options_request(
+		&self,
+		request: &rtsp_types::Request<Vec<u8>>,
+		cseq: i32,
+	) -> rtsp_types::Response<Vec<u8>> {
 		rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 			.header(headers::CSEQ, cseq.to_string())
 			.header(headers::PUBLIC, "OPTIONS DESCRIBE SETUP PLAY")
 			.build(Vec::new())
 	}
 
-	fn handle_setup_request(
-		&self,
-		request: &rtsp_types::Request<Vec<u8>>,
-		cseq: i32,
-	) -> rtsp_types::Response<Vec<u8>> {
+	fn handle_setup_request(&self, request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
 		let transports = match request.typed_header::<rtsp_types::headers::Transports>() {
 			Ok(transports) => transports,
 			Err(e) => {
 				tracing::warn!("Failed to parse transport information from SETUP request: {e}");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-			}
+			},
 		};
 		let transports = match transports {
 			Some(transports) => transports,
 			None => {
 				tracing::warn!("No transport information in SETUP request.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-			}
+			},
 		};
 
 		if let Some(transport) = (*transports).first() {
@@ -138,15 +172,15 @@ impl RtspServer {
 						Some(query) => query,
 						None => {
 							tracing::warn!("No request URI in SETUP request.");
-							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)
-						}
+							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+						},
 					};
 					let query = match request_uri.query_pairs().next() {
 						Some(query) => query,
 						None => {
 							tracing::warn!("No query in request URI in SETUP request.");
-							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)
-						}
+							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+						},
 					};
 					if query.0 != "streamid" {
 						tracing::warn!("Expected only one query parameter with 'streamid', but didn't find it.");
@@ -161,7 +195,7 @@ impl RtspServer {
 						Some(stream) => {
 							tracing::warn!("Unknown stream '{stream}'");
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-						}
+						},
 						None => {
 							tracing::warn!("Unexpected query format for query '{}'", query.1);
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
@@ -174,13 +208,12 @@ impl RtspServer {
 						.header(headers::CSEQ, cseq.to_string())
 						.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
 						.header(headers::TRANSPORT, format!("server_port={port}"))
-						.build(Vec::new())
-					;
-				}
+						.build(Vec::new());
+				},
 				t => {
 					tracing::warn!("Received request for unsupported transport: {:?}", t);
 					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-				}
+				},
 			}
 		}
 
@@ -210,7 +243,7 @@ impl RtspServer {
 			Err(e) => {
 				tracing::warn!("Failed to parse ANNOUNCE request as SDP session: {e}");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-			}
+			},
 		};
 
 		tracing::trace!("Received SDP session from ANNOUNCE request: {sdp_session:#?}");
@@ -277,14 +310,18 @@ impl RtspServer {
 			Err(()) => {
 				tracing::warn!("Invalid video format: {}", video_format);
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-			}
+			},
 		};
 
 		let dynamic_range: u32 = get_sdp_attribute(&sdp_session, "x-nv-video[0].dynamicRangeMode").unwrap_or_default();
 		let dynamic_range = VideoDynamicRange::try_from(dynamic_range).unwrap_or_default();
 
-		let chroma_sampling_type: u32 = get_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
+		let chroma_sampling_type: u32 =
+			get_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
 		let chroma_sampling_type = VideoChromaSampling::try_from(chroma_sampling_type).unwrap_or_default();
+
+		let max_reference_frames: u32 =
+			get_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
 
 		let video_stream_context = VideoStreamContext {
 			width,
@@ -297,6 +334,7 @@ impl RtspServer {
 			video_format,
 			dynamic_range,
 			chroma_sampling_type,
+			max_reference_frames,
 		};
 
 		let packet_duration = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
@@ -320,8 +358,13 @@ impl RtspServer {
 			sink_name: self.config.stream.audio.sink.clone(),
 		};
 
-		if self.session_manager.set_stream_context(video_stream_context, audio_stream_context).await.is_err() {
-			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError)
+		if self
+			.session_manager
+			.set_stream_context(video_stream_context, audio_stream_context)
+			.await
+			.is_err()
+		{
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
 		}
 
 		rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
@@ -335,7 +378,7 @@ impl RtspServer {
 		cseq: i32,
 	) -> rtsp_types::Response<Vec<u8>> {
 		if self.session_manager.start_session().await.is_err() {
-			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError)
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
 		}
 
 		rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
@@ -343,23 +386,23 @@ impl RtspServer {
 			.build(Vec::new())
 	}
 
-	async fn handle_connection(
-		&self,
-		mut connection: TcpStream,
-		address: SocketAddr,
-	) -> Result<(), ()> {
+	async fn handle_connection(&self, mut connection: TcpStream, address: SocketAddr) -> Result<(), ()> {
 		let mut message_buffer = String::new();
 
 		let message = loop {
 			let mut buffer = [0u8; 2048];
-			let bytes_read = connection.read(&mut buffer).await
+			let bytes_read = connection
+				.read(&mut buffer)
+				.await
 				.map_err(|e| tracing::error!("Failed to read from connection '{}': {}", address, e))?;
 			if bytes_read == 0 {
 				tracing::warn!("Received empty RTSP request.");
 				return Ok(());
 			}
-			message_buffer.push_str(std::str::from_utf8(&buffer[..bytes_read])
-				.map_err(|e| tracing::error!("Failed to convert message to string: {e}"))?);
+			message_buffer.push_str(
+				std::str::from_utf8(&buffer[..bytes_read])
+					.map_err(|e| tracing::error!("Failed to convert message to string: {e}"))?,
+			);
 
 			// Hacky workaround to fix rtsp_types parsing SETUP/PLAY requests from Moonlight.
 			let message_buffer = message_buffer.replace("streamid", "rtsp://localhost?streamid");
@@ -377,7 +420,7 @@ impl RtspServer {
 				Err(e) => {
 					tracing::error!("Failed to parse request as RTSP message: {}", e);
 					return Err(());
-				}
+				},
 			};
 		};
 
@@ -387,7 +430,8 @@ impl RtspServer {
 			rtsp_types::Message::Request(ref request) => {
 				tracing::debug!("Received RTSP {:?} request", request.method());
 
-				let cseq: i32 = request.header(&headers::CSEQ)
+				let cseq: i32 = request
+					.header(&headers::CSEQ)
 					.ok_or_else(|| tracing::error!("RTSP request has no CSeq header"))?
 					.as_str()
 					.parse()
@@ -402,27 +446,31 @@ impl RtspServer {
 					method => {
 						tracing::warn!("Received request with unsupported method {:?}", method);
 						rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)
-					}
+					},
 				}
 			},
 			_ => {
 				tracing::warn!("Unknown RTSP message type received");
 				rtsp_response(0, rtsp_types::Version::V2_0, rtsp_types::StatusCode::BadRequest)
-			}
+			},
 		};
 
 		tracing::debug!("Sending RTSP response");
 		tracing::trace!("{:#?}", response);
 
 		let mut buffer = Vec::new();
-		response.write(&mut buffer)
+		response
+			.write(&mut buffer)
 			.map_err(|e| tracing::error!("Failed to serialize RTSP response: {}", e))?;
 
-		connection.write_all(&buffer).await
+		connection
+			.write_all(&buffer)
+			.await
 			.map_err(|e| tracing::error!("Failed to send RTSP response: {}", e))?;
 
 		// For some reason, Moonlight expects a connection per request, so we close the connection here.
-		connection.shutdown()
+		connection
+			.shutdown()
 			.await
 			.map_err(|e| tracing::error!("Failed to shutdown the connection: {e}"))?;
 
@@ -430,14 +478,19 @@ impl RtspServer {
 	}
 }
 
-fn rtsp_response(cseq: i32, version: rtsp_types::Version, status: rtsp_types::StatusCode) -> rtsp_types::Response<Vec<u8>> {
+fn rtsp_response(
+	cseq: i32,
+	version: rtsp_types::Version,
+	status: rtsp_types::StatusCode,
+) -> rtsp_types::Response<Vec<u8>> {
 	rtsp_types::Response::builder(version, status)
 		.header(headers::CSEQ, cseq.to_string())
 		.build(Vec::new())
 }
 
 fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Result<F, ()> {
-	sdp_session.get_first_attribute_value(attribute)
+	sdp_session
+		.get_first_attribute_value(attribute)
 		.map_err(|e| tracing::warn!("Failed to attribute {attribute} from request: {e}"))?
 		.ok_or_else(|| tracing::warn!("No {attribute} attribute in request"))?
 		.trim()

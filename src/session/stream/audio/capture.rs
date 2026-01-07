@@ -6,28 +6,30 @@ use pulse::{
 	def::BufferAttr,
 	mainloop::standard::{IterateResult, Mainloop},
 	proplist::Proplist,
-	sample::Spec
+	sample::Spec,
 };
 use tokio::sync::mpsc::Sender;
 
 use crate::session::manager::SessionShutdownReason;
 
 fn get_default_sink_name() -> Result<String, ()> {
-	// Create a new PulseAudio context
-	let mainloop = Rc::new(RefCell::new(Mainloop::new()
-
-		.ok_or_else(|| tracing::error!("Failed to create pulseaudio client."))?));
-
-	let mut proplist = Proplist::new()
-		.ok_or_else(|| tracing::error!("Failed to create pulseaudio proplist."))?;
-    proplist.set_str(pulse::proplist::properties::APPLICATION_NAME, "Moonshine")
-        .map_err(|()| tracing::error!("Failed to set pulseaudio application name."))?;
-	let context = Rc::new(RefCell::new(
-		Context::new_with_proplist(mainloop.borrow().deref(), "Moonshine context", &proplist)
-			.ok_or_else(|| tracing::error!("Failed to create pulseaudio context."))?
+	// Create a new PulseAudio context.
+	let mainloop = Rc::new(RefCell::new(
+		Mainloop::new().ok_or_else(|| tracing::error!("Failed to create pulseaudio client."))?,
 	));
 
-	context.borrow_mut().connect(None, FlagSet::NOFLAGS, None)
+	let mut proplist = Proplist::new().ok_or_else(|| tracing::error!("Failed to create pulseaudio proplist."))?;
+	proplist
+		.set_str(pulse::proplist::properties::APPLICATION_NAME, "Moonshine")
+		.map_err(|()| tracing::error!("Failed to set pulseaudio application name."))?;
+	let context = Rc::new(RefCell::new(
+		Context::new_with_proplist(mainloop.borrow().deref(), "Moonshine context", &proplist)
+			.ok_or_else(|| tracing::error!("Failed to create pulseaudio context."))?,
+	));
+
+	context
+		.borrow_mut()
+		.connect(None, FlagSet::NOFLAGS, None)
 		.map_err(|e| tracing::error!("Failed to connect to pulseaudio server: {e}"))?;
 
 	// Wait for context to be ready.
@@ -37,19 +39,19 @@ fn get_default_sink_name() -> Result<String, ()> {
 				tracing::error!("Failed to run pulseaudio main loop.");
 				return Err(());
 			},
-			IterateResult::Success(_) => {}
+			IterateResult::Success(_) => {},
 		}
 
 		match context.borrow().get_state() {
 			pulse::context::State::Unconnected
 			| pulse::context::State::Connecting
 			| pulse::context::State::Authorizing
-			| pulse::context::State::SettingName => {}
+			| pulse::context::State::SettingName => {},
 			pulse::context::State::Failed | pulse::context::State::Terminated => {
 				tracing::error!("Failed to run context.");
 				return Err(());
-			}
-			pulse::context::State::Ready => break
+			},
+			pulse::context::State::Ready => break,
 		}
 	}
 
@@ -63,7 +65,7 @@ fn get_default_sink_name() -> Result<String, ()> {
 				None => {
 					tracing::error!("Failed to receive default sink name.");
 					return;
-				}
+				},
 			};
 			*result.borrow_mut() = Some(name.to_string());
 		})
@@ -76,19 +78,21 @@ fn get_default_sink_name() -> Result<String, ()> {
 				tracing::error!("Failed to run pulseaudio main loop.");
 				return Err(());
 			},
-			IterateResult::Success(_) => {}
+			IterateResult::Success(_) => {},
 		};
 		match operation.get_state() {
-			pulse::operation::State::Running => {}
+			pulse::operation::State::Running => {},
 			pulse::operation::State::Cancelled => {
 				tracing::error!("Failed to get default sink name.");
 				return Err(());
-			}
-			pulse::operation::State::Done => break
+			},
+			pulse::operation::State::Done => break,
 		}
 	}
 
-	result.take().ok_or_else(|| tracing::error!("Failed to get default sink name result."))
+	result
+		.take()
+		.ok_or_else(|| tracing::error!("Failed to get default sink name result."))
 }
 
 pub struct AudioCapture {
@@ -116,10 +120,10 @@ impl AudioCapture {
 					Ok(name) => name,
 					Err(()) => {
 						return Err(());
-					}
+					},
 				};
 				format!("{default_sink_name}.monitor")
-			}
+			},
 		};
 
 		let sample_spec = Spec {
@@ -144,7 +148,8 @@ impl AudioCapture {
 				minreq: u32::MAX,
 				fragsize: std::mem::size_of::<f32>() as u32 * sample_rate * channels as u32 * sample_time_ms / 1000,
 			}),
-		).map_err(|e| tracing::error!("Failed to create audio capture device: {e}"));
+		)
+		.map_err(|e| tracing::error!("Failed to create audio capture device: {e}"));
 
 		let stream = match stream {
 			Ok(stream) => stream,
@@ -155,10 +160,14 @@ impl AudioCapture {
 
 		tracing::debug!("Recording from source: {monitor_name}");
 
-		let inner = AudioCaptureInner { audio_tx, sample_rate, channels };
-		std::thread::Builder::new().name("audio-capture".to_string()).spawn(
-			move || inner.run(stream, stop_session_manager)
-		)
+		let inner = AudioCaptureInner {
+			audio_tx,
+			sample_rate,
+			channels,
+		};
+		std::thread::Builder::new()
+			.name("audio-capture".to_string())
+			.spawn(move || inner.run(stream, stop_session_manager))
 			.map_err(|e| tracing::error!("Failed to start audio capture thread: {e}"))?;
 
 		Ok(Self { sample_rate, channels })
@@ -181,26 +190,23 @@ struct AudioCaptureInner {
 }
 
 impl AudioCaptureInner {
-	fn run(
-		self,
-		stream: pulse_simple::Simple,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-	) {
+	fn run(self, stream: pulse_simple::Simple, stop_session_manager: ShutdownManager<SessionShutdownReason>) {
 		// TODO: Make configurable.
 		let sample_time_ms = 5;
-		let frame_size = std::mem::size_of::<f32>() * self.sample_rate as usize * self.channels as usize * sample_time_ms / 1000;
+		let frame_size =
+			std::mem::size_of::<f32>() * self.sample_rate as usize * self.channels as usize * sample_time_ms / 1000;
 
 		// Trigger session shutdown when the audio capture stops.
-		let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::AudioCaptureStopped);
+		let _session_stop_token =
+			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::AudioCaptureStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
 		// Start recording.
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Allocate uninitialized buffer for recording.
 			let buffer: Vec<MaybeUninit<u8>> = vec![MaybeUninit::uninit(); frame_size];
-			let mut buffer = unsafe {
-				std::mem::transmute::<std::vec::Vec<std::mem::MaybeUninit<u8>>, std::vec::Vec<u8>>(buffer)
-			};
+			let mut buffer =
+				unsafe { std::mem::transmute::<std::vec::Vec<std::mem::MaybeUninit<u8>>, std::vec::Vec<u8>>(buffer) };
 
 			match stream.read(&mut buffer) {
 				Ok(()) => {
@@ -229,7 +235,7 @@ impl AudioCaptureInner {
 				Err(e) => {
 					tracing::error!("Failed to read audio data: {}", e);
 					break;
-				}
+				},
 			}
 		}
 

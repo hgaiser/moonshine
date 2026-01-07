@@ -1,7 +1,10 @@
 use async_shutdown::ShutdownManager;
 use tokio::{net::UdpSocket, sync::mpsc};
 
-use crate::{config::Config, session::{manager::SessionShutdownReason, SessionKeys}};
+use crate::{
+	config::Config,
+	session::{manager::SessionShutdownReason, SessionKeys},
+};
 
 use self::{capture::AudioCapture, encoder::AudioEncoder};
 
@@ -33,29 +36,32 @@ impl AudioStream {
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing audio stream.");
 
-		let socket = UdpSocket::bind((config.address, config.stream.audio.port)).await
+		let socket = UdpSocket::bind((config.address, config.stream.audio.port))
+			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
 		if context.qos {
 			// TODO: Check this value 224, what does it mean exactly?
 			tracing::debug!("Enabling QoS on audio socket.");
-			socket.set_tos(224)
+			socket
+				.set_tos(224)
 				.map_err(|e| tracing::error!("Failed to set QoS on the audio socket: {e}"))?;
 		}
 
 		tracing::debug!(
 			"Listening for audio messages on {}",
-			socket.local_addr()
+			socket
+				.local_addr()
 				.map_err(|e| tracing::error!("Failed to get local address associated with control socket: {e}"))?
 		);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = AudioStreamInner { capture: None, encoder: None, sink_name: context.sink_name };
-		tokio::spawn(inner.run(
-			socket,
-			command_rx,
-			stop_session_manager.clone(),
-		));
+		let inner = AudioStreamInner {
+			capture: None,
+			encoder: None,
+			sink_name: context.sink_name,
+		};
+		tokio::spawn(inner.run(socket, command_rx, stop_session_manager.clone()));
 
 		Ok(AudioStream { command_tx })
 	}
@@ -63,14 +69,18 @@ impl AudioStream {
 	pub async fn start(&self, keys: SessionKeys) -> Result<(), ()> {
 		tracing::debug!("Starting audio stream.");
 
-		self.command_tx.send(AudioStreamCommand::Start(keys)).await
+		self.command_tx
+			.send(AudioStreamCommand::Start(keys))
+			.await
 			.map_err(|e| tracing::error!("Failed to send Start command: {e}"))
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
 		tracing::info!("Updating audio stream keys.");
 
-		self.command_tx.send(AudioStreamCommand::UpdateKeys(keys)).await
+		self.command_tx
+			.send(AudioStreamCommand::UpdateKeys(keys))
+			.await
 			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
 	}
 }
@@ -81,7 +91,7 @@ struct AudioStreamInner {
 	sink_name: Option<String>,
 }
 
-unsafe impl Send for AudioStreamInner { }
+unsafe impl Send for AudioStreamInner {}
 
 impl AudioStreamInner {
 	async fn run(
@@ -107,10 +117,11 @@ impl AudioStreamInner {
 					}
 
 					let (audio_tx, audio_rx) = mpsc::channel(10);
-					let capture = match AudioCapture::new(audio_tx, stop_session_manager.clone(), self.sink_name.clone()).await {
-						Ok(capture) => capture,
-						Err(()) => break,
-					};
+					let capture =
+						match AudioCapture::new(audio_tx, stop_session_manager.clone(), self.sink_name.clone()).await {
+							Ok(capture) => capture,
+							Err(()) => break,
+						};
 
 					let encoder = match AudioEncoder::new(
 						capture.sample_rate(),

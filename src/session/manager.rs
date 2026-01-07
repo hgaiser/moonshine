@@ -3,7 +3,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
 
-use super::{Session, stream::{AudioStreamContext, VideoStreamContext}, SessionContext, SessionKeys};
+use super::{
+	stream::{AudioStreamContext, VideoStreamContext},
+	Session, SessionContext, SessionKeys,
+};
 
 #[derive(Clone, Debug)]
 pub enum SessionShutdownReason {
@@ -48,7 +51,7 @@ pub struct SessionManager {
 }
 
 #[derive(Default)]
-struct SessionManagerInner { }
+struct SessionManagerInner {}
 
 impl SessionManager {
 	#[allow(clippy::result_unit_err)]
@@ -68,30 +71,39 @@ impl SessionManager {
 	pub async fn set_stream_context(
 		&self,
 		video_stream_context: VideoStreamContext,
-		audio_stream_context: AudioStreamContext
+		audio_stream_context: AudioStreamContext,
 	) -> Result<(), ()> {
-		self.command_tx.send(SessionManagerCommand::SetStreamContext(video_stream_context, audio_stream_context)).await
+		self.command_tx
+			.send(SessionManagerCommand::SetStreamContext(
+				video_stream_context,
+				audio_stream_context,
+			))
+			.await
 			.map_err(|e| tracing::error!("Failed to send SetStreamContext command: {e}"))
 	}
 
 	pub async fn get_session_context(&self) -> Result<Option<SessionContext>, ()> {
 		let (session_context_tx, session_context_rx) = oneshot::channel();
-		self.command_tx.send(SessionManagerCommand::GetSessionContext(session_context_tx))
+		self.command_tx
+			.send(SessionManagerCommand::GetSessionContext(session_context_tx))
 			.await
 			.map_err(|e| tracing::error!("Failed to get session context: {e}"))?;
-		session_context_rx.await
+		session_context_rx
+			.await
 			.map_err(|e| tracing::error!("Failed to wait for GetCurrentSession response: {e}"))
 	}
 
 	pub async fn initialize_session(&self, context: SessionContext) -> Result<(), ()> {
-		self.command_tx.send(SessionManagerCommand::InitializeSession(context))
+		self.command_tx
+			.send(SessionManagerCommand::InitializeSession(context))
 			.await
 			.map_err(|e| tracing::error!("Failed to initialize session: {e}"))?;
 		Ok(())
 	}
 
 	pub async fn start_session(&self) -> Result<(), ()> {
-		self.command_tx.send(SessionManagerCommand::StartSession)
+		self.command_tx
+			.send(SessionManagerCommand::StartSession)
 			.await
 			.map_err(|e| tracing::error!("Failed to start session: {e}"))
 	}
@@ -99,27 +111,26 @@ impl SessionManager {
 	pub async fn stop_session(&self) -> Result<(), ()> {
 		tracing::info!("Requesting session to be stopped.");
 		let (result_tx, result_rx) = oneshot::channel();
-		self.command_tx.send(SessionManagerCommand::StopSession(result_tx))
+		self.command_tx
+			.send(SessionManagerCommand::StopSession(result_tx))
 			.await
 			.map_err(|e| tracing::error!("Failed to stop session: {e}"))?;
-		result_rx.await
+		result_rx
+			.await
 			.map_err(|e| tracing::error!("Failed to wait for session to stop: {e}"))?;
 		Ok(())
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
-		self.command_tx.send(SessionManagerCommand::UpdateKeys(keys))
+		self.command_tx
+			.send(SessionManagerCommand::UpdateKeys(keys))
 			.await
 			.map_err(|e| tracing::error!("Failed to stop session: {e}"))
 	}
 }
 
 impl SessionManagerInner {
-	async fn run(
-		self,
-		config: Config,
-		mut command_rx: mpsc::Receiver<SessionManagerCommand>,
-	) {
+	async fn run(self, config: Config, mut command_rx: mpsc::Receiver<SessionManagerCommand>) {
 		// The active session, or None if there is no active session.
 		let mut active_session: Option<Session> = None;
 
@@ -141,7 +152,7 @@ impl SessionManagerInner {
 			}
 
 			match command {
-				SessionManagerCommand::SetStreamContext(video, audio) =>  {
+				SessionManagerCommand::SetStreamContext(video, audio) => {
 					if active_session.is_none() {
 						// Well we can, but it is not expected.
 						tracing::warn!("Can't set stream context without an active session.");
@@ -153,7 +164,10 @@ impl SessionManagerInner {
 				},
 
 				SessionManagerCommand::GetSessionContext(session_context_tx) => {
-					let context = active_session.as_ref().map(|s| Some(s.context().clone())).unwrap_or(None);
+					let context = active_session
+						.as_ref()
+						.map(|s| Some(s.context().clone()))
+						.unwrap_or(None);
 					if session_context_tx.send(context).is_err() {
 						tracing::error!("Failed to send current session context.");
 					}
@@ -200,8 +214,11 @@ impl SessionManagerInner {
 
 						if tokio::time::timeout(
 							std::time::Duration::from_secs(10),
-							stop_session_manager.wait_shutdown_complete()
-						).await.is_err() {
+							stop_session_manager.wait_shutdown_complete(),
+						)
+						.await
+						.is_err()
+						{
 							let _ = result_tx.send(());
 							tracing::error!("Timeout while waiting for session to stop.");
 							continue;

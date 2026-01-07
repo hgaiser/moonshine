@@ -9,10 +9,8 @@ clap = { version = "4.5.53", features = ["derive"] }
 dirs = "6.0.0"
 enet = "0.3.0"
 futures = "0.3.31"
-gst = { package = "gstreamer", version = "0.24" }
-gst-app = { package = "gstreamer-app", version = "0.24" }
-gst-video = { package = "gstreamer-video", version = "0.24" }
 hex = "0.4.3"
+ash = { git = "https://github.com/ash-rs/ash", branch = "master" }
 http-body-util = "0.1.3"
 hyper = { version = "1.8.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.18", features = ["tokio"] }
@@ -23,6 +21,8 @@ notify-rust = "4.11.7"
 open = "5.3.3"
 openssl = "0.10.75"
 opus = "0.3.0"
+pipewire = "0.9"
+pixelforge = { version = "0.1.0", git = "https://github.com/hgaiser/pixelforge", features = ["dmabuf"] }
 pulse = { version = "2.30", package = "libpulse-binding" }
 pulse-simple = { version = "2.29", package = "libpulse-simple-binding" }
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }

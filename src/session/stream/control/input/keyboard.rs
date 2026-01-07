@@ -145,10 +145,12 @@ impl Key {
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
-			tracing::warn!("Expected at least {EXPECTED_SIZE} bytes for Key, got {} bytes.", buffer.len());
+			tracing::warn!(
+				"Expected at least {EXPECTED_SIZE} bytes for Key, got {} bytes.",
+				buffer.len()
+			);
 			return Err(());
 		}
-
 
 		Key::from_repr(buffer[1]).ok_or_else(|| tracing::warn!("Unknown keycode: {}", buffer[5]))
 	}
@@ -271,7 +273,10 @@ pub struct Keyboard {
 
 impl Keyboard {
 	pub fn new() -> Result<Self, ()> {
-		Ok(Self { device: None, keyboard: None })
+		Ok(Self {
+			device: None,
+			keyboard: None,
+		})
 	}
 
 	pub fn set_device(&mut self, device: ei::Device) {

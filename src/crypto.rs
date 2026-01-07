@@ -8,11 +8,9 @@ use openssl::{
 	pkey::{PKey, Private},
 	rsa::Rsa,
 	x509::{
-		extension::{
-			BasicConstraints, KeyUsage, SubjectKeyIdentifier
-		},
-	 	X509
-	}
+		extension::{BasicConstraints, KeyUsage, SubjectKeyIdentifier},
+		X509,
+	},
 };
 
 pub fn create_certificate() -> Result<(X509, PKey<Private>), ErrorStack> {
@@ -42,8 +40,7 @@ pub fn create_certificate() -> Result<(X509, PKey<Private>), ErrorStack> {
 			.build()?,
 	)?;
 
-	let subject_key_identifier =
-		SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(None, None))?;
+	let subject_key_identifier = SubjectKeyIdentifier::new().build(&cert_builder.x509v3_context(None, None))?;
 	cert_builder.append_extension(subject_key_identifier)?;
 
 	cert_builder.sign(&key_pair, MessageDigest::sha256())?;
@@ -84,7 +81,11 @@ pub fn decrypt(cipher: &CipherRef, ciphertext: &[u8], key: &[u8]) -> Result<Vec<
 	context.cipher_final_vec(&mut plaintext)?;
 
 	if plaintext.len() != ciphertext.len() {
-		panic!("Cipher and plaintext should be the same length, but are {} vs {}.", plaintext.len(), ciphertext.len());
+		panic!(
+			"Cipher and plaintext should be the same length, but are {} vs {}.",
+			plaintext.len(),
+			ciphertext.len()
+		);
 	}
 
 	Ok(plaintext)

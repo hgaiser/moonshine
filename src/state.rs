@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
 enum StateCommand {
@@ -28,8 +28,8 @@ impl State {
 
 		let inner: StateInner;
 		if path.exists() {
-			let serialized = std::fs::read_to_string(&path)
-				.map_err(|e| tracing::error!("Failed to read state file: {e}"))?;
+			let serialized =
+				std::fs::read_to_string(&path).map_err(|e| tracing::error!("Failed to read state file: {e}"))?;
 			inner = toml::from_str(&serialized)
 				.map_err(|e| tracing::error!("Failed to parse state file at '{}': {e}", path.display()))?;
 
@@ -37,7 +37,6 @@ impl State {
 			tracing::trace!("State: {inner:?}");
 
 			tokio::spawn(inner.run(command_rx));
-
 		} else {
 			let inner = StateInner::new();
 			tokio::spawn(inner.run(command_rx));
@@ -51,23 +50,35 @@ impl State {
 
 	pub async fn get_uuid(&self) -> Result<String, ()> {
 		let (uuid_tx, uuid_rx) = oneshot::channel();
-		self.command_tx.send(StateCommand::GetUuid(uuid_tx)).await
+		self.command_tx
+			.send(StateCommand::GetUuid(uuid_tx))
+			.await
 			.map_err(|e| tracing::error!("Failed to send GetUuid command: {e}"))?;
-		uuid_rx.await.map_err(|e| tracing::error!("Failed to receive GetUuid response: {e}"))
+		uuid_rx
+			.await
+			.map_err(|e| tracing::error!("Failed to receive GetUuid response: {e}"))
 	}
 
 	pub async fn save(&self) -> Result<(), ()> {
 		let (result_tx, result_rx) = oneshot::channel();
-		self.command_tx.send(StateCommand::Save(self.path.clone(), result_tx)).await
+		self.command_tx
+			.send(StateCommand::Save(self.path.clone(), result_tx))
+			.await
 			.map_err(|e| tracing::error!("Failed to send Save command: {e}"))?;
-		result_rx.await.map_err(|e| tracing::error!("Failed to receive Save response: {e}"))?
+		result_rx
+			.await
+			.map_err(|e| tracing::error!("Failed to receive Save response: {e}"))?
 	}
 
 	pub async fn has_client(&self, client: String) -> Result<bool, ()> {
 		let (result_tx, result_rx) = oneshot::channel();
-		self.command_tx.send(StateCommand::HasClient(client, result_tx)).await
+		self.command_tx
+			.send(StateCommand::HasClient(client, result_tx))
+			.await
 			.map_err(|e| tracing::error!("Failed to send HasClient command: {e}"))?;
-		let result = result_rx.await.map_err(|e| tracing::error!("Failed to receive HasClient response: {e}"))?;
+		let result = result_rx
+			.await
+			.map_err(|e| tracing::error!("Failed to receive HasClient response: {e}"))?;
 
 		self.save().await?;
 
@@ -75,7 +86,9 @@ impl State {
 	}
 
 	pub async fn add_client(&self, client: String) -> Result<(), ()> {
-		self.command_tx.send(StateCommand::AddClient(client)).await
+		self.command_tx
+			.send(StateCommand::AddClient(client))
+			.await
 			.map_err(|e| tracing::error!("Failed to send AddClient command: {e}"))
 	}
 
@@ -99,7 +112,10 @@ struct StateInner {
 
 impl StateInner {
 	fn new() -> Self {
-		Self { unique_id: uuid::Uuid::new_v4().to_string(), clients: Default::default() }
+		Self {
+			unique_id: uuid::Uuid::new_v4().to_string(),
+			clients: Default::default(),
+		}
 	}
 
 	async fn run(mut self, mut command_rx: mpsc::Receiver<StateCommand>) {
@@ -128,7 +144,6 @@ impl StateInner {
 					// TODO: Return error to caller.
 					let _ = self.add_client(client);
 				},
-
 				// StateCommand::RemoveClient(client, result_tx) => {
 				// 	if result_tx.send(self.remove_client(client)).is_err() {
 				// 		tracing::error!("Failed to send RemoveClient result.");
@@ -139,12 +154,17 @@ impl StateInner {
 	}
 
 	pub fn save<P: AsRef<Path>>(&self, file: P) -> Result<(), ()> {
-		let parent_dir = file.as_ref().parent().ok_or_else(|| tracing::error!("Failed to get state dir for file {:?}", file.as_ref()))?;
-		std::fs::create_dir_all(parent_dir)
-			.map_err(|e| tracing::error!("Failed to create state dir: {e}"))?;
+		let parent_dir = file
+			.as_ref()
+			.parent()
+			.ok_or_else(|| tracing::error!("Failed to get state dir for file {:?}", file.as_ref()))?;
+		std::fs::create_dir_all(parent_dir).map_err(|e| tracing::error!("Failed to create state dir: {e}"))?;
 
-		std::fs::write(file, toml::to_string_pretty(self).map_err(|e| tracing::error!("Failed to serialize state: {e}"))?)
-			.map_err(|e| tracing::error!("Failed to save state file: {e}"))
+		std::fs::write(
+			file,
+			toml::to_string_pretty(self).map_err(|e| tracing::error!("Failed to serialize state: {e}"))?,
+		)
+		.map_err(|e| tracing::error!("Failed to save state file: {e}"))
 	}
 
 	fn has_client(&self, key: &String) -> bool {

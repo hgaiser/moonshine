@@ -1,6 +1,6 @@
 use std::{path::Path, pin::Pin};
 
-use openssl::ssl::{SslMethod, SslFiletype, SslAcceptor, Ssl};
+use openssl::ssl::{Ssl, SslAcceptor, SslFiletype, SslMethod};
 use tokio::net::TcpStream;
 use tokio_openssl::SslStream;
 
@@ -20,7 +20,8 @@ impl TlsAcceptor {
 
 		let mut stream = tokio_openssl::SslStream::new(ssl, connection)
 			.map_err(|e| tracing::error!("Failed to create TLS stream: {}", e))?;
-		Pin::new(&mut stream).accept()
+		Pin::new(&mut stream)
+			.accept()
 			.await
 			.map_err(|e| tracing::error!("TLS handshake failed: {}", e))?;
 		Ok(stream)

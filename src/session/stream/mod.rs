@@ -1,7 +1,7 @@
 pub use self::{
-	audio::{AudioStreamContext, AudioStream},
-	video::{VideoStreamContext, VideoStream, VideoFormat, VideoDynamicRange, VideoChromaSampling},
+	audio::{AudioStream, AudioStreamContext},
 	control::ControlStream,
+	video::{VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStream, VideoStreamContext},
 };
 
 mod audio;

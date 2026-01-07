@@ -1,17 +1,14 @@
 use inputtino::{
-	BatteryState as InputtinoBatterState,
-	DeviceDefinition,
-	Joypad,
-	JoypadMotionType,
-	JoypadStickPosition,
-	PS5Joypad,
-	SwitchJoypad,
-	XboxOneJoypad
+	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
+	SwitchJoypad, XboxOneJoypad,
 };
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
-use crate::session::stream::control::{feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand}, FeedbackCommand};
+use crate::session::stream::control::{
+	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
+	FeedbackCommand,
+};
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
@@ -320,8 +317,8 @@ impl Gamepad {
 				XboxOneJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
 			),
 			GamepadKind::PlayStation => {
-				let mut gamepad = PS5Joypad::new(&definition)
-					.map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?;
+				let mut gamepad =
+					PS5Joypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?;
 
 				gamepad.set_on_led({
 					let feedback_tx = feedback_tx.clone();
@@ -331,8 +328,8 @@ impl Gamepad {
 							id: index as u16,
 							rgb: (r as u8, g as u8, b as u8),
 						}));
-					}}
-				);
+					}
+				});
 
 				gamepad.set_on_trigger_effect({
 					let feedback_tx = feedback_tx.clone();
@@ -362,23 +359,27 @@ impl Gamepad {
 							left: left.to_owned(),
 							right: right.to_owned(),
 						}));
-					}}
-				);
+					}
+				});
 
 				// Enable gyro and accelerometer events.
-				let _ = feedback_tx.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
-					id: info.index as u16,
-					report_rate: 100,
-					motion_type: JoypadMotionType::ACCELERATION as u8,
-				})).await;
-				let _ = feedback_tx.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
-					id: info.index as u16,
-					report_rate: 100,
-					motion_type: JoypadMotionType::GYROSCOPE as u8,
-				})).await;
+				let _ = feedback_tx
+					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
+						id: info.index as u16,
+						report_rate: 100,
+						motion_type: JoypadMotionType::ACCELERATION as u8,
+					}))
+					.await;
+				let _ = feedback_tx
+					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
+						id: info.index as u16,
+						report_rate: 100,
+						motion_type: JoypadMotionType::GYROSCOPE as u8,
+					}))
+					.await;
 
 				Joypad::PS5(gamepad)
-			}
+			},
 			GamepadKind::Nintendo => Joypad::Switch(
 				SwitchJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
 			),
@@ -403,9 +404,12 @@ impl Gamepad {
 		self.gamepad.set_pressed(update.button_flags as i32);
 
 		// Send analog triggers.
-		self.gamepad.set_stick(JoypadStickPosition::LS, update.left_stick.0, update.left_stick.1);
-		self.gamepad.set_stick(JoypadStickPosition::RS, update.right_stick.0, update.right_stick.1);
-		self.gamepad.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
+		self.gamepad
+			.set_stick(JoypadStickPosition::LS, update.left_stick.0, update.left_stick.1);
+		self.gamepad
+			.set_stick(JoypadStickPosition::RS, update.right_stick.0, update.right_stick.1);
+		self.gamepad
+			.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
 	}
 
 	pub fn touch(&mut self, touch: &GamepadTouch) {
@@ -424,7 +428,12 @@ impl Gamepad {
 
 	pub fn set_motion(&self, motion: &GamepadMotion) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
-			gamepad.set_motion(motion.motion_type, motion.x.to_radians(), motion.y.to_radians(), motion.z.to_radians());
+			gamepad.set_motion(
+				motion.motion_type,
+				motion.x.to_radians(),
+				motion.y.to_radians(),
+				motion.z.to_radians(),
+			);
 		}
 	}
 
@@ -440,7 +449,7 @@ impl Gamepad {
 				_ => {
 					tracing::warn!("Unknown battery state: {:?}", gamepad_battery.battery_state);
 					return;
-				}
+				},
 			};
 
 			gamepad.set_battery(state, gamepad_battery.battery_percentage);

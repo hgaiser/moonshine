@@ -1,5 +1,9 @@
-use std::{path::{PathBuf, Path}, collections::hash_map::DefaultHasher, hash::{Hash, Hasher}};
 use serde::{Deserialize, Serialize};
+use std::{
+	collections::hash_map::DefaultHasher,
+	hash::{Hash, Hasher},
+	path::{Path, PathBuf},
+};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
@@ -31,10 +35,10 @@ pub struct Config {
 impl Config {
 	#[allow(clippy::result_unit_err)]
 	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config, ()> {
-		let config = std::fs::read_to_string(file)
-			.map_err(|e| tracing::error!("Failed to open configuration file: {e}"))?;
-		let config: Config = toml::from_str(&config)
-			.map_err(|e| tracing::error!("Failed to parse configuration file: {e}"))?;
+		let config =
+			std::fs::read_to_string(file).map_err(|e| tracing::error!("Failed to open configuration file: {e}"))?;
+		let config: Config =
+			toml::from_str(&config).map_err(|e| tracing::error!("Failed to parse configuration file: {e}"))?;
 
 		Ok(config)
 	}
@@ -47,27 +51,20 @@ impl Default for Config {
 			address: "0.0.0.0".to_string(),
 			webserver: Default::default(),
 			stream: Default::default(),
-			applications: vec![
-				ApplicationConfig {
-					title: "Steam".to_string(),
-					command: vec![
-						"/usr/bin/steam".to_string(),
-						"steam://open/bigpicture".to_string(),
-					],
-					boxart: None,
-					enable_steam_integration: true,
-				},
-			],
-			application_scanners: vec![
-				ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
-					library: "$HOME/.local/share/Steam".into(),
-					command: vec![
-						"/usr/bin/steam".to_string(),
-						"-bigpicture".to_string(),
-						"steam://rungameid/{game_id}".to_string(),
-					],
-				}),
-			],
+			applications: vec![ApplicationConfig {
+				title: "Steam".to_string(),
+				command: vec!["/usr/bin/steam".to_string(), "steam://open/bigpicture".to_string()],
+				boxart: None,
+				enable_steam_integration: true,
+			}],
+			application_scanners: vec![ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
+				library: "$HOME/.local/share/Steam".into(),
+				command: vec![
+					"/usr/bin/steam".to_string(),
+					"-bigpicture".to_string(),
+					"steam://rungameid/{game_id}".to_string(),
+				],
+			})],
 			stream_timeout: 60,
 		}
 	}
@@ -195,7 +192,10 @@ pub struct AudioStreamConfig {
 
 impl Default for AudioStreamConfig {
 	fn default() -> Self {
-		Self { port: 48000, sink: None }
+		Self {
+			port: 48000,
+			sink: None,
+		}
 	}
 }
 

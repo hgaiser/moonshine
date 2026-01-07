@@ -1,10 +1,20 @@
-use std::{sync::Arc, collections::BTreeMap};
+use std::{collections::BTreeMap, sync::Arc};
 
 use async_shutdown::TriggerShutdownToken;
-use openssl::{hash::MessageDigest, pkey::{PKey, PKeyRef, Private}, md::Md, md_ctx::MdCtx, x509::X509, cipher::Cipher};
-use tokio::sync::{oneshot, mpsc, Notify};
+use openssl::{
+	cipher::Cipher,
+	hash::MessageDigest,
+	md::Md,
+	md_ctx::MdCtx,
+	pkey::{PKey, PKeyRef, Private},
+	x509::X509,
+};
+use tokio::sync::{mpsc, oneshot, Notify};
 
-use crate::{crypto::{encrypt, decrypt}, state::State};
+use crate::{
+	crypto::{decrypt, encrypt},
+	state::State,
+};
 
 /// A client that is not yet paired, but in the pairing process.
 pub struct PendingClient {
@@ -58,7 +68,6 @@ pub enum ClientManagerCommand {
 
 	/// Add a client to the list of paired clients.
 	AddClient(AddClientCommand),
-
 	// /// Remove client from the list of paired clients.
 	// RemoveClient(RemoveClientCommand),
 }
@@ -157,51 +166,69 @@ impl ClientManager {
 		shutdown_token: TriggerShutdownToken<i32>,
 	) -> Self {
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = ClientManagerInner { server_certs, server_pkey };
-		tokio::spawn(async move { inner.run(command_rx, state).await; drop(shutdown_token); });
+		let inner = ClientManagerInner {
+			server_certs,
+			server_pkey,
+		};
+		tokio::spawn(async move {
+			inner.run(command_rx, state).await;
+			drop(shutdown_token);
+		});
 
 		Self { command_tx }
 	}
 
 	pub async fn is_paired(&self, id: String) -> Result<bool, ()> {
 		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx.send(ClientManagerCommand::IsPaired(IsPairedCommand { id, response: response_tx }))
+		self.command_tx
+			.send(ClientManagerCommand::IsPaired(IsPairedCommand {
+				id,
+				response: response_tx,
+			}))
 			.await
 			.map_err(|e| tracing::error!("Failed to check paired status: {e}"))?;
 
-		response_rx.await
+		response_rx
+			.await
 			.map_err(|e| tracing::error!("Failed to receive IsPaired response: {e}"))?
 			.map_err(|e| tracing::error!("Failed to check paired status: {e}"))
 	}
 
 	pub async fn start_pairing(&self, pending_client: PendingClient) -> Result<(), ()> {
-		self.command_tx.send(ClientManagerCommand::StartPairing(StartPairingCommand { pending_client }))
+		self.command_tx
+			.send(ClientManagerCommand::StartPairing(StartPairingCommand {
+				pending_client,
+			}))
 			.await
 			.map_err(|e| tracing::error!("Failed to start pairing: {e}"))
 	}
 
 	pub async fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
 		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx.send(ClientManagerCommand::RegisterPin(RegisterPinCommand {
-			id: id.to_string(),
-			pin: pin.to_string(),
-			response: response_tx,
-		}))
+		self.command_tx
+			.send(ClientManagerCommand::RegisterPin(RegisterPinCommand {
+				id: id.to_string(),
+				pin: pin.to_string(),
+				response: response_tx,
+			}))
 			.await
 			.map_err(|e| tracing::error!("Failed to send pin to client manager: {e}"))?;
 
 		response_rx
 			.await
-			.map_err(|e| tracing::error!("Failed to wait for response to RegisterPin command from client manager: {e}"))?
+			.map_err(|e| {
+				tracing::error!("Failed to wait for response to RegisterPin command from client manager: {e}")
+			})?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
 
 	pub async fn add_client(&self, id: &str) -> Result<(), ()> {
 		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx.send(ClientManagerCommand::AddClient(AddClientCommand {
-			id: id.to_string(),
-			response: response_tx,
-		}))
+		self.command_tx
+			.send(ClientManagerCommand::AddClient(AddClientCommand {
+				id: id.to_string(),
+				response: response_tx,
+			}))
 			.await
 			.map_err(|e| tracing::error!("Failed to send AddClient command to client manager: {e}"))?;
 
@@ -213,49 +240,68 @@ impl ClientManager {
 
 	pub async fn client_challenge(&self, id: &str, challenge: Vec<u8>) -> Result<Vec<u8>, ()> {
 		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx.send(ClientManagerCommand::ClientChallenge(ClientChallengeCommand {
-			id: id.to_string(),
-			challenge,
-			response: response_tx,
-		}))
+		self.command_tx
+			.send(ClientManagerCommand::ClientChallenge(ClientChallengeCommand {
+				id: id.to_string(),
+				challenge,
+				response: response_tx,
+			}))
 			.await
 			.map_err(|e| tracing::error!("Failed to send client challenge to client manager: {e}"))?;
 
 		response_rx
 			.await
-			.map_err(|e| tracing::error!("Failed to wait for response to client challenge command from client manager: {e}"))?
+			.map_err(|e| {
+				tracing::error!("Failed to wait for response to client challenge command from client manager: {e}")
+			})?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
 
 	pub async fn server_challenge_response(&self, id: &str, challenge_response: Vec<u8>) -> Result<Vec<u8>, ()> {
 		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx.send(ClientManagerCommand::ServerChallengeResponse(ServerChallengeResponseCommand {
-			id: id.to_string(),
-			challenge_response,
-			response: response_tx,
-		}))
+		self.command_tx
+			.send(ClientManagerCommand::ServerChallengeResponse(
+				ServerChallengeResponseCommand {
+					id: id.to_string(),
+					challenge_response,
+					response: response_tx,
+				},
+			))
 			.await
 			.map_err(|e| tracing::error!("Failed to send server challenge response to client manager: {e}"))?;
 
 		response_rx
 			.await
-			.map_err(|e| tracing::error!("Failed to wait for response to server challenge response command from client manager: {e}"))?
+			.map_err(|e| {
+				tracing::error!(
+					"Failed to wait for response to server challenge response command from client manager: {e}"
+				)
+			})?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
 
 	pub async fn check_client_pairing_secret(&self, id: &str, client_secret: Vec<u8>) -> Result<(), ()> {
 		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx.send(ClientManagerCommand::CheckClientPairingSecret(CheckClientPairingSecretCommand {
-			id: id.to_string(),
-			client_secret,
-			response: response_tx,
-		}))
+		self.command_tx
+			.send(ClientManagerCommand::CheckClientPairingSecret(
+				CheckClientPairingSecretCommand {
+					id: id.to_string(),
+					client_secret,
+					response: response_tx,
+				},
+			))
 			.await
-			.map_err(|e| tracing::error!("Failed to send check client pairing secret response to client manager: {e}"))?;
+			.map_err(|e| {
+				tracing::error!("Failed to send check client pairing secret response to client manager: {e}")
+			})?;
 
 		response_rx
 			.await
-			.map_err(|e| tracing::error!("Failed to wait for response to check client pairing secret command from client manager: {e}"))?
+			.map_err(|e| {
+				tracing::error!(
+					"Failed to wait for response to check client pairing secret command from client manager: {e}"
+				)
+			})?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
 
@@ -287,17 +333,21 @@ impl ClientManagerInner {
 		let mut pending_clients = BTreeMap::new();
 		while let Some(command) = command_rx.recv().await {
 			match command {
-				ClientManagerCommand::IsPaired(command) => {
-					match state.has_client(command.id).await {
-						Ok(result) => {
-							command.response.send(Ok(result))
-								.map_err(|_| tracing::error!("Failed to send IsPaired response.")).ok();
-						},
-						Err(()) => {
-							command.response.send(Err("Failed to check client paired status.".to_string()))
-								.map_err(|_| tracing::error!("Failed to send IsPaired response.")).ok();
-						},
-					}
+				ClientManagerCommand::IsPaired(command) => match state.has_client(command.id).await {
+					Ok(result) => {
+						command
+							.response
+							.send(Ok(result))
+							.map_err(|_| tracing::error!("Failed to send IsPaired response."))
+							.ok();
+					},
+					Err(()) => {
+						command
+							.response
+							.send(Err("Failed to check client paired status.".to_string()))
+							.map_err(|_| tracing::error!("Failed to send IsPaired response."))
+							.ok();
+					},
 				},
 
 				ClientManagerCommand::StartPairing(command) => {
@@ -311,19 +361,28 @@ impl ClientManagerInner {
 								Ok(key) => key,
 								Err(e) => {
 									tracing::error!("Failed to create client key: {e}");
-									command.response.send(Err(e))
-										.map_err(|_| tracing::error!("Failed to send RegisterPin response.")).ok();
+									command
+										.response
+										.send(Err(e))
+										.map_err(|_| tracing::error!("Failed to send RegisterPin response."))
+										.ok();
 									continue;
-								}
+								},
 							};
 							client.key = Some(key);
 							client.pin_notify.notify_waiters();
-							command.response.send(Ok(()))
-								.map_err(|_| tracing::error!("Failed to send RegisterPin error.")).ok();
+							command
+								.response
+								.send(Ok(()))
+								.map_err(|_| tracing::error!("Failed to send RegisterPin error."))
+								.ok();
 						},
 						None => {
-							command.response.send(Err(format!("No known client with id {}", command.id)))
-								.map_err(|_| tracing::error!("Failed to send pin notify error.")).ok();
+							command
+								.response
+								.send(Err(format!("No known client with id {}", command.id)))
+								.map_err(|_| tracing::error!("Failed to send pin notify error."))
+								.ok();
 						},
 					};
 				},
@@ -333,20 +392,29 @@ impl ClientManagerInner {
 						Some(client) => {
 							match self.client_challenge(client, command.challenge).await {
 								Ok(response) => {
-									command.response.send(Ok(response))
-										.map_err(|_| tracing::error!("Failed to send ClientChallenge response.")).ok();
+									command
+										.response
+										.send(Ok(response))
+										.map_err(|_| tracing::error!("Failed to send ClientChallenge response."))
+										.ok();
 								},
 								Err(e) => {
 									tracing::error!("Failed to respond to client challenge: {e}");
-									command.response.send(Err(e))
-										.map_err(|_| tracing::error!("Failed to send ClientChallenge error.")).ok();
+									command
+										.response
+										.send(Err(e))
+										.map_err(|_| tracing::error!("Failed to send ClientChallenge error."))
+										.ok();
 									continue;
 								},
 							};
 						},
 						None => {
-							command.response.send(Err(format!("No known client with id {}", command.id)))
-								.map_err(|_| tracing::error!("Failed to send ClientChallenge response.")).ok();
+							command
+								.response
+								.send(Err(format!("No known client with id {}", command.id)))
+								.map_err(|_| tracing::error!("Failed to send ClientChallenge response."))
+								.ok();
 						},
 					};
 				},
@@ -356,20 +424,31 @@ impl ClientManagerInner {
 						Some(client) => {
 							match self.server_challenge_response(client, command.challenge_response).await {
 								Ok(response) => {
-									command.response.send(Ok(response))
-										.map_err(|_| tracing::error!("Failed to send ServerChallengeResponse response.")).ok();
+									command
+										.response
+										.send(Ok(response))
+										.map_err(|_| {
+											tracing::error!("Failed to send ServerChallengeResponse response.")
+										})
+										.ok();
 								},
 								Err(e) => {
 									tracing::error!("Failed to respond to server challenge: {e}");
-									command.response.send(Err(e))
-										.map_err(|_| tracing::error!("Failed to send ServerChallengeResponse error.")).ok();
+									command
+										.response
+										.send(Err(e))
+										.map_err(|_| tracing::error!("Failed to send ServerChallengeResponse error."))
+										.ok();
 									continue;
 								},
 							};
 						},
 						None => {
-							command.response.send(Err(format!("No known client with id {}", command.id)))
-								.map_err(|_| tracing::error!("Failed to send ServerChallengeResponse response.")).ok();
+							command
+								.response
+								.send(Err(format!("No known client with id {}", command.id)))
+								.map_err(|_| tracing::error!("Failed to send ServerChallengeResponse response."))
+								.ok();
 						},
 					};
 				},
@@ -379,46 +458,68 @@ impl ClientManagerInner {
 						Some(client) => {
 							match check_client_pairing_secret(client, command.client_secret).await {
 								Ok(()) => {
-									command.response.send(Ok(()))
-										.map_err(|_| tracing::error!("Failed to send CheckClientPairingSecret response.")).ok();
+									command
+										.response
+										.send(Ok(()))
+										.map_err(|_| {
+											tracing::error!("Failed to send CheckClientPairingSecret response.")
+										})
+										.ok();
 								},
 								Err(e) => {
 									tracing::error!("Failed to check client pairing secret: {e}");
-									command.response.send(Err(e))
-										.map_err(|_| tracing::error!("Failed to send CheckClientPairingSecret error.")).ok();
+									command
+										.response
+										.send(Err(e))
+										.map_err(|_| tracing::error!("Failed to send CheckClientPairingSecret error."))
+										.ok();
 									continue;
 								},
 							};
 						},
 						None => {
-							command.response.send(Err(format!("No known client with id {}", command.id)))
-								.map_err(|_| tracing::error!("Failed to send CheckClientPairingSecret response.")).ok();
+							command
+								.response
+								.send(Err(format!("No known client with id {}", command.id)))
+								.map_err(|_| tracing::error!("Failed to send CheckClientPairingSecret response."))
+								.ok();
 						},
 					};
 				},
 
 				ClientManagerCommand::AddClient(command) => {
 					let Ok(has_client) = state.has_client(command.id.clone()).await else {
-						command.response.send(Err("Failed to check client paired status.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response.")).ok();
+						command
+							.response
+							.send(Err("Failed to check client paired status.".to_string()))
+							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
+							.ok();
 						continue;
 					};
 
 					if has_client {
-						command.response.send(Err("Client is already paired, can't add it again.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response.")).ok();
+						command
+							.response
+							.send(Err("Client is already paired, can't add it again.".to_string()))
+							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
+							.ok();
 						continue;
 					}
 
 					if let Err(()) = state.add_client(command.id).await {
-						command.response.send(Err("Failed to add client.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response.")).ok();
+						command
+							.response
+							.send(Err("Failed to add client.".to_string()))
+							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
+							.ok();
 					} else {
-						command.response.send(Ok(()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response.")).ok();
+						command
+							.response
+							.send(Ok(()))
+							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
+							.ok();
 					}
 				},
-
 				// ClientManagerCommand::RemoveClient(command) => {
 				// 	pending_clients.remove(&command.id);
 				// 	let Ok(result) = state.remove_client(command.id).await else {
@@ -447,7 +548,7 @@ impl ClientManagerInner {
 			Some(key) => key,
 			None => {
 				return Err("Client has not provided a pin yet.".to_string());
-			}
+			},
 		};
 
 		// Generate a random server secret.
@@ -487,19 +588,20 @@ impl ClientManagerInner {
 			Some(key) => key,
 			None => {
 				return Err("Client has not provided a pin yet.".to_string());
-			}
+			},
 		};
 
 		let decrypted = decrypt(Cipher::aes_128_ecb(), &challenge_response, key)
 			.map_err(|e| format!("Failed to decrypt server challenge response: {e}"))?;
 		client.client_hash = Some(decrypted);
 
-		let server_secret = client.server_secret
+		let server_secret = client
+			.server_secret
 			.ok_or("Client does not have a server secret.".to_string())?;
 
 		let mut pairing_secret = server_secret.to_vec();
-		let signed = sign(&server_secret, &self.server_pkey)
-			.map_err(|e| format!("Failed to sign server secret: {e}"))?;
+		let signed =
+			sign(&server_secret, &self.server_pkey).map_err(|e| format!("Failed to sign server secret: {e}"))?;
 		pairing_secret.extend(signed);
 
 		Ok(pairing_secret)
@@ -518,7 +620,8 @@ fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
 }
 
 fn sign<T>(data: &[u8], key: &PKeyRef<T>) -> Result<Vec<u8>, openssl::error::ErrorStack>
-	where T: openssl::pkey::HasPrivate
+where
+	T: openssl::pkey::HasPrivate,
 {
 	// Create the signature.
 	let mut context = MdCtx::new()?;
@@ -537,15 +640,21 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 		Some(client_hash) => client_hash,
 		None => {
 			return Err("We did not yet receive a client hash.".to_string());
-		}
+		},
 	};
 
 	if client_secret.len() != 256 + 16 {
-		return Err(format!("Expected client pairing secret to be of size {}, but got {} bytes.", 256 + 16, client_secret.len()));
+		return Err(format!(
+			"Expected client pairing secret to be of size {}, but got {} bytes.",
+			256 + 16,
+			client_secret.len()
+		));
 	}
 	let server_challenge = match client.server_challenge {
 		Some(server_challenge) => server_challenge,
-		None => return Err("Client does not have a server challenge, possibly incorrect pairing procedure?".to_string()),
+		None => {
+			return Err("Client does not have a server challenge, possibly incorrect pairing procedure?".to_string())
+		},
 	};
 
 	let client_secret = &client_secret[..16];
@@ -559,7 +668,7 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 		Ok(data) => data,
 		Err(e) => {
 			return Err(format!("Failed to hash secret: {e}"));
-		}
+		},
 	};
 
 	if !data.to_vec().eq(client_hash) {
