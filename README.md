@@ -149,14 +149,18 @@ command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
 ## FAQ
 
 1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**
-   Both Moonshine and Sunshine fulfill the same goal.
-   However, Moonshine has a much narrower focus on supported software and hardware, whereas Sunshine attempts to support many different combinations.
-   Sunshine supports everything that Moonshine supports and much more.
-
-1. **So why should I use Moonshine?**
-   Realistically, you shouldn't.
-   If you're interested in how these applications work from a technical perspective, then I can recommend looking into the code.
-   Or if you think Sunshine has too many features and you want something simpler, give Moonshine a go ;).
+   There are two main differences between Sunshine and Moonshine:
+   1. Sunshine has a lot more features and wider hardware support.
+      It supports AMD and Intel GPUs, as well as Windows as a host OS.
+   2. Moonshine uses Gamescope for running applications in a headless environment.
+      This has a few benefits:
+      - It isolates the streaming session from the host desktop session.
+        This means that the host system can be used for other tasks while streaming games.
+        Note that this does not allow multi-seat gaming using controllers, as these are not isolated.
+        It might allow multi-seat gaming using keyboard and mouse since these input events are "injected" into the Gamescope session.
+      - It allows running applications that require a graphical environment without needing to have an active desktop session.
+        This is especially useful for headless servers, i.e. without a graphical environment.
+        This also means that no monitor (or HDMI dummy plug) needs to be connected to the GPU for Moonshine to work.
 
 ## Acknowledgement
 
