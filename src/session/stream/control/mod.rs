@@ -1,8 +1,8 @@
-use std::net::{SocketAddr, UdpSocket};
+use std::net::SocketAddr;
 
 use async_shutdown::ShutdownManager;
+use enet::Enet;
 use openssl::{cipher, symm};
-use rusty_enet as enet;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use self::{feedback::FeedbackCommand, input::InputHandler};
@@ -245,23 +245,40 @@ impl ControlStream {
 				.map_err(|e| tracing::error!("Failed to parse address ({}): {e}", config.address))?,
 			config.stream.control.port,
 		);
-		let socket = UdpSocket::bind(socket_address)
-			.map_err(|e| tracing::error!("Failed to bind to socket address ({}): {e}", socket_address))?;
-		let host = rusty_enet::Host::new(
-			socket,
-			enet::HostSettings {
-				peer_limit: 1,
-				channel_limit: 1,
-				..Default::default()
-			},
-		)
-		.map_err(|e| tracing::error!("Failed to create control host: {e}"))?;
 
 		tracing::debug!("Listening for control messages on {:?}", socket_address);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = ControlStreamInner {};
 		tokio::task::spawn_blocking(move || {
+			let enet = match Enet::new() {
+				Ok(enet) => enet,
+				Err(e) => {
+					tracing::error!("Failed to initialize enet: {e}");
+					return;
+				}
+			};
+			let local_addr = match socket_address {
+				SocketAddr::V4(addr) => enet::Address::from(addr),
+				SocketAddr::V6(_) => {
+					tracing::error!("IPv6 is not supported by enet");
+					return;
+				}
+			};
+			let host = match enet.create_host::<()>(
+				Some(&local_addr),
+				1,
+				enet::ChannelLimit::Limited(1),
+				enet::BandwidthLimit::Unlimited,
+				enet::BandwidthLimit::Unlimited
+			) {
+				Ok(host) => host,
+				Err(e) => {
+					tracing::error!("Failed to create enet host: {e}");
+					return;
+				}
+			};
+
 			tokio::runtime::Handle::current().block_on(inner.run(
 				config,
 				host,
@@ -293,7 +310,7 @@ impl ControlStreamInner {
 	pub async fn run(
 		&self,
 		config: Config,
-		mut host: enet::Host<UdpSocket>,
+		mut host: enet::Host<()>,
 		mut command_rx: mpsc::Receiver<ControlStreamCommand>,
 		video_stream: VideoStream,
 		audio_stream: AudioStream,
@@ -346,20 +363,25 @@ impl ControlStreamInner {
 				let packet = encode_control(&context.keys.remote_input_key, sequence_number, &payload);
 
 				if let Ok(packet) = packet {
-					for peer in host.connected_peers_mut() {
-						let _ = peer
-							.send(0, &enet::Packet::reliable(packet.as_slice()))
-							.map_err(|e| tracing::warn!("Failed to send rumble to peer: {e}"));
+					for mut peer in host.peers() {
+						if peer.state() != enet::PeerState::Connected {
+							continue;
+						}
+						if let Ok(packet) = enet::Packet::new(packet.as_slice(), enet::PacketMode::ReliableSequenced) {
+							let _ = peer
+								.send_packet(packet, 0)
+								.map_err(|e| tracing::warn!("Failed to send rumble to peer: {e}"));
+						}
 					}
 				}
 
 				sequence_number += 1;
 			}
 
-			match host.service().map_err(|e| tracing::error!("Failure in enet host: {e}")) {
+			match host.service(10).map_err(|e| tracing::error!("Failure in enet host: {e}")) {
 				Ok(Some(enet::Event::Connect { .. })) => {},
 				Ok(Some(enet::Event::Disconnect { .. })) => {},
-				Ok(Some(enet::Event::Receive { packet, .. })) => {
+				Ok(Some(enet::Event::Receive { ref packet, .. })) => {
 					let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 						Ok(control_message) => control_message,
 						Err(()) => break,
@@ -431,8 +453,6 @@ impl ControlStreamInner {
 				Ok(None) => (),
 				Err(_) => break,
 			}
-
-			std::thread::sleep(std::time::Duration::from_millis(1));
 		}
 
 		tracing::debug!("Control stream stopped.");
