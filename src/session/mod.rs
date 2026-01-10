@@ -1,7 +1,9 @@
 use std::process::Command;
 use std::process::{Child, Stdio};
+use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
+use enet::Enet;
 use manager::SessionShutdownReason;
 use tokio::sync::mpsc;
 
@@ -136,6 +138,7 @@ impl Session {
 		config: Config,
 		context: SessionContext,
 		stop_session_signal: ShutdownManager<SessionShutdownReason>,
+		enet: Arc<Enet>,
 	) -> Result<Self, ()> {
 		let default_sink = get_default_sink().ok();
 		let sink_name = "moonshine-sink".to_string();
@@ -167,6 +170,7 @@ impl Session {
 			gamescope_process: Some(gamescope_process),
 			audio_sink_module_id: Some(module_id),
 			audio_loopback_module_id: loopback_module_id,
+			enet,
 		};
 		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal));
 		Ok(Self {
@@ -215,6 +219,7 @@ struct SessionInner {
 	gamescope_process: Option<Child>,
 	audio_sink_module_id: Option<String>,
 	audio_loopback_module_id: Option<String>,
+	enet: Arc<Enet>,
 }
 
 impl SessionInner {
@@ -251,6 +256,7 @@ impl SessionInner {
 						audio_stream.clone(),
 						session_context.clone(),
 						stop_session_manager.clone(),
+						self.enet.clone(),
 					) {
 						Ok(control_stream) => control_stream,
 						Err(()) => {

@@ -313,15 +313,16 @@ impl RtspServer {
 			},
 		};
 
-		let dynamic_range: u32 = get_sdp_attribute(&sdp_session, "x-nv-video[0].dynamicRangeMode").unwrap_or_default();
+		let dynamic_range: u32 =
+			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].dynamicRangeMode").unwrap_or_default();
 		let dynamic_range = VideoDynamicRange::try_from(dynamic_range).unwrap_or_default();
 
 		let chroma_sampling_type: u32 =
-			get_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
+			get_optional_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
 		let chroma_sampling_type = VideoChromaSampling::try_from(chroma_sampling_type).unwrap_or_default();
 
 		let max_reference_frames: u32 =
-			get_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
+			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
 
 		let video_stream_context = VideoStreamContext {
 			width,
@@ -486,6 +487,15 @@ fn rtsp_response(
 	rtsp_types::Response::builder(version, status)
 		.header(headers::CSEQ, cseq.to_string())
 		.build(Vec::new())
+}
+
+fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Option<F> {
+	sdp_session
+		.get_first_attribute_value(attribute)
+		.ok()
+		.flatten()
+		.map(|s| s.trim())
+		.and_then(|s| s.parse().ok())
 }
 
 fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Result<F, ()> {

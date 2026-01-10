@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use enet::Enet;
@@ -235,6 +236,7 @@ impl ControlStream {
 		audio_stream: AudioStream,
 		context: SessionContext,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		enet: Arc<Enet>,
 	) -> Result<Self, ()> {
 		let input_handler = InputHandler::new(stop_session_manager.clone())?;
 
@@ -251,13 +253,6 @@ impl ControlStream {
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = ControlStreamInner {};
 		tokio::task::spawn_blocking(move || {
-			let enet = match Enet::new() {
-				Ok(enet) => enet,
-				Err(e) => {
-					tracing::error!("Failed to initialize enet: {e}");
-					return;
-				}
-			};
 			let local_addr = match socket_address {
 				SocketAddr::V4(addr) => enet::Address::from(addr),
 				SocketAddr::V6(_) => {
