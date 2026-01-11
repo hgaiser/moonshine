@@ -1,4 +1,4 @@
-[![CI](https://github.com/hgaiser/moonshine/workflows/CI/badge.svg)](https://github.com/hgaiser/moonshine/actions)
+[![CI](https://github.com/hgaiser/moonshine/workflows/Test/badge.svg)](https://github.com/hgaiser/moonshine/actions)
 
 # Moonshine
 
@@ -12,7 +12,7 @@ This means you can play games on the client device, while rendering is done by t
 1. **(Arch) Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux. Windows is currently not supported.
 1. **Moonlight v6.0.0 or higher**. Older versions are untested and might not work.
 
-> ⚠️ **Important**: There are [some](https://github.com/ValveSoftware/gamescope/pull/2023) [fixes](https://github.com/ValveSoftware/gamescope/pull/2022) applied to gamescope, so for now a [fork](https://github.com/hgaiser/gamescope/tree/moonshine) of Gamescope is required (also available on the [AUR](https://aur.archlinux.org/packages/gamescope-moonshine-git).
+> ⚠️ **Important**: There are [some](https://github.com/ValveSoftware/gamescope/pull/2023) [fixes](https://github.com/ValveSoftware/gamescope/pull/2022) applied to gamescope, so for now a [fork](https://github.com/hgaiser/gamescope/tree/moonshine) of Gamescope is required (also available on the [AUR](https://aur.archlinux.org/packages/gamescope-moonshine-git)).
 
 ## Installation
 
