@@ -31,14 +31,13 @@ jobs:
           gcc-libs \
           glib2 \
           glibc \
-          gstreamer \
-          gst-plugins-base-libs \
           libc++ \
           libevdev \
           libpulse \
           openssl \
           opus \
-          rust
+          rust \
+          shaderc
         source /etc/profile
       shell: bash
 

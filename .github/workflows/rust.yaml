@@ -30,15 +30,14 @@ jobs:
           gcc-libs \
           glib2 \
           glibc \
-          gstreamer \
-          gst-plugins-base-libs \
           jq \
           libc++ \
           libevdev \
           libpulse \
           openssl \
           opus \
-          rust
+          rust \
+          shaderc
 
     - name: Build
       run: |
