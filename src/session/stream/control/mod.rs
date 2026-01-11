@@ -3,14 +3,13 @@ use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use enet::Enet;
-use openssl::{cipher, symm};
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use self::{feedback::FeedbackCommand, input::InputHandler};
 use super::{AudioStream, VideoStream};
 use crate::{
 	config::Config,
-	crypto::encrypt,
+	crypto::{decrypt, encrypt},
 	session::{manager::SessionShutdownReason, SessionContext, SessionKeys},
 };
 
@@ -181,25 +180,21 @@ fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Ve
 	initialization_vector[10] = b'H';
 	initialization_vector[11] = b'C';
 
-	let cipher = cipher::Cipher::aes_128_gcm();
-
-	if key.len() != cipher.key_length() {
+	if key.len() != 16 {
 		tracing::warn!(
 			"Key length has {} bytes, but expected {} bytes.",
 			key.len(),
-			cipher.key_length()
+			16
 		);
 		return Err(());
 	}
 
 	let mut tag = [0u8; 16];
 	let payload = encrypt(
-		cipher,
 		payload,
-		Some(key),
-		Some(&initialization_vector),
-		Some(&mut tag),
-		true,
+		key,
+		&initialization_vector,
+		&mut tag,
 	)
 	.map_err(|e| tracing::warn!("Failed to encrypt control data: {e}"))?;
 
@@ -391,19 +386,17 @@ impl ControlStreamInner {
 						initialization_vector[10] = b'C';
 						initialization_vector[11] = b'C';
 
-						let decrypted_result = openssl::symm::decrypt_aead(
-							symm::Cipher::aes_128_gcm(),
-							&context.keys.remote_input_key,
-							Some(&initialization_vector),
-							&[],
+						let decrypted_result = decrypt(
 							&message.payload,
+							&context.keys.remote_input_key,
+							&initialization_vector,
 							&message.tag,
 						);
 
 						decrypted = match decrypted_result {
 							Ok(decrypted) => decrypted,
 							Err(e) => {
-								tracing::error!("Failed to decrypt control message: {:?}", e.errors());
+								tracing::error!("Failed to decrypt control message: {:?}", e);
 								continue;
 							},
 						};

@@ -1,10 +1,9 @@
 use async_shutdown::ShutdownManager;
-use openssl::cipher::Cipher;
 use reed_solomon_erasure::{galois_8, ReedSolomon};
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use crate::{
-	crypto::encrypt,
+	crypto::encrypt_cbc,
 	session::{manager::SessionShutdownReason, stream::RtpHeader, SessionKeys},
 };
 
@@ -183,13 +182,10 @@ impl AudioEncoderInner {
 			let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
 			let mut iv = iv.to_be_bytes().to_vec();
 			iv.extend([0u8; 12]);
-			let payload = match encrypt(
-				Cipher::aes_128_cbc(),
+			let payload = match encrypt_cbc(
 				&encoded_audio[..encoded_size],
-				Some(&keys.remote_input_key),
-				Some(&iv),
-				None,
-				true,
+				&keys.remote_input_key,
+				&iv,
 			) {
 				Ok(payload) => payload,
 				Err(e) => {

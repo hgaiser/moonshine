@@ -12,11 +12,11 @@ use crate::webserver::Webserver;
 use async_shutdown::ShutdownManager;
 use clap::Parser;
 use enet::Enet;
-use openssl::pkey::PKey;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
+use rustls::crypto::CryptoProvider;
 
 mod app_scanner;
 mod clients;
@@ -44,9 +44,18 @@ async fn main() -> Result<(), ()> {
 		.with(EnvFilter::from_default_env())
 		.init();
 
+	// Ensure rustls has a single crypto provider selected at process start.
+	// When multiple crypto backends (ring, aws-lc-rs) are present the crate
+	// requires an explicit choice. Install the default provider now.
+	// Prefer the `ring` provider explicitly to avoid runtime ambiguity
+	// when multiple crypto backends are present in the dependency graph.
+	// Construct the provider from the `ring` module and install it.
+	let provider = rustls::crypto::ring::default_provider();
+	let _ = provider.install_default();
+
 	let mut config;
 	if args.config.exists() {
-		config = Config::read_from_file(args.config).map_err(|_| std::process::exit(1))?;
+		config = Config::read_from_file(args.config).unwrap_or_else(|()| std::process::exit(1));
 	} else {
 		tracing::info!(
 			"No config file found at {}, creating a default config file.",
@@ -147,11 +156,7 @@ impl Moonshine {
 				.map_err(|e| tracing::error!("Failed to create certificate directory: {e}"))?;
 			let mut certfile = std::fs::File::create(&config.webserver.certificate).unwrap();
 			certfile
-				.write(
-					&cert
-						.to_pem()
-						.map_err(|e| tracing::error!("Failed to serialize PEM: {e}"))?,
-				)
+				.write(cert.as_bytes())
 				.map_err(|e| tracing::error!("Failed to write PEM to file: {e}"))?;
 
 			// Write private key to file.
@@ -164,11 +169,7 @@ impl Moonshine {
 				.map_err(|e| tracing::error!("Failed to create private key directory: {e}"))?;
 			let mut keyfile = std::fs::File::create(&config.webserver.private_key).unwrap();
 			keyfile
-				.write(
-					&pkey
-						.private_key_to_pem_pkcs8()
-						.map_err(|e| tracing::error!("Failed to serialize private key: {e}"))?,
-				)
+				.write(pkey.as_bytes())
 				.map_err(|e| tracing::error!("Failed to write private key to file: {e}"))?;
 
 			tracing::debug!("Saved private key to {}", config.webserver.certificate.display());
@@ -176,16 +177,11 @@ impl Moonshine {
 
 			(cert, pkey)
 		} else {
-			let cert = std::fs::read(&config.webserver.certificate)
+			let cert = std::fs::read_to_string(&config.webserver.certificate)
 				.map_err(|e| tracing::error!("Failed to read server certificate: {e}"))?;
-			let cert = openssl::x509::X509::from_pem(&cert)
-				.map_err(|e| tracing::error!("Failed to parse server certificate: {e}"))?;
 
-			let pkey = PKey::private_key_from_pem(
-				&std::fs::read(&config.webserver.private_key)
-					.map_err(|e| tracing::error!("Failed to read private key: {e}"))?,
-			)
-			.map_err(|e| tracing::error!("Failed to parse private key: {e}"))?;
+			let pkey = std::fs::read_to_string(&config.webserver.private_key)
+				.map_err(|e| tracing::error!("Failed to read private key: {e}"))?;
 
 			(cert, pkey)
 		};

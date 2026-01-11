@@ -1,42 +1,56 @@
-use std::{path::Path, pin::Pin};
+use std::fs::File;
+use std::io::BufReader;
+use std::path::Path;
+use std::sync::Arc;
 
-use openssl::ssl::{Ssl, SslAcceptor, SslFiletype, SslMethod};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::ServerConfig;
 use tokio::net::TcpStream;
-use tokio_openssl::SslStream;
+use tokio_rustls::{server::TlsStream, TlsAcceptor as TlsAcceptorTokio};
 
 pub struct TlsAcceptor {
-	acceptor: SslAcceptor,
+	acceptor: TlsAcceptorTokio,
 }
 
 impl TlsAcceptor {
 	pub fn from_config<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<Self, ()> {
-		let acceptor = load_tls_files(certificate, private_key)?;
+		let config = load_tls_files(certificate, private_key)?;
+		let acceptor = TlsAcceptorTokio::from(Arc::new(config));
 		Ok(Self { acceptor })
 	}
 
-	pub async fn accept(&self, connection: TcpStream) -> Result<SslStream<TcpStream>, ()> {
-		let ssl = Ssl::new(self.acceptor.context())
-			.map_err(|e| tracing::error!("Failed to initialize TLS session: {}", e))?;
-
-		let mut stream = tokio_openssl::SslStream::new(ssl, connection)
-			.map_err(|e| tracing::error!("Failed to create TLS stream: {}", e))?;
-		Pin::new(&mut stream)
-			.accept()
+	pub async fn accept(&self, connection: TcpStream) -> Result<TlsStream<TcpStream>, ()> {
+		let stream = self
+			.acceptor
+			.accept(connection)
 			.await
 			.map_err(|e| tracing::error!("TLS handshake failed: {}", e))?;
 		Ok(stream)
 	}
 }
 
-fn load_tls_files<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<SslAcceptor, ()> {
-	let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls_server())
-		.map_err(|e| tracing::error!("Failed to initialize SSL acceptor: {}", e))?;
-	builder
-		.set_private_key_file(&private_key, SslFiletype::PEM)
-		.map_err(|e| tracing::error!("Failed to set private key file '{:?}': {}", private_key.as_ref(), e))?;
-	builder
-		.set_certificate_chain_file(&certificate)
-		.map_err(|e| tracing::error!("Failed to set certificate file '{:?}': {}", certificate.as_ref(), e))?;
+fn load_tls_files<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<ServerConfig, ()> {
+    let certs = load_certs(certificate.as_ref())?;
+    let key = load_private_key(private_key.as_ref())?;
 
-	Ok(builder.build())
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(certs, key)
+        .map_err(|e| tracing::error!("Failed to create TLS configuration: {}", e))?;
+    
+    Ok(config)
+}
+
+fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, ()> {
+    let mut reader = BufReader::new(File::open(path).map_err(|e| tracing::error!("Failed to open certificate file: {}", e))?);
+    rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| tracing::error!("Failed to load certificate: {}", e))
+}
+
+fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ()> {
+    let mut reader = BufReader::new(File::open(path).map_err(|e| tracing::error!("Failed to open private key file: {}", e))?);
+    rustls_pemfile::private_key(&mut reader)
+        .map_err(|e| tracing::error!("Failed to load private key: {}", e))?
+        .ok_or_else(|| tracing::error!("No private key found in file"))
 }

@@ -1,28 +1,25 @@
 use std::{collections::BTreeMap, sync::Arc};
 
+use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
+use aes::Aes128;
 use async_shutdown::TriggerShutdownToken;
-use openssl::{
-	cipher::Cipher,
-	hash::MessageDigest,
-	md::Md,
-	md_ctx::MdCtx,
-	pkey::{PKey, PKeyRef, Private},
-	x509::X509,
+use ring::{
+	rand::{SecureRandom, SystemRandom},
+	signature::{RsaKeyPair, RSA_PKCS1_SHA256},
 };
+use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, Notify};
+use x509_parser::prelude::*;
 
-use crate::{
-	crypto::{decrypt, encrypt},
-	state::State,
-};
+use crate::state::State;
 
 /// A client that is not yet paired, but in the pairing process.
 pub struct PendingClient {
 	/// Unique id of the client.
 	pub id: String,
 
-	/// Client certificate used for secure communication.
-	pub pem: X509,
+	/// Client certificate used for secure communication (PEM format).
+	pub pem: String,
 
 	/// Salt provided by the client to use for encryption.
 	pub salt: [u8; 16],
@@ -68,8 +65,6 @@ pub enum ClientManagerCommand {
 
 	/// Add a client to the list of paired clients.
 	AddClient(AddClientCommand),
-	// /// Remove client from the list of paired clients.
-	// RemoveClient(RemoveClientCommand),
 }
 
 /// Query the manager to check if this unique id is paired or not.
@@ -144,15 +139,6 @@ pub struct AddClientCommand {
 	pub response: oneshot::Sender<Result<(), String>>,
 }
 
-// /// Remove client from the list of paired clients.
-// pub struct RemoveClientCommand {
-// 	/// Id of the client.
-// 	pub id: String,
-
-// 	/// Channel used to provide a response.
-// 	pub response: oneshot::Sender<Result<(), String>>,
-// }
-
 #[derive(Clone)]
 pub struct ClientManager {
 	command_tx: mpsc::Sender<ClientManagerCommand>,
@@ -161,8 +147,8 @@ pub struct ClientManager {
 impl ClientManager {
 	pub fn new(
 		state: State,
-		server_certs: X509,
-		server_pkey: PKey<Private>,
+		server_certs: String,
+		server_pkey: String,
 		shutdown_token: TriggerShutdownToken<i32>,
 	) -> Self {
 		let (command_tx, command_rx) = mpsc::channel(10);
@@ -304,26 +290,11 @@ impl ClientManager {
 			})?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
-
-	// pub async fn remove_client(&self, id: &str) -> Result<(), ()> {
-	// 	let (response_tx, response_rx) = oneshot::channel();
-	// 	self.command_tx.send(ClientManagerCommand::RemoveClient(RemoveClientCommand {
-	// 		id: id.to_string(),
-	// 		response: response_tx,
-	// 	}))
-	// 		.await
-	// 		.map_err(|e| tracing::error!("Failed to send remove client command to client manager: {e}"))?;
-
-	// 	response_rx
-	// 		.await
-	// 		.map_err(|e| tracing::error!("Failed to wait for response to remove client command from client manager: {e}"))?
-	// 		.map_err(|e| tracing::warn!("{e}"))
-	// }
 }
 
 struct ClientManagerInner {
-	server_certs: X509,
-	server_pkey: PKey<Private>,
+	server_certs: String,
+	server_pkey: String,
 }
 
 impl ClientManagerInner {
@@ -520,23 +491,6 @@ impl ClientManagerInner {
 							.ok();
 					}
 				},
-				// ClientManagerCommand::RemoveClient(command) => {
-				// 	pending_clients.remove(&command.id);
-				// 	let Ok(result) = state.remove_client(command.id).await else {
-				// 		command.response.send(Err("Failed to remove client.".to_string()))
-				// 			.map_err(|_| tracing::error!("Failed to send RemoveClient command response.")).ok();
-				// 		continue;
-				// 	};
-
-				// 	if !result {
-				// 		command.response.send(Err("Client is not known, can't remove it.".to_string()))
-				// 			.map_err(|_| tracing::error!("Failed to send remove client command response.")).ok();
-				// 		continue;
-				// 	}
-
-				// 	command.response.send(Ok(()))
-				// 		.map_err(|_| tracing::error!("Failed to send remove client command response.")).ok();
-				// },
 			}
 		}
 
@@ -553,27 +507,34 @@ impl ClientManagerInner {
 
 		// Generate a random server secret.
 		let mut server_secret = [0u8; 16];
-		openssl::rand::rand_bytes(&mut server_secret)
-			.map_err(|e| format!("Failed to create random server secret: {e}"))?;
+        SystemRandom::new().fill(&mut server_secret).map_err(|_| "Failed to generate random".to_string())?;
+
 		client.server_secret = Some(server_secret);
 
-		let mut decrypted = decrypt(Cipher::aes_128_ecb(), &challenge, key)
+		let mut decrypted = aes_decrypt_ecb(&challenge, key)
 			.map_err(|e| format!("Failed to decrypt client challenge: {e}"))?;
-		decrypted.extend_from_slice(self.server_certs.signature().as_slice());
+		
+        // Parse server cert to get signature
+        let signature_bytes = extract_certificate_signature(&self.server_certs)
+            .map_err(|e| format!("Failed to extract server cert signature: {e}"))?;
+
+		decrypted.extend_from_slice(&signature_bytes);
 		decrypted.extend_from_slice(&server_secret);
 
 		let mut server_challenge = [0u8; 16];
-		openssl::rand::rand_bytes(&mut server_challenge)
-			.map_err(|e| format!("Failed to create random server challenge: {e}"))?;
+        SystemRandom::new().fill(&mut server_challenge).map_err(|_| "Failed to generate random".to_string())?;
+
 		client.server_challenge = Some(server_challenge);
 
-		let mut challenge_response = openssl::hash::hash(MessageDigest::sha256(), decrypted.as_slice())
-			.map_err(|e| format!("Failed to hash client challenge response: {e}"))?
-			.to_vec();
-		challenge_response.extend(server_challenge);
+        let mut hasher = Sha256::new();
+        hasher.update(decrypted.as_slice());
+        let challenge_response_hash = hasher.finalize();
+        
+        // Construct decrypted payload: hash + server_challenge
+        let mut challenge_response_decrypted = challenge_response_hash.to_vec();
+		challenge_response_decrypted.extend(server_challenge);
 
-		let cipher = Cipher::aes_128_ecb();
-		let challenge_response = encrypt(cipher, &challenge_response, Some(key), None, None, false)
+		let challenge_response = aes_encrypt_ecb(&challenge_response_decrypted, key)
 			.map_err(|e| format!("Failed to encrypt client challenge response: {e}"))?;
 
 		Ok(challenge_response)
@@ -591,7 +552,7 @@ impl ClientManagerInner {
 			},
 		};
 
-		let decrypted = decrypt(Cipher::aes_128_ecb(), &challenge_response, key)
+		let decrypted = aes_decrypt_ecb(&challenge_response, key)
 			.map_err(|e| format!("Failed to decrypt server challenge response: {e}"))?;
 		client.client_hash = Some(decrypted);
 
@@ -612,27 +573,43 @@ fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
 	let mut key = Vec::with_capacity(salt.len() + pin.len());
 	key.extend(salt);
 	key.extend(pin.as_bytes());
-	openssl::hash::hash(MessageDigest::sha256(), &key)
-		.map_err(|e| format!("Failed to hash key for client: {e}"))?
-		.to_vec()[..16]
+    
+    let mut hasher = Sha256::new();
+    hasher.update(&key);
+    let hash = hasher.finalize();
+    
+	hash[..16]
 		.try_into()
 		.map_err(|e| format!("Received unexpected key result: {e}"))
 }
 
-fn sign<T>(data: &[u8], key: &PKeyRef<T>) -> Result<Vec<u8>, openssl::error::ErrorStack>
-where
-	T: openssl::pkey::HasPrivate,
-{
-	// Create the signature.
-	let mut context = MdCtx::new()?;
-	context.digest_sign_init(Some(Md::sha256()), key)?;
-	context.digest_sign_update(data)?;
+fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
+    // Extract key from PEM using rustls-pemfile
+    let key_bytes = {
+        let mut reader = std::io::Cursor::new(key_pem.as_bytes());
+        match rustls_pemfile::private_key(&mut reader) {
+            Ok(Some(key)) => key.secret_der().to_vec(),
+            Ok(None) => return Err("No key found in PEM".to_string()),
+            Err(e) => return Err(format!("Failed to parse key PEM: {}", e)), 
+        }
+    };
+    
+    // We strictly use RSA for Moonshine hosting
+    let key_pair = RsaKeyPair::from_pkcs8(
+        &key_bytes,
+    ).map_err(|e| format!("Failed to load RSA key pair: {}", e))?;
 
-	// let mut signature = [0u8; 256];
-	let mut signature = Vec::new();
-	context.digest_sign_final_to_vec(&mut signature)?;
+    let rng = SystemRandom::new();
+    let mut signature = vec![0; key_pair.public().modulus_len()];
+    
+    key_pair.sign(&RSA_PKCS1_SHA256, &rng, data, &mut signature).map_err(|e| format!("Failed to sign data: {}", e))?;
+    Ok(signature)
+}
 
-	Ok(signature)
+fn extract_certificate_signature(pem: &str) -> Result<Vec<u8>, String> {
+    let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).map_err(|e| format!("Failed to parse PEM: {}", e))?;
+    let cert = pem_obj.parse_x509().map_err(|e| format!("Failed to parse X509: {}", e))?;
+    Ok(cert.signature_value.data.to_vec())
 }
 
 async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> Result<(), String> {
@@ -643,37 +620,67 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 		},
 	};
 
-	if client_secret.len() != 256 + 16 {
-		return Err(format!(
-			"Expected client pairing secret to be of size {}, but got {} bytes.",
-			256 + 16,
-			client_secret.len()
-		));
-	}
 	let server_challenge = match client.server_challenge {
 		Some(server_challenge) => server_challenge,
 		None => {
 			return Err("Client does not have a server challenge, possibly incorrect pairing procedure?".to_string())
 		},
 	};
+    
+    // We expect at least 16 bytes.
+    if client_secret.len() < 16 {
+		return Err(format!("Expected client pairing secret to be at least 16 bytes, but got {}", client_secret.len()));
+    }
 
-	let client_secret = &client_secret[..16];
-	// let signed_client_secret = &client_pairing_secret[16..];
+	let client_secret_payload = &client_secret[..16];
+    // Remaining bytes are ignored (signature of the secret by client).
+    // Original code seemed to construct data with CLIENT CERT SIGNATURE + CLIENT SECRET PAYLOAD (16 bytes).
 
 	let mut data = server_challenge.to_vec();
-	data.extend(client.pem.signature().as_slice());
-	data.extend(client_secret);
+    
+    let signature_bytes = extract_certificate_signature(&client.pem)
+        .map_err(|e| format!("Failed to extract client cert signature: {e}"))?;
+        
+	data.extend(signature_bytes);
+	data.extend(client_secret_payload);
 
-	let data = match openssl::hash::hash(MessageDigest::sha256(), &data) {
-		Ok(data) => data,
-		Err(e) => {
-			return Err(format!("Failed to hash secret: {e}"));
-		},
-	};
+    let mut hasher = Sha256::new();
+    hasher.update(&data);
+    let hash = hasher.finalize();
 
-	if !data.to_vec().eq(client_hash) {
+	if !hash.to_vec().eq(client_hash) {
 		return Err("Client hash is not as expected, MITM?".to_string());
 	}
 
 	Ok(())
+}
+
+fn aes_encrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    if data.len() % 16 != 0 {
+        return Err(format!("Data length {} not a multiple of 16", data.len()));
+    }
+    
+    let mut encrypted = data.to_vec();
+    for block in encrypted.chunks_mut(16) {
+        let mut gblock = GenericArray::clone_from_slice(block);
+        cipher.encrypt_block(&mut gblock);
+        block.copy_from_slice(&gblock);
+    }
+    Ok(encrypted)
+}
+
+fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
+    let cipher = Aes128::new(GenericArray::from_slice(key));
+    if data.len() % 16 != 0 {
+        return Err(format!("Data length {} not a multiple of 16", data.len()));
+    }
+    
+    let mut decrypted = data.to_vec();
+    for block in decrypted.chunks_mut(16) {
+        let mut gblock = GenericArray::clone_from_slice(block);
+        cipher.decrypt_block(&mut gblock);
+        block.copy_from_slice(&gblock);
+    }
+    Ok(decrypted)
 }

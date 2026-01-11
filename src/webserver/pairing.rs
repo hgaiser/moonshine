@@ -29,7 +29,7 @@ pub async fn handle_pair_request(
 	request: Request<hyper::body::Incoming>,
 	mut params: HashMap<String, String>,
 	local_address: Option<SocketAddr>,
-	server_certs: &openssl::x509::X509,
+	server_certs: &str, // Pass as string (PEM)
 	client_manager: &ClientManager,
 ) -> Response<Full<Bytes>> {
 	if params.contains_key("phrase") {
@@ -59,7 +59,7 @@ async fn get_server_cert(
 	request: Request<hyper::body::Incoming>,
 	mut params: HashMap<String, String>,
 	local_address: Option<SocketAddr>,
-	server_pem: &openssl::x509::X509,
+	server_pem_str: &str,
 	client_manager: &ClientManager,
 ) -> Response<Full<Bytes>> {
 	let client_cert = match params.remove("clientcert") {
@@ -81,6 +81,16 @@ async fn get_server_cert(
 			return bad_request(message);
 		},
 	};
+    
+    // PEM is expected to be a string
+    let client_pem = match String::from_utf8(client_cert) {
+        Ok(s) => s,
+        Err(e) => {
+            let message = format!("Failed to parse client cert as utf8: {e}");
+            tracing::warn!("{message}");
+            return bad_request(message);
+        }
+    };
 
 	let unique_id = match params.remove("uniqueid") {
 		Some(unique_id) => unique_id,
@@ -119,19 +129,10 @@ async fn get_server_cert(
 		},
 	};
 
-	let pem = match openssl::x509::X509::from_pem(client_cert.as_slice()) {
-		Ok(pem) => pem,
-		Err(e) => {
-			let message = format!("{e}");
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
-
 	let pin_notifier = {
 		let pending_client = PendingClient {
 			id: unique_id.clone(),
-			pem,
+			pem: client_pem,
 			salt,
 			pin_notify: Arc::new(Notify::new()),
 			key: None,
@@ -188,16 +189,7 @@ async fn get_server_cert(
 	let mut response = "<root status_code=\"200\">".to_string();
 	response += "<paired>1</paired>";
 
-	let serialized_server_pem = match server_pem.to_pem() {
-		Ok(pem) => pem,
-		Err(e) => {
-			let message = format!("{e}");
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
-
-	response += &format!("<plaincert>{}</plaincert>", hex::encode(serialized_server_pem));
+	response += &format!("<plaincert>{}</plaincert>", hex::encode(server_pem_str));
 	response += "</root>";
 
 	let mut response = Response::new(Full::new(Bytes::from(response)));
