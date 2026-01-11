@@ -33,6 +33,7 @@ jobs:
           glibc \
           libc++ \
           libevdev \
+          libpipewire \
           libpulse \
           openssl \
           opus \

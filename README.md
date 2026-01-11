@@ -49,6 +49,7 @@ glibc
 jq
 libc++
 libevdev
+libpipewire
 libpulse
 openssl
 opus
@@ -69,6 +70,7 @@ $ sudo pacman -S \
    jq \
    libc++ \
    libevdev \
+   libpipewire \
    libpulse \
    openssl \
    opus \

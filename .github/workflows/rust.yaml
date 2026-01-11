@@ -33,6 +33,7 @@ jobs:
           jq \
           libc++ \
           libevdev \
+          libpipewire \
           libpulse \
           openssl \
           opus \
