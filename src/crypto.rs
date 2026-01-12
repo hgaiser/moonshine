@@ -20,7 +20,7 @@ pub fn create_certificate() -> Result<(String, String), Box<dyn std::error::Erro
 	let mut params = CertificateParams::default();
 	params.not_before = SystemTime::now().into();
 	params.not_after = (SystemTime::now() + Duration::from_secs(3650 * 24 * 60 * 60)).into();
-	params.serial_number = Some(SerialNumber::from(rng.next_u64())); 
+	params.serial_number = Some(SerialNumber::from(rng.next_u64()));
 
 	let mut distinguished_name = DistinguishedName::new();
 	distinguished_name.push(DnType::CommonName, "Moonshine");
@@ -52,7 +52,7 @@ pub fn encrypt(
 	// In OpenSSL, encrypting with GCM returns ciphertext usually without tag appended if you use `tag()` to retrieve it separate.
 	// aes-gcm crate append tag to ciphertext.
 	let mut ciphertext = cipher.encrypt(nonce, plaintext)?;
-	
+
 	// Split tag from ciphertext
 	let tag_len = 16;
 	let len = ciphertext.len();
@@ -60,7 +60,7 @@ pub fn encrypt(
 		return Err(aes_gcm::Error);
 	}
 	let actual_ciphertext_len = len - tag_len;
-	
+
 	tag.copy_from_slice(&ciphertext[actual_ciphertext_len..]);
 	ciphertext.truncate(actual_ciphertext_len);
 
@@ -81,25 +81,19 @@ pub fn decrypt(ciphertext: &[u8], key: &[u8], iv: &[u8], tag: &[u8]) -> Result<V
 }
 
 pub fn encrypt_cbc(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, String> {
-    let key = match key.try_into() {
-        Ok(k) => k,
-        Err(_) => return Err("Invalid key length".to_string()),
-    };
-    let iv = match iv.try_into() {
-        Ok(iv) => iv,
-        Err(_) => return Err("Invalid IV length".to_string()),
-    };
-    
-    let cipher = cbc::Encryptor::<aes::Aes128>::new(key, iv);
-    
-    let mut buffer = vec![0u8; data.len() + 16];
-    let pos = data.len();
-    buffer[..pos].copy_from_slice(data);
-    
-    let ct_len = cipher.encrypt_padded_mut::<block_padding::Pkcs7>(&mut buffer, pos)
-        .map_err(|e| format!("Padding error: {:?}", e))?
-        .len();
-    
-    buffer.truncate(ct_len);
-    Ok(buffer)
+	let key = key.into();
+	let iv = iv.into();
+
+	let cipher = cbc::Encryptor::<aes::Aes128>::new(key, iv);
+
+	let mut buffer = vec![0u8; data.len() + 16];
+	let pos = data.len();
+	buffer[..pos].copy_from_slice(data);
+
+	let ct_len = cipher.encrypt_padded_mut::<block_padding::Pkcs7>(&mut buffer, pos)
+		.map_err(|e| format!("Padding error: {:?}", e))?
+		.len();
+
+	buffer.truncate(ct_len);
+	Ok(buffer)
 }

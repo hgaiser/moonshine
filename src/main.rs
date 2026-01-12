@@ -16,7 +16,6 @@ use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
-use rustls::crypto::CryptoProvider;
 
 mod app_scanner;
 mod clients;

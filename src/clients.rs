@@ -507,31 +507,31 @@ impl ClientManagerInner {
 
 		// Generate a random server secret.
 		let mut server_secret = [0u8; 16];
-        SystemRandom::new().fill(&mut server_secret).map_err(|_| "Failed to generate random".to_string())?;
+		SystemRandom::new().fill(&mut server_secret).map_err(|_| "Failed to generate random".to_string())?;
 
 		client.server_secret = Some(server_secret);
 
 		let mut decrypted = aes_decrypt_ecb(&challenge, key)
 			.map_err(|e| format!("Failed to decrypt client challenge: {e}"))?;
-		
-        // Parse server cert to get signature
-        let signature_bytes = extract_certificate_signature(&self.server_certs)
-            .map_err(|e| format!("Failed to extract server cert signature: {e}"))?;
+
+		// Parse server cert to get signature
+		let signature_bytes = extract_certificate_signature(&self.server_certs)
+			.map_err(|e| format!("Failed to extract server cert signature: {e}"))?;
 
 		decrypted.extend_from_slice(&signature_bytes);
 		decrypted.extend_from_slice(&server_secret);
 
 		let mut server_challenge = [0u8; 16];
-        SystemRandom::new().fill(&mut server_challenge).map_err(|_| "Failed to generate random".to_string())?;
+		SystemRandom::new().fill(&mut server_challenge).map_err(|_| "Failed to generate random".to_string())?;
 
 		client.server_challenge = Some(server_challenge);
 
-        let mut hasher = Sha256::new();
-        hasher.update(decrypted.as_slice());
-        let challenge_response_hash = hasher.finalize();
-        
-        // Construct decrypted payload: hash + server_challenge
-        let mut challenge_response_decrypted = challenge_response_hash.to_vec();
+		let mut hasher = Sha256::new();
+		hasher.update(decrypted.as_slice());
+		let challenge_response_hash = hasher.finalize();
+
+		// Construct decrypted payload: hash + server_challenge
+		let mut challenge_response_decrypted = challenge_response_hash.to_vec();
 		challenge_response_decrypted.extend(server_challenge);
 
 		let challenge_response = aes_encrypt_ecb(&challenge_response_decrypted, key)
@@ -573,43 +573,43 @@ fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
 	let mut key = Vec::with_capacity(salt.len() + pin.len());
 	key.extend(salt);
 	key.extend(pin.as_bytes());
-    
-    let mut hasher = Sha256::new();
-    hasher.update(&key);
-    let hash = hasher.finalize();
-    
+
+	let mut hasher = Sha256::new();
+	hasher.update(&key);
+	let hash = hasher.finalize();
+
 	hash[..16]
 		.try_into()
 		.map_err(|e| format!("Received unexpected key result: {e}"))
 }
 
 fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
-    // Extract key from PEM using rustls-pemfile
-    let key_bytes = {
-        let mut reader = std::io::Cursor::new(key_pem.as_bytes());
-        match rustls_pemfile::private_key(&mut reader) {
-            Ok(Some(key)) => key.secret_der().to_vec(),
-            Ok(None) => return Err("No key found in PEM".to_string()),
-            Err(e) => return Err(format!("Failed to parse key PEM: {}", e)), 
-        }
-    };
-    
-    // We strictly use RSA for Moonshine hosting
-    let key_pair = RsaKeyPair::from_pkcs8(
-        &key_bytes,
-    ).map_err(|e| format!("Failed to load RSA key pair: {}", e))?;
+	// Extract key from PEM using rustls-pemfile
+	let key_bytes = {
+		let mut reader = std::io::Cursor::new(key_pem.as_bytes());
+		match rustls_pemfile::private_key(&mut reader) {
+			Ok(Some(key)) => key.secret_der().to_vec(),
+			Ok(None) => return Err("No key found in PEM".to_string()),
+			Err(e) => return Err(format!("Failed to parse key PEM: {}", e)),
+		}
+	};
 
-    let rng = SystemRandom::new();
-    let mut signature = vec![0; key_pair.public().modulus_len()];
-    
-    key_pair.sign(&RSA_PKCS1_SHA256, &rng, data, &mut signature).map_err(|e| format!("Failed to sign data: {}", e))?;
-    Ok(signature)
+	// We strictly use RSA for Moonshine hosting
+	let key_pair = RsaKeyPair::from_pkcs8(
+		&key_bytes,
+	).map_err(|e| format!("Failed to load RSA key pair: {}", e))?;
+
+	let rng = SystemRandom::new();
+	let mut signature = vec![0; key_pair.public().modulus_len()];
+
+	key_pair.sign(&RSA_PKCS1_SHA256, &rng, data, &mut signature).map_err(|e| format!("Failed to sign data: {}", e))?;
+	Ok(signature)
 }
 
 fn extract_certificate_signature(pem: &str) -> Result<Vec<u8>, String> {
-    let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).map_err(|e| format!("Failed to parse PEM: {}", e))?;
-    let cert = pem_obj.parse_x509().map_err(|e| format!("Failed to parse X509: {}", e))?;
-    Ok(cert.signature_value.data.to_vec())
+	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).map_err(|e| format!("Failed to parse PEM: {}", e))?;
+	let cert = pem_obj.parse_x509().map_err(|e| format!("Failed to parse X509: {}", e))?;
+	Ok(cert.signature_value.data.to_vec())
 }
 
 async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> Result<(), String> {
@@ -626,27 +626,27 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 			return Err("Client does not have a server challenge, possibly incorrect pairing procedure?".to_string())
 		},
 	};
-    
-    // We expect at least 16 bytes.
-    if client_secret.len() < 16 {
+
+	// We expect at least 16 bytes.
+	if client_secret.len() < 16 {
 		return Err(format!("Expected client pairing secret to be at least 16 bytes, but got {}", client_secret.len()));
-    }
+	}
 
 	let client_secret_payload = &client_secret[..16];
-    // Remaining bytes are ignored (signature of the secret by client).
-    // Original code seemed to construct data with CLIENT CERT SIGNATURE + CLIENT SECRET PAYLOAD (16 bytes).
+	// Remaining bytes are ignored (signature of the secret by client).
+	// Original code seemed to construct data with CLIENT CERT SIGNATURE + CLIENT SECRET PAYLOAD (16 bytes).
 
 	let mut data = server_challenge.to_vec();
-    
-    let signature_bytes = extract_certificate_signature(&client.pem)
-        .map_err(|e| format!("Failed to extract client cert signature: {e}"))?;
-        
+
+	let signature_bytes = extract_certificate_signature(&client.pem)
+		.map_err(|e| format!("Failed to extract client cert signature: {e}"))?;
+
 	data.extend(signature_bytes);
 	data.extend(client_secret_payload);
 
-    let mut hasher = Sha256::new();
-    hasher.update(&data);
-    let hash = hasher.finalize();
+	let mut hasher = Sha256::new();
+	hasher.update(&data);
+	let hash = hasher.finalize();
 
 	if !hash.to_vec().eq(client_hash) {
 		return Err("Client hash is not as expected, MITM?".to_string());
@@ -656,31 +656,31 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 }
 
 fn aes_encrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    if data.len() % 16 != 0 {
-        return Err(format!("Data length {} not a multiple of 16", data.len()));
-    }
-    
-    let mut encrypted = data.to_vec();
-    for block in encrypted.chunks_mut(16) {
-        let mut gblock = GenericArray::clone_from_slice(block);
-        cipher.encrypt_block(&mut gblock);
-        block.copy_from_slice(&gblock);
-    }
-    Ok(encrypted)
+	let cipher = Aes128::new(GenericArray::from_slice(key));
+	if !data.len().is_multiple_of(16) {
+		return Err(format!("Data length {} not a multiple of 16", data.len()));
+	}
+
+	let mut encrypted = data.to_vec();
+	for block in encrypted.chunks_mut(16) {
+		let mut gblock = GenericArray::clone_from_slice(block);
+		cipher.encrypt_block(&mut gblock);
+		block.copy_from_slice(&gblock);
+	}
+	Ok(encrypted)
 }
 
 fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
-    let cipher = Aes128::new(GenericArray::from_slice(key));
-    if data.len() % 16 != 0 {
-        return Err(format!("Data length {} not a multiple of 16", data.len()));
-    }
-    
-    let mut decrypted = data.to_vec();
-    for block in decrypted.chunks_mut(16) {
-        let mut gblock = GenericArray::clone_from_slice(block);
-        cipher.decrypt_block(&mut gblock);
-        block.copy_from_slice(&gblock);
-    }
-    Ok(decrypted)
+	let cipher = Aes128::new(GenericArray::from_slice(key));
+	if !data.len().is_multiple_of(16) {
+		return Err(format!("Data length {} not a multiple of 16", data.len()));
+	}
+
+	let mut decrypted = data.to_vec();
+	for block in decrypted.chunks_mut(16) {
+		let mut gblock = GenericArray::clone_from_slice(block);
+		cipher.decrypt_block(&mut gblock);
+		block.copy_from_slice(&gblock);
+	}
+	Ok(decrypted)
 }
