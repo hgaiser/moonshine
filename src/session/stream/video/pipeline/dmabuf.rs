@@ -6,6 +6,7 @@
 use ash::vk;
 use pixelforge::VideoContext;
 use std::os::fd::RawFd;
+use std::os::unix::io::{BorrowedFd, IntoRawFd};
 use tracing::debug;
 
 /// Information about a single DMA-BUF plane.
@@ -176,9 +177,16 @@ impl DmaBufImporter {
 		.map_err(|e| format!("Failed to get memory FD properties: {}", e))?;
 
 		// Import memory from DMA-BUF FD.
+		// We duplicate the FD because vkAllocateMemory consumes it, but we want
+		// the caller (DmaBufInfo) to retain ownership of the original FD.
+		let fd = unsafe { BorrowedFd::borrow_raw(planes[0].fd) }
+			.try_clone_to_owned()
+			.map_err(|e| format!("Failed to duplicate DMA-BUF FD: {}", e))?
+			.into_raw_fd();
+
 		let mut import_memory_fd_info = vk::ImportMemoryFdInfoKHR::default()
 			.handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-			.fd(planes[0].fd);
+			.fd(fd);
 
 		// Filter memory types by what the FD supports.
 		let memory_type_bits = mem_requirements.memory_type_bits & memory_fd_properties.memory_type_bits;
@@ -328,9 +336,16 @@ impl DmaBufImporter {
 		.map_err(|e| format!("Failed to get memory FD properties: {}", e))?;
 
 		// Import memory from DMA-BUF FD.
+		// We duplicate the FD because vkAllocateMemory consumes it, but we want
+		// the caller (DmaBufInfo) to retain ownership of the original FD.
+		let fd = unsafe { BorrowedFd::borrow_raw(planes[0].fd) }
+			.try_clone_to_owned()
+			.map_err(|e| format!("Failed to duplicate DMA-BUF FD: {}", e))?
+			.into_raw_fd();
+
 		let mut import_memory_fd_info = vk::ImportMemoryFdInfoKHR::default()
 			.handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-			.fd(planes[0].fd);
+			.fd(fd);
 
 		// Filter memory types by what the FD supports.
 		let memory_type_bits = mem_requirements.memory_type_bits & memory_fd_properties.memory_type_bits;

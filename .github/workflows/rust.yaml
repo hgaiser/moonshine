@@ -35,7 +35,6 @@ jobs:
           libevdev \
           libpipewire \
           libpulse \
-          openssl \
           opus \
           rust \
           shaderc

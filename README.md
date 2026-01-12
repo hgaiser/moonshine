@@ -51,7 +51,6 @@ libc++
 libevdev
 libpipewire
 libpulse
-openssl
 opus
 rust
 shaderc
@@ -72,7 +71,6 @@ $ sudo pacman -S \
    libevdev \
    libpipewire \
    libpulse \
-   openssl \
    opus \
    rust \
    shaderc
@@ -179,7 +177,6 @@ This wouldn't have been possible without the incredible work by the people behin
 Below is a wishlist for improvements for Moonshine.
 If you are interested in contributing, feel free to create an issue or send a message on the [Moonlight Discord](https://discord.com/invite/moonlight-stream-352065098472488960) server.
 
-1. Replace openssl with [rustls](https://crates.io/crates/rustls).
 1. AV1 support.
 1. HDR support.
 1. 5.1 / 7.1 audio support.

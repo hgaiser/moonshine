@@ -3,7 +3,7 @@
 //! This module provides video frame capture from PipeWire nodes.
 //! Frames are captured as DMA-BUF references for zero-copy GPU processing.
 
-use std::os::unix::io::{AsRawFd, BorrowedFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -61,7 +61,7 @@ pub struct CaptureConfig {
 }
 
 /// DMA-BUF information for zero-copy frame capture.
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct DmaBufInfo {
 	/// File descriptor for the DMA-BUF (duplicated, safe to use across threads)
 	pub fd: std::os::unix::io::RawFd,
@@ -75,6 +75,17 @@ pub struct DmaBufInfo {
 	pub width: u32,
 	/// Height of the frame.
 	pub height: u32,
+}
+
+impl Drop for DmaBufInfo {
+	fn drop(&mut self) {
+		if self.fd >= 0 {
+			// SAFETY: We own the FD and it was duplicated for us.
+			unsafe {
+				let _ = OwnedFd::from_raw_fd(self.fd);
+			}
+		}
+	}
 }
 
 /// A captured video frame (DMA-BUF only, zero-copy path)
