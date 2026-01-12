@@ -17,7 +17,7 @@ use crate::session::manager::SessionShutdownReason;
 use super::packetizer::Packetizer;
 use super::{VideoChromaSampling, VideoDynamicRange, VideoFormat};
 
-use capture::{start_capture, CaptureConfig, CapturePixelFormat};
+use capture::{start_capture, CaptureConfig, CapturePixelFormat, CapturedFrame};
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
@@ -235,18 +235,51 @@ impl VideoPipelineInner {
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame)
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
 
+		// Cache for the last received frame to handle IDR requests during static screen.
+		let mut last_frame: Option<CapturedFrame> = None;
+
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Check for IDR request.
+			let mut pending_idr = false;
 			if idr_requested.swap(false, Ordering::SeqCst) {
 				encoder.request_idr();
 				tracing::debug!("IDR frame requested");
+				pending_idr = true;
 			}
 
 			// Try to receive a frame from capture thread (with timeout)
-			match capture.recv_timeout(frame_interval) {
-				Ok(frame) => {
-					// Zero-copy DMA-BUF path - import directly to Vulkan image.
-					let dmabuf_info = &frame.dmabuf;
+			let received_frame = match capture.recv_timeout(frame_interval) {
+				Ok(frame) => Some(frame),
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+					// No frame received within timeout.
+					// If we have a pending IDR request and a cached frame, re-encode it.
+					if pending_idr {
+						if let Some(frame) = &last_frame {
+							tracing::debug!("Re-encoding last frame for IDR request");
+							Some(frame.clone())
+						} else {
+							None
+						}
+					} else {
+						if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+							tracing::warn!("No frames received for 5 seconds");
+							last_frame_time = std::time::Instant::now(); // Reset to avoid spam
+						}
+						None
+					}
+				},
+				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+					tracing::debug!("Frame channel disconnected - capture thread ended");
+					break;
+				},
+			};
+
+			if let Some(frame) = received_frame {
+				// Update cache (this will duplicate the FD, which is fine)
+				last_frame = Some(frame.clone());
+
+				// Zero-copy DMA-BUF path - import directly to Vulkan image.
+				let dmabuf_info = &frame.dmabuf;
 					tracing::debug!(
 						"Received frame: format={:?}, {}x{}, fd={}, offset={}, stride={}",
 						frame.format,
@@ -386,21 +419,11 @@ impl VideoPipelineInner {
 						},
 					}
 
-					last_frame_time = std::time::Instant::now();
-				},
-				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-					// No frame received within timeout - check if we should warn.
-					if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
-						tracing::warn!("No frames received for 5 seconds");
-						last_frame_time = std::time::Instant::now(); // Reset to avoid spam
+					if !pending_idr {
+						last_frame_time = std::time::Instant::now();
 					}
-				},
-				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-					tracing::debug!("Frame channel disconnected - capture thread ended");
-					break;
-				},
+				}
 			}
-		}
 
 		// Wait for capture thread to finish (handled by CaptureHandle Drop)
 		drop(capture);

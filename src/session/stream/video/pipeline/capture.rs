@@ -3,7 +3,7 @@
 //! This module provides video frame capture from PipeWire nodes.
 //! Frames are captured as DMA-BUF references for zero-copy GPU processing.
 
-use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::unix::io::{AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -77,6 +77,30 @@ pub struct DmaBufInfo {
 	pub height: u32,
 }
 
+impl Clone for DmaBufInfo {
+	fn clone(&self) -> Self {
+		// Duplicate the FD.
+		let fd = unsafe { BorrowedFd::borrow_raw(self.fd) }
+			.try_clone_to_owned()
+			.map_err(|e| {
+				tracing::warn!("Failed to duplicate DmaBufInfo FD for clone: {}", e);
+				e
+			})
+			.ok()
+			.map(|owned| owned.into_raw_fd())
+			.unwrap_or(-1);
+
+		Self {
+			fd,
+			offset: self.offset,
+			stride: self.stride,
+			modifier: self.modifier,
+			width: self.width,
+			height: self.height,
+		}
+	}
+}
+
 impl Drop for DmaBufInfo {
 	fn drop(&mut self) {
 		if self.fd >= 0 {
@@ -89,6 +113,7 @@ impl Drop for DmaBufInfo {
 }
 
 /// A captured video frame (DMA-BUF only, zero-copy path)
+#[derive(Clone)]
 pub struct CapturedFrame {
 	/// DMA-BUF info for zero-copy.
 	pub dmabuf: DmaBufInfo,
