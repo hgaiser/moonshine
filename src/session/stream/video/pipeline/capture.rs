@@ -200,6 +200,7 @@ struct NegotiatedFormat {
 	format: Option<SpaVideoFormat>,
 	width: u32,
 	height: u32,
+	modifier: u64,
 }
 
 /// Main capture loop running in dedicated thread.
@@ -279,6 +280,7 @@ fn run_capture_loop(
 				let spa_format = format.format.unwrap_or(SpaVideoFormat::BGRx);
 				let frame_width = format.width;
 				let frame_height = format.height;
+				let modifier = format.modifier;
 				drop(format);
 
 				// Convert SPA format to our format.
@@ -322,7 +324,7 @@ fn run_capture_loop(
 							fd: dup_fd,
 							offset,
 							stride: stride as u32,
-							modifier: 0, // Linear layout (TODO: get from buffer metadata)
+							modifier,
 							width: frame_width,
 							height: frame_height,
 						},
@@ -398,13 +400,15 @@ fn parse_video_format_from_pod(pod: &Pod) -> Option<NegotiatedFormat> {
 		format: Some(SpaVideoFormat::from_raw(video_info.format)),
 		width: video_info.size.width,
 		height: video_info.size.height,
+		modifier: video_info.modifier,
 	};
 
 	tracing::info!(
-		"Parsed video format: {:?} {}x{}",
+		"Parsed video format: {:?} {}x{} mod:{:x}",
 		format.format,
 		format.width,
-		format.height
+		format.height,
+		format.modifier
 	);
 
 	Some(format)
