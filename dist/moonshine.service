@@ -1,0 +1,13 @@
+[Unit]
+Description=Streaming server using the NVIDIA GameStream / Moonlight protocol.
+PartOf=graphical-session.target
+Wants=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/moonshine %E/moonshine/config.toml
+Environment=RUST_LOG=info
+Restart=always
+
+[Install]
+WantedBy=graphical-session.target
