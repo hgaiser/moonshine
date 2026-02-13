@@ -131,10 +131,7 @@ impl VideoPipelineInner {
 		let codec = match self.video_format {
 			VideoFormat::H264 => Codec::H264,
 			VideoFormat::Hevc => Codec::H265,
-			VideoFormat::Av1 => {
-				// PIXELFORGE_TODO: AV1 encoding is not yet implemented in pixelforge.
-				return Err("AV1 encoding not yet supported".to_string());
-			},
+			VideoFormat::Av1 => Codec::AV1,
 		};
 
 		// Convert pixel format.
@@ -153,9 +150,7 @@ impl VideoPipelineInner {
 		let config = match codec {
 			Codec::H264 => EncodeConfig::h264(self.width, self.height),
 			Codec::H265 => EncodeConfig::h265(self.width, self.height),
-			Codec::AV1 => {
-				return Err("AV1 not supported".to_string());
-			},
+			Codec::AV1 => EncodeConfig::av1(self.width, self.height),
 		}
 		.with_pixel_format(pixel_format)
 		.with_bit_depth(bit_depth)
