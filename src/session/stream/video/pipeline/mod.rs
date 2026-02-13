@@ -280,150 +280,150 @@ impl VideoPipelineInner {
 
 				// Zero-copy DMA-BUF path - import directly to Vulkan image.
 				let dmabuf_info = &frame.dmabuf;
-					tracing::debug!(
-						"Received frame: format={:?}, {}x{}, fd={}, offset={}, stride={}",
-						frame.format,
-						dmabuf_info.width,
-						dmabuf_info.height,
-						dmabuf_info.fd,
-						dmabuf_info.offset,
-						dmabuf_info.stride
-					);
-					let importer = match &mut dmabuf_importer {
-						Some(imp) => imp,
-						None => match DmaBufImporter::new(context.clone()) {
-							Ok(imp) => {
-								dmabuf_importer = Some(imp);
-								dmabuf_importer.as_mut().unwrap()
-							},
-							Err(e) => {
-								tracing::error!("Failed to create DMA-BUF importer: {e}");
-								continue;
-							},
+				tracing::debug!(
+					"Received frame: format={:?}, {}x{}, fd={}, offset={}, stride={}",
+					frame.format,
+					dmabuf_info.width,
+					dmabuf_info.height,
+					dmabuf_info.fd,
+					dmabuf_info.offset,
+					dmabuf_info.stride
+				);
+				let importer = match &mut dmabuf_importer {
+					Some(imp) => imp,
+					None => match DmaBufImporter::new(context.clone()) {
+						Ok(imp) => {
+							dmabuf_importer = Some(imp);
+							dmabuf_importer.as_mut().unwrap()
 						},
-					};
-
-					// Create DmaBufPlane from the info.
-					let plane = DmaBufPlane {
-						fd: dmabuf_info.fd,
-						offset: dmabuf_info.offset,
-						stride: dmabuf_info.stride,
-						modifier: dmabuf_info.modifier,
-					};
-					let planes = [plane];
-
-					// Handle based on format.
-					let encode_result = match frame.format {
-						CapturePixelFormat::NV12 => {
-							// NV12 DMA-BUF can be passed directly to encoder (zero-copy)
-							let dmabuf_image =
-								match importer.import_nv12(dmabuf_info.width, dmabuf_info.height, &planes) {
-									Ok(img) => img,
-									Err(e) => {
-										tracing::error!("Failed to import NV12 DMA-BUF: {e}");
-										continue;
-									},
-								};
-							encoder.encode(dmabuf_image.image())
+						Err(e) => {
+							tracing::error!("Failed to create DMA-BUF importer: {e}");
+							continue;
 						},
-						CapturePixelFormat::BGRx
-						| CapturePixelFormat::BGRA
-						| CapturePixelFormat::RGBx
-						| CapturePixelFormat::RGBA => {
-							// RGB DMA-BUF needs conversion to YUV.
-							let input_format = match frame.format {
-								CapturePixelFormat::BGRx => InputFormat::BGRx,
-								CapturePixelFormat::RGBx => InputFormat::RGBx,
-								CapturePixelFormat::BGRA => InputFormat::BGRA,
-								CapturePixelFormat::RGBA => InputFormat::RGBA,
-								_ => unreachable!(),
-							};
+					},
+				};
 
-							// Import the DMA-BUF as a Vulkan image.
-							let dmabuf_image = match frame.format {
-								CapturePixelFormat::BGRx | CapturePixelFormat::BGRA => {
-									importer.import_bgra(dmabuf_info.width, dmabuf_info.height, &planes)
-								},
-								CapturePixelFormat::RGBx | CapturePixelFormat::RGBA => {
-									importer.import_rgba(dmabuf_info.width, dmabuf_info.height, &planes)
-								},
-								_ => unreachable!(),
-							};
+				// Create DmaBufPlane from the info.
+				let plane = DmaBufPlane {
+					fd: dmabuf_info.fd,
+					offset: dmabuf_info.offset,
+					stride: dmabuf_info.stride,
+					modifier: dmabuf_info.modifier,
+				};
+				let planes = [plane];
 
-							let dmabuf_image = match dmabuf_image {
+				// Handle based on format.
+				let encode_result = match frame.format {
+					CapturePixelFormat::NV12 => {
+						// NV12 DMA-BUF can be passed directly to encoder (zero-copy)
+						let dmabuf_image =
+							match importer.import_nv12(dmabuf_info.width, dmabuf_info.height, &planes) {
 								Ok(img) => img,
 								Err(e) => {
-									tracing::error!("Failed to import RGB DMA-BUF: {e}");
+									tracing::error!("Failed to import NV12 DMA-BUF: {e}");
 									continue;
 								},
 							};
+						encoder.encode(dmabuf_image.image())
+					},
+					CapturePixelFormat::BGRx
+					| CapturePixelFormat::BGRA
+					| CapturePixelFormat::RGBx
+					| CapturePixelFormat::RGBA => {
+						// RGB DMA-BUF needs conversion to YUV.
+						let input_format = match frame.format {
+							CapturePixelFormat::BGRx => InputFormat::BGRx,
+							CapturePixelFormat::RGBx => InputFormat::RGBx,
+							CapturePixelFormat::BGRA => InputFormat::BGRA,
+							CapturePixelFormat::RGBA => InputFormat::RGBA,
+							_ => unreachable!(),
+						};
 
-							// Initialize converter if needed.
-							let converter = match &mut color_converter {
-								Some(conv) => conv,
-								None => {
-									let config = ColorConverterConfig {
-										width: self.width,
-										height: self.height,
-										input_format,
-										output_format,
-									};
-									match ColorConverter::new(context.clone(), config) {
-										Ok(conv) => {
-											color_converter = Some(conv);
-											color_converter.as_mut().unwrap()
-										},
-										Err(e) => {
-											tracing::error!("Failed to create color converter: {e}");
-											continue;
-										},
-									}
-								},
-							};
+						// Import the DMA-BUF as a Vulkan image.
+						let dmabuf_image = match frame.format {
+							CapturePixelFormat::BGRx | CapturePixelFormat::BGRA => {
+								importer.import_bgra(dmabuf_info.width, dmabuf_info.height, &planes)
+							},
+							CapturePixelFormat::RGBx | CapturePixelFormat::RGBA => {
+								importer.import_rgba(dmabuf_info.width, dmabuf_info.height, &planes)
+							},
+							_ => unreachable!(),
+						};
 
-							// Convert RGB to YUV directly into the encoder's input image.
-							if let Err(e) = converter.convert(dmabuf_image.image(), encoder.input_image()) {
-								tracing::error!("GPU color conversion failed: {e}");
+						let dmabuf_image = match dmabuf_image {
+							Ok(img) => img,
+							Err(e) => {
+								tracing::error!("Failed to import RGB DMA-BUF: {e}");
 								continue;
-							}
+							},
+						};
 
-							// Encode the converted image.
-							encoder.encode(encoder.input_image())
-						},
-						CapturePixelFormat::I420 => {
-							// I420 DMA-BUF - import and encode.
-							// Note: Encoder might need I420 support
-							tracing::warn!("I420 DMA-BUF not yet supported");
-							continue;
-						},
-					};
-
-					// Process encoded packets.
-					match encode_result {
-						Ok(packets) => {
-							for packet in packets {
-								if let Err(()) = self.send_packet(
-									&packet,
-									&packet_tx,
-									&mut packetizer,
-									&mut frame_number,
-									&mut sequence_number,
-								) {
-									tracing::error!("Failed to send encoded packet");
-									return Err("Failed to send packet".to_string());
+						// Initialize converter if needed.
+						let converter = match &mut color_converter {
+							Some(conv) => conv,
+							None => {
+								let config = ColorConverterConfig {
+									width: self.width,
+									height: self.height,
+									input_format,
+									output_format,
+								};
+								match ColorConverter::new(context.clone(), config) {
+									Ok(conv) => {
+										color_converter = Some(conv);
+										color_converter.as_mut().unwrap()
+									},
+									Err(e) => {
+										tracing::error!("Failed to create color converter: {e}");
+										continue;
+									},
 								}
-							}
-						},
-						Err(e) => {
-							tracing::error!("Failed to encode frame: {e}");
-						},
-					}
+							},
+						};
 
-					if !pending_idr {
-						last_frame_time = std::time::Instant::now();
-					}
+						// Convert RGB to YUV directly into the encoder's input image.
+						if let Err(e) = converter.convert(dmabuf_image.image(), encoder.input_image()) {
+							tracing::error!("GPU color conversion failed: {e}");
+							continue;
+						}
+
+						// Encode the converted image.
+						encoder.encode(encoder.input_image())
+					},
+					CapturePixelFormat::I420 => {
+						// I420 DMA-BUF - import and encode.
+						// Note: Encoder might need I420 support
+						tracing::warn!("I420 DMA-BUF not yet supported");
+						continue;
+					},
+				};
+
+				// Process encoded packets.
+				match encode_result {
+					Ok(packets) => {
+						for packet in packets {
+							if let Err(()) = self.send_packet(
+								&packet,
+								&packet_tx,
+								&mut packetizer,
+								&mut frame_number,
+								&mut sequence_number,
+							) {
+								tracing::error!("Failed to send encoded packet");
+								return Err("Failed to send packet".to_string());
+							}
+						}
+					},
+					Err(e) => {
+						tracing::error!("Failed to encode frame: {e}");
+					},
+				}
+
+				if !pending_idr {
+					last_frame_time = std::time::Instant::now();
 				}
 			}
+		}
 
 		// Wait for capture thread to finish (handled by CaptureHandle Drop)
 		drop(capture);
