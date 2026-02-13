@@ -88,6 +88,8 @@ pub struct VideoStreamContext {
 	pub dynamic_range: VideoDynamicRange,
 	pub chroma_sampling_type: VideoChromaSampling,
 	pub max_reference_frames: u32,
+	/// Pre-discovered PipeWire node ID for gamescope capture.
+	pub node_id: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -212,7 +214,10 @@ impl VideoStreamInner {
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
-		let node_id = find_gamescope_node_id().await?;
+		let node_id = match self.context.node_id {
+			Some(id) => id,
+			None => find_gamescope_node_id().await?,
+		};
 
 		tracing::debug!("Creating pipeline with node_id: {}", node_id);
 		let pipeline = VideoPipeline::new(
