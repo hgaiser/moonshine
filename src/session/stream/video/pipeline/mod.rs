@@ -316,14 +316,13 @@ impl VideoPipelineInner {
 				let encode_result = match frame.format {
 					CapturePixelFormat::NV12 => {
 						// NV12 DMA-BUF can be passed directly to encoder (zero-copy)
-						let dmabuf_image =
-							match importer.import_nv12(dmabuf_info.width, dmabuf_info.height, &planes) {
-								Ok(img) => img,
-								Err(e) => {
-									tracing::error!("Failed to import NV12 DMA-BUF: {e}");
-									continue;
-								},
-							};
+						let dmabuf_image = match importer.import_nv12(dmabuf_info.width, dmabuf_info.height, &planes) {
+							Ok(img) => img,
+							Err(e) => {
+								tracing::error!("Failed to import NV12 DMA-BUF: {e}");
+								continue;
+							},
+						};
 						encoder.encode(dmabuf_image.image())
 					},
 					CapturePixelFormat::BGRx

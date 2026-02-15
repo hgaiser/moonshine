@@ -244,20 +244,20 @@ impl ControlStream {
 				SocketAddr::V6(_) => {
 					tracing::error!("IPv6 is not supported by enet");
 					return;
-				}
+				},
 			};
 			let host = match enet.create_host::<()>(
 				Some(&local_addr),
 				1,
 				enet::ChannelLimit::Limited(1),
 				enet::BandwidthLimit::Unlimited,
-				enet::BandwidthLimit::Unlimited
+				enet::BandwidthLimit::Unlimited,
 			) {
 				Ok(host) => host,
 				Err(e) => {
 					tracing::error!("Failed to create enet host: {e}");
 					return;
-				}
+				},
 			};
 
 			tokio::runtime::Handle::current().block_on(inner.run(
@@ -359,7 +359,10 @@ impl ControlStreamInner {
 				sequence_number += 1;
 			}
 
-			match host.service(10).map_err(|e| tracing::error!("Failure in enet host: {e}")) {
+			match host
+				.service(10)
+				.map_err(|e| tracing::error!("Failure in enet host: {e}"))
+			{
 				Ok(Some(enet::Event::Connect { .. })) => {},
 				Ok(Some(enet::Event::Disconnect { .. })) => {},
 				Ok(Some(enet::Event::Receive { ref packet, .. })) => {
