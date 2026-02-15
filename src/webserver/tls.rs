@@ -30,27 +30,29 @@ impl TlsAcceptor {
 }
 
 fn load_tls_files<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<ServerConfig, ()> {
-    let certs = load_certs(certificate.as_ref())?;
-    let key = load_private_key(private_key.as_ref())?;
+	let certs = load_certs(certificate.as_ref())?;
+	let key = load_private_key(private_key.as_ref())?;
 
-    let config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .map_err(|e| tracing::error!("Failed to create TLS configuration: {}", e))?;
-    
-    Ok(config)
+	let config = ServerConfig::builder()
+		.with_no_client_auth()
+		.with_single_cert(certs, key)
+		.map_err(|e| tracing::error!("Failed to create TLS configuration: {}", e))?;
+
+	Ok(config)
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, ()> {
-    let mut reader = BufReader::new(File::open(path).map_err(|e| tracing::error!("Failed to open certificate file: {}", e))?);
-    rustls_pemfile::certs(&mut reader)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| tracing::error!("Failed to load certificate: {}", e))
+	let mut reader =
+		BufReader::new(File::open(path).map_err(|e| tracing::error!("Failed to open certificate file: {}", e))?);
+	rustls_pemfile::certs(&mut reader)
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|e| tracing::error!("Failed to load certificate: {}", e))
 }
 
 fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ()> {
-    let mut reader = BufReader::new(File::open(path).map_err(|e| tracing::error!("Failed to open private key file: {}", e))?);
-    rustls_pemfile::private_key(&mut reader)
-        .map_err(|e| tracing::error!("Failed to load private key: {}", e))?
-        .ok_or_else(|| tracing::error!("No private key found in file"))
+	let mut reader =
+		BufReader::new(File::open(path).map_err(|e| tracing::error!("Failed to open private key file: {}", e))?);
+	rustls_pemfile::private_key(&mut reader)
+		.map_err(|e| tracing::error!("Failed to load private key: {}", e))?
+		.ok_or_else(|| tracing::error!("No private key found in file"))
 }

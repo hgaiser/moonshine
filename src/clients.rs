@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc};
 
-use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit, generic_array::GenericArray};
+use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use async_shutdown::TriggerShutdownToken;
 use ring::{
@@ -507,12 +507,14 @@ impl ClientManagerInner {
 
 		// Generate a random server secret.
 		let mut server_secret = [0u8; 16];
-		SystemRandom::new().fill(&mut server_secret).map_err(|_| "Failed to generate random".to_string())?;
+		SystemRandom::new()
+			.fill(&mut server_secret)
+			.map_err(|_| "Failed to generate random".to_string())?;
 
 		client.server_secret = Some(server_secret);
 
-		let mut decrypted = aes_decrypt_ecb(&challenge, key)
-			.map_err(|e| format!("Failed to decrypt client challenge: {e}"))?;
+		let mut decrypted =
+			aes_decrypt_ecb(&challenge, key).map_err(|e| format!("Failed to decrypt client challenge: {e}"))?;
 
 		// Parse server cert to get signature
 		let signature_bytes = extract_certificate_signature(&self.server_certs)
@@ -522,7 +524,9 @@ impl ClientManagerInner {
 		decrypted.extend_from_slice(&server_secret);
 
 		let mut server_challenge = [0u8; 16];
-		SystemRandom::new().fill(&mut server_challenge).map_err(|_| "Failed to generate random".to_string())?;
+		SystemRandom::new()
+			.fill(&mut server_challenge)
+			.map_err(|_| "Failed to generate random".to_string())?;
 
 		client.server_challenge = Some(server_challenge);
 
@@ -595,20 +599,22 @@ fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
 	};
 
 	// We strictly use RSA for Moonshine hosting
-	let key_pair = RsaKeyPair::from_pkcs8(
-		&key_bytes,
-	).map_err(|e| format!("Failed to load RSA key pair: {}", e))?;
+	let key_pair = RsaKeyPair::from_pkcs8(&key_bytes).map_err(|e| format!("Failed to load RSA key pair: {}", e))?;
 
 	let rng = SystemRandom::new();
 	let mut signature = vec![0; key_pair.public().modulus_len()];
 
-	key_pair.sign(&RSA_PKCS1_SHA256, &rng, data, &mut signature).map_err(|e| format!("Failed to sign data: {}", e))?;
+	key_pair
+		.sign(&RSA_PKCS1_SHA256, &rng, data, &mut signature)
+		.map_err(|e| format!("Failed to sign data: {}", e))?;
 	Ok(signature)
 }
 
 fn extract_certificate_signature(pem: &str) -> Result<Vec<u8>, String> {
 	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).map_err(|e| format!("Failed to parse PEM: {}", e))?;
-	let cert = pem_obj.parse_x509().map_err(|e| format!("Failed to parse X509: {}", e))?;
+	let cert = pem_obj
+		.parse_x509()
+		.map_err(|e| format!("Failed to parse X509: {}", e))?;
 	Ok(cert.signature_value.data.to_vec())
 }
 
@@ -629,7 +635,10 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 
 	// We expect at least 16 bytes.
 	if client_secret.len() < 16 {
-		return Err(format!("Expected client pairing secret to be at least 16 bytes, but got {}", client_secret.len()));
+		return Err(format!(
+			"Expected client pairing secret to be at least 16 bytes, but got {}",
+			client_secret.len()
+		));
 	}
 
 	let client_secret_payload = &client_secret[..16];

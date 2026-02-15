@@ -81,16 +81,16 @@ async fn get_server_cert(
 			return bad_request(message);
 		},
 	};
-    
-    // PEM is expected to be a string
-    let client_pem = match String::from_utf8(client_cert) {
-        Ok(s) => s,
-        Err(e) => {
-            let message = format!("Failed to parse client cert as utf8: {e}");
-            tracing::warn!("{message}");
-            return bad_request(message);
-        }
-    };
+
+	// PEM is expected to be a string
+	let client_pem = match String::from_utf8(client_cert) {
+		Ok(s) => s,
+		Err(e) => {
+			let message = format!("Failed to parse client cert as utf8: {e}");
+			tracing::warn!("{message}");
+			return bad_request(message);
+		},
+	};
 
 	let unique_id = match params.remove("uniqueid") {
 		Some(unique_id) => unique_id,

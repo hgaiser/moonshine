@@ -182,11 +182,7 @@ impl AudioEncoderInner {
 			let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
 			let mut iv = iv.to_be_bytes().to_vec();
 			iv.extend([0u8; 12]);
-			let payload = match encrypt_cbc(
-				&encoded_audio[..encoded_size],
-				&keys.remote_input_key,
-				&iv,
-			) {
+			let payload = match encrypt_cbc(&encoded_audio[..encoded_size], &keys.remote_input_key, &iv) {
 				Ok(payload) => payload,
 				Err(e) => {
 					tracing::error!("Failed to encrypt audio: {e}");

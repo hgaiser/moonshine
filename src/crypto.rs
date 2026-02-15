@@ -4,18 +4,20 @@ use aes_gcm::{
 	Aes128Gcm, Key, Nonce,
 };
 use rand::RngCore;
-use rcgen::{BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose, SerialNumber};
+use rcgen::{
+	BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose, SerialNumber,
+};
 use rsa::{
-    pkcs8::{EncodePrivateKey, LineEnding},
-    RsaPrivateKey,
+	pkcs8::{EncodePrivateKey, LineEnding},
+	RsaPrivateKey,
 };
 use std::time::{Duration, SystemTime};
 
 pub fn create_certificate() -> Result<(String, String), Box<dyn std::error::Error>> {
-    // Generate RSA key (2048 bits)
-    let mut rng = rand::rngs::OsRng;
-    let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
-    let key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
+	// Generate RSA key (2048 bits)
+	let mut rng = rand::rngs::OsRng;
+	let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
+	let key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
 
 	let mut params = CertificateParams::default();
 	params.not_before = SystemTime::now().into();
@@ -39,12 +41,7 @@ pub fn create_certificate() -> Result<(String, String), Box<dyn std::error::Erro
 	Ok((cert.pem(), key_pem))
 }
 
-pub fn encrypt(
-	plaintext: &[u8],
-	key: &[u8],
-	iv: &[u8],
-	tag: &mut [u8],
-) -> Result<Vec<u8>, aes_gcm::Error> {
+pub fn encrypt(plaintext: &[u8], key: &[u8], iv: &[u8], tag: &mut [u8]) -> Result<Vec<u8>, aes_gcm::Error> {
 	let key = Key::<Aes128Gcm>::from_slice(key);
 	let nonce = Nonce::from_slice(iv);
 	let cipher = Aes128Gcm::new(key);
@@ -90,7 +87,8 @@ pub fn encrypt_cbc(data: &[u8], key: &[u8], iv: &[u8]) -> Result<Vec<u8>, String
 	let pos = data.len();
 	buffer[..pos].copy_from_slice(data);
 
-	let ct_len = cipher.encrypt_padded_mut::<block_padding::Pkcs7>(&mut buffer, pos)
+	let ct_len = cipher
+		.encrypt_padded_mut::<block_padding::Pkcs7>(&mut buffer, pos)
 		.map_err(|e| format!("Padding error: {:?}", e))?
 		.len();
 

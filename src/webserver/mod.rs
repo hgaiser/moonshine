@@ -64,7 +64,7 @@ impl Webserver {
 	pub fn new(
 		config: Config,
 		unique_id: String,
-        // Passing certificate content as string.
+		// Passing certificate content as string.
 		server_certs: String,
 		client_manager: ClientManager,
 		session_manager: SessionManager,
@@ -426,15 +426,15 @@ impl Webserver {
 		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
 		response += "<LocalIP></LocalIP>";
 		let server_codec_mode_support = (ServerCodecModeSupport::H264 as u32)
-            | (ServerCodecModeSupport::H264High8444 as u32)
+			| (ServerCodecModeSupport::H264High8444 as u32)
 			| (ServerCodecModeSupport::Hevc as u32)
 			| (ServerCodecModeSupport::HevcRext8444 as u32)
 			| (ServerCodecModeSupport::HevcMain10 as u32)
 			| (ServerCodecModeSupport::HevcRext10444 as u32);
-			// | (ServerCodecModeSupport::Av1Main8 as u32)
-			// | (ServerCodecModeSupport::Av1High8444 as u32)
-			// | (ServerCodecModeSupport::Av1Main10 as u32)
-			// | (ServerCodecModeSupport::Av1High10444 as u32);
+		// | (ServerCodecModeSupport::Av1Main8 as u32)
+		// | (ServerCodecModeSupport::Av1High8444 as u32)
+		// | (ServerCodecModeSupport::Av1Main10 as u32)
+		// | (ServerCodecModeSupport::Av1High10444 as u32);
 		response += &format!(
 			"<ServerCodecModeSupport>{}</ServerCodecModeSupport>",
 			server_codec_mode_support

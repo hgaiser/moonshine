@@ -181,22 +181,13 @@ fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Ve
 	initialization_vector[11] = b'C';
 
 	if key.len() != 16 {
-		tracing::warn!(
-			"Key length has {} bytes, but expected {} bytes.",
-			key.len(),
-			16
-		);
+		tracing::warn!("Key length has {} bytes, but expected {} bytes.", key.len(), 16);
 		return Err(());
 	}
 
 	let mut tag = [0u8; 16];
-	let payload = encrypt(
-		payload,
-		key,
-		&initialization_vector,
-		&mut tag,
-	)
-	.map_err(|e| tracing::warn!("Failed to encrypt control data: {e}"))?;
+	let payload = encrypt(payload, key, &initialization_vector, &mut tag)
+		.map_err(|e| tracing::warn!("Failed to encrypt control data: {e}"))?;
 
 	if payload.is_empty() {
 		tracing::warn!("Failed to encrypt control data.");
