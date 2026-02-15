@@ -23,23 +23,7 @@ jobs:
       uses: actions/checkout@v3
 
     - name: Install dependencies
-      run: |
-        sudo pacman -Syyuu --noconfirm --needed \
-          avahi \
-          clang \
-          cmake \
-          gcc-libs \
-          glib2 \
-          glibc \
-          libc++ \
-          libevdev \
-          libpipewire \
-          libpulse \
-          opus \
-          rust \
-          shaderc
-        source /etc/profile
-      shell: bash
+      uses: ./.github/actions/install-dependencies
 
     - name: Build
       run: |

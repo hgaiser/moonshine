@@ -124,11 +124,7 @@ impl DmaBufImporter {
 		} else {
 			planes[0].stride as u64
 		};
-		plane_layouts.push(
-			vk::SubresourceLayout::default()
-				.offset(uv_offset)
-				.row_pitch(uv_stride),
-		);
+		plane_layouts.push(vk::SubresourceLayout::default().offset(uv_offset).row_pitch(uv_stride));
 
 		let modifier = planes[0].modifier;
 		let mut drm_format_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()

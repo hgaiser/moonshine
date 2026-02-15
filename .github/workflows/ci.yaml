@@ -1,0 +1,126 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: Check
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        uses: ./.github/actions/install-dependencies
+
+      - name: Run cargo check
+        run: cargo check --all-features
+
+  test:
+    name: Test Suite
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        uses: ./.github/actions/install-dependencies
+
+      - name: Run unit tests
+        run: cargo test --all-features
+
+      # - name: Run doc tests
+      #   run: cargo test --doc --all-features
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install dependencies
+        uses: ./.github/actions/install-dependencies
+
+      - name: Run clippy
+        run: cargo clippy --all-features -- -D warnings
+
+  fmt:
+    name: Rustfmt
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  doc:
+    name: Documentation
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        uses: ./.github/actions/install-dependencies
+
+      - name: Build documentation
+        run: cargo doc --no-deps --all-features
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  machete:
+    name: Cargo Machete (Unused Dependencies)
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-machete
+        run: cargo install cargo-machete
+
+      - name: Check for unused dependencies
+        run: cargo machete

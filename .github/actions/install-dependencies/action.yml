@@ -1,0 +1,23 @@
+name: Install Dependencies
+description: Installs system dependencies for Moonshine
+runs:
+  using: composite
+  steps:
+    - name: Install dependencies
+      run: |
+        sudo pacman -Syyuu --noconfirm --needed \
+          avahi \
+          clang \
+          cmake \
+          gcc-libs \
+          glib2 \
+          glibc \
+          jq \
+          libc++ \
+          libevdev \
+          libpipewire \
+          libpulse \
+          opus \
+          rust \
+          shaderc
+      shell: bash
