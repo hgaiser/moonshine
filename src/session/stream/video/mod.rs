@@ -88,6 +88,8 @@ pub struct VideoStreamContext {
 	pub dynamic_range: VideoDynamicRange,
 	pub chroma_sampling_type: VideoChromaSampling,
 	pub max_reference_frames: u32,
+	/// Pre-discovered PipeWire node ID for gamescope capture.
+	pub node_id: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -111,7 +113,7 @@ impl VideoStream {
 			// 160 corresponds to DSCP CS5 (Video)
 			tracing::debug!("Enabling QoS on video socket.");
 			socket
-				.set_tos(160)
+				.set_tos_v4(160)
 				.map_err(|e| tracing::error!("Failed to set QoS on the video socket: {e}"))?;
 		}
 
@@ -212,7 +214,10 @@ impl VideoStreamInner {
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
-		let node_id = find_gamescope_node_id().await?;
+		let node_id = match self.context.node_id {
+			Some(id) => id,
+			None => find_gamescope_node_id().await?,
+		};
 
 		tracing::debug!("Creating pipeline with node_id: {}", node_id);
 		let pipeline = VideoPipeline::new(
@@ -239,14 +244,20 @@ impl VideoStreamInner {
 	}
 }
 
-async fn find_gamescope_node_id() -> Result<u32, ()> {
-	for _ in 0..10 {
+pub(crate) async fn find_gamescope_node_id() -> Result<u32, ()> {
+	// Allow up to 30 seconds for gamescope to create its PipeWire node.
+	// Cold starts (e.g. Steam launching from scratch inside gamescope) need
+	// significantly more time than warm restarts.
+	for i in 0..60 {
 		if let Ok(id) = find_node_id_by_name("gamescope") {
 			return Ok(id);
 		}
+		if i % 10 == 9 {
+			tracing::debug!("Still waiting for gamescope PipeWire node... ({}s)", (i + 1) / 2);
+		}
 		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 	}
-	tracing::error!("Failed to find gamescope node ID.");
+	tracing::error!("Failed to find gamescope PipeWire node after 30 seconds.");
 	Err(())
 }
 
@@ -280,29 +291,30 @@ async fn handle_video_packets(
 
 	while !stop_session_manager.is_shutdown_triggered() {
 		tokio::select! {
-			packet = packet_rx.recv() => {
+			packet = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 				match packet {
-					Some(packet) => {
+					Ok(Some(packet)) => {
 						if let Some(client_address) = client_address {
 							if let Err(e) = socket.send_to(packet.as_slice(), client_address).await {
 								tracing::warn!("Failed to send packet to client: {e}");
 							}
 						}
 					},
-					None => {
+					_ => {
 						tracing::debug!("Video packet channel closed.");
 						break;
 					},
 				}
 			},
 
-			message = socket.recv_from(&mut buf) => {
+			message = stop_session_manager.wrap_cancel(socket.recv_from(&mut buf)) => {
 				let (len, address) = match message {
-					Ok((len, address)) => (len, address),
-					Err(e) => {
+					Ok(Ok((len, address))) => (len, address),
+					Ok(Err(e)) => {
 						tracing::warn!("Failed to receive message: {e}");
 						break;
 					},
+					Err(_) => break,
 				};
 
 				if &buf[..len] == b"PING" {

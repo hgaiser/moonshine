@@ -25,7 +25,21 @@ use pixelforge::{
 	PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
 
-pub struct VideoPipeline {}
+pub struct VideoPipeline {
+	thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for VideoPipeline {
+	fn drop(&mut self) {
+		if let Some(handle) = self.thread.take() {
+			tracing::debug!("Waiting for video pipeline thread to finish...");
+			if let Err(e) = handle.join() {
+				tracing::error!("Video pipeline thread panicked: {e:?}");
+			}
+			tracing::debug!("Video pipeline thread finished.");
+		}
+	}
+}
 
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
@@ -63,14 +77,19 @@ impl VideoPipeline {
 			max_reference_frames,
 		};
 
-		std::thread::Builder::new()
+		let handle = std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
-				inner.run(packet_tx, idr_frame_request_rx, stop_session_manager);
+				let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+					inner.run(packet_tx, idr_frame_request_rx, stop_session_manager);
+				}));
+				if let Err(e) = result {
+					tracing::error!("Video pipeline thread panicked: {e:?}");
+				}
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
 
-		Ok(Self {})
+		Ok(Self { thread: Some(handle) })
 	}
 }
 

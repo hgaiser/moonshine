@@ -19,6 +19,7 @@ http-body-util = "0.1.3"
 hyper = { version = "1.8.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.18", features = ["tokio"] }
 image = "0.25.9"
+libc = "0.2"
 inputtino = { version = "0.1.0", git = "https://github.com/games-on-whales/inputtino" }
 network-interface = "2.0.3"
 notify-rust = "4.11.7"

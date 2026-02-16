@@ -44,7 +44,7 @@ impl AudioStream {
 			// TODO: Check this value 224, what does it mean exactly?
 			tracing::debug!("Enabling QoS on audio socket.");
 			socket
-				.set_tos(224)
+				.set_tos_v4(224)
 				.map_err(|e| tracing::error!("Failed to set QoS on the audio socket: {e}"))?;
 		}
 

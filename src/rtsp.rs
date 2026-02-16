@@ -336,6 +336,7 @@ impl RtspServer {
 			dynamic_range,
 			chroma_sampling_type,
 			max_reference_frames,
+			node_id: None,
 		};
 
 		let packet_duration = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {

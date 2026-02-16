@@ -216,7 +216,7 @@ pub struct ControlStream {
 
 impl ControlStream {
 	#[allow(clippy::result_unit_err)]
-	pub fn new(
+	pub async fn new(
 		config: Config,
 		video_stream: VideoStream,
 		audio_stream: AudioStream,
@@ -237,12 +237,14 @@ impl ControlStream {
 		tracing::debug!("Listening for control messages on {:?}", socket_address);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
+		let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<(), ()>>();
 		let inner = ControlStreamInner {};
 		tokio::task::spawn_blocking(move || {
 			let local_addr = match socket_address {
 				SocketAddr::V4(addr) => enet::Address::from(addr),
 				SocketAddr::V6(_) => {
 					tracing::error!("IPv6 is not supported by enet");
+					let _ = ready_tx.send(Err(()));
 					return;
 				},
 			};
@@ -256,9 +258,13 @@ impl ControlStream {
 				Ok(host) => host,
 				Err(e) => {
 					tracing::error!("Failed to create enet host: {e}");
+					let _ = ready_tx.send(Err(()));
 					return;
 				},
 			};
+
+			// Signal that the ENet host is listening before entering the event loop.
+			let _ = ready_tx.send(Ok(()));
 
 			tokio::runtime::Handle::current().block_on(inner.run(
 				config,
@@ -271,6 +277,12 @@ impl ControlStream {
 				stop_session_manager.clone(),
 			))
 		});
+
+		// Wait for the ENet host to actually be listening before returning.
+		ready_rx
+			.await
+			.map_err(|_| tracing::error!("Control stream task dropped before signaling ready"))?
+			.map_err(|_| tracing::error!("Control stream failed to start"))?;
 
 		Ok(Self { command_tx })
 	}
@@ -364,7 +376,10 @@ impl ControlStreamInner {
 				.map_err(|e| tracing::error!("Failure in enet host: {e}"))
 			{
 				Ok(Some(enet::Event::Connect { .. })) => {},
-				Ok(Some(enet::Event::Disconnect { .. })) => {},
+				Ok(Some(enet::Event::Disconnect { .. })) => {
+					tracing::info!("Client disconnected.");
+					break;
+				},
 				Ok(Some(enet::Event::Receive { ref packet, .. })) => {
 					let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 						Ok(control_message) => control_message,

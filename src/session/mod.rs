@@ -1,6 +1,8 @@
+use std::os::unix::process::CommandExt;
 use std::process::Command;
 use std::process::{Child, Stdio};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use enet::Enet;
@@ -58,7 +60,6 @@ enum SessionCommand {
 pub struct Session {
 	command_tx: mpsc::Sender<SessionCommand>,
 	context: SessionContext,
-	running: bool,
 	sink_name: Option<String>,
 }
 
@@ -134,7 +135,7 @@ fn set_default_sink(name: &str) -> Result<(), ()> {
 
 #[allow(clippy::result_unit_err)]
 impl Session {
-	pub fn new(
+	pub async fn new(
 		config: Config,
 		context: SessionContext,
 		stop_session_signal: ShutdownManager<SessionShutdownReason>,
@@ -159,7 +160,16 @@ impl Session {
 			None
 		};
 
+		// Shut down existing Steam before launching gamescope if needed.
+		if context.application.enable_steam_integration {
+			shutdown_steam().await;
+		}
+
 		let gamescope_process = start_gamescope(&context, &sink_name)?;
+
+		// Don't wait for gamescope's PipeWire node here - that would block the
+		// session manager and prevent RTSP commands from being processed.
+		// The video stream discovers the node when StartB triggers capture.
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner {
@@ -176,7 +186,6 @@ impl Session {
 		Ok(Self {
 			command_tx,
 			context,
-			running: false,
 			sink_name: Some(sink_name),
 		})
 	}
@@ -186,8 +195,7 @@ impl Session {
 		video_stream_context: VideoStreamContext,
 		mut audio_stream_context: AudioStreamContext,
 	) -> Result<(), ()> {
-		tracing::info!("Starting session.");
-		self.running = true;
+		tracing::info!("Starting session streams.");
 		audio_stream_context.sink_name = self.sink_name.clone();
 		self.command_tx
 			.send(SessionCommand::Start(video_stream_context, audio_stream_context))
@@ -197,10 +205,6 @@ impl Session {
 
 	pub fn context(&self) -> &SessionContext {
 		&self.context
-	}
-
-	pub fn is_running(&self) -> bool {
-		self.running
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
@@ -236,15 +240,20 @@ impl SessionInner {
 		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				SessionCommand::Start(video_stream_context, audio_stream_context) => {
+					// Create a stream-level shutdown manager for this connection.
+					// Client disconnect triggers this, stopping streams but keeping
+					// gamescope alive for reconnection.
+					let stop_stream_manager = ShutdownManager::new();
+
 					let video_stream =
-						match VideoStream::new(self.config.clone(), video_stream_context, stop_session_manager.clone())
+						match VideoStream::new(self.config.clone(), video_stream_context, stop_stream_manager.clone())
 							.await
 						{
 							Ok(video_stream) => video_stream,
 							Err(()) => continue,
 						};
 					let audio_stream =
-						match AudioStream::new(self.config.clone(), audio_stream_context, stop_session_manager.clone())
+						match AudioStream::new(self.config.clone(), audio_stream_context, stop_stream_manager.clone())
 							.await
 						{
 							Ok(audio_stream) => audio_stream,
@@ -255,12 +264,14 @@ impl SessionInner {
 						video_stream.clone(),
 						audio_stream.clone(),
 						session_context.clone(),
-						stop_session_manager.clone(),
+						stop_stream_manager,
 						self.enet.clone(),
-					) {
+					)
+					.await
+					{
 						Ok(control_stream) => control_stream,
 						Err(()) => {
-							tracing::error!("Failed to create control stream, killing session.");
+							tracing::error!("Failed to create control stream.");
 							continue;
 						},
 					};
@@ -271,36 +282,136 @@ impl SessionInner {
 				},
 
 				SessionCommand::UpdateKeys(keys) => {
-					let Some(audio_stream) = &self.audio_stream else {
-						tracing::warn!("Can't update session keys without an audio stream.");
-						continue;
-					};
-					let Some(control_stream) = &self.control_stream else {
-						tracing::warn!("Can't update session keys without a control stream.");
-						continue;
-					};
-
+					// Always save keys for the next stream start (reconnection case).
 					session_context.keys = keys.clone();
-					let _ = audio_stream.update_keys(keys.clone()).await;
-					let _ = control_stream.update_keys(keys).await;
+
+					// If streams are active, update them too.
+					if let Some(audio_stream) = &self.audio_stream {
+						let _ = audio_stream.update_keys(keys.clone()).await;
+					}
+					if let Some(control_stream) = &self.control_stream {
+						let _ = control_stream.update_keys(keys).await;
+					}
 				},
 			}
 		}
 
-		if let Some(mut gamescope_process) = self.gamescope_process {
-			let _ = gamescope_process.kill();
-		}
+		// Slow cleanup (process termination, Steam restart) runs in background.
+		// The game may need time to save state before exiting.
+		let gamescope_process = self.gamescope_process.take();
+		let enable_steam = session_context.application.enable_steam_integration;
+		tokio::spawn(async move {
+			if let Some(child) = gamescope_process {
+				graceful_terminate(child, 30).await;
+			}
+			if enable_steam {
+				restart_host_steam();
+			}
+			tracing::debug!("Background session cleanup complete.");
+		});
 
-		if let Some(module_id) = self.audio_loopback_module_id {
-			unload_audio_sink(&module_id);
-		}
-
-		if let Some(module_id) = self.audio_sink_module_id {
-			unload_audio_sink(&module_id);
-		}
+		// Fast audio cleanup stays in-line to prevent sink name conflicts
+		// if a new session starts immediately.
+		let loopback_id = self.audio_loopback_module_id.take();
+		let sink_id = self.audio_sink_module_id.take();
+		let _ = tokio::task::spawn_blocking(move || {
+			if let Some(id) = loopback_id {
+				unload_audio_sink(&id);
+			}
+			if let Some(id) = sink_id {
+				unload_audio_sink(&id);
+			}
+		})
+		.await;
 
 		tracing::debug!("Session stopped.");
 	}
+}
+
+/// Check if Steam is currently running.
+fn is_steam_running() -> bool {
+	Command::new("pgrep")
+		.arg("-x")
+		.arg("steam")
+		.output()
+		.map(|o| o.status.success())
+		.unwrap_or(false)
+}
+
+/// Shut down an existing Steam instance and poll for it to exit.
+/// Tries graceful shutdown first, then force-kills if needed.
+async fn shutdown_steam() {
+	if !is_steam_running() {
+		tracing::debug!("Steam is not running, skipping shutdown");
+		return;
+	}
+
+	tracing::debug!("Stopping existing Steam instance");
+	let _ = Command::new("steam").arg("-shutdown").output();
+
+	// Poll for graceful exit (5 seconds).
+	for _ in 0..25 {
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+		if !is_steam_running() {
+			tracing::debug!("Steam has exited gracefully");
+			return;
+		}
+	}
+
+	// Force kill if graceful shutdown didn't work.
+	tracing::warn!("Steam didn't respond to graceful shutdown, force killing");
+	let _ = Command::new("pkill").arg("-x").arg("steam").output();
+
+	for _ in 0..10 {
+		tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+		if !is_steam_running() {
+			tracing::debug!("Steam has exited after force kill");
+			return;
+		}
+	}
+	tracing::warn!("Steam still running after force kill, proceeding anyway");
+}
+
+/// Send SIGTERM to the gamescope process group, poll for exit, then SIGKILL as fallback.
+async fn graceful_terminate(mut child: Child, timeout_secs: u64) {
+	let pid = child.id() as i32;
+
+	// SIGTERM to the process group (negative PID targets entire group).
+	// safe because we set process_group(0) on spawn.
+	unsafe {
+		libc::kill(-pid, libc::SIGTERM);
+	}
+
+	let polls = timeout_secs * 2;
+	for _ in 0..polls {
+		tokio::time::sleep(Duration::from_millis(500)).await;
+		match child.try_wait() {
+			Ok(Some(status)) => {
+				tracing::info!("Gamescope exited with status: {status}");
+				return;
+			},
+			Ok(None) => continue,
+			Err(e) => {
+				tracing::warn!("Error checking gamescope status: {e}");
+				break;
+			},
+		}
+	}
+
+	tracing::warn!("Gamescope did not exit after {timeout_secs}s SIGTERM, sending SIGKILL");
+	let _ = child.kill();
+	let _ = child.wait();
+}
+
+/// Restart Steam on the host so it's available after session ends.
+fn restart_host_steam() {
+	tracing::debug!("Restarting Steam on host");
+	let _ = Command::new("setsid")
+		.args(["steam", "-silent"])
+		.stdin(Stdio::null())
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.spawn();
 }
 
 fn start_gamescope(context: &SessionContext, sink_name: &str) -> Result<Child, ()> {
@@ -343,6 +454,7 @@ fn start_gamescope(context: &SessionContext, sink_name: &str) -> Result<Child, (
 	Command::new("gamescope")
 		.args(command)
 		.env("PULSE_SINK", sink_name)
+		.process_group(0) // Own process group so SIGTERM reaches entire tree.
 		.stdout(
 			log_file
 				.try_clone()

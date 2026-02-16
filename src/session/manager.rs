@@ -189,7 +189,9 @@ impl SessionManagerInner {
 						session_context,
 						stop_session_manager.clone(),
 						self.enet.as_ref().unwrap().clone(),
-					) {
+					)
+					.await
+					{
 						Ok(session) => Some(session),
 						Err(()) => continue,
 					};
@@ -200,11 +202,6 @@ impl SessionManagerInner {
 						tracing::warn!("Can't launch a session, there is no session created yet.");
 						continue;
 					};
-
-					if session.is_running() {
-						tracing::info!("Can't start session, it is already running.");
-						continue;
-					}
 
 					let Some(video_stream_context) = video_stream_context.clone() else {
 						tracing::warn!("Can't start a stream without a video stream context.");
@@ -229,18 +226,17 @@ impl SessionManagerInner {
 						.await
 						.is_err()
 						{
-							let _ = result_tx.send(());
-							tracing::error!("Timeout while waiting for session to stop.");
-							continue;
+							tracing::error!("Timeout waiting for session streams to stop.");
 						}
 
+						// Always reset state, even on timeout.
 						stop_session_manager = ShutdownManager::new();
 						active_session = None;
 					} else {
 						tracing::warn!("Trying to stop session, but no session is currently active.");
 					}
 					let _ = result_tx.send(());
-					tracing::info!("Session stopped, waiting for new session.");
+					tracing::info!("Session stopped, ready for new session.");
 				},
 
 				SessionManagerCommand::UpdateKeys(keys) => {
