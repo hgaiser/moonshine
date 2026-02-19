@@ -52,7 +52,7 @@ pub enum CompositorInputEvent {
 /// since we *are* the compositor.
 pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineCompositor) {
 	let serial = SERIAL_COUNTER.next_serial();
-	let time = state.clock.now().as_millis() as u32;
+	let time = state.clock.now().as_millis();
 
 	match event {
 		CompositorInputEvent::KeyDown { keycode } => {

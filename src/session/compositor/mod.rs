@@ -29,6 +29,12 @@ use self::frame::ExportedFrame;
 use self::input::CompositorInputEvent;
 use self::state::MoonshineCompositor;
 
+type CompositorChannels = (
+	mpsc::Receiver<ExportedFrame>,
+	calloop::channel::Sender<CompositorInputEvent>,
+	mpsc::Receiver<u32>,
+);
+
 /// Configuration for the compositor.
 #[derive(Clone, Debug)]
 pub struct CompositorConfig {
@@ -48,14 +54,7 @@ pub struct CompositorConfig {
 pub fn start_compositor(
 	config: CompositorConfig,
 	stop: ShutdownManager<SessionShutdownReason>,
-) -> Result<
-	(
-		mpsc::Receiver<ExportedFrame>,
-		calloop::channel::Sender<CompositorInputEvent>,
-		mpsc::Receiver<u32>,
-	),
-	String,
-> {
+) -> Result<CompositorChannels, String> {
 	let (frame_tx, frame_rx) = mpsc::sync_channel::<ExportedFrame>(2);
 	let (input_tx, input_rx) = calloop::channel::channel::<CompositorInputEvent>();
 	let (xdisplay_tx, xdisplay_rx) = mpsc::sync_channel::<u32>(1);

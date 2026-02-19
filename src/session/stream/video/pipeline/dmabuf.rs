@@ -215,11 +215,9 @@ impl Drop for DmaBufImporter {
 		let device = self.context.device();
 		unsafe {
 			// Clean up cached imports.
-			for slot in self.cached_imports.drain(..) {
-				if let Some(cached) = slot {
-					device.destroy_image(cached.image, None);
-					device.free_memory(cached.memory, None);
-				}
+			for cached in self.cached_imports.drain(..).flatten() {
+				device.destroy_image(cached.image, None);
+				device.free_memory(cached.memory, None);
 			}
 		}
 	}

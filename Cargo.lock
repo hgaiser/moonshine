@@ -2254,7 +2254,6 @@ dependencies = [
  "clap",
  "dirs",
  "enet",
- "futures",
  "hex",
  "http-body-util",
  "hyper",

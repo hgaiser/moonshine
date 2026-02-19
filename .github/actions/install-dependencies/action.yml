@@ -17,6 +17,8 @@ runs:
           libevdev \
           libpipewire \
           libpulse \
+          libxkbcommon \
+          mesa \
           opus \
           rust \
           shaderc

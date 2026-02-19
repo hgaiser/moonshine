@@ -222,122 +222,117 @@ async fn run_gamepad_handler(
 
 	let mut gamepads: [Option<Gamepad>; 16] = Default::default();
 
-	loop {
-		match stop_session_manager.wrap_cancel(command_rx.recv()).await {
-			Ok(Some((command, feedback_tx))) => {
-				match command {
-					InputEvent::GamepadInfo(gamepad) => {
-						tracing::debug!("Gamepad info: {gamepad:?}");
-						if gamepad.index as usize >= gamepads.len() {
-							tracing::warn!(
-								"Received info for gamepad {}, but we only have {} slots.",
-								gamepad.index,
-								gamepads.len()
-							);
-							continue;
-						}
+	while let Ok(Some((command, feedback_tx))) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
+		match command {
+			InputEvent::GamepadInfo(gamepad) => {
+				tracing::debug!("Gamepad info: {gamepad:?}");
+				if gamepad.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received info for gamepad {}, but we only have {} slots.",
+						gamepad.index,
+						gamepads.len()
+					);
+					continue;
+				}
 
-						if gamepads[gamepad.index as usize].is_none() {
-							if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
-								gamepads[gamepad.index as usize] = Some(new_gamepad);
-								tracing::debug!("Gamepad {} connected.", gamepad.index);
-							}
-						}
-					},
-					InputEvent::GamepadTouch(gamepad_touch) => {
-						tracing::trace!("Gamepad touch: {gamepad_touch:?}");
-						if gamepad_touch.index as usize >= gamepads.len() {
-							tracing::warn!(
-								"Received touch for gamepad {}, but we only have {} gamepads.",
-								gamepad_touch.index,
-								gamepads.len()
-							);
-							continue;
-						}
-
-						match gamepads[gamepad_touch.index as usize].as_mut() {
-							Some(gamepad) => gamepad.touch(&gamepad_touch),
-							None => tracing::warn!(
-								"Received touch for gamepad {}, but no gamepad is connected.",
-								gamepad_touch.index
-							),
-						}
-					},
-					InputEvent::GamepadMotion(gamepad_motion) => {
-						tracing::trace!("Gamepad motion: {gamepad_motion:?}");
-						if gamepad_motion.index as usize >= gamepads.len() {
-							tracing::warn!(
-								"Received motion for gamepad {}, but we only have {} gamepads.",
-								gamepad_motion.index,
-								gamepads.len()
-							);
-							continue;
-						}
-
-						match gamepads[gamepad_motion.index as usize].as_mut() {
-							Some(gamepad) => gamepad.set_motion(&gamepad_motion),
-							None => tracing::warn!(
-								"Received motion for gamepad {}, but no gamepad is connected.",
-								gamepad_motion.index
-							),
-						}
-					},
-					InputEvent::GamepadBattery(gamepad_battery) => {
-						tracing::trace!("Gamepad battery: {gamepad_battery:?}");
-						if gamepad_battery.index as usize >= gamepads.len() {
-							tracing::warn!(
-								"Received battery for gamepad {}, but we only have {} gamepads.",
-								gamepad_battery.index,
-								gamepads.len()
-							);
-							continue;
-						}
-
-						match gamepads[gamepad_battery.index as usize].as_mut() {
-							Some(gamepad) => gamepad.set_battery(&gamepad_battery),
-							None => tracing::warn!(
-								"Received battery for gamepad {}, but no gamepad is connected.",
-								gamepad_battery.index
-							),
-						}
-					},
-					InputEvent::GamepadUpdate(gamepad_update) => {
-						tracing::trace!("Gamepad update: {gamepad_update:?}");
-						if gamepad_update.index as usize >= gamepads.len() {
-							tracing::warn!(
-								"Received update for gamepad {}, but we only have {} gamepads.",
-								gamepad_update.index,
-								gamepads.len()
-							);
-							continue;
-						}
-
-						match gamepads[gamepad_update.index as usize].as_mut() {
-							Some(gamepad) => gamepad.update(&gamepad_update),
-							None => tracing::warn!(
-								"Received update for gamepad {}, but no gamepad is connected.",
-								gamepad_update.index
-							),
-						}
-
-						// Disconnect gamepads that are no longer active.
-						for (i, gamepad) in gamepads.iter_mut().enumerate() {
-							if gamepad.is_some() && gamepad_update.active_gamepad_mask & (1 << i) == 0 {
-								tracing::debug!("Gamepad {} disconnected.", i);
-								*gamepad = None;
-							}
-						}
-					},
-					InputEvent::GamepadEnableHaptics => {
-						tracing::debug!("Received request to enable haptics on gamepads.");
-						// We don't actually need to do anything.
-					},
-					_ => {
-						tracing::warn!("Gamepad handler received unexpected non-gamepad event.");
-					},
+				if gamepads[gamepad.index as usize].is_none() {
+					if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
+						gamepads[gamepad.index as usize] = Some(new_gamepad);
+						tracing::debug!("Gamepad {} connected.", gamepad.index);
+					}
 				}
 			},
-			_ => break,
+			InputEvent::GamepadTouch(gamepad_touch) => {
+				tracing::trace!("Gamepad touch: {gamepad_touch:?}");
+				if gamepad_touch.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received touch for gamepad {}, but we only have {} gamepads.",
+						gamepad_touch.index,
+						gamepads.len()
+					);
+					continue;
+				}
+
+				match gamepads[gamepad_touch.index as usize].as_mut() {
+					Some(gamepad) => gamepad.touch(&gamepad_touch),
+					None => tracing::warn!(
+						"Received touch for gamepad {}, but no gamepad is connected.",
+						gamepad_touch.index
+					),
+				}
+			},
+			InputEvent::GamepadMotion(gamepad_motion) => {
+				tracing::trace!("Gamepad motion: {gamepad_motion:?}");
+				if gamepad_motion.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received motion for gamepad {}, but we only have {} gamepads.",
+						gamepad_motion.index,
+						gamepads.len()
+					);
+					continue;
+				}
+
+				match gamepads[gamepad_motion.index as usize].as_mut() {
+					Some(gamepad) => gamepad.set_motion(&gamepad_motion),
+					None => tracing::warn!(
+						"Received motion for gamepad {}, but no gamepad is connected.",
+						gamepad_motion.index
+					),
+				}
+			},
+			InputEvent::GamepadBattery(gamepad_battery) => {
+				tracing::trace!("Gamepad battery: {gamepad_battery:?}");
+				if gamepad_battery.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received battery for gamepad {}, but we only have {} gamepads.",
+						gamepad_battery.index,
+						gamepads.len()
+					);
+					continue;
+				}
+
+				match gamepads[gamepad_battery.index as usize].as_mut() {
+					Some(gamepad) => gamepad.set_battery(&gamepad_battery),
+					None => tracing::warn!(
+						"Received battery for gamepad {}, but no gamepad is connected.",
+						gamepad_battery.index
+					),
+				}
+			},
+			InputEvent::GamepadUpdate(gamepad_update) => {
+				tracing::trace!("Gamepad update: {gamepad_update:?}");
+				if gamepad_update.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received update for gamepad {}, but we only have {} gamepads.",
+						gamepad_update.index,
+						gamepads.len()
+					);
+					continue;
+				}
+
+				match gamepads[gamepad_update.index as usize].as_mut() {
+					Some(gamepad) => gamepad.update(&gamepad_update),
+					None => tracing::warn!(
+						"Received update for gamepad {}, but no gamepad is connected.",
+						gamepad_update.index
+					),
+				}
+
+				// Disconnect gamepads that are no longer active.
+				for (i, gamepad) in gamepads.iter_mut().enumerate() {
+					if gamepad.is_some() && gamepad_update.active_gamepad_mask & (1 << i) == 0 {
+						tracing::debug!("Gamepad {} disconnected.", i);
+						*gamepad = None;
+					}
+				}
+			},
+			InputEvent::GamepadEnableHaptics => {
+				tracing::debug!("Received request to enable haptics on gamepads.");
+				// We don't actually need to do anything.
+			},
+			_ => {
+				tracing::warn!("Gamepad handler received unexpected non-gamepad event.");
+			},
 		}
 	}
 
