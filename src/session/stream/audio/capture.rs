@@ -15,28 +15,28 @@ use crate::session::manager::SessionShutdownReason;
 fn get_default_sink_name() -> Result<String, ()> {
 	// Create a new PulseAudio context.
 	let mainloop = Rc::new(RefCell::new(
-		Mainloop::new().ok_or_else(|| tracing::error!("Failed to create pulseaudio client."))?,
+		Mainloop::new().ok_or_else(|| tracing::warn!("Failed to create pulseaudio client."))?,
 	));
 
-	let mut proplist = Proplist::new().ok_or_else(|| tracing::error!("Failed to create pulseaudio proplist."))?;
+	let mut proplist = Proplist::new().ok_or_else(|| tracing::warn!("Failed to create pulseaudio proplist."))?;
 	proplist
 		.set_str(pulse::proplist::properties::APPLICATION_NAME, "Moonshine")
-		.map_err(|()| tracing::error!("Failed to set pulseaudio application name."))?;
+		.map_err(|()| tracing::warn!("Failed to set pulseaudio application name."))?;
 	let context = Rc::new(RefCell::new(
 		Context::new_with_proplist(mainloop.borrow().deref(), "Moonshine context", &proplist)
-			.ok_or_else(|| tracing::error!("Failed to create pulseaudio context."))?,
+			.ok_or_else(|| tracing::warn!("Failed to create pulseaudio context."))?,
 	));
 
 	context
 		.borrow_mut()
 		.connect(None, FlagSet::NOFLAGS, None)
-		.map_err(|e| tracing::error!("Failed to connect to pulseaudio server: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to connect to pulseaudio server: {e}"))?;
 
 	// Wait for context to be ready.
 	loop {
 		match mainloop.borrow_mut().iterate(false) {
 			IterateResult::Quit(_) | IterateResult::Err(_) => {
-				tracing::error!("Failed to run pulseaudio main loop.");
+				tracing::warn!("Failed to run pulseaudio main loop.");
 				return Err(());
 			},
 			IterateResult::Success(_) => {},
@@ -48,7 +48,7 @@ fn get_default_sink_name() -> Result<String, ()> {
 			| pulse::context::State::Authorizing
 			| pulse::context::State::SettingName => {},
 			pulse::context::State::Failed | pulse::context::State::Terminated => {
-				tracing::error!("Failed to run context.");
+				tracing::warn!("Failed to run context.");
 				return Err(());
 			},
 			pulse::context::State::Ready => break,
@@ -63,7 +63,7 @@ fn get_default_sink_name() -> Result<String, ()> {
 			let name = match info.default_sink_name.as_ref() {
 				Some(name) => name,
 				None => {
-					tracing::error!("Failed to receive default sink name.");
+					tracing::warn!("Failed to receive default sink name.");
 					return;
 				},
 			};
@@ -75,7 +75,7 @@ fn get_default_sink_name() -> Result<String, ()> {
 	loop {
 		match mainloop.borrow_mut().iterate(false) {
 			IterateResult::Quit(_) | IterateResult::Err(_) => {
-				tracing::error!("Failed to run pulseaudio main loop.");
+				tracing::warn!("Failed to run pulseaudio main loop.");
 				return Err(());
 			},
 			IterateResult::Success(_) => {},
@@ -83,7 +83,7 @@ fn get_default_sink_name() -> Result<String, ()> {
 		match operation.get_state() {
 			pulse::operation::State::Running => {},
 			pulse::operation::State::Cancelled => {
-				tracing::error!("Failed to get default sink name.");
+				tracing::warn!("Failed to get default sink name.");
 				return Err(());
 			},
 			pulse::operation::State::Done => break,
@@ -92,7 +92,7 @@ fn get_default_sink_name() -> Result<String, ()> {
 
 	result
 		.take()
-		.ok_or_else(|| tracing::error!("Failed to get default sink name result."))
+		.ok_or_else(|| tracing::warn!("Failed to get default sink name result."))
 }
 
 pub struct AudioCapture {
@@ -149,7 +149,7 @@ impl AudioCapture {
 				fragsize: std::mem::size_of::<f32>() as u32 * sample_rate * channels as u32 * sample_time_ms / 1000,
 			}),
 		)
-		.map_err(|e| tracing::error!("Failed to create audio capture device: {e}"));
+		.map_err(|e| tracing::warn!("Failed to create audio capture device: {e}"));
 
 		let stream = match stream {
 			Ok(stream) => stream,

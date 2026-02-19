@@ -395,14 +395,14 @@ impl RtspServer {
 			let bytes_read = connection
 				.read(&mut buffer)
 				.await
-				.map_err(|e| tracing::error!("Failed to read from connection '{}': {}", address, e))?;
+				.map_err(|e| tracing::warn!("Failed to read from connection '{}': {}", address, e))?;
 			if bytes_read == 0 {
 				tracing::warn!("Received empty RTSP request.");
 				return Ok(());
 			}
 			message_buffer.push_str(
 				std::str::from_utf8(&buffer[..bytes_read])
-					.map_err(|e| tracing::error!("Failed to convert message to string: {e}"))?,
+					.map_err(|e| tracing::warn!("Failed to convert message to string: {e}"))?,
 			);
 
 			// Hacky workaround to fix rtsp_types parsing SETUP/PLAY requests from Moonlight.
@@ -419,7 +419,7 @@ impl RtspServer {
 					continue;
 				},
 				Err(e) => {
-					tracing::error!("Failed to parse request as RTSP message: {}", e);
+					tracing::warn!("Failed to parse request as RTSP message: {}", e);
 					return Err(());
 				},
 			};
@@ -433,10 +433,10 @@ impl RtspServer {
 
 				let cseq: i32 = request
 					.header(&headers::CSEQ)
-					.ok_or_else(|| tracing::error!("RTSP request has no CSeq header"))?
+					.ok_or_else(|| tracing::warn!("RTSP request has no CSeq header"))?
 					.as_str()
 					.parse()
-					.map_err(|e| tracing::error!("Failed to parse CSeq header: {}", e))?;
+					.map_err(|e| tracing::warn!("Failed to parse CSeq header: {}", e))?;
 
 				match request.method() {
 					Method::Announce => self.handle_announce_request(request, cseq).await,
@@ -462,18 +462,18 @@ impl RtspServer {
 		let mut buffer = Vec::new();
 		response
 			.write(&mut buffer)
-			.map_err(|e| tracing::error!("Failed to serialize RTSP response: {}", e))?;
+			.map_err(|e| tracing::warn!("Failed to serialize RTSP response: {}", e))?;
 
 		connection
 			.write_all(&buffer)
 			.await
-			.map_err(|e| tracing::error!("Failed to send RTSP response: {}", e))?;
+			.map_err(|e| tracing::warn!("Failed to send RTSP response: {}", e))?;
 
 		// For some reason, Moonlight expects a connection per request, so we close the connection here.
 		connection
 			.shutdown()
 			.await
-			.map_err(|e| tracing::error!("Failed to shutdown the connection: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to shutdown the connection: {e}"))?;
 
 		Ok(())
 	}

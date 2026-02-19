@@ -58,18 +58,18 @@ impl AudioEncoder {
 			},
 			opus::Application::LowDelay,
 		)
-		.map_err(|e| tracing::error!("Failed to create audio encoder: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to create audio encoder: {e}"))?;
 
 		// Moonlight expects a constant bitrate.
 		encoder
 			.set_vbr(false)
-			.map_err(|e| tracing::error!("Failed to disable variable bitrate: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to disable variable bitrate: {e}"))?;
 		encoder
 			.set_bitrate(opus::Bitrate::Bits(audio_bitrate))
-			.map_err(|e| tracing::error!("Failed to set audio bitrate: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to set audio bitrate: {e}"))?;
 
 		let fec_encoder = ReedSolomon::<galois_8::Field>::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
-			.map_err(|e| tracing::error!("Failed to create FEC encoder: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to create FEC encoder: {e}"))?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioEncoderInner {};
@@ -95,7 +95,7 @@ impl AudioEncoder {
 		self.command_tx
 			.send(AudioEncoderCommand::UpdateKeys(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -172,7 +172,7 @@ impl AudioEncoderInner {
 					tracing::warn!("Failed to encode audio: {e}");
 					let _ = encoder
 						.reset_state()
-						.map_err(|e| tracing::error!("Failed to reset Opus encoder state: {e}"));
+						.map_err(|e| tracing::warn!("Failed to reset Opus encoder state: {e}"));
 					continue;
 				},
 			};
@@ -185,7 +185,7 @@ impl AudioEncoderInner {
 			let payload = match encrypt_cbc(&encoded_audio[..encoded_size], &keys.remote_input_key, &iv) {
 				Ok(payload) => payload,
 				Err(e) => {
-					tracing::error!("Failed to encrypt audio: {e}");
+					tracing::warn!("Failed to encrypt audio: {e}");
 					continue;
 				},
 			};

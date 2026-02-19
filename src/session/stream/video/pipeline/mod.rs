@@ -269,7 +269,7 @@ impl VideoPipelineInner {
 				// Update cache.
 				last_frame = Some(frame.clone());
 
-				tracing::debug!(
+				tracing::trace!(
 					"Received frame: format={}, modifier={:#x}, {}x{}, planes={}",
 					frame.format,
 					frame.modifier,
@@ -286,7 +286,7 @@ impl VideoPipelineInner {
 							dmabuf_importer.as_mut().unwrap()
 						},
 						Err(e) => {
-							tracing::error!("Failed to create DMA-BUF importer: {e}");
+							tracing::warn!("Failed to create DMA-BUF importer: {e}");
 							continue;
 						},
 					},
@@ -308,7 +308,7 @@ impl VideoPipelineInner {
 				let dmabuf_image = match importer.import_bgra(frame.width, frame.height, &planes) {
 					Ok(img) => img,
 					Err(e) => {
-						tracing::error!("Failed to import DMA-BUF: {e}");
+						tracing::warn!("Failed to import DMA-BUF: {e}");
 						continue;
 					},
 				};
@@ -329,7 +329,7 @@ impl VideoPipelineInner {
 								color_converter.as_mut().unwrap()
 							},
 							Err(e) => {
-								tracing::error!("Failed to create color converter: {e}");
+								tracing::warn!("Failed to create color converter: {e}");
 								continue;
 							},
 						}
@@ -338,7 +338,7 @@ impl VideoPipelineInner {
 
 				// Convert to YUV.
 				if let Err(e) = converter.convert(dmabuf_image.image(), encoder.input_image()) {
-					tracing::error!("GPU color conversion failed: {e}");
+					tracing::warn!("GPU color conversion failed: {e}");
 					continue;
 				}
 
@@ -356,13 +356,13 @@ impl VideoPipelineInner {
 								&mut frame_number,
 								&mut sequence_number,
 							) {
-								tracing::error!("Failed to send encoded packet");
+								tracing::warn!("Failed to send encoded packet");
 								return Err("Failed to send packet".to_string());
 							}
 						}
 					},
 					Err(e) => {
-						tracing::error!("Failed to encode frame: {e}");
+						tracing::warn!("Failed to encode frame: {e}");
 					},
 				}
 

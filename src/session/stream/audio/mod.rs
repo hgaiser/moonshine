@@ -45,14 +45,14 @@ impl AudioStream {
 			tracing::debug!("Enabling QoS on audio socket.");
 			socket
 				.set_tos(224)
-				.map_err(|e| tracing::error!("Failed to set QoS on the audio socket: {e}"))?;
+				.map_err(|e| tracing::warn!("Failed to set QoS on the audio socket: {e}"))?;
 		}
 
 		tracing::debug!(
 			"Listening for audio messages on {}",
 			socket
 				.local_addr()
-				.map_err(|e| tracing::error!("Failed to get local address associated with control socket: {e}"))?
+				.map_err(|e| tracing::warn!("Failed to get local address associated with control socket: {e}"))?
 		);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
@@ -72,16 +72,16 @@ impl AudioStream {
 		self.command_tx
 			.send(AudioStreamCommand::Start(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to send Start command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send Start command: {e}"))
 	}
 
 	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
-		tracing::info!("Updating audio stream keys.");
+		tracing::debug!("Updating audio stream keys.");
 
 		self.command_tx
 			.send(AudioStreamCommand::UpdateKeys(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -143,7 +143,7 @@ impl AudioStreamInner {
 
 				AudioStreamCommand::UpdateKeys(keys) => {
 					let Some(encoder) = &self.encoder else {
-						tracing::error!("Can't update session keys, there is no encoder to update.");
+						tracing::warn!("Can't update session keys, there is no encoder to update.");
 						continue;
 					};
 

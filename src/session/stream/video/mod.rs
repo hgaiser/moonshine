@@ -114,14 +114,14 @@ impl VideoStream {
 			tracing::debug!("Enabling QoS on video socket.");
 			socket
 				.set_tos(160)
-				.map_err(|e| tracing::error!("Failed to set QoS on the video socket: {e}"))?;
+				.map_err(|e| tracing::warn!("Failed to set QoS on the video socket: {e}"))?;
 		}
 
 		tracing::debug!(
 			"Listening for video messages on {}",
 			socket
 				.local_addr()
-				.map_err(|e| tracing::error!("Failed to get local address associated with control socket: {e}"))?
+				.map_err(|e| tracing::warn!("Failed to get local address associated with control socket: {e}"))?
 		);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
@@ -183,7 +183,7 @@ impl VideoStreamInner {
 					tracing::debug!("Received request for IDR frame, next frame will be an IDR frame.");
 					let _ = idr_frame_request_tx
 						.send(())
-						.map_err(|e| tracing::error!("Failed to send IDR frame request to encoder: {e}"));
+						.map_err(|e| tracing::warn!("Failed to send IDR frame request to encoder: {e}"));
 				},
 				VideoStreamCommand::Start => {
 					if started_streaming {
@@ -217,7 +217,7 @@ impl VideoStreamInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
 		let frame_rx = self.frame_rx.take().ok_or_else(|| {
-			tracing::error!("No frame receiver available for video pipeline");
+			tracing::warn!("No frame receiver available for video pipeline");
 		})?;
 
 		tracing::debug!("Creating video pipeline with compositor frame receiver.");

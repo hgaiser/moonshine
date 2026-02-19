@@ -59,7 +59,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			tracing::trace!("Key down: {keycode}");
 			if let Some(keyboard) = state.seat.get_keyboard() {
 				let focus = keyboard.current_focus();
-				tracing::debug!(?focus, keycode, "Key down, current keyboard focus");
+				tracing::trace!(?focus, keycode, "Key down, current keyboard focus");
 				// Keycode offset: evdev keycodes are offset by 8 from XKB keycodes.
 				keyboard.input::<(), _>(
 					state,
@@ -193,7 +193,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 				let x11_info = window.x11_surface().map(|x| {
 					(x.title(), x.class(), x.is_override_redirect(), x.wl_surface())
 				});
-				tracing::debug!(?x11_info, ?window_loc, cursor = ?state.cursor_position, "Click: element under cursor");
+				tracing::trace!(?x11_info, ?window_loc, cursor = ?state.cursor_position, "Click: element under cursor");
 
 				let keyboard = state.seat.get_keyboard().unwrap();
 				keyboard.set_focus(state, Some(KeyboardFocusTarget::Window(window)), serial);
@@ -201,9 +201,9 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 				// Log all windows in the space for debugging.
 				for (i, window) in state.space.elements().enumerate() {
 					let x11_info = window.x11_surface().map(|x| (x.title(), x.class()));
-					tracing::debug!(i, ?x11_info, geometry = ?window.geometry(), "Space element");
+					tracing::trace!(i, ?x11_info, geometry = ?window.geometry(), "Space element");
 				}
-				tracing::debug!(
+				tracing::trace!(
 					num_windows = state.space.elements().count(),
 					cursor = ?state.cursor_position,
 					"Click: no surface under cursor"

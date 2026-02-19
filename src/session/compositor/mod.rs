@@ -79,7 +79,7 @@ fn run_compositor(
 
 	// Open a render node (no DRM master required for headless operation).
 	let render_node = find_render_node()?;
-	tracing::info!("Using render node: {}", render_node.display());
+	tracing::debug!("Using render node: {}", render_node.display());
 
 	// Open the render node twice — GbmDevice<File> doesn't impl Clone
 	// because File doesn't impl Clone, so we need separate file handles
@@ -106,7 +106,7 @@ fn run_compositor(
 
 	// Query the EGL display for formats that can be used as render targets.
 	let render_formats = renderer.egl_context().dmabuf_render_formats();
-	tracing::info!("Supported DMA-BUF render formats: {}", render_formats.iter().count());
+	tracing::debug!("Supported DMA-BUF render formats: {}", render_formats.iter().count());
 
 	// Prefer Argb8888, then Xrgb8888, then fall back to first available format.
 	let preferred_fourccs = [Fourcc::Argb8888, Fourcc::Xrgb8888];
@@ -137,7 +137,7 @@ fn run_compositor(
 		})
 		.ok_or_else(|| "No supported DMA-BUF render formats found".to_string())?;
 
-	tracing::info!(
+	tracing::debug!(
 		"Selected render format: {:?} with {} modifier(s)",
 		render_fourcc,
 		render_modifiers.len()
@@ -273,7 +273,7 @@ fn run_compositor(
 	let mut state = state;
 	state.start_xwayland();
 
-	tracing::info!(
+	tracing::debug!(
 		shutdown_triggered = stop.is_shutdown_triggered(),
 		"Entering compositor event loop"
 	);

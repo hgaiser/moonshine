@@ -273,7 +273,7 @@ impl MoonshineCompositor {
 		let socket_source = ListeningSocketSource::new_auto()
 			.expect("Failed to create Wayland listening socket");
 		let socket_name = socket_source.socket_name().to_os_string();
-		tracing::info!("Wayland socket: {:?}", socket_name);
+		tracing::debug!("Wayland socket: {:?}", socket_name);
 
 		// Set WAYLAND_DISPLAY for child processes.
 		std::env::set_var("WAYLAND_DISPLAY", &socket_name);
@@ -282,7 +282,7 @@ impl MoonshineCompositor {
 		let mut display_handle_clone = display_handle.clone();
 		handle
 			.insert_source(socket_source, move |client_stream, _, _state| {
-				tracing::info!("New Wayland client connected");
+				tracing::debug!("New Wayland client connected");
 				if let Err(e) = display_handle_clone.insert_client(
 					client_stream,
 					std::sync::Arc::new(ClientState {
@@ -529,7 +529,7 @@ impl MoonshineCompositor {
 			.unwrap_or_else(|_| std::process::Stdio::null());
 
 		// Log key environment state before spawning.
-		tracing::info!(
+		tracing::debug!(
 			wayland_display = ?std::env::var("WAYLAND_DISPLAY"),
 			xdg_runtime_dir = ?std::env::var("XDG_RUNTIME_DIR"),
 			"Spawning XWayland"
@@ -550,9 +550,9 @@ impl MoonshineCompositor {
 				return;
 			},
 		};
-		tracing::info!(
+		tracing::debug!(
 			display_number = xwayland.display_number(),
-			"XWayland process spawned, waiting for readiness"
+			"XWayland process spawned, waiting for readiness."
 		);
 
 		let ret = self.handle.insert_source(xwayland, move |event, _, data: &mut MoonshineCompositor| match event {
@@ -564,9 +564,9 @@ impl MoonshineCompositor {
 				data.client_compositor_state(&client).set_client_scale(1.0);
 
 				let wm = smithay::xwayland::X11Wm::start_wm(data.handle.clone(), x11_socket, client.clone())
-					.expect("Failed to start X11 window manager");
+					.expect("Failed to start X11 window manager.");
 
-				tracing::info!(display_number, "XWayland ready");
+				tracing::debug!(display_number, "XWayland ready.");
 				std::env::set_var("DISPLAY", format!(":{display_number}"));
 
 				data.xwm = Some(wm);
@@ -578,7 +578,7 @@ impl MoonshineCompositor {
 				}
 			},
 			XWaylandEvent::Error => {
-				tracing::error!("XWayland crashed on startup");
+				tracing::error!("XWayland crashed on startup.");
 			},
 		});
 

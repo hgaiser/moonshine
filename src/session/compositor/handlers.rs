@@ -126,7 +126,7 @@ impl MoonshineCompositor {
 	/// Uses `KeyboardFocusTarget::Window` so that X11 windows receive
 	/// `XSetInputFocus` via the `X11Surface` `KeyboardTarget` impl.
 	pub(super) fn set_keyboard_focus_to_window(&mut self, window: &Window) {
-		tracing::info!("Setting keyboard focus to window");
+		tracing::debug!("Setting keyboard focus to window.");
 		let serial = smithay::utils::SERIAL_COUNTER.next_serial();
 		if let Some(keyboard) = self.seat.get_keyboard() {
 			keyboard.set_focus(self, Some(KeyboardFocusTarget::Window(window.clone())), serial);
@@ -142,7 +142,7 @@ impl XdgShellHandler for MoonshineCompositor {
 	}
 
 	fn new_toplevel(&mut self, surface: ToplevelSurface) {
-		tracing::info!("New XDG toplevel mapped in space");
+		tracing::debug!("New XDG toplevel mapped in space.");
 
 		// Tell the client the desired surface size so Vulkan WSI can
 		// create a swapchain. Without an initial configure the client
@@ -185,7 +185,7 @@ impl SeatHandler for MoonshineCompositor {
 	}
 
 	fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
-		tracing::debug!(?image, "Cursor image changed");
+		tracing::trace!(?image, "Cursor image changed");
 		self.cursor_status = image;
 	}
 
@@ -308,7 +308,7 @@ impl XwmHandler for MoonshineCompositor {
 	fn new_override_redirect_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
 
 	fn map_window_request(&mut self, _xwm: XwmId, window: X11Surface) {
-		tracing::info!(
+		tracing::debug!(
 			title = ?window.title(),
 			class = ?window.class(),
 			override_redirect = window.is_override_redirect(),
@@ -322,13 +322,13 @@ impl XwmHandler for MoonshineCompositor {
 			(self.width as i32, self.height as i32).into(),
 		);
 		if let Err(e) = window.configure(geo) {
-			tracing::error!("Failed to configure X11 window geometry: {e}");
+			tracing::warn!("Failed to configure X11 window geometry: {e}");
 		}
 
 		// Mark the window as fullscreen so the client doesn't draw
 		// resize borders or window decorations.
 		if let Err(e) = window.set_fullscreen(true) {
-			tracing::error!("Failed to set X11 window fullscreen: {e}");
+			tracing::warn!("Failed to set X11 window fullscreen: {e}");
 		}
 
 		// Grant the map request.
@@ -347,7 +347,7 @@ impl XwmHandler for MoonshineCompositor {
 			let x11_info = elem.x11_surface().map(|x| {
 				(x.title(), x.class(), x.is_override_redirect(), x.wl_surface())
 			});
-			tracing::info!(i, ?x11_info, loc = ?self.space.element_location(elem), "Space element after map");
+			tracing::debug!(i, ?x11_info, loc = ?self.space.element_location(elem), "Space element after map");
 		}
 	}
 

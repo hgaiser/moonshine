@@ -96,7 +96,7 @@ impl<'a> ControlMessage<'a> {
 
 		let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
 		if length as usize != buffer.len() - 4 {
-			tracing::info!(
+			tracing::warn!(
 				"Received incorrect packet length: expecting {length} bytes, but buffer says it should be {} bytes.",
 				buffer.len() - 4
 			);
@@ -106,13 +106,13 @@ impl<'a> ControlMessage<'a> {
 		match u16::from_le_bytes(buffer[..2].try_into().unwrap()).try_into()? {
 			ControlMessageType::Encrypted => {
 				if buffer.len() < MINIMUM_ENCRYPTED_LENGTH {
-					tracing::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
+					tracing::warn!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
 					return Err(());
 				}
 
 				let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
 				if (length as usize) < MINIMUM_ENCRYPTED_LENGTH {
-					tracing::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
+					tracing::warn!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
 					return Err(());
 				}
 
@@ -135,7 +135,7 @@ impl<'a> ControlMessage<'a> {
 				// Length of the input event, excluding the length itself.
 				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 				if length as usize != buffer.len() - 8 {
-					tracing::info!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8);
+					tracing::warn!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8);
 					return Err(());
 				}
 
@@ -296,7 +296,7 @@ impl ControlStream {
 			config
 				.address
 				.parse()
-				.map_err(|e| tracing::error!("Failed to parse address ({}): {e}", config.address))?,
+				.map_err(|e| tracing::warn!("Failed to parse address ({}): {e}", config.address))?,
 			config.stream.control.port,
 		);
 
@@ -316,11 +316,11 @@ impl ControlStream {
 			// Diagnostic: test if we can manually bind to the port.
 			match std::net::UdpSocket::bind(socket_address) {
 				Ok(sock) => {
-					tracing::info!("Diagnostic: successfully bound UDP socket to {socket_address}, releasing it now.");
+					tracing::debug!("Diagnostic: successfully bound UDP socket to {socket_address}, releasing it now.");
 					drop(sock);
 				},
 				Err(e) => {
-					tracing::error!("Diagnostic: failed to bind UDP socket to {socket_address}: {e}");
+					tracing::warn!("Diagnostic: failed to bind UDP socket to {socket_address}: {e}");
 				},
 			}
 
@@ -361,7 +361,7 @@ impl ControlStream {
 		self.command_tx
 			.send(ControlStreamCommand::UpdateKeys(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -471,7 +471,7 @@ impl ControlStreamInner {
 						decrypted = match decrypted_result {
 							Ok(decrypted) => decrypted,
 							Err(e) => {
-								tracing::error!("Failed to decrypt control message: {:?}", e);
+								tracing::warn!("Failed to decrypt control message: {:?}", e);
 								continue;
 							},
 						};

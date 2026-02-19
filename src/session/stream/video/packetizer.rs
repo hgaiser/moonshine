@@ -223,7 +223,7 @@ impl Packetizer {
 
 				encoder
 					.encode(&mut shards)
-					.map_err(|e| tracing::error!("Failed to encode packet as FEC shards: {e}"))?;
+					.map_err(|e| tracing::warn!("Failed to encode packet as FEC shards: {e}"))?;
 
 				// Force these values for the parity shards, we don't need to reconstruct them, but Moonlight needs them to match with the frame they came from.
 				for (block_shard_index, shard) in shards[nr_data_shards..].iter_mut().enumerate() {
@@ -255,7 +255,7 @@ impl Packetizer {
 					shard.len()
 				);
 				if packet_tx.blocking_send(shard).is_err() {
-					tracing::info!("Couldn't send packet, video packet channel closed.");
+					tracing::debug!("Couldn't send packet, video packet channel closed.");
 					return Ok(());
 				}
 			}
@@ -285,7 +285,7 @@ impl Packetizer {
 				tracing::trace!("No FEC encoder for this combination of shards, creating a new one.");
 				let encoder = e.insert(
 					ReedSolomon::<galois_8::Field>::new(nr_data_shards, nr_parity_shards)
-						.map_err(|e| tracing::error!("Couldn't create error correction encoder: {e}"))?,
+						.map_err(|e| tracing::warn!("Couldn't create error correction encoder: {e}"))?,
 				);
 				tracing::trace!("Finished preparing FEC encoder.");
 

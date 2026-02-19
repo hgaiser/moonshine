@@ -198,7 +198,7 @@ impl InputHandler {
 				self.gamepad_tx
 					.send((gamepad_event, feedback))
 					.await
-					.map_err(|e| tracing::error!("Failed to send gamepad event: {e}"))?;
+					.map_err(|e| tracing::warn!("Failed to send gamepad event: {e}"))?;
 			},
 		}
 		Ok(())
@@ -235,7 +235,7 @@ async fn run_gamepad_handler(
 						if gamepads[gamepad.index as usize].is_none() {
 							if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
 								gamepads[gamepad.index as usize] = Some(new_gamepad);
-								tracing::info!("Gamepad {} connected.", gamepad.index);
+								tracing::debug!("Gamepad {} connected.", gamepad.index);
 							}
 						}
 					},
@@ -290,7 +290,7 @@ async fn run_gamepad_handler(
 						// Disconnect gamepads that are no longer active.
 						for (i, gamepad) in gamepads.iter_mut().enumerate() {
 							if gamepad.is_some() && gamepad_update.active_gamepad_mask & (1 << i) == 0 {
-								tracing::info!("Gamepad {} disconnected.", i);
+								tracing::debug!("Gamepad {} disconnected.", i);
 								*gamepad = None;
 							}
 						}

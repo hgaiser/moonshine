@@ -74,10 +74,10 @@ fn create_audio_sink(name: &str) -> Result<String, ()> {
 		.arg(format!("sink_name={}", name))
 		.arg(format!("sink_properties=device.description={}", name))
 		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to run pactl: {e}"))?;
 
 	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+		tracing::warn!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
 		return Err(());
 	}
 
@@ -96,10 +96,10 @@ fn create_audio_loopback(source: &str, sink: &str) -> Result<String, ()> {
 		.arg(format!("source={}.monitor", source))
 		.arg(format!("sink={}", sink))
 		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to run pactl: {e}"))?;
 
 	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+		tracing::warn!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
 		return Err(());
 	}
 
@@ -111,10 +111,10 @@ fn get_default_sink() -> Result<String, ()> {
 	let output = Command::new("pactl")
 		.arg("get-default-sink")
 		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to run pactl: {e}"))?;
 
 	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+		tracing::warn!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
 		return Err(());
 	}
 
@@ -127,10 +127,10 @@ fn set_default_sink(name: &str) -> Result<(), ()> {
 		.arg("set-default-sink")
 		.arg(name)
 		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to run pactl: {e}"))?;
 
 	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+		tracing::warn!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
 		return Err(());
 	}
 
@@ -171,7 +171,7 @@ impl Session {
 			refresh_rate: context._refresh_rate,
 		};
 		let (frame_rx, input_tx, xdisplay_rx) = compositor::start_compositor(compositor_config, stop_session_signal.clone())
-			.map_err(|e| tracing::error!("Failed to start compositor: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to start compositor: {e}"))?;
 
 		// Launch the application in a background thread that waits for
 		// XWayland to become ready. We must not block Session::new()
@@ -185,10 +185,10 @@ impl Session {
 			.spawn(move || -> Result<Child, ()> {
 				let xdisplay = xdisplay_rx
 					.recv_timeout(std::time::Duration::from_secs(5))
-					.map_err(|e| tracing::error!("Timed out waiting for XWayland display: {e}"))?;
+					.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
 				launch_application(&app_context, &app_sink, xdisplay)
 			})
-			.map_err(|e| tracing::error!("Failed to spawn app launcher thread: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to spawn app launcher thread: {e}"))?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner {
@@ -223,7 +223,7 @@ impl Session {
 		self.command_tx
 			.send(SessionCommand::Start(video_stream_context, audio_stream_context))
 			.await
-			.map_err(|e| tracing::error!("Failed to send Start command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send Start command: {e}"))
 	}
 
 	pub fn context(&self) -> &SessionContext {
@@ -238,7 +238,7 @@ impl Session {
 		self.command_tx
 			.send(SessionCommand::UpdateKeys(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -357,7 +357,7 @@ impl SessionInner {
 /// headless compositor automatically.
 fn launch_application(context: &SessionContext, sink_name: &str, xdisplay: u32) -> Result<Child, ()> {
 	let Some(program) = context.application.command.first() else {
-		tracing::error!("Application command is empty.");
+		tracing::warn!("Application command is empty.");
 		return Err(());
 	};
 	let args = &context.application.command[1..];
@@ -369,10 +369,10 @@ fn launch_application(context: &SessionContext, sink_name: &str, xdisplay: u32) 
 	);
 
 	let log_dir = std::env::temp_dir().join("moonshine");
-	std::fs::create_dir_all(&log_dir).map_err(|e| tracing::error!("Failed to create log directory: {e}"))?;
+	std::fs::create_dir_all(&log_dir).map_err(|e| tracing::warn!("Failed to create log directory: {e}"))?;
 	let log_path = log_dir.join(format!("app-{}.log", context.application_id));
 	tracing::debug!("Application log path: {}", log_path.display());
-	let log_file = std::fs::File::create(&log_path).map_err(|e| tracing::error!("Failed to create log file: {e}"))?;
+	let log_file = std::fs::File::create(&log_path).map_err(|e| tracing::warn!("Failed to create log file: {e}"))?;
 
 	Command::new(program)
 		.args(args)
@@ -388,10 +388,10 @@ fn launch_application(context: &SessionContext, sink_name: &str, xdisplay: u32) 
 		.stdout(
 			log_file
 				.try_clone()
-				.map_err(|e| tracing::error!("Failed to clone log file handle: {e}"))?,
+				.map_err(|e| tracing::warn!("Failed to clone log file handle: {e}"))?,
 		)
 		.stderr(log_file)
 		.stdin(Stdio::null())
 		.spawn()
-		.map_err(|e| tracing::error!("Failed to launch application: {e}"))
+		.map_err(|e| tracing::warn!("Failed to launch application: {e}"))
 }

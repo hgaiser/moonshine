@@ -124,7 +124,7 @@ async fn main() -> Result<(), ()> {
 
 	// Wait until everything was shutdown.
 	let exit_code = shutdown.wait_shutdown_complete().await;
-	tracing::trace!("Successfully waited for shutdown to complete.");
+	tracing::debug!("Successfully waited for shutdown to complete.");
 	std::process::exit(exit_code);
 }
 
