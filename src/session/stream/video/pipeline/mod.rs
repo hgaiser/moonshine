@@ -1,23 +1,23 @@
 //! Video encoding and streaming pipeline.
 //!
-//! This module handles video capture from PipeWire nodes, encoding with pixelforge,
+//! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
-mod capture;
 mod dmabuf;
 
+use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::session::compositor::frame::ExportedFrame;
 use crate::session::manager::SessionShutdownReason;
 
 use super::packetizer::Packetizer;
 use super::{VideoChromaSampling, VideoDynamicRange, VideoFormat};
 
-use capture::{start_capture, CaptureConfig, CapturePixelFormat, CapturedFrame};
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
@@ -30,7 +30,7 @@ pub struct VideoPipeline {}
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		node_id: u32,
+		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		width: u32,
 		height: u32,
 		framerate: u32,
@@ -49,7 +49,6 @@ impl VideoPipeline {
 		tracing::debug!("Initializing video pipeline.");
 
 		let inner = VideoPipelineInner {
-			node_id,
 			width,
 			height,
 			framerate,
@@ -66,7 +65,7 @@ impl VideoPipeline {
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
-				inner.run(packet_tx, idr_frame_request_rx, stop_session_manager);
+				inner.run(frame_rx, packet_tx, idr_frame_request_rx, stop_session_manager);
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
 
@@ -75,7 +74,6 @@ impl VideoPipeline {
 }
 
 struct VideoPipelineInner {
-	node_id: u32,
 	width: u32,
 	height: u32,
 	framerate: u32,
@@ -92,6 +90,7 @@ struct VideoPipelineInner {
 impl VideoPipelineInner {
 	pub fn run(
 		self,
+		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
@@ -113,7 +112,7 @@ impl VideoPipelineInner {
 		};
 
 		// Start the capture and encoding loop.
-		if let Err(e) = self.run_encoding_loop(context, encoder, packet_tx, idr_frame_request_rx, stop_session_manager)
+		if let Err(e) = self.run_encoding_loop(frame_rx, context, encoder, packet_tx, idr_frame_request_rx, stop_session_manager)
 		{
 			tracing::error!("Video encoding loop failed: {e}");
 		}
@@ -173,6 +172,7 @@ impl VideoPipelineInner {
 
 	fn run_encoding_loop(
 		&self,
+		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
 		packet_tx: mpsc::Sender<Vec<u8>>,
@@ -216,27 +216,18 @@ impl VideoPipelineInner {
 			(VideoChromaSampling::Yuv444, VideoDynamicRange::Hdr) => OutputFormat::YUV444P10,
 		};
 
-		// Color converter will be initialized on first RGB frame.
+		// Color converter will be initialized on first frame.
 		let mut color_converter: Option<ColorConverter> = None;
 
-		// Start the capture.
-		let capture_config = CaptureConfig {
-			node_id: self.node_id,
-			width: self.width,
-			height: self.height,
-		};
-
-		let capture = start_capture(capture_config, stop_session_manager.clone())?;
-
-		// Encoding loop - receives frames from capture thread.
+		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / self.framerate as f64);
 		let mut last_frame_time = std::time::Instant::now();
 
-		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame)
+		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
 
 		// Cache for the last received frame to handle IDR requests during static screen.
-		let mut last_frame: Option<CapturedFrame> = None;
+		let mut last_frame: Option<ExportedFrame> = None;
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Check for IDR request.
@@ -247,8 +238,8 @@ impl VideoPipelineInner {
 				pending_idr = true;
 			}
 
-			// Try to receive a frame from capture thread (with timeout)
-			let received_frame = match capture.recv_timeout(frame_interval) {
+			// Try to receive a frame from compositor (with timeout).
+			let received_frame = match frame_rx.recv_timeout(frame_interval) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
@@ -269,26 +260,24 @@ impl VideoPipelineInner {
 					}
 				},
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-					tracing::debug!("Frame channel disconnected - capture thread ended");
+					tracing::debug!("Frame channel disconnected - compositor stopped");
 					break;
 				},
 			};
 
 			if let Some(frame) = received_frame {
-				// Update cache (this will duplicate the FD, which is fine)
+				// Update cache.
 				last_frame = Some(frame.clone());
 
-				// Zero-copy DMA-BUF path - import directly to Vulkan image.
-				let dmabuf_info = &frame.dmabuf;
 				tracing::debug!(
-					"Received frame: format={:?}, {}x{}, fd={}, offset={}, stride={}",
+					"Received frame: format={}, modifier={:#x}, {}x{}, planes={}",
 					frame.format,
-					dmabuf_info.width,
-					dmabuf_info.height,
-					dmabuf_info.fd,
-					dmabuf_info.offset,
-					dmabuf_info.stride
+					frame.modifier,
+					frame.width,
+					frame.height,
+					frame.planes.len()
 				);
+
 				let importer = match &mut dmabuf_importer {
 					Some(imp) => imp,
 					None => match DmaBufImporter::new(context.clone()) {
@@ -303,99 +292,58 @@ impl VideoPipelineInner {
 					},
 				};
 
-				// Create DmaBufPlane from the info.
-				let plane = DmaBufPlane {
-					fd: dmabuf_info.fd,
-					offset: dmabuf_info.offset,
-					stride: dmabuf_info.stride,
-					modifier: dmabuf_info.modifier,
-				};
-				let planes = [plane];
+				// Build DmaBufPlane array from ExportedFrame planes.
+				let planes: Vec<DmaBufPlane> = frame
+					.planes
+					.iter()
+					.map(|p| DmaBufPlane {
+						fd: p.fd.as_raw_fd(),
+						offset: p.offset,
+						stride: p.stride,
+						modifier: frame.modifier,
+					})
+					.collect();
 
-				// Handle based on format.
-				let encode_result = match frame.format {
-					CapturePixelFormat::NV12 => {
-						// NV12 DMA-BUF can be passed directly to encoder (zero-copy)
-						let dmabuf_image = match importer.import_nv12(dmabuf_info.width, dmabuf_info.height, &planes) {
-							Ok(img) => img,
-							Err(e) => {
-								tracing::error!("Failed to import NV12 DMA-BUF: {e}");
-								continue;
-							},
-						};
-						encoder.encode(dmabuf_image.image())
-					},
-					CapturePixelFormat::BGRx
-					| CapturePixelFormat::BGRA
-					| CapturePixelFormat::RGBx
-					| CapturePixelFormat::RGBA => {
-						// RGB DMA-BUF needs conversion to YUV.
-						let input_format = match frame.format {
-							CapturePixelFormat::BGRx => InputFormat::BGRx,
-							CapturePixelFormat::RGBx => InputFormat::RGBx,
-							CapturePixelFormat::BGRA => InputFormat::BGRA,
-							CapturePixelFormat::RGBA => InputFormat::RGBA,
-							_ => unreachable!(),
-						};
-
-						// Import the DMA-BUF as a Vulkan image.
-						let dmabuf_image = match frame.format {
-							CapturePixelFormat::BGRx | CapturePixelFormat::BGRA => {
-								importer.import_bgra(dmabuf_info.width, dmabuf_info.height, &planes)
-							},
-							CapturePixelFormat::RGBx | CapturePixelFormat::RGBA => {
-								importer.import_rgba(dmabuf_info.width, dmabuf_info.height, &planes)
-							},
-							_ => unreachable!(),
-						};
-
-						let dmabuf_image = match dmabuf_image {
-							Ok(img) => img,
-							Err(e) => {
-								tracing::error!("Failed to import RGB DMA-BUF: {e}");
-								continue;
-							},
-						};
-
-						// Initialize converter if needed.
-						let converter = match &mut color_converter {
-							Some(conv) => conv,
-							None => {
-								let config = ColorConverterConfig {
-									width: self.width,
-									height: self.height,
-									input_format,
-									output_format,
-								};
-								match ColorConverter::new(context.clone(), config) {
-									Ok(conv) => {
-										color_converter = Some(conv);
-										color_converter.as_mut().unwrap()
-									},
-									Err(e) => {
-										tracing::error!("Failed to create color converter: {e}");
-										continue;
-									},
-								}
-							},
-						};
-
-						// Convert RGB to YUV directly into the encoder's input image.
-						if let Err(e) = converter.convert(dmabuf_image.image(), encoder.input_image()) {
-							tracing::error!("GPU color conversion failed: {e}");
-							continue;
-						}
-
-						// Encode the converted image.
-						encoder.encode(encoder.input_image())
-					},
-					CapturePixelFormat::I420 => {
-						// I420 DMA-BUF - import and encode.
-						// Note: Encoder might need I420 support
-						tracing::warn!("I420 DMA-BUF not yet supported");
+				// The compositor exports ARGB/XRGB buffers — import as BGRA and convert.
+				let dmabuf_image = match importer.import_bgra(frame.width, frame.height, &planes) {
+					Ok(img) => img,
+					Err(e) => {
+						tracing::error!("Failed to import DMA-BUF: {e}");
 						continue;
 					},
 				};
+
+				// Initialize converter if needed.
+				let converter = match &mut color_converter {
+					Some(conv) => conv,
+					None => {
+						let config = ColorConverterConfig {
+							width: self.width,
+							height: self.height,
+							input_format: InputFormat::BGRx,
+							output_format,
+						};
+						match ColorConverter::new(context.clone(), config) {
+							Ok(conv) => {
+								color_converter = Some(conv);
+								color_converter.as_mut().unwrap()
+							},
+							Err(e) => {
+								tracing::error!("Failed to create color converter: {e}");
+								continue;
+							},
+						}
+					},
+				};
+
+				// Convert to YUV.
+				if let Err(e) = converter.convert(dmabuf_image.image(), encoder.input_image()) {
+					tracing::error!("GPU color conversion failed: {e}");
+					continue;
+				}
+
+				// Encode the converted image.
+				let encode_result = encoder.encode(encoder.input_image());
 
 				// Process encoded packets.
 				match encode_result {
@@ -423,9 +371,6 @@ impl VideoPipelineInner {
 				}
 			}
 		}
-
-		// Wait for capture thread to finish (handled by CaptureHandle Drop)
-		drop(capture);
 
 		// Flush the encoder.
 		match encoder.flush() {

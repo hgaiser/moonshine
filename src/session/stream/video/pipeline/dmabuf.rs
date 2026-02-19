@@ -65,6 +65,7 @@ pub struct DmaBufImporter {
 	external_memory_fd: ash::khr::external_memory_fd::Device,
 }
 
+#[allow(dead_code)]
 impl DmaBufImporter {
 	/// Create a new DMA-BUF importer.
 	///

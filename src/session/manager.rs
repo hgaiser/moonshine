@@ -37,6 +37,8 @@ pub enum SessionShutdownReason {
 	ControlStreamStopped,
 	/// Input handler stopped unexpectedly.
 	InputHandlerStopped,
+	/// Compositor stopped unexpectedly.
+	CompositorStopped,
 }
 
 pub enum SessionManagerCommand {
@@ -149,6 +151,11 @@ impl SessionManagerInner {
 
 		let mut stop_session_manager = ShutdownManager::new();
 		while let Some(command) = command_rx.recv().await {
+			tracing::debug!(
+				has_session = active_session.is_some(),
+				shutdown_triggered = stop_session_manager.is_shutdown_triggered(),
+				"Session manager received command"
+			);
 			if active_session.is_some() && stop_session_manager.is_shutdown_triggered() {
 				let reason = stop_session_manager.wait_shutdown_complete().await;
 				tracing::warn!("Session stopped unexpectedly, waiting for new session (reason: {reason:?}).");
@@ -184,6 +191,10 @@ impl SessionManagerInner {
 						continue;
 					}
 
+					tracing::info!(
+						shutdown_triggered = stop_session_manager.is_shutdown_triggered(),
+						"Initializing new session"
+					);
 					active_session = match Session::new(
 						config.clone(),
 						session_context,

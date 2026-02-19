@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
@@ -210,6 +211,70 @@ enum ControlStreamCommand {
 	UpdateKeys(SessionKeys),
 }
 
+/// Set `FD_CLOEXEC` on a UDP socket bound to the given address.
+///
+/// The enet C library creates sockets without `SOCK_CLOEXEC`, which means child
+/// processes (e.g. XWayland, launched applications) inherit the file descriptor.
+/// If those child processes outlive the session, the port remains in use and the
+/// next session fails to bind to it.
+fn set_cloexec_on_bound_udp_socket(addr: &SocketAddr) {
+	let target_port = addr.port();
+	let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+		tracing::warn!("Failed to read /proc/self/fd to set CLOEXEC on enet socket.");
+		return;
+	};
+
+	for entry in entries.flatten() {
+		let Ok(fd_str) = entry.file_name().into_string() else {
+			continue;
+		};
+		let Ok(fd) = fd_str.parse::<RawFd>() else {
+			continue;
+		};
+
+		// Safety: we only call POSIX functions to query and set fd flags.
+		unsafe {
+			let mut sock_addr: libc::sockaddr_in = std::mem::zeroed();
+			let mut addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+			if libc::getsockname(fd, &mut sock_addr as *mut _ as *mut libc::sockaddr, &mut addr_len) != 0 {
+				continue;
+			}
+			if sock_addr.sin_family != libc::AF_INET as libc::sa_family_t {
+				continue;
+			}
+			if u16::from_be(sock_addr.sin_port) != target_port {
+				continue;
+			}
+
+			// Verify that this is a UDP socket.
+			let mut sock_type: libc::c_int = 0;
+			let mut opt_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+			if libc::getsockopt(
+				fd,
+				libc::SOL_SOCKET,
+				libc::SO_TYPE,
+				&mut sock_type as *mut _ as *mut libc::c_void,
+				&mut opt_len,
+			) != 0 || sock_type != libc::SOCK_DGRAM
+			{
+				continue;
+			}
+
+			let flags = libc::fcntl(fd, libc::F_GETFD);
+			if flags == -1 {
+				tracing::warn!("Failed to get fd flags for enet socket (fd={fd}).");
+				continue;
+			}
+			if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
+				tracing::warn!("Failed to set FD_CLOEXEC on enet socket (fd={fd}).");
+			} else {
+				tracing::debug!("Set FD_CLOEXEC on enet socket (fd={fd}).");
+			}
+		}
+	}
+}
+
 pub struct ControlStream {
 	command_tx: mpsc::Sender<ControlStreamCommand>,
 }
@@ -223,8 +288,9 @@ impl ControlStream {
 		context: SessionContext,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		enet: Arc<Enet>,
+		input_tx: calloop::channel::Sender<crate::session::compositor::input::CompositorInputEvent>,
 	) -> Result<Self, ()> {
-		let input_handler = InputHandler::new(stop_session_manager.clone())?;
+		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone())?;
 
 		let socket_address = SocketAddr::new(
 			config
@@ -246,6 +312,18 @@ impl ControlStream {
 					return;
 				},
 			};
+
+			// Diagnostic: test if we can manually bind to the port.
+			match std::net::UdpSocket::bind(socket_address) {
+				Ok(sock) => {
+					tracing::info!("Diagnostic: successfully bound UDP socket to {socket_address}, releasing it now.");
+					drop(sock);
+				},
+				Err(e) => {
+					tracing::error!("Diagnostic: failed to bind UDP socket to {socket_address}: {e}");
+				},
+			}
+
 			let host = match enet.create_host::<()>(
 				Some(&local_addr),
 				1,
@@ -259,6 +337,9 @@ impl ControlStream {
 					return;
 				},
 			};
+
+			// Prevent the enet socket fd from being inherited by child processes.
+			set_cloexec_on_bound_udp_socket(&socket_address);
 
 			tokio::runtime::Handle::current().block_on(inner.run(
 				config,
@@ -438,5 +519,11 @@ impl ControlStreamInner {
 		}
 
 		tracing::debug!("Control stream stopped.");
+
+		// Explicitly drop the ENet host before the delay shutdown token
+		// to ensure the socket is released before wait_shutdown_complete
+		// returns. Without this, the next session's control stream may
+		// fail to bind to the same port.
+		drop(host);
 	}
 }

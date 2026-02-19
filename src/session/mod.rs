@@ -1,3 +1,4 @@
+use std::os::unix::process::CommandExt as _;
 use std::process::Command;
 use std::process::{Child, Stdio};
 use std::sync::Arc;
@@ -12,9 +13,12 @@ use crate::{
 	session::stream::{AudioStream, ControlStream, VideoStream},
 };
 
+use self::compositor::frame::ExportedFrame;
+use self::compositor::input::CompositorInputEvent;
 use self::stream::{AudioStreamContext, VideoStreamContext};
 pub use manager::SessionManager;
 
+pub mod compositor;
 pub mod manager;
 pub mod stream;
 
@@ -29,6 +33,7 @@ pub struct SessionKeys {
 
 /// Launch a session for a client.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct SessionContext {
 	/// Application to launch.
 	pub application: ApplicationConfig,
@@ -159,7 +164,31 @@ impl Session {
 			None
 		};
 
-		let gamescope_process = start_gamescope(&context, &sink_name)?;
+		// Start the headless compositor.
+		let compositor_config = compositor::CompositorConfig {
+			width: context.resolution.0,
+			height: context.resolution.1,
+			refresh_rate: context._refresh_rate,
+		};
+		let (frame_rx, input_tx, xdisplay_rx) = compositor::start_compositor(compositor_config, stop_session_signal.clone())
+			.map_err(|e| tracing::error!("Failed to start compositor: {e}"))?;
+
+		// Launch the application in a background thread that waits for
+		// XWayland to become ready. We must not block Session::new()
+		// because the session manager processes commands sequentially
+		// and stalling it would prevent the control stream from being
+		// established on time.
+		let app_context = context.clone();
+		let app_sink = sink_name.clone();
+		let app_handle = std::thread::Builder::new()
+			.name("app-launcher".to_string())
+			.spawn(move || -> Result<Child, ()> {
+				let xdisplay = xdisplay_rx
+					.recv_timeout(std::time::Duration::from_secs(5))
+					.map_err(|e| tracing::error!("Timed out waiting for XWayland display: {e}"))?;
+				launch_application(&app_context, &app_sink, xdisplay)
+			})
+			.map_err(|e| tracing::error!("Failed to spawn app launcher thread: {e}"))?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner {
@@ -167,7 +196,9 @@ impl Session {
 			video_stream: None,
 			audio_stream: None,
 			control_stream: None,
-			gamescope_process: Some(gamescope_process),
+			frame_rx: Some(frame_rx),
+			input_tx: Some(input_tx),
+			app_launcher: Some(app_handle),
 			audio_sink_module_id: Some(module_id),
 			audio_loopback_module_id: loopback_module_id,
 			enet,
@@ -216,7 +247,9 @@ struct SessionInner {
 	video_stream: Option<VideoStream>,
 	audio_stream: Option<AudioStream>,
 	control_stream: Option<ControlStream>,
-	gamescope_process: Option<Child>,
+	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
+	input_tx: Option<calloop::channel::Sender<CompositorInputEvent>>,
+	app_launcher: Option<std::thread::JoinHandle<Result<Child, ()>>>,
 	audio_sink_module_id: Option<String>,
 	audio_loopback_module_id: Option<String>,
 	enet: Arc<Enet>,
@@ -236,8 +269,9 @@ impl SessionInner {
 		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				SessionCommand::Start(video_stream_context, audio_stream_context) => {
+					let frame_rx = self.frame_rx.take();
 					let video_stream =
-						match VideoStream::new(self.config.clone(), video_stream_context, stop_session_manager.clone())
+						match VideoStream::new(self.config.clone(), video_stream_context, frame_rx, stop_session_manager.clone())
 							.await
 						{
 							Ok(video_stream) => video_stream,
@@ -250,6 +284,7 @@ impl SessionInner {
 							Ok(audio_stream) => audio_stream,
 							Err(()) => continue,
 						};
+					let input_tx = self.input_tx.take().expect("Input sender already consumed");
 					let control_stream = match ControlStream::new(
 						self.config.clone(),
 						video_stream.clone(),
@@ -257,6 +292,7 @@ impl SessionInner {
 						session_context.clone(),
 						stop_session_manager.clone(),
 						self.enet.clone(),
+						input_tx,
 					) {
 						Ok(control_stream) => control_stream,
 						Err(()) => {
@@ -287,8 +323,19 @@ impl SessionInner {
 			}
 		}
 
-		if let Some(mut gamescope_process) = self.gamescope_process {
-			let _ = gamescope_process.kill();
+		// Collect the app process from the launcher thread and terminate
+		// the entire process group. The child was launched with
+		// `process_group(0)` so it is the leader of its own group.
+		// Sending the signal to the group ensures that sub-processes
+		// spawned by the app (e.g. Steam's children) are also terminated.
+		if let Some(handle) = self.app_launcher {
+			if let Ok(Ok(ref child)) = handle.join() {
+				let pid = child.id() as libc::pid_t;
+				// Send SIGTERM to the entire process group (negative pid).
+				unsafe {
+					libc::kill(-pid, libc::SIGTERM);
+				}
+			}
 		}
 
 		if let Some(module_id) = self.audio_loopback_module_id {
@@ -303,46 +350,41 @@ impl SessionInner {
 	}
 }
 
-fn start_gamescope(context: &SessionContext, sink_name: &str) -> Result<Child, ()> {
-	let width = context.resolution.0.to_string();
-	let height = context.resolution.1.to_string();
-	let refresh_rate = context._refresh_rate.to_string();
+/// Launch the application as a child process.
+///
+/// The compositor has already set `WAYLAND_DISPLAY` in the process
+/// environment, so the child inherits it and connects to our
+/// headless compositor automatically.
+fn launch_application(context: &SessionContext, sink_name: &str, xdisplay: u32) -> Result<Child, ()> {
+	let Some(program) = context.application.command.first() else {
+		tracing::error!("Application command is empty.");
+		return Err(());
+	};
+	let args = &context.application.command[1..];
 
-	let mut command = vec![
-		"--backend".to_string(),
-		"headless".to_string(),
-		"-w".to_string(),
-		width.clone(),
-		"-h".to_string(),
-		height.clone(),
-		"-W".to_string(),
-		width,
-		"-H".to_string(),
-		height,
-		"-r".to_string(),
-		refresh_rate,
-		"--immediate-flips".to_string(),
-		"--force-grab-cursor".to_string(),
-	];
-
-	if context.application.enable_steam_integration {
-		command.push("--steam".to_string());
-	}
-
-	command.push("--".to_string());
-	command.extend(context.application.command.clone());
-
-	tracing::debug!("Starting gamescope with command: {:?}", command);
+	tracing::info!(
+		program,
+		?args,
+		"Launching application"
+	);
 
 	let log_dir = std::env::temp_dir().join("moonshine");
 	std::fs::create_dir_all(&log_dir).map_err(|e| tracing::error!("Failed to create log directory: {e}"))?;
-	let log_path = log_dir.join(format!("gamescope-{}.log", context.application_id));
-	tracing::debug!("Gamescope log path: {}", log_path.display());
+	let log_path = log_dir.join(format!("app-{}.log", context.application_id));
+	tracing::debug!("Application log path: {}", log_path.display());
 	let log_file = std::fs::File::create(&log_path).map_err(|e| tracing::error!("Failed to create log file: {e}"))?;
 
-	Command::new("gamescope")
-		.args(command)
+	Command::new(program)
+		.args(args)
 		.env("PULSE_SINK", sink_name)
+		// Set DISPLAY so X11 apps connect to our XWayland instance.
+		// WAYLAND_DISPLAY is already set by the compositor for native
+		// Wayland apps.
+		.env("DISPLAY", format!(":{xdisplay}"))
+		// Launch in a new process group so we can kill the entire tree
+		// on session stop (important for apps like Steam that spawn
+		// many sub-processes).
+		.process_group(0)
 		.stdout(
 			log_file
 				.try_clone()
@@ -351,5 +393,5 @@ fn start_gamescope(context: &SessionContext, sink_name: &str) -> Result<Child, (
 		.stderr(log_file)
 		.stdin(Stdio::null())
 		.spawn()
-		.map_err(|e| tracing::error!("Failed to start gamescope: {e}"))
+		.map_err(|e| tracing::error!("Failed to launch application: {e}"))
 }

@@ -5,6 +5,7 @@ use tokio::{
 };
 
 use crate::{config::Config, session::manager::SessionShutdownReason};
+use crate::session::compositor::frame::ExportedFrame;
 
 mod packetizer;
 mod pipeline;
@@ -99,6 +100,7 @@ impl VideoStream {
 	pub async fn new(
 		config: Config,
 		context: VideoStreamContext,
+		frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
@@ -127,6 +129,7 @@ impl VideoStream {
 			context,
 			config,
 			pipeline: None,
+			frame_rx,
 		};
 		tokio::spawn(inner.run(socket, command_rx, stop_session_manager.clone()));
 
@@ -154,6 +157,7 @@ struct VideoStreamInner {
 	context: VideoStreamContext,
 	config: Config,
 	pipeline: Option<VideoPipeline>,
+	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
 }
 
 impl VideoStreamInner {
@@ -212,11 +216,13 @@ impl VideoStreamInner {
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
-		let node_id = find_gamescope_node_id().await?;
+		let frame_rx = self.frame_rx.take().ok_or_else(|| {
+			tracing::error!("No frame receiver available for video pipeline");
+		})?;
 
-		tracing::debug!("Creating pipeline with node_id: {}", node_id);
+		tracing::debug!("Creating video pipeline with compositor frame receiver.");
 		let pipeline = VideoPipeline::new(
-			node_id,
+			frame_rx,
 			self.context.width,
 			self.context.height,
 			self.context.fps,
@@ -237,33 +243,6 @@ impl VideoStreamInner {
 
 		Ok(())
 	}
-}
-
-async fn find_gamescope_node_id() -> Result<u32, ()> {
-	for _ in 0..10 {
-		if let Ok(id) = find_node_id_by_name("gamescope") {
-			return Ok(id);
-		}
-		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-	}
-	tracing::error!("Failed to find gamescope node ID.");
-	Err(())
-}
-
-fn find_node_id_by_name(name: &str) -> Result<u32, ()> {
-	let output = std::process::Command::new("sh")
-		.arg("-c")
-		.arg(format!("pw-dump | jq '.[] | select(.info.props[\"node.name\"] == \"{}\") | select(.info.props[\"media.class\"] | test(\"Video/.*\")) | .id'", name))
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pw-dump: {e}"))?;
-
-	if !output.status.success() {
-		return Err(());
-	}
-
-	let output_str = String::from_utf8_lossy(&output.stdout);
-	let id: u32 = output_str.trim().parse().map_err(|_| ())?;
-	Ok(id)
 }
 
 async fn handle_video_packets(
