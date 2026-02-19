@@ -27,6 +27,65 @@ use pixelforge::{
 
 pub struct VideoPipeline {}
 
+/// A single frame's latency breakdown for periodic summary reporting.
+struct LatencySample {
+	channel_wait: std::time::Duration,
+	import: std::time::Duration,
+	convert: std::time::Duration,
+	encode: std::time::Duration,
+	packetize: std::time::Duration,
+	total: std::time::Duration,
+}
+
+/// Log a summary of latency statistics over a batch of samples.
+fn log_latency_summary(samples: &[LatencySample]) {
+	let n = samples.len();
+	if n == 0 {
+		return;
+	}
+
+	let mut totals: Vec<u64> = samples.iter().map(|s| s.total.as_micros() as u64).collect();
+	totals.sort_unstable();
+
+	let mut channel: Vec<u64> = samples.iter().map(|s| s.channel_wait.as_micros() as u64).collect();
+	channel.sort_unstable();
+
+	let mut imports: Vec<u64> = samples.iter().map(|s| s.import.as_micros() as u64).collect();
+	imports.sort_unstable();
+
+	let mut converts: Vec<u64> = samples.iter().map(|s| s.convert.as_micros() as u64).collect();
+	converts.sort_unstable();
+
+	let mut encodes: Vec<u64> = samples.iter().map(|s| s.encode.as_micros() as u64).collect();
+	encodes.sort_unstable();
+
+	let mut packetizes: Vec<u64> = samples.iter().map(|s| s.packetize.as_micros() as u64).collect();
+	packetizes.sort_unstable();
+
+	let p50 = |v: &[u64]| v[v.len() / 2];
+	let p95 = |v: &[u64]| v[(v.len() as f64 * 0.95) as usize];
+	let p99 = |v: &[u64]| v[(v.len() as f64 * 0.99) as usize];
+
+	tracing::debug!(
+		frames = n,
+		total_p50_us = p50(&totals),
+		total_p95_us = p95(&totals),
+		total_p99_us = p99(&totals),
+		channel_p50_us = p50(&channel),
+		channel_p95_us = p95(&channel),
+		channel_p99_us = p99(&channel),
+		import_p50_us = p50(&imports),
+		convert_p50_us = p50(&converts),
+		convert_p95_us = p95(&converts),
+		convert_p99_us = p99(&converts),
+		encode_p50_us = p50(&encodes),
+		encode_p95_us = p95(&encodes),
+		encode_p99_us = p99(&encodes),
+		packetize_p50_us = p50(&packetizes),
+		"Frame latency summary (μs)"
+	);
+}
+
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
@@ -226,8 +285,12 @@ impl VideoPipelineInner {
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
 
-		// Cache for the last received frame to handle IDR requests during static screen.
-		let mut last_frame: Option<ExportedFrame> = None;
+		// Whether at least one frame has been encoded (for IDR re-encode).
+		let mut has_encoded = false;
+
+		// Rolling latency statistics for periodic summary.
+		let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
+		let mut last_summary_time = std::time::Instant::now();
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Check for IDR request.
@@ -243,21 +306,31 @@ impl VideoPipelineInner {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
-					// If we have a pending IDR request and a cached frame, re-encode it.
-					if pending_idr {
-						if let Some(frame) = &last_frame {
-							tracing::debug!("Re-encoding last frame for IDR request");
-							Some(frame.clone())
-						} else {
-							None
+					// If we have a pending IDR request and have encoded before,
+					// re-encode the encoder's input image (still contains
+					// the last frame's data after color conversion).
+					if pending_idr && has_encoded {
+						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
+						let encode_result = encoder.encode(encoder.input_image());
+						if let Ok(packets) = encode_result {
+							for packet in packets {
+								if let Err(()) = self.send_packet(
+									&packet,
+									&packet_tx,
+									&mut packetizer,
+									&mut frame_number,
+									&mut sequence_number,
+								) {
+									tracing::warn!("Failed to send IDR re-encode packet");
+								}
+							}
 						}
-					} else {
-						if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
-							tracing::warn!("No frames received for 5 seconds");
-							last_frame_time = std::time::Instant::now(); // Reset to avoid spam
-						}
-						None
 					}
+					if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+						tracing::warn!("No frames received for 5 seconds");
+						last_frame_time = std::time::Instant::now();
+					}
+					None
 				},
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
 					tracing::debug!("Frame channel disconnected - compositor stopped");
@@ -266,8 +339,7 @@ impl VideoPipelineInner {
 			};
 
 			if let Some(frame) = received_frame {
-				// Update cache.
-				last_frame = Some(frame.clone());
+				let t1_received = std::time::Instant::now();
 
 				tracing::trace!(
 					"Received frame: format={}, modifier={:#x}, {}x{}, planes={}",
@@ -287,6 +359,7 @@ impl VideoPipelineInner {
 						},
 						Err(e) => {
 							tracing::warn!("Failed to create DMA-BUF importer: {e}");
+							frame.consumed.store(true, Ordering::Release);
 							continue;
 						},
 					},
@@ -304,14 +377,22 @@ impl VideoPipelineInner {
 					})
 					.collect();
 
-				// The compositor exports ARGB/XRGB buffers — import as BGRA and convert.
-				let dmabuf_image = match importer.import_bgra(frame.width, frame.height, &planes) {
+				// Import the DMA-BUF (reuses cached VkImage for known buffer indices).
+				let source_image = match importer.import_or_reuse_bgra(
+					frame.buffer_index,
+					frame.width,
+					frame.height,
+					&planes,
+				) {
 					Ok(img) => img,
 					Err(e) => {
 						tracing::warn!("Failed to import DMA-BUF: {e}");
+						frame.consumed.store(true, Ordering::Release);
 						continue;
 					},
 				};
+
+				let t2_imported = std::time::Instant::now();
 
 				// Initialize converter if needed.
 				let converter = match &mut color_converter {
@@ -337,13 +418,22 @@ impl VideoPipelineInner {
 				};
 
 				// Convert to YUV.
-				if let Err(e) = converter.convert(dmabuf_image.image(), encoder.input_image()) {
+				if let Err(e) = converter.convert(source_image, encoder.input_image()) {
 					tracing::warn!("GPU color conversion failed: {e}");
+					frame.consumed.store(true, Ordering::Release);
 					continue;
 				}
 
+				// The DMA-BUF content has been read into the encoder's input
+				// image — signal the compositor that this GBM buffer is free.
+				frame.consumed.store(true, Ordering::Release);
+
+				let t3_converted = std::time::Instant::now();
+
 				// Encode the converted image.
 				let encode_result = encoder.encode(encoder.input_image());
+
+				let t4_encoded = std::time::Instant::now();
 
 				// Process encoded packets.
 				match encode_result {
@@ -366,9 +456,61 @@ impl VideoPipelineInner {
 					},
 				}
 
+				let t5_packetized = std::time::Instant::now();
+
+				// Log per-frame latency breakdown.
+				let channel_wait = t1_received.duration_since(frame.created_at);
+				let import_dur = t2_imported.duration_since(t1_received);
+				let convert_dur = t3_converted.duration_since(t2_imported);
+				let encode_dur = t4_encoded.duration_since(t3_converted);
+				let packetize_dur = t5_packetized.duration_since(t4_encoded);
+				let total = t5_packetized.duration_since(frame.created_at);
+
+				tracing::debug!(
+					channel_wait_us = channel_wait.as_micros() as u64,
+					import_us = import_dur.as_micros() as u64,
+					convert_us = convert_dur.as_micros() as u64,
+					encode_us = encode_dur.as_micros() as u64,
+					packetize_us = packetize_dur.as_micros() as u64,
+					total_us = total.as_micros() as u64,
+					"Frame latency breakdown"
+				);
+
+				// Warn on spike frames (total > 4ms) so they stand out in logs.
+				if total.as_micros() > 4000 {
+					tracing::warn!(
+						total_us = total.as_micros() as u64,
+						channel_us = channel_wait.as_micros() as u64,
+						import_us = import_dur.as_micros() as u64,
+						convert_us = convert_dur.as_micros() as u64,
+						encode_us = encode_dur.as_micros() as u64,
+						packetize_us = packetize_dur.as_micros() as u64,
+						buffer_index = frame.buffer_index,
+						"SPIKE: frame latency exceeds 4ms"
+					);
+				}
+
+				latency_samples.push(LatencySample {
+					channel_wait,
+					import: import_dur,
+					convert: convert_dur,
+					encode: encode_dur,
+					packetize: packetize_dur,
+					total,
+				});
+
+				// Periodic summary every 5 seconds.
+				if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
+					log_latency_summary(&latency_samples);
+					latency_samples.clear();
+					last_summary_time = std::time::Instant::now();
+				}
+
 				if !pending_idr {
 					last_frame_time = std::time::Instant::now();
 				}
+
+				has_encoded = true;
 			}
 		}
 

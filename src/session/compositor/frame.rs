@@ -4,6 +4,9 @@
 //! and the video pipeline. It replaces the PipeWire-based `CapturedFrame`.
 
 use std::os::unix::io::{AsFd, OwnedFd};
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::time::Instant;
 
 /// A compositor frame exported for encoding.
 ///
@@ -22,6 +25,14 @@ pub struct ExportedFrame {
 	pub width: u32,
 	/// Frame height in pixels.
 	pub height: u32,
+	/// Timestamp when the frame was produced by the compositor.
+	pub created_at: Instant,
+	/// Index of the pre-allocated GBM buffer in the compositor's pool.
+	pub buffer_index: usize,
+	/// Shared flag set to `true` by the encoder after color conversion
+	/// completes, signalling the compositor that this GBM buffer may be
+	/// reused for rendering.
+	pub consumed: Arc<AtomicBool>,
 }
 
 impl Clone for ExportedFrame {
@@ -32,6 +43,9 @@ impl Clone for ExportedFrame {
 			modifier: self.modifier,
 			width: self.width,
 			height: self.height,
+			created_at: self.created_at,
+			buffer_index: self.buffer_index,
+			consumed: self.consumed.clone(),
 		}
 	}
 }

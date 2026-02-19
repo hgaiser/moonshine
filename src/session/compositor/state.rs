@@ -5,8 +5,10 @@
 
 use std::os::unix::io::OwnedFd;
 use std::sync::mpsc;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use smithay::backend::allocator::dmabuf::AsDmabuf;
+use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::gbm::GbmAllocator;
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc, Modifier};
 use smithay::backend::renderer::damage::OutputDamageTracker;
@@ -39,6 +41,20 @@ use smithay::xwayland::X11Wm;
 
 use super::cursor::{self, PointerElement, PointerRenderElement};
 use super::frame::{ExportedFrame, ExportedPlane};
+
+/// Number of pre-allocated GBM buffers. Three allows the compositor to
+/// always have a free buffer: at most two frames are queued in the
+/// `sync_channel(2)` and one is being processed by the encoder.
+const BUFFER_POOL_SIZE: usize = 3;
+
+/// A pre-allocated GBM buffer slot in the compositor's buffer pool.
+pub(crate) struct GbmBufferSlot {
+	/// The exported DMA-BUF kept alive for the lifetime of the pool.
+	dmabuf: Dmabuf,
+	/// Shared with the encoder — `true` means the encoder is done reading
+	/// and the compositor may render into this buffer again.
+	consumed: Arc<AtomicBool>,
+}
 
 // Combined render element type for compositing space + cursor elements.
 // We use GlesRenderer concretely (no generics) to avoid complex trait bound issues.
@@ -206,6 +222,21 @@ pub struct MoonshineCompositor {
 	pub render_fourcc: Fourcc,
 	pub render_modifiers: Vec<Modifier>,
 
+	// -- Buffer pool --
+	pub buffer_pool: Vec<GbmBufferSlot>,
+	pub next_buffer_index: usize,
+
+	// -- Static screen detection --
+	/// Set to `true` whenever visible content changes (surface commit, cursor
+	/// move). Cleared after a frame is sent. When false and a frame was sent
+	/// less than 1 second ago, rendering is skipped to save GPU/CPU/bandwidth.
+	pub screen_dirty: bool,
+	/// Timestamp of the last frame that was actually sent to the encoder.
+	pub last_frame_sent_at: std::time::Instant,
+	/// Cached cursor position from the last sent frame, to detect cursor-only
+	/// changes without a surface commit.
+	pub last_cursor_position: Point<f64, Logical>,
+
 	// -- XWayland --
 	pub xwayland_shell_state: XWaylandShellState,
 	pub xwm: Option<X11Wm>,
@@ -240,7 +271,7 @@ impl MoonshineCompositor {
 		handle: LoopHandle<'static, Self>,
 		output: Output,
 		damage_tracker: OutputDamageTracker,
-		allocator: GbmAllocator<std::fs::File>,
+		mut allocator: GbmAllocator<std::fs::File>,
 		renderer: GlesRenderer,
 		frame_tx: mpsc::SyncSender<ExportedFrame>,
 		width: u32,
@@ -324,6 +355,22 @@ impl MoonshineCompositor {
 		let mut pointer_element = PointerElement::default();
 		pointer_element.set_buffer(cursor_buffer);
 
+		// Pre-allocate GBM buffer pool for zero-alloc frame export.
+		let mut buffer_pool = Vec::with_capacity(BUFFER_POOL_SIZE);
+		for i in 0..BUFFER_POOL_SIZE {
+			let buffer = allocator
+				.create_buffer(width, height, render_fourcc, &render_modifiers)
+				.unwrap_or_else(|e| panic!("Failed to pre-allocate GBM buffer {i}: {e}"));
+			let dmabuf = buffer
+				.export()
+				.unwrap_or_else(|e| panic!("Failed to export GBM buffer {i}: {e}"));
+			buffer_pool.push(GbmBufferSlot {
+				dmabuf,
+				consumed: Arc::new(AtomicBool::new(true)),
+			});
+		}
+		tracing::debug!("Pre-allocated {BUFFER_POOL_SIZE} GBM buffers for frame pool.");
+
 		(Self {
 			display_handle,
 			compositor_state,
@@ -350,6 +397,11 @@ impl MoonshineCompositor {
 			height,
 			render_fourcc,
 			render_modifiers,
+			buffer_pool,
+			next_buffer_index: 0,
+			screen_dirty: true,
+			last_frame_sent_at: std::time::Instant::now(),
+			last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
 			xwayland_shell_state,
 			xwm: None,
 			xdisplay: None,
@@ -361,34 +413,58 @@ impl MoonshineCompositor {
 	pub fn render_and_export(
 		&mut self,
 	) {
-		// Allocate a GBM buffer for this frame.
-		let buffer = match self.allocator.create_buffer(
-			self.width,
-			self.height,
-			self.render_fourcc,
-			&self.render_modifiers,
-		) {
-			Ok(buffer) => buffer,
+		// Detect cursor-only movement as a screen change.
+		if self.cursor_position != self.last_cursor_position {
+			self.screen_dirty = true;
+			self.last_cursor_position = self.cursor_position;
+		}
+
+		// Skip rendering when the screen is static and we already sent a
+		// keepalive frame within the last second.
+		if !self.screen_dirty
+			&& self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1)
+		{
+			return;
+		}
+
+		// Pick the next buffer from the pre-allocated pool.
+		let idx = self.next_buffer_index;
+		let slot = &self.buffer_pool[idx];
+		if !slot.consumed.load(Ordering::Acquire) {
+			// The encoder is still reading this buffer — skip the frame
+			// to avoid overwriting its content.
+			tracing::trace!("Buffer {idx} still in use by encoder, skipping frame");
+			return;
+		}
+
+		// Mark the buffer as in-use before rendering.
+		self.buffer_pool[idx].consumed.store(false, Ordering::Release);
+		self.next_buffer_index = (idx + 1) % BUFFER_POOL_SIZE;
+
+		// Clone the consumed flag before the mutable borrow on the dmabuf
+		// so we can signal the encoder later without conflicting borrows.
+		let consumed = self.buffer_pool[idx].consumed.clone();
+
+		// Pre-build the ExportedFrame planes (fd duplication) BEFORE the
+		// mutable borrow from renderer.bind(). This avoids a borrow
+		// conflict: the framebuffer holds a mutable ref to the dmabuf,
+		// and export_dmabuf would need an immutable ref to the same dmabuf.
+		let exported_frame = match export_dmabuf(&self.buffer_pool[idx].dmabuf, idx, consumed.clone()) {
+			Ok(frame) => frame,
 			Err(e) => {
-				tracing::error!("Failed to allocate GBM buffer: {e}");
+				tracing::error!("Failed to export frame: {e}");
+				consumed.store(true, Ordering::Release);
 				return;
 			},
 		};
 
-		// Export the buffer as a Dmabuf so we can bind it for rendering.
-		let mut dmabuf = match buffer.export() {
-			Ok(dmabuf) => dmabuf,
-			Err(e) => {
-				tracing::error!("Failed to export GBM buffer as Dmabuf: {e}");
-				return;
-			},
-		};
-
-		// Bind the Dmabuf as a render target.
-		let mut framebuffer = match self.renderer.bind(&mut dmabuf) {
+		// Bind the pre-allocated Dmabuf as a render target.
+		let bind_result = self.renderer.bind(&mut self.buffer_pool[idx].dmabuf);
+		let mut framebuffer = match bind_result {
 			Ok(fb) => fb,
 			Err(e) => {
 				tracing::error!("Failed to bind Dmabuf for rendering: {e}");
+				consumed.store(true, Ordering::Release);
 				return;
 			},
 		};
@@ -471,20 +547,31 @@ impl MoonshineCompositor {
 			},
 		}
 
-		// Drop framebuffer before exporting, to release the mutable borrow on dmabuf.
+		// Drop framebuffer before sending, to release the mutable borrow on dmabuf.
 		drop(framebuffer);
 
-		// Build ExportedFrame from the Dmabuf.
-		let exported = export_dmabuf(&dmabuf);
-		match exported {
-			Ok(frame) => {
-				// Send to the encoder — drop the frame if encoder is behind.
-				if let Err(mpsc::TrySendError::Disconnected(_)) = self.frame_tx.try_send(frame) {
-					tracing::debug!("Frame channel disconnected, compositor stopping.");
-				}
+		// Update created_at to reflect the actual render completion time.
+		// The ExportedFrame was built before renderer.bind() (borrow workaround),
+		// so the original timestamp is too early.
+		let mut exported_frame = exported_frame;
+		exported_frame.created_at = std::time::Instant::now();
+
+		// Send the pre-built frame to the encoder.
+		// The rendering happened after export_dmabuf duplicated the fds,
+		// but the fds reference the same DMA-BUF — the encoder will see
+		// the freshly rendered content.
+		match self.frame_tx.try_send(exported_frame) {
+			Err(mpsc::TrySendError::Disconnected(_)) => {
+				tracing::debug!("Frame channel disconnected, compositor stopping.");
 			},
-			Err(e) => {
-				tracing::error!("Failed to export frame: {e}");
+			Err(mpsc::TrySendError::Full(_)) => {
+				// Channel full — release the buffer back to the pool.
+				consumed.store(true, Ordering::Release);
+			},
+			Ok(()) => {
+				// Frame accepted — reset dirty tracking.
+				self.screen_dirty = false;
+				self.last_frame_sent_at = std::time::Instant::now();
 			},
 		}
 
@@ -594,7 +681,11 @@ impl MoonshineCompositor {
 /// original fds inside the Dmabuf, and they will be closed when the
 /// buffer is recycled. The encoder needs the fds to remain valid
 /// until Vulkan's vkAllocateMemory consumes them.
-fn export_dmabuf(dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf) -> Result<ExportedFrame, String> {
+fn export_dmabuf(
+	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
+	buffer_index: usize,
+	consumed: Arc<AtomicBool>,
+) -> Result<ExportedFrame, String> {
 	let planes: Vec<ExportedPlane> = dmabuf
 		.handles()
 		.zip(dmabuf.offsets())
@@ -617,5 +708,8 @@ fn export_dmabuf(dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf) -> Result
 		modifier: Into::<u64>::into(dmabuf.format().modifier),
 		width: dmabuf.width() as u32,
 		height: dmabuf.height() as u32,
+		created_at: std::time::Instant::now(),
+		buffer_index,
+		consumed,
 	})
 }

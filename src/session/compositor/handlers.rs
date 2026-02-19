@@ -87,6 +87,9 @@ impl CompositorHandler for MoonshineCompositor {
 
 	fn commit(&mut self, surface: &WlSurface) {
 		tracing::trace!("Surface commit");
+		// Mark the screen as dirty so the next timer tick renders and sends a frame.
+		self.screen_dirty = true;
+
 		// Initialize RendererSurfaceState for this surface so that
 		// space_render_elements can produce render elements from the
 		// attached buffer. Without this call surfaces appear bufferless

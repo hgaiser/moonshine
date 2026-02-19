@@ -26,7 +26,7 @@ network-interface = "2.0.3"
 notify-rust = "4.11.7"
 open = "5.3.3"
 opus = "0.3.0"
-pixelforge = { version = "0.1.0", git = "https://github.com/hgaiser/pixelforge", features = ["dmabuf"] }
+pixelforge = { version = "0.1.0", path = "../pixelforge", features = ["dmabuf"] }
 pkcs8 = "0.10.2"
 pulse = { version = "2.30", package = "libpulse-binding" }
 pulse-simple = { version = "2.29", package = "libpulse-simple-binding" }
@@ -55,6 +55,9 @@ walkdir = "2.5.0"
 x509-parser = "0.18.0"
 xcursor = "0.3"
 zeroconf = "0.17.0"
+
+# [profile.release]
+# debug = true
 
 [patch.crates-io]
 reed-solomon-erasure = { version = "6.0.0", git = "https://github.com/hgaiser/reed-solomon-erasure", branch = "moonshine" }
