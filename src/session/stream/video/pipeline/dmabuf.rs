@@ -35,51 +35,25 @@ struct CachedImport {
 
 /// Importer for DMA-BUF file descriptors into Vulkan images.
 ///
-/// Owns a reusable command pool, command buffer, and fence (created once),
-/// and a per-buffer-index cache of `VkImage` + `VkDeviceMemory`.
+/// Owns a per-buffer-index cache of `VkImage` + `VkDeviceMemory`.
+/// Layout transitions are deferred to the consumer (e.g. `ColorConverter`)
+/// to avoid a separate GPU submission per first-time import.
 pub struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
-	/// Command pool created once and reused for every layout transition.
-	command_pool: vk::CommandPool,
-	/// Command buffer allocated from `command_pool`.
-	command_buffer: vk::CommandBuffer,
-	/// Fence reused across submissions.
-	fence: vk::Fence,
 	/// Per-buffer-index cache. Index corresponds to `ExportedFrame::buffer_index`.
 	cached_imports: Vec<Option<CachedImport>>,
 }
 
 impl DmaBufImporter {
-	/// Create a new DMA-BUF importer with reusable command infrastructure.
+	/// Create a new DMA-BUF importer.
 	pub fn new(context: VideoContext) -> Result<Self, String> {
 		let external_memory_fd =
 			ash::khr::external_memory_fd::Device::load(context.instance(), context.device());
-		let device = context.device();
-
-		// Create a reusable command pool + buffer + fence.
-		let pool_info = vk::CommandPoolCreateInfo::default()
-			.queue_family_index(context.transfer_queue_family())
-			.flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-		let command_pool = unsafe { device.create_command_pool(&pool_info, None) }
-			.map_err(|e| format!("Command pool creation: {e}"))?;
-
-		let alloc_info = vk::CommandBufferAllocateInfo::default()
-			.command_pool(command_pool)
-			.level(vk::CommandBufferLevel::PRIMARY)
-			.command_buffer_count(1);
-		let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info) }
-			.map_err(|e| format!("Command buffer allocation: {e}"))?;
-
-		let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }
-			.map_err(|e| format!("Fence creation: {e}"))?;
 
 		Ok(Self {
 			context,
 			external_memory_fd,
-			command_pool,
-			command_buffer: command_buffers[0],
-			fence,
 			cached_imports: Vec::new(),
 		})
 	}
@@ -87,24 +61,24 @@ impl DmaBufImporter {
 	/// Import a BGRA DMA-BUF as a Vulkan image, reusing a cached import when
 	/// the same `buffer_index` has been seen before.
 	///
-	/// On the first call for a given `buffer_index`, the full Vulkan import
-	/// pipeline runs (create image, allocate + import memory, layout
-	/// transition to GENERAL). Subsequent calls return the cached `VkImage`
-	/// handle directly — no Vulkan object creation or GPU submission needed.
+	/// Returns `(image, needs_transition)` where `needs_transition` is `true`
+	/// for first-time imports whose image is still in `UNDEFINED` layout.
+	/// The caller is responsible for transitioning the image (e.g. by passing
+	/// the appropriate `src_layout` to `ColorConverter::convert`).
 	pub fn import_or_reuse_bgra(
 		&mut self,
 		buffer_index: usize,
 		width: u32,
 		height: u32,
 		planes: &[DmaBufPlane],
-	) -> Result<vk::Image, String> {
+	) -> Result<(vk::Image, bool), String> {
 		// Grow the cache vector if needed.
 		if self.cached_imports.len() <= buffer_index {
 			self.cached_imports.resize_with(buffer_index + 1, || None);
 		}
 
 		if let Some(cached) = &self.cached_imports[buffer_index] {
-			return Ok(cached.image);
+			return Ok((cached.image, false));
 		}
 
 		// First time seeing this buffer — full import.
@@ -115,11 +89,8 @@ impl DmaBufImporter {
 
 		let (image, memory) = self.import_bgra_internal(width, height, planes)?;
 
-		// Transition UNDEFINED → GENERAL (only needed once).
-		self.transition_image_layout(image)?;
-
 		self.cached_imports[buffer_index] = Some(CachedImport { image, memory });
-		Ok(image)
+		Ok((image, true))
 	}
 
 	/// Perform the raw Vulkan import of a BGRA DMA-BUF.
@@ -242,67 +213,6 @@ impl DmaBufImporter {
 
 		Ok((image, memory))
 	}
-
-	/// Submit an UNDEFINED → GENERAL layout transition using the reusable
-	/// command buffer and fence, then wait for completion.
-	fn transition_image_layout(&self, image: vk::Image) -> Result<(), String> {
-		let device = self.context.device();
-
-		let begin_info = vk::CommandBufferBeginInfo::default()
-			.flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-		unsafe { device.begin_command_buffer(self.command_buffer, &begin_info) }
-			.map_err(|e| format!("Command buffer begin: {e}"))?;
-
-		let barrier = vk::ImageMemoryBarrier::default()
-			.old_layout(vk::ImageLayout::UNDEFINED)
-			.new_layout(vk::ImageLayout::GENERAL)
-			.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-			.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-			.image(image)
-			.subresource_range(vk::ImageSubresourceRange {
-				aspect_mask: vk::ImageAspectFlags::COLOR,
-				base_mip_level: 0,
-				level_count: 1,
-				base_array_layer: 0,
-				layer_count: 1,
-			})
-			.src_access_mask(vk::AccessFlags::empty())
-			.dst_access_mask(vk::AccessFlags::MEMORY_READ);
-
-		unsafe {
-			device.cmd_pipeline_barrier(
-				self.command_buffer,
-				vk::PipelineStageFlags::TOP_OF_PIPE,
-				vk::PipelineStageFlags::BOTTOM_OF_PIPE,
-				vk::DependencyFlags::empty(),
-				&[],
-				&[],
-				&[barrier],
-			);
-		}
-
-		unsafe { device.end_command_buffer(self.command_buffer) }
-			.map_err(|e| format!("Command buffer end: {e}"))?;
-
-		let submit_info = vk::SubmitInfo::default()
-			.command_buffers(std::slice::from_ref(&self.command_buffer));
-
-		unsafe {
-			device.queue_submit(
-				self.context.transfer_queue(),
-				&[submit_info],
-				self.fence,
-			)
-		}
-		.map_err(|e| format!("Queue submit failed: {e}"))?;
-
-		unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }
-			.map_err(|e| format!("Fence wait failed: {e}"))?;
-		unsafe { device.reset_fences(&[self.fence]) }
-			.map_err(|e| format!("Fence reset failed: {e}"))?;
-
-		Ok(())
-	}
 }
 
 impl Drop for DmaBufImporter {
@@ -316,10 +226,6 @@ impl Drop for DmaBufImporter {
 					device.free_memory(cached.memory, None);
 				}
 			}
-
-			// Clean up reusable command infrastructure.
-			device.destroy_fence(self.fence, None);
-			device.destroy_command_pool(self.command_pool, None);
 		}
 	}
 }

@@ -9,6 +9,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use ash::vk;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc};
 
@@ -101,7 +102,7 @@ impl VideoPipeline {
 		dynamic_range: VideoDynamicRange,
 		chroma_sampling: VideoChromaSampling,
 		max_reference_frames: u32,
-		packet_tx: mpsc::Sender<Vec<u8>>,
+		packet_tx: mpsc::Sender<Vec<Vec<u8>>>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
@@ -150,7 +151,7 @@ impl VideoPipelineInner {
 	pub fn run(
 		self,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
-		packet_tx: mpsc::Sender<Vec<u8>>,
+		packet_tx: mpsc::Sender<Vec<Vec<u8>>>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
@@ -234,7 +235,7 @@ impl VideoPipelineInner {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
-		packet_tx: mpsc::Sender<Vec<u8>>,
+		packet_tx: mpsc::Sender<Vec<Vec<u8>>>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), String> {
@@ -378,18 +379,27 @@ impl VideoPipelineInner {
 					.collect();
 
 				// Import the DMA-BUF (reuses cached VkImage for known buffer indices).
-				let source_image = match importer.import_or_reuse_bgra(
+				let (source_image, needs_transition) = match importer.import_or_reuse_bgra(
 					frame.buffer_index,
 					frame.width,
 					frame.height,
 					&planes,
 				) {
-					Ok(img) => img,
+					Ok(result) => result,
 					Err(e) => {
 						tracing::warn!("Failed to import DMA-BUF: {e}");
 						frame.consumed.store(true, Ordering::Release);
 						continue;
 					},
+				};
+
+				// First-time imports are in UNDEFINED layout; the converter
+				// will handle the transition inside its command buffer.
+				// Cached imports were left in GENERAL by the previous convert.
+				let src_layout = if needs_transition {
+					vk::ImageLayout::UNDEFINED
+				} else {
+					vk::ImageLayout::GENERAL
 				};
 
 				let t2_imported = std::time::Instant::now();
@@ -418,7 +428,7 @@ impl VideoPipelineInner {
 				};
 
 				// Convert to YUV.
-				if let Err(e) = converter.convert(source_image, encoder.input_image()) {
+				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
 					tracing::warn!("GPU color conversion failed: {e}");
 					frame.consumed.store(true, Ordering::Release);
 					continue;
@@ -538,7 +548,7 @@ impl VideoPipelineInner {
 	fn send_packet(
 		&self,
 		packet: &EncodedPacket,
-		packet_tx: &mpsc::Sender<Vec<u8>>,
+		packet_tx: &mpsc::Sender<Vec<Vec<u8>>>,
 		packetizer: &mut Packetizer,
 		frame_number: &mut u32,
 		sequence_number: &mut u32,
@@ -555,16 +565,22 @@ impl VideoPipelineInner {
 
 		*frame_number += 1;
 
-		packetizer.packetize(
+		let shards = packetizer.packetize(
 			&packet.data,
 			packet.is_key_frame,
-			packet_tx,
 			self.packet_size,
 			self.minimum_fec_packets,
 			self.fec_percentage,
 			*frame_number,
 			sequence_number,
 			rtp_timestamp,
-		)
+		)?;
+
+		if packet_tx.blocking_send(shards).is_err() {
+			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
+			return Err(());
+		}
+
+		Ok(())
 	}
 }

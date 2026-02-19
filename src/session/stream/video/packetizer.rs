@@ -1,7 +1,6 @@
 use crate::session::stream::RtpHeader;
 use reed_solomon_erasure::{galois_8, ReedSolomon};
 use std::collections::{hash_map::Entry, HashMap};
-use tokio::sync::mpsc;
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub const MAX_SHARDS: usize = 255;
@@ -22,12 +21,14 @@ struct VideoFrameHeader {
 	padding2: u32,
 }
 
+const VIDEO_FRAME_HEADER_SIZE: usize = 8;
+
 impl VideoFrameHeader {
-	fn serialize(&self, buffer: &mut Vec<u8>) {
-		buffer.extend(self.header_type.to_le_bytes());
-		buffer.extend(self.padding1.to_le_bytes());
-		buffer.extend(self.frame_type.to_le_bytes());
-		buffer.extend(self.padding2.to_le_bytes());
+	fn serialize(&self, buffer: &mut [u8]) {
+		buffer[0] = self.header_type;
+		buffer[1..3].copy_from_slice(&self.padding1.to_le_bytes());
+		buffer[3] = self.frame_type;
+		buffer[4..8].copy_from_slice(&self.padding2.to_le_bytes());
 	}
 }
 
@@ -55,6 +56,37 @@ impl NvVideoPacket {
 	}
 }
 
+/// Extend a shard buffer with bytes from the logical [header ++ encoded_data] stream,
+/// without materializing the concatenation.
+///
+/// `offset` is the byte position within the logical stream (0 = start of header).
+/// `len` is the number of bytes to copy.
+fn extend_from_header_and_data(
+	shard: &mut Vec<u8>,
+	header: &[u8; VIDEO_FRAME_HEADER_SIZE],
+	encoded_data: &[u8],
+	offset: usize,
+	len: usize,
+) {
+	let total = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
+	let end = (offset + len).min(total);
+
+	if offset < VIDEO_FRAME_HEADER_SIZE {
+		// Some bytes come from the header.
+		let header_end = VIDEO_FRAME_HEADER_SIZE.min(end);
+		shard.extend_from_slice(&header[offset..header_end]);
+		if end > VIDEO_FRAME_HEADER_SIZE {
+			// Remaining bytes come from encoded_data.
+			shard.extend_from_slice(&encoded_data[..end - VIDEO_FRAME_HEADER_SIZE]);
+		}
+	} else {
+		// All bytes come from encoded_data.
+		let data_start = offset - VIDEO_FRAME_HEADER_SIZE;
+		let data_end = end - VIDEO_FRAME_HEADER_SIZE;
+		shard.extend_from_slice(&encoded_data[data_start..data_end]);
+	}
+}
+
 pub struct Packetizer {
 	fec_encoders: HashMap<(usize, usize), ReedSolomon<galois_8::Field>>,
 }
@@ -66,19 +98,22 @@ impl Packetizer {
 		}
 	}
 
+	/// Packetize an encoded frame into a batch of network-ready shards.
+	///
+	/// Returns all data + parity shards for the frame. The caller is
+	/// responsible for sending them over the network.
 	#[allow(clippy::too_many_arguments)]
 	pub fn packetize(
 		&mut self,
 		encoded_data: &[u8],
 		is_key_frame: bool,
-		packet_tx: &mpsc::Sender<Vec<u8>>,
 		requested_packet_size: usize,
 		minimum_fec_packets: u32,
 		fec_percentage: u8,
 		frame_number: u32,
 		sequence_number: &mut u32,
 		rtp_timestamp: u32,
-	) -> Result<(), ()> {
+	) -> Result<Vec<Vec<u8>>, ()> {
 		tracing::trace!(
 			"Packetizing frame {}, size={}, keyframe={}",
 			frame_number,
@@ -90,7 +125,6 @@ impl Packetizer {
 		const PADDING: u32 = 0;
 
 		let requested_shard_payload_size = requested_packet_size - std::mem::size_of::<NvVideoPacket>();
-		const VIDEO_FRAME_HEADER_SIZE: usize = 8;
 		let packet_data_len = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
 		let last_shard_size = packet_data_len % requested_shard_payload_size;
 		let last_shard_size = if last_shard_size == 0 {
@@ -107,10 +141,9 @@ impl Packetizer {
 			padding2: last_shard_size as u32,
 		};
 
-		// Prefix the frame with a VideoFrameHeader.
-		let mut buffer = Vec::with_capacity(VIDEO_FRAME_HEADER_SIZE);
-		video_frame_header.serialize(&mut buffer);
-		let packet_data = [&buffer, encoded_data].concat();
+		// Serialize header into a fixed-size array (avoids heap allocation).
+		let mut header_bytes = [0u8; VIDEO_FRAME_HEADER_SIZE];
+		video_frame_header.serialize(&mut header_bytes);
 
 		// The total size of a shard.
 		let requested_shard_size = std::mem::size_of::<RtpHeader>()
@@ -119,7 +152,7 @@ impl Packetizer {
 			+ requested_shard_payload_size;
 
 		// Determine how many data shards we will be sending.
-		let nr_data_shards = packet_data.len().div_ceil(requested_shard_payload_size);
+		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
 
 		// Determine how many parity and data shards are permitted per FEC block.
@@ -135,6 +168,9 @@ impl Packetizer {
 
 		tracing::trace!("Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block.");
 		tracing::trace!("Sending {nr_blocks} blocks of video data.");
+
+		// Collect all shards across all blocks into a single batch.
+		let mut all_shards = Vec::new();
 
 		for block_index in 0..nr_blocks {
 			// Determine what data shards are in this block.
@@ -170,9 +206,9 @@ impl Packetizer {
 
 			let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
 			for (block_shard_index, data_shard_index) in (start..end).enumerate() {
-				// Determine which part of the payload is in this shard.
-				let start = data_shard_index * requested_shard_payload_size;
-				let end = ((data_shard_index + 1) * requested_shard_payload_size).min(packet_data.len());
+				// Determine which part of the logical [header ++ encoded_data] is in this shard.
+				let payload_start = data_shard_index * requested_shard_payload_size;
+				let payload_len = requested_shard_payload_size.min(packet_data_len - payload_start);
 
 				let mut shard = Vec::with_capacity(requested_shard_size);
 
@@ -203,12 +239,18 @@ impl Packetizer {
 				}
 				video_packet_header.serialize(&mut shard);
 
-				// Append the payload.
-				shard.extend(&packet_data[start..end]);
+				// Copy payload directly from header bytes + encoded data (no intermediate concat).
+				extend_from_header_and_data(
+					&mut shard,
+					&header_bytes,
+					encoded_data,
+					payload_start,
+					payload_len,
+				);
 
 				// Pad with zeros at the end to make an equally sized shard.
-				if end - start < requested_shard_payload_size {
-					shard.extend(vec![0u8; requested_shard_payload_size - (end - start)]);
+				if payload_len < requested_shard_payload_size {
+					shard.resize(requested_shard_size, 0);
 				}
 
 				shards.push(shard);
@@ -247,18 +289,7 @@ impl Packetizer {
 				}
 			}
 
-			for (index, shard) in shards.into_iter().enumerate() {
-				tracing::trace!(
-					"Sending shard {}/{} with size {} bytes.",
-					index + 1,
-					nr_data_shards + nr_parity_shards,
-					shard.len()
-				);
-				if packet_tx.blocking_send(shard).is_err() {
-					tracing::debug!("Couldn't send packet, video packet channel closed.");
-					return Ok(());
-				}
-			}
+			all_shards.extend(shards);
 
 			tracing::trace!("Finished sending frame {frame_number}.");
 
@@ -268,7 +299,7 @@ impl Packetizer {
 			}
 		}
 
-		Ok(())
+		Ok(all_shards)
 	}
 
 	fn get_fec_encoder(
