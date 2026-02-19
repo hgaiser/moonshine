@@ -5,7 +5,6 @@
 
 mod dmabuf;
 
-use std::os::fd::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -367,23 +366,24 @@ impl VideoPipelineInner {
 				};
 
 				// Build DmaBufPlane array from ExportedFrame planes.
-				let planes: Vec<DmaBufPlane> = frame
-					.planes
-					.iter()
-					.map(|p| DmaBufPlane {
-						fd: p.fd.as_raw_fd(),
+				let mut planes_buf = [DmaBufPlane { fd: 0, offset: 0, stride: 0, modifier: 0 }; 4];
+				let plane_count = frame.planes.len().min(4);
+				for (i, p) in frame.planes.iter().take(4).enumerate() {
+					planes_buf[i] = DmaBufPlane {
+						fd: p.fd,
 						offset: p.offset,
 						stride: p.stride,
 						modifier: frame.modifier,
-					})
-					.collect();
+					};
+				}
+				let planes = &planes_buf[..plane_count];
 
 				// Import the DMA-BUF (reuses cached VkImage for known buffer indices).
 				let (source_image, needs_transition) = match importer.import_or_reuse_bgra(
 					frame.buffer_index,
 					frame.width,
 					frame.height,
-					&planes,
+					planes,
 				) {
 					Ok(result) => result,
 					Err(e) => {

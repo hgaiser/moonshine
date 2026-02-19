@@ -3,17 +3,18 @@
 //! `ExportedFrame` is the single frame-exchange type between the compositor
 //! and the video pipeline. It replaces the PipeWire-based `CapturedFrame`.
 
-use std::os::unix::io::{AsFd, OwnedFd};
+use std::os::unix::io::RawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 /// A compositor frame exported for encoding.
 ///
-/// Each plane's file descriptor is a *duplicate* of the GBM buffer's fd,
-/// ensuring the buffer can be recycled independently of the encoder's
-/// consumption timeline.
-#[derive(Debug)]
+/// Plane file descriptors are borrowed references to the compositor's
+/// pre-allocated GBM buffer pool.  The pool lives for the entire streaming
+/// session, so the fds remain valid.  The `consumed` flag prevents the
+/// compositor from recycling a buffer before the encoder finishes reading.
+#[derive(Debug, Clone)]
 pub struct ExportedFrame {
 	/// Per-plane DMA-BUF metadata.
 	pub planes: Vec<ExportedPlane>,
@@ -35,42 +36,16 @@ pub struct ExportedFrame {
 	pub consumed: Arc<AtomicBool>,
 }
 
-impl Clone for ExportedFrame {
-	fn clone(&self) -> Self {
-		Self {
-			planes: self.planes.iter().map(|p| p.clone()).collect(),
-			format: self.format,
-			modifier: self.modifier,
-			width: self.width,
-			height: self.height,
-			created_at: self.created_at,
-			buffer_index: self.buffer_index,
-			consumed: self.consumed.clone(),
-		}
-	}
-}
-
 /// Metadata for a single DMA-BUF plane.
-#[derive(Debug)]
+///
+/// The fd is a borrowed reference (raw fd number) into the compositor's
+/// buffer pool.  It is NOT owned — do not close it.
+#[derive(Debug, Clone, Copy)]
 pub struct ExportedPlane {
-	/// Owned file descriptor — the encoder takes ownership.
-	pub fd: OwnedFd,
+	/// Raw file descriptor — borrowed from the compositor's buffer pool.
+	pub fd: RawFd,
 	/// Byte offset into the DMA-BUF for this plane.
 	pub offset: u32,
 	/// Row stride in bytes.
 	pub stride: u32,
-}
-
-impl Clone for ExportedPlane {
-	fn clone(&self) -> Self {
-		// Duplicate the fd so each clone has independent ownership.
-		let dup_fd = self.fd.as_fd()
-			.try_clone_to_owned()
-			.expect("Failed to duplicate ExportedPlane fd during clone");
-		Self {
-			fd: dup_fd,
-			offset: self.offset,
-			stride: self.stride,
-		}
-	}
 }

@@ -18,7 +18,7 @@ use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::gles::GlesRenderer;
+use smithay::backend::renderer::gles::{Capability, GlesRenderer};
 use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::utils::Transform;
@@ -101,7 +101,20 @@ fn run_compositor(
 		.map_err(|e| format!("Failed to create EGL display: {e}"))?;
 	let egl_context = EGLContext::new(&egl_display)
 		.map_err(|e| format!("Failed to create EGL context: {e}"))?;
-	let renderer = unsafe { GlesRenderer::new(egl_context) }
+
+	// Use all supported capabilities except per-texture Fencing.
+	// Moonshine renders with a single non-shared EGL context and the
+	// frame-level EGLFence (ExportFence) already ensures all GPU work is
+	// complete before the DMA-BUF is handed to Vulkan.  Per-texture read
+	// fences are redundant here and DMA-BUF implicit sync protects client
+	// buffer reuse.  Removing them saves ~3% compositor-thread CPU
+	// (TextureSync::update_read overhead).
+	let capabilities = unsafe { GlesRenderer::supported_capabilities(&egl_context) }
+		.map_err(|e| format!("Failed to query renderer capabilities: {e}"))?;
+	let capabilities = capabilities
+		.into_iter()
+		.filter(|c| *c != Capability::Fencing);
+	let renderer = unsafe { GlesRenderer::with_capabilities(egl_context, capabilities) }
 		.map_err(|e| format!("Failed to create GLES renderer: {e}"))?;
 
 	// Query the EGL display for formats that can be used as render targets.

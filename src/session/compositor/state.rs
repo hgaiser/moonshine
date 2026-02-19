@@ -3,7 +3,7 @@
 //! `MoonshineCompositor` is the central state struct for the headless compositor.
 //! All Smithay `delegate_*!` macros target this struct.
 
-use std::os::unix::io::OwnedFd;
+use std::os::unix::io::AsRawFd;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -225,6 +225,11 @@ pub struct MoonshineCompositor {
 	// -- Buffer pool --
 	pub buffer_pool: Vec<GbmBufferSlot>,
 	pub next_buffer_index: usize,
+	/// Per-buffer render count for damage tracking.  `None` means the buffer
+	/// has never been rendered to yet (age = 0 → full redraw).
+	pub buffer_last_rendered_at: [Option<usize>; BUFFER_POOL_SIZE],
+	/// Monotonically increasing render counter.
+	pub render_count: usize,
 
 	// -- Static screen detection --
 	/// Set to `true` whenever visible content changes (surface commit, cursor
@@ -399,6 +404,8 @@ impl MoonshineCompositor {
 			render_modifiers,
 			buffer_pool,
 			next_buffer_index: 0,
+			buffer_last_rendered_at: [None; BUFFER_POOL_SIZE],
+			render_count: 0,
 			screen_dirty: true,
 			last_frame_sent_at: std::time::Instant::now(),
 			last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
@@ -530,14 +537,24 @@ impl MoonshineCompositor {
 			"Rendering frame"
 		);
 
-		// Render using the damage tracker (full redraw for now, age=0).
+		// Compute the buffer age for partial damage tracking.
+		// Age = number of render_output calls since this buffer was last rendered to.
+		// `None` (first use) → 0 → full redraw (contents undefined).
+		let buffer_age = self.buffer_last_rendered_at[idx]
+			.map(|last| self.render_count - last)
+			.unwrap_or(0);
+
 		let render_result = self.damage_tracker.render_output(
 			&mut self.renderer,
 			&mut framebuffer,
-			0, // buffer age - 0 forces full redraw
+			buffer_age,
 			&elements,
 			[0.0, 0.0, 0.0, 1.0], // black clear color
 		);
+
+		// Update the buffer's render count for future age calculations.
+		self.buffer_last_rendered_at[idx] = Some(self.render_count);
+		self.render_count += 1;
 
 		match render_result {
 			Ok(_) | Err(smithay::backend::renderer::damage::Error::OutputNoMode(_)) => {},
@@ -677,10 +694,11 @@ impl MoonshineCompositor {
 
 /// Convert a Smithay Dmabuf into our pipeline's ExportedFrame.
 ///
-/// We duplicate each plane's fd because Smithay retains ownership of the
-/// original fds inside the Dmabuf, and they will be closed when the
-/// buffer is recycled. The encoder needs the fds to remain valid
-/// until Vulkan's vkAllocateMemory consumes them.
+/// Export a DMA-BUF as an `ExportedFrame` for the video encoder.
+///
+/// Plane fds are borrowed (raw fd numbers) from the compositor's buffer pool.
+/// The pool outlives all in-flight frames and the `consumed` flag prevents
+/// buffer recycling before the encoder finishes reading.
 fn export_dmabuf(
 	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
 	buffer_index: usize,
@@ -691,16 +709,13 @@ fn export_dmabuf(
 		.zip(dmabuf.offsets())
 		.zip(dmabuf.strides())
 		.map(|((handle, offset), stride)| {
-			let dup_fd: OwnedFd = handle
-				.try_clone_to_owned()
-				.map_err(|e| format!("Failed to duplicate DMA-BUF fd: {e}"))?;
-			Ok(ExportedPlane {
-				fd: dup_fd,
+			ExportedPlane {
+				fd: handle.as_raw_fd(),
 				offset,
 				stride,
-			})
+			}
 		})
-		.collect::<Result<Vec<_>, String>>()?;
+		.collect();
 
 	Ok(ExportedFrame {
 		planes,
