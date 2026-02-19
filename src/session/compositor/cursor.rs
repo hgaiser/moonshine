@@ -7,9 +7,7 @@
 use std::io::Read;
 
 use smithay::backend::allocator::Fourcc;
-use smithay::backend::renderer::element::memory::{
-	MemoryRenderBuffer, MemoryRenderBufferRenderElement,
-};
+use smithay::backend::renderer::element::memory::{MemoryRenderBuffer, MemoryRenderBufferRenderElement};
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, Kind};
 use smithay::backend::renderer::{ImportAll, ImportMem, Renderer, Texture};
@@ -21,9 +19,7 @@ use smithay::utils::{Physical, Point, Scale, Transform};
 /// Load the default cursor from the XCursor theme and return a
 /// `MemoryRenderBuffer` suitable for compositing.
 pub fn load_default_cursor() -> MemoryRenderBuffer {
-	let name = std::env::var("XCURSOR_THEME")
-		.ok()
-		.unwrap_or_else(|| "default".into());
+	let name = std::env::var("XCURSOR_THEME").ok().unwrap_or_else(|| "default".into());
 	let size = std::env::var("XCURSOR_SIZE")
 		.ok()
 		.and_then(|s| s.parse().ok())
@@ -180,7 +176,7 @@ where
 				} else {
 					vec![]
 				}
-			}
+			},
 			CursorImageStatus::Surface(surface) => {
 				let elements: Vec<PointerRenderElement<R>> =
 					smithay::backend::renderer::element::surface::render_elements_from_surface_tree(
@@ -192,7 +188,7 @@ where
 						Kind::Cursor,
 					);
 				elements.into_iter().map(E::from).collect()
-			}
+			},
 		}
 	}
 }

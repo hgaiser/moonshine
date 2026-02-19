@@ -4,8 +4,8 @@
 //! and the video pipeline. It replaces the PipeWire-based `CapturedFrame`.
 
 use std::os::unix::io::RawFd;
-use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// A compositor frame exported for encoding.

@@ -4,9 +4,9 @@
 //! All Smithay `delegate_*!` macros target this struct.
 
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::gbm::GbmAllocator;
@@ -15,27 +15,27 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::{AsRenderElements, Element, Id, RenderElement};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
-use smithay::backend::renderer::{Bind, ImportDma};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
-use smithay::wayland::compositor;
+use smithay::backend::renderer::{Bind, ImportDma};
 use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::Space;
-use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
+use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Clock, IsAlive, Logical, Monotonic, Point};
+use smithay::wayland::compositor;
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
+use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
+use smithay::wayland::pointer_constraints::PointerConstraintsState;
+use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
-use smithay::wayland::pointer_constraints::PointerConstraintsState;
-use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
@@ -106,7 +106,11 @@ impl Element for OutputRenderElements {
 		}
 	}
 
-	fn damage_since(&self, scale: smithay::utils::Scale<f64>, commit: Option<CommitCounter>) -> DamageSet<i32, smithay::utils::Physical> {
+	fn damage_since(
+		&self,
+		scale: smithay::utils::Scale<f64>,
+		commit: Option<CommitCounter>,
+	) -> DamageSet<i32, smithay::utils::Physical> {
 		match self {
 			Self::Space(e) => e.damage_since(scale, commit),
 			Self::Pointer(e) => e.damage_since(scale, commit),
@@ -150,7 +154,10 @@ impl RenderElement<GlesRenderer> for OutputRenderElements {
 		}
 	}
 
-	fn underlying_storage(&self, renderer: &mut GlesRenderer) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
+	fn underlying_storage(
+		&self,
+		renderer: &mut GlesRenderer,
+	) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
 		match self {
 			Self::Space(e) => e.underlying_storage(renderer),
 			Self::Pointer(e) => e.underlying_storage(renderer),
@@ -306,8 +313,7 @@ impl MoonshineCompositor {
 		seat.add_pointer();
 
 		// Create the Wayland socket for clients to connect.
-		let socket_source = ListeningSocketSource::new_auto()
-			.expect("Failed to create Wayland listening socket");
+		let socket_source = ListeningSocketSource::new_auto().expect("Failed to create Wayland listening socket");
 		let socket_name = socket_source.socket_name().to_os_string();
 		tracing::debug!("Wayland socket: {:?}", socket_name);
 
@@ -353,7 +359,8 @@ impl MoonshineCompositor {
 			.build()
 			.expect("Failed to build DmabufFeedback");
 		let mut dmabuf_state = DmabufState::new();
-		let dmabuf_global = dmabuf_state.create_global_with_default_feedback::<Self>(&display_handle, &default_feedback);
+		let dmabuf_global =
+			dmabuf_state.create_global_with_default_feedback::<Self>(&display_handle, &default_feedback);
 
 		// Load the default xcursor and build a PointerElement with it.
 		let cursor_buffer = cursor::load_default_cursor();
@@ -376,50 +383,51 @@ impl MoonshineCompositor {
 		}
 		tracing::debug!("Pre-allocated {BUFFER_POOL_SIZE} GBM buffers for frame pool.");
 
-		(Self {
-			display_handle,
-			compositor_state,
-			shm_state,
-			xdg_shell_state,
-			seat_state,
-			output_manager_state,
-			data_device_state,
-			output,
-			damage_tracker,
-			allocator,
-			renderer,
-			dmabuf_state,
-			dmabuf_global,
-			frame_tx,
-			seat,
-			cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
-			cursor_status: CursorImageStatus::default_named(),
-			pointer_element,
-			space,
-			clock,
-			handle,
-			width,
-			height,
-			render_fourcc,
-			render_modifiers,
-			buffer_pool,
-			next_buffer_index: 0,
-			buffer_last_rendered_at: [None; BUFFER_POOL_SIZE],
-			render_count: 0,
-			screen_dirty: true,
-			last_frame_sent_at: std::time::Instant::now(),
-			last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
-			xwayland_shell_state,
-			xwm: None,
-			xdisplay: None,
-			xdisplay_tx: Some(xdisplay_tx),
-		}, display)
+		(
+			Self {
+				display_handle,
+				compositor_state,
+				shm_state,
+				xdg_shell_state,
+				seat_state,
+				output_manager_state,
+				data_device_state,
+				output,
+				damage_tracker,
+				allocator,
+				renderer,
+				dmabuf_state,
+				dmabuf_global,
+				frame_tx,
+				seat,
+				cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
+				cursor_status: CursorImageStatus::default_named(),
+				pointer_element,
+				space,
+				clock,
+				handle,
+				width,
+				height,
+				render_fourcc,
+				render_modifiers,
+				buffer_pool,
+				next_buffer_index: 0,
+				buffer_last_rendered_at: [None; BUFFER_POOL_SIZE],
+				render_count: 0,
+				screen_dirty: true,
+				last_frame_sent_at: std::time::Instant::now(),
+				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
+				xwayland_shell_state,
+				xwm: None,
+				xdisplay: None,
+				xdisplay_tx: Some(xdisplay_tx),
+			},
+			display,
+		)
 	}
 
 	/// Render the current scene and export the frame to the encoder.
-	pub fn render_and_export(
-		&mut self,
-	) {
+	pub fn render_and_export(&mut self) {
 		// Detect cursor-only movement as a screen change.
 		if self.cursor_position != self.last_cursor_position {
 			self.screen_dirty = true;
@@ -428,9 +436,7 @@ impl MoonshineCompositor {
 
 		// Skip rendering when the screen is static and we already sent a
 		// keepalive frame within the last second.
-		if !self.screen_dirty
-			&& self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1)
-		{
+		if !self.screen_dirty && self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1) {
 			return;
 		}
 
@@ -517,17 +523,13 @@ impl MoonshineCompositor {
 		let cursor_pos = self.cursor_position;
 		let cursor_elements: Vec<OutputRenderElements> = self.pointer_element.render_elements(
 			&mut self.renderer,
-			(cursor_pos - cursor_hotspot.to_f64())
-				.to_physical(scale)
-				.to_i32_round(),
+			(cursor_pos - cursor_hotspot.to_f64()).to_physical(scale).to_i32_round(),
 			scale,
 			1.0,
 		);
 
 		// Combine cursor elements (rendered on top) with space elements.
-		let mut elements: Vec<OutputRenderElements> = Vec::with_capacity(
-			cursor_elements.len() + space_elements.len(),
-		);
+		let mut elements: Vec<OutputRenderElements> = Vec::with_capacity(cursor_elements.len() + space_elements.len());
 		elements.extend(cursor_elements);
 		elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
 
@@ -659,32 +661,34 @@ impl MoonshineCompositor {
 			"XWayland process spawned, waiting for readiness."
 		);
 
-		let ret = self.handle.insert_source(xwayland, move |event, _, data: &mut MoonshineCompositor| match event {
-			XWaylandEvent::Ready {
-				x11_socket,
-				display_number,
-			} => {
-				// Set the client compositor scale to 1.0 (no HiDPI scaling for XWayland).
-				data.client_compositor_state(&client).set_client_scale(1.0);
+		let ret = self
+			.handle
+			.insert_source(xwayland, move |event, _, data: &mut MoonshineCompositor| match event {
+				XWaylandEvent::Ready {
+					x11_socket,
+					display_number,
+				} => {
+					// Set the client compositor scale to 1.0 (no HiDPI scaling for XWayland).
+					data.client_compositor_state(&client).set_client_scale(1.0);
 
-				let wm = smithay::xwayland::X11Wm::start_wm(data.handle.clone(), x11_socket, client.clone())
-					.expect("Failed to start X11 window manager.");
+					let wm = smithay::xwayland::X11Wm::start_wm(data.handle.clone(), x11_socket, client.clone())
+						.expect("Failed to start X11 window manager.");
 
-				tracing::debug!(display_number, "XWayland ready.");
-				std::env::set_var("DISPLAY", format!(":{display_number}"));
+					tracing::debug!(display_number, "XWayland ready.");
+					std::env::set_var("DISPLAY", format!(":{display_number}"));
 
-				data.xwm = Some(wm);
-				data.xdisplay = Some(display_number);
+					data.xwm = Some(wm);
+					data.xdisplay = Some(display_number);
 
-				// Notify the session thread that XWayland is ready.
-				if let Some(tx) = data.xdisplay_tx.take() {
-					let _ = tx.send(display_number);
-				}
-			},
-			XWaylandEvent::Error => {
-				tracing::error!("XWayland crashed on startup.");
-			},
-		});
+					// Notify the session thread that XWayland is ready.
+					if let Some(tx) = data.xdisplay_tx.take() {
+						let _ = tx.send(display_number);
+					}
+				},
+				XWaylandEvent::Error => {
+					tracing::error!("XWayland crashed on startup.");
+				},
+			});
 
 		if let Err(e) = ret {
 			tracing::error!("Failed to insert XWayland source into event loop: {e}");
@@ -708,12 +712,10 @@ fn export_dmabuf(
 		.handles()
 		.zip(dmabuf.offsets())
 		.zip(dmabuf.strides())
-		.map(|((handle, offset), stride)| {
-			ExportedPlane {
-				fd: handle.as_raw_fd(),
-				offset,
-				stride,
-			}
+		.map(|((handle, offset), stride)| ExportedPlane {
+			fd: handle.as_raw_fd(),
+			offset,
+			stride,
 		})
 		.collect();
 

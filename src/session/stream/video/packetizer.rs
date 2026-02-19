@@ -240,13 +240,7 @@ impl Packetizer {
 				video_packet_header.serialize(&mut shard);
 
 				// Copy payload directly from header bytes + encoded data (no intermediate concat).
-				extend_from_header_and_data(
-					&mut shard,
-					&header_bytes,
-					encoded_data,
-					payload_start,
-					payload_len,
-				);
+				extend_from_header_and_data(&mut shard, &header_bytes, encoded_data, payload_start, payload_len);
 
 				// Pad with zeros at the end to make an equally sized shard.
 				if payload_len < requested_shard_payload_size {

@@ -48,8 +48,7 @@ pub struct DmaBufImporter {
 impl DmaBufImporter {
 	/// Create a new DMA-BUF importer.
 	pub fn new(context: VideoContext) -> Result<Self, String> {
-		let external_memory_fd =
-			ash::khr::external_memory_fd::Device::load(context.instance(), context.device());
+		let external_memory_fd = ash::khr::external_memory_fd::Device::load(context.instance(), context.device());
 
 		Ok(Self {
 			context,
@@ -117,21 +116,23 @@ impl DmaBufImporter {
 		let plane_layouts = [plane_layout];
 
 		let modifier = planes[0].modifier;
-		let mut drm_format_modifier_info =
-			vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-				.drm_format_modifier(modifier)
-				.plane_layouts(&plane_layouts);
+		let mut drm_format_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
+			.drm_format_modifier(modifier)
+			.plane_layouts(&plane_layouts);
 
-		let mut external_memory_info = vk::ExternalMemoryImageCreateInfo::default()
-			.handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
-		external_memory_info.p_next = &mut drm_format_modifier_info
-			as *mut vk::ImageDrmFormatModifierExplicitCreateInfoEXT
-			as *mut _;
+		let mut external_memory_info =
+			vk::ExternalMemoryImageCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
+		external_memory_info.p_next =
+			&mut drm_format_modifier_info as *mut vk::ImageDrmFormatModifierExplicitCreateInfoEXT as *mut _;
 
 		let mut image_create_info = vk::ImageCreateInfo::default()
 			.image_type(vk::ImageType::TYPE_2D)
 			.format(format)
-			.extent(vk::Extent3D { width, height, depth: 1 })
+			.extent(vk::Extent3D {
+				width,
+				height,
+				depth: 1,
+			})
 			.mip_levels(1)
 			.array_layers(1)
 			.samples(vk::SampleCountFlags::TYPE_1)
@@ -139,8 +140,7 @@ impl DmaBufImporter {
 			.usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::SAMPLED)
 			.sharing_mode(vk::SharingMode::EXCLUSIVE)
 			.initial_layout(vk::ImageLayout::UNDEFINED);
-		image_create_info.p_next =
-			&mut external_memory_info as *mut vk::ExternalMemoryImageCreateInfo as *mut _;
+		image_create_info.p_next = &mut external_memory_info as *mut vk::ExternalMemoryImageCreateInfo as *mut _;
 
 		let image = unsafe { device.create_image(&image_create_info, None) }
 			.map_err(|e| format!("DMA-BUF image creation: {e}"))?;
@@ -169,8 +169,7 @@ impl DmaBufImporter {
 			.handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
 			.fd(fd);
 
-		let memory_type_bits =
-			mem_requirements.memory_type_bits & memory_fd_properties.memory_type_bits;
+		let memory_type_bits = mem_requirements.memory_type_bits & memory_fd_properties.memory_type_bits;
 
 		debug!(
 			"Memory allocation: size={}, image_type_bits={:#x}, fd_type_bits={:#x}, combined={:#x}",
@@ -186,17 +185,13 @@ impl DmaBufImporter {
 			.ok_or_else(|| "No suitable memory type for DMA-BUF import".to_string())?;
 
 		// Dedicated allocation (required by many drivers for external memory).
-		let mut dedicated_alloc_info =
-			vk::MemoryDedicatedAllocateInfo::default().image(image);
-		import_memory_fd_info.p_next = &mut dedicated_alloc_info
-			as *mut vk::MemoryDedicatedAllocateInfo
-			as *mut _;
+		let mut dedicated_alloc_info = vk::MemoryDedicatedAllocateInfo::default().image(image);
+		import_memory_fd_info.p_next = &mut dedicated_alloc_info as *mut vk::MemoryDedicatedAllocateInfo as *mut _;
 
 		let mut alloc_info = vk::MemoryAllocateInfo::default()
 			.allocation_size(mem_requirements.size)
 			.memory_type_index(memory_type_index);
-		alloc_info.p_next =
-			&mut import_memory_fd_info as *mut vk::ImportMemoryFdInfoKHR as *mut _;
+		alloc_info.p_next = &mut import_memory_fd_info as *mut vk::ImportMemoryFdInfoKHR as *mut _;
 
 		let memory = unsafe { device.allocate_memory(&alloc_info, None) }.map_err(|e| {
 			unsafe { device.destroy_image(image, None) };

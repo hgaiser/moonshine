@@ -3,6 +3,10 @@
 //! These are the minimum required delegate implementations for a working
 //! Wayland compositor with XWayland support.
 
+use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::allocator::Buffer;
+use smithay::backend::renderer::utils::on_commit_buffer_handler;
+use smithay::backend::renderer::ImportDma;
 use smithay::delegate_compositor;
 use smithay::delegate_data_device;
 use smithay::delegate_dmabuf;
@@ -13,9 +17,6 @@ use smithay::delegate_seat;
 use smithay::delegate_shm;
 use smithay::delegate_xdg_shell;
 use smithay::delegate_xwayland_shell;
-use smithay::backend::allocator::dmabuf::Dmabuf;
-use smithay::backend::allocator::Buffer;
-use smithay::backend::renderer::ImportDma;
 use smithay::desktop::Window;
 use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -26,23 +27,16 @@ use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Serial};
 use smithay::wayland::buffer::BufferHandler;
-use smithay::backend::renderer::utils::on_commit_buffer_handler;
-use smithay::wayland::compositor::{
-	is_sync_subsurface, CompositorClientState, CompositorHandler, CompositorState,
-};
+use smithay::wayland::compositor::{is_sync_subsurface, CompositorClientState, CompositorHandler, CompositorState};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
+use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraintsHandler};
 use smithay::wayland::selection::data_device::{
 	ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
 };
 use smithay::wayland::selection::SelectionHandler;
-use smithay::wayland::shell::xdg::{
-	PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState,
-};
+use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
-use smithay::wayland::pointer_constraints::{
-	with_pointer_constraint, PointerConstraintsHandler,
-};
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
@@ -73,7 +67,10 @@ impl CompositorHandler for MoonshineCompositor {
 		&mut self.compositor_state
 	}
 
-	fn client_compositor_state<'a>(&self, client: &'a smithay::reexports::wayland_server::Client) -> &'a CompositorClientState {
+	fn client_compositor_state<'a>(
+		&self,
+		client: &'a smithay::reexports::wayland_server::Client,
+	) -> &'a CompositorClientState {
 		// XWayland clients use XWaylandClientData; regular Wayland
 		// clients use our ClientState. Try both.
 		if let Some(state) = client.get_data::<ClientState>() {
@@ -240,9 +237,7 @@ impl PointerConstraintsHandler for MoonshineCompositor {
 		pointer: &PointerHandle<Self>,
 		location: Point<f64, Logical>,
 	) {
-		if with_pointer_constraint(surface, pointer, |constraint| {
-			constraint.is_some_and(|c| c.is_active())
-		}) {
+		if with_pointer_constraint(surface, pointer, |constraint| constraint.is_some_and(|c| c.is_active())) {
 			let origin = self
 				.space
 				.elements()
@@ -320,10 +315,7 @@ impl XwmHandler for MoonshineCompositor {
 		);
 
 		// Configure the X11 window to fill the output.
-		let geo = Rectangle::new(
-			(0, 0).into(),
-			(self.width as i32, self.height as i32).into(),
-		);
+		let geo = Rectangle::new((0, 0).into(), (self.width as i32, self.height as i32).into());
 		if let Err(e) = window.configure(geo) {
 			tracing::warn!("Failed to configure X11 window geometry: {e}");
 		}
@@ -347,9 +339,9 @@ impl XwmHandler for MoonshineCompositor {
 
 		// Log all space elements after mapping for debugging.
 		for (i, elem) in self.space.elements().enumerate() {
-			let x11_info = elem.x11_surface().map(|x| {
-				(x.title(), x.class(), x.is_override_redirect(), x.wl_surface())
-			});
+			let x11_info = elem
+				.x11_surface()
+				.map(|x| (x.title(), x.class(), x.is_override_redirect(), x.wl_surface()));
 			tracing::debug!(i, ?x11_info, loc = ?self.space.element_location(elem), "Space element after map");
 		}
 	}

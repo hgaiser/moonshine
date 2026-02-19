@@ -64,25 +64,16 @@ impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 	) {
 		match self {
 			KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
-				WindowSurface::Wayland(w) => {
-					KeyboardTarget::enter(w.wl_surface(), seat, data, keys, serial)
-				},
+				WindowSurface::Wayland(w) => KeyboardTarget::enter(w.wl_surface(), seat, data, keys, serial),
 				WindowSurface::X11(s) => KeyboardTarget::enter(s, seat, data, keys, serial),
 			},
 		}
 	}
 
-	fn leave(
-		&self,
-		seat: &Seat<MoonshineCompositor>,
-		data: &mut MoonshineCompositor,
-		serial: Serial,
-	) {
+	fn leave(&self, seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, serial: Serial) {
 		match self {
 			KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
-				WindowSurface::Wayland(w) => {
-					KeyboardTarget::leave(w.wl_surface(), seat, data, serial)
-				},
+				WindowSurface::Wayland(w) => KeyboardTarget::leave(w.wl_surface(), seat, data, serial),
 				WindowSurface::X11(s) => KeyboardTarget::leave(s, seat, data, serial),
 			},
 		}
@@ -99,12 +90,8 @@ impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 	) {
 		match self {
 			KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
-				WindowSurface::Wayland(w) => {
-					KeyboardTarget::key(w.wl_surface(), seat, data, key, state, serial, time)
-				},
-				WindowSurface::X11(s) => {
-					KeyboardTarget::key(s, seat, data, key, state, serial, time)
-				},
+				WindowSurface::Wayland(w) => KeyboardTarget::key(w.wl_surface(), seat, data, key, state, serial, time),
+				WindowSurface::X11(s) => KeyboardTarget::key(s, seat, data, key, state, serial, time),
 			},
 		}
 	}
@@ -118,12 +105,8 @@ impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 	) {
 		match self {
 			KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
-				WindowSurface::Wayland(w) => {
-					KeyboardTarget::modifiers(w.wl_surface(), seat, data, modifiers, serial)
-				},
-				WindowSurface::X11(s) => {
-					KeyboardTarget::modifiers(s, seat, data, modifiers, serial)
-				},
+				WindowSurface::Wayland(w) => KeyboardTarget::modifiers(w.wl_surface(), seat, data, modifiers, serial),
+				WindowSurface::X11(s) => KeyboardTarget::modifiers(s, seat, data, modifiers, serial),
 			},
 		}
 	}

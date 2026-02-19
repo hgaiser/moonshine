@@ -202,9 +202,7 @@ impl ClientManager {
 
 		response_rx
 			.await
-			.map_err(|e| {
-				tracing::warn!("Failed to wait for response to RegisterPin command from client manager: {e}")
-			})?
+			.map_err(|e| tracing::warn!("Failed to wait for response to RegisterPin command from client manager: {e}"))?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
 

@@ -170,8 +170,9 @@ impl Session {
 			height: context.resolution.1,
 			refresh_rate: context._refresh_rate,
 		};
-		let (frame_rx, input_tx, xdisplay_rx) = compositor::start_compositor(compositor_config, stop_session_signal.clone())
-			.map_err(|e| tracing::warn!("Failed to start compositor: {e}"))?;
+		let (frame_rx, input_tx, xdisplay_rx) =
+			compositor::start_compositor(compositor_config, stop_session_signal.clone())
+				.map_err(|e| tracing::warn!("Failed to start compositor: {e}"))?;
 
 		// Launch the application in a background thread that waits for
 		// XWayland to become ready. We must not block Session::new()
@@ -270,13 +271,17 @@ impl SessionInner {
 			match command {
 				SessionCommand::Start(video_stream_context, audio_stream_context) => {
 					let frame_rx = self.frame_rx.take();
-					let video_stream =
-						match VideoStream::new(self.config.clone(), video_stream_context, frame_rx, stop_session_manager.clone())
-							.await
-						{
-							Ok(video_stream) => video_stream,
-							Err(()) => continue,
-						};
+					let video_stream = match VideoStream::new(
+						self.config.clone(),
+						video_stream_context,
+						frame_rx,
+						stop_session_manager.clone(),
+					)
+					.await
+					{
+						Ok(video_stream) => video_stream,
+						Err(()) => continue,
+					};
 					let audio_stream =
 						match AudioStream::new(self.config.clone(), audio_stream_context, stop_session_manager.clone())
 							.await
@@ -362,11 +367,7 @@ fn launch_application(context: &SessionContext, sink_name: &str, xdisplay: u32) 
 	};
 	let args = &context.application.command[1..];
 
-	tracing::info!(
-		program,
-		?args,
-		"Launching application"
-	);
+	tracing::info!(program, ?args, "Launching application");
 
 	let log_dir = std::env::temp_dir().join("moonshine");
 	std::fs::create_dir_all(&log_dir).map_err(|e| tracing::warn!("Failed to create log directory: {e}"))?;

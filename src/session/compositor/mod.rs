@@ -4,11 +4,11 @@
 //! with an in-process Smithay compositor. Frames are rendered to GBM-backed
 //! DMA-BUFs and exported directly to the video encoder.
 
-pub mod frame;
-pub mod input;
 mod cursor;
 mod focus;
+pub mod frame;
 mod handlers;
+pub mod input;
 mod state;
 
 use std::sync::mpsc;
@@ -48,7 +48,14 @@ pub struct CompositorConfig {
 pub fn start_compositor(
 	config: CompositorConfig,
 	stop: ShutdownManager<SessionShutdownReason>,
-) -> Result<(mpsc::Receiver<ExportedFrame>, calloop::channel::Sender<CompositorInputEvent>, mpsc::Receiver<u32>), String> {
+) -> Result<
+	(
+		mpsc::Receiver<ExportedFrame>,
+		calloop::channel::Sender<CompositorInputEvent>,
+		mpsc::Receiver<u32>,
+	),
+	String,
+> {
 	let (frame_tx, frame_rx) = mpsc::sync_channel::<ExportedFrame>(2);
 	let (input_tx, input_rx) = calloop::channel::channel::<CompositorInputEvent>();
 	let (xdisplay_tx, xdisplay_rx) = mpsc::sync_channel::<u32>(1);
@@ -90,17 +97,16 @@ fn run_compositor(
 		.map_err(|e| format!("Failed to open render node {}: {e}", render_node.display()))?;
 
 	// Initialize GBM.
-	let gbm_device_alloc = GbmDevice::new(render_fd_alloc)
-		.map_err(|e| format!("Failed to create GBM device for allocator: {e}"))?;
+	let gbm_device_alloc =
+		GbmDevice::new(render_fd_alloc).map_err(|e| format!("Failed to create GBM device for allocator: {e}"))?;
 	let gbm_allocator = GbmAllocator::new(gbm_device_alloc, GbmBufferFlags::RENDERING);
 
 	// Initialize EGL + GLES renderer.
-	let gbm_device_egl = GbmDevice::new(render_fd_egl)
-		.map_err(|e| format!("Failed to create GBM device for EGL: {e}"))?;
-	let egl_display = unsafe { EGLDisplay::new(gbm_device_egl) }
-		.map_err(|e| format!("Failed to create EGL display: {e}"))?;
-	let egl_context = EGLContext::new(&egl_display)
-		.map_err(|e| format!("Failed to create EGL context: {e}"))?;
+	let gbm_device_egl =
+		GbmDevice::new(render_fd_egl).map_err(|e| format!("Failed to create GBM device for EGL: {e}"))?;
+	let egl_display =
+		unsafe { EGLDisplay::new(gbm_device_egl) }.map_err(|e| format!("Failed to create EGL display: {e}"))?;
+	let egl_context = EGLContext::new(&egl_display).map_err(|e| format!("Failed to create EGL context: {e}"))?;
 
 	// Use all supported capabilities except per-texture Fencing.
 	// Moonshine renders with a single non-shared EGL context and the
@@ -111,9 +117,7 @@ fn run_compositor(
 	// (TextureSync::update_read overhead).
 	let capabilities = unsafe { GlesRenderer::supported_capabilities(&egl_context) }
 		.map_err(|e| format!("Failed to query renderer capabilities: {e}"))?;
-	let capabilities = capabilities
-		.into_iter()
-		.filter(|c| *c != Capability::Fencing);
+	let capabilities = capabilities.into_iter().filter(|c| *c != Capability::Fencing);
 	let renderer = unsafe { GlesRenderer::with_capabilities(egl_context, capabilities) }
 		.map_err(|e| format!("Failed to create GLES renderer: {e}"))?;
 
@@ -157,8 +161,8 @@ fn run_compositor(
 	);
 
 	// Create the calloop event loop.
-	let mut event_loop: EventLoop<MoonshineCompositor> = EventLoop::try_new()
-		.map_err(|e| format!("Failed to create event loop: {e}"))?;
+	let mut event_loop: EventLoop<MoonshineCompositor> =
+		EventLoop::try_new().map_err(|e| format!("Failed to create event loop: {e}"))?;
 
 	// Create the Wayland display.
 	let display = smithay::reexports::wayland_server::Display::<MoonshineCompositor>::new()

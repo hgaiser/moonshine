@@ -171,8 +171,14 @@ impl VideoPipelineInner {
 		};
 
 		// Start the capture and encoding loop.
-		if let Err(e) = self.run_encoding_loop(frame_rx, context, encoder, packet_tx, idr_frame_request_rx, stop_session_manager)
-		{
+		if let Err(e) = self.run_encoding_loop(
+			frame_rx,
+			context,
+			encoder,
+			packet_tx,
+			idr_frame_request_rx,
+			stop_session_manager,
+		) {
 			tracing::error!("Video encoding loop failed: {e}");
 		}
 
@@ -366,7 +372,12 @@ impl VideoPipelineInner {
 				};
 
 				// Build DmaBufPlane array from ExportedFrame planes.
-				let mut planes_buf = [DmaBufPlane { fd: 0, offset: 0, stride: 0, modifier: 0 }; 4];
+				let mut planes_buf = [DmaBufPlane {
+					fd: 0,
+					offset: 0,
+					stride: 0,
+					modifier: 0,
+				}; 4];
 				let plane_count = frame.planes.len().min(4);
 				for (i, p) in frame.planes.iter().take(4).enumerate() {
 					planes_buf[i] = DmaBufPlane {
@@ -379,19 +390,15 @@ impl VideoPipelineInner {
 				let planes = &planes_buf[..plane_count];
 
 				// Import the DMA-BUF (reuses cached VkImage for known buffer indices).
-				let (source_image, needs_transition) = match importer.import_or_reuse_bgra(
-					frame.buffer_index,
-					frame.width,
-					frame.height,
-					planes,
-				) {
-					Ok(result) => result,
-					Err(e) => {
-						tracing::warn!("Failed to import DMA-BUF: {e}");
-						frame.consumed.store(true, Ordering::Release);
-						continue;
-					},
-				};
+				let (source_image, needs_transition) =
+					match importer.import_or_reuse_bgra(frame.buffer_index, frame.width, frame.height, planes) {
+						Ok(result) => result,
+						Err(e) => {
+							tracing::warn!("Failed to import DMA-BUF: {e}");
+							frame.consumed.store(true, Ordering::Release);
+							continue;
+						},
+					};
 
 				// First-time imports are in UNDEFINED layout; the converter
 				// will handle the transition inside its command buffer.

@@ -190,9 +190,9 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			// so that X11 windows receive XSetInputFocus via the X11Surface dispatch.
 			if let Some((window, window_loc)) = state.space.element_under(state.cursor_position) {
 				let window = window.clone();
-				let x11_info = window.x11_surface().map(|x| {
-					(x.title(), x.class(), x.is_override_redirect(), x.wl_surface())
-				});
+				let x11_info = window
+					.x11_surface()
+					.map(|x| (x.title(), x.class(), x.is_override_redirect(), x.wl_surface()));
 				tracing::trace!(?x11_info, ?window_loc, cursor = ?state.cursor_position, "Click: element under cursor");
 
 				let keyboard = state.seat.get_keyboard().unwrap();
@@ -238,19 +238,13 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 		CompositorInputEvent::ScrollVertical { amount } => {
 			tracing::trace!("Scroll vertical: {amount}");
 			let pointer = state.seat.get_pointer().unwrap();
-			pointer.axis(
-				state,
-				AxisFrame::new(time).value(Axis::Vertical, -(amount as f64)),
-			);
+			pointer.axis(state, AxisFrame::new(time).value(Axis::Vertical, -(amount as f64)));
 			pointer.frame(state);
 		},
 		CompositorInputEvent::ScrollHorizontal { amount } => {
 			tracing::trace!("Scroll horizontal: {amount}");
 			let pointer = state.seat.get_pointer().unwrap();
-			pointer.axis(
-				state,
-				AxisFrame::new(time).value(Axis::Horizontal, amount as f64),
-			);
+			pointer.axis(state, AxisFrame::new(time).value(Axis::Horizontal, amount as f64));
 			pointer.frame(state);
 		},
 	}
@@ -285,7 +279,6 @@ fn find_surface_under(
 )> {
 	let (window, window_loc) = state.space.element_under(state.cursor_position)?;
 	let pos_within_window = state.cursor_position - window_loc.to_f64();
-	let (surface, surface_offset) =
-		window.surface_under(pos_within_window, WindowSurfaceType::ALL)?;
+	let (surface, surface_offset) = window.surface_under(pos_within_window, WindowSurfaceType::ALL)?;
 	Some((surface, surface_offset.to_f64() + window_loc.to_f64()))
 }
