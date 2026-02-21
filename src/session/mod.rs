@@ -169,6 +169,7 @@ impl Session {
 			width: context.resolution.0,
 			height: context.resolution.1,
 			refresh_rate: context._refresh_rate,
+			gpu: config.gpu.clone(),
 		};
 		let (frame_rx, input_tx, xdisplay_rx) =
 			compositor::start_compositor(compositor_config, stop_session_signal.clone())

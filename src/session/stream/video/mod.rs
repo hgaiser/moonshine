@@ -9,7 +9,9 @@ use crate::{config::Config, session::manager::SessionShutdownReason};
 
 mod packetizer;
 mod pipeline;
+mod shard_batch;
 use pipeline::VideoPipeline;
+use shard_batch::ShardBatch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoFormat {
@@ -172,7 +174,7 @@ impl VideoStreamInner {
 			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoStreamStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
-		let (packet_tx, packet_rx) = mpsc::channel::<Vec<Vec<u8>>>(128);
+		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
 		tokio::spawn(handle_video_packets(packet_rx, socket, stop_session_manager.clone()));
 
 		let mut started_streaming = false;
@@ -212,7 +214,7 @@ impl VideoStreamInner {
 
 	async fn start(
 		&mut self,
-		packet_tx: mpsc::Sender<Vec<Vec<u8>>>,
+		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
@@ -246,7 +248,7 @@ impl VideoStreamInner {
 }
 
 async fn handle_video_packets(
-	mut packet_rx: mpsc::Receiver<Vec<Vec<u8>>>,
+	mut packet_rx: mpsc::Receiver<ShardBatch>,
 	socket: UdpSocket,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -261,10 +263,10 @@ async fn handle_video_packets(
 		tokio::select! {
 			batch = packet_rx.recv() => {
 				match batch {
-					Some(shards) => {
+					Some(batch) => {
 						if let Some(client_address) = client_address {
-							for shard in &shards {
-								if let Err(e) = socket.send_to(shard.as_slice(), client_address).await {
+							for shard in batch.shards() {
+								if let Err(e) = socket.send_to(shard, client_address).await {
 									tracing::warn!("Failed to send packet to client: {e}");
 								}
 							}

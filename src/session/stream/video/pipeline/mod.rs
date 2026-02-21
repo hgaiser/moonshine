@@ -16,6 +16,7 @@ use crate::session::compositor::frame::ExportedFrame;
 use crate::session::manager::SessionShutdownReason;
 
 use super::packetizer::Packetizer;
+use super::shard_batch::ShardBatch;
 use super::{VideoChromaSampling, VideoDynamicRange, VideoFormat};
 
 use dmabuf::{DmaBufImporter, DmaBufPlane};
@@ -101,7 +102,7 @@ impl VideoPipeline {
 		dynamic_range: VideoDynamicRange,
 		chroma_sampling: VideoChromaSampling,
 		max_reference_frames: u32,
-		packet_tx: mpsc::Sender<Vec<Vec<u8>>>,
+		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
@@ -150,7 +151,7 @@ impl VideoPipelineInner {
 	pub fn run(
 		self,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
-		packet_tx: mpsc::Sender<Vec<Vec<u8>>>,
+		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
@@ -240,7 +241,7 @@ impl VideoPipelineInner {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
-		packet_tx: mpsc::Sender<Vec<Vec<u8>>>,
+		packet_tx: mpsc::Sender<ShardBatch>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), String> {
@@ -249,23 +250,21 @@ impl VideoPipelineInner {
 		let idr_requested_clone = idr_requested.clone();
 
 		// Start a thread to listen for IDR requests.
-		let stop_clone = stop_session_manager.clone();
-		std::thread::spawn(move || {
-			while !stop_clone.is_shutdown_triggered() {
-				match idr_frame_request_rx.try_recv() {
-					Ok(_) => {
-						tracing::debug!("Received request for IDR frame.");
-						idr_requested_clone.store(true, Ordering::SeqCst);
-					},
-					Err(broadcast::error::TryRecvError::Empty) => {
-						std::thread::sleep(std::time::Duration::from_millis(1));
-					},
-					Err(broadcast::error::TryRecvError::Lagged(_)) => {},
-					Err(broadcast::error::TryRecvError::Closed) => {
-						tracing::debug!("IDR frame channel closed.");
-						break;
-					},
-				}
+		// Uses blocking_recv() so the thread sleeps until a request arrives.
+		std::thread::spawn(move || loop {
+			match idr_frame_request_rx.blocking_recv() {
+				Ok(_) => {
+					tracing::debug!("Received request for IDR frame.");
+					idr_requested_clone.store(true, Ordering::SeqCst);
+				},
+				Err(broadcast::error::RecvError::Lagged(n)) => {
+					tracing::debug!("IDR frame channel lagged by {n} messages.");
+					idr_requested_clone.store(true, Ordering::SeqCst);
+				},
+				Err(broadcast::error::RecvError::Closed) => {
+					tracing::debug!("IDR frame channel closed.");
+					break;
+				},
 			}
 		});
 
@@ -555,7 +554,7 @@ impl VideoPipelineInner {
 	fn send_packet(
 		&self,
 		packet: &EncodedPacket,
-		packet_tx: &mpsc::Sender<Vec<Vec<u8>>>,
+		packet_tx: &mpsc::Sender<ShardBatch>,
 		packetizer: &mut Packetizer,
 		frame_number: &mut u32,
 		sequence_number: &mut u32,

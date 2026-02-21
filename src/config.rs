@@ -28,6 +28,9 @@ pub struct Config {
 	#[serde(skip_serializing_if = "Vec::is_empty", default)]
 	pub application_scanners: Vec<ApplicationScannerConfig>,
 
+	/// Path to the DRM render node to use (e.g. /dev/dri/renderD128).
+	pub gpu: Option<String>,
+
 	/// Time in seconds since last ping after which the stream closes.
 	pub stream_timeout: u64,
 }
@@ -65,6 +68,7 @@ impl Default for Config {
 					"steam://rungameid/{game_id}".to_string(),
 				],
 			})],
+			gpu: None,
 			stream_timeout: 60,
 		}
 	}

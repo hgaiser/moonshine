@@ -29,12 +29,6 @@ use self::frame::ExportedFrame;
 use self::input::CompositorInputEvent;
 use self::state::MoonshineCompositor;
 
-type CompositorChannels = (
-	mpsc::Receiver<ExportedFrame>,
-	calloop::channel::Sender<CompositorInputEvent>,
-	mpsc::Receiver<u32>,
-);
-
 /// Configuration for the compositor.
 #[derive(Clone, Debug)]
 pub struct CompositorConfig {
@@ -44,7 +38,16 @@ pub struct CompositorConfig {
 	pub height: u32,
 	/// Refresh rate in Hz.
 	pub refresh_rate: u32,
+	/// Optional GPU configuration (path, PCI ID, vendor:device, or vendor name).
+	pub gpu: Option<String>,
 }
+
+/// Result type for `start_compositor`.
+type CompositorHandles = (
+	mpsc::Receiver<ExportedFrame>,
+	calloop::channel::Sender<CompositorInputEvent>,
+	mpsc::Receiver<u32>,
+);
 
 /// Start the headless compositor on a dedicated thread.
 ///
@@ -54,7 +57,7 @@ pub struct CompositorConfig {
 pub fn start_compositor(
 	config: CompositorConfig,
 	stop: ShutdownManager<SessionShutdownReason>,
-) -> Result<CompositorChannels, String> {
+) -> Result<CompositorHandles, String> {
 	let (frame_tx, frame_rx) = mpsc::sync_channel::<ExportedFrame>(2);
 	let (input_tx, input_rx) = calloop::channel::channel::<CompositorInputEvent>();
 	let (xdisplay_tx, xdisplay_rx) = mpsc::sync_channel::<u32>(1);
@@ -84,7 +87,7 @@ fn run_compositor(
 	let _delay_stop = stop.delay_shutdown_token();
 
 	// Open a render node (no DRM master required for headless operation).
-	let render_node = find_render_node()?;
+	let render_node = find_render_node(&config.gpu)?;
 	tracing::debug!("Using render node: {}", render_node.display());
 
 	// Open the render node twice — GbmDevice<File> doesn't impl Clone
@@ -304,8 +307,8 @@ fn run_compositor(
 	Ok(())
 }
 
-/// Find the first available DRM render node.
-fn find_render_node() -> Result<std::path::PathBuf, String> {
+/// Find the appropriate DRM render node.
+fn find_render_node(gpu_config: &Option<String>) -> Result<std::path::PathBuf, String> {
 	// Check environment variable override first.
 	if let Ok(node) = std::env::var("MOONSHINE_RENDER_NODE") {
 		return Ok(std::path::PathBuf::from(node));
@@ -331,9 +334,89 @@ fn find_render_node() -> Result<std::path::PathBuf, String> {
 
 	entries.sort_by_key(|e| e.file_name());
 
-	entries
-		.into_iter()
-		.next()
-		.map(|e| e.path())
-		.ok_or_else(|| "No render node found in /dev/dri".to_string())
+	// If no render nodes found, return error.
+	if entries.is_empty() {
+		return Err("No render node found in /dev/dri".to_string());
+	}
+
+	// Helper to get uevent info
+	let get_device_info = |entry: &std::fs::DirEntry| -> Option<(String, String)> {
+		let file_name = entry.file_name();
+		let name = file_name.to_str()?;
+		let device_path = std::path::Path::new("/sys/class/drm").join(name).join("device/uevent");
+		let content = std::fs::read_to_string(device_path).ok()?;
+
+		// Parse uevent for convenience
+		// We care about PCI_SLOT_NAME (e.g. 0000:01:00.0), PCI_ID (e.g. 10DE:2C02), DRIVER (e.g. nvidia)
+		Some((name.to_string(), content))
+	};
+
+	if let Some(config_str) = gpu_config {
+		// If config is an absolute path, use it directly.
+		let path = std::path::Path::new(config_str);
+		if path.is_absolute() {
+			if path.exists() {
+				return Ok(path.to_path_buf());
+			} else {
+				return Err(format!("Configured GPU path does not exist: {}", config_str));
+			}
+		}
+
+		// Otherwise, search for a match in available nodes.
+		for entry in &entries {
+			if let Some((name, uevent)) = get_device_info(entry) {
+				// Check filename match (e.g. "renderD128")
+				if name == *config_str {
+					return Ok(entry.path());
+				}
+
+				// Check uevent content matches
+				// We do a case-insensitive substring match for flexibility.
+				if uevent.to_lowercase().contains(&config_str.to_lowercase()) {
+					return Ok(entry.path());
+				}
+			}
+		}
+
+		return Err(format!("No GPU found matching configuration: {}", config_str));
+	}
+
+	// Heuristics: prefer discrete GPU.
+	// We prioritize NVIDIA > AMD > Intel for discrete GPUs.
+	// But distinguishing AMD iGPU vs dGPU is hard without more info.
+	// However, usually:
+	// NVIDIA (10DE) -> Discrete
+	// AMD (1002) -> Discrete or Integrated
+	// Intel (8086) -> Integrated (mostly)
+
+	// Let's iterate and score them.
+	let mut best_node = None;
+	let mut best_score = -1;
+
+	for entry in &entries {
+		let score = if let Some((_, uevent)) = get_device_info(entry) {
+			if uevent.contains("PCI_ID=10DE") {
+				// NVIDIA
+				100
+			} else if uevent.contains("PCI_ID=1002") {
+				// AMD
+				// If we could distinguish iGPU/dGPU here it would be better, but for now give it a high score.
+				// Assuming if NVIDIA is present it wins (score 100), otherwise AMD (score 50).
+				50
+			} else {
+				// Intel or others
+				0
+			}
+		} else {
+			0
+		};
+
+		if score > best_score {
+			best_score = score;
+			best_node = Some(entry.path());
+		}
+	}
+
+	// If found a "better" one, use it. Otherwise fall back to the first one (original behavior).
+	Ok(best_node.unwrap_or_else(|| entries[0].path()))
 }

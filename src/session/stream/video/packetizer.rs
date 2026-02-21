@@ -1,9 +1,18 @@
-use crate::session::stream::RtpHeader;
 use reed_solomon_erasure::{galois_8, ReedSolomon};
 use std::collections::{hash_map::Entry, HashMap};
 
+use super::shard_batch::{ShardBatch, ShardBuf};
+
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub const MAX_SHARDS: usize = 255;
+
+const NV_VIDEO_PACKET_SIZE: usize = 16;
+const RTP_HEADER_SIZE: usize = 12;
+const PADDING_SIZE: usize = 4;
+/// Byte offset where the NvVideoPacket starts within a shard.
+const NV_PACKET_OFFSET: usize = RTP_HEADER_SIZE + PADDING_SIZE;
+/// Byte offset where the payload starts within a shard.
+const PAYLOAD_OFFSET: usize = NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE;
 
 #[repr(u8)]
 enum RtpFlag {
@@ -32,37 +41,37 @@ impl VideoFrameHeader {
 	}
 }
 
-#[derive(Debug)]
-#[repr(C)]
-struct NvVideoPacket {
+/// Write an RTP header directly into a byte slice at offset 0.
+fn write_rtp_header(buf: &mut [u8], sequence_number: u16, timestamp: u32) {
+	buf[0] = 0x90;
+	buf[1] = 0; // packet_type
+	buf[2..4].copy_from_slice(&sequence_number.to_be_bytes());
+	buf[4..8].copy_from_slice(&timestamp.to_be_bytes());
+	buf[8..12].copy_from_slice(&0u32.to_be_bytes()); // ssrc
+}
+
+/// Write an NvVideoPacket directly into a byte slice.
+fn write_nv_video_packet(
+	buf: &mut [u8],
 	stream_packet_index: u32,
 	frame_index: u32,
 	flags: u8,
-	reserved: u8,
-	multi_fec_flags: u8,
 	multi_fec_blocks: u8,
 	fec_info: u32,
+) {
+	buf[0..4].copy_from_slice(&stream_packet_index.to_le_bytes());
+	buf[4..8].copy_from_slice(&frame_index.to_le_bytes());
+	buf[8] = flags;
+	buf[9] = 0; // reserved
+	buf[10] = 0x10; // multi_fec_flags
+	buf[11] = multi_fec_blocks;
+	buf[12..16].copy_from_slice(&fec_info.to_le_bytes());
 }
 
-impl NvVideoPacket {
-	fn serialize(&self, buffer: &mut Vec<u8>) {
-		buffer.extend(self.stream_packet_index.to_le_bytes());
-		buffer.extend(self.frame_index.to_le_bytes());
-		buffer.extend(self.flags.to_le_bytes());
-		buffer.extend(self.reserved.to_le_bytes());
-		buffer.extend(self.multi_fec_flags.to_le_bytes());
-		buffer.extend(self.multi_fec_blocks.to_le_bytes());
-		buffer.extend(self.fec_info.to_le_bytes());
-	}
-}
-
-/// Extend a shard buffer with bytes from the logical [header ++ encoded_data] stream,
-/// without materializing the concatenation.
-///
-/// `offset` is the byte position within the logical stream (0 = start of header).
-/// `len` is the number of bytes to copy.
-fn extend_from_header_and_data(
-	shard: &mut Vec<u8>,
+/// Copy bytes from the logical [header ++ encoded_data] stream into a
+/// destination slice, without materializing the concatenation.
+fn copy_header_and_data(
+	dst: &mut [u8],
 	header: &[u8; VIDEO_FRAME_HEADER_SIZE],
 	encoded_data: &[u8],
 	offset: usize,
@@ -70,20 +79,22 @@ fn extend_from_header_and_data(
 ) {
 	let total = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
 	let end = (offset + len).min(total);
+	let mut written = 0;
 
 	if offset < VIDEO_FRAME_HEADER_SIZE {
-		// Some bytes come from the header.
 		let header_end = VIDEO_FRAME_HEADER_SIZE.min(end);
-		shard.extend_from_slice(&header[offset..header_end]);
+		let n = header_end - offset;
+		dst[written..written + n].copy_from_slice(&header[offset..header_end]);
+		written += n;
 		if end > VIDEO_FRAME_HEADER_SIZE {
-			// Remaining bytes come from encoded_data.
-			shard.extend_from_slice(&encoded_data[..end - VIDEO_FRAME_HEADER_SIZE]);
+			let n = end - VIDEO_FRAME_HEADER_SIZE;
+			dst[written..written + n].copy_from_slice(&encoded_data[..n]);
 		}
 	} else {
-		// All bytes come from encoded_data.
 		let data_start = offset - VIDEO_FRAME_HEADER_SIZE;
 		let data_end = end - VIDEO_FRAME_HEADER_SIZE;
-		shard.extend_from_slice(&encoded_data[data_start..data_end]);
+		let n = data_end - data_start;
+		dst[written..written + n].copy_from_slice(&encoded_data[data_start..data_end]);
 	}
 }
 
@@ -100,8 +111,8 @@ impl Packetizer {
 
 	/// Packetize an encoded frame into a batch of network-ready shards.
 	///
-	/// Returns all data + parity shards for the frame. The caller is
-	/// responsible for sending them over the network.
+	/// Returns a `ShardBatch` containing all data + parity shards packed
+	/// contiguously in a single allocation per block.
 	#[allow(clippy::too_many_arguments)]
 	pub fn packetize(
 		&mut self,
@@ -113,7 +124,7 @@ impl Packetizer {
 		frame_number: u32,
 		sequence_number: &mut u32,
 		rtp_timestamp: u32,
-	) -> Result<Vec<Vec<u8>>, ()> {
+	) -> Result<ShardBatch, ()> {
 		tracing::trace!(
 			"Packetizing frame {}, size={}, keyframe={}",
 			frame_number,
@@ -121,10 +132,7 @@ impl Packetizer {
 			is_key_frame
 		);
 
-		// Random padding, because we need it.
-		const PADDING: u32 = 0;
-
-		let requested_shard_payload_size = requested_packet_size - std::mem::size_of::<NvVideoPacket>();
+		let requested_shard_payload_size = requested_packet_size - NV_VIDEO_PACKET_SIZE;
 		let packet_data_len = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
 		let last_shard_size = packet_data_len % requested_shard_payload_size;
 		let last_shard_size = if last_shard_size == 0 {
@@ -133,33 +141,26 @@ impl Packetizer {
 			last_shard_size
 		};
 
-		// TODO: Figure out what this header means?
 		let video_frame_header = VideoFrameHeader {
-			header_type: 0x01, // Always 0x01 for short headers. What is this exactly?
+			header_type: 0x01,
 			padding1: 0,
 			frame_type: if is_key_frame { 2 } else { 1 },
 			padding2: last_shard_size as u32,
 		};
 
-		// Serialize header into a fixed-size array (avoids heap allocation).
 		let mut header_bytes = [0u8; VIDEO_FRAME_HEADER_SIZE];
 		video_frame_header.serialize(&mut header_bytes);
 
-		// The total size of a shard.
-		let requested_shard_size = std::mem::size_of::<RtpHeader>()
-			+ std::mem::size_of_val(&PADDING)
-			+ std::mem::size_of::<NvVideoPacket>()
-			+ requested_shard_payload_size;
+		// The total size of a shard (RTP + padding + NvVideoPacket + payload).
+		let requested_shard_size = PAYLOAD_OFFSET + requested_shard_payload_size;
 
-		// Determine how many data shards we will be sending.
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
 
-		// Determine how many parity and data shards are permitted per FEC block.
 		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
 		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
 
-		// We need to subtract number of data shards by 1, otherwise you can get a situation where.
+		// We need to subtract number of data shards by 1, otherwise you can get a situation where
 		// there are for example 100 data shards allowed per block and also 100 data shards available.
 		// In this case, nr_blocks = 100 / 100 + 1 = 2, but we only need to send 1 block.
 		// Subtracting the value of nr_data_shards by 1 avoids this situation.
@@ -169,11 +170,10 @@ impl Packetizer {
 		tracing::trace!("Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block.");
 		tracing::trace!("Sending {nr_blocks} blocks of video data.");
 
-		// Collect all shards across all blocks into a single batch.
-		let mut all_shards = Vec::new();
+		// Accumulate all blocks into a single batch.
+		let mut all_shards = ShardBatch::empty();
 
 		for block_index in 0..nr_blocks {
-			// Determine what data shards are in this block.
 			let start = block_index * nr_data_shards_per_block;
 			let mut end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
 
@@ -182,15 +182,13 @@ impl Packetizer {
 				end = nr_data_shards;
 			}
 
-			// Compute how many parity shards we will need (approximately) in this block.
 			let nr_data_shards = end - start;
 			assert!(nr_data_shards != 0);
 
 			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize) // Lower limit by the minimum number of parity shards.
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards)); // But hard total upper limit in the number of shards.
+				.max(minimum_fec_packets as usize)
+				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
 
-			// Create the FEC encoder for this amount of shards.
 			let encoder = if nr_parity_shards > 0 {
 				Some(self.get_fec_encoder(nr_data_shards, nr_parity_shards)?)
 			} else {
@@ -204,90 +202,89 @@ impl Packetizer {
 				"Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards."
 			);
 
-			let mut shards = Vec::with_capacity(nr_data_shards + nr_parity_shards);
+			// Single allocation for all shards in this block (data + parity), zeroed.
+			let total_shards = nr_data_shards + nr_parity_shards;
+			let mut shard_buf = ShardBuf::new(total_shards, requested_shard_size);
+
+			// Write data shards directly into the flat buffer.
 			for (block_shard_index, data_shard_index) in (start..end).enumerate() {
-				// Determine which part of the logical [header ++ encoded_data] is in this shard.
 				let payload_start = data_shard_index * requested_shard_payload_size;
 				let payload_len = requested_shard_payload_size.min(packet_data_len - payload_start);
 
-				let mut shard = Vec::with_capacity(requested_shard_size);
+				let shard = shard_buf.shard_mut(block_shard_index);
 
-				let rtp_header = RtpHeader {
-					header: 0x90, // What is this?
-					packet_type: 0,
-					sequence_number: *sequence_number as u16,
-					timestamp: rtp_timestamp,
-					ssrc: 0,
-				};
-				rtp_header.serialize(&mut shard);
-				shard.extend(PADDING.to_le_bytes());
+				// Write RTP header.
+				write_rtp_header(shard, *sequence_number as u16, rtp_timestamp);
 
-				let mut video_packet_header = NvVideoPacket {
-					stream_packet_index: *sequence_number << 8,
-					frame_index: frame_number,
-					flags: RtpFlag::ContainsPicData as u8,
-					reserved: 0,
-					multi_fec_flags: 0x10,
-					multi_fec_blocks: ((block_index as u8) << 4) | last_block_index,
-					fec_info: (block_shard_index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
-				};
+				// Padding (4 bytes of zeros) is already zeroed.
+
+				// Write NvVideoPacket header.
+				let mut flags = RtpFlag::ContainsPicData as u8;
 				if block_shard_index == 0 {
-					video_packet_header.flags |= RtpFlag::StartOfFrame as u8;
+					flags |= RtpFlag::StartOfFrame as u8;
 				}
 				if block_shard_index == nr_data_shards - 1 {
-					video_packet_header.flags |= RtpFlag::EndOfFrame as u8;
+					flags |= RtpFlag::EndOfFrame as u8;
 				}
-				video_packet_header.serialize(&mut shard);
+				write_nv_video_packet(
+					&mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE],
+					*sequence_number << 8,
+					frame_number,
+					flags,
+					((block_index as u8) << 4) | last_block_index,
+					(block_shard_index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
+				);
 
-				// Copy payload directly from header bytes + encoded data (no intermediate concat).
-				extend_from_header_and_data(&mut shard, &header_bytes, encoded_data, payload_start, payload_len);
+				// Copy payload from [header ++ encoded_data].
+				copy_header_and_data(
+					&mut shard[PAYLOAD_OFFSET..],
+					&header_bytes,
+					encoded_data,
+					payload_start,
+					payload_len,
+				);
 
-				// Pad with zeros at the end to make an equally sized shard.
-				if payload_len < requested_shard_payload_size {
-					shard.resize(requested_shard_size, 0);
-				}
-
-				shards.push(shard);
+				// Remaining bytes are already zero (padding for undersized last shard).
 
 				*sequence_number += 1;
 			}
 
-			if let Some(encoder) = encoder {
-				for _ in 0..nr_parity_shards {
-					shards.push(vec![0u8; requested_shard_size]);
-				}
+			// Parity shards are already zeroed from ShardBuf::new().
 
+			if let Some(encoder) = encoder {
+				// Create FEC-compatible slice views into the flat buffer.
+				let mut fec_slices = shard_buf.as_fec_slices();
 				encoder
-					.encode(&mut shards)
+					.encode(&mut fec_slices)
 					.map_err(|e| tracing::warn!("Failed to encode packet as FEC shards: {e}"))?;
 
-				// Force these values for the parity shards, we don't need to reconstruct them, but Moonlight needs them to match with the frame they came from.
-				for (block_shard_index, shard) in shards[nr_data_shards..].iter_mut().enumerate() {
-					let rtp_header = unsafe { &mut *(shard.as_mut_ptr() as *mut RtpHeader) };
-					rtp_header.header = 0x90u8.to_be(); // The `.to_be` is redundant for u8, but is there to make it clear it should be big-endian.
-					rtp_header.sequence_number = (*sequence_number as u16).to_be();
+				// Write headers for parity shards. FEC overwrites the entire shard
+				// content, so we patch the fields Moonlight needs afterward.
+				for block_shard_index in 0..nr_parity_shards {
+					let shard = shard_buf.shard_mut(nr_data_shards + block_shard_index);
 
-					let video_packet_header = unsafe {
-						&mut *(shard
-							.as_mut_ptr()
-							.add(std::mem::size_of::<RtpHeader>() + std::mem::size_of_val(&PADDING))
-							as *mut NvVideoPacket)
-					};
-					video_packet_header.multi_fec_blocks = ((block_index as u8) << 4) | last_block_index;
-					video_packet_header.fec_info = ((nr_data_shards + block_shard_index) << 12
+					// RTP header.
+					shard[0] = 0x90;
+					shard[1] = 0; // packet_type
+					shard[2..4].copy_from_slice(&(*sequence_number as u16).to_be_bytes());
+
+					// NvVideoPacket fields that Moonlight needs.
+					let nv = &mut shard[NV_PACKET_OFFSET..NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE];
+					nv[4..8].copy_from_slice(&frame_number.to_le_bytes()); // frame_index
+					nv[11] = ((block_index as u8) << 4) | last_block_index; // multi_fec_blocks
+					let fec_info = ((nr_data_shards + block_shard_index) << 12
 						| nr_data_shards << 22
 						| fec_percentage << 4) as u32;
-					video_packet_header.frame_index = frame_number;
+					nv[12..16].copy_from_slice(&fec_info.to_le_bytes()); // fec_info
 
 					*sequence_number += 1;
 				}
 			}
 
-			all_shards.extend(shards);
+			all_shards.extend_from(&shard_buf.into_batch());
 
 			tracing::trace!("Finished sending frame {frame_number}.");
 
-			// At this point we should have sent all the data shards in the last block, so we can break the loop.
 			if block_index == 3 {
 				break;
 			}
