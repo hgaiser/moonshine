@@ -492,8 +492,9 @@ impl VideoPipelineInner {
 					"Frame latency breakdown"
 				);
 
-				// Warn on spike frames (total > 4ms) so they stand out in logs.
-				if total.as_micros() > 4000 {
+				// Warn on spike frames (total > frame interval) so they stand out in logs.
+				let frame_interval_us = 1_000_000 / self.framerate as u128;
+				if total.as_micros() > frame_interval_us {
 					tracing::warn!(
 						total_us = total.as_micros() as u64,
 						channel_us = channel_wait.as_micros() as u64,
@@ -502,7 +503,8 @@ impl VideoPipelineInner {
 						encode_us = encode_dur.as_micros() as u64,
 						packetize_us = packetize_dur.as_micros() as u64,
 						buffer_index = frame.buffer_index,
-						"SPIKE: frame latency exceeds 4ms"
+						"SPIKE: frame latency exceeds {}us",
+						frame_interval_us
 					);
 				}
 
