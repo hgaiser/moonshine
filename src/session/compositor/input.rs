@@ -54,6 +54,12 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 	let serial = SERIAL_COUNTER.next_serial();
 	let time = state.clock.now().as_millis();
 
+	// specific pointer events (non-keyboard) should reset the cursor inactivity timer
+	match event {
+		CompositorInputEvent::KeyDown { .. } | CompositorInputEvent::KeyUp { .. } => {},
+		_ => state.last_pointer_activity = std::time::Instant::now(),
+	}
+
 	match event {
 		CompositorInputEvent::KeyDown { keycode } => {
 			tracing::trace!("Key down: {keycode}");
