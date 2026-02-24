@@ -250,6 +250,9 @@ pub struct MoonshineCompositor {
 	/// changes without a surface commit.
 	pub last_cursor_position: Point<f64, Logical>,
 
+	// -- Extended protocols --
+	pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
+
 	// -- XWayland --
 	pub xwayland_shell_state: XWaylandShellState,
 	pub xwm: Option<X11Wm>,
@@ -303,6 +306,7 @@ impl MoonshineCompositor {
 		let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
 		RelativePointerManagerState::new::<Self>(&display_handle);
 		PointerConstraintsState::new::<Self>(&display_handle);
+		let viewporter_state = smithay::wayland::viewporter::ViewporterState::new::<Self>(&display_handle);
 		let clock = Clock::new();
 
 		let mut space = Space::default();
@@ -419,6 +423,7 @@ impl MoonshineCompositor {
 				screen_dirty: true,
 				last_frame_sent_at: std::time::Instant::now(),
 				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
+				viewporter_state,
 				xwayland_shell_state,
 				xwm: None,
 				xdisplay: None,

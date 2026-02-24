@@ -15,6 +15,7 @@ use smithay::delegate_pointer_constraints;
 use smithay::delegate_relative_pointer;
 use smithay::delegate_seat;
 use smithay::delegate_shm;
+use smithay::delegate_viewporter;
 use smithay::delegate_xdg_shell;
 use smithay::delegate_xwayland_shell;
 use smithay::desktop::Window;
@@ -266,6 +267,7 @@ delegate_output!(MoonshineCompositor);
 delegate_relative_pointer!(MoonshineCompositor);
 delegate_pointer_constraints!(MoonshineCompositor);
 delegate_xwayland_shell!(MoonshineCompositor);
+delegate_viewporter!(MoonshineCompositor);
 
 // -- DMA-BUF Handler --
 
