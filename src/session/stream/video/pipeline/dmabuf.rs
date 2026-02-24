@@ -109,11 +109,17 @@ impl DmaBufImporter {
 		let device = self.context.device();
 		let format = vk::Format::B8G8R8A8_UNORM;
 
-		// Build DRM format modifier info for single-plane RGB.
-		let plane_layout = vk::SubresourceLayout::default()
-			.offset(planes[0].offset as u64)
-			.row_pitch(planes[0].stride as u64);
-		let plane_layouts = [plane_layout];
+		// Build DRM format modifier plane layouts for all planes.
+		// AMD modifiers (e.g. tiled/DCC) may require multiple planes;
+		// the layout count must match the modifier's expected plane count.
+		let plane_layouts: Vec<vk::SubresourceLayout> = planes
+			.iter()
+			.map(|p| {
+				vk::SubresourceLayout::default()
+					.offset(p.offset as u64)
+					.row_pitch(p.stride as u64)
+			})
+			.collect();
 
 		let modifier = planes[0].modifier;
 		let mut drm_format_modifier_info = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()

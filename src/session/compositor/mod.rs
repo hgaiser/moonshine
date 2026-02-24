@@ -90,13 +90,20 @@ fn run_compositor(
 	let render_node = find_render_node(&config.gpu)?;
 	tracing::debug!("Using render node: {}", render_node.display());
 
-	// Open the render node twice — GbmDevice<File> doesn't impl Clone
-	// because File doesn't impl Clone, so we need separate file handles
-	// for the allocator's GBM device and the EGL display's GBM device.
-	let render_fd_alloc = std::fs::File::open(&render_node)
+	// Open the render node.
+	// Must use read-write access: DRM render nodes require O_RDWR for
+	// GPU buffer mapping (amdgpu_bo_cpu_map fails with EACCES otherwise).
+	let render_fd_alloc = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.open(&render_node)
 		.map_err(|e| format!("Failed to open render node {}: {e}", render_node.display()))?;
-	let render_fd_egl = std::fs::File::open(&render_node)
-		.map_err(|e| format!("Failed to open render node {}: {e}", render_node.display()))?;
+
+	// Clone the file handle for the EGL display's GBM device.
+	// GbmDevice takes ownership of the file, so we need a separate handle.
+	let render_fd_egl = render_fd_alloc
+		.try_clone()
+		.map_err(|e| format!("Failed to clone render node handle: {e}"))?;
 
 	// Initialize GBM.
 	let gbm_device_alloc =

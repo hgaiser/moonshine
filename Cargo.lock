@@ -187,7 +187,7 @@ dependencies = [
 [[package]]
 name = "ash"
 version = "0.38.0+1.3.296"
-source = "git+https://github.com/ash-rs/ash?branch=master#c9292cf1b3fb70e4416fe9c47d6d938bd80d52b4"
+source = "git+https://github.com/ash-rs/ash?branch=master#c13363c032da9e589ca9d8673a299a3735ee255c"
 dependencies = [
  "libloading",
 ]
@@ -2664,7 +2664,7 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.1.0"
-source = "git+https://github.com/hgaiser/pixelforge?branch=main#6d6015fcea25a1d5d31af6f51e595b7cb1e86477"
+source = "git+https://github.com/hgaiser/pixelforge?branch=amd-support#dc5ad49bd6d94b9baa672cd62cbbb29759c026d4"
 dependencies = [
  "ash",
  "shaderc",
