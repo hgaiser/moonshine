@@ -236,7 +236,9 @@ impl VideoPipelineInner {
 		.with_frame_rate(self.framerate, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
 		.with_b_frames(0) // No B-frames for low latency
-		.with_max_reference_frames(self.max_reference_frames);
+		.with_max_reference_frames(self.max_reference_frames)
+		.with_virtual_buffer_size_ms(1000 / self.framerate)
+		.with_initial_virtual_buffer_size_ms(0);
 
 		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
 
