@@ -115,7 +115,7 @@ impl VideoStream {
 			// 160 corresponds to DSCP CS5 (Video)
 			tracing::debug!("Enabling QoS on video socket.");
 			socket
-				.set_tos(160)
+				.set_tos_v4(160)
 				.map_err(|e| tracing::warn!("Failed to set QoS on the video socket: {e}"))?;
 		}
 
