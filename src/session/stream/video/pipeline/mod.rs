@@ -35,6 +35,7 @@ struct LatencySample {
 	convert: std::time::Duration,
 	encode: std::time::Duration,
 	packetize: std::time::Duration,
+	send: std::time::Duration,
 	total: std::time::Duration,
 }
 
@@ -63,6 +64,9 @@ fn log_latency_summary(samples: &[LatencySample]) {
 	let mut packetizes: Vec<u64> = samples.iter().map(|s| s.packetize.as_micros() as u64).collect();
 	packetizes.sort_unstable();
 
+	let mut sends: Vec<u64> = samples.iter().map(|s| s.send.as_micros() as u64).collect();
+	sends.sort_unstable();
+
 	let p50 = |v: &[u64]| v[v.len() / 2];
 	let p95 = |v: &[u64]| v[(v.len() as f64 * 0.95) as usize];
 	let p99 = |v: &[u64]| v[(v.len() as f64 * 0.99) as usize];
@@ -83,6 +87,9 @@ fn log_latency_summary(samples: &[LatencySample]) {
 		encode_p95_us = p95(&encodes),
 		encode_p99_us = p99(&encodes),
 		packetize_p50_us = p50(&packetizes),
+		send_p50_us = p50(&sends),
+		send_p95_us = p95(&sends),
+		send_p99_us = p99(&sends),
 		"Frame latency summary (μs)"
 	);
 }
@@ -269,6 +276,7 @@ impl VideoPipelineInner {
 		});
 
 		let mut packetizer = Packetizer::new();
+		packetizer.warm_up(self.fec_percentage, self.minimum_fec_packets);
 		let mut sequence_number = 0u32;
 		let mut frame_number = 0u32;
 
@@ -452,19 +460,30 @@ impl VideoPipelineInner {
 				let t4_encoded = std::time::Instant::now();
 
 				// Process encoded packets.
+				let mut packetize_dur = std::time::Duration::ZERO;
+				let mut send_dur = std::time::Duration::ZERO;
+				let mut encoded_bytes = 0usize;
+				let mut is_key_frame = false;
 				match encode_result {
 					Ok(packets) => {
 						for packet in packets {
-							if let Err(()) = self.send_packet(
+							encoded_bytes += packet.data.len();
+							is_key_frame |= packet.is_key_frame;
+							let (p, s) = match self.send_packet(
 								&packet,
 								&packet_tx,
 								&mut packetizer,
 								&mut frame_number,
 								&mut sequence_number,
 							) {
-								tracing::warn!("Failed to send encoded packet");
-								return Err("Failed to send packet".to_string());
-							}
+								Ok(durations) => durations,
+								Err(()) => {
+									tracing::warn!("Failed to send encoded packet");
+									return Err("Failed to send packet".to_string());
+								},
+							};
+							packetize_dur += p;
+							send_dur += s;
 						}
 					},
 					Err(e) => {
@@ -472,15 +491,14 @@ impl VideoPipelineInner {
 					},
 				}
 
-				let t5_packetized = std::time::Instant::now();
+				let t5_done = std::time::Instant::now();
 
 				// Log per-frame latency breakdown.
 				let channel_wait = t1_received.duration_since(frame.created_at);
 				let import_dur = t2_imported.duration_since(t1_received);
 				let convert_dur = t3_converted.duration_since(t2_imported);
 				let encode_dur = t4_encoded.duration_since(t3_converted);
-				let packetize_dur = t5_packetized.duration_since(t4_encoded);
-				let total = t5_packetized.duration_since(frame.created_at);
+				let total = t5_done.duration_since(frame.created_at);
 
 				tracing::debug!(
 					channel_wait_us = channel_wait.as_micros() as u64,
@@ -488,6 +506,7 @@ impl VideoPipelineInner {
 					convert_us = convert_dur.as_micros() as u64,
 					encode_us = encode_dur.as_micros() as u64,
 					packetize_us = packetize_dur.as_micros() as u64,
+					send_us = send_dur.as_micros() as u64,
 					total_us = total.as_micros() as u64,
 					"Frame latency breakdown"
 				);
@@ -502,6 +521,9 @@ impl VideoPipelineInner {
 						convert_us = convert_dur.as_micros() as u64,
 						encode_us = encode_dur.as_micros() as u64,
 						packetize_us = packetize_dur.as_micros() as u64,
+						send_us = send_dur.as_micros() as u64,
+						encoded_bytes,
+						is_key_frame,
 						buffer_index = frame.buffer_index,
 						"SPIKE: frame latency exceeds {}us",
 						frame_interval_us
@@ -514,6 +536,7 @@ impl VideoPipelineInner {
 					convert: convert_dur,
 					encode: encode_dur,
 					packetize: packetize_dur,
+					send: send_dur,
 					total,
 				});
 
@@ -553,6 +576,7 @@ impl VideoPipelineInner {
 		Ok(())
 	}
 
+	/// Returns `(packetize_duration, send_duration)` on success.
 	fn send_packet(
 		&self,
 		packet: &EncodedPacket,
@@ -560,7 +584,7 @@ impl VideoPipelineInner {
 		packetizer: &mut Packetizer,
 		frame_number: &mut u32,
 		sequence_number: &mut u32,
-	) -> Result<(), ()> {
+	) -> Result<(std::time::Duration, std::time::Duration), ()> {
 		// Calculate RTP timestamp from PTS (convert to 90kHz clock)
 		let rtp_timestamp = (packet.pts * 90000 / self.framerate as u64) as u32;
 
@@ -573,6 +597,8 @@ impl VideoPipelineInner {
 
 		*frame_number += 1;
 
+		let t_start = std::time::Instant::now();
+
 		let shards = packetizer.packetize(
 			&packet.data,
 			packet.is_key_frame,
@@ -584,11 +610,15 @@ impl VideoPipelineInner {
 			rtp_timestamp,
 		)?;
 
+		let t_packetized = std::time::Instant::now();
+
 		if packet_tx.blocking_send(shards).is_err() {
 			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
 			return Err(());
 		}
 
-		Ok(())
+		let t_sent = std::time::Instant::now();
+
+		Ok((t_packetized - t_start, t_sent - t_packetized))
 	}
 }
