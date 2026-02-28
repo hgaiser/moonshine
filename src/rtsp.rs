@@ -154,8 +154,8 @@ impl RtspServer {
 			}
 
 			let mut params = format!("{}{}{}", config.channels, config.streams, config.coupled_streams);
-			for j in 0..config.channels as usize {
-				params.push_str(&format!("{}", mapping[j]));
+			for &m in mapping.iter().take(config.channels as usize) {
+				params.push_str(&format!("{}", m));
 			}
 			result.push_str(&format!("a=fmtp:97 surround-params={}\n", params));
 		}
