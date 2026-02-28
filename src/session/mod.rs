@@ -1,4 +1,3 @@
-use std::os::unix::process::CommandExt as _;
 use std::process::Command;
 use std::process::{Child, Stdio};
 use std::sync::Arc;
@@ -182,7 +181,7 @@ impl Session {
 		// established on time.
 		let app_context = context.clone();
 		let app_sink = sink_name.clone();
-		let app_handle = std::thread::Builder::new()
+		std::thread::Builder::new()
 			.name("app-launcher".to_string())
 			.spawn(move || -> Result<Child, ()> {
 				let xdisplay = xdisplay_rx
@@ -200,7 +199,6 @@ impl Session {
 			control_stream: None,
 			frame_rx: Some(frame_rx),
 			input_tx: Some(input_tx),
-			app_launcher: Some(app_handle),
 			audio_sink_module_id: Some(module_id),
 			audio_loopback_module_id: loopback_module_id,
 			enet,
@@ -251,7 +249,6 @@ struct SessionInner {
 	control_stream: Option<ControlStream>,
 	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
 	input_tx: Option<calloop::channel::Sender<CompositorInputEvent>>,
-	app_launcher: Option<std::thread::JoinHandle<Result<Child, ()>>>,
 	audio_sink_module_id: Option<String>,
 	audio_loopback_module_id: Option<String>,
 	enet: Arc<Enet>,
@@ -329,20 +326,15 @@ impl SessionInner {
 			}
 		}
 
-		// Collect the app process from the launcher thread and terminate
-		// the entire process group. The child was launched with
-		// `process_group(0)` so it is the leader of its own group.
-		// Sending the signal to the group ensures that sub-processes
-		// spawned by the app (e.g. Steam's children) are also terminated.
-		if let Some(handle) = self.app_launcher {
-			if let Ok(Ok(ref child)) = handle.join() {
-				let pid = child.id() as libc::pid_t;
-				// Send SIGTERM to the entire process group (negative pid).
-				unsafe {
-					libc::kill(-pid, libc::SIGTERM);
-				}
-			}
-		}
+		// Signal all processes in the systemd scope to terminate.
+		// Uses `kill` instead of `stop` to avoid blocking while systemd
+		// waits for processes to exit. The scope will auto-cleanup via
+		// the --collect flag once all processes have exited.
+		let _ = Command::new("systemctl")
+			.args(["--user", "kill", "--signal=SIGTERM", "moonshine-session.scope"])
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status();
 
 		if let Some(module_id) = self.audio_loopback_module_id {
 			unload_audio_sink(&module_id);
@@ -374,19 +366,22 @@ fn launch_application(context: &SessionContext, sink_name: &str, xdisplay: u32) 
 	std::fs::create_dir_all(&log_dir).map_err(|e| tracing::warn!("Failed to create log directory: {e}"))?;
 	let log_path = log_dir.join(format!("app-{}.log", context.application_id));
 	tracing::debug!("Application log path: {}", log_path.display());
+
 	let log_file = std::fs::File::create(&log_path).map_err(|e| tracing::warn!("Failed to create log file: {e}"))?;
 
-	Command::new(program)
+	// Stop any leftover scope from a previous session before starting a new one.
+	let _ = Command::new("systemctl")
+		.args(["--user", "stop", "moonshine-session.scope"])
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status();
+
+	Command::new("systemd-run")
+		.args(["--user", "--scope", "--collect", "--unit", "moonshine-session", "--property=TimeoutStopSec=5", "--"])
+		.arg(program)
 		.args(args)
 		.env("PULSE_SINK", sink_name)
-		// Set DISPLAY so X11 apps connect to our XWayland instance.
-		// WAYLAND_DISPLAY is already set by the compositor for native
-		// Wayland apps.
 		.env("DISPLAY", format!(":{xdisplay}"))
-		// Launch in a new process group so we can kill the entire tree
-		// on session stop (important for apps like Steam that spawn
-		// many sub-processes).
-		.process_group(0)
 		.stdout(
 			log_file
 				.try_clone()
