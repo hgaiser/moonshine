@@ -25,22 +25,23 @@ from pathlib import Path
 # Matches the per-frame latency breakdown log line from pipeline/mod.rs.
 # The tracing crate puts the message first, then structured fields after (or vice versa).
 # Support both orderings.
-# Example format 1 (fields after message):
+# Example format (new, with send_us):
+#   ... Frame latency breakdown channel_wait_us=42 import_us=15 convert_us=200 encode_us=1500 packetize_us=300 send_us=5 total_us=2057
+# Example format (old, without send_us):
 #   ... Frame latency breakdown channel_wait_us=42 import_us=15 convert_us=200 encode_us=1500 packetize_us=300 total_us=2057
-# Example format 2 (fields before message):
-#   ... channel_wait_us=42 import_us=15 convert_us=200 encode_us=1500 packetize_us=300 total_us=2057 Frame latency breakdown
 FRAME_LATENCY_RE = re.compile(
     r"channel_wait_us=(\d+)\s+"
     r"import_us=(\d+)\s+"
     r"convert_us=(\d+)\s+"
     r"encode_us=(\d+)\s+"
     r"packetize_us=(\d+)\s+"
+    r"(?:send_us=(\d+)\s+)?"
     r"total_us=(\d+)"
 )
 
 # Matches the spike warning line.
 SPIKE_RE = re.compile(
-    r"SPIKE: frame latency exceeds 4ms"
+    r"SPIKE: frame latency exceeds \d+us"
 )
 
 # Matches the periodic summary line.
@@ -51,7 +52,7 @@ SUMMARY_RE = re.compile(
     r"total_p99_us=(\d+)"
 )
 
-STAGE_NAMES = ["channel_wait", "import", "convert", "encode", "packetize", "total"]
+STAGE_NAMES = ["channel_wait", "import", "convert", "encode", "packetize", "send", "total"]
 
 # ANSI escape code pattern for stripping terminal colors from log output.
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
@@ -74,7 +75,8 @@ def parse_log_file(path):
                     "convert": int(m.group(3)),
                     "encode": int(m.group(4)),
                     "packetize": int(m.group(5)),
-                    "total": int(m.group(6)),
+                    "send": int(m.group(6)) if m.group(6) is not None else 0,
+                    "total": int(m.group(7)),
                 }
                 samples.append(sample)
 
@@ -188,10 +190,15 @@ def plot_histograms(samples, stats):
         print("matplotlib is required for plotting. Install with: pip install matplotlib")
         sys.exit(1)
 
-    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
+    fig, axes = plt.subplots(2, 4, figsize=(18, 10))
     fig.suptitle("Moonshine Video Pipeline Latency Histograms", fontsize=14)
 
-    for ax, stage in zip(axes.flat, STAGE_NAMES):
+    for i, ax in enumerate(axes.flat):
+        if i >= len(STAGE_NAMES):
+            ax.set_visible(False)
+            continue
+
+        stage = STAGE_NAMES[i]
         values = [s[stage] for s in samples]
         if not values:
             continue
