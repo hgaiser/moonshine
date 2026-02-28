@@ -186,7 +186,7 @@ impl AudioEncoderInner {
 						.reset_state()
 						.map_err(|e| tracing::warn!("Failed to reset Opus encoder state: {e}"));
 					// Return the frame for recycling even on error.
-					let _ = frame_recycle_tx.send(AudioFrame {
+					let _ = frame_recycle_tx.try_send(AudioFrame {
 						buf: frame.buf,
 						capture_ts_ms: 0,
 					});
@@ -203,6 +203,10 @@ impl AudioEncoderInner {
 				Ok(payload) => payload,
 				Err(e) => {
 					tracing::warn!("Failed to encrypt audio: {e}");
+					let _ = frame_recycle_tx.try_send(AudioFrame {
+						buf: frame.buf,
+						capture_ts_ms: 0,
+					});
 					continue;
 				},
 			};
@@ -259,6 +263,10 @@ impl AudioEncoderInner {
 				if fec_encoder.reset().is_err() {
 					tracing::warn!("Parity is not ready, but we were expecting it to be ready.");
 					fec_encoder.reset_force();
+					let _ = frame_recycle_tx.try_send(AudioFrame {
+						buf: frame.buf,
+						capture_ts_ms: 0,
+					});
 					continue;
 				}
 
@@ -305,7 +313,7 @@ impl AudioEncoderInner {
 			}
 
 			// Return the empty frame for recycling.
-			let _ = frame_recycle_tx.send(AudioFrame {
+			let _ = frame_recycle_tx.try_send(AudioFrame {
 				buf: frame.buf,
 				capture_ts_ms: 0,
 			});

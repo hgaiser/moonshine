@@ -88,7 +88,7 @@ pub(super) fn handle_command(
 			Ok(())
 		},
 		pulse::Command::GetSourceInfoList => {
-			let reply: pulse::SinkInfoList = Vec::new();
+			let reply: pulse::SourceInfoList = Vec::new();
 			write_reply(&mut client.socket, seq, &reply, client.protocol_version)?;
 			Ok(())
 		},
@@ -108,6 +108,12 @@ pub(super) fn handle_command(
 				}) {
 					sample_spec = format;
 				}
+			}
+
+			if !is_supported_format(sample_spec.format) {
+				tracing::warn!("rejecting unsupported sample format {:?}", sample_spec.format);
+				pulse::write_error(&mut client.socket, seq, &pulse::PulseError::NotSupported)?;
+				return Ok(());
 			}
 
 			let mut buffer_attr = params.buffer_attr;
@@ -167,6 +173,8 @@ pub(super) fn handle_command(
 		pulse::Command::DrainPlaybackStream(channel) => {
 			if let Some(stream) = client.playback_streams.get_mut(&channel) {
 				stream.state = StreamState::Draining(seq);
+			} else {
+				pulse::write_error(&mut client.socket, seq, &pulse::PulseError::NoEntity)?;
 			}
 			Ok(())
 		},
@@ -185,6 +193,8 @@ pub(super) fn handle_command(
 				};
 
 				write_reply(&mut client.socket, seq, &reply, client.protocol_version)?;
+			} else {
+				pulse::write_error(&mut client.socket, seq, &pulse::PulseError::NoEntity)?;
 			}
 
 			Ok(())
@@ -374,6 +384,21 @@ pub(super) fn handle_command(
 			Ok(())
 		},
 	}
+}
+
+fn is_supported_format(format: pulse::SampleFormat) -> bool {
+	matches!(
+		format,
+		pulse::SampleFormat::U8
+			| pulse::SampleFormat::S16Le
+			| pulse::SampleFormat::S16Be
+			| pulse::SampleFormat::Float32Le
+			| pulse::SampleFormat::Float32Be
+			| pulse::SampleFormat::S32Le
+			| pulse::SampleFormat::S32Be
+			| pulse::SampleFormat::S24Le
+			| pulse::SampleFormat::S24Be
+	)
 }
 
 fn sample_spec_from_format(f: &pulse::FormatInfo) -> Result<pulse::SampleSpec, Error> {

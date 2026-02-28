@@ -1,5 +1,3 @@
-use std::path::PathBuf;
-
 use async_shutdown::ShutdownManager;
 use tokio::{net::UdpSocket, sync::mpsc};
 
@@ -128,7 +126,6 @@ impl AudioConfig {
 pub struct AudioStreamContext {
 	pub packet_duration_ms: u32,
 	pub qos: bool,
-	pub socket_path: Option<PathBuf>,
 	pub audio_config: AudioConfig,
 }
 
@@ -146,6 +143,7 @@ impl AudioStream {
 	pub async fn new(
 		config: Config,
 		context: AudioStreamContext,
+		listener: std::os::unix::net::UnixListener,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing audio stream.");
@@ -172,11 +170,11 @@ impl AudioStream {
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioStreamInner {
 			encoder: None,
-			socket_path: context.socket_path,
+			listener: Some(listener),
 			packet_duration_ms: context.packet_duration_ms,
 			audio_config: context.audio_config,
 			pulse_server_close_tx: None,
-			_pulse_server_waker: None,
+			pulse_server_waker: None,
 		};
 		tokio::spawn(inner.run(socket, command_rx, stop_session_manager.clone()));
 
@@ -204,14 +202,12 @@ impl AudioStream {
 
 struct AudioStreamInner {
 	encoder: Option<AudioEncoder>,
-	socket_path: Option<PathBuf>,
+	listener: Option<std::os::unix::net::UnixListener>,
 	packet_duration_ms: u32,
 	audio_config: AudioConfig,
 	pulse_server_close_tx: Option<crossbeam_channel::Sender<()>>,
-	_pulse_server_waker: Option<mio::Waker>,
+	pulse_server_waker: Option<mio::Waker>,
 }
-
-unsafe impl Send for AudioStreamInner {}
 
 impl AudioStreamInner {
 	async fn run(
@@ -236,18 +232,18 @@ impl AudioStreamInner {
 						continue;
 					}
 
-					let Some(ref socket_path) = self.socket_path else {
-						tracing::error!("No socket path configured for PulseServer.");
+					let Some(listener) = self.listener.take() else {
+						tracing::error!("No listener available for PulseServer.");
 						break;
 					};
 
 					// Create frame channels for PulseServer ↔ Encoder communication.
-					let (frame_tx, frame_rx) = crossbeam_channel::unbounded();
-					let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::unbounded();
+					let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
+					let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::bounded(3);
 
 					// Start PulseServer.
 					let (mut server, close_tx, waker): (PulseServer, _, _) = match PulseServer::new(
-						socket_path,
+						listener,
 						self.audio_config.channels,
 						self.packet_duration_ms,
 						frame_tx,
@@ -266,14 +262,14 @@ impl AudioStreamInner {
 						.spawn(move || {
 							if let Err(e) = server.run() {
 								tracing::error!("PulseServer error: {e}");
-								let _ = server_stop.trigger_shutdown(SessionShutdownReason::AudioCaptureStopped);
+								let _ = server_stop.trigger_shutdown(SessionShutdownReason::PulseServerStopped);
 							}
 						})
 						.map_err(|e| tracing::error!("Failed to spawn pulse server thread: {e}"))
 						.ok();
 
 					self.pulse_server_close_tx = Some(close_tx);
-					self._pulse_server_waker = Some(waker);
+					self.pulse_server_waker = Some(waker);
 
 					let encoder = match AudioEncoder::new(
 						CAPTURE_SAMPLE_RATE,
@@ -305,6 +301,14 @@ impl AudioStreamInner {
 		}
 
 		tracing::debug!("Audio stream stopped.");
+
+		// Signal PulseServer to stop and wake its poll loop.
+		if let Some(close_tx) = self.pulse_server_close_tx.take() {
+			let _ = close_tx.send(());
+		}
+		if let Some(waker) = self.pulse_server_waker.take() {
+			let _ = waker.wake();
+		}
 	}
 }
 

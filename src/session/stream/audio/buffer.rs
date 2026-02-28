@@ -215,7 +215,8 @@ where
 			pulse::SampleFormat::S32Le => self.inner.read_i32::<LE>().ok().map(Sample::from_sample),
 			pulse::SampleFormat::S32Be => self.inner.read_i32::<BE>().ok().map(Sample::from_sample),
 			pulse::SampleFormat::S24Le => self.inner.read_i24::<LE>().ok().map(Sample::from_sample),
-			_ => unimplemented!(),
+			pulse::SampleFormat::S24Be => self.inner.read_i24::<BE>().ok().map(Sample::from_sample),
+			_ => unreachable!("unsupported sample format {:?}", self.sample_spec.format),
 		}
 	}
 }

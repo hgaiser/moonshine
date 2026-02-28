@@ -67,15 +67,6 @@ impl DynPlaybackBuffer {
 			Self::Surround71(b) => drain_mix_impl(b, num_frames, output, vol),
 		}
 	}
-
-	/// Drain frames without mixing (just drop them).
-	pub fn drain_discard(&mut self, num_frames: usize) -> bool {
-		match self {
-			Self::Stereo(b) => b.drain(num_frames).is_some(),
-			Self::Surround51(b) => b.drain(num_frames).is_some(),
-			Self::Surround71(b) => b.drain(num_frames).is_some(),
-		}
-	}
 }
 
 fn drain_mix_impl<F: dasp::Frame<Sample = f32>>(

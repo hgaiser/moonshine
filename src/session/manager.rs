@@ -29,8 +29,8 @@ pub enum SessionShutdownReason {
 	AudioStreamStopped,
 	/// Audio packet handler stopped unexpectedly.
 	AudioPacketHandlerStopped,
-	/// Audio capture stopped unexpectedly.
-	AudioCaptureStopped,
+	/// PulseAudio server stopped unexpectedly.
+	PulseServerStopped,
 	/// Audio encoder stopped unexpectedly.
 	AudioEncoderStopped,
 	/// Control stream stopped unexpectedly.

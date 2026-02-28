@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::process::Command;
 use std::process::{Child, Stdio};
 use std::sync::Arc;
@@ -50,9 +49,6 @@ pub struct SessionContext {
 	/// Encryption keys for encoding traffic.
 	pub keys: SessionKeys,
 
-	/// Whether to play audio on the host.
-	pub host_audio: bool,
-
 	/// Audio channel count (2, 6, or 8).
 	pub audio_channels: u8,
 
@@ -70,7 +66,6 @@ pub struct Session {
 	command_tx: mpsc::Sender<SessionCommand>,
 	context: SessionContext,
 	running: bool,
-	socket_path: PathBuf,
 }
 
 #[allow(clippy::result_unit_err)]
@@ -88,6 +83,14 @@ impl Session {
 		std::fs::create_dir_all(&pulse_dir)
 			.map_err(|e| tracing::error!("Failed to create pulse socket directory: {e}"))?;
 		let socket_path = pulse_dir.join("native");
+
+		// Remove any stale socket file from a previous session.
+		let _ = std::fs::remove_file(&socket_path);
+
+		// Bind the PulseAudio socket before launching the application so that
+		// the app can connect as soon as it starts.
+		let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+			.map_err(|e| tracing::error!("Failed to bind PulseAudio socket: {e}"))?;
 
 		// Start the headless compositor.
 		let compositor_config = compositor::CompositorConfig {
@@ -126,24 +129,23 @@ impl Session {
 			frame_rx: Some(frame_rx),
 			input_tx: Some(input_tx),
 			enet,
+			listener: Some(listener),
 		};
 		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal));
 		Ok(Self {
 			command_tx,
 			context,
 			running: false,
-			socket_path,
 		})
 	}
 
 	pub async fn start(
 		&mut self,
 		video_stream_context: VideoStreamContext,
-		mut audio_stream_context: AudioStreamContext,
+		audio_stream_context: AudioStreamContext,
 	) -> Result<(), ()> {
 		tracing::info!("Starting session.");
 		self.running = true;
-		audio_stream_context.socket_path = Some(self.socket_path.clone());
 		self.command_tx
 			.send(SessionCommand::Start(video_stream_context, audio_stream_context))
 			.await
@@ -174,6 +176,7 @@ struct SessionInner {
 	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
 	input_tx: Option<calloop::channel::Sender<CompositorInputEvent>>,
 	enet: Arc<Enet>,
+	listener: Option<std::os::unix::net::UnixListener>,
 }
 
 impl SessionInner {
@@ -202,13 +205,21 @@ impl SessionInner {
 						Ok(video_stream) => video_stream,
 						Err(()) => continue,
 					};
-					let audio_stream =
-						match AudioStream::new(self.config.clone(), audio_stream_context, stop_session_manager.clone())
-							.await
-						{
-							Ok(audio_stream) => audio_stream,
-							Err(()) => continue,
-						};
+					let Some(listener) = self.listener.take() else {
+						tracing::error!("No listener available for audio stream.");
+						continue;
+					};
+					let audio_stream = match AudioStream::new(
+						self.config.clone(),
+						audio_stream_context,
+						listener,
+						stop_session_manager.clone(),
+					)
+					.await
+					{
+						Ok(audio_stream) => audio_stream,
+						Err(()) => continue,
+					};
 					let input_tx = self.input_tx.take().expect("Input sender already consumed");
 					let control_stream = match ControlStream::new(
 						self.config.clone(),

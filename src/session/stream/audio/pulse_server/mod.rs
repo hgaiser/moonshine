@@ -4,7 +4,7 @@ mod dyn_buffer;
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read};
 use std::os::unix::io::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time;
 
 use bytes::BytesMut;
@@ -28,9 +28,12 @@ const DEFAULT_CLOCK_RATE_HZ: u32 = 200;
 
 const SINK_NAME: &str = "moonshine";
 
+/// Pre-allocated zero-volume slice for muted streams (up to 8 channels).
+const ZERO_VOL: [f32; 8] = [0.0; 8];
+
 /// A buffer of interleaved f32 samples ready for Opus encoding.
 pub struct AudioFrame {
-	/// Interleaved stereo f32 samples.
+	/// Interleaved f32 samples for the negotiated channel count.
 	pub buf: Vec<f32>,
 
 	/// Capture timestamp in milliseconds since process start.
@@ -89,6 +92,7 @@ pub struct PulseServer {
 	close_rx: crossbeam_channel::Receiver<()>,
 	frame_tx: crossbeam_channel::Sender<AudioFrame>,
 	frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
+	spare_frame: Option<AudioFrame>,
 
 	clients: BTreeMap<mio::Token, Client>,
 	server_state: ServerState,
@@ -98,21 +102,34 @@ pub struct PulseServer {
 
 impl PulseServer {
 	pub fn new(
-		socket_path: impl AsRef<Path>,
+		listener: std::os::unix::net::UnixListener,
 		channels: u8,
 		packet_duration_ms: u32,
 		frame_tx: crossbeam_channel::Sender<AudioFrame>,
 		frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
 	) -> Result<(Self, crossbeam_channel::Sender<()>, mio::Waker), Error> {
-		let socket_path = socket_path.as_ref();
-		let listener = UnixListener::bind(socket_path)?;
+		let socket_path = listener
+			.local_addr()?
+			.as_pathname()
+			.ok_or("listener has no pathname")?
+			.to_path_buf();
+		listener.set_nonblocking(true)?;
+		let listener = UnixListener::from_std(listener);
 		let poll = mio::Poll::new()?;
 		let waker = mio::Waker::new(poll.registry(), WAKER)?;
 
-		let clock_rate_hz = if packet_duration_ms > 0 {
-			1000 / packet_duration_ms
-		} else {
-			DEFAULT_CLOCK_RATE_HZ
+		let clock_rate_hz = match packet_duration_ms {
+			5 | 10 => 1000 / packet_duration_ms,
+			_ => {
+				if packet_duration_ms != 0 {
+					tracing::warn!(
+						"Unsupported packet_duration_ms {}, falling back to default {}Hz",
+						packet_duration_ms,
+						DEFAULT_CLOCK_RATE_HZ,
+					);
+				}
+				DEFAULT_CLOCK_RATE_HZ
+			},
 		};
 
 		let mut clock = mio_timerfd::TimerFd::new(mio_timerfd::ClockId::Monotonic)?;
@@ -181,13 +198,14 @@ impl PulseServer {
 		Ok((
 			Self {
 				listener,
-				socket_path: socket_path.to_path_buf(),
+				socket_path,
 				poll,
 				clock,
 				clock_rate_hz,
 				close_rx,
 				frame_tx,
 				frame_recycle_rx,
+				spare_frame: None,
 				clients: BTreeMap::new(),
 				server_state: ServerState {
 					server_info,
@@ -239,8 +257,12 @@ impl PulseServer {
 						self.clock.read()?;
 						self.clock_tick()?;
 					},
-					LISTENER => {
-						let (mut socket, _) = self.listener.accept()?;
+					LISTENER => loop {
+						let (mut socket, _) = match self.listener.accept() {
+							Ok(conn) => conn,
+							Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+							Err(e) => return Err(e.into()),
+						};
 						let id = next_client_token as u32;
 						let token = mio::Token(next_client_token as usize);
 						next_client_token += 1;
@@ -308,6 +330,13 @@ impl PulseServer {
 				}
 
 				let desc = pulse::read_descriptor(&mut Cursor::new(&client.incoming[..pulse::DESCRIPTOR_SIZE]))?;
+
+				// Guard against excessively large payloads (max 4 MiB).
+				const MAX_PAYLOAD_SIZE: u32 = 4 * 1024 * 1024;
+				if desc.length > MAX_PAYLOAD_SIZE {
+					return Err(format!("payload too large: {} bytes", desc.length).into());
+				}
+
 				if client.incoming.len() < (desc.length as usize + pulse::DESCRIPTOR_SIZE) {
 					read_size = desc.length as usize + pulse::DESCRIPTOR_SIZE - client.incoming.len();
 					continue 'read;
@@ -353,11 +382,21 @@ impl PulseServer {
 			Ok(mut frame) => {
 				frame.buf.resize(encode_len as usize, 0.0);
 				frame.buf.fill(0.0);
-				Some(frame)
+				frame
 			},
 			Err(crossbeam_channel::TryRecvError::Empty) => {
-				// No one's listening, but we still need to drain audio from clients.
-				None
+				if let Some(mut frame) = self.spare_frame.take() {
+					frame.buf.resize(encode_len as usize, 0.0);
+					frame.buf.fill(0.0);
+					frame
+				} else {
+					// Recycle pool temporarily exhausted; allocate a fresh frame to avoid
+					// deadlocking the encoder which is blocked on frame_rx.recv().
+					AudioFrame {
+						buf: vec![0.0; encode_len as usize],
+						capture_ts_ms: 0,
+					}
+				}
 			},
 			Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
 		};
@@ -368,15 +407,16 @@ impl PulseServer {
 				if matches!(stream.state, StreamState::Playing | StreamState::Draining(_)) {
 					let buffer_len = stream.buffer.len_bytes();
 
-					let drained = if let Some(ref mut frame) = frame {
-						let vol = if stream.muted {
-							vec![0.0; stream.volume.len()]
-						} else {
-							stream.volume.clone()
-						};
-						stream.buffer.drain_and_mix(num_frames as usize, &mut frame.buf, &vol)
+					let drained = if stream.muted {
+						stream.buffer.drain_and_mix(
+							num_frames as usize,
+							&mut frame.buf,
+							&ZERO_VOL[..stream.volume.len()],
+						)
 					} else {
-						stream.buffer.drain_discard(num_frames as usize)
+						stream
+							.buffer
+							.drain_and_mix(num_frames as usize, &mut frame.buf, &stream.volume)
 					};
 
 					if !drained {
@@ -433,19 +473,24 @@ impl PulseServer {
 			}
 		}
 
-		if let Some(mut frame) = frame {
-			// Apply sink-level volume.
-			if self.server_state.sink_muted {
-				frame.buf.fill(0.0);
-			} else if self.server_state.sink_volume.iter().any(|&v| v != 1.0) {
-				let vol = &self.server_state.sink_volume;
-				for (i, sample) in frame.buf.iter_mut().enumerate() {
-					*sample *= vol[i % vol.len()];
-				}
+		// Apply sink-level volume.
+		if self.server_state.sink_muted {
+			frame.buf.fill(0.0);
+		} else if self.server_state.sink_volume.iter().any(|&v| v != 1.0) {
+			let vol = &self.server_state.sink_volume;
+			for (i, sample) in frame.buf.iter_mut().enumerate() {
+				*sample *= vol[i % vol.len()];
 			}
+		}
 
-			frame.capture_ts_ms = capture_ts;
-			let _ = self.frame_tx.send(frame);
+		frame.capture_ts_ms = capture_ts;
+		match self.frame_tx.try_send(frame) {
+			Ok(()) => {},
+			Err(crossbeam_channel::TrySendError::Full(frame)) => {
+				// Encoder is behind; stash the frame so we don't lose the allocation.
+				self.spare_frame = Some(frame);
+			},
+			Err(crossbeam_channel::TrySendError::Disconnected(_)) => return Ok(()),
 		}
 
 		Ok(())

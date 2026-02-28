@@ -400,7 +400,6 @@ impl RtspServer {
 		let audio_stream_context = AudioStreamContext {
 			packet_duration_ms: packet_duration,
 			qos: audio_qos_type != "0",
-			socket_path: None,
 			audio_config,
 		};
 
