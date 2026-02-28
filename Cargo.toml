@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 aes = "0.8.4"
 aes-gcm = "0.10.3"
-ash = { git = "https://github.com/ash-rs/ash", branch = "master" }
+ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649" }
 async-shutdown = "0.2.2"
 
 calloop = "0.14.4"
@@ -25,7 +25,7 @@ network-interface = "2.0.5"
 notify-rust = "4.12.0"
 open = "5.3.3"
 opus = "0.3.1"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", branch = "amd-support", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", branch = "av1-support-rebased", features = ["dmabuf"] }
 pkcs8 = "0.10.2"
 pulseaudio = "0.3.1"
 mio = { version = "1.1.1", features = ["net", "os-ext", "os-poll"] }

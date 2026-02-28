@@ -430,11 +430,11 @@ impl Webserver {
 			| (ServerCodecModeSupport::Hevc as u32)
 			| (ServerCodecModeSupport::HevcRext8444 as u32)
 			| (ServerCodecModeSupport::HevcMain10 as u32)
-			| (ServerCodecModeSupport::HevcRext10444 as u32);
-		// | (ServerCodecModeSupport::Av1Main8 as u32)
-		// | (ServerCodecModeSupport::Av1High8444 as u32)
-		// | (ServerCodecModeSupport::Av1Main10 as u32)
-		// | (ServerCodecModeSupport::Av1High10444 as u32);
+			| (ServerCodecModeSupport::HevcRext10444 as u32)
+			| (ServerCodecModeSupport::Av1Main8 as u32)
+			| (ServerCodecModeSupport::Av1High8444 as u32)
+			| (ServerCodecModeSupport::Av1Main10 as u32)
+			| (ServerCodecModeSupport::Av1High10444 as u32);
 		response += &format!(
 			"<ServerCodecModeSupport>{}</ServerCodecModeSupport>",
 			server_codec_mode_support
