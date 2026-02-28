@@ -840,7 +840,9 @@ fn sanitize_prop_str(b: &[u8]) -> Result<&str, Error> {
 	use std::ffi::CStr;
 
 	let s = CStr::from_bytes_with_nul(b).map_err(|e| -> Error { format!("invalid string: {e}").into() })?;
-	let s = s.to_str().map_err(|e| -> Error { format!("invalid utf-8: {e}").into() })?;
+	let s = s
+		.to_str()
+		.map_err(|e| -> Error { format!("invalid utf-8: {e}").into() })?;
 	Ok(s.trim_matches('"'))
 }
 
