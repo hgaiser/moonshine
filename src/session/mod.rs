@@ -52,6 +52,12 @@ pub struct SessionContext {
 
 	/// Whether to play audio on the host.
 	pub host_audio: bool,
+
+	/// Audio channel count (2, 6, or 8).
+	pub audio_channels: u8,
+
+	/// Audio channel mask (Windows SPEAKER_ bitmask).
+	pub audio_channel_mask: u32,
 }
 
 enum SessionCommand {

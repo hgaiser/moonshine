@@ -9,17 +9,127 @@ use crate::{
 };
 
 use self::encoder::AudioEncoder;
-use self::pulse_server::{PulseServer, CAPTURE_CHANNEL_COUNT, CAPTURE_SAMPLE_RATE};
+use self::pulse_server::{PulseServer, CAPTURE_SAMPLE_RATE};
 
 mod buffer;
 mod encoder;
 mod pulse_server;
 
+/// Opus multistream configuration for a specific channel layout.
+#[derive(Clone, Debug)]
+pub struct OpusStreamConfig {
+	pub channels: u8,
+	pub streams: u8,
+	pub coupled_streams: u8,
+	pub mapping: [u8; 8],
+	pub bitrate: u32,
+}
+
+/// Pre-defined Opus stream configurations matching Sunshine's behavior.
+pub const OPUS_STEREO: OpusStreamConfig = OpusStreamConfig {
+	channels: 2,
+	streams: 1,
+	coupled_streams: 1,
+	mapping: [0, 1, 0, 0, 0, 0, 0, 0],
+	bitrate: 96_000,
+};
+
+pub const OPUS_HIGH_STEREO: OpusStreamConfig = OpusStreamConfig {
+	channels: 2,
+	streams: 1,
+	coupled_streams: 1,
+	mapping: [0, 1, 0, 0, 0, 0, 0, 0],
+	bitrate: 512_000,
+};
+
+pub const OPUS_SURROUND51: OpusStreamConfig = OpusStreamConfig {
+	channels: 6,
+	streams: 4,
+	coupled_streams: 2,
+	mapping: [0, 1, 4, 5, 2, 3, 0, 0],
+	bitrate: 256_000,
+};
+
+pub const OPUS_HIGH_SURROUND51: OpusStreamConfig = OpusStreamConfig {
+	channels: 6,
+	streams: 6,
+	coupled_streams: 0,
+	mapping: [0, 1, 2, 3, 4, 5, 0, 0],
+	bitrate: 1_536_000,
+};
+
+pub const OPUS_SURROUND71: OpusStreamConfig = OpusStreamConfig {
+	channels: 8,
+	streams: 5,
+	coupled_streams: 3,
+	mapping: [0, 1, 4, 5, 6, 7, 2, 3],
+	bitrate: 450_000,
+};
+
+pub const OPUS_HIGH_SURROUND71: OpusStreamConfig = OpusStreamConfig {
+	channels: 8,
+	streams: 8,
+	coupled_streams: 0,
+	mapping: [0, 1, 2, 3, 4, 5, 6, 7],
+	bitrate: 2_048_000,
+};
+
+/// All standard configurations, ordered for RTSP DESCRIBE emission.
+pub const ALL_STREAM_CONFIGS: [&OpusStreamConfig; 6] = [
+	&OPUS_STEREO,
+	&OPUS_HIGH_STEREO,
+	&OPUS_SURROUND51,
+	&OPUS_HIGH_SURROUND51,
+	&OPUS_SURROUND71,
+	&OPUS_HIGH_SURROUND71,
+];
+
+/// Audio configuration negotiated between client and server.
+#[derive(Clone, Debug)]
+pub struct AudioConfig {
+	pub channels: u8,
+	pub channel_mask: u32,
+	pub high_quality: bool,
+	pub stream_config: OpusStreamConfig,
+}
+
+impl Default for AudioConfig {
+	fn default() -> Self {
+		Self {
+			channels: 2,
+			channel_mask: 0x3,
+			high_quality: true,
+			stream_config: OPUS_HIGH_STEREO,
+		}
+	}
+}
+
+impl AudioConfig {
+	/// Select the appropriate OpusStreamConfig based on channel count and quality.
+	pub fn from_channels(channels: u8, channel_mask: u32, high_quality: bool) -> Self {
+		let stream_config = match (channels, high_quality) {
+			(6, false) => OPUS_SURROUND51,
+			(6, true) => OPUS_HIGH_SURROUND51,
+			(8, false) => OPUS_SURROUND71,
+			(8, true) => OPUS_HIGH_SURROUND71,
+			(_, false) => OPUS_STEREO,
+			(_, true) => OPUS_HIGH_STEREO,
+		};
+		Self {
+			channels: stream_config.channels,
+			channel_mask,
+			high_quality,
+			stream_config,
+		}
+	}
+}
+
 #[derive(Clone, Default)]
 pub struct AudioStreamContext {
-	pub _packet_duration: u32,
+	pub packet_duration_ms: u32,
 	pub qos: bool,
 	pub socket_path: Option<PathBuf>,
+	pub audio_config: AudioConfig,
 }
 
 enum AudioStreamCommand {
@@ -63,6 +173,8 @@ impl AudioStream {
 		let inner = AudioStreamInner {
 			encoder: None,
 			socket_path: context.socket_path,
+			packet_duration_ms: context.packet_duration_ms,
+			audio_config: context.audio_config,
 			pulse_server_close_tx: None,
 			_pulse_server_waker: None,
 		};
@@ -93,6 +205,8 @@ impl AudioStream {
 struct AudioStreamInner {
 	encoder: Option<AudioEncoder>,
 	socket_path: Option<PathBuf>,
+	packet_duration_ms: u32,
+	audio_config: AudioConfig,
 	pulse_server_close_tx: Option<crossbeam_channel::Sender<()>>,
 	_pulse_server_waker: Option<mio::Waker>,
 }
@@ -132,14 +246,19 @@ impl AudioStreamInner {
 					let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::unbounded();
 
 					// Start PulseServer.
-					let (mut server, close_tx, waker): (PulseServer, _, _) =
-						match PulseServer::new(socket_path, frame_tx, frame_recycle_rx) {
-							Ok(result) => result,
-							Err(e) => {
-								tracing::error!("Failed to create PulseServer: {e}");
-								break;
-							},
-						};
+					let (mut server, close_tx, waker): (PulseServer, _, _) = match PulseServer::new(
+						socket_path,
+						self.audio_config.channels,
+						self.packet_duration_ms,
+						frame_tx,
+						frame_recycle_rx,
+					) {
+						Ok(result) => result,
+						Err(e) => {
+							tracing::error!("Failed to create PulseServer: {e}");
+							break;
+						},
+					};
 
 					let server_stop = stop_session_manager.clone();
 					std::thread::Builder::new()
@@ -158,7 +277,7 @@ impl AudioStreamInner {
 
 					let encoder = match AudioEncoder::new(
 						CAPTURE_SAMPLE_RATE,
-						CAPTURE_CHANNEL_COUNT as u8,
+						&self.audio_config.stream_config,
 						frame_rx,
 						frame_recycle_tx,
 						keys.clone(),

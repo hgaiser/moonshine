@@ -172,32 +172,35 @@ where
 
 		let input_channels = self.sample_spec.channels as usize;
 
-		if input_channels <= F::CHANNELS {
-			// Mono or stereo input — read one sample per input channel,
-			// duplicate the last channel if input has fewer channels.
-			let mut samples = [0.0f32; 2];
-			for s in samples.iter_mut().take(input_channels) {
-				*s = self.read_sample().unwrap();
-			}
-			// Duplicate last channel to fill remaining output channels.
-			let last = samples[input_channels - 1];
-			for s in samples.iter_mut().take(F::CHANNELS).skip(input_channels) {
-				*s = last;
-			}
-			return Some(F::from_fn(|ch| samples[ch]));
-		}
-
-		// Read all input channels, then downmix to stereo using ITU-R BS.775
-		// coefficients based on the channel map.
+		// Read all input samples for this frame.
 		let mut samples = [0.0f32; 32];
 		for s in samples.iter_mut().take(input_channels) {
 			*s = self.read_sample().unwrap();
 		}
 
-		let left = self.downmix.mix_left(&samples[..input_channels]);
-		let right = self.downmix.mix_right(&samples[..input_channels]);
+		if input_channels == F::CHANNELS {
+			// Passthrough — same channel count.
+			return Some(F::from_fn(|ch| samples[ch]));
+		}
 
-		Some(F::from_fn(|ch| if ch == 0 { left } else { right }))
+		if input_channels < F::CHANNELS {
+			// Upmix: mono → both FL/FR; otherwise zero-fill remaining channels.
+			if input_channels == 1 {
+				return Some(F::from_fn(|ch| if ch < 2 { samples[0] } else { 0.0 }));
+			}
+			return Some(F::from_fn(|ch| if ch < input_channels { samples[ch] } else { 0.0 }));
+		}
+
+		// Downmix: more input channels than output channels.
+		if F::CHANNELS == 2 {
+			// Stereo downmix using ITU-R BS.775 coefficients.
+			let left = self.downmix.mix_left(&samples[..input_channels]);
+			let right = self.downmix.mix_right(&samples[..input_channels]);
+			return Some(F::from_fn(|ch| if ch == 0 { left } else { right }));
+		}
+
+		// Surround output with even more input channels — take first F::CHANNELS.
+		Some(F::from_fn(|ch| samples[ch]))
 	}
 
 	fn read_sample(&mut self) -> Option<F::Sample> {

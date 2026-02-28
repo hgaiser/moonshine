@@ -7,7 +7,7 @@ use crate::{
 	session::{manager::SessionShutdownReason, stream::RtpHeader, SessionKeys},
 };
 
-use super::pulse_server::AudioFrame;
+use super::{pulse_server::AudioFrame, OpusStreamConfig};
 
 const NR_DATA_SHARDS: usize = 4;
 const NR_PARITY_SHARDS: usize = 2;
@@ -35,30 +35,27 @@ pub struct AudioEncoder {
 impl AudioEncoder {
 	pub fn new(
 		sample_rate: u32,
-		channels: u8,
+		stream_config: &OpusStreamConfig,
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		// TODO: Make this configurable.
-		let audio_bitrate = 512000;
-
 		tracing::debug!("Starting audio encoder.");
 		tracing::debug!(
-			"Creating audio encoder with sample rate {} and {} channels.",
+			"Creating audio encoder with sample rate {}, {} channels ({} streams, {} coupled).",
 			sample_rate,
-			channels
+			stream_config.channels,
+			stream_config.streams,
+			stream_config.coupled_streams,
 		);
 
-		let mut encoder = opus::Encoder::new(
+		let mut encoder = opus::MSEncoder::new(
 			sample_rate,
-			if channels > 1 {
-				opus::Channels::Stereo
-			} else {
-				opus::Channels::Mono
-			},
+			stream_config.streams,
+			stream_config.coupled_streams,
+			&stream_config.mapping[..stream_config.channels as usize],
 			opus::Application::LowDelay,
 		)
 		.map_err(|e| tracing::warn!("Failed to create audio encoder: {e}"))?;
@@ -68,7 +65,7 @@ impl AudioEncoder {
 			.set_vbr(false)
 			.map_err(|e| tracing::warn!("Failed to disable variable bitrate: {e}"))?;
 		encoder
-			.set_bitrate(opus::Bitrate::Bits(audio_bitrate))
+			.set_bitrate(opus::Bitrate::Bits(stream_config.bitrate as i32))
 			.map_err(|e| tracing::warn!("Failed to set audio bitrate: {e}"))?;
 
 		let fec_encoder = ReedSolomon::<galois_8::Field>::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
@@ -113,7 +110,7 @@ impl AudioEncoderInner {
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		mut fec_encoder: ReedSolomon<galois_8::Field>,
-		mut encoder: opus::Encoder,
+		mut encoder: opus::MSEncoder,
 		mut keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,

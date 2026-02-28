@@ -1,5 +1,5 @@
 pub use self::{
-	audio::{AudioStream, AudioStreamContext},
+	audio::{AudioConfig, AudioStream, AudioStreamContext, ALL_STREAM_CONFIGS},
 	control::ControlStream,
 	video::{VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStream, VideoStreamContext},
 };

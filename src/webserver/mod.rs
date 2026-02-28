@@ -646,6 +646,13 @@ impl Webserver {
 			None => false,
 		};
 
+		let surround_audio_info: u32 = params
+			.remove("surroundAudioInfo")
+			.and_then(|s| s.parse().ok())
+			.unwrap_or(196610); // Default: stereo (0x30002)
+		let audio_channels = (surround_audio_info & 0xFFFF) as u8;
+		let audio_channel_mask = surround_audio_info >> 16;
+
 		let application = match self.config.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
 			None => {
@@ -667,6 +674,8 @@ impl Webserver {
 					remote_input_key_id,
 				},
 				host_audio,
+				audio_channels,
+				audio_channel_mask,
 			})
 			.await;
 
