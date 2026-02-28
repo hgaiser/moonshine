@@ -230,7 +230,7 @@ async fn client_challenge(
 		Ok(challenge) => challenge,
 		Err(e) => {
 			let message = e.to_string();
-			tracing::error!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		},
 	};
@@ -269,7 +269,7 @@ async fn server_challenge_response(
 				"Expected 'serverchallengeresp' in server challenge response request, got {:?}.",
 				params.keys()
 			);
-			tracing::error!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		},
 	};
@@ -277,7 +277,7 @@ async fn server_challenge_response(
 		Ok(server_challenge_response) => server_challenge_response,
 		Err(e) => {
 			let message = e.to_string();
-			tracing::error!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		},
 	};
@@ -361,7 +361,7 @@ async fn client_pairing_secret(
 		Ok(client_pairing_secret) => client_pairing_secret,
 		Err(e) => {
 			let message = e.to_string();
-			tracing::error!("{message}");
+			tracing::warn!("{message}");
 			return bad_request(message);
 		},
 	};

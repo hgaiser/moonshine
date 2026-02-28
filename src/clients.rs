@@ -172,12 +172,12 @@ impl ClientManager {
 				response: response_tx,
 			}))
 			.await
-			.map_err(|e| tracing::error!("Failed to check paired status: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to check paired status: {e}"))?;
 
 		response_rx
 			.await
-			.map_err(|e| tracing::error!("Failed to receive IsPaired response: {e}"))?
-			.map_err(|e| tracing::error!("Failed to check paired status: {e}"))
+			.map_err(|e| tracing::warn!("Failed to receive IsPaired response: {e}"))?
+			.map_err(|e| tracing::warn!("Failed to check paired status: {e}"))
 	}
 
 	pub async fn start_pairing(&self, pending_client: PendingClient) -> Result<(), ()> {
@@ -186,7 +186,7 @@ impl ClientManager {
 				pending_client,
 			}))
 			.await
-			.map_err(|e| tracing::error!("Failed to start pairing: {e}"))
+			.map_err(|e| tracing::warn!("Failed to start pairing: {e}"))
 	}
 
 	pub async fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
@@ -198,13 +198,11 @@ impl ClientManager {
 				response: response_tx,
 			}))
 			.await
-			.map_err(|e| tracing::error!("Failed to send pin to client manager: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to send pin to client manager: {e}"))?;
 
 		response_rx
 			.await
-			.map_err(|e| {
-				tracing::error!("Failed to wait for response to RegisterPin command from client manager: {e}")
-			})?
+			.map_err(|e| tracing::warn!("Failed to wait for response to RegisterPin command from client manager: {e}"))?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
 
@@ -216,11 +214,11 @@ impl ClientManager {
 				response: response_tx,
 			}))
 			.await
-			.map_err(|e| tracing::error!("Failed to send AddClient command to client manager: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to send AddClient command to client manager: {e}"))?;
 
 		response_rx
 			.await
-			.map_err(|e| tracing::error!("Failed to wait for response to AddClient command from client manager: {e}"))?
+			.map_err(|e| tracing::warn!("Failed to wait for response to AddClient command from client manager: {e}"))?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
 
@@ -233,12 +231,12 @@ impl ClientManager {
 				response: response_tx,
 			}))
 			.await
-			.map_err(|e| tracing::error!("Failed to send client challenge to client manager: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to send client challenge to client manager: {e}"))?;
 
 		response_rx
 			.await
 			.map_err(|e| {
-				tracing::error!("Failed to wait for response to client challenge command from client manager: {e}")
+				tracing::warn!("Failed to wait for response to client challenge command from client manager: {e}")
 			})?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
@@ -254,12 +252,12 @@ impl ClientManager {
 				},
 			))
 			.await
-			.map_err(|e| tracing::error!("Failed to send server challenge response to client manager: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to send server challenge response to client manager: {e}"))?;
 
 		response_rx
 			.await
 			.map_err(|e| {
-				tracing::error!(
+				tracing::warn!(
 					"Failed to wait for response to server challenge response command from client manager: {e}"
 				)
 			})?
@@ -278,13 +276,13 @@ impl ClientManager {
 			))
 			.await
 			.map_err(|e| {
-				tracing::error!("Failed to send check client pairing secret response to client manager: {e}")
+				tracing::warn!("Failed to send check client pairing secret response to client manager: {e}")
 			})?;
 
 		response_rx
 			.await
 			.map_err(|e| {
-				tracing::error!(
+				tracing::warn!(
 					"Failed to wait for response to check client pairing secret command from client manager: {e}"
 				)
 			})?
@@ -331,7 +329,7 @@ impl ClientManagerInner {
 							let key = match create_key(&client.salt, &command.pin) {
 								Ok(key) => key,
 								Err(e) => {
-									tracing::error!("Failed to create client key: {e}");
+									tracing::warn!("Failed to create client key: {e}");
 									command
 										.response
 										.send(Err(e))
@@ -370,7 +368,7 @@ impl ClientManagerInner {
 										.ok();
 								},
 								Err(e) => {
-									tracing::error!("Failed to respond to client challenge: {e}");
+									tracing::warn!("Failed to respond to client challenge: {e}");
 									command
 										.response
 										.send(Err(e))
@@ -404,7 +402,7 @@ impl ClientManagerInner {
 										.ok();
 								},
 								Err(e) => {
-									tracing::error!("Failed to respond to server challenge: {e}");
+									tracing::warn!("Failed to respond to server challenge: {e}");
 									command
 										.response
 										.send(Err(e))
@@ -438,7 +436,7 @@ impl ClientManagerInner {
 										.ok();
 								},
 								Err(e) => {
-									tracing::error!("Failed to check client pairing secret: {e}");
+									tracing::warn!("Failed to check client pairing secret: {e}");
 									command
 										.response
 										.send(Err(e))

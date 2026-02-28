@@ -799,7 +799,7 @@ fn not_found() -> Response<Full<Bytes>> {
 
 fn get_mac_address(address: IpAddr) -> Result<Option<String>, ()> {
 	let interfaces = network_interface::NetworkInterface::show()
-		.map_err(|e| tracing::error!("Failed to retrieve network interfaces: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to retrieve network interfaces: {e}"))?;
 
 	for interface in interfaces {
 		for interface_address in interface.addr {

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::os::fd::RawFd;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
@@ -95,7 +96,7 @@ impl<'a> ControlMessage<'a> {
 
 		let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
 		if length as usize != buffer.len() - 4 {
-			tracing::info!(
+			tracing::warn!(
 				"Received incorrect packet length: expecting {length} bytes, but buffer says it should be {} bytes.",
 				buffer.len() - 4
 			);
@@ -105,13 +106,13 @@ impl<'a> ControlMessage<'a> {
 		match u16::from_le_bytes(buffer[..2].try_into().unwrap()).try_into()? {
 			ControlMessageType::Encrypted => {
 				if buffer.len() < MINIMUM_ENCRYPTED_LENGTH {
-					tracing::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
+					tracing::warn!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
 					return Err(());
 				}
 
 				let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
 				if (length as usize) < MINIMUM_ENCRYPTED_LENGTH {
-					tracing::info!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
+					tracing::warn!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
 					return Err(());
 				}
 
@@ -134,7 +135,7 @@ impl<'a> ControlMessage<'a> {
 				// Length of the input event, excluding the length itself.
 				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 				if length as usize != buffer.len() - 8 {
-					tracing::info!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8);
+					tracing::warn!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8);
 					return Err(());
 				}
 
@@ -210,6 +211,70 @@ enum ControlStreamCommand {
 	UpdateKeys(SessionKeys),
 }
 
+/// Set `FD_CLOEXEC` on a UDP socket bound to the given address.
+///
+/// The enet C library creates sockets without `SOCK_CLOEXEC`, which means child
+/// processes (e.g. XWayland, launched applications) inherit the file descriptor.
+/// If those child processes outlive the session, the port remains in use and the
+/// next session fails to bind to it.
+fn set_cloexec_on_bound_udp_socket(addr: &SocketAddr) {
+	let target_port = addr.port();
+	let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+		tracing::warn!("Failed to read /proc/self/fd to set CLOEXEC on enet socket.");
+		return;
+	};
+
+	for entry in entries.flatten() {
+		let Ok(fd_str) = entry.file_name().into_string() else {
+			continue;
+		};
+		let Ok(fd) = fd_str.parse::<RawFd>() else {
+			continue;
+		};
+
+		// Safety: we only call POSIX functions to query and set fd flags.
+		unsafe {
+			let mut sock_addr: libc::sockaddr_in = std::mem::zeroed();
+			let mut addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
+
+			if libc::getsockname(fd, &mut sock_addr as *mut _ as *mut libc::sockaddr, &mut addr_len) != 0 {
+				continue;
+			}
+			if sock_addr.sin_family != libc::AF_INET as libc::sa_family_t {
+				continue;
+			}
+			if u16::from_be(sock_addr.sin_port) != target_port {
+				continue;
+			}
+
+			// Verify that this is a UDP socket.
+			let mut sock_type: libc::c_int = 0;
+			let mut opt_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+			if libc::getsockopt(
+				fd,
+				libc::SOL_SOCKET,
+				libc::SO_TYPE,
+				&mut sock_type as *mut _ as *mut libc::c_void,
+				&mut opt_len,
+			) != 0 || sock_type != libc::SOCK_DGRAM
+			{
+				continue;
+			}
+
+			let flags = libc::fcntl(fd, libc::F_GETFD);
+			if flags == -1 {
+				tracing::warn!("Failed to get fd flags for enet socket (fd={fd}).");
+				continue;
+			}
+			if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
+				tracing::warn!("Failed to set FD_CLOEXEC on enet socket (fd={fd}).");
+			} else {
+				tracing::debug!("Set FD_CLOEXEC on enet socket (fd={fd}).");
+			}
+		}
+	}
+}
+
 pub struct ControlStream {
 	command_tx: mpsc::Sender<ControlStreamCommand>,
 }
@@ -223,14 +288,15 @@ impl ControlStream {
 		context: SessionContext,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		enet: Arc<Enet>,
+		input_tx: calloop::channel::Sender<crate::session::compositor::input::CompositorInputEvent>,
 	) -> Result<Self, ()> {
-		let input_handler = InputHandler::new(stop_session_manager.clone())?;
+		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone())?;
 
 		let socket_address = SocketAddr::new(
 			config
 				.address
 				.parse()
-				.map_err(|e| tracing::error!("Failed to parse address ({}): {e}", config.address))?,
+				.map_err(|e| tracing::warn!("Failed to parse address ({}): {e}", config.address))?,
 			config.stream.control.port,
 		);
 
@@ -246,6 +312,7 @@ impl ControlStream {
 					return;
 				},
 			};
+
 			let host = match enet.create_host::<()>(
 				Some(&local_addr),
 				1,
@@ -259,6 +326,9 @@ impl ControlStream {
 					return;
 				},
 			};
+
+			// Prevent the enet socket fd from being inherited by child processes.
+			set_cloexec_on_bound_udp_socket(&socket_address);
 
 			tokio::runtime::Handle::current().block_on(inner.run(
 				config,
@@ -280,7 +350,7 @@ impl ControlStream {
 		self.command_tx
 			.send(ControlStreamCommand::UpdateKeys(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -390,7 +460,7 @@ impl ControlStreamInner {
 						decrypted = match decrypted_result {
 							Ok(decrypted) => decrypted,
 							Err(e) => {
-								tracing::error!("Failed to decrypt control message: {:?}", e);
+								tracing::warn!("Failed to decrypt control message: {:?}", e);
 								continue;
 							},
 						};
@@ -438,5 +508,11 @@ impl ControlStreamInner {
 		}
 
 		tracing::debug!("Control stream stopped.");
+
+		// Explicitly drop the ENet host before the delay shutdown token
+		// to ensure the socket is released before wait_shutdown_complete
+		// returns. Without this, the next session's control stream may
+		// fail to bind to the same port.
+		drop(host);
 	}
 }

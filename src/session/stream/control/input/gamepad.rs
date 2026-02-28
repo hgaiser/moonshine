@@ -314,11 +314,11 @@ impl Gamepad {
 
 		let mut gamepad = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => Joypad::XboxOne(
-				XboxOneJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
+				XboxOneJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
 			),
 			GamepadKind::PlayStation => {
 				let mut gamepad =
-					PS5Joypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?;
+					PS5Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
 
 				gamepad.set_on_led({
 					let feedback_tx = feedback_tx.clone();
@@ -381,7 +381,7 @@ impl Gamepad {
 				Joypad::PS5(gamepad)
 			},
 			GamepadKind::Nintendo => Joypad::Switch(
-				SwitchJoypad::new(&definition).map_err(|e| tracing::error!("Failed to create gamepad: {e}"))?,
+				SwitchJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
 			),
 		};
 

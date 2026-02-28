@@ -28,6 +28,9 @@ pub struct Config {
 	#[serde(skip_serializing_if = "Vec::is_empty", default)]
 	pub application_scanners: Vec<ApplicationScannerConfig>,
 
+	/// Path to the DRM render node to use (e.g. /dev/dri/renderD128).
+	pub gpu: Option<String>,
+
 	/// Time in seconds since last ping after which the stream closes.
 	pub stream_timeout: u64,
 }
@@ -36,9 +39,9 @@ impl Config {
 	#[allow(clippy::result_unit_err)]
 	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config, ()> {
 		let config =
-			std::fs::read_to_string(file).map_err(|e| tracing::error!("Failed to open configuration file: {e}"))?;
+			std::fs::read_to_string(file).map_err(|e| tracing::warn!("Failed to open configuration file: {e}"))?;
 		let config: Config =
-			toml::from_str(&config).map_err(|e| tracing::error!("Failed to parse configuration file: {e}"))?;
+			toml::from_str(&config).map_err(|e| tracing::warn!("Failed to parse configuration file: {e}"))?;
 
 		Ok(config)
 	}
@@ -55,7 +58,6 @@ impl Default for Config {
 				title: "Steam".to_string(),
 				command: vec!["/usr/bin/steam".to_string(), "steam://open/bigpicture".to_string()],
 				boxart: None,
-				enable_steam_integration: true,
 			}],
 			application_scanners: vec![ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
 				library: "$HOME/.local/share/Steam".into(),
@@ -65,6 +67,7 @@ impl Default for Config {
 					"steam://rungameid/{game_id}".to_string(),
 				],
 			})],
+			gpu: None,
 			stream_timeout: 60,
 		}
 	}
@@ -106,10 +109,6 @@ pub struct ApplicationConfig {
 
 	/// The command to run.
 	pub command: Vec<String>,
-
-	/// Enable Steam integration.
-	#[serde(default)]
-	pub enable_steam_integration: bool,
 }
 
 impl ApplicationConfig {

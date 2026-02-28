@@ -1,10 +1,16 @@
+use std::cell::RefCell;
+use std::ops::Deref;
 use std::process::Command;
 use std::process::{Child, Stdio};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use enet::Enet;
 use manager::SessionShutdownReason;
+use pulse::context::{Context, FlagSet};
+use pulse::mainloop::standard::{IterateResult, Mainloop};
+use pulse::proplist::Proplist;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -12,9 +18,12 @@ use crate::{
 	session::stream::{AudioStream, ControlStream, VideoStream},
 };
 
+use self::compositor::frame::ExportedFrame;
+use self::compositor::input::CompositorInputEvent;
 use self::stream::{AudioStreamContext, VideoStreamContext};
 pub use manager::SessionManager;
 
+pub mod compositor;
 pub mod manager;
 pub mod stream;
 
@@ -29,6 +38,7 @@ pub struct SessionKeys {
 
 /// Launch a session for a client.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct SessionContext {
 	/// Application to launch.
 	pub application: ApplicationConfig,
@@ -62,74 +72,227 @@ pub struct Session {
 	sink_name: Option<String>,
 }
 
-fn create_audio_sink(name: &str) -> Result<String, ()> {
-	let output = Command::new("pactl")
-		.arg("load-module")
-		.arg("module-null-sink")
-		.arg(format!("sink_name={}", name))
-		.arg(format!("sink_properties=device.description={}", name))
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
+type PulseContext = (Rc<RefCell<Mainloop>>, Rc<RefCell<Context>>);
 
-	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+fn create_pulse_context() -> Result<PulseContext, ()> {
+	let mainloop = Rc::new(RefCell::new(
+		Mainloop::new().ok_or_else(|| tracing::warn!("Failed to create PulseAudio mainloop."))?,
+	));
+
+	let mut proplist = Proplist::new().ok_or_else(|| tracing::warn!("Failed to create PulseAudio proplist."))?;
+	proplist
+		.set_str(pulse::proplist::properties::APPLICATION_NAME, "Moonshine")
+		.map_err(|()| tracing::warn!("Failed to set PulseAudio application name."))?;
+
+	let context = Rc::new(RefCell::new(
+		Context::new_with_proplist(mainloop.borrow().deref(), "Moonshine context", &proplist)
+			.ok_or_else(|| tracing::warn!("Failed to create PulseAudio context."))?,
+	));
+
+	context
+		.borrow_mut()
+		.connect(None, FlagSet::NOFLAGS, None)
+		.map_err(|e| tracing::warn!("Failed to connect to PulseAudio server: {e}"))?;
+
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match context.borrow().get_state() {
+			pulse::context::State::Unconnected
+			| pulse::context::State::Connecting
+			| pulse::context::State::Authorizing
+			| pulse::context::State::SettingName => {},
+			pulse::context::State::Failed | pulse::context::State::Terminated => {
+				tracing::warn!("PulseAudio context failed.");
+				return Err(());
+			},
+			pulse::context::State::Ready => break,
+		}
+	}
+
+	Ok((mainloop, context))
+}
+
+fn wait_for_operation(
+	mainloop: &Rc<RefCell<Mainloop>>,
+	operation: pulse::operation::Operation<dyn FnMut(bool)>,
+) -> Result<(), ()> {
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed during operation.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match operation.get_state() {
+			pulse::operation::State::Running => {},
+			pulse::operation::State::Cancelled => {
+				tracing::warn!("PulseAudio operation was cancelled.");
+				return Err(());
+			},
+			pulse::operation::State::Done => return Ok(()),
+		}
+	}
+}
+
+fn create_audio_sink(name: &str) -> Result<u32, ()> {
+	let (mainloop, context) = create_pulse_context()?;
+	let argument = format!("sink_name={name} sink_properties=device.description={name}");
+	let result: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+
+	let operation = {
+		let result = result.clone();
+		context
+			.borrow_mut()
+			.introspect()
+			.load_module("module-null-sink", &argument, move |module_index| {
+				*result.borrow_mut() = Some(module_index);
+			})
+	};
+
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed while loading module-null-sink.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match operation.get_state() {
+			pulse::operation::State::Running => {},
+			pulse::operation::State::Cancelled => {
+				tracing::warn!("load_module module-null-sink operation was cancelled.");
+				return Err(());
+			},
+			pulse::operation::State::Done => break,
+		}
+	}
+
+	let module_id = result
+		.take()
+		.ok_or_else(|| tracing::warn!("Failed to get module index for module-null-sink."))?;
+
+	if module_id == u32::MAX {
+		tracing::warn!("Failed to load module-null-sink (invalid index returned).");
 		return Err(());
 	}
 
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	Ok(stdout.trim().to_string())
+	tracing::debug!(module_id, "Loaded module-null-sink");
+	Ok(module_id)
 }
 
-fn unload_audio_sink(module_id: &str) {
-	let _ = Command::new("pactl").arg("unload-module").arg(module_id).output();
+fn unload_audio_sink(module_id: u32) {
+	let Ok((mainloop, context)) = create_pulse_context() else {
+		return;
+	};
+	let operation = context
+		.borrow_mut()
+		.introspect()
+		.unload_module(module_id, |_success| {});
+	let _ = wait_for_operation(&mainloop, operation);
 }
 
-fn create_audio_loopback(source: &str, sink: &str) -> Result<String, ()> {
-	let output = Command::new("pactl")
-		.arg("load-module")
-		.arg("module-loopback")
-		.arg(format!("source={}.monitor", source))
-		.arg(format!("sink={}", sink))
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
+fn create_audio_loopback(source: &str, sink: &str) -> Result<u32, ()> {
+	let (mainloop, context) = create_pulse_context()?;
+	let argument = format!("source={source}.monitor sink={sink}");
+	let result: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
 
-	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+	let operation = {
+		let result = result.clone();
+		context
+			.borrow_mut()
+			.introspect()
+			.load_module("module-loopback", &argument, move |module_index| {
+				*result.borrow_mut() = Some(module_index);
+			})
+	};
+
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed while loading module-loopback.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match operation.get_state() {
+			pulse::operation::State::Running => {},
+			pulse::operation::State::Cancelled => {
+				tracing::warn!("load_module module-loopback operation was cancelled.");
+				return Err(());
+			},
+			pulse::operation::State::Done => break,
+		}
+	}
+
+	let module_id = result
+		.take()
+		.ok_or_else(|| tracing::warn!("Failed to get module index for module-loopback."))?;
+
+	if module_id == u32::MAX {
+		tracing::warn!("Failed to load module-loopback (invalid index returned).");
 		return Err(());
 	}
 
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	Ok(stdout.trim().to_string())
+	tracing::debug!(module_id, "Loaded module-loopback");
+	Ok(module_id)
 }
 
 fn get_default_sink() -> Result<String, ()> {
-	let output = Command::new("pactl")
-		.arg("get-default-sink")
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
+	let (mainloop, context) = create_pulse_context()?;
+	let result = Rc::new(RefCell::new(None));
 
-	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
-		return Err(());
+	let operation = {
+		let result = result.clone();
+		context.borrow().introspect().get_server_info(move |info| {
+			if let Some(name) = info.default_sink_name.as_ref() {
+				*result.borrow_mut() = Some(name.to_string());
+			}
+		})
+	};
+
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed while getting default sink.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match operation.get_state() {
+			pulse::operation::State::Running => {},
+			pulse::operation::State::Cancelled => {
+				tracing::warn!("get_server_info operation was cancelled.");
+				return Err(());
+			},
+			pulse::operation::State::Done => break,
+		}
 	}
 
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	Ok(stdout.trim().to_string())
+	result
+		.take()
+		.ok_or_else(|| tracing::warn!("Failed to get default sink name."))
 }
 
 fn set_default_sink(name: &str) -> Result<(), ()> {
-	let output = Command::new("pactl")
-		.arg("set-default-sink")
-		.arg(name)
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
-
-	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
-		return Err(());
-	}
-
-	Ok(())
+	let (mainloop, context) = create_pulse_context()?;
+	let operation = context.borrow_mut().set_default_sink(name, |success| {
+		if !success {
+			tracing::warn!("set_default_sink callback reported failure.");
+		}
+	});
+	wait_for_operation(&mainloop, operation)
 }
 
 #[allow(clippy::result_unit_err)]
@@ -140,7 +303,7 @@ impl Session {
 		stop_session_signal: ShutdownManager<SessionShutdownReason>,
 		enet: Arc<Enet>,
 	) -> Result<Self, ()> {
-		let default_sink = get_default_sink().ok();
+		let default_sink = get_default_sink().ok().filter(|s| s != "auto_null");
 		let sink_name = "moonshine-sink".to_string();
 		let module_id = create_audio_sink(&sink_name)?;
 
@@ -159,7 +322,33 @@ impl Session {
 			None
 		};
 
-		let gamescope_process = start_gamescope(&context, &sink_name)?;
+		// Start the headless compositor.
+		let compositor_config = compositor::CompositorConfig {
+			width: context.resolution.0,
+			height: context.resolution.1,
+			refresh_rate: context._refresh_rate,
+			gpu: config.gpu.clone(),
+		};
+		let (frame_rx, input_tx, xdisplay_rx) =
+			compositor::start_compositor(compositor_config, stop_session_signal.clone())
+				.map_err(|e| tracing::warn!("Failed to start compositor: {e}"))?;
+
+		// Launch the application in a background thread that waits for
+		// XWayland to become ready. We must not block Session::new()
+		// because the session manager processes commands sequentially
+		// and stalling it would prevent the control stream from being
+		// established on time.
+		let app_context = context.clone();
+		let app_sink = sink_name.clone();
+		std::thread::Builder::new()
+			.name("app-launcher".to_string())
+			.spawn(move || -> Result<Child, ()> {
+				let xdisplay = xdisplay_rx
+					.recv_timeout(std::time::Duration::from_secs(5))
+					.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
+				launch_application(&app_context, &app_sink, xdisplay)
+			})
+			.map_err(|e| tracing::warn!("Failed to spawn app launcher thread: {e}"))?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner {
@@ -167,7 +356,8 @@ impl Session {
 			video_stream: None,
 			audio_stream: None,
 			control_stream: None,
-			gamescope_process: Some(gamescope_process),
+			frame_rx: Some(frame_rx),
+			input_tx: Some(input_tx),
 			audio_sink_module_id: Some(module_id),
 			audio_loopback_module_id: loopback_module_id,
 			enet,
@@ -192,7 +382,7 @@ impl Session {
 		self.command_tx
 			.send(SessionCommand::Start(video_stream_context, audio_stream_context))
 			.await
-			.map_err(|e| tracing::error!("Failed to send Start command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send Start command: {e}"))
 	}
 
 	pub fn context(&self) -> &SessionContext {
@@ -207,7 +397,7 @@ impl Session {
 		self.command_tx
 			.send(SessionCommand::UpdateKeys(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -216,9 +406,10 @@ struct SessionInner {
 	video_stream: Option<VideoStream>,
 	audio_stream: Option<AudioStream>,
 	control_stream: Option<ControlStream>,
-	gamescope_process: Option<Child>,
-	audio_sink_module_id: Option<String>,
-	audio_loopback_module_id: Option<String>,
+	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
+	input_tx: Option<calloop::channel::Sender<CompositorInputEvent>>,
+	audio_sink_module_id: Option<u32>,
+	audio_loopback_module_id: Option<u32>,
 	enet: Arc<Enet>,
 }
 
@@ -236,13 +427,18 @@ impl SessionInner {
 		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				SessionCommand::Start(video_stream_context, audio_stream_context) => {
-					let video_stream =
-						match VideoStream::new(self.config.clone(), video_stream_context, stop_session_manager.clone())
-							.await
-						{
-							Ok(video_stream) => video_stream,
-							Err(()) => continue,
-						};
+					let frame_rx = self.frame_rx.take();
+					let video_stream = match VideoStream::new(
+						self.config.clone(),
+						video_stream_context,
+						frame_rx,
+						stop_session_manager.clone(),
+					)
+					.await
+					{
+						Ok(video_stream) => video_stream,
+						Err(()) => continue,
+					};
 					let audio_stream =
 						match AudioStream::new(self.config.clone(), audio_stream_context, stop_session_manager.clone())
 							.await
@@ -250,6 +446,7 @@ impl SessionInner {
 							Ok(audio_stream) => audio_stream,
 							Err(()) => continue,
 						};
+					let input_tx = self.input_tx.take().expect("Input sender already consumed");
 					let control_stream = match ControlStream::new(
 						self.config.clone(),
 						video_stream.clone(),
@@ -257,6 +454,7 @@ impl SessionInner {
 						session_context.clone(),
 						stop_session_manager.clone(),
 						self.enet.clone(),
+						input_tx,
 					) {
 						Ok(control_stream) => control_stream,
 						Err(()) => {
@@ -287,69 +485,76 @@ impl SessionInner {
 			}
 		}
 
-		if let Some(mut gamescope_process) = self.gamescope_process {
-			let _ = gamescope_process.kill();
-		}
+		// Stop the systemd scope to kill the application and all of its
+		// descendants. The scope was created with TimeoutStopSec=5, so
+		// this blocks at most 5 seconds before systemd sends SIGKILL.
+		let _ = Command::new("systemctl")
+			.args(["--user", "stop", "moonshine-session.scope"])
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status();
 
 		if let Some(module_id) = self.audio_loopback_module_id {
-			unload_audio_sink(&module_id);
+			unload_audio_sink(module_id);
 		}
 
 		if let Some(module_id) = self.audio_sink_module_id {
-			unload_audio_sink(&module_id);
+			unload_audio_sink(module_id);
 		}
 
 		tracing::debug!("Session stopped.");
 	}
 }
 
-fn start_gamescope(context: &SessionContext, sink_name: &str) -> Result<Child, ()> {
-	let width = context.resolution.0.to_string();
-	let height = context.resolution.1.to_string();
-	let refresh_rate = context._refresh_rate.to_string();
+/// Launch the application as a child process.
+///
+/// The compositor has already set `WAYLAND_DISPLAY` in the process
+/// environment, so the child inherits it and connects to our
+/// headless compositor automatically.
+fn launch_application(context: &SessionContext, sink_name: &str, xdisplay: u32) -> Result<Child, ()> {
+	let Some(program) = context.application.command.first() else {
+		tracing::warn!("Application command is empty.");
+		return Err(());
+	};
+	let args = &context.application.command[1..];
 
-	let mut command = vec![
-		"--backend".to_string(),
-		"headless".to_string(),
-		"-w".to_string(),
-		width.clone(),
-		"-h".to_string(),
-		height.clone(),
-		"-W".to_string(),
-		width,
-		"-H".to_string(),
-		height,
-		"-r".to_string(),
-		refresh_rate,
-		"--immediate-flips".to_string(),
-		"--force-grab-cursor".to_string(),
-	];
-
-	if context.application.enable_steam_integration {
-		command.push("--steam".to_string());
-	}
-
-	command.push("--".to_string());
-	command.extend(context.application.command.clone());
-
-	tracing::debug!("Starting gamescope with command: {:?}", command);
+	tracing::info!(program, ?args, "Launching application");
 
 	let log_dir = std::env::temp_dir().join("moonshine");
-	std::fs::create_dir_all(&log_dir).map_err(|e| tracing::error!("Failed to create log directory: {e}"))?;
-	let log_path = log_dir.join(format!("gamescope-{}.log", context.application_id));
-	tracing::debug!("Gamescope log path: {}", log_path.display());
-	let log_file = std::fs::File::create(&log_path).map_err(|e| tracing::error!("Failed to create log file: {e}"))?;
+	std::fs::create_dir_all(&log_dir).map_err(|e| tracing::warn!("Failed to create log directory: {e}"))?;
+	let log_path = log_dir.join(format!("app-{}.log", context.application_id));
+	tracing::debug!("Application log path: {}", log_path.display());
 
-	Command::new("gamescope")
-		.args(command)
+	let log_file = std::fs::File::create(&log_path).map_err(|e| tracing::warn!("Failed to create log file: {e}"))?;
+
+	// Stop any leftover scope from a previous session before starting a new one.
+	let _ = Command::new("systemctl")
+		.args(["--user", "stop", "moonshine-session.scope"])
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status();
+
+	Command::new("systemd-run")
+		.args([
+			"--user",
+			"--scope",
+			"--collect",
+			"--unit",
+			"moonshine-session",
+			"--property=TimeoutStopSec=5",
+			"--",
+		])
+		.arg(program)
+		.args(args)
 		.env("PULSE_SINK", sink_name)
+		.env("DISPLAY", format!(":{xdisplay}"))
 		.stdout(
 			log_file
 				.try_clone()
-				.map_err(|e| tracing::error!("Failed to clone log file handle: {e}"))?,
+				.map_err(|e| tracing::warn!("Failed to clone log file handle: {e}"))?,
 		)
 		.stderr(log_file)
 		.stdin(Stdio::null())
 		.spawn()
-		.map_err(|e| tracing::error!("Failed to start gamescope: {e}"))
+		.map_err(|e| tracing::warn!("Failed to launch application: {e}"))
 }

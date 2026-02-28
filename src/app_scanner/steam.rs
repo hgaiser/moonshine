@@ -15,7 +15,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 		.to_string_lossy()
 		.to_string();
 	let library_path =
-		shellexpand::full(&library_path).map_err(|e| tracing::error!("Failed to expand {library_path:?}: {e}"))?;
+		shellexpand::full(&library_path).map_err(|e| tracing::warn!("Failed to expand {library_path:?}: {e}"))?;
 	let library =
 		std::fs::read_to_string(library_path.as_ref()).map_err(|e| tracing::warn!("Failed to open library: {e}"))?;
 
@@ -31,10 +31,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 
 	let mut applications = Vec::new();
 	for line in library.lines().skip(2) {
-		let mut application = ApplicationConfig {
-			enable_steam_integration: true,
-			..Default::default()
-		};
+		let mut application = ApplicationConfig { ..Default::default() };
 
 		if line.trim().is_empty() {
 			continue;
@@ -84,7 +81,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 				tracing::warn!("No boxart for game '{}' at '{}.", application.title, boxart.display());
 			}
 		} else {
-			tracing::info!(
+			tracing::debug!(
 				"No boxart found for game '{}' in directory '{}'.",
 				application.title,
 				game_dir.display()

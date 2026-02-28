@@ -24,7 +24,7 @@ impl TlsAcceptor {
 			.acceptor
 			.accept(connection)
 			.await
-			.map_err(|e| tracing::error!("TLS handshake failed: {}", e))?;
+			.map_err(|e| tracing::warn!("TLS handshake failed: {}", e))?;
 		Ok(stream)
 	}
 }
