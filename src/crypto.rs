@@ -1,4 +1,4 @@
-use aes::cipher::{BlockEncryptMut, KeyIvInit};
+use aes::cipher::{block_padding, BlockEncryptMut, KeyIvInit};
 use aes_gcm::{
 	aead::{Aead, KeyInit},
 	Aes128Gcm, Key, Nonce,

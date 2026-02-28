@@ -8,7 +8,7 @@ aes = "0.8.4"
 aes-gcm = "0.10.3"
 ash = { git = "https://github.com/ash-rs/ash", branch = "master" }
 async-shutdown = "0.2.2"
-block-padding = "0.3.3"
+
 calloop = "0.14.4"
 cbc = "0.1.2"
 clap = { version = "4.5.60", features = ["derive"] }
@@ -35,7 +35,7 @@ dasp = { version = "0.11.0", features = ["signal", "interpolate", "interpolate-s
 bytes = "1.11.1"
 byteorder = "1.5.0"
 rand = "0.8.5"
-rcgen = "0.13.2"
+rcgen = "0.14.7"
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
 ring = "0.17.14"
 rsa = "0.9.10"
@@ -47,10 +47,10 @@ serde = "1.0.228"
 sha2 = "0.10.9"
 shellexpand = "3.1.2"
 smithay = { version = "0.7.0", default-features = false, features = ["backend_drm", "backend_gbm", "backend_egl", "renderer_gl", "wayland_frontend", "desktop", "xwayland", "x11rb_event_source"] }
-strum_macros = "0.27.2"
+strum_macros = "0.28.0"
 tokio = { version = "1.49.0", features = ["rt-multi-thread", "macros", "net", "io-util", "signal", "tracing"] }
 tokio-rustls = "0.26.4"
-toml = "0.9.12"
+toml = "1.0.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 url = "2.5.8"
