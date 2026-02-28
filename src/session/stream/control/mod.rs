@@ -313,17 +313,6 @@ impl ControlStream {
 				},
 			};
 
-			// Diagnostic: test if we can manually bind to the port.
-			match std::net::UdpSocket::bind(socket_address) {
-				Ok(sock) => {
-					tracing::debug!("Diagnostic: successfully bound UDP socket to {socket_address}, releasing it now.");
-					drop(sock);
-				},
-				Err(e) => {
-					tracing::warn!("Diagnostic: failed to bind UDP socket to {socket_address}: {e}");
-				},
-			}
-
 			let host = match enet.create_host::<()>(
 				Some(&local_addr),
 				1,

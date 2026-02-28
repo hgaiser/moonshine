@@ -542,7 +542,7 @@ impl MoonshineCompositor {
 			1.0,
 		);
 
-		// Combine cursor elements (rendered on top) with space elements.
+		// Combine elements in front-to-back order: cursor first (on top), then space.
 		let mut elements: Vec<OutputRenderElements> = Vec::with_capacity(cursor_elements.len() + space_elements.len());
 		elements.extend(cursor_elements);
 		elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));

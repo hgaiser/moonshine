@@ -44,14 +44,6 @@ SPIKE_RE = re.compile(
     r"SPIKE: frame latency exceeds \d+us"
 )
 
-# Matches the periodic summary line.
-SUMMARY_RE = re.compile(
-    r"frames=(\d+)\s+"
-    r"total_p50_us=(\d+)\s+"
-    r"total_p95_us=(\d+)\s+"
-    r"total_p99_us=(\d+)"
-)
-
 STAGE_NAMES = ["channel_wait", "import", "convert", "encode", "packetize", "send", "total"]
 
 # ANSI escape code pattern for stripping terminal colors from log output.

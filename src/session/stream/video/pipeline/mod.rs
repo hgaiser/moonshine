@@ -437,6 +437,7 @@ impl VideoPipelineInner {
 							},
 							Err(e) => {
 								tracing::warn!("Failed to create color converter: {e}");
+								frame.consumed.store(true, Ordering::Release);
 								continue;
 							},
 						}
