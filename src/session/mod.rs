@@ -486,12 +486,11 @@ impl SessionInner {
 			}
 		}
 
-		// Signal all processes in the systemd scope to terminate.
-		// Uses `kill` instead of `stop` to avoid blocking while systemd
-		// waits for processes to exit. The scope will auto-cleanup via
-		// the --collect flag once all processes have exited.
+		// Stop the systemd scope to kill the application and all of its
+		// descendants. The scope was created with TimeoutStopSec=5, so
+		// this blocks at most 5 seconds before systemd sends SIGKILL.
 		let _ = Command::new("systemctl")
-			.args(["--user", "kill", "--signal=SIGTERM", "moonshine-session.scope"])
+			.args(["--user", "stop", "moonshine-session.scope"])
 			.stdout(Stdio::null())
 			.stderr(Stdio::null())
 			.status();
