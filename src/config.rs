@@ -58,7 +58,6 @@ impl Default for Config {
 				title: "Steam".to_string(),
 				command: vec!["/usr/bin/steam".to_string(), "steam://open/bigpicture".to_string()],
 				boxart: None,
-				enable_steam_integration: true,
 			}],
 			application_scanners: vec![ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
 				library: "$HOME/.local/share/Steam".into(),
@@ -110,10 +109,6 @@ pub struct ApplicationConfig {
 
 	/// The command to run.
 	pub command: Vec<String>,
-
-	/// Enable Steam integration.
-	#[serde(default)]
-	pub enable_steam_integration: bool,
 }
 
 impl ApplicationConfig {

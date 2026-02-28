@@ -32,7 +32,6 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 	let mut applications = Vec::new();
 	for line in library.lines().skip(2) {
 		let mut application = ApplicationConfig {
-			enable_steam_integration: true,
 			..Default::default()
 		};
 
