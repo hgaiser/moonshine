@@ -27,8 +27,13 @@ open = "5.3.3"
 opus = "0.3.0"
 pixelforge = { git = "https://github.com/hgaiser/pixelforge", branch = "amd-support", features = ["dmabuf"] }
 pkcs8 = "0.10.2"
-pulse = { version = "2.30", package = "libpulse-binding" }
-pulse-simple = { version = "2.29", package = "libpulse-simple-binding" }
+pulseaudio = { path = "../pulseaudio-rs" }
+mio = { version = "1", features = ["net", "os-ext", "os-poll"] }
+mio-timerfd = "0.2"
+crossbeam-channel = "0.5"
+dasp = { version = "0.11", features = ["signal", "interpolate", "interpolate-sinc", "ring_buffer"] }
+bytes = "1"
+byteorder = "1"
 rand = "0.8.5"
 rcgen = "0.13"
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }

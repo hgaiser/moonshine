@@ -7,6 +7,8 @@ use crate::{
 	session::{manager::SessionShutdownReason, stream::RtpHeader, SessionKeys},
 };
 
+use super::pulse_server::AudioFrame;
+
 const NR_DATA_SHARDS: usize = 4;
 const NR_PARITY_SHARDS: usize = 2;
 const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
@@ -34,7 +36,8 @@ impl AudioEncoder {
 	pub fn new(
 		sample_rate: u32,
 		channels: u8,
-		audio_rx: mpsc::Receiver<Vec<f32>>,
+		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
+		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
@@ -78,7 +81,8 @@ impl AudioEncoder {
 			.spawn(move || {
 				inner.run(
 					command_rx,
-					audio_rx,
+					frame_rx,
+					frame_recycle_tx,
 					fec_encoder,
 					encoder,
 					keys,
@@ -106,7 +110,8 @@ impl AudioEncoderInner {
 	fn run(
 		self,
 		mut command_rx: mpsc::Receiver<AudioEncoderCommand>,
-		mut audio_rx: mpsc::Receiver<Vec<f32>>,
+		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
+		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		mut fec_encoder: ReedSolomon<galois_8::Field>,
 		mut encoder: opus::Encoder,
 		mut keys: SessionKeys,
@@ -141,6 +146,14 @@ impl AudioEncoderInner {
 		// TODO: Decide the correct size for this buffer.
 		let mut encoded_audio = vec![0u8; 1400];
 
+		// Pre-seed the recycling pipeline with empty frames.
+		for _ in 0..3 {
+			let _ = frame_recycle_tx.send(AudioFrame {
+				buf: Vec::new(),
+				capture_ts_ms: 0,
+			});
+		}
+
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Check if there's a command.
 			match command_rx.try_recv() {
@@ -158,21 +171,28 @@ impl AudioEncoderInner {
 				Err(TryRecvError::Empty) => {},
 			};
 
-			let audio_fragment = audio_rx.blocking_recv();
-			let Some(audio_fragment) = audio_fragment else {
-				tracing::debug!("Audio fragment channel closed.");
-				break;
+			let frame = match frame_rx.recv() {
+				Ok(frame) => frame,
+				Err(_) => {
+					tracing::debug!("PulseServer channel closed.");
+					break;
+				},
 			};
 
 			// TODO: Figure out the 1000 / 90 value.
 			let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
-			let encoded_size = match encoder.encode_float(&audio_fragment, &mut encoded_audio) {
+			let encoded_size = match encoder.encode_float(&frame.buf, &mut encoded_audio) {
 				Ok(encoded_size) => encoded_size,
 				Err(e) => {
 					tracing::warn!("Failed to encode audio: {e}");
 					let _ = encoder
 						.reset_state()
 						.map_err(|e| tracing::warn!("Failed to reset Opus encoder state: {e}"));
+					// Return the frame for recycling even on error.
+					let _ = frame_recycle_tx.send(AudioFrame {
+						buf: frame.buf,
+						capture_ts_ms: 0,
+					});
 					continue;
 				},
 			};
@@ -286,6 +306,12 @@ impl AudioEncoderInner {
 					}
 				}
 			}
+
+			// Return the empty frame for recycling.
+			let _ = frame_recycle_tx.send(AudioFrame {
+				buf: frame.buf,
+				capture_ts_ms: 0,
+			});
 		}
 
 		tracing::debug!("Audio encoder stopped.");

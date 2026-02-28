@@ -356,7 +356,7 @@ impl RtspServer {
 		let audio_stream_context = AudioStreamContext {
 			_packet_duration: packet_duration,
 			qos: audio_qos_type != "0",
-			sink_name: self.config.stream.audio.sink.clone(),
+			socket_path: None,
 		};
 
 		if self
