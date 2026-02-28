@@ -31,9 +31,7 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 
 	let mut applications = Vec::new();
 	for line in library.lines().skip(2) {
-		let mut application = ApplicationConfig {
-			..Default::default()
-		};
+		let mut application = ApplicationConfig { ..Default::default() };
 
 		if line.trim().is_empty() {
 			continue;

@@ -72,7 +72,9 @@ pub struct Session {
 	sink_name: Option<String>,
 }
 
-fn create_pulse_context() -> Result<(Rc<RefCell<Mainloop>>, Rc<RefCell<Context>>), ()> {
+type PulseContext = (Rc<RefCell<Mainloop>>, Rc<RefCell<Context>>);
+
+fn create_pulse_context() -> Result<PulseContext, ()> {
 	let mainloop = Rc::new(RefCell::new(
 		Mainloop::new().ok_or_else(|| tracing::warn!("Failed to create PulseAudio mainloop."))?,
 	));
