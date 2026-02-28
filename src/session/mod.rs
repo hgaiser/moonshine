@@ -1,10 +1,16 @@
+use std::cell::RefCell;
+use std::ops::Deref;
 use std::process::Command;
 use std::process::{Child, Stdio};
+use std::rc::Rc;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use enet::Enet;
 use manager::SessionShutdownReason;
+use pulse::context::{Context, FlagSet};
+use pulse::mainloop::standard::{IterateResult, Mainloop};
+use pulse::proplist::Proplist;
 use tokio::sync::mpsc;
 
 use crate::{
@@ -66,74 +72,228 @@ pub struct Session {
 	sink_name: Option<String>,
 }
 
-fn create_audio_sink(name: &str) -> Result<String, ()> {
-	let output = Command::new("pactl")
-		.arg("load-module")
-		.arg("module-null-sink")
-		.arg(format!("sink_name={}", name))
-		.arg(format!("sink_properties=device.description={}", name))
-		.output()
-		.map_err(|e| tracing::warn!("Failed to run pactl load-module: {e}"))?;
+fn create_pulse_context() -> Result<(Rc<RefCell<Mainloop>>, Rc<RefCell<Context>>), ()> {
+	let mainloop = Rc::new(RefCell::new(
+		Mainloop::new().ok_or_else(|| tracing::warn!("Failed to create PulseAudio mainloop."))?,
+	));
 
-	if !output.status.success() {
-		tracing::warn!("pactl load-module module-null-sink failed: {}", String::from_utf8_lossy(&output.stderr));
+	let mut proplist =
+		Proplist::new().ok_or_else(|| tracing::warn!("Failed to create PulseAudio proplist."))?;
+	proplist
+		.set_str(pulse::proplist::properties::APPLICATION_NAME, "Moonshine")
+		.map_err(|()| tracing::warn!("Failed to set PulseAudio application name."))?;
+
+	let context = Rc::new(RefCell::new(
+		Context::new_with_proplist(mainloop.borrow().deref(), "Moonshine context", &proplist)
+			.ok_or_else(|| tracing::warn!("Failed to create PulseAudio context."))?,
+	));
+
+	context
+		.borrow_mut()
+		.connect(None, FlagSet::NOFLAGS, None)
+		.map_err(|e| tracing::warn!("Failed to connect to PulseAudio server: {e}"))?;
+
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match context.borrow().get_state() {
+			pulse::context::State::Unconnected
+			| pulse::context::State::Connecting
+			| pulse::context::State::Authorizing
+			| pulse::context::State::SettingName => {},
+			pulse::context::State::Failed | pulse::context::State::Terminated => {
+				tracing::warn!("PulseAudio context failed.");
+				return Err(());
+			},
+			pulse::context::State::Ready => break,
+		}
+	}
+
+	Ok((mainloop, context))
+}
+
+fn wait_for_operation(
+	mainloop: &Rc<RefCell<Mainloop>>,
+	operation: pulse::operation::Operation<dyn FnMut(bool)>,
+) -> Result<(), ()> {
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed during operation.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match operation.get_state() {
+			pulse::operation::State::Running => {},
+			pulse::operation::State::Cancelled => {
+				tracing::warn!("PulseAudio operation was cancelled.");
+				return Err(());
+			},
+			pulse::operation::State::Done => return Ok(()),
+		}
+	}
+}
+
+fn create_audio_sink(name: &str) -> Result<u32, ()> {
+	let (mainloop, context) = create_pulse_context()?;
+	let argument = format!("sink_name={name} sink_properties=device.description={name}");
+	let result: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
+
+	let operation = {
+		let result = result.clone();
+		context
+			.borrow_mut()
+			.introspect()
+			.load_module("module-null-sink", &argument, move |module_index| {
+				*result.borrow_mut() = Some(module_index);
+			})
+	};
+
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed while loading module-null-sink.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match operation.get_state() {
+			pulse::operation::State::Running => {},
+			pulse::operation::State::Cancelled => {
+				tracing::warn!("load_module module-null-sink operation was cancelled.");
+				return Err(());
+			},
+			pulse::operation::State::Done => break,
+		}
+	}
+
+	let module_id = result
+		.take()
+		.ok_or_else(|| tracing::warn!("Failed to get module index for module-null-sink."))?;
+
+	if module_id == u32::MAX {
+		tracing::warn!("Failed to load module-null-sink (invalid index returned).");
 		return Err(());
 	}
 
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	Ok(stdout.trim().to_string())
+	tracing::debug!(module_id, "Loaded module-null-sink");
+	Ok(module_id)
 }
 
-fn unload_audio_sink(module_id: &str) {
-	let _ = Command::new("pactl").arg("unload-module").arg(module_id).output();
+fn unload_audio_sink(module_id: u32) {
+	let Ok((mainloop, context)) = create_pulse_context() else {
+		return;
+	};
+	let operation = context
+		.borrow_mut()
+		.introspect()
+		.unload_module(module_id, |_success| {});
+	let _ = wait_for_operation(&mainloop, operation);
 }
 
-fn create_audio_loopback(source: &str, sink: &str) -> Result<String, ()> {
-	let output = Command::new("pactl")
-		.arg("load-module")
-		.arg("module-loopback")
-		.arg(format!("source={}.monitor", source))
-		.arg(format!("sink={}", sink))
-		.output()
-		.map_err(|e| tracing::warn!("Failed to run pactl load-module: {e}"))?;
+fn create_audio_loopback(source: &str, sink: &str) -> Result<u32, ()> {
+	let (mainloop, context) = create_pulse_context()?;
+	let argument = format!("source={source}.monitor sink={sink}");
+	let result: Rc<RefCell<Option<u32>>> = Rc::new(RefCell::new(None));
 
-	if !output.status.success() {
-		tracing::warn!("pactl load-module module-loopback failed: {}", String::from_utf8_lossy(&output.stderr));
+	let operation = {
+		let result = result.clone();
+		context
+			.borrow_mut()
+			.introspect()
+			.load_module("module-loopback", &argument, move |module_index| {
+				*result.borrow_mut() = Some(module_index);
+			})
+	};
+
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed while loading module-loopback.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match operation.get_state() {
+			pulse::operation::State::Running => {},
+			pulse::operation::State::Cancelled => {
+				tracing::warn!("load_module module-loopback operation was cancelled.");
+				return Err(());
+			},
+			pulse::operation::State::Done => break,
+		}
+	}
+
+	let module_id = result
+		.take()
+		.ok_or_else(|| tracing::warn!("Failed to get module index for module-loopback."))?;
+
+	if module_id == u32::MAX {
+		tracing::warn!("Failed to load module-loopback (invalid index returned).");
 		return Err(());
 	}
 
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	Ok(stdout.trim().to_string())
+	tracing::debug!(module_id, "Loaded module-loopback");
+	Ok(module_id)
 }
 
 fn get_default_sink() -> Result<String, ()> {
-	let output = Command::new("pactl")
-		.arg("get-default-sink")
-		.output()
-		.map_err(|e| tracing::warn!("Failed to run pactl get-default-sink: {e}"))?;
+	let (mainloop, context) = create_pulse_context()?;
+	let result = Rc::new(RefCell::new(None));
 
-	if !output.status.success() {
-		tracing::warn!("pactl get-default-sink failed: {}", String::from_utf8_lossy(&output.stderr));
-		return Err(());
+	let operation = {
+		let result = result.clone();
+		context.borrow().introspect().get_server_info(move |info| {
+			if let Some(name) = info.default_sink_name.as_ref() {
+				*result.borrow_mut() = Some(name.to_string());
+			}
+		})
+	};
+
+	loop {
+		match mainloop.borrow_mut().iterate(false) {
+			IterateResult::Quit(_) | IterateResult::Err(_) => {
+				tracing::warn!("PulseAudio mainloop failed while getting default sink.");
+				return Err(());
+			},
+			IterateResult::Success(_) => {},
+		}
+
+		match operation.get_state() {
+			pulse::operation::State::Running => {},
+			pulse::operation::State::Cancelled => {
+				tracing::warn!("get_server_info operation was cancelled.");
+				return Err(());
+			},
+			pulse::operation::State::Done => break,
+		}
 	}
 
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	Ok(stdout.trim().to_string())
+	result
+		.take()
+		.ok_or_else(|| tracing::warn!("Failed to get default sink name."))
 }
 
 fn set_default_sink(name: &str) -> Result<(), ()> {
-	let output = Command::new("pactl")
-		.arg("set-default-sink")
-		.arg(name)
-		.output()
-		.map_err(|e| tracing::warn!("Failed to run pactl set-default-sink: {e}"))?;
-
-	if !output.status.success() {
-		tracing::warn!("pactl set-default-sink '{name}' failed: {}", String::from_utf8_lossy(&output.stderr));
-		return Err(());
-	}
-
-	Ok(())
+	let (mainloop, context) = create_pulse_context()?;
+	let operation = context
+		.borrow_mut()
+		.set_default_sink(name, |success| {
+			if !success {
+				tracing::warn!("set_default_sink callback reported failure.");
+			}
+		});
+	wait_for_operation(&mainloop, operation)
 }
 
 #[allow(clippy::result_unit_err)]
@@ -249,8 +409,8 @@ struct SessionInner {
 	control_stream: Option<ControlStream>,
 	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
 	input_tx: Option<calloop::channel::Sender<CompositorInputEvent>>,
-	audio_sink_module_id: Option<String>,
-	audio_loopback_module_id: Option<String>,
+	audio_sink_module_id: Option<u32>,
+	audio_loopback_module_id: Option<u32>,
 	enet: Arc<Enet>,
 }
 
@@ -337,11 +497,11 @@ impl SessionInner {
 			.status();
 
 		if let Some(module_id) = self.audio_loopback_module_id {
-			unload_audio_sink(&module_id);
+			unload_audio_sink(module_id);
 		}
 
 		if let Some(module_id) = self.audio_sink_module_id {
-			unload_audio_sink(&module_id);
+			unload_audio_sink(module_id);
 		}
 
 		tracing::debug!("Session stopped.");
