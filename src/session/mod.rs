@@ -73,10 +73,10 @@ fn create_audio_sink(name: &str) -> Result<String, ()> {
 		.arg(format!("sink_name={}", name))
 		.arg(format!("sink_properties=device.description={}", name))
 		.output()
-		.map_err(|e| tracing::warn!("Failed to run pactl: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to run pactl load-module: {e}"))?;
 
 	if !output.status.success() {
-		tracing::warn!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+		tracing::warn!("pactl load-module module-null-sink failed: {}", String::from_utf8_lossy(&output.stderr));
 		return Err(());
 	}
 
@@ -95,10 +95,10 @@ fn create_audio_loopback(source: &str, sink: &str) -> Result<String, ()> {
 		.arg(format!("source={}.monitor", source))
 		.arg(format!("sink={}", sink))
 		.output()
-		.map_err(|e| tracing::warn!("Failed to run pactl: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to run pactl load-module: {e}"))?;
 
 	if !output.status.success() {
-		tracing::warn!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+		tracing::warn!("pactl load-module module-loopback failed: {}", String::from_utf8_lossy(&output.stderr));
 		return Err(());
 	}
 
@@ -110,10 +110,10 @@ fn get_default_sink() -> Result<String, ()> {
 	let output = Command::new("pactl")
 		.arg("get-default-sink")
 		.output()
-		.map_err(|e| tracing::warn!("Failed to run pactl: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to run pactl get-default-sink: {e}"))?;
 
 	if !output.status.success() {
-		tracing::warn!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+		tracing::warn!("pactl get-default-sink failed: {}", String::from_utf8_lossy(&output.stderr));
 		return Err(());
 	}
 
@@ -126,10 +126,10 @@ fn set_default_sink(name: &str) -> Result<(), ()> {
 		.arg("set-default-sink")
 		.arg(name)
 		.output()
-		.map_err(|e| tracing::warn!("Failed to run pactl: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to run pactl set-default-sink: {e}"))?;
 
 	if !output.status.success() {
-		tracing::warn!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
+		tracing::warn!("pactl set-default-sink '{name}' failed: {}", String::from_utf8_lossy(&output.stderr));
 		return Err(());
 	}
 
@@ -144,7 +144,7 @@ impl Session {
 		stop_session_signal: ShutdownManager<SessionShutdownReason>,
 		enet: Arc<Enet>,
 	) -> Result<Self, ()> {
-		let default_sink = get_default_sink().ok();
+		let default_sink = get_default_sink().ok().filter(|s| s != "auto_null");
 		let sink_name = "moonshine-sink".to_string();
 		let module_id = create_audio_sink(&sink_name)?;
 
