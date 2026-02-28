@@ -641,10 +641,19 @@ impl Webserver {
 			},
 		};
 
-		let host_audio = match params.remove("localAudioPlayMode") {
-			Some(host_audio) => host_audio == "1",
-			None => false,
+		// TODO: localAudioPlayMode (host_audio) is not yet supported with the
+		// per-session PulseServer approach.
+
+		let surround_audio_info: u32 = params
+			.remove("surroundAudioInfo")
+			.and_then(|s| s.parse().ok())
+			.unwrap_or(196610); // Default: stereo (0x30002)
+		let audio_channels = match surround_audio_info & 0xFFFF {
+			6 => 6u8,
+			8 => 8,
+			_ => 2, // Default to stereo for unknown/invalid values.
 		};
+		let audio_channel_mask = surround_audio_info >> 16;
 
 		let application = match self.config.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
@@ -666,7 +675,8 @@ impl Webserver {
 					remote_input_key,
 					remote_input_key_id,
 				},
-				host_audio,
+				audio_channels,
+				audio_channel_mask,
 			})
 			.await;
 
