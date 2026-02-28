@@ -77,8 +77,7 @@ fn create_pulse_context() -> Result<(Rc<RefCell<Mainloop>>, Rc<RefCell<Context>>
 		Mainloop::new().ok_or_else(|| tracing::warn!("Failed to create PulseAudio mainloop."))?,
 	));
 
-	let mut proplist =
-		Proplist::new().ok_or_else(|| tracing::warn!("Failed to create PulseAudio proplist."))?;
+	let mut proplist = Proplist::new().ok_or_else(|| tracing::warn!("Failed to create PulseAudio proplist."))?;
 	proplist
 		.set_str(pulse::proplist::properties::APPLICATION_NAME, "Moonshine")
 		.map_err(|()| tracing::warn!("Failed to set PulseAudio application name."))?;
@@ -286,13 +285,11 @@ fn get_default_sink() -> Result<String, ()> {
 
 fn set_default_sink(name: &str) -> Result<(), ()> {
 	let (mainloop, context) = create_pulse_context()?;
-	let operation = context
-		.borrow_mut()
-		.set_default_sink(name, |success| {
-			if !success {
-				tracing::warn!("set_default_sink callback reported failure.");
-			}
-		});
+	let operation = context.borrow_mut().set_default_sink(name, |success| {
+		if !success {
+			tracing::warn!("set_default_sink callback reported failure.");
+		}
+	});
 	wait_for_operation(&mainloop, operation)
 }
 
@@ -536,7 +533,15 @@ fn launch_application(context: &SessionContext, sink_name: &str, xdisplay: u32) 
 		.status();
 
 	Command::new("systemd-run")
-		.args(["--user", "--scope", "--collect", "--unit", "moonshine-session", "--property=TimeoutStopSec=5", "--"])
+		.args([
+			"--user",
+			"--scope",
+			"--collect",
+			"--unit",
+			"moonshine-session",
+			"--property=TimeoutStopSec=5",
+			"--",
+		])
 		.arg(program)
 		.args(args)
 		.env("PULSE_SINK", sink_name)
