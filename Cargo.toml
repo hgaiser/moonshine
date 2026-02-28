@@ -27,7 +27,7 @@ open = "5.3.3"
 opus = "0.3.1"
 pixelforge = { git = "https://github.com/hgaiser/pixelforge", branch = "amd-support", features = ["dmabuf"] }
 pkcs8 = "0.10.2"
-pulseaudio = { path = "../pulseaudio-rs" }
+pulseaudio = "0.3.1"
 mio = { version = "1.1.1", features = ["net", "os-ext", "os-poll"] }
 mio-timerfd = "0.2.0"
 crossbeam-channel = "0.5.15"
