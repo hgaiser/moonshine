@@ -135,16 +135,27 @@ impl RtspServer {
 			self.encryption_flags_supported()
 		));
 		result.push_str("sprop-parameter-sets=AAAAAU\n");
+		result.push_str("a=x-nv-video[0].refPicInvalidation:1\n");
 		result.push_str("a=rtpmap:98 AV1/90000\n");
 		result.push_str("a=fmtp:96 packetization-mode=1\n");
 
 		// Emit surround-params for each Opus configuration.
 		// Moonlight selects the appropriate config at ANNOUNCE based on channel count and quality.
-		for config in ALL_STREAM_CONFIGS {
-			// Build surround-params: channelCount streams coupledStreams mapping...
-			let mut params = format!("{} {} {}", config.channels, config.streams, config.coupled_streams);
-			for i in 0..config.channels as usize {
-				params.push_str(&format!(" {}", config.mapping[i]));
+		// Values are packed as single digits with no separators, matching moonlight-common-c's
+		// parseOpusConfigFromParamString() which reads one digit character at a time.
+		for (i, config) in ALL_STREAM_CONFIGS.iter().enumerate() {
+			// GFE advertises an incorrect mapping for normal quality surround configurations,
+			// rotating LFE (index 3) to the end. Moonlight undoes this rotation after parsing.
+			// We must apply the same rotation for normal quality 5.1 and 7.1 configs.
+			let mut mapping = config.mapping;
+			let is_normal_surround = i == 2 || i == 4; // SURROUND51 or SURROUND71
+			if is_normal_surround && config.channels >= 6 {
+				mapping[3..config.channels as usize].rotate_left(1);
+			}
+
+			let mut params = format!("{}{}{}", config.channels, config.streams, config.coupled_streams);
+			for j in 0..config.channels as usize {
+				params.push_str(&format!("{}", mapping[j]));
 			}
 			result.push_str(&format!("a=fmtp:97 surround-params={}\n", params));
 		}
