@@ -450,17 +450,14 @@ impl VideoPipelineInner {
 				let converter = match &mut color_converter {
 					Some(conv) => conv,
 					None => {
-						let color_space = match self.dynamic_range {
-							VideoDynamicRange::Sdr => ColorSpace::Bt709,
-							VideoDynamicRange::Hdr => ColorSpace::Bt2020,
+						let (color_space, full_range) = match self.dynamic_range {
+							VideoDynamicRange::Sdr => (ColorSpace::Bt709, true),
+							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, false),
 						};
-						let config = ColorConverterConfig {
-							width: self.width,
-							height: self.height,
-							input_format: frame_input_format,
-							output_format,
-							color_space,
-						};
+						let mut config =
+							ColorConverterConfig::new(self.width, self.height, frame_input_format, output_format);
+						config.color_space = color_space;
+						config.full_range = full_range;
 						match ColorConverter::new(context.clone(), config) {
 							Ok(conv) => {
 								color_converter = Some(conv);

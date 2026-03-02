@@ -182,6 +182,15 @@ fn run_compositor(
 		render_modifiers.len()
 	);
 
+	// Derive effective HDR: only if an HDR-capable format was actually selected.
+	let hdr = config.hdr && matches!(render_fourcc, Fourcc::Abgr16161616f | Fourcc::Abgr2101010);
+	if config.hdr && !hdr {
+		tracing::warn!(
+			"HDR requested but no HDR-capable format available (using {:?}), falling back to SDR",
+			render_fourcc
+		);
+	}
+
 	// Create the calloop event loop.
 	let mut event_loop: EventLoop<MoonshineCompositor> =
 		EventLoop::try_new().map_err(|e| format!("Failed to create event loop: {e}"))?;
@@ -228,7 +237,7 @@ fn run_compositor(
 		render_modifiers,
 		xdisplay_tx,
 		&render_node,
-		config.hdr,
+		hdr,
 	);
 
 	// Insert the Wayland display as a calloop event source so client
