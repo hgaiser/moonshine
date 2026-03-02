@@ -497,6 +497,9 @@ impl ControlStreamInner {
 						ControlMessage::InputData(event) => {
 							let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;
 						},
+						ControlMessage::HdrMode => {
+							tracing::info!("Received HdrMode toggle from client");
+						},
 						skipped_message => {
 							tracing::trace!("Skipped control message: {skipped_message:?}");
 						},

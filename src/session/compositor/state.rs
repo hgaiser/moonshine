@@ -749,7 +749,11 @@ fn export_dmabuf(
 		created_at: std::time::Instant::now(),
 		buffer_index,
 		consumed,
-		color_space: if hdr { FrameColorSpace::Bt2020Pq } else { FrameColorSpace::Srgb },
+		color_space: if hdr {
+			FrameColorSpace::Bt2020Pq
+		} else {
+			FrameColorSpace::Srgb
+		},
 		hdr_metadata: None,
 	})
 }

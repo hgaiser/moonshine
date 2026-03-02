@@ -140,7 +140,12 @@ fn run_compositor(
 	// HDR: prefer FP16 > 10-bit > 8-bit for maximum precision.
 	// SDR: prefer 8-bit ARGB/XRGB.
 	let preferred_fourccs: Vec<Fourcc> = if config.hdr {
-		vec![Fourcc::Abgr16161616f, Fourcc::Abgr2101010, Fourcc::Argb8888, Fourcc::Xrgb8888]
+		vec![
+			Fourcc::Abgr16161616f,
+			Fourcc::Abgr2101010,
+			Fourcc::Argb8888,
+			Fourcc::Xrgb8888,
+		]
 	} else {
 		vec![Fourcc::Argb8888, Fourcc::Xrgb8888]
 	};

@@ -22,9 +22,8 @@ use super::{VideoChromaSampling, VideoDynamicRange, VideoFormat};
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
-	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig,
-	EncodedPacket, Encoder, InputFormat, OutputFormat, PixelFormat, RateControlMode, VideoContext,
-	VideoContextBuilder,
+	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodedPacket, Encoder,
+	InputFormat, OutputFormat, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
 
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
@@ -36,10 +35,10 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	// ABGR2101010 = 0x30334241
 	// ABGR16161616F = 0x48344241
 	match fourcc {
-		0x34324241 | 0x34324258 => (InputFormat::RGBA, vk::Format::R8G8B8A8_UNORM),       // ABGR/XBGR8888
-		0x30334241 => (InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32),   // ABGR2101010
-		0x48344241 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT),            // ABGR16161616F
-		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                            // ARGB/XRGB8888 (default)
+		0x34324241 | 0x34324258 => (InputFormat::RGBA, vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
+		0x30334241 => (InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32), // ABGR2101010
+		0x48344241 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT),      // ABGR16161616F
+		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                       // ARGB/XRGB8888 (default)
 	}
 }
 
@@ -421,15 +420,20 @@ impl VideoPipelineInner {
 				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
 
 				// Import the DMA-BUF (reuses cached VkImage for known buffer indices).
-				let (source_image, needs_transition) =
-					match importer.import_or_reuse(frame.buffer_index, frame.width, frame.height, import_vk_format, planes) {
-						Ok(result) => result,
-						Err(e) => {
-							tracing::warn!("Failed to import DMA-BUF: {e}");
-							frame.consumed.store(true, Ordering::Release);
-							continue;
-						},
-					};
+				let (source_image, needs_transition) = match importer.import_or_reuse(
+					frame.buffer_index,
+					frame.width,
+					frame.height,
+					import_vk_format,
+					planes,
+				) {
+					Ok(result) => result,
+					Err(e) => {
+						tracing::warn!("Failed to import DMA-BUF: {e}");
+						frame.consumed.store(true, Ordering::Release);
+						continue;
+					},
+				};
 
 				// First-time imports are in UNDEFINED layout; the converter
 				// will handle the transition inside its command buffer.

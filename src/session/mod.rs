@@ -12,8 +12,8 @@ use crate::{
 	session::stream::{AudioStream, ControlStream, VideoStream},
 };
 
-use self::stream::{AudioStreamContext, VideoStreamContext};
 use self::stream::VideoDynamicRange;
+use self::stream::{AudioStreamContext, VideoStreamContext};
 pub use manager::SessionManager;
 
 pub mod compositor;
@@ -189,15 +189,14 @@ impl SessionInner {
 					// for XWayland to become ready.
 					let app_context = session_context.clone();
 					let app_socket_path = self.socket_path.clone();
-					if let Err(e) = std::thread::Builder::new()
-						.name("app-launcher".to_string())
-						.spawn(move || -> Result<Child, ()> {
+					if let Err(e) = std::thread::Builder::new().name("app-launcher".to_string()).spawn(
+						move || -> Result<Child, ()> {
 							let xdisplay = xdisplay_rx
 								.recv_timeout(std::time::Duration::from_secs(5))
 								.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
 							launch_application(&app_context, &app_socket_path, xdisplay)
-						})
-					{
+						},
+					) {
 						tracing::error!("Failed to spawn app launcher thread: {e}");
 						continue;
 					}
