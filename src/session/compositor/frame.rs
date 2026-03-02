@@ -8,6 +8,34 @@ use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// Color space of the compositor output frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FrameColorSpace {
+	/// sRGB (BT.709 primaries, sRGB EOTF, BT.709 matrix).
+	#[default]
+	Srgb,
+	/// HDR10 (BT.2020 primaries, PQ EOTF, BT.2020 NCL matrix).
+	Bt2020Pq,
+}
+
+/// Static HDR metadata (HDR10).
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
+pub struct HdrMetadata {
+	/// Mastering display color primaries (CIE 1931 xy, in 0.00002 units).
+	pub display_primaries: [(u16, u16); 3],
+	/// White point (CIE 1931 xy, in 0.00002 units).
+	pub white_point: (u16, u16),
+	/// Maximum luminance in 0.0001 cd/m² units.
+	pub max_luminance: u32,
+	/// Minimum luminance in 0.0001 cd/m² units.
+	pub min_luminance: u32,
+	/// Maximum content light level in cd/m² (nits).
+	pub max_cll: u16,
+	/// Maximum frame-average light level in cd/m² (nits).
+	pub max_fall: u16,
+}
+
 /// A compositor frame exported for encoding.
 ///
 /// Plane file descriptors are borrowed references to the compositor's
@@ -34,6 +62,12 @@ pub struct ExportedFrame {
 	/// completes, signalling the compositor that this GBM buffer may be
 	/// reused for rendering.
 	pub consumed: Arc<AtomicBool>,
+	/// Color space of the rendered frame.
+	#[allow(dead_code)]
+	pub color_space: FrameColorSpace,
+	/// Optional HDR metadata from the composited content.
+	#[allow(dead_code)]
+	pub hdr_metadata: Option<HdrMetadata>,
 }
 
 /// Metadata for a single DMA-BUF plane.

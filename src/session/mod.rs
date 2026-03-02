@@ -12,9 +12,8 @@ use crate::{
 	session::stream::{AudioStream, ControlStream, VideoStream},
 };
 
-use self::compositor::frame::ExportedFrame;
-use self::compositor::input::CompositorInputEvent;
 use self::stream::{AudioStreamContext, VideoStreamContext};
+use self::stream::VideoDynamicRange;
 pub use manager::SessionManager;
 
 pub mod compositor;
@@ -92,33 +91,9 @@ impl Session {
 		let listener = std::os::unix::net::UnixListener::bind(&socket_path)
 			.map_err(|e| tracing::error!("Failed to bind PulseAudio socket: {e}"))?;
 
-		// Start the headless compositor.
-		let compositor_config = compositor::CompositorConfig {
-			width: context.resolution.0,
-			height: context.resolution.1,
-			refresh_rate: context._refresh_rate,
-			gpu: config.gpu.clone(),
-		};
-		let (frame_rx, input_tx, xdisplay_rx) =
-			compositor::start_compositor(compositor_config, stop_session_signal.clone())
-				.map_err(|e| tracing::warn!("Failed to start compositor: {e}"))?;
-
-		// Launch the application in a background thread that waits for
-		// XWayland to become ready. We must not block Session::new()
-		// because the session manager processes commands sequentially
-		// and stalling it would prevent the control stream from being
-		// established on time.
-		let app_context = context.clone();
-		let app_socket_path = socket_path.clone();
-		std::thread::Builder::new()
-			.name("app-launcher".to_string())
-			.spawn(move || -> Result<Child, ()> {
-				let xdisplay = xdisplay_rx
-					.recv_timeout(std::time::Duration::from_secs(5))
-					.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
-				launch_application(&app_context, &app_socket_path, xdisplay)
-			})
-			.map_err(|e| tracing::warn!("Failed to spawn app launcher thread: {e}"))?;
+		// Compositor and application launch are deferred to SessionCommand::Start
+		// so that the video stream context (with dynamic_range / HDR mode) is
+		// available for compositor format selection.
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner {
@@ -126,10 +101,9 @@ impl Session {
 			video_stream: None,
 			audio_stream: None,
 			control_stream: None,
-			frame_rx: Some(frame_rx),
-			input_tx: Some(input_tx),
 			enet,
 			listener: Some(listener),
+			socket_path,
 		};
 		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal));
 		Ok(Self {
@@ -173,10 +147,9 @@ struct SessionInner {
 	video_stream: Option<VideoStream>,
 	audio_stream: Option<AudioStream>,
 	control_stream: Option<ControlStream>,
-	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
-	input_tx: Option<calloop::channel::Sender<CompositorInputEvent>>,
 	enet: Arc<Enet>,
 	listener: Option<std::os::unix::net::UnixListener>,
+	socket_path: std::path::PathBuf,
 }
 
 impl SessionInner {
@@ -193,11 +166,46 @@ impl SessionInner {
 		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				SessionCommand::Start(video_stream_context, audio_stream_context) => {
-					let frame_rx = self.frame_rx.take();
+					// Start the headless compositor with HDR format selection
+					// based on the negotiated dynamic range.
+					let hdr = video_stream_context.dynamic_range == VideoDynamicRange::Hdr;
+					let compositor_config = compositor::CompositorConfig {
+						width: session_context.resolution.0,
+						height: session_context.resolution.1,
+						refresh_rate: session_context._refresh_rate,
+						gpu: self.config.gpu.clone(),
+						hdr,
+					};
+					let (frame_rx, input_tx, xdisplay_rx) =
+						match compositor::start_compositor(compositor_config, stop_session_manager.clone()) {
+							Ok(handles) => handles,
+							Err(e) => {
+								tracing::error!("Failed to start compositor: {e}");
+								continue;
+							},
+						};
+
+					// Launch the application in a background thread that waits
+					// for XWayland to become ready.
+					let app_context = session_context.clone();
+					let app_socket_path = self.socket_path.clone();
+					if let Err(e) = std::thread::Builder::new()
+						.name("app-launcher".to_string())
+						.spawn(move || -> Result<Child, ()> {
+							let xdisplay = xdisplay_rx
+								.recv_timeout(std::time::Duration::from_secs(5))
+								.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
+							launch_application(&app_context, &app_socket_path, xdisplay)
+						})
+					{
+						tracing::error!("Failed to spawn app launcher thread: {e}");
+						continue;
+					}
+
 					let video_stream = match VideoStream::new(
 						self.config.clone(),
 						video_stream_context,
-						frame_rx,
+						Some(frame_rx),
 						stop_session_manager.clone(),
 					)
 					.await
@@ -220,7 +228,6 @@ impl SessionInner {
 						Ok(audio_stream) => audio_stream,
 						Err(()) => continue,
 					};
-					let input_tx = self.input_tx.take().expect("Input sender already consumed");
 					let control_stream = match ControlStream::new(
 						self.config.clone(),
 						video_stream.clone(),

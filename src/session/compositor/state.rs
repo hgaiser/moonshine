@@ -40,7 +40,7 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
 use super::cursor::{self, PointerElement, PointerRenderElement};
-use super::frame::{ExportedFrame, ExportedPlane};
+use super::frame::{ExportedFrame, ExportedPlane, FrameColorSpace};
 
 /// Number of pre-allocated GBM buffers. Three allows the compositor to
 /// always have a free buffer: at most two frames are queued in the
@@ -253,6 +253,10 @@ pub struct MoonshineCompositor {
 	// -- Extended protocols --
 	pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
 
+	// -- HDR --
+	/// Whether HDR mode is active. Controls the `FrameColorSpace` on exported frames.
+	pub hdr: bool,
+
 	// -- XWayland --
 	pub xwayland_shell_state: XWaylandShellState,
 	pub xwm: Option<X11Wm>,
@@ -296,6 +300,7 @@ impl MoonshineCompositor {
 		render_modifiers: Vec<Modifier>,
 		xdisplay_tx: mpsc::SyncSender<u32>,
 		render_node: &std::path::Path,
+		hdr: bool,
 	) -> (Self, Display<Self>) {
 		let compositor_state = CompositorState::new::<Self>(&display_handle);
 		let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -424,6 +429,7 @@ impl MoonshineCompositor {
 				last_frame_sent_at: std::time::Instant::now(),
 				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
 				viewporter_state,
+				hdr,
 				xwayland_shell_state,
 				xwm: None,
 				xdisplay: None,
@@ -469,7 +475,7 @@ impl MoonshineCompositor {
 		// mutable borrow from renderer.bind(). This avoids a borrow
 		// conflict: the framebuffer holds a mutable ref to the dmabuf,
 		// and export_dmabuf would need an immutable ref to the same dmabuf.
-		let exported_frame = match export_dmabuf(&self.buffer_pool[idx].dmabuf, idx, consumed.clone()) {
+		let exported_frame = match export_dmabuf(&self.buffer_pool[idx].dmabuf, idx, consumed.clone(), self.hdr) {
 			Ok(frame) => frame,
 			Err(e) => {
 				tracing::error!("Failed to export frame: {e}");
@@ -721,6 +727,7 @@ fn export_dmabuf(
 	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
 	buffer_index: usize,
 	consumed: Arc<AtomicBool>,
+	hdr: bool,
 ) -> Result<ExportedFrame, String> {
 	let planes: Vec<ExportedPlane> = dmabuf
 		.handles()
@@ -742,5 +749,7 @@ fn export_dmabuf(
 		created_at: std::time::Instant::now(),
 		buffer_index,
 		consumed,
+		color_space: if hdr { FrameColorSpace::Bt2020Pq } else { FrameColorSpace::Srgb },
+		hdr_metadata: None,
 	})
 }

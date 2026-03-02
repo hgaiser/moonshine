@@ -40,6 +40,8 @@ pub struct CompositorConfig {
 	pub refresh_rate: u32,
 	/// Optional GPU configuration (path, PCI ID, vendor:device, or vendor name).
 	pub gpu: Option<String>,
+	/// Whether HDR mode is active. When true, prefers 10-bit/FP16 GBM formats.
+	pub hdr: bool,
 }
 
 /// Result type for `start_compositor`.
@@ -134,8 +136,14 @@ fn run_compositor(
 	let render_formats = renderer.egl_context().dmabuf_render_formats();
 	tracing::debug!("Supported DMA-BUF render formats: {}", render_formats.iter().count());
 
-	// Prefer Argb8888, then Xrgb8888, then fall back to first available format.
-	let preferred_fourccs = [Fourcc::Argb8888, Fourcc::Xrgb8888];
+	// Select preferred render format based on HDR mode.
+	// HDR: prefer FP16 > 10-bit > 8-bit for maximum precision.
+	// SDR: prefer 8-bit ARGB/XRGB.
+	let preferred_fourccs: Vec<Fourcc> = if config.hdr {
+		vec![Fourcc::Abgr16161616f, Fourcc::Abgr2101010, Fourcc::Argb8888, Fourcc::Xrgb8888]
+	} else {
+		vec![Fourcc::Argb8888, Fourcc::Xrgb8888]
+	};
 	let (render_fourcc, render_modifiers) = preferred_fourccs
 		.iter()
 		.find_map(|&fourcc| {
@@ -215,6 +223,7 @@ fn run_compositor(
 		render_modifiers,
 		xdisplay_tx,
 		&render_node,
+		config.hdr,
 	);
 
 	// Insert the Wayland display as a calloop event source so client
