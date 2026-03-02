@@ -286,7 +286,11 @@ impl Webserver {
 		for application in self.config.applications.iter() {
 			response += "<App>";
 
-			// TODO: Fix HDR support.
+			// HDR is not yet functional: Smithay 0.7 lacks wp_color_management_v1
+			// support, so the compositor cannot produce HDR content. Advertising
+			// HDR here would cause clients to negotiate HDR mode and receive
+			// incorrectly encoded sRGB frames. Re-enable once Smithay supports
+			// the color management protocol.
 			response += "<IsHdrSupported>0</IsHdrSupported>";
 			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&application.title)).as_ref();
 			response += format!("<ID>{}</ID>", application.id()).as_ref();

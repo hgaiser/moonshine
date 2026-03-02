@@ -25,7 +25,7 @@ network-interface = "2.0.5"
 notify-rust = "4.12.0"
 open = "5.3.3"
 opus = "0.3.1"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", branch = "av1-support-rebased", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", features = ["dmabuf"] }
 pkcs8 = "0.10.2"
 pulseaudio = "0.3.1"
 mio = { version = "1.1.1", features = ["net", "os-ext", "os-poll"] }

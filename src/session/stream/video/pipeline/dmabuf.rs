@@ -57,18 +57,23 @@ impl DmaBufImporter {
 		})
 	}
 
-	/// Import a BGRA DMA-BUF as a Vulkan image, reusing a cached import when
+	/// Import a DMA-BUF as a Vulkan image, reusing a cached import when
 	/// the same `buffer_index` has been seen before.
+	///
+	/// The `format` parameter specifies the Vulkan format matching the DMA-BUF
+	/// pixel format (e.g. `B8G8R8A8_UNORM` for SDR, `A2B10G10R10_UNORM_PACK32`
+	/// for 10-bit HDR, `R16G16B16A16_SFLOAT` for FP16 HDR).
 	///
 	/// Returns `(image, needs_transition)` where `needs_transition` is `true`
 	/// for first-time imports whose image is still in `UNDEFINED` layout.
 	/// The caller is responsible for transitioning the image (e.g. by passing
 	/// the appropriate `src_layout` to `ColorConverter::convert`).
-	pub fn import_or_reuse_bgra(
+	pub fn import_or_reuse(
 		&mut self,
 		buffer_index: usize,
 		width: u32,
 		height: u32,
+		format: vk::Format,
 		planes: &[DmaBufPlane],
 	) -> Result<(vk::Image, bool), String> {
 		// Grow the cache vector if needed.
@@ -82,24 +87,25 @@ impl DmaBufImporter {
 
 		// First time seeing this buffer — full import.
 		debug!(
-			"First import for buffer {buffer_index}: {}x{}, fd={}, stride={}, modifier={:#x}",
-			width, height, planes[0].fd, planes[0].stride, planes[0].modifier
+			"First import for buffer {buffer_index}: {}x{}, format={:?}, fd={}, stride={}, modifier={:#x}",
+			width, height, format, planes[0].fd, planes[0].stride, planes[0].modifier
 		);
 
-		let (image, memory) = self.import_bgra_internal(width, height, planes)?;
+		let (image, memory) = self.import_internal(width, height, format, planes)?;
 
 		self.cached_imports[buffer_index] = Some(CachedImport { image, memory });
 		Ok((image, true))
 	}
 
-	/// Perform the raw Vulkan import of a BGRA DMA-BUF.
+	/// Perform the raw Vulkan import of a DMA-BUF with the specified format.
 	///
 	/// Returns the `(VkImage, VkDeviceMemory)` pair. The image is in
 	/// `UNDEFINED` layout; the caller must transition it.
-	fn import_bgra_internal(
+	fn import_internal(
 		&self,
 		width: u32,
 		height: u32,
+		format: vk::Format,
 		planes: &[DmaBufPlane],
 	) -> Result<(vk::Image, vk::DeviceMemory), String> {
 		if planes.is_empty() {
@@ -107,7 +113,6 @@ impl DmaBufImporter {
 		}
 
 		let device = self.context.device();
-		let format = vk::Format::B8G8R8A8_UNORM;
 
 		// Build DRM format modifier plane layouts for all planes.
 		// AMD modifiers (e.g. tiled/DCC) may require multiple planes;
