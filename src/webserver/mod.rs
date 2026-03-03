@@ -286,7 +286,11 @@ impl Webserver {
 		for application in self.config.applications.iter() {
 			response += "<App>";
 
-			// TODO: Fix HDR support.
+			// HDR is not yet functional: Smithay 0.7 lacks wp_color_management_v1
+			// support, so the compositor cannot produce HDR content. Advertising
+			// HDR here would cause clients to negotiate HDR mode and receive
+			// incorrectly encoded sRGB frames. Re-enable once Smithay supports
+			// the color management protocol.
 			response += "<IsHdrSupported>0</IsHdrSupported>";
 			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&application.title)).as_ref();
 			response += format!("<ID>{}</ID>", application.id()).as_ref();
@@ -429,11 +433,11 @@ impl Webserver {
 			| (ServerCodecModeSupport::Hevc as u32)
 			| (ServerCodecModeSupport::HevcRext8444 as u32)
 			| (ServerCodecModeSupport::HevcMain10 as u32)
-			| (ServerCodecModeSupport::HevcRext10444 as u32);
-		// | (ServerCodecModeSupport::Av1Main8 as u32)
-		// | (ServerCodecModeSupport::Av1High8444 as u32)
-		// | (ServerCodecModeSupport::Av1Main10 as u32)
-		// | (ServerCodecModeSupport::Av1High10444 as u32);
+			| (ServerCodecModeSupport::HevcRext10444 as u32)
+			| (ServerCodecModeSupport::Av1Main8 as u32)
+			| (ServerCodecModeSupport::Av1High8444 as u32)
+			| (ServerCodecModeSupport::Av1Main10 as u32)
+			| (ServerCodecModeSupport::Av1High10444 as u32);
 		response += &format!(
 			"<ServerCodecModeSupport>{}</ServerCodecModeSupport>",
 			server_codec_mode_support
@@ -640,10 +644,19 @@ impl Webserver {
 			},
 		};
 
-		let host_audio = match params.remove("localAudioPlayMode") {
-			Some(host_audio) => host_audio == "1",
-			None => false,
+		// TODO: localAudioPlayMode (host_audio) is not yet supported with the
+		// per-session PulseServer approach.
+
+		let surround_audio_info: u32 = params
+			.remove("surroundAudioInfo")
+			.and_then(|s| s.parse().ok())
+			.unwrap_or(196610); // Default: stereo (0x30002)
+		let audio_channels = match surround_audio_info & 0xFFFF {
+			6 => 6u8,
+			8 => 8,
+			_ => 2, // Default to stereo for unknown/invalid values.
 		};
+		let audio_channel_mask = surround_audio_info >> 16;
 
 		let application = match self.config.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
@@ -665,7 +678,8 @@ impl Webserver {
 					remote_input_key,
 					remote_input_key_id,
 				},
-				host_audio,
+				audio_channels,
+				audio_channel_mask,
 			})
 			.await;
 
@@ -798,7 +812,7 @@ fn not_found() -> Response<Full<Bytes>> {
 
 fn get_mac_address(address: IpAddr) -> Result<Option<String>, ()> {
 	let interfaces = network_interface::NetworkInterface::show()
-		.map_err(|e| tracing::error!("Failed to retrieve network interfaces: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to retrieve network interfaces: {e}"))?;
 
 	for interface in interfaces {
 		for interface_address in interface.addr {

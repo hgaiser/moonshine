@@ -1,36 +1,119 @@
 //! Video encoding and streaming pipeline.
 //!
-//! This module handles video capture from PipeWire nodes, encoding with pixelforge,
+//! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
-mod capture;
 mod dmabuf;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+use ash::vk;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc};
 
+use crate::session::compositor::frame::ExportedFrame;
 use crate::session::manager::SessionShutdownReason;
 
 use super::packetizer::Packetizer;
+use super::shard_batch::ShardBatch;
 use super::{VideoChromaSampling, VideoDynamicRange, VideoFormat};
 
-use capture::{start_capture, CaptureConfig, CapturePixelFormat, CapturedFrame};
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
-	Codec, ColorConverter, ColorConverterConfig, EncodeConfig, EncodedPacket, Encoder, InputFormat, OutputFormat,
-	PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
+	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodedPacket, Encoder,
+	InputFormat, OutputFormat, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
 
+/// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
+/// and Vulkan import format.
+fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
+	// DRM fourcc values (from drm_fourcc.h):
+	// ARGB8888 = 0x34325241, XRGB8888 = 0x34325258
+	// ABGR8888 = 0x34324241, XBGR8888 = 0x34324258
+	// ABGR2101010 = 0x30334241
+	// ABGR16161616F = 0x48344241
+	match fourcc {
+		0x34324241 | 0x34324258 => (InputFormat::RGBA, vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
+		0x30334241 => (InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32), // ABGR2101010
+		0x48344241 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT),      // ABGR16161616F
+		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                       // ARGB/XRGB8888 (default)
+	}
+}
+
 pub struct VideoPipeline {}
+
+/// A single frame's latency breakdown for periodic summary reporting.
+struct LatencySample {
+	channel_wait: std::time::Duration,
+	import: std::time::Duration,
+	convert: std::time::Duration,
+	encode: std::time::Duration,
+	packetize: std::time::Duration,
+	send: std::time::Duration,
+	total: std::time::Duration,
+}
+
+/// Log a summary of latency statistics over a batch of samples.
+fn log_latency_summary(samples: &[LatencySample]) {
+	let n = samples.len();
+	if n == 0 {
+		return;
+	}
+
+	let mut totals: Vec<u64> = samples.iter().map(|s| s.total.as_micros() as u64).collect();
+	totals.sort_unstable();
+
+	let mut channel: Vec<u64> = samples.iter().map(|s| s.channel_wait.as_micros() as u64).collect();
+	channel.sort_unstable();
+
+	let mut imports: Vec<u64> = samples.iter().map(|s| s.import.as_micros() as u64).collect();
+	imports.sort_unstable();
+
+	let mut converts: Vec<u64> = samples.iter().map(|s| s.convert.as_micros() as u64).collect();
+	converts.sort_unstable();
+
+	let mut encodes: Vec<u64> = samples.iter().map(|s| s.encode.as_micros() as u64).collect();
+	encodes.sort_unstable();
+
+	let mut packetizes: Vec<u64> = samples.iter().map(|s| s.packetize.as_micros() as u64).collect();
+	packetizes.sort_unstable();
+
+	let mut sends: Vec<u64> = samples.iter().map(|s| s.send.as_micros() as u64).collect();
+	sends.sort_unstable();
+
+	let p50 = |v: &[u64]| v[v.len() / 2];
+	let p95 = |v: &[u64]| v[(v.len() as f64 * 0.95) as usize];
+	let p99 = |v: &[u64]| v[(v.len() as f64 * 0.99) as usize];
+
+	tracing::debug!(
+		frames = n,
+		total_p50_us = p50(&totals),
+		total_p95_us = p95(&totals),
+		total_p99_us = p99(&totals),
+		channel_p50_us = p50(&channel),
+		channel_p95_us = p95(&channel),
+		channel_p99_us = p99(&channel),
+		import_p50_us = p50(&imports),
+		convert_p50_us = p50(&converts),
+		convert_p95_us = p95(&converts),
+		convert_p99_us = p99(&converts),
+		encode_p50_us = p50(&encodes),
+		encode_p95_us = p95(&encodes),
+		encode_p99_us = p99(&encodes),
+		packetize_p50_us = p50(&packetizes),
+		send_p50_us = p50(&sends),
+		send_p95_us = p95(&sends),
+		send_p99_us = p99(&sends),
+		"Frame latency summary (μs)"
+	);
+}
 
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		node_id: u32,
+		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		width: u32,
 		height: u32,
 		framerate: u32,
@@ -42,14 +125,13 @@ impl VideoPipeline {
 		dynamic_range: VideoDynamicRange,
 		chroma_sampling: VideoChromaSampling,
 		max_reference_frames: u32,
-		packet_tx: mpsc::Sender<Vec<u8>>,
+		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
 		let inner = VideoPipelineInner {
-			node_id,
 			width,
 			height,
 			framerate,
@@ -66,7 +148,7 @@ impl VideoPipeline {
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
-				inner.run(packet_tx, idr_frame_request_rx, stop_session_manager);
+				inner.run(frame_rx, packet_tx, idr_frame_request_rx, stop_session_manager);
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
 
@@ -75,7 +157,6 @@ impl VideoPipeline {
 }
 
 struct VideoPipelineInner {
-	node_id: u32,
 	width: u32,
 	height: u32,
 	framerate: u32,
@@ -92,7 +173,8 @@ struct VideoPipelineInner {
 impl VideoPipelineInner {
 	pub fn run(
 		self,
-		packet_tx: mpsc::Sender<Vec<u8>>,
+		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
@@ -113,8 +195,14 @@ impl VideoPipelineInner {
 		};
 
 		// Start the capture and encoding loop.
-		if let Err(e) = self.run_encoding_loop(context, encoder, packet_tx, idr_frame_request_rx, stop_session_manager)
-		{
+		if let Err(e) = self.run_encoding_loop(
+			frame_rx,
+			context,
+			encoder,
+			packet_tx,
+			idr_frame_request_rx,
+			stop_session_manager,
+		) {
 			tracing::error!("Video encoding loop failed: {e}");
 		}
 
@@ -131,10 +219,7 @@ impl VideoPipelineInner {
 		let codec = match self.video_format {
 			VideoFormat::H264 => Codec::H264,
 			VideoFormat::Hevc => Codec::H265,
-			VideoFormat::Av1 => {
-				// PIXELFORGE_TODO: AV1 encoding is not yet implemented in pixelforge.
-				return Err("AV1 encoding not yet supported".to_string());
-			},
+			VideoFormat::Av1 => Codec::AV1,
 		};
 
 		// Convert pixel format.
@@ -149,22 +234,29 @@ impl VideoPipelineInner {
 			VideoDynamicRange::Hdr => pixelforge::EncodeBitDepth::Ten,
 		};
 
+		// Select color description for VUI signaling.
+		let color_description = match self.dynamic_range {
+			VideoDynamicRange::Sdr => ColorDescription::bt709(),
+			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq(),
+		};
+
 		// Create encode configuration.
 		let config = match codec {
 			Codec::H264 => EncodeConfig::h264(self.width, self.height),
 			Codec::H265 => EncodeConfig::h265(self.width, self.height),
-			Codec::AV1 => {
-				return Err("AV1 not supported".to_string());
-			},
+			Codec::AV1 => EncodeConfig::av1(self.width, self.height),
 		}
 		.with_pixel_format(pixel_format)
 		.with_bit_depth(bit_depth)
+		.with_color_description(color_description)
 		.with_rate_control(RateControlMode::Cbr)
 		.with_target_bitrate(self.bitrate as u32)
 		.with_frame_rate(self.framerate, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
 		.with_b_frames(0) // No B-frames for low latency
-		.with_max_reference_frames(self.max_reference_frames);
+		.with_max_reference_frames(self.max_reference_frames)
+		.with_virtual_buffer_size_ms(1000 / self.framerate)
+		.with_initial_virtual_buffer_size_ms(0);
 
 		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
 
@@ -173,9 +265,10 @@ impl VideoPipelineInner {
 
 	fn run_encoding_loop(
 		&self,
+		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
-		packet_tx: mpsc::Sender<Vec<u8>>,
+		packet_tx: mpsc::Sender<ShardBatch>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), String> {
@@ -184,27 +277,26 @@ impl VideoPipelineInner {
 		let idr_requested_clone = idr_requested.clone();
 
 		// Start a thread to listen for IDR requests.
-		let stop_clone = stop_session_manager.clone();
-		std::thread::spawn(move || {
-			while !stop_clone.is_shutdown_triggered() {
-				match idr_frame_request_rx.try_recv() {
-					Ok(_) => {
-						tracing::debug!("Received request for IDR frame.");
-						idr_requested_clone.store(true, Ordering::SeqCst);
-					},
-					Err(broadcast::error::TryRecvError::Empty) => {
-						std::thread::sleep(std::time::Duration::from_millis(1));
-					},
-					Err(broadcast::error::TryRecvError::Lagged(_)) => {},
-					Err(broadcast::error::TryRecvError::Closed) => {
-						tracing::debug!("IDR frame channel closed.");
-						break;
-					},
-				}
+		// Uses blocking_recv() so the thread sleeps until a request arrives.
+		std::thread::spawn(move || loop {
+			match idr_frame_request_rx.blocking_recv() {
+				Ok(_) => {
+					tracing::debug!("Received request for IDR frame.");
+					idr_requested_clone.store(true, Ordering::SeqCst);
+				},
+				Err(broadcast::error::RecvError::Lagged(n)) => {
+					tracing::debug!("IDR frame channel lagged by {n} messages.");
+					idr_requested_clone.store(true, Ordering::SeqCst);
+				},
+				Err(broadcast::error::RecvError::Closed) => {
+					tracing::debug!("IDR frame channel closed.");
+					break;
+				},
 			}
 		});
 
 		let mut packetizer = Packetizer::new();
+		packetizer.warm_up(self.fec_percentage, self.minimum_fec_packets);
 		let mut sequence_number = 0u32;
 		let mut frame_number = 0u32;
 
@@ -216,27 +308,22 @@ impl VideoPipelineInner {
 			(VideoChromaSampling::Yuv444, VideoDynamicRange::Hdr) => OutputFormat::YUV444P10,
 		};
 
-		// Color converter will be initialized on first RGB frame.
+		// Color converter will be initialized on first frame.
 		let mut color_converter: Option<ColorConverter> = None;
 
-		// Start the capture.
-		let capture_config = CaptureConfig {
-			node_id: self.node_id,
-			width: self.width,
-			height: self.height,
-		};
-
-		let capture = start_capture(capture_config, stop_session_manager.clone())?;
-
-		// Encoding loop - receives frames from capture thread.
+		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / self.framerate as f64);
 		let mut last_frame_time = std::time::Instant::now();
 
-		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame)
+		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
 		let mut dmabuf_importer: Option<DmaBufImporter> = None;
 
-		// Cache for the last received frame to handle IDR requests during static screen.
-		let mut last_frame: Option<CapturedFrame> = None;
+		// Whether at least one frame has been encoded (for IDR re-encode).
+		let mut has_encoded = false;
+
+		// Rolling latency statistics for periodic summary.
+		let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
+		let mut last_summary_time = std::time::Instant::now();
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Check for IDR request.
@@ -247,48 +334,55 @@ impl VideoPipelineInner {
 				pending_idr = true;
 			}
 
-			// Try to receive a frame from capture thread (with timeout)
-			let received_frame = match capture.recv_timeout(frame_interval) {
+			// Try to receive a frame from compositor (with timeout).
+			let received_frame = match frame_rx.recv_timeout(frame_interval) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
-					// If we have a pending IDR request and a cached frame, re-encode it.
-					if pending_idr {
-						if let Some(frame) = &last_frame {
-							tracing::debug!("Re-encoding last frame for IDR request");
-							Some(frame.clone())
-						} else {
-							None
+					// If we have a pending IDR request and have encoded before,
+					// re-encode the encoder's input image (still contains
+					// the last frame's data after color conversion).
+					if pending_idr && has_encoded {
+						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
+						let encode_result = encoder.encode(encoder.input_image());
+						if let Ok(packets) = encode_result {
+							for packet in packets {
+								if let Err(()) = self.send_packet(
+									&packet,
+									&packet_tx,
+									&mut packetizer,
+									&mut frame_number,
+									&mut sequence_number,
+								) {
+									tracing::warn!("Failed to send IDR re-encode packet");
+								}
+							}
 						}
-					} else {
-						if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
-							tracing::warn!("No frames received for 5 seconds");
-							last_frame_time = std::time::Instant::now(); // Reset to avoid spam
-						}
-						None
 					}
+					if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+						tracing::warn!("No frames received for 5 seconds");
+						last_frame_time = std::time::Instant::now();
+					}
+					None
 				},
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-					tracing::debug!("Frame channel disconnected - capture thread ended");
+					tracing::debug!("Frame channel disconnected - compositor stopped");
 					break;
 				},
 			};
 
 			if let Some(frame) = received_frame {
-				// Update cache (this will duplicate the FD, which is fine)
-				last_frame = Some(frame.clone());
+				let t1_received = std::time::Instant::now();
 
-				// Zero-copy DMA-BUF path - import directly to Vulkan image.
-				let dmabuf_info = &frame.dmabuf;
-				tracing::debug!(
-					"Received frame: format={:?}, {}x{}, fd={}, offset={}, stride={}",
+				tracing::trace!(
+					"Received frame: format={}, modifier={:#x}, {}x{}, planes={}",
 					frame.format,
-					dmabuf_info.width,
-					dmabuf_info.height,
-					dmabuf_info.fd,
-					dmabuf_info.offset,
-					dmabuf_info.stride
+					frame.modifier,
+					frame.width,
+					frame.height,
+					frame.planes.len()
 				);
+
 				let importer = match &mut dmabuf_importer {
 					Some(imp) => imp,
 					None => match DmaBufImporter::new(context.clone()) {
@@ -297,135 +391,200 @@ impl VideoPipelineInner {
 							dmabuf_importer.as_mut().unwrap()
 						},
 						Err(e) => {
-							tracing::error!("Failed to create DMA-BUF importer: {e}");
+							tracing::warn!("Failed to create DMA-BUF importer: {e}");
+							frame.consumed.store(true, Ordering::Release);
 							continue;
 						},
 					},
 				};
 
-				// Create DmaBufPlane from the info.
-				let plane = DmaBufPlane {
-					fd: dmabuf_info.fd,
-					offset: dmabuf_info.offset,
-					stride: dmabuf_info.stride,
-					modifier: dmabuf_info.modifier,
-				};
-				let planes = [plane];
+				// Build DmaBufPlane array from ExportedFrame planes.
+				let mut planes_buf = [DmaBufPlane {
+					fd: 0,
+					offset: 0,
+					stride: 0,
+					modifier: 0,
+				}; 4];
+				let plane_count = frame.planes.len().min(4);
+				for (i, p) in frame.planes.iter().take(4).enumerate() {
+					planes_buf[i] = DmaBufPlane {
+						fd: p.fd,
+						offset: p.offset,
+						stride: p.stride,
+						modifier: frame.modifier,
+					};
+				}
+				let planes = &planes_buf[..plane_count];
 
-				// Handle based on format.
-				let encode_result = match frame.format {
-					CapturePixelFormat::NV12 => {
-						// NV12 DMA-BUF can be passed directly to encoder (zero-copy)
-						let dmabuf_image = match importer.import_nv12(dmabuf_info.width, dmabuf_info.height, &planes) {
-							Ok(img) => img,
-							Err(e) => {
-								tracing::error!("Failed to import NV12 DMA-BUF: {e}");
-								continue;
-							},
-						};
-						encoder.encode(dmabuf_image.image())
-					},
-					CapturePixelFormat::BGRx
-					| CapturePixelFormat::BGRA
-					| CapturePixelFormat::RGBx
-					| CapturePixelFormat::RGBA => {
-						// RGB DMA-BUF needs conversion to YUV.
-						let input_format = match frame.format {
-							CapturePixelFormat::BGRx => InputFormat::BGRx,
-							CapturePixelFormat::RGBx => InputFormat::RGBx,
-							CapturePixelFormat::BGRA => InputFormat::BGRA,
-							CapturePixelFormat::RGBA => InputFormat::RGBA,
-							_ => unreachable!(),
-						};
+				// Determine Vulkan format and input format from the frame's DRM fourcc.
+				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
 
-						// Import the DMA-BUF as a Vulkan image.
-						let dmabuf_image = match frame.format {
-							CapturePixelFormat::BGRx | CapturePixelFormat::BGRA => {
-								importer.import_bgra(dmabuf_info.width, dmabuf_info.height, &planes)
-							},
-							CapturePixelFormat::RGBx | CapturePixelFormat::RGBA => {
-								importer.import_rgba(dmabuf_info.width, dmabuf_info.height, &planes)
-							},
-							_ => unreachable!(),
-						};
-
-						let dmabuf_image = match dmabuf_image {
-							Ok(img) => img,
-							Err(e) => {
-								tracing::error!("Failed to import RGB DMA-BUF: {e}");
-								continue;
-							},
-						};
-
-						// Initialize converter if needed.
-						let converter = match &mut color_converter {
-							Some(conv) => conv,
-							None => {
-								let config = ColorConverterConfig {
-									width: self.width,
-									height: self.height,
-									input_format,
-									output_format,
-								};
-								match ColorConverter::new(context.clone(), config) {
-									Ok(conv) => {
-										color_converter = Some(conv);
-										color_converter.as_mut().unwrap()
-									},
-									Err(e) => {
-										tracing::error!("Failed to create color converter: {e}");
-										continue;
-									},
-								}
-							},
-						};
-
-						// Convert RGB to YUV directly into the encoder's input image.
-						if let Err(e) = converter.convert(dmabuf_image.image(), encoder.input_image()) {
-							tracing::error!("GPU color conversion failed: {e}");
-							continue;
-						}
-
-						// Encode the converted image.
-						encoder.encode(encoder.input_image())
-					},
-					CapturePixelFormat::I420 => {
-						// I420 DMA-BUF - import and encode.
-						// Note: Encoder might need I420 support
-						tracing::warn!("I420 DMA-BUF not yet supported");
+				// Import the DMA-BUF (reuses cached VkImage for known buffer indices).
+				let (source_image, needs_transition) = match importer.import_or_reuse(
+					frame.buffer_index,
+					frame.width,
+					frame.height,
+					import_vk_format,
+					planes,
+				) {
+					Ok(result) => result,
+					Err(e) => {
+						tracing::warn!("Failed to import DMA-BUF: {e}");
+						frame.consumed.store(true, Ordering::Release);
 						continue;
 					},
 				};
 
+				// First-time imports are in UNDEFINED layout; the converter
+				// will handle the transition inside its command buffer.
+				// Cached imports were left in GENERAL by the previous convert.
+				let src_layout = if needs_transition {
+					vk::ImageLayout::UNDEFINED
+				} else {
+					vk::ImageLayout::GENERAL
+				};
+
+				let t2_imported = std::time::Instant::now();
+
+				// Initialize converter if needed.
+				let converter = match &mut color_converter {
+					Some(conv) => conv,
+					None => {
+						let (color_space, full_range) = match self.dynamic_range {
+							VideoDynamicRange::Sdr => (ColorSpace::Bt709, true),
+							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, false),
+						};
+						let mut config =
+							ColorConverterConfig::new(self.width, self.height, frame_input_format, output_format);
+						config.color_space = color_space;
+						config.full_range = full_range;
+						match ColorConverter::new(context.clone(), config) {
+							Ok(conv) => {
+								color_converter = Some(conv);
+								color_converter.as_mut().unwrap()
+							},
+							Err(e) => {
+								tracing::warn!("Failed to create color converter: {e}");
+								frame.consumed.store(true, Ordering::Release);
+								continue;
+							},
+						}
+					},
+				};
+
+				// Convert to YUV.
+				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
+					tracing::warn!("GPU color conversion failed: {e}");
+					frame.consumed.store(true, Ordering::Release);
+					continue;
+				}
+
+				// The DMA-BUF content has been read into the encoder's input
+				// image — signal the compositor that this GBM buffer is free.
+				frame.consumed.store(true, Ordering::Release);
+
+				let t3_converted = std::time::Instant::now();
+
+				// Encode the converted image.
+				let encode_result = encoder.encode(encoder.input_image());
+
+				let t4_encoded = std::time::Instant::now();
+
 				// Process encoded packets.
+				let mut packetize_dur = std::time::Duration::ZERO;
+				let mut send_dur = std::time::Duration::ZERO;
+				let mut encoded_bytes = 0usize;
+				let mut is_key_frame = false;
 				match encode_result {
 					Ok(packets) => {
 						for packet in packets {
-							if let Err(()) = self.send_packet(
+							encoded_bytes += packet.data.len();
+							is_key_frame |= packet.is_key_frame;
+							let (p, s) = match self.send_packet(
 								&packet,
 								&packet_tx,
 								&mut packetizer,
 								&mut frame_number,
 								&mut sequence_number,
 							) {
-								tracing::error!("Failed to send encoded packet");
-								return Err("Failed to send packet".to_string());
-							}
+								Ok(durations) => durations,
+								Err(()) => {
+									tracing::warn!("Failed to send encoded packet");
+									return Err("Failed to send packet".to_string());
+								},
+							};
+							packetize_dur += p;
+							send_dur += s;
 						}
 					},
 					Err(e) => {
-						tracing::error!("Failed to encode frame: {e}");
+						tracing::warn!("Failed to encode frame: {e}");
 					},
+				}
+
+				let t5_done = std::time::Instant::now();
+
+				// Log per-frame latency breakdown.
+				let channel_wait = t1_received.duration_since(frame.created_at);
+				let import_dur = t2_imported.duration_since(t1_received);
+				let convert_dur = t3_converted.duration_since(t2_imported);
+				let encode_dur = t4_encoded.duration_since(t3_converted);
+				let total = t5_done.duration_since(frame.created_at);
+
+				tracing::debug!(
+					channel_wait_us = channel_wait.as_micros() as u64,
+					import_us = import_dur.as_micros() as u64,
+					convert_us = convert_dur.as_micros() as u64,
+					encode_us = encode_dur.as_micros() as u64,
+					packetize_us = packetize_dur.as_micros() as u64,
+					send_us = send_dur.as_micros() as u64,
+					total_us = total.as_micros() as u64,
+					"Frame latency breakdown"
+				);
+
+				// Warn on spike frames (total > frame interval) so they stand out in logs.
+				let frame_interval_us = 1_000_000 / self.framerate as u128;
+				if total.as_micros() > frame_interval_us {
+					tracing::warn!(
+						total_us = total.as_micros() as u64,
+						channel_us = channel_wait.as_micros() as u64,
+						import_us = import_dur.as_micros() as u64,
+						convert_us = convert_dur.as_micros() as u64,
+						encode_us = encode_dur.as_micros() as u64,
+						packetize_us = packetize_dur.as_micros() as u64,
+						send_us = send_dur.as_micros() as u64,
+						encoded_bytes,
+						is_key_frame,
+						buffer_index = frame.buffer_index,
+						"SPIKE: frame latency exceeds {}us",
+						frame_interval_us
+					);
+				}
+
+				latency_samples.push(LatencySample {
+					channel_wait,
+					import: import_dur,
+					convert: convert_dur,
+					encode: encode_dur,
+					packetize: packetize_dur,
+					send: send_dur,
+					total,
+				});
+
+				// Periodic summary every 5 seconds.
+				if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
+					log_latency_summary(&latency_samples);
+					latency_samples.clear();
+					last_summary_time = std::time::Instant::now();
 				}
 
 				if !pending_idr {
 					last_frame_time = std::time::Instant::now();
 				}
+
+				has_encoded = true;
 			}
 		}
-
-		// Wait for capture thread to finish (handled by CaptureHandle Drop)
-		drop(capture);
 
 		// Flush the encoder.
 		match encoder.flush() {
@@ -448,14 +607,15 @@ impl VideoPipelineInner {
 		Ok(())
 	}
 
+	/// Returns `(packetize_duration, send_duration)` on success.
 	fn send_packet(
 		&self,
 		packet: &EncodedPacket,
-		packet_tx: &mpsc::Sender<Vec<u8>>,
+		packet_tx: &mpsc::Sender<ShardBatch>,
 		packetizer: &mut Packetizer,
 		frame_number: &mut u32,
 		sequence_number: &mut u32,
-	) -> Result<(), ()> {
+	) -> Result<(std::time::Duration, std::time::Duration), ()> {
 		// Calculate RTP timestamp from PTS (convert to 90kHz clock)
 		let rtp_timestamp = (packet.pts * 90000 / self.framerate as u64) as u32;
 
@@ -468,16 +628,28 @@ impl VideoPipelineInner {
 
 		*frame_number += 1;
 
-		packetizer.packetize(
+		let t_start = std::time::Instant::now();
+
+		let shards = packetizer.packetize(
 			&packet.data,
 			packet.is_key_frame,
-			packet_tx,
 			self.packet_size,
 			self.minimum_fec_packets,
 			self.fec_percentage,
 			*frame_number,
 			sequence_number,
 			rtp_timestamp,
-		)
+		)?;
+
+		let t_packetized = std::time::Instant::now();
+
+		if packet_tx.blocking_send(shards).is_err() {
+			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
+			return Err(());
+		}
+
+		let t_sent = std::time::Instant::now();
+
+		Ok((t_packetized - t_start, t_sent - t_packetized))
 	}
 }

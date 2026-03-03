@@ -2,22 +2,21 @@ use async_shutdown::ShutdownManager;
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
-use crate::session::{manager::SessionShutdownReason, stream::control::input::gamepad::Gamepad};
+use crate::session::{
+	compositor::input::CompositorInputEvent, manager::SessionShutdownReason, stream::control::input::gamepad::Gamepad,
+};
 
 use self::{
 	gamepad::{GamepadBattery, GamepadInfo, GamepadMotion, GamepadTouch, GamepadUpdate},
-	keyboard::{Key, Keyboard},
-	mouse::{Mouse, MouseButton, MouseMoveAbsolute, MouseMoveRelative, MouseScrollHorizontal, MouseScrollVertical},
-	reis::ReisClient,
+	keyboard::Key,
+	mouse::{MouseButton, MouseMoveAbsolute, MouseMoveRelative, MouseScrollHorizontal, MouseScrollVertical},
 };
-use ::reis::event::{DeviceCapability, EiEvent};
 
 use super::FeedbackCommand;
 
 mod gamepad;
 mod keyboard;
 mod mouse;
-mod reis;
 
 #[derive(FromRepr)]
 #[repr(u32)]
@@ -110,12 +109,16 @@ impl InputEvent {
 }
 
 pub struct InputHandler {
-	command_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
+	input_tx: calloop::channel::Sender<CompositorInputEvent>,
+	gamepad_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
 }
 
 impl InputHandler {
-	pub fn new(stop_session_manager: ShutdownManager<SessionShutdownReason>) -> Result<Self, ()> {
-		let (command_tx, command_rx) = mpsc::channel(10);
+	pub fn new(
+		input_tx: calloop::channel::Sender<CompositorInputEvent>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	) -> Result<Self, ()> {
+		let (gamepad_tx, gamepad_rx) = mpsc::channel(10);
 
 		std::thread::spawn(move || {
 			let rt = tokio::runtime::Builder::new_current_thread()
@@ -127,23 +130,80 @@ impl InputHandler {
 				let local = tokio::task::LocalSet::new();
 				local
 					.run_until(async move {
-						let mouse = Mouse::new().expect("Failed to create mouse");
-						let keyboard = Keyboard::new().expect("Failed to create keyboard");
-						let inner = InputHandlerInner { mouse, keyboard };
-						inner.run(command_rx, stop_session_manager).await;
+						run_gamepad_handler(gamepad_rx, stop_session_manager).await;
 					})
 					.await;
 			});
 		});
 
-		Ok(Self { command_tx })
+		Ok(Self { input_tx, gamepad_tx })
 	}
 
 	async fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
-		self.command_tx
-			.send((event, feedback))
-			.await
-			.map_err(|e| tracing::error!("Failed to send input event: {e}"))
+		match event {
+			InputEvent::KeyDown(key) => {
+				if let Some(keycode) = key.to_linux_keycode() {
+					tracing::trace!("Pressing key: {key:?} (keycode: {keycode})");
+					let _ = self.input_tx.send(CompositorInputEvent::KeyDown { keycode });
+				}
+			},
+			InputEvent::KeyUp(key) => {
+				if let Some(keycode) = key.to_linux_keycode() {
+					tracing::trace!("Releasing key: {key:?} (keycode: {keycode})");
+					let _ = self.input_tx.send(CompositorInputEvent::KeyUp { keycode });
+				}
+			},
+			InputEvent::MouseMoveAbsolute(event) => {
+				tracing::trace!("Absolute mouse movement: {event:?}");
+				let _ = self.input_tx.send(CompositorInputEvent::MouseMoveAbsolute {
+					x: event.x,
+					y: event.y,
+					screen_width: event.screen_width,
+					screen_height: event.screen_height,
+				});
+			},
+			InputEvent::MouseMoveRelative(event) => {
+				tracing::trace!("Moving mouse relative: {event:?}");
+				let _ = self.input_tx.send(CompositorInputEvent::MouseMoveRelative {
+					dx: event.x,
+					dy: event.y,
+				});
+			},
+			InputEvent::MouseButtonDown(button) => {
+				tracing::trace!("Pressing mouse button: {button:?}");
+				let button_code: u32 = button.into();
+				let _ = self
+					.input_tx
+					.send(CompositorInputEvent::MouseButtonDown { button: button_code });
+			},
+			InputEvent::MouseButtonUp(button) => {
+				tracing::trace!("Releasing mouse button: {button:?}");
+				let button_code: u32 = button.into();
+				let _ = self
+					.input_tx
+					.send(CompositorInputEvent::MouseButtonUp { button: button_code });
+			},
+			InputEvent::MouseScrollVertical(event) => {
+				tracing::trace!("Scrolling vertically: {event:?}");
+				let _ = self
+					.input_tx
+					.send(CompositorInputEvent::ScrollVertical { amount: event.amount });
+			},
+			InputEvent::MouseScrollHorizontal(event) => {
+				tracing::trace!("Scrolling horizontally: {event:?}");
+				let _ = self
+					.input_tx
+					.send(CompositorInputEvent::ScrollHorizontal { amount: event.amount });
+			},
+			// Gamepad events: forward to gamepad handler thread.
+			gamepad_event => {
+				self.gamepad_tx
+					.send((gamepad_event, feedback))
+					.await
+					.map_err(|e| tracing::warn!("Failed to send gamepad event: {e}"))?;
+			},
+		}
+		Ok(())
 	}
 
 	pub async fn handle_raw_input(&self, event: &[u8], feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
@@ -152,254 +212,129 @@ impl InputHandler {
 	}
 }
 
-struct InputHandlerInner {
-	mouse: Mouse,
-	keyboard: Keyboard,
-}
+async fn run_gamepad_handler(
+	mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
+	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+) {
+	// Trigger session shutdown when the input handler stops.
+	let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::InputHandlerStopped);
+	let _delay_stop = stop_session_manager.delay_shutdown_token();
 
-impl InputHandlerInner {
-	pub async fn run(
-		mut self,
-		mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-	) {
-		// Trigger session shutdown when the input handler stops.
-		let _session_stop_token =
-			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::InputHandlerStopped);
-		let _delay_stop = stop_session_manager.delay_shutdown_token();
+	let mut gamepads: [Option<Gamepad>; 16] = Default::default();
 
-		let mut gamepads: [Option<Gamepad>; 16] = Default::default();
+	while let Ok(Some((command, feedback_tx))) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
+		match command {
+			InputEvent::GamepadInfo(gamepad) => {
+				tracing::debug!("Gamepad info: {gamepad:?}");
+				if gamepad.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received info for gamepad {}, but we only have {} slots.",
+						gamepad.index,
+						gamepads.len()
+					);
+					continue;
+				}
 
-		let mut reis_client = match ReisClient::new().await {
-			Ok(client) => Some(client),
-			Err(e) => {
-				tracing::debug!("Could not yet connect to libei: {e}");
-				None
-			},
-		};
-
-		enum ReisWorkResult {
-			Event(Option<Result<EiEvent, ::reis::Error>>),
-			Connected(Box<ReisClient>),
-			ConnectError(std::io::Error),
-		}
-
-		loop {
-			tokio::select! {
-				res = async {
-					if let Some(client) = &mut reis_client {
-						let event = client.next_event().await;
-						ReisWorkResult::Event(event)
-					} else {
-						tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-						match ReisClient::new().await {
-							Ok(client) => ReisWorkResult::Connected(Box::new(client)),
-							Err(e) => ReisWorkResult::ConnectError(e),
-						}
-					}
-				} => {
-					match res {
-						ReisWorkResult::Event(Some(Ok(event))) => {
-							self.handle_reis_event(event);
-							if let Some(client) = &reis_client {
-								if let Err(e) = client.flush() {
-									tracing::error!("Failed to flush reis client: {e}");
-								}
-							}
-						}
-						ReisWorkResult::Event(Some(Err(e))) => {
-							tracing::error!("Reis error: {e}");
-							reis_client = None;
-						}
-						ReisWorkResult::Event(None) => {
-							tracing::debug!("Reis stream ended.");
-							reis_client = None;
-						}
-						ReisWorkResult::Connected(client) => {
-							tracing::debug!("Connected to libeis.");
-							reis_client = Some(*client);
-						}
-						ReisWorkResult::ConnectError(e) => {
-							tracing::debug!("Could not yet connect to libeis: {e}");
-						}
+				if gamepads[gamepad.index as usize].is_none() {
+					if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
+						gamepads[gamepad.index as usize] = Some(new_gamepad);
+						tracing::debug!("Gamepad {} connected.", gamepad.index);
 					}
 				}
-				cmd = stop_session_manager.wrap_cancel(command_rx.recv()) => {
-					match cmd {
-						Ok(Some((command, feedback_tx))) => {
-							match command {
-								InputEvent::KeyDown(key) => {
-									tracing::trace!("Pressing key: {key:?}");
-									self.keyboard.key_down(key);
-								},
-								InputEvent::KeyUp(key) => {
-									tracing::trace!("Releasing key: {key:?}");
-									self.keyboard.key_up(key);
-								},
-								InputEvent::MouseMoveAbsolute(event) => {
-									tracing::trace!("Absolute mouse movement: {event:?}");
-									self.mouse.move_absolute(
-										event.x as i32,
-										event.y as i32,
-										event.screen_width as i32,
-										event.screen_height as i32,
-									);
-								},
-								InputEvent::MouseMoveRelative(event) => {
-									tracing::trace!("Moving mouse relative: {event:?}");
-									self.mouse.move_relative(event.x as i32, event.y as i32);
-								},
-								InputEvent::MouseButtonDown(button) => {
-									tracing::trace!("Pressing mouse button: {button:?}");
-									self.mouse.button_down(button);
-								},
-								InputEvent::MouseButtonUp(button) => {
-									tracing::trace!("Releasing mouse button: {button:?}");
-									self.mouse.button_up(button);
-								},
-								InputEvent::MouseScrollVertical(event) => {
-									tracing::trace!("Scrolling vertically: {event:?}");
-									self.mouse.scroll_vertical(event.amount);
-								},
-								InputEvent::MouseScrollHorizontal(event) => {
-									tracing::trace!("Scrolling horizontally: {event:?}");
-									self.mouse.scroll_horizontal(event.amount);
-								},
-								InputEvent::GamepadInfo(gamepad) => {
-									tracing::debug!("Gamepad info: {gamepad:?}");
-									if gamepad.index as usize >= gamepads.len() {
-										tracing::warn!("Received info for gamepad {}, but we only have {} slots.", gamepad.index, gamepads.len());
-										continue;
-									}
-
-									if gamepads[gamepad.index as usize].is_none() {
-										if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
-											gamepads[gamepad.index as usize] = Some(new_gamepad);
-											tracing::info!("Gamepad {} connected.", gamepad.index);
-										}
-									}
-								},
-								InputEvent::GamepadTouch(gamepad_touch) => {
-									tracing::trace!("Gamepad touch: {gamepad_touch:?}");
-									if gamepad_touch.index as usize >= gamepads.len() {
-										tracing::warn!("Received touch for gamepad {}, but we only have {} gamepads.", gamepad_touch.index, gamepads.len());
-										continue;
-									}
-
-									match gamepads[gamepad_touch.index as usize].as_mut() {
-										Some(gamepad) => gamepad.touch(&gamepad_touch),
-										None => tracing::warn!("Received touch for gamepad {}, but no gamepad is connected.", gamepad_touch.index),
-									}
-								},
-								InputEvent::GamepadMotion(gamepad_motion) => {
-									tracing::trace!("Gamepad motion: {gamepad_motion:?}");
-									if gamepad_motion.index as usize >= gamepads.len() {
-										tracing::warn!("Received motion for gamepad {}, but we only have {} gamepads.", gamepad_motion.index, gamepads.len());
-										continue;
-									}
-
-									match gamepads[gamepad_motion.index as usize].as_mut() {
-										Some(gamepad) => gamepad.set_motion(&gamepad_motion),
-										None => tracing::warn!("Received motion for gamepad {}, but no gamepad is connected.", gamepad_motion.index),
-									}
-								},
-								InputEvent::GamepadBattery(gamepad_battery) => {
-									tracing::trace!("Gamepad battery: {gamepad_battery:?}");
-									if gamepad_battery.index as usize >= gamepads.len() {
-										tracing::warn!("Received battery for gamepad {}, but we only have {} gamepads.", gamepad_battery.index, gamepads.len());
-										continue;
-									}
-
-									match gamepads[gamepad_battery.index as usize].as_mut() {
-										Some(gamepad) => gamepad.set_battery(&gamepad_battery),
-										None => tracing::warn!("Received battery for gamepad {}, but no gamepad is connected.", gamepad_battery.index),
-									}
-								},
-								InputEvent::GamepadUpdate(gamepad_update) => {
-									tracing::trace!("Gamepad update: {gamepad_update:?}");
-									if gamepad_update.index as usize >= gamepads.len() {
-										tracing::warn!("Received update for gamepad {}, but we only have {} gamepads.", gamepad_update.index, gamepads.len());
-										continue;
-									}
-
-									match gamepads[gamepad_update.index as usize].as_mut() {
-										Some(gamepad) => gamepad.update(&gamepad_update),
-										None => tracing::warn!("Received update for gamepad {}, but no gamepad is connected.", gamepad_update.index),
-									}
-
-									// Disconnect gamepads that are no longer active.
-									for (i, gamepad) in gamepads.iter_mut().enumerate() {
-										if gamepad.is_some() && gamepad_update.active_gamepad_mask & (1 << i) == 0 {
-											tracing::info!("Gamepad {} disconnected.", i);
-											*gamepad = None;
-										}
-									}
-								},
-								InputEvent::GamepadEnableHaptics => {
-									tracing::debug!("Received request to enable haptics on gamepads.");
-									// We don't actually need to do anything.
-								},
-							}
-
-							if let Some(client) = &reis_client {
-								if let Err(e) = client.flush() {
-									tracing::error!("Failed to flush reis client: {e}");
-								}
-							}
-						}
-						_ => break,
-					}
-				}
-			}
-		}
-
-		tracing::debug!("Input handler stopped.");
-	}
-
-	fn handle_reis_event(&mut self, event: EiEvent) {
-		match event {
-			EiEvent::SeatAdded(e) => {
-				e.seat.bind_capabilities(&[
-					DeviceCapability::Pointer,
-					DeviceCapability::Keyboard,
-					DeviceCapability::Button,
-					DeviceCapability::Scroll,
-					DeviceCapability::PointerAbsolute,
-				]);
 			},
-			EiEvent::DeviceAdded(e) => {
-				let device = e.device;
-				if device.has_capability(DeviceCapability::Pointer) {
-					if let Some(pointer) = device.interface::<::reis::ei::Pointer>() {
-						self.mouse.set_pointer(pointer);
-					}
-					if let Some(pointer_absolute) = device.interface::<::reis::ei::PointerAbsolute>() {
-						self.mouse.set_pointer_absolute(pointer_absolute);
-					}
-					if let Some(button) = device.interface::<::reis::ei::Button>() {
-						self.mouse.set_button(button);
-					}
-					if let Some(scroll) = device.interface::<::reis::ei::Scroll>() {
-						self.mouse.set_scroll(scroll);
-					}
-					self.mouse.set_device(device.device().clone());
+			InputEvent::GamepadTouch(gamepad_touch) => {
+				tracing::trace!("Gamepad touch: {gamepad_touch:?}");
+				if gamepad_touch.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received touch for gamepad {}, but we only have {} gamepads.",
+						gamepad_touch.index,
+						gamepads.len()
+					);
+					continue;
 				}
-				if device.has_capability(DeviceCapability::Keyboard) {
-					if let Some(keyboard) = device.interface::<::reis::ei::Keyboard>() {
-						self.keyboard.set_keyboard(keyboard);
-					}
-					self.keyboard.set_device(device.device().clone());
+
+				match gamepads[gamepad_touch.index as usize].as_mut() {
+					Some(gamepad) => gamepad.touch(&gamepad_touch),
+					None => tracing::warn!(
+						"Received touch for gamepad {}, but no gamepad is connected.",
+						gamepad_touch.index
+					),
 				}
 			},
-			EiEvent::DeviceResumed(e) => {
-				let device = e.device;
-				device.device().start_emulating(e.serial, 1);
+			InputEvent::GamepadMotion(gamepad_motion) => {
+				tracing::trace!("Gamepad motion: {gamepad_motion:?}");
+				if gamepad_motion.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received motion for gamepad {}, but we only have {} gamepads.",
+						gamepad_motion.index,
+						gamepads.len()
+					);
+					continue;
+				}
+
+				match gamepads[gamepad_motion.index as usize].as_mut() {
+					Some(gamepad) => gamepad.set_motion(&gamepad_motion),
+					None => tracing::warn!(
+						"Received motion for gamepad {}, but no gamepad is connected.",
+						gamepad_motion.index
+					),
+				}
 			},
-			EiEvent::DevicePaused(e) => {
-				let device = e.device;
-				device.device().stop_emulating(e.serial);
+			InputEvent::GamepadBattery(gamepad_battery) => {
+				tracing::trace!("Gamepad battery: {gamepad_battery:?}");
+				if gamepad_battery.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received battery for gamepad {}, but we only have {} gamepads.",
+						gamepad_battery.index,
+						gamepads.len()
+					);
+					continue;
+				}
+
+				match gamepads[gamepad_battery.index as usize].as_mut() {
+					Some(gamepad) => gamepad.set_battery(&gamepad_battery),
+					None => tracing::warn!(
+						"Received battery for gamepad {}, but no gamepad is connected.",
+						gamepad_battery.index
+					),
+				}
 			},
-			_ => {},
+			InputEvent::GamepadUpdate(gamepad_update) => {
+				tracing::trace!("Gamepad update: {gamepad_update:?}");
+				if gamepad_update.index as usize >= gamepads.len() {
+					tracing::warn!(
+						"Received update for gamepad {}, but we only have {} gamepads.",
+						gamepad_update.index,
+						gamepads.len()
+					);
+					continue;
+				}
+
+				match gamepads[gamepad_update.index as usize].as_mut() {
+					Some(gamepad) => gamepad.update(&gamepad_update),
+					None => tracing::warn!(
+						"Received update for gamepad {}, but no gamepad is connected.",
+						gamepad_update.index
+					),
+				}
+
+				// Disconnect gamepads that are no longer active.
+				for (i, gamepad) in gamepads.iter_mut().enumerate() {
+					if gamepad.is_some() && gamepad_update.active_gamepad_mask & (1 << i) == 0 {
+						tracing::debug!("Gamepad {} disconnected.", i);
+						*gamepad = None;
+					}
+				}
+			},
+			InputEvent::GamepadEnableHaptics => {
+				tracing::debug!("Received request to enable haptics on gamepads.");
+				// We don't actually need to do anything.
+			},
+			_ => {
+				tracing::warn!("Gamepad handler received unexpected non-gamepad event.");
+			},
 		}
 	}
+
+	tracing::debug!("Input handler stopped.");
 }

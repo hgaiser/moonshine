@@ -29,14 +29,16 @@ pub enum SessionShutdownReason {
 	AudioStreamStopped,
 	/// Audio packet handler stopped unexpectedly.
 	AudioPacketHandlerStopped,
-	/// Audio capture stopped unexpectedly.
-	AudioCaptureStopped,
+	/// PulseAudio server stopped unexpectedly.
+	PulseServerStopped,
 	/// Audio encoder stopped unexpectedly.
 	AudioEncoderStopped,
 	/// Control stream stopped unexpectedly.
 	ControlStreamStopped,
 	/// Input handler stopped unexpectedly.
 	InputHandlerStopped,
+	/// Compositor stopped unexpectedly.
+	CompositorStopped,
 }
 
 pub enum SessionManagerCommand {
@@ -84,7 +86,7 @@ impl SessionManager {
 				audio_stream_context,
 			))
 			.await
-			.map_err(|e| tracing::error!("Failed to send SetStreamContext command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send SetStreamContext command: {e}"))
 	}
 
 	pub async fn get_session_context(&self) -> Result<Option<SessionContext>, ()> {
@@ -92,17 +94,17 @@ impl SessionManager {
 		self.command_tx
 			.send(SessionManagerCommand::GetSessionContext(session_context_tx))
 			.await
-			.map_err(|e| tracing::error!("Failed to get session context: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to get session context: {e}"))?;
 		session_context_rx
 			.await
-			.map_err(|e| tracing::error!("Failed to wait for GetCurrentSession response: {e}"))
+			.map_err(|e| tracing::warn!("Failed to wait for GetCurrentSession response: {e}"))
 	}
 
 	pub async fn initialize_session(&self, context: SessionContext) -> Result<(), ()> {
 		self.command_tx
 			.send(SessionManagerCommand::InitializeSession(context))
 			.await
-			.map_err(|e| tracing::error!("Failed to initialize session: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to initialize session: {e}"))?;
 		Ok(())
 	}
 
@@ -110,7 +112,7 @@ impl SessionManager {
 		self.command_tx
 			.send(SessionManagerCommand::StartSession)
 			.await
-			.map_err(|e| tracing::error!("Failed to start session: {e}"))
+			.map_err(|e| tracing::warn!("Failed to start session: {e}"))
 	}
 
 	pub async fn stop_session(&self) -> Result<(), ()> {
@@ -119,10 +121,10 @@ impl SessionManager {
 		self.command_tx
 			.send(SessionManagerCommand::StopSession(result_tx))
 			.await
-			.map_err(|e| tracing::error!("Failed to stop session: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to stop session: {e}"))?;
 		result_rx
 			.await
-			.map_err(|e| tracing::error!("Failed to wait for session to stop: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to wait for session to stop: {e}"))?;
 		Ok(())
 	}
 
@@ -130,7 +132,7 @@ impl SessionManager {
 		self.command_tx
 			.send(SessionManagerCommand::UpdateKeys(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to stop session: {e}"))
+			.map_err(|e| tracing::warn!("Failed to stop session: {e}"))
 	}
 }
 
@@ -149,6 +151,11 @@ impl SessionManagerInner {
 
 		let mut stop_session_manager = ShutdownManager::new();
 		while let Some(command) = command_rx.recv().await {
+			tracing::debug!(
+				has_session = active_session.is_some(),
+				shutdown_triggered = stop_session_manager.is_shutdown_triggered(),
+				"Session manager received command"
+			);
 			if active_session.is_some() && stop_session_manager.is_shutdown_triggered() {
 				let reason = stop_session_manager.wait_shutdown_complete().await;
 				tracing::warn!("Session stopped unexpectedly, waiting for new session (reason: {reason:?}).");
@@ -174,7 +181,7 @@ impl SessionManagerInner {
 						.map(|s| Some(s.context().clone()))
 						.unwrap_or(None);
 					if session_context_tx.send(context).is_err() {
-						tracing::error!("Failed to send current session context.");
+						tracing::warn!("Failed to send current session context.");
 					}
 				},
 
@@ -184,6 +191,7 @@ impl SessionManagerInner {
 						continue;
 					}
 
+					tracing::info!("Initializing new session");
 					active_session = match Session::new(
 						config.clone(),
 						session_context,
@@ -202,7 +210,7 @@ impl SessionManagerInner {
 					};
 
 					if session.is_running() {
-						tracing::info!("Can't start session, it is already running.");
+						tracing::warn!("Can't start session, it is already running.");
 						continue;
 					}
 

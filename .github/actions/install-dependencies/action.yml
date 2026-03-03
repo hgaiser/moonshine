@@ -15,8 +15,9 @@ runs:
           jq \
           libc++ \
           libevdev \
-          libpipewire \
           libpulse \
+          libxkbcommon \
+          mesa \
           opus \
           rust \
           shaderc

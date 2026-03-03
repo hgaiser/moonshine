@@ -16,7 +16,10 @@ use crate::{
 	config::Config,
 	session::{
 		manager::SessionManager,
-		stream::{AudioStreamContext, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamContext},
+		stream::{
+			AudioConfig, AudioStreamContext, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamContext,
+			ALL_STREAM_CONFIGS,
+		},
 	},
 };
 
@@ -132,8 +135,30 @@ impl RtspServer {
 			self.encryption_flags_supported()
 		));
 		result.push_str("sprop-parameter-sets=AAAAAU\n");
+		result.push_str("a=x-nv-video[0].refPicInvalidation:1\n");
 		result.push_str("a=rtpmap:98 AV1/90000\n");
-		result.push_str("a=fmtp:96 packetization-mode=1");
+		result.push_str("a=fmtp:96 packetization-mode=1\n");
+
+		// Emit surround-params for each Opus configuration.
+		// Moonlight selects the appropriate config at ANNOUNCE based on channel count and quality.
+		// Values are packed as single digits with no separators, matching moonlight-common-c's
+		// parseOpusConfigFromParamString() which reads one digit character at a time.
+		for (i, config) in ALL_STREAM_CONFIGS.iter().enumerate() {
+			// GFE advertises an incorrect mapping for normal quality surround configurations,
+			// rotating LFE (index 3) to the end. Moonlight undoes this rotation after parsing.
+			// We must apply the same rotation for normal quality 5.1 and 7.1 configs.
+			let mut mapping = config.mapping;
+			let is_normal_surround = i == 2 || i == 4; // SURROUND51 or SURROUND71
+			if is_normal_surround && config.channels >= 6 {
+				mapping[3..config.channels as usize].rotate_left(1);
+			}
+
+			let mut params = format!("{}{}{}", config.channels, config.streams, config.coupled_streams);
+			for &m in mapping.iter().take(config.channels as usize) {
+				params.push_str(&format!("{}", m));
+			}
+			result.push_str(&format!("a=fmtp:97 surround-params={}\n", params));
+		}
 
 		result
 	}
@@ -339,10 +364,10 @@ impl RtspServer {
 			node_id: None,
 		};
 
-		let packet_duration = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
+		let packet_duration: u32 = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
 			Ok(packet_duration) => packet_duration,
 			Err(()) => {
-				tracing::warn!("Failed to parse x-nv-video[0].clientViewportHt in SDP session.");
+				tracing::warn!("Failed to parse x-nv-aqos.packetDuration in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
@@ -354,10 +379,40 @@ impl RtspServer {
 			},
 		};
 
+		// Parse surround audio attributes from SDP.
+		let surround_channels: u8 =
+			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.numChannels").unwrap_or(2);
+		let surround_mask: u32 =
+			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.channelMask").unwrap_or(0x3);
+		let surround_enable: u8 = get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.enable").unwrap_or(0);
+		let audio_quality: u8 =
+			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.AudioQuality").unwrap_or(1);
+
+		let (channels, channel_mask) = if surround_enable != 0 {
+			(surround_channels, surround_mask)
+		} else {
+			// Fall back to the values from the HTTP launch request.
+			let ctx = self.session_manager.get_session_context().await;
+			match ctx {
+				Ok(Some(session_ctx)) => (session_ctx.audio_channels, session_ctx.audio_channel_mask),
+				_ => (2, 0x3),
+			}
+		};
+		let high_quality = audio_quality != 0;
+		let audio_config = AudioConfig::from_channels(channels, channel_mask, high_quality);
+
+		tracing::info!(
+			"Audio config: {} channels, mask=0x{:x}, high_quality={}, config={:?}",
+			audio_config.channels,
+			audio_config.channel_mask,
+			audio_config.high_quality,
+			audio_config.stream_config
+		);
+
 		let audio_stream_context = AudioStreamContext {
-			_packet_duration: packet_duration,
+			packet_duration_ms: packet_duration,
 			qos: audio_qos_type != "0",
-			sink_name: self.config.stream.audio.sink.clone(),
+			audio_config,
 		};
 
 		if self
@@ -396,14 +451,14 @@ impl RtspServer {
 			let bytes_read = connection
 				.read(&mut buffer)
 				.await
-				.map_err(|e| tracing::error!("Failed to read from connection '{}': {}", address, e))?;
+				.map_err(|e| tracing::warn!("Failed to read from connection '{}': {}", address, e))?;
 			if bytes_read == 0 {
 				tracing::warn!("Received empty RTSP request.");
 				return Ok(());
 			}
 			message_buffer.push_str(
 				std::str::from_utf8(&buffer[..bytes_read])
-					.map_err(|e| tracing::error!("Failed to convert message to string: {e}"))?,
+					.map_err(|e| tracing::warn!("Failed to convert message to string: {e}"))?,
 			);
 
 			// Hacky workaround to fix rtsp_types parsing SETUP/PLAY requests from Moonlight.
@@ -420,7 +475,7 @@ impl RtspServer {
 					continue;
 				},
 				Err(e) => {
-					tracing::error!("Failed to parse request as RTSP message: {}", e);
+					tracing::warn!("Failed to parse request as RTSP message: {}", e);
 					return Err(());
 				},
 			};
@@ -434,10 +489,10 @@ impl RtspServer {
 
 				let cseq: i32 = request
 					.header(&headers::CSEQ)
-					.ok_or_else(|| tracing::error!("RTSP request has no CSeq header"))?
+					.ok_or_else(|| tracing::warn!("RTSP request has no CSeq header"))?
 					.as_str()
 					.parse()
-					.map_err(|e| tracing::error!("Failed to parse CSeq header: {}", e))?;
+					.map_err(|e| tracing::warn!("Failed to parse CSeq header: {}", e))?;
 
 				match request.method() {
 					Method::Announce => self.handle_announce_request(request, cseq).await,
@@ -463,18 +518,18 @@ impl RtspServer {
 		let mut buffer = Vec::new();
 		response
 			.write(&mut buffer)
-			.map_err(|e| tracing::error!("Failed to serialize RTSP response: {}", e))?;
+			.map_err(|e| tracing::warn!("Failed to serialize RTSP response: {}", e))?;
 
 		connection
 			.write_all(&buffer)
 			.await
-			.map_err(|e| tracing::error!("Failed to send RTSP response: {}", e))?;
+			.map_err(|e| tracing::warn!("Failed to send RTSP response: {}", e))?;
 
 		// For some reason, Moonlight expects a connection per request, so we close the connection here.
 		connection
 			.shutdown()
 			.await
-			.map_err(|e| tracing::error!("Failed to shutdown the connection: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to shutdown the connection: {e}"))?;
 
 		Ok(())
 	}

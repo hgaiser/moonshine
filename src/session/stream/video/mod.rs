@@ -4,11 +4,14 @@ use tokio::{
 	sync::{broadcast, mpsc},
 };
 
+use crate::session::compositor::frame::ExportedFrame;
 use crate::{config::Config, session::manager::SessionShutdownReason};
 
 mod packetizer;
 mod pipeline;
+mod shard_batch;
 use pipeline::VideoPipeline;
+use shard_batch::ShardBatch;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum VideoFormat {
@@ -101,6 +104,7 @@ impl VideoStream {
 	pub async fn new(
 		config: Config,
 		context: VideoStreamContext,
+		frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
@@ -113,15 +117,15 @@ impl VideoStream {
 			// 160 corresponds to DSCP CS5 (Video)
 			tracing::debug!("Enabling QoS on video socket.");
 			socket
-				.set_tos(160)
-				.map_err(|e| tracing::error!("Failed to set QoS on the video socket: {e}"))?;
+				.set_tos_v4(160)
+				.map_err(|e| tracing::warn!("Failed to set QoS on the video socket: {e}"))?;
 		}
 
 		tracing::debug!(
 			"Listening for video messages on {}",
 			socket
 				.local_addr()
-				.map_err(|e| tracing::error!("Failed to get local address associated with control socket: {e}"))?
+				.map_err(|e| tracing::warn!("Failed to get local address associated with control socket: {e}"))?
 		);
 
 		let (command_tx, command_rx) = mpsc::channel(10);
@@ -129,6 +133,7 @@ impl VideoStream {
 			context,
 			config,
 			pipeline: None,
+			frame_rx,
 		};
 		tokio::spawn(inner.run(socket, command_rx, stop_session_manager.clone()));
 
@@ -156,6 +161,7 @@ struct VideoStreamInner {
 	context: VideoStreamContext,
 	config: Config,
 	pipeline: Option<VideoPipeline>,
+	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
 }
 
 impl VideoStreamInner {
@@ -170,7 +176,7 @@ impl VideoStreamInner {
 			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoStreamStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
-		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(1024);
+		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
 		tokio::spawn(handle_video_packets(packet_rx, socket, stop_session_manager.clone()));
 
 		let mut started_streaming = false;
@@ -181,7 +187,7 @@ impl VideoStreamInner {
 					tracing::debug!("Received request for IDR frame, next frame will be an IDR frame.");
 					let _ = idr_frame_request_tx
 						.send(())
-						.map_err(|e| tracing::error!("Failed to send IDR frame request to encoder: {e}"));
+						.map_err(|e| tracing::warn!("Failed to send IDR frame request to encoder: {e}"));
 				},
 				VideoStreamCommand::Start => {
 					if started_streaming {
@@ -210,7 +216,7 @@ impl VideoStreamInner {
 
 	async fn start(
 		&mut self,
-		packet_tx: mpsc::Sender<Vec<u8>>,
+		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<(), ()> {
@@ -219,9 +225,13 @@ impl VideoStreamInner {
 			None => find_gamescope_node_id().await?,
 		};
 
-		tracing::debug!("Creating pipeline with node_id: {}", node_id);
+		let frame_rx = self.frame_rx.take().ok_or_else(|| {
+			tracing::warn!("No frame receiver available for video pipeline");
+		})?;
+
+		tracing::debug!("Creating video pipeline with compositor frame receiver.");
 		let pipeline = VideoPipeline::new(
-			node_id,
+			frame_rx,
 			self.context.width,
 			self.context.height,
 			self.context.fps,
@@ -244,35 +254,8 @@ impl VideoStreamInner {
 	}
 }
 
-async fn find_gamescope_node_id() -> Result<u32, ()> {
-	for _ in 0..10 {
-		if let Ok(id) = find_node_id_by_name("gamescope") {
-			return Ok(id);
-		}
-		tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-	}
-	tracing::error!("Failed to find gamescope node ID.");
-	Err(())
-}
-
-fn find_node_id_by_name(name: &str) -> Result<u32, ()> {
-	let output = std::process::Command::new("sh")
-		.arg("-c")
-		.arg(format!("pw-dump | jq '.[] | select(.info.props[\"node.name\"] == \"{}\") | select(.info.props[\"media.class\"] | test(\"Video/.*\")) | .id'", name))
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pw-dump: {e}"))?;
-
-	if !output.status.success() {
-		return Err(());
-	}
-
-	let output_str = String::from_utf8_lossy(&output.stdout);
-	let id: u32 = output_str.trim().parse().map_err(|_| ())?;
-	Ok(id)
-}
-
 async fn handle_video_packets(
-	mut packet_rx: mpsc::Receiver<Vec<u8>>,
+	mut packet_rx: mpsc::Receiver<ShardBatch>,
 	socket: UdpSocket,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -285,12 +268,14 @@ async fn handle_video_packets(
 
 	while !stop_session_manager.is_shutdown_triggered() {
 		tokio::select! {
-			packet = packet_rx.recv() => {
-				match packet {
-					Some(packet) => {
+			batch = packet_rx.recv() => {
+				match batch {
+					Some(batch) => {
 						if let Some(client_address) = client_address {
-							if let Err(e) = socket.send_to(packet.as_slice(), client_address).await {
-								tracing::warn!("Failed to send packet to client: {e}");
+							for shard in batch.shards() {
+								if let Err(e) = socket.send_to(shard, client_address).await {
+									tracing::warn!("Failed to send packet to client: {e}");
+								}
 							}
 						}
 					},

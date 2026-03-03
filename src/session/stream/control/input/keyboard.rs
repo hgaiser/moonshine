@@ -1,5 +1,3 @@
-use reis::ei;
-use reis::ei::keyboard::KeyState;
 use strum_macros::FromRepr;
 
 #[derive(Debug, Eq, PartialEq, FromRepr)]
@@ -155,7 +153,8 @@ impl Key {
 		Key::from_repr(buffer[1]).ok_or_else(|| tracing::warn!("Unknown keycode: {}", buffer[5]))
 	}
 
-	fn to_linux_keycode(&self) -> Option<u32> {
+	/// Convert a Windows virtual key code to a Linux evdev keycode.
+	pub fn to_linux_keycode(&self) -> Option<u32> {
 		match self {
 			Key::Backspace => Some(14),
 			Key::Tab => Some(15),
@@ -262,50 +261,6 @@ impl Key {
 			Key::RightBrace => Some(27),
 			Key::Apostrophe => Some(40),
 			_ => None,
-		}
-	}
-}
-
-pub struct Keyboard {
-	device: Option<ei::Device>,
-	keyboard: Option<ei::Keyboard>,
-}
-
-impl Keyboard {
-	pub fn new() -> Result<Self, ()> {
-		Ok(Self {
-			device: None,
-			keyboard: None,
-		})
-	}
-
-	pub fn set_device(&mut self, device: ei::Device) {
-		self.device = Some(device);
-	}
-
-	pub fn set_keyboard(&mut self, keyboard: ei::Keyboard) {
-		self.keyboard = Some(keyboard);
-	}
-
-	pub fn key_down(&mut self, key: Key) {
-		if let Some(keyboard) = &self.keyboard {
-			if let Some(keycode) = key.to_linux_keycode() {
-				keyboard.key(keycode, KeyState::Press);
-			}
-		}
-		if let Some(device) = &self.device {
-			device.frame(0, 0);
-		}
-	}
-
-	pub fn key_up(&mut self, key: Key) {
-		if let Some(keyboard) = &self.keyboard {
-			if let Some(keycode) = key.to_linux_keycode() {
-				keyboard.key(keycode, KeyState::Released);
-			}
-		}
-		if let Some(device) = &self.device {
-			device.frame(0, 0);
 		}
 	}
 }

@@ -7,6 +7,8 @@ use crate::{
 	session::{manager::SessionShutdownReason, stream::RtpHeader, SessionKeys},
 };
 
+use super::{pulse_server::AudioFrame, OpusStreamConfig};
+
 const NR_DATA_SHARDS: usize = 4;
 const NR_PARITY_SHARDS: usize = 2;
 const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
@@ -33,43 +35,41 @@ pub struct AudioEncoder {
 impl AudioEncoder {
 	pub fn new(
 		sample_rate: u32,
-		channels: u8,
-		audio_rx: mpsc::Receiver<Vec<f32>>,
+		stream_config: &OpusStreamConfig,
+		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
+		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		// TODO: Make this configurable.
-		let audio_bitrate = 512000;
-
 		tracing::debug!("Starting audio encoder.");
 		tracing::debug!(
-			"Creating audio encoder with sample rate {} and {} channels.",
+			"Creating audio encoder with sample rate {}, {} channels ({} streams, {} coupled).",
 			sample_rate,
-			channels
+			stream_config.channels,
+			stream_config.streams,
+			stream_config.coupled_streams,
 		);
 
-		let mut encoder = opus::Encoder::new(
+		let mut encoder = opus::MSEncoder::new(
 			sample_rate,
-			if channels > 1 {
-				opus::Channels::Stereo
-			} else {
-				opus::Channels::Mono
-			},
+			stream_config.streams,
+			stream_config.coupled_streams,
+			&stream_config.mapping[..stream_config.channels as usize],
 			opus::Application::LowDelay,
 		)
-		.map_err(|e| tracing::error!("Failed to create audio encoder: {e}"))?;
+		.map_err(|e| tracing::warn!("Failed to create audio encoder: {e}"))?;
 
 		// Moonlight expects a constant bitrate.
 		encoder
 			.set_vbr(false)
-			.map_err(|e| tracing::error!("Failed to disable variable bitrate: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to disable variable bitrate: {e}"))?;
 		encoder
-			.set_bitrate(opus::Bitrate::Bits(audio_bitrate))
-			.map_err(|e| tracing::error!("Failed to set audio bitrate: {e}"))?;
+			.set_bitrate(opus::Bitrate::Bits(stream_config.bitrate as i32))
+			.map_err(|e| tracing::warn!("Failed to set audio bitrate: {e}"))?;
 
 		let fec_encoder = ReedSolomon::<galois_8::Field>::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
-			.map_err(|e| tracing::error!("Failed to create FEC encoder: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to create FEC encoder: {e}"))?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioEncoderInner {};
@@ -78,7 +78,8 @@ impl AudioEncoder {
 			.spawn(move || {
 				inner.run(
 					command_rx,
-					audio_rx,
+					frame_rx,
+					frame_recycle_tx,
 					fec_encoder,
 					encoder,
 					keys,
@@ -95,7 +96,7 @@ impl AudioEncoder {
 		self.command_tx
 			.send(AudioEncoderCommand::UpdateKeys(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -106,9 +107,10 @@ impl AudioEncoderInner {
 	fn run(
 		self,
 		mut command_rx: mpsc::Receiver<AudioEncoderCommand>,
-		mut audio_rx: mpsc::Receiver<Vec<f32>>,
+		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
+		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		mut fec_encoder: ReedSolomon<galois_8::Field>,
-		mut encoder: opus::Encoder,
+		mut encoder: opus::MSEncoder,
 		mut keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
@@ -141,6 +143,14 @@ impl AudioEncoderInner {
 		// TODO: Decide the correct size for this buffer.
 		let mut encoded_audio = vec![0u8; 1400];
 
+		// Pre-seed the recycling pipeline with empty frames.
+		for _ in 0..3 {
+			let _ = frame_recycle_tx.send(AudioFrame {
+				buf: Vec::new(),
+				capture_ts_ms: 0,
+			});
+		}
+
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Check if there's a command.
 			match command_rx.try_recv() {
@@ -158,21 +168,28 @@ impl AudioEncoderInner {
 				Err(TryRecvError::Empty) => {},
 			};
 
-			let audio_fragment = audio_rx.blocking_recv();
-			let Some(audio_fragment) = audio_fragment else {
-				tracing::debug!("Audio fragment channel closed.");
-				break;
+			let frame = match frame_rx.recv() {
+				Ok(frame) => frame,
+				Err(_) => {
+					tracing::debug!("PulseServer channel closed.");
+					break;
+				},
 			};
 
 			// TODO: Figure out the 1000 / 90 value.
 			let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
-			let encoded_size = match encoder.encode_float(&audio_fragment, &mut encoded_audio) {
+			let encoded_size = match encoder.encode_float(&frame.buf, &mut encoded_audio) {
 				Ok(encoded_size) => encoded_size,
 				Err(e) => {
 					tracing::warn!("Failed to encode audio: {e}");
 					let _ = encoder
 						.reset_state()
-						.map_err(|e| tracing::error!("Failed to reset Opus encoder state: {e}"));
+						.map_err(|e| tracing::warn!("Failed to reset Opus encoder state: {e}"));
+					// Return the frame for recycling even on error.
+					let _ = frame_recycle_tx.try_send(AudioFrame {
+						buf: frame.buf,
+						capture_ts_ms: 0,
+					});
 					continue;
 				},
 			};
@@ -185,7 +202,11 @@ impl AudioEncoderInner {
 			let payload = match encrypt_cbc(&encoded_audio[..encoded_size], &keys.remote_input_key, &iv) {
 				Ok(payload) => payload,
 				Err(e) => {
-					tracing::error!("Failed to encrypt audio: {e}");
+					tracing::warn!("Failed to encrypt audio: {e}");
+					let _ = frame_recycle_tx.try_send(AudioFrame {
+						buf: frame.buf,
+						capture_ts_ms: 0,
+					});
 					continue;
 				},
 			};
@@ -242,6 +263,10 @@ impl AudioEncoderInner {
 				if fec_encoder.reset().is_err() {
 					tracing::warn!("Parity is not ready, but we were expecting it to be ready.");
 					fec_encoder.reset_force();
+					let _ = frame_recycle_tx.try_send(AudioFrame {
+						buf: frame.buf,
+						capture_ts_ms: 0,
+					});
 					continue;
 				}
 
@@ -286,6 +311,12 @@ impl AudioEncoderInner {
 					}
 				}
 			}
+
+			// Return the empty frame for recycling.
+			let _ = frame_recycle_tx.try_send(AudioFrame {
+				buf: frame.buf,
+				capture_ts_ms: 0,
+			});
 		}
 
 		tracing::debug!("Audio encoder stopped.");

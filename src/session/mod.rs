@@ -12,9 +12,11 @@ use crate::{
 	session::stream::{AudioStream, ControlStream, VideoStream},
 };
 
+use self::stream::VideoDynamicRange;
 use self::stream::{AudioStreamContext, VideoStreamContext};
 pub use manager::SessionManager;
 
+pub mod compositor;
 pub mod manager;
 pub mod stream;
 
@@ -29,6 +31,7 @@ pub struct SessionKeys {
 
 /// Launch a session for a client.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 pub struct SessionContext {
 	/// Application to launch.
 	pub application: ApplicationConfig,
@@ -45,8 +48,11 @@ pub struct SessionContext {
 	/// Encryption keys for encoding traffic.
 	pub keys: SessionKeys,
 
-	/// Whether to play audio on the host.
-	pub host_audio: bool,
+	/// Audio channel count (2, 6, or 8).
+	pub audio_channels: u8,
+
+	/// Audio channel mask (Windows SPEAKER_ bitmask).
+	pub audio_channel_mask: u32,
 }
 
 enum SessionCommand {
@@ -59,77 +65,6 @@ pub struct Session {
 	command_tx: mpsc::Sender<SessionCommand>,
 	context: SessionContext,
 	running: bool,
-	sink_name: Option<String>,
-}
-
-fn create_audio_sink(name: &str) -> Result<String, ()> {
-	let output = Command::new("pactl")
-		.arg("load-module")
-		.arg("module-null-sink")
-		.arg(format!("sink_name={}", name))
-		.arg(format!("sink_properties=device.description={}", name))
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
-
-	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
-		return Err(());
-	}
-
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	Ok(stdout.trim().to_string())
-}
-
-fn unload_audio_sink(module_id: &str) {
-	let _ = Command::new("pactl").arg("unload-module").arg(module_id).output();
-}
-
-fn create_audio_loopback(source: &str, sink: &str) -> Result<String, ()> {
-	let output = Command::new("pactl")
-		.arg("load-module")
-		.arg("module-loopback")
-		.arg(format!("source={}.monitor", source))
-		.arg(format!("sink={}", sink))
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
-
-	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
-		return Err(());
-	}
-
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	Ok(stdout.trim().to_string())
-}
-
-fn get_default_sink() -> Result<String, ()> {
-	let output = Command::new("pactl")
-		.arg("get-default-sink")
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
-
-	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
-		return Err(());
-	}
-
-	let stdout = String::from_utf8_lossy(&output.stdout);
-	Ok(stdout.trim().to_string())
-}
-
-fn set_default_sink(name: &str) -> Result<(), ()> {
-	let output = Command::new("pactl")
-		.arg("set-default-sink")
-		.arg(name)
-		.output()
-		.map_err(|e| tracing::error!("Failed to run pactl: {e}"))?;
-
-	if !output.status.success() {
-		tracing::error!("pactl failed: {}", String::from_utf8_lossy(&output.stderr));
-		return Err(());
-	}
-
-	Ok(())
 }
 
 #[allow(clippy::result_unit_err)]
@@ -140,26 +75,25 @@ impl Session {
 		stop_session_signal: ShutdownManager<SessionShutdownReason>,
 		enet: Arc<Enet>,
 	) -> Result<Self, ()> {
-		let default_sink = get_default_sink().ok();
-		let sink_name = "moonshine-sink".to_string();
-		let module_id = create_audio_sink(&sink_name)?;
+		// Create the socket directory for the PulseAudio server.
+		let runtime_dir =
+			std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+		let pulse_dir = std::path::Path::new(&runtime_dir).join("moonshine/pulse");
+		std::fs::create_dir_all(&pulse_dir)
+			.map_err(|e| tracing::error!("Failed to create pulse socket directory: {e}"))?;
+		let socket_path = pulse_dir.join("native");
 
-		if let Some(sink) = &default_sink {
-			let _ = set_default_sink(sink);
-		}
+		// Remove any stale socket file from a previous session.
+		let _ = std::fs::remove_file(&socket_path);
 
-		let loopback_module_id = if context.host_audio {
-			if let Some(default_sink) = default_sink {
-				create_audio_loopback(&sink_name, &default_sink).ok()
-			} else {
-				tracing::warn!("Could not determine default sink for loopback.");
-				None
-			}
-		} else {
-			None
-		};
+		// Bind the PulseAudio socket before launching the application so that
+		// the app can connect as soon as it starts.
+		let listener = std::os::unix::net::UnixListener::bind(&socket_path)
+			.map_err(|e| tracing::error!("Failed to bind PulseAudio socket: {e}"))?;
 
-		let gamescope_process = start_gamescope(&context, &sink_name)?;
+		// Compositor and application launch are deferred to SessionCommand::Start
+		// so that the video stream context (with dynamic_range / HDR mode) is
+		// available for compositor format selection.
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = SessionInner {
@@ -167,32 +101,29 @@ impl Session {
 			video_stream: None,
 			audio_stream: None,
 			control_stream: None,
-			gamescope_process: Some(gamescope_process),
-			audio_sink_module_id: Some(module_id),
-			audio_loopback_module_id: loopback_module_id,
 			enet,
+			listener: Some(listener),
+			socket_path,
 		};
 		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal));
 		Ok(Self {
 			command_tx,
 			context,
 			running: false,
-			sink_name: Some(sink_name),
 		})
 	}
 
 	pub async fn start(
 		&mut self,
 		video_stream_context: VideoStreamContext,
-		mut audio_stream_context: AudioStreamContext,
+		audio_stream_context: AudioStreamContext,
 	) -> Result<(), ()> {
 		tracing::info!("Starting session.");
 		self.running = true;
-		audio_stream_context.sink_name = self.sink_name.clone();
 		self.command_tx
 			.send(SessionCommand::Start(video_stream_context, audio_stream_context))
 			.await
-			.map_err(|e| tracing::error!("Failed to send Start command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send Start command: {e}"))
 	}
 
 	pub fn context(&self) -> &SessionContext {
@@ -207,7 +138,7 @@ impl Session {
 		self.command_tx
 			.send(SessionCommand::UpdateKeys(keys))
 			.await
-			.map_err(|e| tracing::error!("Failed to send UpdateKeys command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
 	}
 }
 
@@ -216,10 +147,9 @@ struct SessionInner {
 	video_stream: Option<VideoStream>,
 	audio_stream: Option<AudioStream>,
 	control_stream: Option<ControlStream>,
-	gamescope_process: Option<Child>,
-	audio_sink_module_id: Option<String>,
-	audio_loopback_module_id: Option<String>,
 	enet: Arc<Enet>,
+	listener: Option<std::os::unix::net::UnixListener>,
+	socket_path: std::path::PathBuf,
 }
 
 impl SessionInner {
@@ -236,20 +166,67 @@ impl SessionInner {
 		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				SessionCommand::Start(video_stream_context, audio_stream_context) => {
-					let video_stream =
-						match VideoStream::new(self.config.clone(), video_stream_context, stop_session_manager.clone())
-							.await
-						{
-							Ok(video_stream) => video_stream,
-							Err(()) => continue,
+					// Start the headless compositor with HDR format selection
+					// based on the negotiated dynamic range.
+					let hdr = video_stream_context.dynamic_range == VideoDynamicRange::Hdr;
+					let compositor_config = compositor::CompositorConfig {
+						width: session_context.resolution.0,
+						height: session_context.resolution.1,
+						refresh_rate: session_context._refresh_rate,
+						gpu: self.config.gpu.clone(),
+						hdr,
+					};
+					let (frame_rx, input_tx, xdisplay_rx) =
+						match compositor::start_compositor(compositor_config, stop_session_manager.clone()) {
+							Ok(handles) => handles,
+							Err(e) => {
+								tracing::error!("Failed to start compositor: {e}");
+								continue;
+							},
 						};
-					let audio_stream =
-						match AudioStream::new(self.config.clone(), audio_stream_context, stop_session_manager.clone())
-							.await
-						{
-							Ok(audio_stream) => audio_stream,
-							Err(()) => continue,
-						};
+
+					// Launch the application in a background thread that waits
+					// for XWayland to become ready.
+					let app_context = session_context.clone();
+					let app_socket_path = self.socket_path.clone();
+					if let Err(e) = std::thread::Builder::new().name("app-launcher".to_string()).spawn(
+						move || -> Result<Child, ()> {
+							let xdisplay = xdisplay_rx
+								.recv_timeout(std::time::Duration::from_secs(5))
+								.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
+							launch_application(&app_context, &app_socket_path, xdisplay)
+						},
+					) {
+						tracing::error!("Failed to spawn app launcher thread: {e}");
+						continue;
+					}
+
+					let video_stream = match VideoStream::new(
+						self.config.clone(),
+						video_stream_context,
+						Some(frame_rx),
+						stop_session_manager.clone(),
+					)
+					.await
+					{
+						Ok(video_stream) => video_stream,
+						Err(()) => continue,
+					};
+					let Some(listener) = self.listener.take() else {
+						tracing::error!("No listener available for audio stream.");
+						continue;
+					};
+					let audio_stream = match AudioStream::new(
+						self.config.clone(),
+						audio_stream_context,
+						listener,
+						stop_session_manager.clone(),
+					)
+					.await
+					{
+						Ok(audio_stream) => audio_stream,
+						Err(()) => continue,
+					};
 					let control_stream = match ControlStream::new(
 						self.config.clone(),
 						video_stream.clone(),
@@ -257,6 +234,7 @@ impl SessionInner {
 						session_context.clone(),
 						stop_session_manager.clone(),
 						self.enet.clone(),
+						input_tx,
 					) {
 						Ok(control_stream) => control_stream,
 						Err(()) => {
@@ -287,69 +265,68 @@ impl SessionInner {
 			}
 		}
 
-		if let Some(mut gamescope_process) = self.gamescope_process {
-			let _ = gamescope_process.kill();
-		}
-
-		if let Some(module_id) = self.audio_loopback_module_id {
-			unload_audio_sink(&module_id);
-		}
-
-		if let Some(module_id) = self.audio_sink_module_id {
-			unload_audio_sink(&module_id);
-		}
+		// Stop the systemd scope to kill the application and all of its
+		// descendants. The scope was created with TimeoutStopSec=5, so
+		// this blocks at most 5 seconds before systemd sends SIGKILL.
+		let _ = Command::new("systemctl")
+			.args(["--user", "stop", "moonshine-session.scope"])
+			.stdout(Stdio::null())
+			.stderr(Stdio::null())
+			.status();
 
 		tracing::debug!("Session stopped.");
 	}
 }
 
-fn start_gamescope(context: &SessionContext, sink_name: &str) -> Result<Child, ()> {
-	let width = context.resolution.0.to_string();
-	let height = context.resolution.1.to_string();
-	let refresh_rate = context._refresh_rate.to_string();
+/// Launch the application as a child process.
+///
+/// The compositor has already set `WAYLAND_DISPLAY` in the process
+/// environment, so the child inherits it and connects to our
+/// headless compositor automatically.
+fn launch_application(context: &SessionContext, socket_path: &std::path::Path, xdisplay: u32) -> Result<Child, ()> {
+	let Some(program) = context.application.command.first() else {
+		tracing::warn!("Application command is empty.");
+		return Err(());
+	};
+	let args = &context.application.command[1..];
 
-	let mut command = vec![
-		"--backend".to_string(),
-		"headless".to_string(),
-		"-w".to_string(),
-		width.clone(),
-		"-h".to_string(),
-		height.clone(),
-		"-W".to_string(),
-		width,
-		"-H".to_string(),
-		height,
-		"-r".to_string(),
-		refresh_rate,
-		"--immediate-flips".to_string(),
-		"--force-grab-cursor".to_string(),
-	];
-
-	if context.application.enable_steam_integration {
-		command.push("--steam".to_string());
-	}
-
-	command.push("--".to_string());
-	command.extend(context.application.command.clone());
-
-	tracing::debug!("Starting gamescope with command: {:?}", command);
+	tracing::info!(program, ?args, "Launching application");
 
 	let log_dir = std::env::temp_dir().join("moonshine");
-	std::fs::create_dir_all(&log_dir).map_err(|e| tracing::error!("Failed to create log directory: {e}"))?;
-	let log_path = log_dir.join(format!("gamescope-{}.log", context.application_id));
-	tracing::debug!("Gamescope log path: {}", log_path.display());
-	let log_file = std::fs::File::create(&log_path).map_err(|e| tracing::error!("Failed to create log file: {e}"))?;
+	std::fs::create_dir_all(&log_dir).map_err(|e| tracing::warn!("Failed to create log directory: {e}"))?;
+	let log_path = log_dir.join(format!("app-{}.log", context.application_id));
+	tracing::debug!("Application log path: {}", log_path.display());
 
-	Command::new("gamescope")
-		.args(command)
-		.env("PULSE_SINK", sink_name)
+	let log_file = std::fs::File::create(&log_path).map_err(|e| tracing::warn!("Failed to create log file: {e}"))?;
+
+	// Stop any leftover scope from a previous session before starting a new one.
+	let _ = Command::new("systemctl")
+		.args(["--user", "stop", "moonshine-session.scope"])
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status();
+
+	Command::new("systemd-run")
+		.args([
+			"--user",
+			"--scope",
+			"--collect",
+			"--unit",
+			"moonshine-session",
+			"--property=TimeoutStopSec=5",
+			"--",
+		])
+		.arg(program)
+		.args(args)
+		.env("PULSE_SERVER", format!("unix:{}", socket_path.display()))
+		.env("DISPLAY", format!(":{xdisplay}"))
 		.stdout(
 			log_file
 				.try_clone()
-				.map_err(|e| tracing::error!("Failed to clone log file handle: {e}"))?,
+				.map_err(|e| tracing::warn!("Failed to clone log file handle: {e}"))?,
 		)
 		.stderr(log_file)
 		.stdin(Stdio::null())
 		.spawn()
-		.map_err(|e| tracing::error!("Failed to start gamescope: {e}"))
+		.map_err(|e| tracing::warn!("Failed to launch application: {e}"))
 }

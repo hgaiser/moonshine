@@ -8,11 +8,9 @@ This means you can play games on the client device, while rendering is done by t
 
 ## Requirements and limitations
 
-1. **Gamescope**. Moonshine uses [Gamescope](https://github.com/ValveSoftware/gamescope) in headless mode to run and stream content. This means that Moonshine is independent of whatever runs on the host system (X11, Wayland, headless, etc). This also means you can run Moonshine and stream games, while using the host system for other tasks.
-1. **(Arch) Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux. Windows is currently not supported.
+1. **Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux.
+1. **systemd**. Moonshine uses `systemd-run` to launch applications in a systemd scope for reliable process cleanup.
 1. **Moonlight v6.0.0 or higher**. Older versions are untested and might not work.
-
-> ⚠️ **Important**: There are [some](https://github.com/ValveSoftware/gamescope/pull/2023) [fixes](https://github.com/ValveSoftware/gamescope/pull/2022) applied to gamescope, so for now a [fork](https://github.com/hgaiser/gamescope/tree/moonshine) of Gamescope is required (also available on the [AUR](https://aur.archlinux.org/packages/gamescope-moonshine-git)).
 
 ## Installation
 
@@ -49,7 +47,6 @@ glibc
 jq
 libc++
 libevdev
-libpipewire
 libpulse
 opus
 rust
@@ -69,7 +66,6 @@ $ sudo pacman -S \
    jq \
    libc++ \
    libevdev \
-   libpipewire \
    libpulse \
    opus \
    rust \
@@ -81,8 +77,6 @@ Then compile and run:
 ```sh
 $ cargo run --release -- /path/to/config.toml
 ```
-
-> ⚠️ **Important**: To install the patched Gamescope, run `yay -S gamescope-moonshine-git`.
 
 ## Configuration
 
@@ -110,15 +104,14 @@ Where `<PIN>` should be replaced with the actual PIN number.
 
 ### Applications
 
-Each application defined in the configuration is executed within a [Gamescope](https://github.com/ValveSoftware/gamescope) session.
-This ensures that the application runs in a headless environment, independent of the host's desktop session.
+Each application defined in the configuration is launched in a headless session using Moonshine's built-in compositor.
+This ensures that the application runs independently of the host's desktop session.
 
 In `config.toml` each application has the following information:
 
 1. `title`. The title as reported in Moonlight.
 1. `boxart` (optional). A path to the boxart (image) for this title.
-1. `command`. A list of strings representing the command to run. The first entry is the executable, the remaining entries are the arguments. This command is executed within a `gamescope` session.
-1. `enable_steam_integration` (optional). Whether to enable Steam integration for this application (this enables the `--steam` flag for Gamescope). Defaults to `false`.
+1. `command`. A list of strings representing the command to run. The first entry is the executable, the remaining entries are the arguments.
 
 Example:
 
@@ -126,7 +119,6 @@ Example:
 [[application]]
 title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
-enable_steam_integration = true
 ```
 
 ### Application scanners
@@ -153,12 +145,12 @@ command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
 1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**
    There are two main differences between Sunshine and Moonshine:
    1. Sunshine has a lot more features and wider software support. Moonshine currently only works on Linux.
-   2. Moonshine uses Gamescope for running applications in a headless environment.
+   2. Moonshine uses its own built-in headless compositor (based on [Smithay](https://github.com/Smithay/smithay)) to run applications.
       This has a few benefits:
       - Moonshine isolates the streaming session from the host desktop session.
         This means that the host system can be used for other tasks while streaming games.
         Note that this does not allow multi-seat gaming using controllers, as these are not isolated.
-        It might allow multi-seat gaming using keyboard and mouse since these input events are "injected" into the Gamescope session.
+        It might allow multi-seat gaming using keyboard and mouse since these input events are "injected" into the compositor session.
       - Moonshine streams applications without needing an active desktop session.
         This is especially useful for headless servers, i.e. without a graphical environment.
         This also means that no monitor (or HDMI dummy plug) needs to be connected to the GPU for Moonshine to work.

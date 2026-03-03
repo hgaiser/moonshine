@@ -1,5 +1,5 @@
 pub use self::{
-	audio::{AudioStream, AudioStreamContext},
+	audio::{AudioConfig, AudioStream, AudioStreamContext, ALL_STREAM_CONFIGS},
 	control::ControlStream,
 	video::{VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStream, VideoStreamContext},
 };
@@ -18,12 +18,4 @@ struct RtpHeader {
 	ssrc: u32,
 }
 
-impl RtpHeader {
-	fn serialize(&self, buffer: &mut Vec<u8>) {
-		buffer.extend(self.header.to_be_bytes());
-		buffer.extend(self.packet_type.to_be_bytes());
-		buffer.extend(self.sequence_number.to_be_bytes());
-		buffer.extend(self.timestamp.to_be_bytes());
-		buffer.extend(self.ssrc.to_be_bytes());
-	}
-}
+impl RtpHeader {}
