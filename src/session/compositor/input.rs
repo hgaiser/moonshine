@@ -11,7 +11,6 @@ use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotio
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
 
-use super::focus::KeyboardFocusTarget;
 use super::state::MoonshineCompositor;
 
 /// Input events sent from the control stream to the compositor.
@@ -60,13 +59,16 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 		_ => state.last_pointer_activity = std::time::Instant::now(),
 	}
 
+	// One-time X11 focus reset when HDR/gamescope WSI mode is active.
+	if state.override_surface.is_some() && state.x11_focus_needs_reset {
+		state.sync_x11_focus();
+	}
+
 	match event {
 		CompositorInputEvent::KeyDown { keycode } => {
 			tracing::trace!("Key down: {keycode}");
+
 			if let Some(keyboard) = state.seat.get_keyboard() {
-				let focus = keyboard.current_focus();
-				tracing::trace!(?focus, keycode, "Key down, current keyboard focus");
-				// Keycode offset: evdev keycodes are offset by 8 from XKB keycodes.
 				keyboard.input::<(), _>(
 					state,
 					Keycode::from(keycode + 8),
@@ -79,6 +81,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 		},
 		CompositorInputEvent::KeyUp { keycode } => {
 			tracing::trace!("Key up: {keycode}");
+
 			if let Some(keyboard) = state.seat.get_keyboard() {
 				keyboard.input::<(), _>(
 					state,
@@ -97,7 +100,6 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			screen_height,
 		} => {
 			tracing::trace!("Mouse absolute: ({x}, {y}) screen: ({screen_width}x{screen_height})");
-			// Map Moonlight client coordinates to compositor output coordinates.
 			let output_size = state
 				.output
 				.current_mode()
@@ -133,30 +135,26 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 		},
 		CompositorInputEvent::MouseMoveRelative { dx, dy } => {
 			tracing::trace!("Mouse relative: ({dx}, {dy})");
-			let delta = Point::from((dx as f64, dy as f64));
 
+			let delta = Point::from((dx as f64, dy as f64));
 			let pointer = state.seat.get_pointer().unwrap();
 
 			// Check for pointer constraints (lock/confine).
 			let mut pointer_locked = false;
 			let under = find_surface_under(state);
+
 			if let Some((ref surface, ref _surface_loc)) = under {
 				with_pointer_constraint(surface, &pointer, |constraint| match constraint {
-					Some(constraint) if constraint.is_active() => {
-						match &*constraint {
-							PointerConstraint::Locked(_) => {
-								pointer_locked = true;
-							},
-							PointerConstraint::Confined(_) => {
-								// For confined, we still move but within bounds.
-							},
-						}
+					Some(constraint) if constraint.is_active() => match &*constraint {
+						PointerConstraint::Locked(_) => {
+							pointer_locked = true;
+						},
+						PointerConstraint::Confined(_) => {},
 					},
 					_ => {},
 				});
 			}
 
-			// Send relative motion first (this is what games use for look-around).
 			pointer.relative_motion(
 				state,
 				under.clone(),
@@ -167,14 +165,13 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 				},
 			);
 
-			// If pointer is locked, only emit relative motion (no absolute update).
+			state.cursor_position += delta;
+			clamp_cursor(state);
+
 			if pointer_locked {
 				pointer.frame(state);
 				return;
 			}
-
-			state.cursor_position += delta;
-			clamp_cursor(state);
 
 			pointer.motion(
 				state,
@@ -189,33 +186,8 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 		},
 		CompositorInputEvent::MouseButtonDown { button } => {
 			tracing::trace!("Mouse button down: {button:#x}");
+
 			let pointer = state.seat.get_pointer().unwrap();
-
-			// Set keyboard focus to the window under the pointer on click,
-			// following the click-to-focus model. We use KeyboardFocusTarget::Window
-			// so that X11 windows receive XSetInputFocus via the X11Surface dispatch.
-			if let Some((window, window_loc)) = state.space.element_under(state.cursor_position) {
-				let window = window.clone();
-				let x11_info = window
-					.x11_surface()
-					.map(|x| (x.title(), x.class(), x.is_override_redirect(), x.wl_surface()));
-				tracing::trace!(?x11_info, ?window_loc, cursor = ?state.cursor_position, "Click: element under cursor");
-
-				let keyboard = state.seat.get_keyboard().unwrap();
-				keyboard.set_focus(state, Some(KeyboardFocusTarget::Window(window)), serial);
-			} else {
-				// Log all windows in the space for debugging.
-				for (i, window) in state.space.elements().enumerate() {
-					let x11_info = window.x11_surface().map(|x| (x.title(), x.class()));
-					tracing::trace!(i, ?x11_info, geometry = ?window.geometry(), "Space element");
-				}
-				tracing::trace!(
-					num_windows = state.space.elements().count(),
-					cursor = ?state.cursor_position,
-					"Click: no surface under cursor"
-				);
-			}
-
 			pointer.button(
 				state,
 				&ButtonEvent {
@@ -229,6 +201,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 		},
 		CompositorInputEvent::MouseButtonUp { button } => {
 			tracing::trace!("Mouse button up: {button:#x}");
+
 			let pointer = state.seat.get_pointer().unwrap();
 			pointer.button(
 				state,
@@ -243,12 +216,14 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 		},
 		CompositorInputEvent::ScrollVertical { amount } => {
 			tracing::trace!("Scroll vertical: {amount}");
+
 			let pointer = state.seat.get_pointer().unwrap();
 			pointer.axis(state, AxisFrame::new(time).value(Axis::Vertical, -(amount as f64)));
 			pointer.frame(state);
 		},
 		CompositorInputEvent::ScrollHorizontal { amount } => {
 			tracing::trace!("Scroll horizontal: {amount}");
+
 			let pointer = state.seat.get_pointer().unwrap();
 			pointer.axis(state, AxisFrame::new(time).value(Axis::Horizontal, amount as f64));
 			pointer.frame(state);
@@ -263,26 +238,37 @@ fn clamp_cursor(state: &mut MoonshineCompositor) {
 		.current_mode()
 		.map(|m| m.size)
 		.unwrap_or((state.width as i32, state.height as i32).into());
-	// Use exclusive upper bound (width-1, height-1) so the cursor stays
-	// within the last pixel. At exactly `width` the cursor is outside the
-	// window surface and surface_under() returns None.
 	state.cursor_position.x = state.cursor_position.x.clamp(0.0, (output_size.w - 1) as f64);
 	state.cursor_position.y = state.cursor_position.y.clamp(0.0, (output_size.h - 1) as f64);
 }
 
 /// Find the Wayland surface under the current cursor position.
 ///
-/// Returns the surface and the cursor's position relative to the surface origin,
-/// suitable for passing to `PointerHandle::motion()`.
-///
-/// Uses `Window::surface_under()` which works for both native Wayland toplevel
-/// windows and X11 windows managed through XWayland.
+/// In gamescope mode (override_surface is set), always routes to the focused
+/// game window to match gamescope's input behavior. This prevents stray
+/// override-redirect windows (Steam popups, etc.) from intercepting pointer
+/// events.
 fn find_surface_under(
 	state: &MoonshineCompositor,
 ) -> Option<(
 	<MoonshineCompositor as smithay::input::SeatHandler>::PointerFocus,
 	Point<f64, Logical>,
 )> {
+	if state.override_surface.is_some() {
+		let wid = state.focused_x11_window?;
+		for window in state.space.elements() {
+			if let Some(x11) = window.x11_surface() {
+				if x11.window_id() == wid {
+					let window_loc = state.space.element_geometry(window)?.loc;
+					let pos_within_window = state.cursor_position - window_loc.to_f64();
+					let (surface, surface_offset) = window.surface_under(pos_within_window, WindowSurfaceType::ALL)?;
+					return Some((surface, surface_offset.to_f64() + window_loc.to_f64()));
+				}
+			}
+		}
+		return None;
+	}
+
 	let (window, window_loc) = state.space.element_under(state.cursor_position)?;
 	let pos_within_window = state.cursor_position - window_loc.to_f64();
 	let (surface, surface_offset) = window.surface_under(pos_within_window, WindowSurfaceType::ALL)?;

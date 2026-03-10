@@ -4,11 +4,14 @@
 //! with an in-process Smithay compositor. Frames are rendered to GBM-backed
 //! DMA-BUFs and exported directly to the video encoder.
 
+mod color_management;
 mod cursor;
 mod focus;
 pub mod frame;
+mod gamescope_swapchain;
 mod handlers;
 pub mod input;
+mod protocols;
 mod state;
 
 use std::sync::mpsc;
@@ -44,11 +47,19 @@ pub struct CompositorConfig {
 	pub hdr: bool,
 }
 
+/// Information sent from the compositor thread once XWayland is ready.
+pub struct CompositorReady {
+	/// X11 display number (e.g. `:1` → `1`).
+	pub xdisplay: u32,
+	/// Wayland socket name for the gamescope WSI layer (only set when HDR is active).
+	pub gamescope_wayland_display: Option<String>,
+}
+
 /// Result type for `start_compositor`.
 type CompositorHandles = (
 	mpsc::Receiver<ExportedFrame>,
 	calloop::channel::Sender<CompositorInputEvent>,
-	mpsc::Receiver<u32>,
+	mpsc::Receiver<CompositorReady>,
 );
 
 /// Start the headless compositor on a dedicated thread.
@@ -62,18 +73,18 @@ pub fn start_compositor(
 ) -> Result<CompositorHandles, String> {
 	let (frame_tx, frame_rx) = mpsc::sync_channel::<ExportedFrame>(2);
 	let (input_tx, input_rx) = calloop::channel::channel::<CompositorInputEvent>();
-	let (xdisplay_tx, xdisplay_rx) = mpsc::sync_channel::<u32>(1);
+	let (ready_tx, ready_rx) = mpsc::sync_channel::<CompositorReady>(1);
 
 	std::thread::Builder::new()
 		.name("compositor".to_string())
 		.spawn(move || {
-			if let Err(e) = run_compositor(config, frame_tx, input_rx, xdisplay_tx, stop) {
+			if let Err(e) = run_compositor(config, frame_tx, input_rx, ready_tx, stop) {
 				tracing::error!("Compositor failed: {e}");
 			}
 		})
 		.map_err(|e| format!("Failed to spawn compositor thread: {e}"))?;
 
-	Ok((frame_rx, input_tx, xdisplay_rx))
+	Ok((frame_rx, input_tx, ready_rx))
 }
 
 /// Main compositor loop running on a dedicated thread.
@@ -81,7 +92,7 @@ fn run_compositor(
 	config: CompositorConfig,
 	frame_tx: mpsc::SyncSender<ExportedFrame>,
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
-	xdisplay_tx: mpsc::SyncSender<u32>,
+	ready_tx: mpsc::SyncSender<CompositorReady>,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) -> Result<(), String> {
 	// Trigger session shutdown if the compositor exits unexpectedly.
@@ -137,12 +148,16 @@ fn run_compositor(
 	tracing::debug!("Supported DMA-BUF render formats: {}", render_formats.iter().count());
 
 	// Select preferred render format based on HDR mode.
-	// HDR: prefer FP16 > 10-bit > 8-bit for maximum precision.
+	// HDR: prefer 10-bit > FP16 > 8-bit.
+	// 10-bit UNORM is the natural format for PQ (ST 2084) since the compositor
+	// blits without color management — PQ-encoded values are preserved as-is.
+	// FP16 would also work but requires matching transfer function assumptions
+	// in the encoder shader.
 	// SDR: prefer 8-bit ARGB/XRGB.
 	let preferred_fourccs: Vec<Fourcc> = if config.hdr {
 		vec![
-			Fourcc::Abgr16161616f,
 			Fourcc::Abgr2101010,
+			Fourcc::Abgr16161616f,
 			Fourcc::Argb8888,
 			Fourcc::Xrgb8888,
 		]
@@ -176,7 +191,7 @@ fn run_compositor(
 		})
 		.ok_or_else(|| "No supported DMA-BUF render formats found".to_string())?;
 
-	tracing::debug!(
+	tracing::info!(
 		"Selected render format: {:?} with {} modifier(s)",
 		render_fourcc,
 		render_modifiers.len()
@@ -235,7 +250,7 @@ fn run_compositor(
 		config.height,
 		render_fourcc,
 		render_modifiers,
-		xdisplay_tx,
+		ready_tx,
 		&render_node,
 		hdr,
 	);
@@ -255,6 +270,12 @@ fn run_compositor(
 					if let Err(e) = display.dispatch_clients(state) {
 						tracing::error!("Failed to dispatch Wayland clients: {e}");
 					}
+
+					// Send deferred wp_image_description_info_v1 destructor events.
+					for info in state.deferred_info_done.drain(..) {
+						info.done();
+					}
+
 					// Flush pending events back to clients. Without this,
 					// responses (e.g. wl_registry.global, wl_callback.done)
 					// remain buffered and are never sent, causing XWayland's
@@ -332,6 +353,13 @@ fn run_compositor(
 			.dispatch(None, &mut state)
 			.map_err(|e| format!("Event loop dispatch error: {e}"))?;
 	}
+
+	// Stop the application first so X11 clients disconnect from
+	// Xwayland, then tear down the X11 window manager. When the event
+	// loop is dropped afterwards, Smithay's XWayland::Drop disconnects
+	// the Wayland client, and the `-terminate` flag causes Xwayland to
+	// exit.
+	state.shutdown_session_processes();
 
 	tracing::info!("Compositor stopped.");
 	Ok(())
@@ -449,4 +477,64 @@ fn find_render_node(gpu_config: &Option<String>) -> Result<std::path::PathBuf, S
 
 	// If found a "better" one, use it. Otherwise fall back to the first one (original behavior).
 	Ok(best_node.unwrap_or_else(|| entries[0].path()))
+}
+
+/// Probe the GPU for HDR-capable render formats.
+///
+/// Opens the render node, creates a temporary EGL context to query
+/// DMA-BUF render formats, and returns `true` if any 10-bit or FP16
+/// format suitable for HDR is available (Abgr2101010, Abgr16161616f).
+pub fn probe_hdr_support(gpu_config: &Option<String>) -> bool {
+	let render_node = match find_render_node(gpu_config) {
+		Ok(node) => node,
+		Err(e) => {
+			tracing::warn!("HDR probe: failed to find render node: {e}");
+			return false;
+		},
+	};
+
+	let render_fd = match std::fs::OpenOptions::new().read(true).write(true).open(&render_node) {
+		Ok(fd) => fd,
+		Err(e) => {
+			tracing::warn!("HDR probe: failed to open render node {}: {e}", render_node.display());
+			return false;
+		},
+	};
+
+	let gbm_device = match GbmDevice::new(render_fd) {
+		Ok(dev) => dev,
+		Err(e) => {
+			tracing::warn!("HDR probe: failed to create GBM device: {e}");
+			return false;
+		},
+	};
+
+	let egl_display = match unsafe { EGLDisplay::new(gbm_device) } {
+		Ok(d) => d,
+		Err(e) => {
+			tracing::warn!("HDR probe: failed to create EGL display: {e}");
+			return false;
+		},
+	};
+
+	let egl_context = match EGLContext::new(&egl_display) {
+		Ok(c) => c,
+		Err(e) => {
+			tracing::warn!("HDR probe: failed to create EGL context: {e}");
+			return false;
+		},
+	};
+
+	let render_formats = egl_context.dmabuf_render_formats();
+	let hdr_capable = render_formats
+		.iter()
+		.any(|f| matches!(f.code, Fourcc::Abgr2101010 | Fourcc::Abgr16161616f));
+
+	if hdr_capable {
+		tracing::info!("HDR probe: GPU supports HDR-capable render formats.");
+	} else {
+		tracing::info!("HDR probe: no HDR-capable render formats found, HDR will not be advertised.");
+	}
+
+	hdr_capable
 }

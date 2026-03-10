@@ -6,10 +6,20 @@ Moonshine is a headless streaming server which implements the protocol used by [
 It is intended for streaming games from a server to a client, while receiving input (mouse, keyboard, controller) from the client.
 This means you can play games on the client device, while rendering is done by the server.
 
+## Features
+
+- **Headless compositor**: Built-in Wayland compositor based on [Smithay](https://github.com/Smithay/smithay), isolating streaming sessions from the host desktop.
+- **Codec support**: H.264, H.265, and AV1 via hardware-accelerated Vulkan Video encoding ([PixelForge](https://github.com/hgaiser/pixelforge)).
+- **HDR support**: 10-bit encoding with PQ transfer function and BT.2020 color space (via `wp_color_management_v1`).
+- **Input handling**: Mouse, keyboard, and gamepad input (including motion, touchpad, haptics) via [inputtino](https://github.com/games-on-whales/inputtino).
+- **Audio streaming**: PulseAudio-based audio capture with Opus encoding.
+- **No monitor required**: Works on headless servers without a graphical environment or HDMI dummy plug.
+
 ## Requirements and limitations
 
 1. **Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux.
 1. **systemd**. Moonshine uses `systemd-run` to launch applications in a systemd scope for reliable process cleanup.
+1. **Vulkan Video**. A GPU with Vulkan video encoding support (e.g., NVIDIA RTX series, AMD RDNA2+, Intel Arc).
 1. **Moonlight v6.0.0 or higher**. Older versions are untested and might not work.
 
 ## Installation
@@ -42,15 +52,13 @@ avahi
 clang
 cmake
 gcc-libs
-glib2
 glibc
-jq
-libc++
 libevdev
 libpulse
 opus
 rust
 shaderc
+vulkan-headers
 ```
 
 On systems with `pacman` these can be installed with the following command:
@@ -61,15 +69,13 @@ $ sudo pacman -S \
    clang \
    cmake \
    gcc-libs \
-   glib2 \
    glibc \
-   jq \
-   libc++ \
    libevdev \
    libpulse \
    opus \
    rust \
-   shaderc
+   shaderc \
+   vulkan-headers
 ```
 
 Then compile and run:
@@ -150,7 +156,7 @@ command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
       - Moonshine isolates the streaming session from the host desktop session.
         This means that the host system can be used for other tasks while streaming games.
         Note that this does not allow multi-seat gaming using controllers, as these are not isolated.
-        It might allow multi-seat gaming using keyboard and mouse since these input events are "injected" into the compositor session.
+        It might allow some form of multi-seat gaming using keyboard and mouse since these input events are "injected" into the compositor session.
       - Moonshine streams applications without needing an active desktop session.
         This is especially useful for headless servers, i.e. without a graphical environment.
         This also means that no monitor (or HDMI dummy plug) needs to be connected to the GPU for Moonshine to work.
@@ -163,12 +169,3 @@ This wouldn't have been possible without the incredible work by the people behin
 2. [Sunshine](https://github.com/LizardByte/Sunshine), which laid a lot of the groundwork for the host part of the API.
 3. [Inputtino](https://github.com/games-on-whales/inputtino), for a thorough implementation of input devices.
 4. [magic-mirror](https://github.com/colinmarc/magic-mirror), for inspiration of using Vulkan and a Wayland compositor for headless streaming.
-
-## TODO's
-
-Below is a wishlist for improvements for Moonshine.
-If you are interested in contributing, feel free to create an issue or send a message on the [Moonlight Discord](https://discord.com/invite/moonlight-stream-352065098472488960) server.
-
-1. AV1 support.
-1. HDR support.
-1. 5.1 / 7.1 audio support.

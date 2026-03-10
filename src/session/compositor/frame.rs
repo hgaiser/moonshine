@@ -63,7 +63,6 @@ pub struct ExportedFrame {
 	/// reused for rendering.
 	pub consumed: Arc<AtomicBool>,
 	/// Color space of the rendered frame.
-	#[allow(dead_code)]
 	pub color_space: FrameColorSpace,
 	/// Optional HDR metadata from the composited content.
 	#[allow(dead_code)]

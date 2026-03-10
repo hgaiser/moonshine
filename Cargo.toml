@@ -8,10 +8,13 @@ aes = "0.8.4"
 aes-gcm = "0.10.3"
 ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649" }
 async-shutdown = "0.2.2"
-
+byteorder = "1.5.0"
+bytes = "1.11.1"
 calloop = "0.14.4"
 cbc = "0.1.2"
 clap = { version = "4.5.60", features = ["derive"] }
+crossbeam-channel = "0.5.15"
+dasp = { version = "0.11.0", features = ["signal", "interpolate", "interpolate-sinc", "ring_buffer"] }
 dirs = "6.0.0"
 enet = "0.3.0"
 hex = "0.4.3"
@@ -21,19 +24,15 @@ hyper-util = { version = "0.1.20", features = ["tokio"] }
 image = "0.25.9"
 inputtino = { version = "0.1.0", git = "https://github.com/games-on-whales/inputtino" }
 libc = "0.2.182"
+mio = { version = "1.1.1", features = ["net", "os-ext", "os-poll"] }
+mio-timerfd = "0.2.0"
 network-interface = "2.0.5"
 notify-rust = "4.12.0"
 open = "5.3.3"
 opus = "0.3.1"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", branch = "main", features = ["dmabuf"] }
 pkcs8 = "0.10.2"
 pulseaudio = "0.3.1"
-mio = { version = "1.1.1", features = ["net", "os-ext", "os-poll"] }
-mio-timerfd = "0.2.0"
-crossbeam-channel = "0.5.15"
-dasp = { version = "0.11.0", features = ["signal", "interpolate", "interpolate-sinc", "ring_buffer"] }
-bytes = "1.11.1"
-byteorder = "1.5.0"
 rand = "0.8.5"
 rcgen = "0.14.7"
 reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
@@ -56,6 +55,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 url = "2.5.8"
 uuid = { version = "1.21.0", features = ["v4"] }
 walkdir = "2.5.0"
+wayland-scanner = "0.31"
 x509-parser = "0.18.1"
 xcursor = "0.3.10"
 zeroconf = "0.17.0"

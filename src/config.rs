@@ -5,6 +5,10 @@ use std::{
 	path::{Path, PathBuf},
 };
 
+fn default_true() -> bool {
+	true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
 	/// Name of the Moonshine host.
@@ -30,6 +34,16 @@ pub struct Config {
 
 	/// Path to the DRM render node to use (e.g. /dev/dri/renderD128).
 	pub gpu: Option<String>,
+
+	/// Whether to advertise HDR support to clients.
+	///
+	/// When true (the default), the server tells clients that HDR is available.
+	/// At session time the compositor still verifies that an HDR-capable render
+	/// format is available and silently falls back to SDR if not. Set this to
+	/// false to prevent clients from attempting HDR sessions on hardware that
+	/// cannot deliver them.
+	#[serde(default = "default_true")]
+	pub hdr_support: bool,
 
 	/// Time in seconds since last ping after which the stream closes.
 	pub stream_timeout: u64,
@@ -68,6 +82,7 @@ impl Default for Config {
 				],
 			})],
 			gpu: None,
+			hdr_support: true,
 			stream_timeout: 60,
 		}
 	}

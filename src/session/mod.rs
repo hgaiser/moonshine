@@ -176,7 +176,7 @@ impl SessionInner {
 						gpu: self.config.gpu.clone(),
 						hdr,
 					};
-					let (frame_rx, input_tx, xdisplay_rx) =
+					let (frame_rx, input_tx, ready_rx) =
 						match compositor::start_compositor(compositor_config, stop_session_manager.clone()) {
 							Ok(handles) => handles,
 							Err(e) => {
@@ -191,10 +191,10 @@ impl SessionInner {
 					let app_socket_path = self.socket_path.clone();
 					if let Err(e) = std::thread::Builder::new().name("app-launcher".to_string()).spawn(
 						move || -> Result<Child, ()> {
-							let xdisplay = xdisplay_rx
+							let ready = ready_rx
 								.recv_timeout(std::time::Duration::from_secs(5))
 								.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
-							launch_application(&app_context, &app_socket_path, xdisplay)
+							launch_application(&app_context, &app_socket_path, &ready)
 						},
 					) {
 						tracing::error!("Failed to spawn app launcher thread: {e}");
@@ -235,6 +235,7 @@ impl SessionInner {
 						stop_session_manager.clone(),
 						self.enet.clone(),
 						input_tx,
+						hdr,
 					) {
 						Ok(control_stream) => control_stream,
 						Err(()) => {
@@ -280,10 +281,15 @@ impl SessionInner {
 
 /// Launch the application as a child process.
 ///
-/// The compositor has already set `WAYLAND_DISPLAY` in the process
-/// environment, so the child inherits it and connects to our
-/// headless compositor automatically.
-fn launch_application(context: &SessionContext, socket_path: &std::path::Path, xdisplay: u32) -> Result<Child, ()> {
+/// `WAYLAND_DISPLAY` is removed from the child environment so that
+/// games connect via X11 (`DISPLAY`) through XWayland. When HDR is
+/// active, the gamescope WSI layer is configured through
+/// `GAMESCOPE_WAYLAND_DISPLAY` instead.
+fn launch_application(
+	context: &SessionContext,
+	socket_path: &std::path::Path,
+	ready: &compositor::CompositorReady,
+) -> Result<Child, ()> {
 	let Some(program) = context.application.command.first() else {
 		tracing::warn!("Application command is empty.");
 		return Err(());
@@ -306,27 +312,42 @@ fn launch_application(context: &SessionContext, socket_path: &std::path::Path, x
 		.stderr(Stdio::null())
 		.status();
 
-	Command::new("systemd-run")
-		.args([
-			"--user",
-			"--scope",
-			"--collect",
-			"--unit",
-			"moonshine-session",
-			"--property=TimeoutStopSec=5",
-			"--",
-		])
-		.arg(program)
-		.args(args)
-		.env("PULSE_SERVER", format!("unix:{}", socket_path.display()))
-		.env("DISPLAY", format!(":{xdisplay}"))
-		.stdout(
-			log_file
-				.try_clone()
-				.map_err(|e| tracing::warn!("Failed to clone log file handle: {e}"))?,
-		)
-		.stderr(log_file)
-		.stdin(Stdio::null())
-		.spawn()
-		.map_err(|e| tracing::warn!("Failed to launch application: {e}"))
+	let mut cmd = Command::new("systemd-run");
+	cmd.args([
+		"--user",
+		"--scope",
+		"--collect",
+		"--unit",
+		"moonshine-session",
+		"--property=TimeoutStopSec=5",
+		"--",
+	])
+	.arg(program)
+	.args(args)
+	.env("PULSE_SERVER", format!("unix:{}", socket_path.display()))
+	.env("DISPLAY", format!(":{}", ready.xdisplay))
+	// Remove WAYLAND_DISPLAY so the game uses X11 via DISPLAY,
+	// and the gamescope WSI layer only needs GAMESCOPE_WAYLAND_DISPLAY.
+	.env_remove("WAYLAND_DISPLAY");
+
+	// Pass gamescope WSI env vars directly to the child process.
+	if let Some(ref gamescope_display) = ready.gamescope_wayland_display {
+		tracing::debug!(gamescope_display, "Setting GAMESCOPE_WAYLAND_DISPLAY for application");
+		cmd.env("GAMESCOPE_WAYLAND_DISPLAY", gamescope_display);
+		cmd.env("ENABLE_GAMESCOPE_WSI", "1");
+		// DXVK's dxgi.dll gates HDR color space exposure on this env var.
+		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
+		// games will not see HDR as available.
+		cmd.env("DXVK_HDR", "1");
+	}
+
+	cmd.stdout(
+		log_file
+			.try_clone()
+			.map_err(|e| tracing::warn!("Failed to clone log file handle: {e}"))?,
+	)
+	.stderr(log_file)
+	.stdin(Stdio::null())
+	.spawn()
+	.map_err(|e| tracing::warn!("Failed to launch application: {e}"))
 }
