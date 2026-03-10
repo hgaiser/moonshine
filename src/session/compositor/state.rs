@@ -12,25 +12,30 @@ use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::gbm::GbmAllocator;
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc, Modifier};
 use smithay::backend::renderer::damage::OutputDamageTracker;
+use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::{AsRenderElements, Element, Id, RenderElement};
+use smithay::backend::renderer::element::{AsRenderElements, Element, Id, Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
-use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions};
-use smithay::backend::renderer::{Bind, ImportDma};
+use smithay::backend::renderer::utils::{with_renderer_surface_state, CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::{Bind, BufferType, ImportDma};
 use smithay::desktop::space::SpaceRenderElements;
+use smithay::desktop::utils::send_frames_surface_tree;
+use smithay::desktop::utils::{take_presentation_feedback_surface_tree, OutputPresentationFeedback};
 use smithay::desktop::Space;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
 use smithay::reexports::calloop::LoopHandle;
 use smithay::reexports::wayland_server::backend::ClientData;
+use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
 use smithay::utils::{Clock, IsAlive, Logical, Monotonic, Point};
 use smithay::wayland::compositor;
 use smithay::wayland::compositor::{CompositorClientState, CompositorState};
-use smithay::wayland::dmabuf::{DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
+use smithay::wayland::dmabuf::{self, DmabufFeedbackBuilder, DmabufGlobal, DmabufState};
 use smithay::wayland::output::OutputManagerState;
 use smithay::wayland::pointer_constraints::PointerConstraintsState;
+use smithay::wayland::presentation::Refresh;
 use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
@@ -40,12 +45,24 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
 use super::cursor::{self, PointerElement, PointerRenderElement};
-use super::frame::{ExportedFrame, ExportedPlane, FrameColorSpace};
+use super::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
 
 /// Number of pre-allocated GBM buffers. Three allows the compositor to
 /// always have a free buffer: at most two frames are queued in the
 /// `sync_channel(2)` and one is being processed by the encoder.
 const BUFFER_POOL_SIZE: usize = 3;
+
+/// Cached X11 atom IDs, interned once on connection setup.
+pub struct CachedAtoms {
+	pub net_active_window: u32,
+	pub gamescope_focused_app: u32,
+	pub gamescope_focusable_apps: u32,
+	pub gamescope_focusable_windows: u32,
+	pub gamescope_hdr_output_feedback: u32,
+	pub gamescope_xwayland_server_id: u32,
+	pub xa_window: u32,
+	pub xa_cardinal: u32,
+}
 
 /// A pre-allocated GBM buffer slot in the compositor's buffer pool.
 pub(crate) struct GbmBufferSlot {
@@ -253,9 +270,19 @@ pub struct MoonshineCompositor {
 	// -- Extended protocols --
 	pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
 
-	// -- HDR --
-	/// Whether HDR mode is active. Controls the `FrameColorSpace` on exported frames.
-	pub hdr: bool,
+	// -- HDR / Color Management --
+	/// Color management protocol state (wp_color_management_v1).
+	/// Present when HDR mode is active.
+	pub color_management: Option<super::color_management::ColorManagementState>,
+
+	/// Deferred destructor events for wp_image_description_info_v1.
+	///
+	/// The `done()` event is a destructor that removes the object from
+	/// wayland-backend's map. Sending it inside a `Dispatch::request`
+	/// handler would panic because the backend tries to set user_data on
+	/// the (now-deleted) child object after the handler returns. We
+	/// collect them here and drain them right after `dispatch_clients`.
+	pub deferred_info_done: Vec<smithay::reexports::wayland_protocols::wp::color_management::v1::server::wp_image_description_info_v1::WpImageDescriptionInfoV1>,
 
 	// -- XWayland --
 	pub xwayland_shell_state: XWaylandShellState,
@@ -263,7 +290,48 @@ pub struct MoonshineCompositor {
 	pub xdisplay: Option<u32>,
 	/// Channel to notify the session thread of the XWayland display number
 	/// once it becomes ready.
-	pub xdisplay_tx: Option<mpsc::SyncSender<u32>>,
+	pub xdisplay_tx: Option<mpsc::SyncSender<super::CompositorReady>>,
+
+	/// Wayland socket name for the gamescope WSI layer (only set when HDR is active).
+	pub gamescope_wayland_display: Option<String>,
+
+	// -- Gamescope WSI layer --
+	/// Override surface from gamescope_swapchain::override_window_content.
+	/// When set, this surface is rendered instead of the original X11 window.
+	pub override_surface: Option<WlSurface>,
+
+	/// X11 connection for setting focus and managing atoms when the game's
+	/// X11 window operates via the gamescope WSI layer.
+	/// Stores `(connection, root_window, cached_atoms)`.
+	pub x11_input_conn: Option<(smithay::reexports::x11rb::rust_connection::RustConnection, u32, CachedAtoms)>,
+
+	/// X11 window ID of the currently focused window (from Smithay's keyboard focus).
+	pub focused_x11_window: Option<u32>,
+
+	/// App ID of the currently focused game (from steam_app_* window class).
+	/// Used to set GAMESCOPE_FOCUSED_APP on the root window so the Steam
+	/// client knows which game has focus.
+	pub focused_app_id: u32,
+
+	/// When true, the next input event should re-set X11 focus to the client
+	/// window via our direct X11 connection. This is needed because XWayland's
+	/// internal `wl_keyboard.enter` handling sets X11 focus on the FRAME
+	/// window (from the reparenting WM), overriding Smithay's focus on the
+	/// client window.
+	pub x11_focus_needs_reset: bool,
+
+	// -- Direct scanout --
+	/// Client buffers held alive during direct scanout until the encoder
+	/// signals `consumed`. Each entry pairs a consumed flag, the DMA-BUF
+	/// fd numbers (for `scanout_fd_map` cleanup), and the cloned Smithay
+	/// `Buffer` (keeps wl_buffer from being released).
+	held_scanout_buffers: Vec<(Arc<AtomicBool>, Vec<i32>, smithay::backend::renderer::utils::Buffer)>,
+	/// Maps DMA-BUF fd numbers to stable buffer indices for the encoder's
+	/// import cache. Indices start at `BUFFER_POOL_SIZE` to avoid collisions
+	/// with the GBM pool.
+	scanout_fd_map: std::collections::HashMap<i32, usize>,
+	/// Next available scanout buffer index.
+	scanout_next_index: usize,
 }
 
 /// Client state required by Smithay's compositor.
@@ -298,7 +366,7 @@ impl MoonshineCompositor {
 		height: u32,
 		render_fourcc: Fourcc,
 		render_modifiers: Vec<Modifier>,
-		xdisplay_tx: mpsc::SyncSender<u32>,
+		xdisplay_tx: mpsc::SyncSender<super::CompositorReady>,
 		render_node: &std::path::Path,
 		hdr: bool,
 	) -> (Self, Display<Self>) {
@@ -312,6 +380,7 @@ impl MoonshineCompositor {
 		RelativePointerManagerState::new::<Self>(&display_handle);
 		PointerConstraintsState::new::<Self>(&display_handle);
 		let viewporter_state = smithay::wayland::viewporter::ViewporterState::new::<Self>(&display_handle);
+		smithay::wayland::presentation::PresentationState::new::<Self>(&display_handle, 1);
 		let clock = Clock::new();
 
 		let mut space = Space::default();
@@ -329,6 +398,16 @@ impl MoonshineCompositor {
 
 		// Set WAYLAND_DISPLAY for child processes.
 		std::env::set_var("WAYLAND_DISPLAY", &socket_name);
+
+		// Store the socket name for the gamescope WSI layer when HDR is active.
+		// The actual env vars are passed to child processes via cmd.env() in
+		// session/mod.rs, avoiding the unsound std::env::set_var in a
+		// multi-threaded context.
+		let gamescope_wayland_display = if hdr {
+			Some(socket_name.to_string_lossy().into_owned())
+		} else {
+			None
+		};
 
 		// Register the socket source with the event loop.
 		let mut display_handle_clone = display_handle.clone();
@@ -393,6 +472,18 @@ impl MoonshineCompositor {
 		}
 		tracing::debug!("Pre-allocated {BUFFER_POOL_SIZE} GBM buffers for frame pool.");
 
+		// Initialize color management protocol when HDR is active.
+		let color_management = if hdr {
+			Some(super::color_management::ColorManagementState::new(&display_handle, hdr))
+		} else {
+			None
+		};
+
+		// Register gamescope swapchain protocol for WSI layer support.
+		if hdr {
+			super::gamescope_swapchain::register_globals(&display_handle);
+		}
+
 		(
 			Self {
 				display_handle,
@@ -429,11 +520,21 @@ impl MoonshineCompositor {
 				last_frame_sent_at: std::time::Instant::now(),
 				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
 				viewporter_state,
-				hdr,
+				color_management,
+				deferred_info_done: Vec::new(),
 				xwayland_shell_state,
 				xwm: None,
 				xdisplay: None,
 				xdisplay_tx: Some(xdisplay_tx),
+				gamescope_wayland_display,
+				override_surface: None,
+				x11_input_conn: None,
+				focused_x11_window: None,
+				focused_app_id: 0,
+				x11_focus_needs_reset: false,
+				held_scanout_buffers: Vec::new(),
+				scanout_fd_map: std::collections::HashMap::new(),
+				scanout_next_index: BUFFER_POOL_SIZE,
 			},
 			display,
 		)
@@ -450,6 +551,28 @@ impl MoonshineCompositor {
 		// Skip rendering when the screen is static and we already sent a
 		// keepalive frame within the last second.
 		if !self.screen_dirty && self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1) {
+			return;
+		}
+
+		// Release held scanout buffers that the encoder has finished reading.
+		// Remove their FDs from the map so recycled FDs get fresh indices.
+		self.held_scanout_buffers.retain(|(consumed, fds, _)| {
+			if consumed.load(Ordering::Acquire) {
+				for fd in fds {
+					self.scanout_fd_map.remove(fd);
+				}
+				false
+			} else {
+				true
+			}
+		});
+
+		// Try direct scanout: bypass compositor rendering when a single
+		// fullscreen DMA-BUF surface covers the entire output.
+		// Skip when the gamescope WSI layer has an override surface, as the
+		// override surface needs its own frame callbacks delivered.
+		if self.override_surface.is_none() && self.try_direct_scanout() {
+			tracing::trace!("Frame via direct scanout (not override path)");
 			return;
 		}
 
@@ -475,7 +598,13 @@ impl MoonshineCompositor {
 		// mutable borrow from renderer.bind(). This avoids a borrow
 		// conflict: the framebuffer holds a mutable ref to the dmabuf,
 		// and export_dmabuf would need an immutable ref to the same dmabuf.
-		let exported_frame = match export_dmabuf(&self.buffer_pool[idx].dmabuf, idx, consumed.clone(), self.hdr) {
+		let exported_frame = match export_dmabuf(
+			&self.buffer_pool[idx].dmabuf,
+			idx,
+			consumed.clone(),
+			self.color_management.as_ref().map(|cm| cm.frame_color_space()),
+			self.color_management.as_ref().and_then(|cm| cm.hdr_metadata()),
+		) {
 			Ok(frame) => frame,
 			Err(e) => {
 				tracing::error!("Failed to export frame: {e}");
@@ -551,7 +680,30 @@ impl MoonshineCompositor {
 		// Combine elements in front-to-back order: cursor first (on top), then space.
 		let mut elements: Vec<OutputRenderElements> = Vec::with_capacity(cursor_elements.len() + space_elements.len());
 		elements.extend(cursor_elements);
-		elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+
+		// If the gamescope WSI layer created an override surface (via
+		// override_window_content), render it instead of the XWayland
+		// space elements. The override surface receives frames directly
+		// from the NVIDIA Vulkan driver.
+		if self.override_surface.as_ref().is_some_and(|s| s.alive()) {
+			let override_surface = self.override_surface.as_ref().unwrap();
+			let override_elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
+				render_elements_from_surface_tree(
+					&mut self.renderer,
+					override_surface,
+					(0, 0),
+					1.0,
+					1.0,
+					Kind::Unspecified,
+				);
+			elements.extend(override_elements.into_iter().map(OutputRenderElements::Space));
+		} else {
+			if self.override_surface.is_some() {
+				tracing::debug!("Override surface is dead, clearing.");
+				self.override_surface = None;
+			}
+			elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+		}
 
 		tracing::trace!(
 			num_space_elements,
@@ -625,6 +777,39 @@ impl MoonshineCompositor {
 			);
 		});
 
+		// Also send frame callbacks to the override surface if active,
+		// so the NVIDIA driver's Wayland WSI unblocks and presents the
+		// next frame.
+		if let Some(ref override_surface) = self.override_surface {
+			if override_surface.alive() {
+				send_frames_surface_tree(
+					override_surface,
+					&self.output,
+					self.clock.now(),
+					Some(std::time::Duration::ZERO),
+					|_, _| Some(self.output.clone()),
+				);
+
+				// Drain and respond to wp_presentation_feedback callbacks
+				// so the NVIDIA driver's WaitForPresentKHR can return.
+				let mut feedback = OutputPresentationFeedback::new(&self.output);
+				take_presentation_feedback_surface_tree(
+					override_surface,
+					&mut feedback,
+					|_, _| Some(self.output.clone()),
+					|_, _| {
+						smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+					},
+				);
+				feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
+					self.clock.now(),
+					Refresh::Unknown,
+					0,
+					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(),
+				);
+			}
+		}
+
 		// Flush the frame callbacks (and any other pending events) to
 		// clients immediately. Without this, the wl_callback.done events
 		// sit in the outgoing buffer until the next Wayland socket
@@ -633,6 +818,167 @@ impl MoonshineCompositor {
 		if let Err(e) = self.display_handle.flush_clients() {
 			tracing::error!("Failed to flush clients after render: {e}");
 		}
+	}
+
+	/// Attempt direct DMA-BUF scanout, bypassing compositor rendering.
+	///
+	/// Returns `true` if a frame was successfully exported directly from
+	/// the client's DMA-BUF, skipping the GBM pool and GL compositing.
+	/// This preserves pixel-exact content (important for HDR/PQ) and
+	/// reduces GPU usage and latency.
+	///
+	/// Conditions for direct scanout:
+	/// - Exactly one window in the compositor space
+	/// - The window's committed buffer is a DMA-BUF (not SHM)
+	fn try_direct_scanout(&mut self) -> bool {
+		// Must have exactly one window, no overlapping surfaces.
+		let windows: Vec<_> = self.space.elements().cloned().collect();
+		if windows.len() != 1 {
+			return false;
+		}
+
+		let window = &windows[0];
+		let toplevel = match window.toplevel() {
+			Some(t) => t,
+			None => return false,
+		};
+
+		// The window must be positioned at the origin to avoid an offset frame.
+		if let Some(geo) = self.space.element_geometry(window) {
+			if geo.loc != Point::from((0, 0)) {
+				return false;
+			}
+		}
+
+		let wl_surface = toplevel.wl_surface().clone();
+
+		// Get the committed buffer and check if it's a DMA-BUF.
+		let scanout_buffer = with_renderer_surface_state(&wl_surface, |state| {
+			let buffer = state.buffer()?;
+			if !matches!(smithay::backend::renderer::buffer_type(buffer), Some(BufferType::Dma)) {
+				return None;
+			}
+			Some(buffer.clone())
+		});
+
+		let Some(Some(buffer)) = scanout_buffer else {
+			return false;
+		};
+		let Ok(client_dmabuf) = dmabuf::get_dmabuf(&buffer) else {
+			return false;
+		};
+		let client_dmabuf = client_dmabuf.clone();
+
+		// The surface buffer must exactly match the output dimensions with
+		// no scaling or offset, otherwise the encoder would receive a
+		// partial or stretched frame.
+		if client_dmabuf.width() != self.width || client_dmabuf.height() != self.height {
+			return false;
+		}
+
+		// Assign a stable buffer index for the encoder's import cache.
+		let fds: Vec<i32> = client_dmabuf
+			.handles()
+			.map(|h: std::os::unix::io::BorrowedFd<'_>| h.as_raw_fd())
+			.collect();
+		let fd = fds.first().copied().unwrap_or(-1);
+		let buffer_index = *self.scanout_fd_map.entry(fd).or_insert_with(|| {
+			let idx = self.scanout_next_index;
+			self.scanout_next_index += 1;
+			idx
+		});
+
+		let consumed = Arc::new(AtomicBool::new(false));
+
+		let color_space = self
+			.color_management
+			.as_ref()
+			.map(|cm| cm.frame_color_space())
+			.unwrap_or(FrameColorSpace::Srgb);
+		let hdr_metadata = self.color_management.as_ref().and_then(|cm| cm.hdr_metadata());
+
+		let planes: Vec<ExportedPlane> = client_dmabuf
+			.handles()
+			.zip(client_dmabuf.offsets())
+			.zip(client_dmabuf.strides())
+			.map(
+				|((handle, offset), stride): ((std::os::unix::io::BorrowedFd<'_>, u32), u32)| ExportedPlane {
+					fd: handle.as_raw_fd(),
+					offset,
+					stride,
+				},
+			)
+			.collect();
+
+		let exported_frame = ExportedFrame {
+			planes,
+			format: client_dmabuf.format().code as u32,
+			modifier: Into::<u64>::into(client_dmabuf.format().modifier),
+			width: client_dmabuf.width(),
+			height: client_dmabuf.height(),
+			created_at: std::time::Instant::now(),
+			buffer_index,
+			consumed: consumed.clone(),
+			color_space,
+			hdr_metadata,
+		};
+
+		// Hold the client Buffer alive until the encoder finishes reading.
+		self.held_scanout_buffers.push((consumed.clone(), fds, buffer));
+
+		match self.frame_tx.try_send(exported_frame) {
+			Err(mpsc::TrySendError::Disconnected(_)) => {
+				tracing::debug!("Frame channel disconnected, compositor stopping.");
+			},
+			Err(mpsc::TrySendError::Full(_)) => {
+				consumed.store(true, Ordering::Release);
+			},
+			Ok(()) => {
+				self.screen_dirty = false;
+				self.last_frame_sent_at = std::time::Instant::now();
+			},
+		}
+
+		// Send frame callbacks to the client.
+		window.send_frame(
+			&self.output,
+			self.clock.now(),
+			Some(std::time::Duration::ZERO),
+			|_, _| Some(self.output.clone()),
+		);
+
+		// Drain and respond to wp_presentation_feedback callbacks.
+		let mut feedback = OutputPresentationFeedback::new(&self.output);
+		take_presentation_feedback_surface_tree(
+			&wl_surface,
+			&mut feedback,
+			|_, _| Some(self.output.clone()),
+			|_, _| {
+				smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+			},
+		);
+		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
+			self.clock.now(),
+			Refresh::Unknown,
+			0,
+			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
+			),
+		);
+
+		if let Err(e) = self.display_handle.flush_clients() {
+			tracing::error!("Failed to flush clients after scanout: {e}");
+		}
+
+		true
+	}
+
+	/// Handle gamescope WSI layer's `override_window_content` request.
+	///
+	/// Stores the override surface so it gets rendered instead of the
+	/// original X11 window.
+	pub fn override_window_surface(&mut self, x11_window: u32, surface: WlSurface) {
+		tracing::debug!(x11_window, "Storing override surface for X11 window");
+		self.override_surface = Some(surface);
 	}
 
 	/// Start the XWayland server so X11 applications can connect.
@@ -695,14 +1041,97 @@ impl MoonshineCompositor {
 						.expect("Failed to start X11 window manager.");
 
 					tracing::debug!(display_number, "XWayland ready.");
-					std::env::set_var("DISPLAY", format!(":{display_number}"));
 
 					data.xwm = Some(wm);
 					data.xdisplay = Some(display_number);
 
+					// Open a separate X11 connection for focus management
+					// and gamescope atom updates.
+					{
+						use smithay::reexports::x11rb::connection::Connection as _;
+						use smithay::reexports::x11rb::protocol::xproto::ConnectionExt as _;
+						use smithay::reexports::x11rb::rust_connection::RustConnection;
+						let display = format!(":{display_number}");
+						match RustConnection::connect(Some(&display)) {
+							Ok((conn, screen_num)) => {
+								let root = conn.setup().roots[screen_num].root;
+								tracing::debug!(display_number, root, "Opened X11 input connection.");
+
+								// Intern atoms once for the lifetime of this connection.
+								let atoms = CachedAtoms {
+									net_active_window: conn
+										.intern_atom(false, b"_NET_ACTIVE_WINDOW")
+										.ok()
+										.and_then(|c| c.reply().ok())
+										.map(|r| r.atom)
+										.unwrap_or(0),
+									gamescope_focused_app: conn
+										.intern_atom(false, b"GAMESCOPE_FOCUSED_APP")
+										.ok()
+										.and_then(|c| c.reply().ok())
+										.map(|r| r.atom)
+										.unwrap_or(0),
+									gamescope_focusable_apps: conn
+										.intern_atom(false, b"GAMESCOPE_FOCUSABLE_APPS")
+										.ok()
+										.and_then(|c| c.reply().ok())
+										.map(|r| r.atom)
+										.unwrap_or(0),
+									gamescope_focusable_windows: conn
+										.intern_atom(false, b"GAMESCOPE_FOCUSABLE_WINDOWS")
+										.ok()
+										.and_then(|c| c.reply().ok())
+										.map(|r| r.atom)
+										.unwrap_or(0),
+									gamescope_hdr_output_feedback: conn
+										.intern_atom(false, b"GAMESCOPE_HDR_OUTPUT_FEEDBACK")
+										.ok()
+										.and_then(|c| c.reply().ok())
+										.map(|r| r.atom)
+										.unwrap_or(0),
+									gamescope_xwayland_server_id: conn
+										.intern_atom(false, b"GAMESCOPE_XWAYLAND_SERVER_ID")
+										.ok()
+										.and_then(|c| c.reply().ok())
+										.map(|r| r.atom)
+										.unwrap_or(0),
+									xa_window: conn
+										.intern_atom(false, b"WINDOW")
+										.ok()
+										.and_then(|c| c.reply().ok())
+										.map(|r| r.atom)
+										.unwrap_or(33),
+									xa_cardinal: conn
+										.intern_atom(false, b"CARDINAL")
+										.ok()
+										.and_then(|c| c.reply().ok())
+										.map(|r| r.atom)
+										.unwrap_or(6),
+								};
+
+								data.x11_input_conn = Some((conn, root, atoms));
+							},
+							Err(e) => {
+								tracing::warn!("Failed to open X11 input connection: {e}");
+							},
+						}
+					}
+
+					// Set gamescope X11 atoms for the WSI layer if HDR is active.
+					if data.color_management.is_some() {
+						if let Some((conn, root, atoms)) = &data.x11_input_conn {
+							data.set_gamescope_x11_atoms(conn, *root, atoms, display_number);
+						} else {
+							tracing::warn!("Cannot set gamescope X11 atoms: no X11 connection");
+						}
+					}
+
 					// Notify the session thread that XWayland is ready.
 					if let Some(tx) = data.xdisplay_tx.take() {
-						let _ = tx.send(display_number);
+						let _ = tx.send(super::CompositorReady {
+							xdisplay: display_number,
+							gamescope_wayland_display: data.gamescope_wayland_display.clone(),
+						});
 					}
 				},
 				XWaylandEvent::Error => {
@@ -712,6 +1141,98 @@ impl MoonshineCompositor {
 
 		if let Err(e) = ret {
 			tracing::error!("Failed to insert XWayland source into event loop: {e}");
+		}
+	}
+
+	/// Set gamescope-specific X11 atoms on the XWayland root window.
+	///
+	/// The gamescope WSI Vulkan layer reads these atoms from the root
+	/// window to determine if HDR output is enabled and to get the
+	/// XWayland server ID for override_window_content.
+	fn set_gamescope_x11_atoms(
+		&self,
+		conn: &smithay::reexports::x11rb::rust_connection::RustConnection,
+		root: u32,
+		atoms: &CachedAtoms,
+		display_number: u32,
+	) {
+		use smithay::reexports::x11rb::connection::Connection;
+		use smithay::reexports::x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
+
+		// Set GAMESCOPE_HDR_OUTPUT_FEEDBACK = 1 on root window.
+		let _ = conn.change_property32(
+			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
+			root,
+			atoms.gamescope_hdr_output_feedback,
+			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
+			&[1u32],
+		);
+
+		// Set GAMESCOPE_XWAYLAND_SERVER_ID = 0 on root window.
+		// The gamescope WSI layer reads this to pass to override_window_content.
+		let _ = conn.change_property32(
+			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
+			root,
+			atoms.gamescope_xwayland_server_id,
+			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
+			&[0u32],
+		);
+
+		// Set GAMESCOPE_FOCUSED_APP = 0 (no game focused yet).
+		let _ = conn.change_property32(
+			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
+			root,
+			atoms.gamescope_focused_app,
+			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
+			&[0u32],
+		);
+
+		// Set GAMESCOPE_FOCUSABLE_APPS = [] (empty, no windows yet).
+		let _ = conn.change_property32(
+			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
+			root,
+			atoms.gamescope_focusable_apps,
+			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
+			&[],
+		);
+
+		// Set GAMESCOPE_FOCUSABLE_WINDOWS = [] (empty, no windows yet).
+		let _ = conn.change_property32(
+			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
+			root,
+			atoms.gamescope_focusable_windows,
+			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
+			&[],
+		);
+
+		let _ = conn.flush();
+		tracing::debug!("Set gamescope X11 atoms on root window (display :{display_number})");
+	}
+
+	/// Shut down the application and XWayland server.
+	///
+	/// Stops the application's systemd scope first so that X11 clients
+	/// disconnect, then drops the X11 window manager connection. This
+	/// ensures all clients are gone before Xwayland's `-terminate` flag
+	/// triggers a clean exit.
+	pub fn shutdown_session_processes(&mut self) {
+		// Stop the application so all X11 clients disconnect from Xwayland.
+		let status = std::process::Command::new("systemctl")
+			.args(["--user", "stop", "moonshine-session.scope"])
+			.stdout(std::process::Stdio::null())
+			.stderr(std::process::Stdio::null())
+			.status();
+		match status {
+			Ok(s) if s.success() => tracing::debug!("Stopped moonshine-session.scope"),
+			Ok(s) => tracing::debug!("systemctl stop exited with {s}"),
+			Err(e) => tracing::warn!("Failed to stop moonshine-session.scope: {e}"),
+		}
+
+		// Drop the X11 window manager, closing the privileged WM
+		// connection to Xwayland. Combined with the client disconnect
+		// above, Xwayland will see no remaining connections.
+		if self.xwm.take().is_some() {
+			tracing::debug!("Dropped X11 window manager");
 		}
 	}
 }
@@ -727,7 +1248,8 @@ fn export_dmabuf(
 	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
 	buffer_index: usize,
 	consumed: Arc<AtomicBool>,
-	hdr: bool,
+	surface_color_space: Option<FrameColorSpace>,
+	hdr_metadata: Option<HdrMetadata>,
 ) -> Result<ExportedFrame, String> {
 	let planes: Vec<ExportedPlane> = dmabuf
 		.handles()
@@ -749,11 +1271,7 @@ fn export_dmabuf(
 		created_at: std::time::Instant::now(),
 		buffer_index,
 		consumed,
-		color_space: if hdr {
-			FrameColorSpace::Bt2020Pq
-		} else {
-			FrameColorSpace::Srgb
-		},
-		hdr_metadata: None,
+		color_space: surface_color_space.unwrap_or(FrameColorSpace::Srgb),
+		hdr_metadata,
 	})
 }

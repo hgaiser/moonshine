@@ -12,7 +12,7 @@ use ash::vk;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc};
 
-use crate::session::compositor::frame::ExportedFrame;
+use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
 use crate::session::manager::SessionShutdownReason;
 
 use super::packetizer::Packetizer;
@@ -472,6 +472,17 @@ impl VideoPipelineInner {
 					},
 				};
 
+				// Select per-frame color space. In HDR mode, SDR content
+				// (sRGB) needs an sRGB→BT.2020+PQ conversion, while
+				// native HDR content uses BT.2020 directly.
+				if self.dynamic_range == VideoDynamicRange::Hdr {
+					let cs = match frame.color_space {
+						FrameColorSpace::Srgb => ColorSpace::SrgbToBt2020Pq,
+						FrameColorSpace::Bt2020Pq => ColorSpace::Bt2020,
+					};
+					converter.set_color_space(cs);
+				}
+
 				// Convert to YUV.
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
 					tracing::warn!("GPU color conversion failed: {e}");
@@ -500,6 +511,7 @@ impl VideoPipelineInner {
 						for packet in packets {
 							encoded_bytes += packet.data.len();
 							is_key_frame |= packet.is_key_frame;
+
 							let (p, s) = match self.send_packet(
 								&packet,
 								&packet_tx,

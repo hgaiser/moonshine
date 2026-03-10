@@ -27,6 +27,15 @@ use super::state::MoonshineCompositor;
 #[derive(Debug, Clone, PartialEq)]
 pub enum KeyboardFocusTarget {
 	Window(Window),
+	/// An X11 window whose rendering bypasses XWayland (e.g. gamescope WSI),
+	/// leaving it without a `wl_surface`. Keyboard events are proxied through
+	/// another XWayland `wl_surface` so that `wl_keyboard` protocol delivery
+	/// still reaches the XWayland client. XWayland then forwards the events
+	/// to whichever X11 window holds X11 focus.
+	ProxiedX11 {
+		window: Window,
+		proxy_surface: WlSurface,
+	},
 }
 
 impl IsAlive for KeyboardFocusTarget {
@@ -34,6 +43,7 @@ impl IsAlive for KeyboardFocusTarget {
 	fn alive(&self) -> bool {
 		match self {
 			KeyboardFocusTarget::Window(w) => w.alive(),
+			KeyboardFocusTarget::ProxiedX11 { window, .. } => window.alive(),
 		}
 	}
 }
@@ -43,6 +53,7 @@ impl WaylandFocus for KeyboardFocusTarget {
 	fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
 		match self {
 			KeyboardFocusTarget::Window(w) => w.wl_surface(),
+			KeyboardFocusTarget::ProxiedX11 { proxy_surface, .. } => Some(Cow::Borrowed(proxy_surface)),
 		}
 	}
 }
@@ -67,6 +78,9 @@ impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 				WindowSurface::Wayland(w) => KeyboardTarget::enter(w.wl_surface(), seat, data, keys, serial),
 				WindowSurface::X11(s) => KeyboardTarget::enter(s, seat, data, keys, serial),
 			},
+			KeyboardFocusTarget::ProxiedX11 { proxy_surface, .. } => {
+				KeyboardTarget::enter(proxy_surface, seat, data, keys, serial);
+			},
 		}
 	}
 
@@ -75,6 +89,9 @@ impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 			KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
 				WindowSurface::Wayland(w) => KeyboardTarget::leave(w.wl_surface(), seat, data, serial),
 				WindowSurface::X11(s) => KeyboardTarget::leave(s, seat, data, serial),
+			},
+			KeyboardFocusTarget::ProxiedX11 { proxy_surface, .. } => {
+				KeyboardTarget::leave(proxy_surface, seat, data, serial);
 			},
 		}
 	}
@@ -93,6 +110,9 @@ impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 				WindowSurface::Wayland(w) => KeyboardTarget::key(w.wl_surface(), seat, data, key, state, serial, time),
 				WindowSurface::X11(s) => KeyboardTarget::key(s, seat, data, key, state, serial, time),
 			},
+			KeyboardFocusTarget::ProxiedX11 { proxy_surface, .. } => {
+				KeyboardTarget::key(proxy_surface, seat, data, key, state, serial, time);
+			},
 		}
 	}
 
@@ -107,6 +127,9 @@ impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 			KeyboardFocusTarget::Window(w) => match w.underlying_surface() {
 				WindowSurface::Wayland(w) => KeyboardTarget::modifiers(w.wl_surface(), seat, data, modifiers, serial),
 				WindowSurface::X11(s) => KeyboardTarget::modifiers(s, seat, data, modifiers, serial),
+			},
+			KeyboardFocusTarget::ProxiedX11 { proxy_surface, .. } => {
+				KeyboardTarget::modifiers(proxy_surface, seat, data, modifiers, serial);
 			},
 		}
 	}

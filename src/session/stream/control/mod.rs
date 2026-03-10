@@ -280,7 +280,7 @@ pub struct ControlStream {
 }
 
 impl ControlStream {
-	#[allow(clippy::result_unit_err)]
+	#[allow(clippy::result_unit_err, clippy::too_many_arguments)]
 	pub fn new(
 		config: Config,
 		video_stream: VideoStream,
@@ -289,6 +289,7 @@ impl ControlStream {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		enet: Arc<Enet>,
 		input_tx: calloop::channel::Sender<crate::session::compositor::input::CompositorInputEvent>,
+		hdr: bool,
 	) -> Result<Self, ()> {
 		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone())?;
 
@@ -339,6 +340,7 @@ impl ControlStream {
 				context,
 				input_handler,
 				stop_session_manager.clone(),
+				hdr,
 			))
 		});
 
@@ -352,6 +354,25 @@ impl ControlStream {
 			.await
 			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
 	}
+}
+
+/// Build the payload for an HDR mode control message (type 0x010e).
+///
+/// Format matches Sunshine's `control_hdr_mode_t`:
+/// - u16 LE: message type (0x010e)
+/// - u16 LE: payload length (1 + 30 = 31 bytes for metadata)
+/// - u8: enabled (1 = HDR on, 0 = HDR off)
+/// - SS_HDR_METADATA: 30 bytes of HDR metadata (zeroed for now)
+fn build_hdr_mode_payload(enabled: bool) -> Vec<u8> {
+	let metadata_size = 30u16; // SS_HDR_METADATA: 15 x u16 fields
+	let payload_len = 1 + metadata_size; // enabled byte + metadata
+	let mut buf = Vec::with_capacity(4 + payload_len as usize);
+	buf.extend((ControlMessageType::HdrMode as u16).to_le_bytes());
+	buf.extend(payload_len.to_le_bytes());
+	buf.push(if enabled { 1 } else { 0 });
+	// HDR metadata fields (all zeros — no mastering display info available yet).
+	buf.extend(std::iter::repeat_n(0u8, metadata_size as usize));
+	buf
 }
 
 struct ControlStreamInner {}
@@ -368,6 +389,7 @@ impl ControlStreamInner {
 		mut context: SessionContext,
 		input_handler: InputHandler,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		hdr: bool,
 	) {
 		// Trigger session shutdown when the control stream stops.
 		let _session_stop_token =
@@ -381,6 +403,7 @@ impl ControlStreamInner {
 
 		// Sequence number of feedback messages.
 		let mut sequence_number = 0u32;
+		let mut send_hdr_mode = false;
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Check if we received a command.
@@ -489,6 +512,7 @@ impl ControlStreamInner {
 							if video_stream.start().await.is_err() {
 								break;
 							}
+							send_hdr_mode = hdr;
 						},
 						ControlMessage::Ping => {
 							stop_deadline =
@@ -507,6 +531,28 @@ impl ControlStreamInner {
 				},
 				Ok(None) => (),
 				Err(_) => break,
+			}
+
+			// Send HDR mode notification after the host.service() match to avoid double mutable borrow.
+			if send_hdr_mode {
+				send_hdr_mode = false;
+				let hdr_payload = build_hdr_mode_payload(true);
+				let hdr_packet = encode_control(&context.keys.remote_input_key, sequence_number, &hdr_payload);
+				sequence_number += 1;
+
+				if let Ok(hdr_packet) = hdr_packet {
+					for mut peer in host.peers() {
+						if peer.state() != enet::PeerState::Connected {
+							continue;
+						}
+						if let Ok(p) = enet::Packet::new(hdr_packet.as_slice(), enet::PacketMode::ReliableSequenced) {
+							let _ = peer
+								.send_packet(p, 0)
+								.map_err(|e| tracing::warn!("Failed to send HDR mode to peer: {e}"));
+						}
+					}
+					tracing::info!("Sent HDR mode enabled to client");
+				}
 			}
 		}
 

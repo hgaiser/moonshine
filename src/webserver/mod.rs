@@ -57,6 +57,7 @@ pub struct Webserver {
 	client_manager: ClientManager,
 	session_manager: SessionManager,
 	server_certs: String,
+	hdr_supported: bool,
 }
 
 impl Webserver {
@@ -70,12 +71,17 @@ impl Webserver {
 		session_manager: SessionManager,
 		shutdown: ShutdownManager<i32>,
 	) -> Result<Self, ()> {
+		// Gate HDR advertisement on both the config flag and a runtime
+		// GPU capability probe (10-bit or FP16 render formats).
+		let hdr_supported = config.hdr_support && crate::session::compositor::probe_hdr_support(&config.gpu);
+
 		let server = Self {
 			config: config.clone(),
 			unique_id,
 			client_manager,
 			session_manager,
 			server_certs,
+			hdr_supported,
 		};
 
 		// Run HTTP webserver.
@@ -286,12 +292,8 @@ impl Webserver {
 		for application in self.config.applications.iter() {
 			response += "<App>";
 
-			// HDR is not yet functional: Smithay 0.7 lacks wp_color_management_v1
-			// support, so the compositor cannot produce HDR content. Advertising
-			// HDR here would cause clients to negotiate HDR mode and receive
-			// incorrectly encoded sRGB frames. Re-enable once Smithay supports
-			// the color management protocol.
-			response += "<IsHdrSupported>0</IsHdrSupported>";
+			let hdr_supported = u8::from(self.hdr_supported);
+			response += format!("<IsHdrSupported>{hdr_supported}</IsHdrSupported>").as_ref();
 			response += format!("<AppTitle>{}</AppTitle>", escape_xml(&application.title)).as_ref();
 			response += format!("<ID>{}</ID>", application.id()).as_ref();
 
