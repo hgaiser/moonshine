@@ -285,30 +285,31 @@ pub struct Gamepad {
 
 impl Gamepad {
 	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
+		let id = format!("00:11:22:33:{}", info.index);
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
 				0x045e,
 				0x02dd,
 				0x0100,
-				"00:11:22:33:44",
-				"00:11:22:33:44",
+				id.as_str(),
+				id.as_str(),
 			),
 			GamepadKind::PlayStation => DeviceDefinition::new(
 				"Moonshine PS5 controller",
 				0x054C,
 				0x0CE6,
 				0x8111,
-				"00:11:22:33:44",
-				"00:11:22:33:44",
+				id.as_str(),
+				id.as_str(),
 			),
 			GamepadKind::Nintendo => DeviceDefinition::new(
 				"Moonshine Switch controller",
 				0x057e,
 				0x2009,
 				0x8111,
-				"00:11:22:33:44",
-				"00:11:22:33:44",
+				id.as_str(),
+				id.as_str(),
 			),
 		};
 
