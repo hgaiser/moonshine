@@ -55,7 +55,9 @@ gcc-libs
 glibc
 libevdev
 libpulse
+make
 opus
+pkg-config
 rust
 shaderc
 vulkan-headers
@@ -72,7 +74,9 @@ $ sudo pacman -S \
    glibc \
    libevdev \
    libpulse \
+   make \
    opus \
+   pkg-config \
    rust \
    shaderc \
    vulkan-headers
