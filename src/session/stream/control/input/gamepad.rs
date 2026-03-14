@@ -285,7 +285,7 @@ pub struct Gamepad {
 
 impl Gamepad {
 	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
-		let id = format!("00:11:22:33:{}", info.index);
+		let id = format!("00:11:22:33:{:02x}", info.index);
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
