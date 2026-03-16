@@ -65,3 +65,4 @@ zeroconf = "0.17.0"
 
 [patch.crates-io]
 reed-solomon-erasure = { version = "6.0.0", git = "https://github.com/hgaiser/reed-solomon-erasure", branch = "moonshine" }
+enet-sys = { git = "https://github.com/eslam-allam/enet-sys", branch = "master" }
