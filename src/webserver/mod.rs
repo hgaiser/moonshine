@@ -391,15 +391,6 @@ impl Webserver {
 		mac_address: Option<String>,
 		https: bool,
 	) -> Response<Full<Bytes>> {
-		let unique_id = match params.get("uniqueid") {
-			Some(unique_id) => unique_id.clone(),
-			None => {
-				let message = format!("Expected 'uniqueid' in /serverinfo request, got {:?}.", params.keys());
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
 		let session_context = match self.session_manager.get_session_context().await {
 			Ok(session_context) => session_context,
 			Err(()) => {
@@ -411,10 +402,9 @@ impl Webserver {
 
 		// Seems we should only say we paired when using HTTPS.
 		let paired = if https {
-			if self.client_manager.is_paired(unique_id).await.unwrap_or(false) {
-				"1"
-			} else {
-				"0"
+			match params.get("uniqueid") {
+				Some(unique_id) if self.client_manager.is_paired(unique_id.clone()).await.unwrap_or(false) => "1",
+				Some(_) | None => "0",
 			}
 		} else {
 			"0"
