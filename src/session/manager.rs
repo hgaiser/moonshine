@@ -39,6 +39,8 @@ pub enum SessionShutdownReason {
 	InputHandlerStopped,
 	/// Compositor stopped unexpectedly.
 	CompositorStopped,
+	/// Application stopped unexpectedly.
+	ApplicationStopped,
 }
 
 pub enum SessionManagerCommand {
@@ -150,7 +152,23 @@ impl SessionManagerInner {
 		tracing::debug!("Session manager waiting for commands.");
 
 		let mut stop_session_manager = ShutdownManager::new();
-		while let Some(command) = command_rx.recv().await {
+		loop {
+			// Select on both incoming commands and session shutdown, so we
+			// notice an unexpected shutdown immediately instead of waiting
+			// for the next command to arrive.
+			let command = tokio::select! {
+				command = command_rx.recv() => {
+					let Some(command) = command else { break; };
+					command
+				}
+				reason = stop_session_manager.wait_shutdown_complete(), if active_session.is_some() => {
+					tracing::warn!("Session stopped unexpectedly, waiting for new session (reason: {reason:?}).");
+					active_session = None;
+					stop_session_manager = ShutdownManager::new();
+					continue;
+				}
+			};
+
 			tracing::debug!(
 				has_session = active_session.is_some(),
 				shutdown_triggered = stop_session_manager.is_shutdown_triggered(),

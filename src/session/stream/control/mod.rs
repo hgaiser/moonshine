@@ -375,6 +375,21 @@ fn build_hdr_mode_payload(enabled: bool) -> Vec<u8> {
 	buf
 }
 
+/// Build the payload for a termination extended control message.
+///
+/// The encrypted protocol uses V2 framing: `type(u16 LE) + length(u16 LE) + data`.
+/// The client strips the length field after decryption (V2 → V1 conversion) and
+/// then reads a 4-byte big-endian error code. Known NVST_DISCONN values are mapped
+/// to client-side error constants (e.g. `0x80030023` → graceful termination).
+fn build_termination_payload(error_code: u32) -> Vec<u8> {
+	let payload_len = 4u16; // 4 bytes for error code.
+	let mut buf = Vec::with_capacity(4 + payload_len as usize);
+	buf.extend((ControlMessageType::TerminationExtended as u16).to_le_bytes());
+	buf.extend(payload_len.to_le_bytes());
+	buf.extend(error_code.to_be_bytes());
+	buf
+}
+
 struct ControlStreamInner {}
 
 impl ControlStreamInner {
@@ -557,6 +572,24 @@ impl ControlStreamInner {
 		}
 
 		tracing::debug!("Control stream stopped.");
+
+		// Notify the client of graceful termination before closing the connection.
+		// NVST_DISCONN_SERVER_TERMINATED_CLOSED (0x80030023) is recognized by the
+		// client as a graceful shutdown so it does not display an error.
+		let termination_payload = build_termination_payload(0x80030023);
+		if let Ok(packet) = encode_control(&context.keys.remote_input_key, sequence_number, &termination_payload) {
+			for mut peer in host.peers() {
+				if peer.state() != enet::PeerState::Connected {
+					continue;
+				}
+				if let Ok(p) = enet::Packet::new(packet.as_slice(), enet::PacketMode::ReliableSequenced) {
+					let _ = peer
+						.send_packet(p, 0)
+						.map_err(|e| tracing::warn!("Failed to send termination to peer: {e}"));
+				}
+			}
+			host.flush();
+		}
 
 		// Explicitly drop the ENet host before the delay shutdown token
 		// to ensure the socket is released before wait_shutdown_complete

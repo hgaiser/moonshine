@@ -189,12 +189,28 @@ impl SessionInner {
 					// for XWayland to become ready.
 					let app_context = session_context.clone();
 					let app_socket_path = self.socket_path.clone();
+					let app_shutdown_manager = stop_session_manager.clone();
 					if let Err(e) = std::thread::Builder::new().name("app-launcher".to_string()).spawn(
 						move || -> Result<Child, ()> {
-							let ready = ready_rx
-								.recv_timeout(std::time::Duration::from_secs(5))
-								.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
-							launch_application(&app_context, &app_socket_path, &ready)
+							let result = (|| -> Result<Child, ()> {
+								let ready = ready_rx
+									.recv_timeout(std::time::Duration::from_secs(5))
+									.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
+								let mut child = launch_application(&app_context, &app_socket_path, &ready)?;
+
+								// Wait for the application to exit.
+								if let Err(e) = child.wait() {
+									tracing::error!("Failed to wait for application: {e}");
+								}
+								tracing::info!("Application exited.");
+
+								Ok(child)
+							})();
+
+							// Stop the session when the application exits.
+							let _ = app_shutdown_manager.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
+
+							result
 						},
 					) {
 						tracing::error!("Failed to spawn app launcher thread: {e}");
