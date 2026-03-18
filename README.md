@@ -135,7 +135,7 @@ command = ["/usr/bin/steam", "steam://open/bigpicture"]
 
 In addition to defining specific applications, it is also possible to define application scanners.
 These scanners scan for applications on startup.
-Currently, only a `steam` scanner is implemented.
+Currently, `steam` and `desktop` scanners are implemented.
 This scanner searches for a Steam library, checks which games are installed in that library and adds applications with the configured `command`.
 
 The command has an additional template value that gets substituted when executed, the `{game_id}`.
@@ -148,6 +148,23 @@ The following application scanner will run the game through Steam:
 type = "steam"
 library = "$HOME/.local/share/Steam"
 command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
+```
+
+The `desktop` scanner searches explicitly configured directories for `.desktop` files and exposes launchable applications directly from their desktop entry metadata.
+It resolves the application title from `Name`, converts `Exec` into Moonshine's `command`, and attempts to resolve `Icon` into a boxart path.
+
+The scanner skips entries that are hidden, marked `NoDisplay`, have `Type` other than `Application`, or require a terminal unless `include_terminal = true`.
+`TryExec` is treated as advisory metadata: unresolved entries are still included and only logged.
+
+```toml
+[[application_scanner]]
+type = "desktop"
+directories = [
+  "$HOME/.local/share/applications",
+  "/usr/share/applications",
+]
+include_terminal = false
+resolve_icons = true
 ```
 
 ## FAQ
