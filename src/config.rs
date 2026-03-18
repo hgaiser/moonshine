@@ -9,6 +9,10 @@ fn default_true() -> bool {
 	true
 }
 
+fn default_false() -> bool {
+	false
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
 	/// Name of the Moonshine host.
@@ -140,6 +144,9 @@ impl ApplicationConfig {
 pub enum ApplicationScannerConfig {
 	/// Scans a 'libraryfolders.vdf' file from a Steam library directory.
 	Steam(SteamApplicationScannerConfig),
+
+	/// Scans directories containing freedesktop .desktop launchers.
+	Desktop(DesktopApplicationScannerConfig),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -149,6 +156,20 @@ pub struct SteamApplicationScannerConfig {
 
 	/// The command to run.
 	pub command: Vec<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DesktopApplicationScannerConfig {
+	/// Directories to scan recursively for `.desktop` files.
+	pub directories: Vec<PathBuf>,
+
+	/// Whether terminal-based entries should be included.
+	#[serde(default = "default_false")]
+	pub include_terminal: bool,
+
+	/// Whether to resolve desktop entry icons into Moonshine boxart paths.
+	#[serde(default = "default_true")]
+	pub resolve_icons: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
