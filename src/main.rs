@@ -1,6 +1,5 @@
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use crate::clients::ClientManager;
 use crate::config::Config;
@@ -11,7 +10,6 @@ use crate::state::State;
 use crate::webserver::Webserver;
 use async_shutdown::ShutdownManager;
 use clap::Parser;
-use enet::Enet;
 use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -185,11 +183,8 @@ impl Moonshine {
 			(cert, pkey)
 		};
 
-		let enet = Enet::new().map_err(|e| tracing::error!("Failed to initialize enet: {e}"))?;
-		let enet = Arc::new(enet);
-
 		// Create a manager for interacting with sessions.
-		let session_manager = SessionManager::new(config.clone(), shutdown.clone(), enet)?;
+		let session_manager = SessionManager::new(config.clone(), shutdown.clone())?;
 
 		// Create a manager for saving and loading client state.
 		let client_manager = ClientManager::new(state.clone(), cert.clone(), pkey, shutdown.trigger_shutdown_token(3));

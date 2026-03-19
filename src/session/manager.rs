@@ -1,7 +1,4 @@
-use std::sync::Arc;
-
 use async_shutdown::ShutdownManager;
-use enet::Enet;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
@@ -58,15 +55,13 @@ pub struct SessionManager {
 }
 
 #[derive(Default)]
-struct SessionManagerInner {
-	enet: Option<Arc<Enet>>,
-}
+struct SessionManagerInner {}
 
 impl SessionManager {
 	#[allow(clippy::result_unit_err)]
-	pub fn new(config: Config, shutdown: ShutdownManager<i32>, enet: Arc<Enet>) -> Result<Self, ()> {
+	pub fn new(config: Config, shutdown: ShutdownManager<i32>) -> Result<Self, ()> {
 		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner: SessionManagerInner = SessionManagerInner { enet: Some(enet) };
+		let inner: SessionManagerInner = SessionManagerInner {};
 		let shutdown_token = shutdown.trigger_shutdown_token(2);
 		let delay_token = shutdown.delay_shutdown_token();
 		tokio::spawn(async move {
@@ -210,12 +205,7 @@ impl SessionManagerInner {
 					}
 
 					tracing::info!("Initializing new session");
-					active_session = match Session::new(
-						config.clone(),
-						session_context,
-						stop_session_manager.clone(),
-						self.enet.as_ref().unwrap().clone(),
-					) {
+					active_session = match Session::new(config.clone(), session_context, stop_session_manager.clone()) {
 						Ok(session) => Some(session),
 						Err(()) => continue,
 					};

@@ -1,5 +1,5 @@
 use async_shutdown::ShutdownManager;
-use reed_solomon_erasure::{galois_8, ReedSolomon};
+use fec_rs::ReedSolomon;
 use tokio::sync::mpsc::{self, error::TryRecvError};
 
 use crate::{
@@ -68,7 +68,7 @@ impl AudioEncoder {
 			.set_bitrate(opus::Bitrate::Bits(stream_config.bitrate as i32))
 			.map_err(|e| tracing::warn!("Failed to set audio bitrate: {e}"))?;
 
-		let fec_encoder = ReedSolomon::<galois_8::Field>::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
+		let fec_encoder = ReedSolomon::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
 			.map_err(|e| tracing::warn!("Failed to create FEC encoder: {e}"))?;
 
 		let (command_tx, command_rx) = mpsc::channel(10);
@@ -109,7 +109,7 @@ impl AudioEncoderInner {
 		mut command_rx: mpsc::Receiver<AudioEncoderCommand>,
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
-		mut fec_encoder: ReedSolomon<galois_8::Field>,
+		mut fec_encoder: ReedSolomon,
 		mut encoder: opus::MSEncoder,
 		mut keys: SessionKeys,
 		packet_tx: mpsc::Sender<Vec<u8>>,
@@ -130,8 +130,10 @@ impl AudioEncoderInner {
 		// constant and known in advance.
 		// Source: https://github.com/moonlight-stream/moonlight-common-c/blob/5de4a5b85a28d8d639482a1a105c3a06eb67a2fd/src/RtpAudioQueue.c#L57.
 		// TODO: Find a way to fix this, it is very ugly..
-		fec_encoder.set_parity_matrix(&[0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c]);
-		let mut fec_encoder = reed_solomon_erasure::ShardByShard::new(&fec_encoder);
+		fec_encoder
+			.set_parity_matrix(&[0x77, 0x40, 0x38, 0x0e, 0xc7, 0xa7, 0x0d, 0x6c])
+			.expect("Moonlight audio parity matrix must match Reed-Solomon shard layout");
+		let mut fec_encoder = fec_rs::ShardByShard::new(&fec_encoder);
 
 		let mut shards = vec![vec![0u8; MAX_SHARD_SIZE]; NR_TOTAL_SHARDS];
 

@@ -16,7 +16,7 @@ clap = { version = "4.5.60", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 dasp = { version = "0.11.0", features = ["signal", "interpolate", "interpolate-sinc", "ring_buffer"] }
 dirs = "6.0.0"
-enet = "0.3.0"
+tokio-enet = "0.1.0"
 hex = "0.4.3"
 http-body-util = "0.1.3"
 hyper = { version = "1.8.1", features = ["server", "http1"] }
@@ -35,7 +35,7 @@ pkcs8 = "0.10.2"
 pulseaudio = "0.3.1"
 rand = "0.8.5"
 rcgen = "0.14.7"
-reed-solomon-erasure = { version = "6.0.0", features = ["simd-accel"] }
+fec-rs = { version = "0.1.0", features = ["parallel"] }
 ring = "0.17.14"
 rsa = "0.9.10"
 rtsp-types = "0.1.3"
@@ -63,9 +63,6 @@ zeroconf = "0.17.0"
 
 # [profile.release]
 # debug = true
-
-[patch.crates-io]
-reed-solomon-erasure = { version = "6.0.0", git = "https://github.com/hgaiser/reed-solomon-erasure", branch = "moonshine" }
 
 [dev-dependencies]
 tempfile = "3.26.0"

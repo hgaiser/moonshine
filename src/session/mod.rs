@@ -1,9 +1,7 @@
 use std::process::Command;
 use std::process::{Child, Stdio};
-use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
-use enet::Enet;
 use manager::SessionShutdownReason;
 use tokio::sync::mpsc;
 
@@ -73,7 +71,6 @@ impl Session {
 		config: Config,
 		context: SessionContext,
 		stop_session_signal: ShutdownManager<SessionShutdownReason>,
-		enet: Arc<Enet>,
 	) -> Result<Self, ()> {
 		// Create the socket directory for the PulseAudio server.
 		let runtime_dir =
@@ -101,7 +98,6 @@ impl Session {
 			video_stream: None,
 			audio_stream: None,
 			control_stream: None,
-			enet,
 			listener: Some(listener),
 			socket_path,
 		};
@@ -147,7 +143,6 @@ struct SessionInner {
 	video_stream: Option<VideoStream>,
 	audio_stream: Option<AudioStream>,
 	control_stream: Option<ControlStream>,
-	enet: Arc<Enet>,
 	listener: Option<std::os::unix::net::UnixListener>,
 	socket_path: std::path::PathBuf,
 }
@@ -249,7 +244,6 @@ impl SessionInner {
 						audio_stream.clone(),
 						session_context.clone(),
 						stop_session_manager.clone(),
-						self.enet.clone(),
 						input_tx,
 						hdr,
 					) {

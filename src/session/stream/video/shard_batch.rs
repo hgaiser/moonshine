@@ -70,7 +70,7 @@ impl ShardBuf {
 	/// Provide mutable shard slices for FEC encoding.
 	///
 	/// Returns a `Vec` of `ShardSlice` wrappers that implement
-	/// `AsRef<[u8]> + AsMut<[u8]>`, suitable for reed-solomon-erasure.
+	/// `AsRef<[u8]> + AsMut<[u8]>`, suitable for fec-rs.
 	pub fn as_fec_slices(&mut self) -> Vec<ShardSlice<'_>> {
 		// This is safe because each ShardSlice references a non-overlapping region.
 		let ptr = self.data.as_mut_ptr();
@@ -95,7 +95,7 @@ impl ShardBuf {
 /// A mutable reference to one shard within a `ShardBuf`.
 ///
 /// Implements `AsRef<[u8]> + AsMut<[u8]>` so it can be used with
-/// reed-solomon-erasure's `encode()` method.
+/// fec-rs's `encode()` method.
 pub struct ShardSlice<'a>(&'a mut [u8]);
 
 impl AsRef<[u8]> for ShardSlice<'_> {
