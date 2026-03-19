@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.0] - 2026-03-20
+
+### Added
+
+- Desktop application scanner to automatically find installed applications.
+- HDR support for Steam and Proton games.
+- Support for 5.1 and 7.1 surround sound audio.
+- Option to select specific GPU for encoding.
+- Profiling tools for performance analysis.
+- Systemd service file and udev rules for easier deployment.
+- Added `-bigpicture` flag when launching Steam games.
+
+### Changed
+
+- Replaced `gamescope` with `smithay` for the Wayland compositor implementation.
+- Reimplemented PulseAudio integration as a separate server for better stability.
+- Replaced `reed-solomon-erasure` with `fec-rs` for forward error correction.
+- Replaced `enet` with `tokio-enet` for improved networking performance.
+- Replaced OpenSSL with `rustls` for TLS connections.
+- Migrated application lifecycle management to use `systemd` scopes.
+- Switched to `reis` for input emulation (keyboard/mouse).
+- Switched to `pixelforge` for video encoding.
+
+### Fixed
+
+- Improved handling of application exit to correctly terminate the session.
+- Fixed audio packet framing issues that caused problems on Android clients.
+- Fixed `uniqueid` validation in server info endpoint.
+- Mouse cursor is now hidden after 3 seconds of inactivity.
+- Fixed cleanup of resources when a session is forcefully stopped.
+
 ## [v0.7.0] - 2025-11-23
 
 ### Added
