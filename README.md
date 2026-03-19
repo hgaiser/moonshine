@@ -136,7 +136,7 @@ command = ["/usr/bin/steam", "steam://open/bigpicture"]
 In addition to defining specific applications, it is also possible to define application scanners.
 These scanners scan for applications on startup.
 Currently, `steam` and `desktop` scanners are implemented.
-This scanner searches for a Steam library, checks which games are installed in that library and adds applications with the configured `command`.
+The `steam` scanner searches for a Steam library, checks which games are installed in that library and adds applications with the configured `command`.
 
 The command has an additional template value that gets substituted when executed, the `{game_id}`.
 This is replaced with the Steam game id.
