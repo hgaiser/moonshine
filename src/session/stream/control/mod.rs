@@ -1,10 +1,9 @@
 use std::net::SocketAddr;
-use std::os::fd::RawFd;
-use std::sync::Arc;
+use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
-use enet::Enet;
 use tokio::sync::mpsc::{self, error::TryRecvError};
+use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
 use self::{feedback::FeedbackCommand, input::InputHandler};
 use super::{AudioStream, VideoStream};
@@ -211,70 +210,6 @@ enum ControlStreamCommand {
 	UpdateKeys(SessionKeys),
 }
 
-/// Set `FD_CLOEXEC` on a UDP socket bound to the given address.
-///
-/// The enet C library creates sockets without `SOCK_CLOEXEC`, which means child
-/// processes (e.g. XWayland, launched applications) inherit the file descriptor.
-/// If those child processes outlive the session, the port remains in use and the
-/// next session fails to bind to it.
-fn set_cloexec_on_bound_udp_socket(addr: &SocketAddr) {
-	let target_port = addr.port();
-	let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
-		tracing::warn!("Failed to read /proc/self/fd to set CLOEXEC on enet socket.");
-		return;
-	};
-
-	for entry in entries.flatten() {
-		let Ok(fd_str) = entry.file_name().into_string() else {
-			continue;
-		};
-		let Ok(fd) = fd_str.parse::<RawFd>() else {
-			continue;
-		};
-
-		// Safety: we only call POSIX functions to query and set fd flags.
-		unsafe {
-			let mut sock_addr: libc::sockaddr_in = std::mem::zeroed();
-			let mut addr_len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-
-			if libc::getsockname(fd, &mut sock_addr as *mut _ as *mut libc::sockaddr, &mut addr_len) != 0 {
-				continue;
-			}
-			if sock_addr.sin_family != libc::AF_INET as libc::sa_family_t {
-				continue;
-			}
-			if u16::from_be(sock_addr.sin_port) != target_port {
-				continue;
-			}
-
-			// Verify that this is a UDP socket.
-			let mut sock_type: libc::c_int = 0;
-			let mut opt_len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-			if libc::getsockopt(
-				fd,
-				libc::SOL_SOCKET,
-				libc::SO_TYPE,
-				&mut sock_type as *mut _ as *mut libc::c_void,
-				&mut opt_len,
-			) != 0 || sock_type != libc::SOCK_DGRAM
-			{
-				continue;
-			}
-
-			let flags = libc::fcntl(fd, libc::F_GETFD);
-			if flags == -1 {
-				tracing::warn!("Failed to get fd flags for enet socket (fd={fd}).");
-				continue;
-			}
-			if libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC) == -1 {
-				tracing::warn!("Failed to set FD_CLOEXEC on enet socket (fd={fd}).");
-			} else {
-				tracing::debug!("Set FD_CLOEXEC on enet socket (fd={fd}).");
-			}
-		}
-	}
-}
-
 pub struct ControlStream {
 	command_tx: mpsc::Sender<ControlStreamCommand>,
 }
@@ -287,7 +222,6 @@ impl ControlStream {
 		audio_stream: AudioStream,
 		context: SessionContext,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-		enet: Arc<Enet>,
 		input_tx: calloop::channel::Sender<crate::session::compositor::input::CompositorInputEvent>,
 		hdr: bool,
 	) -> Result<Self, ()> {
@@ -305,22 +239,15 @@ impl ControlStream {
 
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = ControlStreamInner {};
-		tokio::task::spawn_blocking(move || {
-			let local_addr = match socket_address {
-				SocketAddr::V4(addr) => enet::Address::from(addr),
-				SocketAddr::V6(_) => {
-					tracing::error!("IPv6 is not supported by enet");
-					return;
-				},
+		tokio::spawn(async move {
+			let host_config = HostConfig {
+				address: Some(socket_address),
+				peer_count: 1,
+				channel_limit: 1,
+				..Default::default()
 			};
 
-			let host = match enet.create_host::<()>(
-				Some(&local_addr),
-				1,
-				enet::ChannelLimit::Limited(1),
-				enet::BandwidthLimit::Unlimited,
-				enet::BandwidthLimit::Unlimited,
-			) {
+			let host = match Host::new(host_config) {
 				Ok(host) => host,
 				Err(e) => {
 					tracing::error!("Failed to create enet host: {e}");
@@ -328,20 +255,19 @@ impl ControlStream {
 				},
 			};
 
-			// Prevent the enet socket fd from being inherited by child processes.
-			set_cloexec_on_bound_udp_socket(&socket_address);
-
-			tokio::runtime::Handle::current().block_on(inner.run(
-				config,
-				host,
-				command_rx,
-				video_stream,
-				audio_stream,
-				context,
-				input_handler,
-				stop_session_manager.clone(),
-				hdr,
-			))
+			inner
+				.run(
+					config,
+					host,
+					command_rx,
+					video_stream,
+					audio_stream,
+					context,
+					input_handler,
+					stop_session_manager.clone(),
+					hdr,
+				)
+				.await
 		});
 
 		Ok(Self { command_tx })
@@ -397,7 +323,7 @@ impl ControlStreamInner {
 	pub async fn run(
 		&self,
 		config: Config,
-		mut host: enet::Host<()>,
+		mut host: Host,
 		mut command_rx: mpsc::Receiver<ControlStreamCommand>,
 		video_stream: VideoStream,
 		audio_stream: AudioStream,
@@ -452,13 +378,10 @@ impl ControlStreamInner {
 				let packet = encode_control(&context.keys.remote_input_key, sequence_number, &payload);
 
 				if let Ok(packet) = packet {
-					for mut peer in host.peers() {
-						if peer.state() != enet::PeerState::Connected {
-							continue;
-						}
-						if let Ok(packet) = enet::Packet::new(packet.as_slice(), enet::PacketMode::ReliableSequenced) {
+					if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
+						if peer.state() == PeerState::Connected {
 							let _ = peer
-								.send_packet(packet, 0)
+								.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
 								.map_err(|e| tracing::warn!("Failed to send rumble to peer: {e}"));
 						}
 					}
@@ -468,12 +391,13 @@ impl ControlStreamInner {
 			}
 
 			match host
-				.service(10)
+				.service(Duration::from_millis(10))
+				.await
 				.map_err(|e| tracing::error!("Failure in enet host: {e}"))
 			{
-				Ok(Some(enet::Event::Connect { .. })) => {},
-				Ok(Some(enet::Event::Disconnect { .. })) => {},
-				Ok(Some(enet::Event::Receive { ref packet, .. })) => {
+				Ok(Some(Event::Connect { .. })) => {},
+				Ok(Some(Event::Disconnect { .. })) => {},
+				Ok(Some(Event::Receive { ref packet, .. })) => {
 					let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 						Ok(control_message) => control_message,
 						Err(()) => break,
@@ -556,13 +480,10 @@ impl ControlStreamInner {
 				sequence_number += 1;
 
 				if let Ok(hdr_packet) = hdr_packet {
-					for mut peer in host.peers() {
-						if peer.state() != enet::PeerState::Connected {
-							continue;
-						}
-						if let Ok(p) = enet::Packet::new(hdr_packet.as_slice(), enet::PacketMode::ReliableSequenced) {
+					if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
+						if peer.state() == PeerState::Connected {
 							let _ = peer
-								.send_packet(p, 0)
+								.send(0, Packet::new(hdr_packet.as_slice(), PacketMode::ReliableSequenced))
 								.map_err(|e| tracing::warn!("Failed to send HDR mode to peer: {e}"));
 						}
 					}
@@ -578,17 +499,14 @@ impl ControlStreamInner {
 		// client as a graceful shutdown so it does not display an error.
 		let termination_payload = build_termination_payload(0x80030023);
 		if let Ok(packet) = encode_control(&context.keys.remote_input_key, sequence_number, &termination_payload) {
-			for mut peer in host.peers() {
-				if peer.state() != enet::PeerState::Connected {
-					continue;
-				}
-				if let Ok(p) = enet::Packet::new(packet.as_slice(), enet::PacketMode::ReliableSequenced) {
+			if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
+				if peer.state() == PeerState::Connected {
 					let _ = peer
-						.send_packet(p, 0)
+						.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
 						.map_err(|e| tracing::warn!("Failed to send termination to peer: {e}"));
 				}
 			}
-			host.flush();
+			let _ = host.flush().await;
 		}
 
 		// Explicitly drop the ENet host before the delay shutdown token

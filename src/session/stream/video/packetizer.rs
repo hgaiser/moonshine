@@ -1,4 +1,4 @@
-use reed_solomon_erasure::{galois_8, ReedSolomon};
+use fec_rs::ReedSolomon;
 use std::collections::{hash_map::Entry, HashMap};
 use std::time::Instant;
 
@@ -100,7 +100,7 @@ fn copy_header_and_data(
 }
 
 pub struct Packetizer {
-	fec_encoders: HashMap<(usize, usize), ReedSolomon<galois_8::Field>>,
+	fec_encoders: HashMap<(usize, usize), ReedSolomon>,
 }
 
 impl Packetizer {
@@ -342,11 +342,7 @@ impl Packetizer {
 		Ok(all_shards)
 	}
 
-	fn get_fec_encoder(
-		&mut self,
-		nr_data_shards: usize,
-		nr_parity_shards: usize,
-	) -> Result<&mut ReedSolomon<galois_8::Field>, ()> {
+	fn get_fec_encoder(&mut self, nr_data_shards: usize, nr_parity_shards: usize) -> Result<&mut ReedSolomon, ()> {
 		Ok(match self.fec_encoders.entry((nr_data_shards, nr_parity_shards)) {
 			Entry::Occupied(e) => {
 				tracing::trace!("Found a FEC encoder for this combination of shards.");
@@ -355,7 +351,7 @@ impl Packetizer {
 			Entry::Vacant(e) => {
 				tracing::trace!("No FEC encoder for this combination of shards, creating a new one.");
 				let encoder = e.insert(
-					ReedSolomon::<galois_8::Field>::new(nr_data_shards, nr_parity_shards)
+					ReedSolomon::new(nr_data_shards, nr_parity_shards)
 						.map_err(|e| tracing::warn!("Couldn't create error correction encoder: {e}"))?,
 				);
 				tracing::trace!("Finished preparing FEC encoder.");
