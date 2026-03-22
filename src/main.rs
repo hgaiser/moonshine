@@ -89,6 +89,8 @@ async fn main() -> Result<(), ()> {
 	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
 	config.applications.extend(scanned_applications);
 
+	app_scanner::resolve_missing_boxart(&mut config.applications);
+
 	// Spawn a task to wait for CTRL+C and trigger a shutdown.
 	let shutdown = ShutdownManager::new();
 	tokio::spawn({

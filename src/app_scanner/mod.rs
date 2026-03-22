@@ -35,3 +35,13 @@ pub fn scan_applications(application_scanners: &Vec<ApplicationScannerConfig>) -
 
 	applications
 }
+
+/// Resolve missing boxart for applications by searching for icons matching the application title.
+pub fn resolve_missing_boxart(applications: &mut [ApplicationConfig]) {
+	let resolver = desktop::IconResolver::new(true);
+	for app in applications.iter_mut() {
+		if app.boxart.is_none() {
+			app.boxart = resolver.find_icon_by_name(&app.title.to_ascii_lowercase());
+		}
+	}
+}

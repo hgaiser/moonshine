@@ -418,14 +418,14 @@ fn is_executable(path: &Path) -> bool {
 	}
 }
 
-struct IconResolver {
+pub(super) struct IconResolver {
 	enabled: bool,
 	cache: HashMap<String, Option<PathBuf>>,
 	search_roots: Vec<PathBuf>,
 }
 
 impl IconResolver {
-	fn new(enabled: bool) -> Self {
+	pub(super) fn new(enabled: bool) -> Self {
 		Self {
 			enabled,
 			cache: HashMap::new(),
@@ -470,7 +470,7 @@ impl IconResolver {
 		None
 	}
 
-	fn find_icon_by_name(&self, icon: &str) -> Option<PathBuf> {
+	pub(super) fn find_icon_by_name(&self, icon: &str) -> Option<PathBuf> {
 		let icon_stem = Path::new(icon)
 			.file_stem()
 			.and_then(|stem| stem.to_str())
