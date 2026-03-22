@@ -74,7 +74,9 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 			.collect();
 
 		let game_dir = config.library.join(format!("appcache/librarycache/{game_id}/"));
-		if let Some(boxart) = search_file(&game_dir, "library_600x900.jpg") {
+		if let Some(boxart) =
+			search_file(&game_dir, "library_600x900.jpg").or_else(|| search_file(&game_dir, "library_capsule.jpg"))
+		{
 			if boxart.exists() {
 				application.boxart = Some(boxart);
 			} else {
