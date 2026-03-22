@@ -143,22 +143,53 @@ impl PulseServer {
 			sample_rate: CAPTURE_SAMPLE_RATE,
 		};
 
+		let channel_map = match channels {
+			6 => pulse::ChannelMap::new([
+				pulse::ChannelPosition::FrontLeft,
+				pulse::ChannelPosition::FrontRight,
+				pulse::ChannelPosition::FrontCenter,
+				pulse::ChannelPosition::Lfe,
+				pulse::ChannelPosition::RearLeft,
+				pulse::ChannelPosition::RearRight,
+			]),
+			8 => pulse::ChannelMap::new([
+				pulse::ChannelPosition::FrontLeft,
+				pulse::ChannelPosition::FrontRight,
+				pulse::ChannelPosition::FrontCenter,
+				pulse::ChannelPosition::Lfe,
+				pulse::ChannelPosition::RearLeft,
+				pulse::ChannelPosition::RearRight,
+				pulse::ChannelPosition::SideLeft,
+				pulse::ChannelPosition::SideRight,
+			]),
+			_ => pulse::ChannelMap::stereo(),
+		};
+
+		let port_name = match channels {
+			6 => "Surround 5.1 Output",
+			8 => "Surround 7.1 Output",
+			_ => "Stereo Output",
+		};
+
 		let mut dummy_sink = pulse::SinkInfo::new_dummy(1);
 		dummy_sink.name = sink_name.clone();
 		dummy_sink.description = Some(std::ffi::CString::new("Moonshine virtual output").unwrap());
 		dummy_sink.sample_spec = capture_spec;
+		dummy_sink.channel_map = channel_map;
+		dummy_sink.cvolume = pulse::ChannelVolume::norm(channels);
 
-		let mut server_info = pulse::ServerInfo {
+		let server_info = pulse::ServerInfo {
 			server_name: Some(std::ffi::CString::new("Moonshine").unwrap()),
 			server_version: Some(std::ffi::CString::new(env!("CARGO_PKG_VERSION")).unwrap()),
 			host_name: Some(std::ffi::CString::new("moonshine").unwrap()),
 			default_sink_name: Some(sink_name.clone()),
 			default_source_name: Some(sink_name),
 			sample_spec: capture_spec,
+			channel_map,
 			..Default::default()
 		};
-		server_info.channel_map = dummy_sink.channel_map;
 
+		dummy_sink.ports[0].name = std::ffi::CString::new(port_name).unwrap();
 		dummy_sink.ports[0].port_type = pulse::port_info::PortType::Network;
 		dummy_sink.ports[0].description = Some(std::ffi::CString::new("virtual output").unwrap());
 
