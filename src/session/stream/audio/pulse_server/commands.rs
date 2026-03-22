@@ -116,15 +116,26 @@ pub(super) fn handle_command(
 				return Ok(());
 			}
 
+			// When fix_channels is set, the client expects the stream to be fixed
+			// to the sink's channel configuration (used by winepulse for probing).
+			let (stream_spec, stream_channel_map) = if params.flags.fix_channels {
+				let mut fixed_spec = sample_spec;
+				fixed_spec.channels = server.capture_spec.channels;
+				let fixed_map = server.sinks[0].channel_map;
+				(fixed_spec, fixed_map)
+			} else {
+				(sample_spec, params.channel_map)
+			};
+
 			let mut buffer_attr = params.buffer_attr;
-			configure_buffer(&mut buffer_attr, &sample_spec);
+			configure_buffer(&mut buffer_attr, &stream_spec);
 
 			let target_length = buffer_attr.target_length;
 			let flags = params.flags;
 
 			let cvolume = params
 				.cvolume
-				.unwrap_or_else(|| pulse::ChannelVolume::norm(sample_spec.channels));
+				.unwrap_or_else(|| pulse::ChannelVolume::norm(stream_spec.channels));
 			let volume = cvolume_to_linear(&cvolume, server.capture_channels);
 			let muted = params.flags.start_muted == Some(true);
 
@@ -132,7 +143,7 @@ pub(super) fn handle_command(
 				stream_index: server.next_stream_index,
 				state: StreamState::Prebuffering(buffer_attr.pre_buffering as u64),
 				buffer_attr,
-				buffer: DynPlaybackBuffer::new(sample_spec, params.channel_map, server.capture_spec),
+				buffer: DynPlaybackBuffer::new(stream_spec, stream_channel_map, server.capture_spec),
 				volume,
 				muted,
 				requested_bytes: target_length as usize,
@@ -157,8 +168,8 @@ pub(super) fn handle_command(
 			let reply = pulse::CreatePlaybackStreamReply {
 				channel,
 				stream_index,
-				sample_spec,
-				channel_map: params.channel_map,
+				sample_spec: stream_spec,
+				channel_map: stream_channel_map,
 				buffer_attr,
 				requested_bytes: target_length,
 				sink_name: Some(sink_name),
