@@ -91,15 +91,9 @@ impl Dispatch<GamescopeSwapchain, SwapchainData> for MoonshineCompositor {
 			Request::SwapchainFeedback {
 				vk_colorspace,
 				vk_format,
-				vk_engine_name,
 				..
 			} => {
-				tracing::debug!(
-					vk_colorspace,
-					vk_format,
-					vk_engine_name,
-					"gamescope_swapchain::swapchain_feedback"
-				);
+				tracing::debug!(vk_colorspace, vk_format, "gamescope_swapchain::swapchain_feedback");
 
 				if let Some(cm) = &mut state.color_management {
 					if vk_colorspace == VK_COLOR_SPACE_HDR10_ST2084_EXT {
