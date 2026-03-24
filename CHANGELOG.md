@@ -5,6 +5,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.8.1] - 2026-03-24
+
+### Added
+
+- Bundled gamescope WSI Vulkan layer, removing the dependency on gamescope for HDR.
+
+### Fixed
+
+- Fixed missing boxart for Steam games using the new library cache format.
+- Fixed boxart resolution for manually configured applications by searching XDG icon directories.
+- Fixed surround sound (5.1/7.1) not being detected by Wine/Proton in the PulseAudio virtual sink.
+- Fixed compatibility with older gamescope WSI layers (e.g. Bazzite) that do not send `vk_engine_name` in swapchain feedback.
+
 ## [v0.8.0] - 2026-03-20
 
 ### Added
