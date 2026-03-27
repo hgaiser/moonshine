@@ -100,6 +100,10 @@ pub struct WebserverConfig {
 	/// Port of the HTTPS webserver.
 	pub port_https: u16,
 
+	/// Whether to allow new clients to pair.
+	#[serde(default = "default_true")]
+	pub enable_pairing: bool,
+
 	/// Path to the certificate for SSL encryption.
 	pub certificate: PathBuf,
 
@@ -112,6 +116,7 @@ impl Default for WebserverConfig {
 		Self {
 			port: 47989,
 			port_https: 47984,
+			enable_pairing: true,
 			certificate: "$HOME/.config/moonshine/cert.pem".into(),
 			private_key: "$HOME/.config/moonshine/key.pem".into(),
 		}

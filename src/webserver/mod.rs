@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_shutdown::ShutdownManager;
-use http_body_util::{BodyExt, Full};
+use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
 	body::Bytes,
 	header::{self, HeaderValue},
@@ -296,6 +296,10 @@ impl Webserver {
 					self.app_asset(params)
 				},
 				(&Method::GET, "/pair") => {
+					if !self.config.webserver.enable_pairing {
+						tracing::warn!("Pairing is disabled in configuration.");
+						return Ok(bad_request("Pairing is disabled.".to_string()));
+					}
 					handle_pair_request(
 						request,
 						params,
@@ -335,6 +339,10 @@ impl Webserver {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
 				(&Method::GET, "/pair") => {
+					if !self.config.webserver.enable_pairing {
+						tracing::warn!("Pairing is disabled in configuration.");
+						return Ok(bad_request("Pairing is disabled.".to_string()));
+					}
 					handle_pair_request(
 						request,
 						params,
@@ -346,8 +354,18 @@ impl Webserver {
 					)
 					.await
 				},
-				(&Method::GET, "/pin") => self.pin().await,
-				(&Method::POST, "/submit-pin") => self.submit_pin(request).await,
+				(&Method::GET, "/pin") => {
+					if !self.config.webserver.enable_pairing {
+						return Ok(bad_request("Pairing is disabled.".to_string()));
+					}
+					self.pin().await
+				},
+				(&Method::POST, "/submit-pin") => {
+					if !self.config.webserver.enable_pairing {
+						return Ok(bad_request("Pairing is disabled.".to_string()));
+					}
+					self.submit_pin(request).await
+				},
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
@@ -539,18 +557,14 @@ impl Webserver {
 	}
 
 	async fn submit_pin(&self, request: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
-		// Read the POST body (limit to 1 KB to prevent abuse).
-		let body = match request.collect().await {
+		// Enforce a hard 1 KB limit while reading the body to reject oversized requests early.
+		let body = match Limited::new(request.into_body(), 1024).collect().await {
 			Ok(body) => body.to_bytes(),
 			Err(e) => {
 				tracing::warn!("Failed to read request body: {e}");
 				return bad_request("Bad request.".to_string());
 			},
 		};
-
-		if body.len() > 1024 {
-			return bad_request("Bad request.".to_string());
-		}
 
 		let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
 

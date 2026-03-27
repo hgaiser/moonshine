@@ -33,6 +33,7 @@ pub struct AudioEncoder {
 }
 
 impl AudioEncoder {
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		sample_rate: u32,
 		stream_config: &OpusStreamConfig,

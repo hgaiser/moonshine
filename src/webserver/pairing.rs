@@ -49,7 +49,7 @@ pub async fn handle_pair_request(
 				)
 				.await
 			},
-			"pairchallenge" => pair_challenge(params, client_manager).await,
+			"pairchallenge" => pair_challenge(params).await,
 			unknown => {
 				let message = format!("Unknown pair phrase received: {}", unknown);
 				tracing::warn!("{message}");
@@ -334,18 +334,15 @@ async fn server_challenge_response(
 	response
 }
 
-async fn pair_challenge(mut params: HashMap<String, String>, client_manager: &ClientManager) -> Response<Full<Bytes>> {
-	let unique_id = match params.remove("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			let message = format!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
+async fn pair_challenge(params: HashMap<String, String>) -> Response<Full<Bytes>> {
+	if !params.contains_key("uniqueid") {
+		let message = format!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
+		tracing::warn!("{message}");
+		return bad_request(message);
+	}
 
-	// All moonlight clients use the same uniqueid, so we ignore errors here.
-	let _ = client_manager.add_client(&unique_id).await;
+	// Client is not persisted here; it is only persisted after the
+	// RSA signature verification succeeds in the clientpairingsecret step.
 
 	let mut response = "<root status_code=\"200\">".to_string();
 	response += "<paired>1</paired>";

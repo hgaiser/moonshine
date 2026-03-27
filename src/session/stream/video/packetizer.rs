@@ -1,5 +1,5 @@
 use aes_gcm::{
-	aead::{Aead, KeyInit},
+	aead::{AeadInPlace, KeyInit},
 	Aes128Gcm, Key, Nonce,
 };
 use fec_rs::ReedSolomon;
@@ -115,17 +115,24 @@ pub struct Packetizer {
 }
 
 impl Packetizer {
-	pub fn new(encryption_key: Option<&[u8]>) -> Self {
-		let cipher = encryption_key.map(|key| {
-			let key = Key::<Aes128Gcm>::from_slice(key);
-			Aes128Gcm::new(key)
-		});
+	pub fn new(encryption_key: Option<&[u8]>) -> Result<Self, ()> {
+		let cipher = match encryption_key {
+			Some(key) if key.len() != 16 => {
+				tracing::error!("Video encryption key must be exactly 16 bytes, got {}", key.len());
+				return Err(());
+			},
+			Some(key) => {
+				let key = Key::<Aes128Gcm>::from_slice(key);
+				Some(Aes128Gcm::new(key))
+			},
+			None => None,
+		};
 
-		Self {
+		Ok(Self {
 			fec_encoders: HashMap::new(),
 			cipher,
 			gcm_iv_counter: 0,
-		}
+		})
 	}
 
 	/// Pre-create FEC encoders for all possible block sizes to avoid
@@ -356,22 +363,17 @@ impl Packetizer {
 
 					let nonce = Nonce::from_slice(&iv);
 
-					// Encrypt the shard data in-place.
+					// Encrypt the shard data in-place, returning a detached 16-byte tag.
 					let shard_data = shard_buf.shard_mut(shard_index);
-					let ciphertext = cipher
-						.encrypt(nonce, shard_data as &[u8])
+					let tag = cipher
+						.encrypt_in_place_detached(nonce, b"", shard_data)
 						.map_err(|e| tracing::warn!("Failed to encrypt video shard: {e}"))?;
-
-					// aes-gcm appends the 16-byte tag to the ciphertext.
-					let tag_offset = ciphertext.len() - 16;
-					let (ct, tag) = ciphertext.split_at(tag_offset);
-					shard_data[..ct.len()].copy_from_slice(ct);
 
 					// Fill the encryption prefix: iv(12) + frameNumber(4) + tag(16).
 					let prefix = shard_buf.prefix_mut(shard_index);
 					prefix[..12].copy_from_slice(&iv);
 					prefix[12..16].copy_from_slice(&frame_number.to_le_bytes());
-					prefix[16..32].copy_from_slice(tag);
+					prefix[16..32].copy_from_slice(&tag);
 				}
 			}
 

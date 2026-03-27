@@ -65,9 +65,6 @@ pub enum ClientManagerCommand {
 
 	/// Check to make sure the client pairing secret is as expected.
 	CheckClientPairingSecret(CheckClientPairingSecretCommand),
-
-	/// Add a client to the list of paired clients.
-	AddClient(AddClientCommand),
 }
 
 /// Query the manager to check if this unique id is paired or not.
@@ -137,15 +134,6 @@ pub struct CheckClientPairingSecretCommand {
 
 	/// Challenge response from the client.
 	pub client_secret: Vec<u8>,
-
-	/// Channel used to provide a response.
-	pub response: oneshot::Sender<Result<(), String>>,
-}
-
-/// Add a client to the list of paired clients.
-pub struct AddClientCommand {
-	/// Id of the client.
-	pub id: String,
 
 	/// Channel used to provide a response.
 	pub response: oneshot::Sender<Result<(), String>>,
@@ -231,22 +219,6 @@ impl ClientManager {
 		response_rx
 			.await
 			.map_err(|e| tracing::warn!("Failed to wait for response to RegisterPin command from client manager: {e}"))?
-			.map_err(|e| tracing::warn!("{e}"))
-	}
-
-	pub async fn add_client(&self, id: &str) -> Result<(), ()> {
-		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx
-			.send(ClientManagerCommand::AddClient(AddClientCommand {
-				id: id.to_string(),
-				response: response_tx,
-			}))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send AddClient command to client manager: {e}"))?;
-
-		response_rx
-			.await
-			.map_err(|e| tracing::warn!("Failed to wait for response to AddClient command from client manager: {e}"))?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
 
@@ -472,6 +444,31 @@ impl ClientManagerInner {
 						Some(client) => {
 							match check_client_pairing_secret(client, command.client_secret).await {
 								Ok(()) => {
+									// Verification succeeded — now persist the client and cert fingerprint.
+									let fingerprint = cert_pem_fingerprint(&client.pem);
+									if let Some(fp) = &fingerprint {
+										if let Err(()) = state.add_paired_cert(fp.clone()).await {
+											tracing::warn!("Failed to store paired cert fingerprint: {fp}");
+										}
+									}
+
+									let Ok(has_client) = state.has_client(command.id.clone()).await else {
+										command
+											.response
+											.send(Err("Failed to check client paired status.".to_string()))
+											.map_err(|_| {
+												tracing::error!("Failed to send CheckClientPairingSecret response.")
+											})
+											.ok();
+										continue;
+									};
+
+									if has_client {
+										tracing::info!("Client '{}' re-paired with updated certificate.", command.id);
+									} else if let Err(()) = state.add_client(command.id.clone()).await {
+										tracing::warn!("Failed to persist client '{}'.", command.id);
+									}
+
 									command
 										.response
 										.send(Ok(()))
@@ -499,58 +496,6 @@ impl ClientManagerInner {
 								.ok();
 						},
 					};
-				},
-
-				ClientManagerCommand::AddClient(command) => {
-					// Compute and store the cert fingerprint from the pending client.
-					if let Some(pending) = pending_clients.get(&command.id) {
-						let fingerprint = cert_pem_fingerprint(&pending.pem);
-						match fingerprint {
-							Some(fp) => {
-								if let Err(()) = state.add_paired_cert(fp.clone()).await {
-									tracing::warn!("Failed to store paired cert fingerprint: {fp}");
-								}
-							},
-							None => {
-								tracing::warn!("Could not compute cert fingerprint for client {}", command.id);
-							},
-						}
-					}
-
-					// Allow re-pairing: if the client ID is already stored, just
-					// update its cert fingerprint (done above) and return success.
-					let Ok(has_client) = state.has_client(command.id.clone()).await else {
-						command
-							.response
-							.send(Err("Failed to check client paired status.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
-							.ok();
-						continue;
-					};
-
-					if has_client {
-						tracing::info!("Client '{}' re-paired with updated certificate.", command.id);
-						command
-							.response
-							.send(Ok(()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
-							.ok();
-						continue;
-					}
-
-					if let Err(()) = state.add_client(command.id).await {
-						command
-							.response
-							.send(Err("Failed to add client.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
-							.ok();
-					} else {
-						command
-							.response
-							.send(Ok(()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
-							.ok();
-					}
 				},
 			}
 		}
