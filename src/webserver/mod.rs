@@ -316,13 +316,13 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
 						return Ok(resp);
 					}
-					self.launch(params).await
+					self.launch(params, local_address).await
 				},
 				(&Method::GET, "/resume") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
 						return Ok(resp);
 					}
-					self.resume(params).await
+					self.resume(params, local_address).await
 				},
 				(&Method::GET, "/cancel") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
@@ -629,7 +629,11 @@ impl Webserver {
 	// 	}
 	// }
 
-	async fn launch(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
+	async fn launch(
+		&self,
+		mut params: HashMap<String, String>,
+		local_address: Option<SocketAddr>,
+	) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
 			None => {
@@ -766,9 +770,14 @@ impl Webserver {
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		response += "<gamesession>1</gamesession>";
+		if let Some(addr) = local_address {
+			response += &format!(
+				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
+				addr.ip(),
+				self.config.stream.port
+			);
+		}
 		response += "</root>";
-
-		// TODO: Return sessionUrl0.
 
 		let mut response = Response::new(Full::new(Bytes::from(response)));
 		response
@@ -778,7 +787,11 @@ impl Webserver {
 		response
 	}
 
-	async fn resume(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
+	async fn resume(
+		&self,
+		mut params: HashMap<String, String>,
+		local_address: Option<SocketAddr>,
+	) -> Response<Full<Bytes>> {
 		let remote_input_key = match params.remove("rikey") {
 			Some(remote_input_key) => remote_input_key,
 			None => {
@@ -826,9 +839,13 @@ impl Webserver {
 		}
 
 		let mut response = "<root status_code=\"200\">".to_string();
-
-		// TODO: Return sessionUrl0.
-
+		if let Some(addr) = local_address {
+			response += &format!(
+				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
+				addr.ip(),
+				self.config.stream.port
+			);
+		}
 		response += "<resume>1</resume>";
 		response += "</root>";
 
