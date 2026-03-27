@@ -234,23 +234,11 @@ impl Default for VideoStreamConfig {
 pub struct AudioStreamConfig {
 	/// Port to use for streaming audio data.
 	pub port: u16,
-
-	/// Whether to enable audio stream encryption (AES-128-CBC).
-	///
-	/// When enabled, the server advertises audio encryption support to clients.
-	/// The client must also support and enable audio encryption for it to be active.
-	/// Disabled by default for compatibility with clients that don't support encryption
-	/// (e.g. Steam Link).
-	#[serde(default = "default_false")]
-	pub encrypt: bool,
 }
 
 impl Default for AudioStreamConfig {
 	fn default() -> Self {
-		Self {
-			port: 48000,
-			encrypt: false,
-		}
+		Self { port: 48000 }
 	}
 }
 

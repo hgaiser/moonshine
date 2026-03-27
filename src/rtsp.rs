@@ -114,12 +114,9 @@ impl RtspServer {
 	}
 
 	fn encryption_flags_supported(&self) -> u8 {
-		let mut flags = EncryptionFlags::ControlV2 as u8;
+		let mut flags = EncryptionFlags::ControlV2 as u8 | EncryptionFlags::Audio as u8;
 		if self.config.stream.video.encrypt {
 			flags |= EncryptionFlags::Video as u8;
-		}
-		if self.config.stream.audio.encrypt {
-			flags |= EncryptionFlags::Audio as u8;
 		}
 		flags
 	}
@@ -425,8 +422,7 @@ impl RtspServer {
 			packet_duration_ms: packet_duration,
 			qos: audio_qos_type != "0",
 			audio_config,
-			encrypt_audio: self.config.stream.audio.encrypt
-				&& (client_encryption_flags & EncryptionFlags::Audio as u8 != 0),
+			encrypt_audio: client_encryption_flags & EncryptionFlags::Audio as u8 != 0,
 		};
 
 		if self

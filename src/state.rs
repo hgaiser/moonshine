@@ -78,20 +78,17 @@ impl State {
 			.send(StateCommand::HasClient(client, result_tx))
 			.await
 			.map_err(|e| tracing::warn!("Failed to send HasClient command: {e}"))?;
-		let result = result_rx
+		result_rx
 			.await
-			.map_err(|e| tracing::warn!("Failed to receive HasClient response: {e}"))?;
-
-		self.save().await?;
-
-		Ok(result)
+			.map_err(|e| tracing::warn!("Failed to receive HasClient response: {e}"))
 	}
 
 	pub async fn add_client(&self, client: String) -> Result<(), ()> {
 		self.command_tx
 			.send(StateCommand::AddClient(client))
 			.await
-			.map_err(|e| tracing::warn!("Failed to send AddClient command: {e}"))
+			.map_err(|e| tracing::warn!("Failed to send AddClient command: {e}"))?;
+		self.save().await
 	}
 
 	pub async fn has_paired_cert(&self, fingerprint: String) -> Result<bool, ()> {
