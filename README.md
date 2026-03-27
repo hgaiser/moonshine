@@ -112,7 +112,7 @@ http://localhost:47989/pin
 Or, you can also do this in commandline:
 
 ```sh
-$ curl "http://localhost:47989/submit-pin?uniqueid=0123456789ABCDEF&pin=<PIN>"
+$ curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
 ```
 
 Where `<PIN>` should be replaced with the actual PIN number.
@@ -186,6 +186,17 @@ resolve_icons = true
       - Moonshine streams applications without needing an active desktop session.
         This is especially useful for headless servers, i.e. without a graphical environment.
         This also means that no monitor (or HDMI dummy plug) needs to be connected to the GPU for Moonshine to work.
+
+## Security
+
+Moonshine is **not designed for use on untrusted networks**.
+The Moonlight/GameStream protocol has inherent security limitations (e.g. AES-ECB in pairing, unauthenticated AES-CBC audio, plaintext RTSP) that cannot be addressed without breaking client compatibility.
+While Moonshine implements mutual TLS for HTTPS endpoints and optional video/audio encryption, these measures do not provide the level of security needed for exposure to the public internet.
+
+If you need to stream over the internet, use a VPN such as [Tailscale](https://tailscale.com/), [WireGuard](https://www.wireguard.com/), or [ZeroTier](https://www.zerotier.com/).
+This ensures all traffic between the client and server is encrypted at the network level, regardless of protocol-level limitations.
+
+**Do not expose Moonshine ports directly to the internet.**
 
 ## Acknowledgement
 

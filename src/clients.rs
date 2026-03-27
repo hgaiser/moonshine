@@ -5,7 +5,7 @@ use aes::Aes128;
 use async_shutdown::TriggerShutdownToken;
 use ring::{
 	rand::{SecureRandom, SystemRandom},
-	signature::{RsaKeyPair, RSA_PKCS1_SHA256},
+	signature::{RsaKeyPair, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256},
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -48,6 +48,9 @@ pub enum ClientManagerCommand {
 	/// Check if a client is already paired.
 	IsPaired(IsPairedCommand),
 
+	/// Check if a client certificate fingerprint is from a paired client.
+	IsCertPaired(IsCertPairedCommand),
+
 	/// Initiate the pairing procedure.
 	StartPairing(StartPairingCommand),
 
@@ -62,15 +65,21 @@ pub enum ClientManagerCommand {
 
 	/// Check to make sure the client pairing secret is as expected.
 	CheckClientPairingSecret(CheckClientPairingSecretCommand),
-
-	/// Add a client to the list of paired clients.
-	AddClient(AddClientCommand),
 }
 
 /// Query the manager to check if this unique id is paired or not.
 pub struct IsPairedCommand {
 	/// Unique id of the client.
 	pub id: String,
+
+	/// Channel used to provide a response.
+	pub response: oneshot::Sender<Result<bool, String>>,
+}
+
+/// Query the manager to check if a certificate fingerprint belongs to a paired client.
+pub struct IsCertPairedCommand {
+	/// SHA-256 fingerprint of the client's DER-encoded certificate.
+	pub fingerprint: String,
 
 	/// Channel used to provide a response.
 	pub response: oneshot::Sender<Result<bool, String>>,
@@ -130,15 +139,6 @@ pub struct CheckClientPairingSecretCommand {
 	pub response: oneshot::Sender<Result<(), String>>,
 }
 
-/// Add a client to the list of paired clients.
-pub struct AddClientCommand {
-	/// Id of the client.
-	pub id: String,
-
-	/// Channel used to provide a response.
-	pub response: oneshot::Sender<Result<(), String>>,
-}
-
 #[derive(Clone)]
 pub struct ClientManager {
 	command_tx: mpsc::Sender<ClientManagerCommand>,
@@ -180,6 +180,22 @@ impl ClientManager {
 			.map_err(|e| tracing::warn!("Failed to check paired status: {e}"))
 	}
 
+	pub async fn is_cert_paired(&self, fingerprint: &str) -> Result<bool, ()> {
+		let (response_tx, response_rx) = oneshot::channel();
+		self.command_tx
+			.send(ClientManagerCommand::IsCertPaired(IsCertPairedCommand {
+				fingerprint: fingerprint.to_string(),
+				response: response_tx,
+			}))
+			.await
+			.map_err(|e| tracing::warn!("Failed to check cert paired status: {e}"))?;
+
+		response_rx
+			.await
+			.map_err(|e| tracing::warn!("Failed to receive IsCertPaired response: {e}"))?
+			.map_err(|e| tracing::warn!("Failed to check cert paired status: {e}"))
+	}
+
 	pub async fn start_pairing(&self, pending_client: PendingClient) -> Result<(), ()> {
 		self.command_tx
 			.send(ClientManagerCommand::StartPairing(StartPairingCommand {
@@ -203,22 +219,6 @@ impl ClientManager {
 		response_rx
 			.await
 			.map_err(|e| tracing::warn!("Failed to wait for response to RegisterPin command from client manager: {e}"))?
-			.map_err(|e| tracing::warn!("{e}"))
-	}
-
-	pub async fn add_client(&self, id: &str) -> Result<(), ()> {
-		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx
-			.send(ClientManagerCommand::AddClient(AddClientCommand {
-				id: id.to_string(),
-				response: response_tx,
-			}))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send AddClient command to client manager: {e}"))?;
-
-		response_rx
-			.await
-			.map_err(|e| tracing::warn!("Failed to wait for response to AddClient command from client manager: {e}"))?
 			.map_err(|e| tracing::warn!("{e}"))
 	}
 
@@ -315,6 +315,23 @@ impl ClientManagerInner {
 							.response
 							.send(Err("Failed to check client paired status.".to_string()))
 							.map_err(|_| tracing::error!("Failed to send IsPaired response."))
+							.ok();
+					},
+				},
+
+				ClientManagerCommand::IsCertPaired(command) => match state.has_paired_cert(command.fingerprint).await {
+					Ok(result) => {
+						command
+							.response
+							.send(Ok(result))
+							.map_err(|_| tracing::error!("Failed to send IsCertPaired response."))
+							.ok();
+					},
+					Err(()) => {
+						command
+							.response
+							.send(Err("Failed to check cert paired status.".to_string()))
+							.map_err(|_| tracing::error!("Failed to send IsCertPaired response."))
 							.ok();
 					},
 				},
@@ -427,6 +444,31 @@ impl ClientManagerInner {
 						Some(client) => {
 							match check_client_pairing_secret(client, command.client_secret).await {
 								Ok(()) => {
+									// Verification succeeded — now persist the client and cert fingerprint.
+									let fingerprint = cert_pem_fingerprint(&client.pem);
+									if let Some(fp) = &fingerprint {
+										if let Err(()) = state.add_paired_cert(fp.clone()).await {
+											tracing::warn!("Failed to store paired cert fingerprint: {fp}");
+										}
+									}
+
+									let Ok(has_client) = state.has_client(command.id.clone()).await else {
+										command
+											.response
+											.send(Err("Failed to check client paired status.".to_string()))
+											.map_err(|_| {
+												tracing::error!("Failed to send CheckClientPairingSecret response.")
+											})
+											.ok();
+										continue;
+									};
+
+									if has_client {
+										tracing::info!("Client '{}' re-paired with updated certificate.", command.id);
+									} else if let Err(()) = state.add_client(command.id.clone()).await {
+										tracing::warn!("Failed to persist client '{}'.", command.id);
+									}
+
 									command
 										.response
 										.send(Ok(()))
@@ -454,40 +496,6 @@ impl ClientManagerInner {
 								.ok();
 						},
 					};
-				},
-
-				ClientManagerCommand::AddClient(command) => {
-					let Ok(has_client) = state.has_client(command.id.clone()).await else {
-						command
-							.response
-							.send(Err("Failed to check client paired status.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
-							.ok();
-						continue;
-					};
-
-					if has_client {
-						command
-							.response
-							.send(Err("Client is already paired, can't add it again.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
-							.ok();
-						continue;
-					}
-
-					if let Err(()) = state.add_client(command.id).await {
-						command
-							.response
-							.send(Err("Failed to add client.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
-							.ok();
-					} else {
-						command
-							.response
-							.send(Ok(()))
-							.map_err(|_| tracing::error!("Failed to send AddClient command response."))
-							.ok();
-					}
 				},
 			}
 		}
@@ -616,6 +624,18 @@ fn extract_certificate_signature(pem: &str) -> Result<Vec<u8>, String> {
 	Ok(cert.signature_value.data.to_vec())
 }
 
+fn verify_client_signature(pem: &str, secret: &[u8], signature: &[u8]) -> Result<(), String> {
+	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).map_err(|e| format!("Failed to parse PEM: {}", e))?;
+	let cert = pem_obj
+		.parse_x509()
+		.map_err(|e| format!("Failed to parse X509: {}", e))?;
+	let public_key_bytes = cert.tbs_certificate.subject_pki.subject_public_key.data;
+	let public_key = ring::signature::UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key_bytes);
+	public_key.verify(secret, signature).map_err(|_| {
+		"Client certificate signature verification failed: signature does not match the client's public key".to_string()
+	})
+}
+
 async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> Result<(), String> {
 	let client_hash = match &client.client_hash {
 		Some(client_hash) => client_hash,
@@ -640,8 +660,7 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 	}
 
 	let client_secret_payload = &client_secret[..16];
-	// Remaining bytes are ignored (signature of the secret by client).
-	// Original code seemed to construct data with CLIENT CERT SIGNATURE + CLIENT SECRET PAYLOAD (16 bytes).
+	let client_signature = &client_secret[16..];
 
 	let mut data = server_challenge.to_vec();
 
@@ -658,6 +677,9 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 	if !hash.to_vec().eq(client_hash) {
 		return Err("Client hash is not as expected, MITM?".to_string());
 	}
+
+	// Verify the client's signature over the secret using the client's X.509 public key.
+	verify_client_signature(&client.pem, client_secret_payload, client_signature)?;
 
 	Ok(())
 }
@@ -690,4 +712,10 @@ fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 		block.copy_from_slice(&gblock);
 	}
 	Ok(decrypted)
+}
+
+/// Compute SHA-256 fingerprint of a client certificate given in PEM format.
+fn cert_pem_fingerprint(pem: &str) -> Option<String> {
+	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).ok()?;
+	Some(hex::encode(Sha256::digest(&pem_obj.contents)))
 }

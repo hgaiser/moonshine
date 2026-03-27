@@ -214,8 +214,13 @@ impl SessionInner {
 
 					let video_stream = match VideoStream::new(
 						self.config.clone(),
-						video_stream_context,
+						video_stream_context.clone(),
 						Some(frame_rx),
+						if video_stream_context.encrypt_video {
+							Some(session_context.keys.remote_input_key.clone())
+						} else {
+							None
+						},
 						stop_session_manager.clone(),
 					)
 					.await

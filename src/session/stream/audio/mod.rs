@@ -127,6 +127,8 @@ pub struct AudioStreamContext {
 	pub packet_duration_ms: u32,
 	pub qos: bool,
 	pub audio_config: AudioConfig,
+	/// Whether the client has enabled audio encryption.
+	pub encrypt_audio: bool,
 }
 
 enum AudioStreamCommand {
@@ -173,6 +175,7 @@ impl AudioStream {
 			listener: Some(listener),
 			packet_duration_ms: context.packet_duration_ms,
 			audio_config: context.audio_config,
+			encrypt_audio: context.encrypt_audio,
 			pulse_server_close_tx: None,
 			pulse_server_waker: None,
 		};
@@ -205,6 +208,7 @@ struct AudioStreamInner {
 	listener: Option<std::os::unix::net::UnixListener>,
 	packet_duration_ms: u32,
 	audio_config: AudioConfig,
+	encrypt_audio: bool,
 	pulse_server_close_tx: Option<crossbeam_channel::Sender<()>>,
 	pulse_server_waker: Option<mio::Waker>,
 }
@@ -277,6 +281,7 @@ impl AudioStreamInner {
 						frame_rx,
 						frame_recycle_tx,
 						keys.clone(),
+						self.encrypt_audio,
 						packet_tx.clone(),
 						stop_session_manager.clone(),
 					) {

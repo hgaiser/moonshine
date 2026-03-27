@@ -100,6 +100,10 @@ pub struct WebserverConfig {
 	/// Port of the HTTPS webserver.
 	pub port_https: u16,
 
+	/// Whether to allow new clients to pair.
+	#[serde(default = "default_true")]
+	pub enable_pairing: bool,
+
 	/// Path to the certificate for SSL encryption.
 	pub certificate: PathBuf,
 
@@ -112,6 +116,7 @@ impl Default for WebserverConfig {
 		Self {
 			port: 47989,
 			port_https: 47984,
+			enable_pairing: true,
 			certificate: "$HOME/.config/moonshine/cert.pem".into(),
 			private_key: "$HOME/.config/moonshine/key.pem".into(),
 		}
@@ -205,6 +210,14 @@ pub struct VideoStreamConfig {
 
 	/// What percentage of data packets should be parity packets.
 	pub fec_percentage: u8,
+
+	/// Whether to enable video stream encryption (AES-128-GCM).
+	///
+	/// When enabled, the server advertises video encryption support to clients.
+	/// The client must also support and enable video encryption for it to be active.
+	/// Disabled by default for compatibility with older clients.
+	#[serde(default = "default_false")]
+	pub encrypt: bool,
 }
 
 impl Default for VideoStreamConfig {
@@ -212,6 +225,7 @@ impl Default for VideoStreamConfig {
 		Self {
 			port: 47998,
 			fec_percentage: 20,
+			encrypt: false,
 		}
 	}
 }
