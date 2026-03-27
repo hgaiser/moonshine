@@ -15,6 +15,7 @@ use hyper::{
 	Method, Request, Response, StatusCode,
 };
 use hyper_util::rt::tokio::TokioIo;
+use image::imageops::FilterType;
 use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
 use sha2::{Digest, Sha256};
@@ -460,6 +461,11 @@ impl Webserver {
 			},
 		};
 
+		// Moonlight expects 2:3 aspect ratio box art (e.g. 600x900).
+		// Icons that don't match this ratio (e.g. square desktop icons) get stretched.
+		// Fit the image into a 600x900 canvas, preserving aspect ratio, centered.
+		let asset = fit_to_boxart(asset);
+
 		let mut buffer = std::io::Cursor::new(vec![]);
 		if let Err(e) = asset.write_to(&mut buffer, ImageFormat::Png) {
 			let message = format!("Failed to encode boxart: {e}");
@@ -901,6 +907,34 @@ fn bad_request(message: String) -> Response<Full<Bytes>> {
 		.status(StatusCode::BAD_REQUEST)
 		.body(Full::new(Bytes::from(message)))
 		.unwrap()
+}
+
+const BOXART_WIDTH: u32 = 600;
+const BOXART_HEIGHT: u32 = 900;
+
+fn fit_to_boxart(asset: image::DynamicImage) -> image::DynamicImage {
+	let (w, h) = (asset.width(), asset.height());
+
+	// Already the right aspect ratio (within a small tolerance), return as-is.
+	let target_ratio = BOXART_WIDTH as f64 / BOXART_HEIGHT as f64;
+	let image_ratio = w as f64 / h as f64;
+	if (image_ratio - target_ratio).abs() < 0.01 {
+		return asset;
+	}
+
+	// Scale the image to fit within the box art dimensions while preserving aspect ratio.
+	let scale = f64::min(BOXART_WIDTH as f64 / w as f64, BOXART_HEIGHT as f64 / h as f64);
+	let new_w = (w as f64 * scale).round() as u32;
+	let new_h = (h as f64 * scale).round() as u32;
+	let resized = asset.resize_exact(new_w, new_h, FilterType::Lanczos3);
+
+	// Center the resized image on a transparent canvas.
+	let mut canvas = image::RgbaImage::new(BOXART_WIDTH, BOXART_HEIGHT);
+	let offset_x = (BOXART_WIDTH - new_w) / 2;
+	let offset_y = (BOXART_HEIGHT - new_h) / 2;
+	image::imageops::overlay(&mut canvas, &resized.to_rgba8(), offset_x as i64, offset_y as i64);
+
+	image::DynamicImage::ImageRgba8(canvas)
 }
 
 fn unauthorized(message: &str) -> Response<Full<Bytes>> {
