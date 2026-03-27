@@ -91,6 +91,8 @@ pub struct VideoStreamContext {
 	pub dynamic_range: VideoDynamicRange,
 	pub chroma_sampling_type: VideoChromaSampling,
 	pub max_reference_frames: u32,
+	/// Whether the client has enabled video encryption.
+	pub encrypt_video: bool,
 }
 
 #[derive(Clone)]
@@ -103,6 +105,7 @@ impl VideoStream {
 		config: Config,
 		context: VideoStreamContext,
 		frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
+		encryption_key: Option<Vec<u8>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
@@ -132,6 +135,7 @@ impl VideoStream {
 			config,
 			pipeline: None,
 			frame_rx,
+			encryption_key,
 		};
 		tokio::spawn(inner.run(socket, command_rx, stop_session_manager.clone()));
 
@@ -160,6 +164,7 @@ struct VideoStreamInner {
 	config: Config,
 	pipeline: Option<VideoPipeline>,
 	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
+	encryption_key: Option<Vec<u8>>,
 }
 
 impl VideoStreamInner {
@@ -236,6 +241,7 @@ impl VideoStreamInner {
 			self.context.dynamic_range,
 			self.context.chroma_sampling_type,
 			self.context.max_reference_frames,
+			self.encryption_key.take(),
 			packet_tx,
 			idr_frame_request_rx,
 			stop_session_manager.clone(),

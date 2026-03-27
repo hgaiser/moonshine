@@ -112,7 +112,7 @@ http://localhost:47989/pin
 Or, you can also do this in commandline:
 
 ```sh
-$ curl "http://localhost:47989/submit-pin?uniqueid=0123456789ABCDEF&pin=<PIN>"
+$ curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
 ```
 
 Where `<PIN>` should be replaced with the actual PIN number.

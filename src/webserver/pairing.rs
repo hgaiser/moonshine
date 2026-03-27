@@ -1,5 +1,6 @@
 use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
+use async_shutdown::ShutdownManager;
 use http_body_util::Full;
 use hyper::{
 	body::Bytes,
@@ -31,10 +32,23 @@ pub async fn handle_pair_request(
 	local_address: Option<SocketAddr>,
 	server_certs: &str, // Pass as string (PEM)
 	client_manager: &ClientManager,
+	http_port: u16,
+	shutdown: &ShutdownManager<i32>,
 ) -> Response<Full<Bytes>> {
 	if params.contains_key("phrase") {
 		match params.remove("phrase").unwrap().as_str() {
-			"getservercert" => get_server_cert(request, params, local_address, server_certs, client_manager).await,
+			"getservercert" => {
+				get_server_cert(
+					request,
+					params,
+					local_address,
+					server_certs,
+					client_manager,
+					http_port,
+					shutdown,
+				)
+				.await
+			},
 			"pairchallenge" => pair_challenge(params, client_manager).await,
 			unknown => {
 				let message = format!("Unknown pair phrase received: {}", unknown);
@@ -56,11 +70,13 @@ pub async fn handle_pair_request(
 }
 
 async fn get_server_cert(
-	request: Request<hyper::body::Incoming>,
+	_request: Request<hyper::body::Incoming>,
 	mut params: HashMap<String, String>,
 	local_address: Option<SocketAddr>,
 	server_pem_str: &str,
 	client_manager: &ClientManager,
+	http_port: u16,
+	shutdown: &ShutdownManager<i32>,
 ) -> Response<Full<Bytes>> {
 	let client_cert = match params.remove("clientcert") {
 		Some(client_cert) => client_cert,
@@ -156,12 +172,7 @@ async fn get_server_cert(
 
 	// Emit a notification, allowing the user to automatically open the PIN page.
 	if let Some(local_address) = local_address {
-		let scheme = request
-			.uri()
-			.scheme()
-			.map(|s| s.to_string())
-			.unwrap_or("http".to_string());
-		let pin_url = format!("{}://{}:{}/pin", scheme, local_address.ip(), local_address.port());
+		let pin_url = format!("http://{}:{}/pin", local_address.ip(), http_port);
 		tracing::info!("Waiting for pin to be sent at {pin_url}");
 
 		let _ = std::thread::Builder::new()
@@ -184,7 +195,13 @@ async fn get_server_cert(
 			});
 	}
 
-	pin_notifier.notified().await;
+	tokio::select! {
+		_ = pin_notifier.notified() => {},
+		_ = shutdown.wait_shutdown_triggered() => {
+			tracing::info!("Shutdown triggered, aborting pairing.");
+			return bad_request("Server is shutting down.".to_string());
+		},
+	}
 
 	let mut response = "<root status_code=\"200\">".to_string();
 	response += "<paired>1</paired>";
@@ -382,8 +399,6 @@ async fn client_pairing_secret(
 	{
 		return bad_request("Failed to check client pairing secret".to_string());
 	}
-
-	// TODO: Verify x509 cert.
 
 	let mut response = "<root status_code=\"200\">".to_string();
 	response += "<paired>1</paired>";

@@ -125,6 +125,7 @@ impl VideoPipeline {
 		dynamic_range: VideoDynamicRange,
 		chroma_sampling: VideoChromaSampling,
 		max_reference_frames: u32,
+		encryption_key: Option<Vec<u8>>,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
@@ -143,6 +144,7 @@ impl VideoPipeline {
 			dynamic_range,
 			chroma_sampling,
 			max_reference_frames,
+			encryption_key,
 		};
 
 		std::thread::Builder::new()
@@ -168,6 +170,7 @@ struct VideoPipelineInner {
 	dynamic_range: VideoDynamicRange,
 	chroma_sampling: VideoChromaSampling,
 	max_reference_frames: u32,
+	encryption_key: Option<Vec<u8>>,
 }
 
 impl VideoPipelineInner {
@@ -295,7 +298,7 @@ impl VideoPipelineInner {
 			}
 		});
 
-		let mut packetizer = Packetizer::new();
+		let mut packetizer = Packetizer::new(self.encryption_key.as_deref());
 		packetizer.warm_up(self.fec_percentage, self.minimum_fec_packets);
 		let mut sequence_number = 0u32;
 		let mut frame_number = 0u32;

@@ -1,3 +1,7 @@
+use aes_gcm::{
+	aead::{Aead, KeyInit},
+	Aes128Gcm, Key, Nonce,
+};
 use fec_rs::ReedSolomon;
 use std::collections::{hash_map::Entry, HashMap};
 use std::time::Instant;
@@ -14,6 +18,9 @@ const PADDING_SIZE: usize = 4;
 const NV_PACKET_OFFSET: usize = RTP_HEADER_SIZE + PADDING_SIZE;
 /// Byte offset where the payload starts within a shard.
 const PAYLOAD_OFFSET: usize = NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE;
+
+/// Size of the per-shard encryption prefix: iv(12) + frameNumber(4) + tag(16).
+const ENC_PREFIX_SIZE: usize = 12 + 4 + 16;
 
 #[repr(u8)]
 enum RtpFlag {
@@ -101,12 +108,23 @@ fn copy_header_and_data(
 
 pub struct Packetizer {
 	fec_encoders: HashMap<(usize, usize), ReedSolomon>,
+	/// AES-128-GCM cipher for video encryption, `None` when disabled.
+	cipher: Option<Aes128Gcm>,
+	/// Monotonically increasing IV counter (one increment per encrypted shard).
+	gcm_iv_counter: u64,
 }
 
 impl Packetizer {
-	pub fn new() -> Self {
+	pub fn new(encryption_key: Option<&[u8]>) -> Self {
+		let cipher = encryption_key.map(|key| {
+			let key = Key::<Aes128Gcm>::from_slice(key);
+			Aes128Gcm::new(key)
+		});
+
 		Self {
 			fec_encoders: HashMap::new(),
+			cipher,
+			gcm_iv_counter: 0,
 		}
 	}
 
@@ -173,6 +191,9 @@ impl Packetizer {
 		// The total size of a shard (RTP + padding + NvVideoPacket + payload).
 		let requested_shard_size = PAYLOAD_OFFSET + requested_shard_payload_size;
 
+		// When encryption is enabled, reserve space for the per-shard prefix.
+		let prefix_size = if self.cipher.is_some() { ENC_PREFIX_SIZE } else { 0 };
+
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
 
@@ -233,7 +254,7 @@ impl Packetizer {
 			// Single allocation for all shards in this block (data + parity), zeroed.
 			let total_shards = nr_data_shards + nr_parity_shards;
 			let t_alloc = Instant::now();
-			let mut shard_buf = ShardBuf::new(total_shards, requested_shard_size);
+			let mut shard_buf = ShardBuf::new(total_shards, requested_shard_size, prefix_size);
 			total_alloc_us += t_alloc.elapsed().as_micros();
 
 			let t_data_write = Instant::now();
@@ -322,6 +343,36 @@ impl Packetizer {
 				}
 
 				total_fec_headers_us += t_fec_headers.elapsed().as_micros();
+			}
+
+			// Encrypt each shard if video encryption is enabled.
+			if let Some(cipher) = &self.cipher {
+				for shard_index in 0..total_shards {
+					// Build the 12-byte IV: bytes 0..8 = counter (LE), byte 11 = 'V'.
+					let mut iv = [0u8; 12];
+					iv[..8].copy_from_slice(&self.gcm_iv_counter.to_le_bytes());
+					iv[11] = b'V';
+					self.gcm_iv_counter += 1;
+
+					let nonce = Nonce::from_slice(&iv);
+
+					// Encrypt the shard data in-place.
+					let shard_data = shard_buf.shard_mut(shard_index);
+					let ciphertext = cipher
+						.encrypt(nonce, shard_data as &[u8])
+						.map_err(|e| tracing::warn!("Failed to encrypt video shard: {e}"))?;
+
+					// aes-gcm appends the 16-byte tag to the ciphertext.
+					let tag_offset = ciphertext.len() - 16;
+					let (ct, tag) = ciphertext.split_at(tag_offset);
+					shard_data[..ct.len()].copy_from_slice(ct);
+
+					// Fill the encryption prefix: iv(12) + frameNumber(4) + tag(16).
+					let prefix = shard_buf.prefix_mut(shard_index);
+					prefix[..12].copy_from_slice(&iv);
+					prefix[12..16].copy_from_slice(&frame_number.to_le_bytes());
+					prefix[16..32].copy_from_slice(tag);
+				}
 			}
 
 			let t_extend = Instant::now();

@@ -39,6 +39,7 @@ impl AudioEncoder {
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		keys: SessionKeys,
+		encrypt: bool,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
@@ -83,6 +84,7 @@ impl AudioEncoder {
 					fec_encoder,
 					encoder,
 					keys,
+					encrypt,
 					packet_tx,
 					stop_session_manager,
 				)
@@ -112,6 +114,7 @@ impl AudioEncoderInner {
 		mut fec_encoder: ReedSolomon,
 		mut encoder: opus::MSEncoder,
 		mut keys: SessionKeys,
+		encrypt: bool,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) {
@@ -196,21 +199,24 @@ impl AudioEncoderInner {
 				},
 			};
 
-			// Encrypt the audio data.
-			// TODO: Check if we should, some clients (ie. Steam Link) don't support this.
-			let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
-			let mut iv = iv.to_be_bytes().to_vec();
-			iv.extend([0u8; 12]);
-			let payload = match encrypt_cbc(&encoded_audio[..encoded_size], &keys.remote_input_key, &iv) {
-				Ok(payload) => payload,
-				Err(e) => {
-					tracing::warn!("Failed to encrypt audio: {e}");
-					let _ = frame_recycle_tx.try_send(AudioFrame {
-						buf: frame.buf,
-						capture_ts_ms: 0,
-					});
-					continue;
-				},
+			// Encrypt the audio data if encryption is enabled.
+			let payload = if encrypt {
+				let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
+				let mut iv = iv.to_be_bytes().to_vec();
+				iv.extend([0u8; 12]);
+				match encrypt_cbc(&encoded_audio[..encoded_size], &keys.remote_input_key, &iv) {
+					Ok(payload) => payload,
+					Err(e) => {
+						tracing::warn!("Failed to encrypt audio: {e}");
+						let _ = frame_recycle_tx.try_send(AudioFrame {
+							buf: frame.buf,
+							capture_ts_ms: 0,
+						});
+						continue;
+					},
+				}
+			} else {
+				encoded_audio[..encoded_size].to_vec()
 			};
 
 			let shard = &mut shards[sequence_number as usize % NR_DATA_SHARDS];

@@ -205,6 +205,14 @@ pub struct VideoStreamConfig {
 
 	/// What percentage of data packets should be parity packets.
 	pub fec_percentage: u8,
+
+	/// Whether to enable video stream encryption (AES-128-GCM).
+	///
+	/// When enabled, the server advertises video encryption support to clients.
+	/// The client must also support and enable video encryption for it to be active.
+	/// Disabled by default for compatibility with older clients.
+	#[serde(default = "default_false")]
+	pub encrypt: bool,
 }
 
 impl Default for VideoStreamConfig {
@@ -212,6 +220,7 @@ impl Default for VideoStreamConfig {
 		Self {
 			port: 47998,
 			fec_percentage: 20,
+			encrypt: false,
 		}
 	}
 }
@@ -220,11 +229,23 @@ impl Default for VideoStreamConfig {
 pub struct AudioStreamConfig {
 	/// Port to use for streaming audio data.
 	pub port: u16,
+
+	/// Whether to enable audio stream encryption (AES-128-CBC).
+	///
+	/// When enabled, the server advertises audio encryption support to clients.
+	/// The client must also support and enable audio encryption for it to be active.
+	/// Disabled by default for compatibility with clients that don't support encryption
+	/// (e.g. Steam Link).
+	#[serde(default = "default_false")]
+	pub encrypt: bool,
 }
 
 impl Default for AudioStreamConfig {
 	fn default() -> Self {
-		Self { port: 48000 }
+		Self {
+			port: 48000,
+			encrypt: false,
+		}
 	}
 }
 

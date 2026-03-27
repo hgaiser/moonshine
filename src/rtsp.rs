@@ -32,8 +32,8 @@ enum ServerCapabilities {
 #[repr(u8)]
 enum EncryptionFlags {
 	ControlV2 = 0x01,
-	_Video = 0x02,
-	_Audio = 0x04,
+	Video = 0x02,
+	Audio = 0x04,
 }
 
 #[derive(Clone)]
@@ -114,7 +114,14 @@ impl RtspServer {
 	}
 
 	fn encryption_flags_supported(&self) -> u8 {
-		EncryptionFlags::ControlV2 as u8
+		let mut flags = EncryptionFlags::ControlV2 as u8;
+		if self.config.stream.video.encrypt {
+			flags |= EncryptionFlags::Video as u8;
+		}
+		if self.config.stream.audio.encrypt {
+			flags |= EncryptionFlags::Audio as u8;
+		}
+		flags
 	}
 
 	#[allow(clippy::result_unit_err)]
@@ -349,6 +356,10 @@ impl RtspServer {
 		let max_reference_frames: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
 
+		// Parse the client's encryption flags from the ANNOUNCE SDP.
+		let client_encryption_flags: u8 =
+			get_optional_sdp_attribute(&sdp_session, "x-ss-general.encryptionEnabled").unwrap_or(0);
+
 		let video_stream_context = VideoStreamContext {
 			width,
 			height,
@@ -361,6 +372,8 @@ impl RtspServer {
 			dynamic_range,
 			chroma_sampling_type,
 			max_reference_frames,
+			encrypt_video: self.config.stream.video.encrypt
+				&& (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
 		};
 
 		let packet_duration: u32 = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
@@ -412,6 +425,8 @@ impl RtspServer {
 			packet_duration_ms: packet_duration,
 			qos: audio_qos_type != "0",
 			audio_config,
+			encrypt_audio: self.config.stream.audio.encrypt
+				&& (client_encryption_flags & EncryptionFlags::Audio as u8 != 0),
 		};
 
 		if self
@@ -443,6 +458,16 @@ impl RtspServer {
 	}
 
 	async fn handle_connection(&self, mut connection: TcpStream, address: SocketAddr) -> Result<(), ()> {
+		// Gate RTSP access: only process requests when a session has been initialized
+		// via the authenticated /launch or /resume endpoint (H-3 mitigation).
+		match self.session_manager.get_session_context().await {
+			Ok(Some(_)) => {},
+			_ => {
+				tracing::warn!("Rejected RTSP connection from {}: no active session", address);
+				return Ok(());
+			},
+		}
+
 		let mut message_buffer = String::new();
 
 		let message = loop {

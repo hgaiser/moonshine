@@ -8,6 +8,8 @@ enum StateCommand {
 	Save(PathBuf, oneshot::Sender<Result<(), ()>>),
 	HasClient(String, oneshot::Sender<bool>),
 	AddClient(String),
+	HasPairedCert(String, oneshot::Sender<bool>),
+	AddPairedCert(String),
 	// RemoveClient(String, oneshot::Sender<bool>),
 }
 
@@ -92,6 +94,25 @@ impl State {
 			.map_err(|e| tracing::warn!("Failed to send AddClient command: {e}"))
 	}
 
+	pub async fn has_paired_cert(&self, fingerprint: String) -> Result<bool, ()> {
+		let (result_tx, result_rx) = oneshot::channel();
+		self.command_tx
+			.send(StateCommand::HasPairedCert(fingerprint, result_tx))
+			.await
+			.map_err(|e| tracing::warn!("Failed to send HasPairedCert command: {e}"))?;
+		result_rx
+			.await
+			.map_err(|e| tracing::warn!("Failed to receive HasPairedCert response: {e}"))
+	}
+
+	pub async fn add_paired_cert(&self, fingerprint: String) -> Result<(), ()> {
+		self.command_tx
+			.send(StateCommand::AddPairedCert(fingerprint))
+			.await
+			.map_err(|e| tracing::warn!("Failed to send AddPairedCert command: {e}"))?;
+		self.save().await
+	}
+
 	// pub async fn remove_client(&self, client: String) -> Result<bool, ()> {
 	// 	let (result_tx, result_rx) = oneshot::channel();
 	// 	self.command_tx.send(StateCommand::RemoveClient(client, result_tx)).await
@@ -108,6 +129,8 @@ impl State {
 struct StateInner {
 	unique_id: String,
 	clients: Vec<String>,
+	#[serde(default)]
+	paired_certs: Vec<String>,
 }
 
 impl StateInner {
@@ -115,6 +138,7 @@ impl StateInner {
 		Self {
 			unique_id: uuid::Uuid::new_v4().to_string(),
 			clients: Default::default(),
+			paired_certs: Default::default(),
 		}
 	}
 
@@ -143,6 +167,16 @@ impl StateInner {
 				StateCommand::AddClient(client) => {
 					// TODO: Return error to caller.
 					let _ = self.add_client(client);
+				},
+
+				StateCommand::HasPairedCert(fingerprint, result_tx) => {
+					if result_tx.send(self.has_paired_cert(&fingerprint)).is_err() {
+						tracing::error!("Failed to send HasPairedCert result.");
+					}
+				},
+
+				StateCommand::AddPairedCert(fingerprint) => {
+					self.add_paired_cert(fingerprint);
 				},
 				// StateCommand::RemoveClient(client, result_tx) => {
 				// 	if result_tx.send(self.remove_client(client)).is_err() {
@@ -178,6 +212,16 @@ impl StateInner {
 		} else {
 			self.clients.push(key);
 			true
+		}
+	}
+
+	fn has_paired_cert(&self, fingerprint: &str) -> bool {
+		self.paired_certs.iter().any(|fp| fp == fingerprint)
+	}
+
+	fn add_paired_cert(&mut self, fingerprint: String) {
+		if !self.paired_certs.contains(&fingerprint) {
+			self.paired_certs.push(fingerprint);
 		}
 	}
 

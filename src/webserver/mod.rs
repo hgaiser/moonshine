@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_shutdown::ShutdownManager;
-use http_body_util::Full;
+use http_body_util::{BodyExt, Full};
 use hyper::{
 	body::Bytes,
 	header::{self, HeaderValue},
@@ -17,6 +17,7 @@ use hyper::{
 use hyper_util::rt::tokio::TokioIo;
 use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 use crate::{
@@ -58,6 +59,7 @@ pub struct Webserver {
 	session_manager: SessionManager,
 	server_certs: String,
 	hdr_supported: bool,
+	shutdown: ShutdownManager<i32>,
 }
 
 impl Webserver {
@@ -82,6 +84,7 @@ impl Webserver {
 			session_manager,
 			server_certs,
 			hdr_supported,
+			shutdown: shutdown.clone(),
 		};
 
 		// Run HTTP webserver.
@@ -134,14 +137,19 @@ impl Webserver {
 
 							tokio::spawn({
 								let server = server.clone();
+								let shutdown = server.shutdown.clone();
 								async move {
-									let _ = hyper::server::conn::http1::Builder::new()
-										.serve_connection(
-											io,
-											service_fn(|request| {
-												server.serve(request, address, mac_address.clone(), false)
-											}),
-										)
+									let _ = shutdown
+										.wrap_cancel(async move {
+											let _ = hyper::server::conn::http1::Builder::new()
+												.serve_connection(
+													io,
+													service_fn(|request| {
+														server.serve(request, address, mac_address.clone(), false, None)
+													}),
+												)
+												.await;
+										})
 										.await;
 								}
 							});
@@ -207,18 +215,37 @@ impl Webserver {
 								Err(()) => continue,
 							};
 
+							// Extract peer certificate fingerprint from TLS connection for mTLS verification.
+							let peer_cert_fingerprint = connection
+								.get_ref()
+								.1
+								.peer_certificates()
+								.and_then(|certs| certs.first())
+								.map(|cert| hex::encode(Sha256::digest(cert.as_ref())));
+
 							let io = TokioIo::new(connection);
 
 							tokio::spawn({
 								let server = server.clone();
+								let shutdown = server.shutdown.clone();
 								async move {
-									let _ = hyper::server::conn::http1::Builder::new()
-										.serve_connection(
-											io,
-											service_fn(|request| {
-												server.serve(request, address, mac_address.clone(), true)
-											}),
-										)
+									let _ = shutdown
+										.wrap_cancel(async move {
+											let _ = hyper::server::conn::http1::Builder::new()
+												.serve_connection(
+													io,
+													service_fn(|request| {
+														server.serve(
+															request,
+															address,
+															mac_address.clone(),
+															true,
+															peer_cert_fingerprint.clone(),
+														)
+													}),
+												)
+												.await;
+										})
 										.await;
 								}
 							});
@@ -243,6 +270,7 @@ impl Webserver {
 		local_address: Option<SocketAddr>,
 		mac_address: Option<String>,
 		https: bool,
+		peer_cert_fingerprint: Option<String>,
 	) -> Result<Response<Full<Bytes>>, Infallible> {
 		let params = request
 			.uri()
@@ -255,15 +283,49 @@ impl Webserver {
 		let response = if https {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
-				(&Method::GET, "/applist") => self.app_list(),
-				(&Method::GET, "/appasset") => self.app_asset(params),
+				(&Method::GET, "/applist") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+						return Ok(resp);
+					}
+					self.app_list()
+				},
+				(&Method::GET, "/appasset") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+						return Ok(resp);
+					}
+					self.app_asset(params)
+				},
 				(&Method::GET, "/pair") => {
-					handle_pair_request(request, params, local_address, &self.server_certs, &self.client_manager).await
+					handle_pair_request(
+						request,
+						params,
+						local_address,
+						&self.server_certs,
+						&self.client_manager,
+						self.config.webserver.port,
+						&self.shutdown,
+					)
+					.await
 				},
 				// (&Method::GET, "/unpair") => self.unpair(params).await,
-				(&Method::GET, "/launch") => self.launch(params).await,
-				(&Method::GET, "/resume") => self.resume(params).await,
-				(&Method::GET, "/cancel") => self.cancel().await,
+				(&Method::GET, "/launch") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+						return Ok(resp);
+					}
+					self.launch(params).await
+				},
+				(&Method::GET, "/resume") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+						return Ok(resp);
+					}
+					self.resume(params).await
+				},
+				(&Method::GET, "/cancel") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+						return Ok(resp);
+					}
+					self.cancel().await
+				},
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
@@ -273,10 +335,19 @@ impl Webserver {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
 				(&Method::GET, "/pair") => {
-					handle_pair_request(request, params, local_address, &self.server_certs, &self.client_manager).await
+					handle_pair_request(
+						request,
+						params,
+						local_address,
+						&self.server_certs,
+						&self.client_manager,
+						self.config.webserver.port,
+						&self.shutdown,
+					)
+					.await
 				},
 				(&Method::GET, "/pin") => self.pin().await,
-				(&Method::GET, "/submit-pin") => self.submit_pin(params).await,
+				(&Method::POST, "/submit-pin") => self.submit_pin(request).await,
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
@@ -467,41 +538,54 @@ impl Webserver {
 		response
 	}
 
-	async fn submit_pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
+	async fn submit_pin(&self, request: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
+		// Read the POST body (limit to 1 KB to prevent abuse).
+		let body = match request.collect().await {
+			Ok(body) => body.to_bytes(),
+			Err(e) => {
+				tracing::warn!("Failed to read request body: {e}");
+				return bad_request("Bad request.".to_string());
+			},
+		};
+
+		if body.len() > 1024 {
+			return bad_request("Bad request.".to_string());
+		}
+
+		let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+
 		let unique_id = match params.get("uniqueid") {
 			Some(unique_id) => unique_id,
 			None => {
-				let message = format!("Expected 'uniqueid' in pin request, got {:?}.", params.keys());
-				tracing::warn!("{message}");
-				return bad_request(message);
+				tracing::warn!("Missing 'uniqueid' in PIN submission.");
+				return bad_request("Bad request.".to_string());
 			},
 		};
 
 		let pin = match params.get("pin") {
 			Some(pin) => pin,
 			None => {
-				let message = format!("Expected 'pin' in pin request, got {:?}.", params.keys());
-				tracing::warn!("{message}");
-				return bad_request(message);
+				tracing::warn!("Missing 'pin' in PIN submission.");
+				return bad_request("Bad request.".to_string());
 			},
 		};
 
 		let response = self.client_manager.register_pin(unique_id, pin).await;
 		match response {
-			Ok(()) => match Response::builder()
-				.status(StatusCode::OK)
-				.body(Full::new(Bytes::from(format!(
-					"Successfully received pin '{}' for unique id '{}'.",
-					pin, unique_id
-				)))) {
-				Ok(response) => response,
-				Err(e) => {
-					let message = format!("Failed to create '/pin' response: {e}");
-					tracing::warn!("{message}");
-					bad_request(message)
-				},
+			Ok(()) => {
+				tracing::info!("PIN registered successfully.");
+				match Response::builder()
+					.status(StatusCode::OK)
+					.body(Full::new(Bytes::from("PIN accepted.")))
+				{
+					Ok(response) => response,
+					Err(e) => {
+						tracing::warn!("Failed to create response: {e}");
+						bad_request("Bad request.".to_string())
+					},
+				}
 			},
-			Err(()) => bad_request("Failed to register pin".to_string()),
+			Err(()) => bad_request("Failed to register PIN.".to_string()),
 		}
 	}
 
@@ -532,20 +616,6 @@ impl Webserver {
 	// }
 
 	async fn launch(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
-		let unique_id = match params.remove("uniqueid") {
-			Some(unique_id) => unique_id,
-			None => {
-				let message = format!("Expected 'uniqueid' in launch request, got {:?}.", params.keys());
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
-		match self.client_manager.is_paired(unique_id).await {
-			Ok(paired) => paired,
-			Err(()) => return bad_request("Failed to check client paired status".to_string()),
-		};
-
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
 			None => {
@@ -695,20 +765,6 @@ impl Webserver {
 	}
 
 	async fn resume(&self, mut params: HashMap<String, String>) -> Response<Full<Bytes>> {
-		let unique_id = match params.remove("uniqueid") {
-			Some(unique_id) => unique_id,
-			None => {
-				let message = format!("Expected 'uniqueid' in resume request, got {:?}.", params.keys());
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
-		match self.client_manager.is_paired(unique_id).await {
-			Ok(paired) => paired,
-			Err(()) => return bad_request("Failed to check client paired status".to_string()),
-		};
-
 		let remote_input_key = match params.remove("rikey") {
 			Some(remote_input_key) => remote_input_key,
 			None => {
@@ -787,12 +843,39 @@ impl Webserver {
 			.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 		response
 	}
+
+	/// Verify that the connecting client has presented a TLS certificate
+	/// that belongs to a paired client. Returns `None` if authorized,
+	/// or `Some(response)` with a 401 response if not.
+	async fn verify_paired_client(&self, peer_cert_fingerprint: &Option<String>) -> Option<Response<Full<Bytes>>> {
+		match peer_cert_fingerprint {
+			Some(fingerprint) => match self.client_manager.is_cert_paired(fingerprint).await {
+				Ok(true) => None,
+				Ok(false) => {
+					tracing::warn!("Client certificate not recognized (fingerprint: {fingerprint})");
+					Some(unauthorized("Client certificate is not from a paired client."))
+				},
+				Err(()) => Some(bad_request("Failed to verify client certificate.".to_string())),
+			},
+			None => {
+				tracing::warn!("No client certificate provided for protected endpoint.");
+				Some(unauthorized("No client certificate provided."))
+			},
+		}
+	}
 }
 
 fn bad_request(message: String) -> Response<Full<Bytes>> {
 	Response::builder()
 		.status(StatusCode::BAD_REQUEST)
 		.body(Full::new(Bytes::from(message)))
+		.unwrap()
+}
+
+fn unauthorized(message: &str) -> Response<Full<Bytes>> {
+	Response::builder()
+		.status(StatusCode::UNAUTHORIZED)
+		.body(Full::new(Bytes::from(message.to_string())))
 		.unwrap()
 }
 

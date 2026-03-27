@@ -1,12 +1,92 @@
+use std::fmt;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
 use std::sync::Arc;
 
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use rustls::ServerConfig;
+use rustls::client::danger::HandshakeSignatureValid;
+use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider, WebPkiSupportedAlgorithms};
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::DistinguishedName;
+use rustls::{DigitallySignedStruct, Error, ServerConfig, SignatureScheme};
 use tokio::net::TcpStream;
 use tokio_rustls::{server::TlsStream, TlsAcceptor as TlsAcceptorTokio};
+
+/// A client certificate verifier that accepts any client certificate.
+///
+/// This allows the TLS layer to request and capture client certificates
+/// without rejecting connections. Actual authorization (checking if the
+/// certificate belongs to a paired client) happens at the application layer.
+///
+/// Client certificates are optional — clients without certificates (e.g.,
+/// during pairing) can still connect.
+struct AllowAnyClientCert {
+	supported_algs: WebPkiSupportedAlgorithms,
+}
+
+impl AllowAnyClientCert {
+	fn new() -> Self {
+		let provider = CryptoProvider::get_default()
+			.cloned()
+			.unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+		Self {
+			supported_algs: provider.signature_verification_algorithms,
+		}
+	}
+}
+
+impl fmt::Debug for AllowAnyClientCert {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("AllowAnyClientCert").finish()
+	}
+}
+
+impl ClientCertVerifier for AllowAnyClientCert {
+	fn offer_client_auth(&self) -> bool {
+		true
+	}
+
+	fn client_auth_mandatory(&self) -> bool {
+		false
+	}
+
+	fn root_hint_subjects(&self) -> &[DistinguishedName] {
+		&[]
+	}
+
+	fn verify_client_cert(
+		&self,
+		_end_entity: &CertificateDer<'_>,
+		_intermediates: &[CertificateDer<'_>],
+		_now: UnixTime,
+	) -> Result<ClientCertVerified, Error> {
+		// Accept any certificate — authorization is checked at the application layer.
+		Ok(ClientCertVerified::assertion())
+	}
+
+	fn verify_tls12_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, Error> {
+		verify_tls12_signature(message, cert, dss, &self.supported_algs)
+	}
+
+	fn verify_tls13_signature(
+		&self,
+		message: &[u8],
+		cert: &CertificateDer<'_>,
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, Error> {
+		verify_tls13_signature(message, cert, dss, &self.supported_algs)
+	}
+
+	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+		self.supported_algs.supported_schemes()
+	}
+}
 
 pub struct TlsAcceptor {
 	acceptor: TlsAcceptorTokio,
@@ -34,7 +114,7 @@ fn load_tls_files<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<Serv
 	let key = load_private_key(private_key.as_ref())?;
 
 	let config = ServerConfig::builder()
-		.with_no_client_auth()
+		.with_client_cert_verifier(Arc::new(AllowAnyClientCert::new()))
 		.with_single_cert(certs, key)
 		.map_err(|e| tracing::error!("Failed to create TLS configuration: {}", e))?;
 
