@@ -4,15 +4,16 @@
 //! and packetization for network transmission.
 
 mod dmabuf;
+mod hdr_sei;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use ash::vk;
 use async_shutdown::ShutdownManager;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
+use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
 use super::packetizer::Packetizer;
@@ -129,6 +130,7 @@ impl VideoPipeline {
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		hdr_metadata_tx: watch::Sender<HdrModeState>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -150,7 +152,13 @@ impl VideoPipeline {
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
-				inner.run(frame_rx, packet_tx, idr_frame_request_rx, stop_session_manager);
+				inner.run(
+					frame_rx,
+					packet_tx,
+					idr_frame_request_rx,
+					stop_session_manager,
+					hdr_metadata_tx,
+				);
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
 
@@ -180,6 +188,7 @@ impl VideoPipelineInner {
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		hdr_metadata_tx: watch::Sender<HdrModeState>,
 	) {
 		tracing::debug!("Starting video pipeline.");
 
@@ -205,6 +214,7 @@ impl VideoPipelineInner {
 			packet_tx,
 			idr_frame_request_rx,
 			stop_session_manager,
+			hdr_metadata_tx,
 		) {
 			tracing::error!("Video encoding loop failed: {e}");
 		}
@@ -266,6 +276,7 @@ impl VideoPipelineInner {
 		Ok((context, encoder))
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	fn run_encoding_loop(
 		&self,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
@@ -274,6 +285,7 @@ impl VideoPipelineInner {
 		packet_tx: mpsc::Sender<ShardBatch>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		hdr_metadata_tx: watch::Sender<HdrModeState>,
 	) -> Result<(), String> {
 		// Flag to request an IDR frame.
 		let idr_requested = Arc::new(AtomicBool::new(false));
@@ -328,6 +340,21 @@ impl VideoPipelineInner {
 		// Rolling latency statistics for periodic summary.
 		let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
 		let mut last_summary_time = std::time::Instant::now();
+
+		// Track the last HDR mode state sent to the control stream.
+		let mut last_hdr_state = HdrModeState {
+			enabled: self.dynamic_range == VideoDynamicRange::Hdr,
+			metadata: None,
+		};
+
+		// Track the encoder's current VUI color description, initialized
+		// to match what the encoder was created with. When the required
+		// color_desc differs, we call set_color_description() to update
+		// the SPS/sequence header.
+		let mut encoder_color_desc: Option<ColorDescription> = Some(match self.dynamic_range {
+			VideoDynamicRange::Sdr => ColorDescription::bt709(),
+			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq(),
+		});
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			// Check for IDR request.
@@ -476,15 +503,34 @@ impl VideoPipelineInner {
 					},
 				};
 
-				// Select per-frame color space. In HDR mode, SDR content
-				// (sRGB) needs an sRGB→BT.2020+PQ conversion, while
-				// native HDR content uses BT.2020 directly.
+				// In HDR mode, select per-frame color space and encoder VUI
+				// based on the frame's actual color space. SDR frames are
+				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
+				// dynamic VUI switching in the encoder.
 				if self.dynamic_range == VideoDynamicRange::Hdr {
-					let cs = match frame.color_space {
-						FrameColorSpace::Srgb => ColorSpace::SrgbToBt2020Pq,
-						FrameColorSpace::Bt2020Pq => ColorSpace::Bt2020,
+					let frame_cs = frame.color_space;
+					let (cs, full_range, color_desc) = match frame_cs {
+						FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709()),
+						FrameColorSpace::Bt2020Pq => (ColorSpace::Bt2020, false, ColorDescription::bt2020_pq()),
 					};
-					converter.set_color_space(cs);
+
+					// Switch encoder VUI first. Only update the converter if
+					// the encoder switch succeeds, so that the converter's
+					// color space stays in sync with the encoder's VUI.
+					if encoder_color_desc != Some(color_desc) {
+						tracing::info!("Switching encoder color description to {color_desc:?}");
+						match encoder.set_color_description(color_desc) {
+							Ok(()) => {
+								encoder_color_desc = Some(color_desc);
+								converter.set_color_space(cs);
+								converter.set_full_range(full_range);
+							},
+							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
+						}
+					} else {
+						converter.set_color_space(cs);
+						converter.set_full_range(full_range);
+					}
 				}
 
 				// Convert to YUV.
@@ -497,6 +543,30 @@ impl VideoPipelineInner {
 				// The DMA-BUF content has been read into the encoder's input
 				// image — signal the compositor that this GBM buffer is free.
 				frame.consumed.store(true, Ordering::Release);
+
+				// Forward HDR mode state changes to the control stream.
+				// In HDR sessions, `enabled` reflects whether the current
+				// frame is encoded as BT.2020+PQ (true) or BT.709 (false).
+				if self.dynamic_range == VideoDynamicRange::Hdr {
+					let hdr_enabled = encoder_color_desc == Some(ColorDescription::bt2020_pq());
+					let new_state = HdrModeState {
+						enabled: hdr_enabled,
+						metadata: frame.hdr_metadata,
+					};
+					if new_state != last_hdr_state {
+						tracing::info!(
+							"HDR mode state changed: enabled={}, metadata={}",
+							new_state.enabled,
+							if new_state.metadata.is_some() {
+								"present"
+							} else {
+								"none"
+							}
+						);
+						last_hdr_state = new_state.clone();
+						let _ = hdr_metadata_tx.send(new_state);
+					}
+				}
 
 				let t3_converted = std::time::Instant::now();
 
@@ -512,7 +582,16 @@ impl VideoPipelineInner {
 				let mut is_key_frame = false;
 				match encode_result {
 					Ok(packets) => {
-						for packet in packets {
+						for mut packet in packets {
+							// Inject HDR metadata into the bitstream on key frames,
+							// but only when encoding as BT.2020+PQ (HDR frames).
+							// SDR frames encoded as BT.709 should not carry HDR SEI.
+							if packet.is_key_frame && encoder_color_desc == Some(ColorDescription::bt2020_pq()) {
+								if let Some(ref m) = last_hdr_state.metadata {
+									packet.data = hdr_sei::inject_hdr_metadata(&packet.data, m, self.video_format);
+								}
+							}
+
 							encoded_bytes += packet.data.len();
 							is_key_frame |= packet.is_key_frame;
 
