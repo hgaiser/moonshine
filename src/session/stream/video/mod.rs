@@ -1,10 +1,10 @@
 use async_shutdown::ShutdownManager;
 use tokio::{
 	net::UdpSocket,
-	sync::{broadcast, mpsc},
+	sync::{broadcast, mpsc, watch},
 };
 
-use crate::session::compositor::frame::ExportedFrame;
+use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::{config::Config, session::manager::SessionShutdownReason};
 
 mod packetizer;
@@ -107,6 +107,7 @@ impl VideoStream {
 		frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
 		encryption_key: Option<Vec<u8>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		hdr_metadata_tx: watch::Sender<HdrModeState>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 
@@ -136,6 +137,7 @@ impl VideoStream {
 			pipeline: None,
 			frame_rx,
 			encryption_key,
+			hdr_metadata_tx: Some(hdr_metadata_tx),
 		};
 		tokio::spawn(inner.run(socket, command_rx, stop_session_manager.clone()));
 
@@ -165,6 +167,7 @@ struct VideoStreamInner {
 	pipeline: Option<VideoPipeline>,
 	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
 	encryption_key: Option<Vec<u8>>,
+	hdr_metadata_tx: Option<watch::Sender<HdrModeState>>,
 }
 
 impl VideoStreamInner {
@@ -226,6 +229,9 @@ impl VideoStreamInner {
 		let frame_rx = self.frame_rx.take().ok_or_else(|| {
 			tracing::warn!("No frame receiver available for video pipeline");
 		})?;
+		let hdr_metadata_tx = self.hdr_metadata_tx.take().ok_or_else(|| {
+			tracing::warn!("No HDR metadata sender available for video pipeline");
+		})?;
 
 		tracing::debug!("Creating video pipeline with compositor frame receiver.");
 		let pipeline = VideoPipeline::new(
@@ -245,6 +251,7 @@ impl VideoStreamInner {
 			packet_tx,
 			idr_frame_request_rx,
 			stop_session_manager.clone(),
+			hdr_metadata_tx,
 		)?;
 
 		self.pipeline = Some(pipeline);

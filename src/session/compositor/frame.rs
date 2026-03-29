@@ -19,8 +19,7 @@ pub enum FrameColorSpace {
 }
 
 /// Static HDR metadata (HDR10).
-#[derive(Debug, Clone, Copy)]
-#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HdrMetadata {
 	/// Mastering display color primaries (CIE 1931 xy, in 0.00002 units).
 	pub display_primaries: [(u16, u16); 3],
@@ -34,6 +33,44 @@ pub struct HdrMetadata {
 	pub max_cll: u16,
 	/// Maximum frame-average light level in cd/m² (nits).
 	pub max_fall: u16,
+}
+
+/// HDR mode state sent from the video pipeline to the control stream.
+///
+/// Combines the `enabled` flag (whether the client should be in HDR mode)
+/// with optional HDR metadata. The `enabled` flag toggles based on actual
+/// frame content — SDR frames set it to false, HDR frames set it to true.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HdrModeState {
+	/// Whether the client's display should be in HDR mode.
+	pub enabled: bool,
+	/// HDR10 static metadata from the composited content.
+	pub metadata: Option<HdrMetadata>,
+}
+
+impl HdrMetadata {
+	/// Reasonable fallback metadata for HDR10 when applications don't provide
+	/// their own. Uses BT.2020 primaries, D65 white point, and a conservative
+	/// 1000 nit peak luminance.
+	pub fn fallback() -> Self {
+		Self {
+			// BT.2020 display primaries in 0.00002 units.
+			display_primaries: [
+				(34000, 16000), // Red:   0.680, 0.320
+				(13250, 34500), // Green: 0.265, 0.690
+				(7500, 3000),   // Blue:  0.150, 0.060
+			],
+			// D65 white point in 0.00002 units.
+			white_point: (15635, 16450), // 0.3127, 0.3290
+			// 1000 nits max luminance in 0.0001 cd/m².
+			max_luminance: 10_000_000,
+			// 0.001 nits min luminance in 0.0001 cd/m².
+			min_luminance: 10,
+			// Unknown content light levels.
+			max_cll: 0,
+			max_fall: 0,
+		}
+	}
 }
 
 /// A compositor frame exported for encoding.
@@ -65,7 +102,6 @@ pub struct ExportedFrame {
 	/// Color space of the rendered frame.
 	pub color_space: FrameColorSpace,
 	/// Optional HDR metadata from the composited content.
-	#[allow(dead_code)]
 	pub hdr_metadata: Option<HdrMetadata>,
 }
 
