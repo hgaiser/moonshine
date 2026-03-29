@@ -461,9 +461,9 @@ impl Webserver {
 			},
 		};
 
-		// Moonlight expects 2:3 aspect ratio box art (e.g. 600x900).
-		// Icons that don't match this ratio (e.g. square desktop icons) get stretched.
-		// Fit the image into a 600x900 canvas, preserving aspect ratio, centered.
+		// Moonlight displays box art at a fixed 200x267 pixel area using stretch mode.
+		// Icons that don't match this ratio (e.g. square desktop icons) get distorted.
+		// Fit the image into a 600x801 canvas (same ratio as 200:267), preserving aspect ratio, centered.
 		let asset = fit_to_boxart(asset);
 
 		let mut buffer = std::io::Cursor::new(vec![]);
@@ -910,7 +910,7 @@ fn bad_request(message: String) -> Response<Full<Bytes>> {
 }
 
 const BOXART_WIDTH: u32 = 600;
-const BOXART_HEIGHT: u32 = 900;
+const BOXART_HEIGHT: u32 = 801;
 
 fn fit_to_boxart(asset: image::DynamicImage) -> image::DynamicImage {
 	let (w, h) = (asset.width(), asset.height());
