@@ -94,7 +94,12 @@ fn parse_desktop_application(
 
 	let boxart = icon_resolver.resolve(entry.icon().map(str::trim).filter(|icon| !icon.is_empty()), path);
 
-	Ok(Some(ApplicationConfig { title, boxart, command }))
+	Ok(Some(ApplicationConfig {
+		title,
+		boxart,
+		command,
+		wayland_native: false,
+	}))
 }
 
 #[derive(Debug, Default)]
