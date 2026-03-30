@@ -97,6 +97,7 @@
 <body>
 	<div id="container">
 		<div id="pin-instructions">Please fill in the PIN from Moonlight</div>
+		<div id="uniqueid-display" style="text-align: center; margin-bottom: 1rem; font-size: 0.9rem; color: #aaa;">Client ID: <span id="uniqueid-value">{{UNIQUE_ID}}</span></div>
 
 		<form autocomplete="off" id="pin-form" action="pin" method="post">
 			<div id="pin-fields">
@@ -128,10 +129,11 @@
 				pin += field.value;
 			}
 
+			const uniqueid = document.getElementById("uniqueid-value").textContent.trim();
 			const response = await fetch('/submit-pin', {
 				method: 'POST',
 				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-				body: `uniqueid=0123456789ABCDEF&pin=${pin}`
+				body: `uniqueid=${uniqueid}&pin=${pin}`
 			});
 
 			if (response.ok) {
