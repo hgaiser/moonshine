@@ -359,7 +359,7 @@ impl Webserver {
 					if !self.config.webserver.enable_pairing {
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
-					self.pin().await
+					self.pin(params).await
 				},
 				(&Method::POST, "/submit-pin") => {
 					if !self.config.webserver.enable_pairing {
@@ -551,9 +551,12 @@ impl Webserver {
 		response
 	}
 
-	async fn pin(&self) -> Response<Full<Bytes>> {
+	async fn pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
+		let unique_id = params.get("uniqueid").cloned().unwrap_or_else(|| "0123456789ABCDEF".to_string());
 		let content = include_bytes!("../../assets/pin.html");
-		let mut response = Response::new(Full::new(Bytes::from_static(content)));
+		let html = String::from_utf8_lossy(content);
+		let html = html.replace("{{UNIQUE_ID}}", &unique_id);
+		let mut response = Response::new(Full::new(Bytes::from(html)));
 		response.headers_mut().insert(
 			header::CONTENT_TYPE,
 			HeaderValue::from_static("text/html; charset=UTF-8"),
