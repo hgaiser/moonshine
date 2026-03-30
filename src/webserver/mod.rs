@@ -552,7 +552,10 @@ impl Webserver {
 	}
 
 	async fn pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
-		let unique_id = params.get("uniqueid").cloned().unwrap_or_else(|| "0123456789ABCDEF".to_string());
+		let unique_id = params
+			.get("uniqueid")
+			.cloned()
+			.unwrap_or_else(|| "0123456789ABCDEF".to_string());
 		let content = include_bytes!("../../assets/pin.html");
 		let html = String::from_utf8_lossy(content);
 		let html = html.replace("{{UNIQUE_ID}}", &unique_id);
