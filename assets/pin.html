@@ -97,7 +97,7 @@
 <body>
 	<div id="container">
 		<div id="pin-instructions">Please fill in the PIN from Moonlight</div>
-		<div id="uniqueid-display" style="text-align: center; margin-bottom: 1rem; font-size: 0.9rem; color: #aaa;">Client ID: <span id="uniqueid-value"></span></div>
+		<div id="uniqueid-display" style="text-align: center; margin-bottom: 1rem; font-size: 0.9rem; color: #aaa;">Client ID: <span id="uniqueid-value">{{UNIQUE_ID}}</span></div>
 
 		<form autocomplete="off" id="pin-form" action="pin" method="post">
 			<div id="pin-fields">
@@ -114,9 +114,6 @@
 	</div>
 
 	<script>
-		const uniqueid_value = document.getElementById("uniqueid-value");
-		uniqueid_value.textContent = "{{UNIQUE_ID}}";
-
 		const pin_instructions = document.getElementById("pin-instructions");
 		const pin_fields = document.querySelectorAll(".pin-field");
 		const pin_form = document.getElementById("pin-form");
