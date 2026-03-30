@@ -3,13 +3,14 @@ use std::process::{Child, Stdio};
 
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::{
 	config::{ApplicationConfig, Config},
 	session::stream::{AudioStream, ControlStream, VideoStream},
 };
 
+use self::compositor::frame::HdrModeState;
 use self::stream::VideoDynamicRange;
 use self::stream::{AudioStreamContext, VideoStreamContext};
 pub use manager::SessionManager;
@@ -212,6 +213,14 @@ impl SessionInner {
 						continue;
 					}
 
+					// HDR metadata watch channel: the video pipeline publishes
+					// metadata extracted from frames, the control stream
+					// forwards it to the client.
+					let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState {
+						enabled: hdr,
+						metadata: None,
+					});
+
 					let video_stream = match VideoStream::new(
 						self.config.clone(),
 						video_stream_context.clone(),
@@ -222,6 +231,7 @@ impl SessionInner {
 							None
 						},
 						stop_session_manager.clone(),
+						hdr_metadata_tx,
 					)
 					.await
 					{
@@ -251,6 +261,7 @@ impl SessionInner {
 						stop_session_manager.clone(),
 						input_tx,
 						hdr,
+						hdr_metadata_rx,
 					) {
 						Ok(control_stream) => control_stream,
 						Err(()) => {

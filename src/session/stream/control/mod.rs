@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use tokio::sync::mpsc::{self, error::TryRecvError};
+use tokio::sync::watch;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
 use self::{feedback::FeedbackCommand, input::InputHandler};
@@ -10,7 +11,11 @@ use super::{AudioStream, VideoStream};
 use crate::{
 	config::Config,
 	crypto::{decrypt, encrypt},
-	session::{manager::SessionShutdownReason, SessionContext, SessionKeys},
+	session::{
+		compositor::frame::{HdrMetadata, HdrModeState},
+		manager::SessionShutdownReason,
+		SessionContext, SessionKeys,
+	},
 };
 
 mod feedback;
@@ -224,6 +229,7 @@ impl ControlStream {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		input_tx: calloop::channel::Sender<crate::session::compositor::input::CompositorInputEvent>,
 		hdr: bool,
+		hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	) -> Result<Self, ()> {
 		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone())?;
 
@@ -266,6 +272,7 @@ impl ControlStream {
 					input_handler,
 					stop_session_manager.clone(),
 					hdr,
+					hdr_metadata_rx,
 				)
 				.await
 		});
@@ -288,16 +295,41 @@ impl ControlStream {
 /// - u16 LE: message type (0x010e)
 /// - u16 LE: payload length (1 + 30 = 31 bytes for metadata)
 /// - u8: enabled (1 = HDR on, 0 = HDR off)
-/// - SS_HDR_METADATA: 30 bytes of HDR metadata (zeroed for now)
-fn build_hdr_mode_payload(enabled: bool) -> Vec<u8> {
+/// - SS_HDR_METADATA: 30 bytes (15 x u16 LE fields: display primaries,
+///   white point, luminance, content light levels, padding). Populated
+///   from the provided metadata, or zeroed when `metadata` is `None`.
+fn build_hdr_mode_payload(enabled: bool, metadata: Option<&HdrMetadata>) -> Vec<u8> {
 	let metadata_size = 30u16; // SS_HDR_METADATA: 15 x u16 fields
 	let payload_len = 1 + metadata_size; // enabled byte + metadata
 	let mut buf = Vec::with_capacity(4 + payload_len as usize);
 	buf.extend((ControlMessageType::HdrMode as u16).to_le_bytes());
 	buf.extend(payload_len.to_le_bytes());
 	buf.push(if enabled { 1 } else { 0 });
-	// HDR metadata fields (all zeros — no mastering display info available yet).
-	buf.extend(std::iter::repeat_n(0u8, metadata_size as usize));
+
+	if let Some(m) = metadata {
+		// Display primaries (RGB order).
+		for &(x, y) in &m.display_primaries {
+			buf.extend(x.to_le_bytes());
+			buf.extend(y.to_le_bytes());
+		}
+		// White point.
+		buf.extend(m.white_point.0.to_le_bytes());
+		buf.extend(m.white_point.1.to_le_bytes());
+		// Max display luminance (convert from 0.0001 cd/m² to nits).
+		buf.extend(((m.max_luminance / 10000).min(u16::MAX as u32) as u16).to_le_bytes());
+		// Min display luminance (0.0001 cd/m² maps to 1/10000th nit).
+		buf.extend((m.min_luminance.min(u16::MAX as u32) as u16).to_le_bytes());
+		// Content light levels (direct copy, already in nits).
+		buf.extend(m.max_cll.to_le_bytes());
+		buf.extend(m.max_fall.to_le_bytes());
+		// maxFullFrameLuminance (not available from Wayland protocol).
+		buf.extend(0u16.to_le_bytes());
+		// Padding.
+		buf.extend([0u8; 4]);
+	} else {
+		buf.extend(std::iter::repeat_n(0u8, metadata_size as usize));
+	}
+
 	buf
 }
 
@@ -331,6 +363,7 @@ impl ControlStreamInner {
 		input_handler: InputHandler,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr: bool,
+		mut hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	) {
 		// Trigger session shutdown when the control stream stops.
 		let _session_stop_token =
@@ -475,7 +508,13 @@ impl ControlStreamInner {
 			// Send HDR mode notification after the host.service() match to avoid double mutable borrow.
 			if send_hdr_mode {
 				send_hdr_mode = false;
-				let hdr_payload = build_hdr_mode_payload(true);
+				let state = hdr_metadata_rx.borrow_and_update().clone();
+				let metadata = if state.enabled {
+					Some(state.metadata.unwrap_or_else(HdrMetadata::fallback))
+				} else {
+					None
+				};
+				let hdr_payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
 				let hdr_packet = encode_control(&context.keys.remote_input_key, sequence_number, &hdr_payload);
 				sequence_number += 1;
 
@@ -487,7 +526,31 @@ impl ControlStreamInner {
 								.map_err(|e| tracing::warn!("Failed to send HDR mode to peer: {e}"));
 						}
 					}
-					tracing::info!("Sent HDR mode enabled to client");
+					tracing::info!("Sent HDR mode to client: enabled={}", state.enabled);
+				}
+			}
+
+			// Check for HDR metadata updates from the video pipeline.
+			if hdr && hdr_metadata_rx.has_changed().unwrap_or(false) {
+				let state = hdr_metadata_rx.borrow_and_update().clone();
+				let metadata = if state.enabled {
+					Some(state.metadata.unwrap_or_else(HdrMetadata::fallback))
+				} else {
+					None
+				};
+				let hdr_payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
+				let hdr_packet = encode_control(&context.keys.remote_input_key, sequence_number, &hdr_payload);
+				sequence_number += 1;
+
+				if let Ok(hdr_packet) = hdr_packet {
+					if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
+						if peer.state() == PeerState::Connected {
+							let _ = peer
+								.send(0, Packet::new(hdr_packet.as_slice(), PacketMode::ReliableSequenced))
+								.map_err(|e| tracing::warn!("Failed to send HDR metadata update to peer: {e}"));
+						}
+					}
+					tracing::info!("Resent HDR mode to client: enabled={}", state.enabled);
 				}
 			}
 		}
