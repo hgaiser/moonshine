@@ -105,11 +105,7 @@ pub struct TlsAcceptor {
 }
 
 impl TlsAcceptor {
-	pub fn from_config<P: AsRef<Path>>(
-		certificate: P,
-		private_key: P,
-		strict_verification: bool,
-	) -> Result<Self, ()> {
+	pub fn from_config<P: AsRef<Path>>(certificate: P, private_key: P, strict_verification: bool) -> Result<Self, ()> {
 		let config = load_tls_files(certificate, private_key, strict_verification)?;
 		let acceptor = TlsAcceptorTokio::from(Arc::new(config));
 		Ok(Self { acceptor })
