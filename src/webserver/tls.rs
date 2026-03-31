@@ -23,15 +23,17 @@ use tokio_rustls::{server::TlsStream, TlsAcceptor as TlsAcceptorTokio};
 /// during pairing) can still connect.
 struct AllowAnyClientCert {
 	supported_algs: WebPkiSupportedAlgorithms,
+	strict_verification: bool,
 }
 
 impl AllowAnyClientCert {
-	fn new() -> Self {
+	fn new(strict_verification: bool) -> Self {
 		let provider = CryptoProvider::get_default()
 			.cloned()
 			.unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
 		Self {
 			supported_algs: provider.signature_verification_algorithms,
+			strict_verification,
 		}
 	}
 }
@@ -71,7 +73,12 @@ impl ClientCertVerifier for AllowAnyClientCert {
 		cert: &CertificateDer<'_>,
 		dss: &DigitallySignedStruct,
 	) -> Result<HandshakeSignatureValid, Error> {
-		verify_tls12_signature(message, cert, dss, &self.supported_algs)
+		if self.strict_verification {
+			verify_tls12_signature(message, cert, dss, &self.supported_algs)
+		} else {
+			// Skip signature verification for compatibility with X.509 v2 certificates
+			Ok(HandshakeSignatureValid::assertion())
+		}
 	}
 
 	fn verify_tls13_signature(
@@ -80,7 +87,12 @@ impl ClientCertVerifier for AllowAnyClientCert {
 		cert: &CertificateDer<'_>,
 		dss: &DigitallySignedStruct,
 	) -> Result<HandshakeSignatureValid, Error> {
-		verify_tls13_signature(message, cert, dss, &self.supported_algs)
+		if self.strict_verification {
+			verify_tls13_signature(message, cert, dss, &self.supported_algs)
+		} else {
+			// Skip signature verification for compatibility with X.509 v2 certificates
+			Ok(HandshakeSignatureValid::assertion())
+		}
 	}
 
 	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -93,8 +105,12 @@ pub struct TlsAcceptor {
 }
 
 impl TlsAcceptor {
-	pub fn from_config<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<Self, ()> {
-		let config = load_tls_files(certificate, private_key)?;
+	pub fn from_config<P: AsRef<Path>>(
+		certificate: P,
+		private_key: P,
+		strict_verification: bool,
+	) -> Result<Self, ()> {
+		let config = load_tls_files(certificate, private_key, strict_verification)?;
 		let acceptor = TlsAcceptorTokio::from(Arc::new(config));
 		Ok(Self { acceptor })
 	}
@@ -109,12 +125,16 @@ impl TlsAcceptor {
 	}
 }
 
-fn load_tls_files<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<ServerConfig, ()> {
+fn load_tls_files<P: AsRef<Path>>(
+	certificate: P,
+	private_key: P,
+	strict_verification: bool,
+) -> Result<ServerConfig, ()> {
 	let certs = load_certs(certificate.as_ref())?;
 	let key = load_private_key(private_key.as_ref())?;
 
 	let config = ServerConfig::builder()
-		.with_client_cert_verifier(Arc::new(AllowAnyClientCert::new()))
+		.with_client_cert_verifier(Arc::new(AllowAnyClientCert::new(strict_verification)))
 		.with_single_cert(certs, key)
 		.map_err(|e| tracing::error!("Failed to create TLS configuration: {}", e))?;
 

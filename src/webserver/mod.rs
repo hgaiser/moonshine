@@ -193,8 +193,11 @@ impl Webserver {
 						let listener = TcpListener::bind(https_address)
 							.await
 							.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
-						let acceptor =
-							TlsAcceptor::from_config(config.webserver.certificate, config.webserver.private_key)?;
+						let acceptor = TlsAcceptor::from_config(
+							config.webserver.certificate,
+							config.webserver.private_key,
+							config.webserver.strict_cert_verification,
+						)?;
 
 						tracing::debug!("HTTPS server listening for connections on {https_address}");
 						loop {
@@ -898,6 +901,10 @@ impl Webserver {
 	/// that belongs to a paired client. Returns `None` if authorized,
 	/// or `Some(response)` with a 401 response if not.
 	async fn verify_paired_client(&self, peer_cert_fingerprint: &Option<String>) -> Option<Response<Full<Bytes>>> {
+		if !self.config.webserver.require_client_cert {
+			return None;
+		}
+
 		match peer_cert_fingerprint {
 			Some(fingerprint) => match self.client_manager.is_cert_paired(fingerprint).await {
 				Ok(true) => None,

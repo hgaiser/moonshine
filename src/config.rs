@@ -104,6 +104,22 @@ pub struct WebserverConfig {
 	#[serde(default = "default_true")]
 	pub enable_pairing: bool,
 
+	/// Whether to require client certificates for HTTPS endpoints.
+	///
+	/// When enabled (the default), HTTPS endpoints (/launch, /resume, /cancel, /applist, /appasset)
+	/// require a valid client certificate from a paired client. Disable this for compatibility
+	/// with clients that do not support mTLS.
+	#[serde(default = "default_true")]
+	pub require_client_cert: bool,
+
+	/// Whether to enforce strict X.509 v3 certificate verification.
+	///
+	/// When enabled (the default), only X.509 v3 certificates are accepted. Disable this to
+	/// accept older X.509 v2 certificates (e.g., from moonlight-tv). This bypasses TLS-level
+	/// signature verification for client certificates.
+	#[serde(default = "default_true")]
+	pub strict_cert_verification: bool,
+
 	/// Path to the certificate for SSL encryption.
 	pub certificate: PathBuf,
 
@@ -117,6 +133,8 @@ impl Default for WebserverConfig {
 			port: 47989,
 			port_https: 47984,
 			enable_pairing: true,
+			require_client_cert: true,
+			strict_cert_verification: true,
 			certificate: "$HOME/.config/moonshine/cert.pem".into(),
 			private_key: "$HOME/.config/moonshine/key.pem".into(),
 		}
