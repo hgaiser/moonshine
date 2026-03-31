@@ -351,6 +351,7 @@ fn launch_application(
 	.arg(program)
 	.args(args)
 	.env("PULSE_SERVER", format!("unix:{}", socket_path.display()))
+	.env("PULSE_RUNTIME_PATH", socket_path.parent().unwrap().display().to_string())
 	.env("DISPLAY", format!(":{}", ready.xdisplay))
 	// Remove WAYLAND_DISPLAY so the game uses X11 via DISPLAY,
 	// and the gamescope WSI layer only needs GAMESCOPE_WAYLAND_DISPLAY.
