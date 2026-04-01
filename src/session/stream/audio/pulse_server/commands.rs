@@ -531,14 +531,14 @@ fn configure_buffer(attr: &mut pulse::stream::BufferAttr, spec: &pulse::SampleSp
 	}
 
 	if attr.target_length == u32::MAX {
-		attr.target_length = (len_10ms * 2)
+		attr.target_length = (len_10ms * 6)
 			.next_multiple_of(attr.minimum_request_length)
 			.min(attr.max_length);
 	} else {
 		attr.target_length = attr
 			.target_length
 			.next_multiple_of(attr.minimum_request_length)
-			.max(len_10ms)
+			.max(len_10ms * 6)
 			.min(attr.max_length);
 
 		if attr.target_length < (attr.minimum_request_length * 2) {
