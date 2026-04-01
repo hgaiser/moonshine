@@ -100,7 +100,7 @@ impl Session {
 			audio_stream: None,
 			control_stream: None,
 			listener: Some(listener),
-			socket_path,
+			pulse_dir,
 		};
 		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal));
 		Ok(Self {
@@ -145,7 +145,7 @@ struct SessionInner {
 	audio_stream: Option<AudioStream>,
 	control_stream: Option<ControlStream>,
 	listener: Option<std::os::unix::net::UnixListener>,
-	socket_path: std::path::PathBuf,
+	pulse_dir: std::path::PathBuf,
 }
 
 impl SessionInner {
@@ -184,7 +184,7 @@ impl SessionInner {
 					// Launch the application in a background thread that waits
 					// for XWayland to become ready.
 					let app_context = session_context.clone();
-					let app_socket_path = self.socket_path.clone();
+					let app_pulse_dir = self.pulse_dir.clone();
 					let app_shutdown_manager = stop_session_manager.clone();
 					if let Err(e) = std::thread::Builder::new().name("app-launcher".to_string()).spawn(
 						move || -> Result<Child, ()> {
@@ -192,7 +192,7 @@ impl SessionInner {
 								let ready = ready_rx
 									.recv_timeout(std::time::Duration::from_secs(5))
 									.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
-								let mut child = launch_application(&app_context, &app_socket_path, &ready)?;
+								let mut child = launch_application(&app_context, &app_pulse_dir, &ready)?;
 
 								// Wait for the application to exit.
 								if let Err(e) = child.wait() {
@@ -313,7 +313,7 @@ impl SessionInner {
 /// `GAMESCOPE_WAYLAND_DISPLAY` instead.
 fn launch_application(
 	context: &SessionContext,
-	socket_path: &std::path::Path,
+	pulse_dir: &std::path::Path,
 	ready: &compositor::CompositorReady,
 ) -> Result<Child, ()> {
 	let Some(program) = context.application.command.first() else {
@@ -350,7 +350,8 @@ fn launch_application(
 	])
 	.arg(program)
 	.args(args)
-	.env("PULSE_SERVER", format!("unix:{}", socket_path.display()))
+	.env("PULSE_SERVER", format!("unix:{}", pulse_dir.join("native").display()))
+	.env("PULSE_RUNTIME_PATH", pulse_dir)
 	.env("DISPLAY", format!(":{}", ready.xdisplay));
 
 	// Conditionally set WAYLAND_DISPLAY based on application config.
