@@ -66,6 +66,7 @@ pkg-config
 rust
 shaderc
 vulkan-headers
+libc++
 ```
 
 On systems with `pacman` these can be installed with the following command:
@@ -84,7 +85,8 @@ $ sudo pacman -S \
    pkg-config \
    rust \
    shaderc \
-   vulkan-headers
+   vulkan-headers \
+   libc++
 ```
 
 Then compile and run:
