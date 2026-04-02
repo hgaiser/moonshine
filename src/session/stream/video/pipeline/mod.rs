@@ -378,12 +378,14 @@ impl VideoPipelineInner {
 						let encode_result = encoder.encode(encoder.input_image());
 						if let Ok(packets) = encode_result {
 							for packet in packets {
+								// Use current time as frame_created_at for re-encoded IDR (no actual frame)
 								if let Err(()) = self.send_packet(
 									&packet,
 									&packet_tx,
 									&mut packetizer,
 									&mut frame_number,
 									&mut sequence_number,
+									std::time::Instant::now(),
 								) {
 									tracing::warn!("Failed to send IDR re-encode packet");
 								}
@@ -601,6 +603,7 @@ impl VideoPipelineInner {
 								&mut packetizer,
 								&mut frame_number,
 								&mut sequence_number,
+								frame.created_at,
 							) {
 								Ok(durations) => durations,
 								Err(()) => {
@@ -685,12 +688,14 @@ impl VideoPipelineInner {
 		match encoder.flush() {
 			Ok(packets) => {
 				for packet in packets {
+					// Use current time as frame_created_at for flush packets (no actual frame)
 					let _ = self.send_packet(
 						&packet,
 						&packet_tx,
 						&mut packetizer,
 						&mut frame_number,
 						&mut sequence_number,
+						std::time::Instant::now(),
 					);
 				}
 			},
@@ -710,6 +715,7 @@ impl VideoPipelineInner {
 		packetizer: &mut Packetizer,
 		frame_number: &mut u32,
 		sequence_number: &mut u32,
+		frame_created_at: std::time::Instant,
 	) -> Result<(std::time::Duration, std::time::Duration), ()> {
 		// Calculate RTP timestamp from PTS (convert to 90kHz clock)
 		let rtp_timestamp = (packet.pts * 90000 / self.framerate as u64) as u32;
@@ -725,6 +731,11 @@ impl VideoPipelineInner {
 
 		let t_start = std::time::Instant::now();
 
+		// Calculate frame processing latency (capture to packetization) in 1/10 ms units
+		// We estimate packetization takes negligible time, so use current time
+		let processing_latency = std::time::Instant::now().duration_since(frame_created_at);
+		let latency_10ms = (processing_latency.as_micros() as u128 / 100) as u16;
+
 		let shards = packetizer.packetize(
 			&packet.data,
 			packet.is_key_frame,
@@ -734,6 +745,7 @@ impl VideoPipelineInner {
 			*frame_number,
 			sequence_number,
 			rtp_timestamp,
+			latency_10ms,
 		)?;
 
 		let t_packetized = std::time::Instant::now();
