@@ -734,7 +734,7 @@ impl VideoPipelineInner {
 		// Calculate frame processing latency (capture to packetization) in 1/10 ms units
 		// We estimate packetization takes negligible time, so use current time
 		let processing_latency = std::time::Instant::now().duration_since(frame_created_at);
-		let latency_10ms = (processing_latency.as_micros() as u128 / 100) as u16;
+		let latency_10ms = (processing_latency.as_micros() / 100) as u16;
 
 		let shards = packetizer.packetize(
 			&packet.data,
