@@ -173,7 +173,7 @@ impl SessionInner {
 						hdr,
 					};
 					let (frame_rx, input_tx, ready_rx) =
-						match compositor::start_compositor(compositor_config, stop_session_manager.clone()) {
+						match compositor::start_compositor(self.config.clone(),compositor_config, stop_session_manager.clone()) {
 							Ok(handles) => handles,
 							Err(e) => {
 								tracing::error!("Failed to start compositor: {e}");

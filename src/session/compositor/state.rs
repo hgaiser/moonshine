@@ -22,6 +22,7 @@ use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::utils::{take_presentation_feedback_surface_tree, OutputPresentationFeedback};
 use smithay::desktop::Space;
+use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
@@ -44,6 +45,7 @@ use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
+use crate::Config;
 use super::cursor::{self, PointerElement, PointerRenderElement};
 use super::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
 
@@ -369,6 +371,7 @@ impl MoonshineCompositor {
 		xdisplay_tx: mpsc::SyncSender<super::CompositorReady>,
 		render_node: &std::path::Path,
 		hdr: bool,
+		config: Config,
 	) -> (Self, Display<Self>) {
 		let compositor_state = CompositorState::new::<Self>(&display_handle);
 		let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -383,11 +386,20 @@ impl MoonshineCompositor {
 		smithay::wayland::presentation::PresentationState::new::<Self>(&display_handle, 1);
 		let clock = Clock::new();
 
+		let kb_config = &config.keyboard;
+		let xkb_config = XkbConfig {
+		    layout:  &kb_config.layout,
+		    variant: &kb_config.variant,
+		    model:   &kb_config.model,
+		    options: kb_config.options.clone(),
+		    rules: "evdev", 
+		};
+
 		let mut space = Space::default();
 
 		// Create seat with keyboard and pointer.
 		let mut seat = seat_state.new_wl_seat(&display_handle, "moonshine");
-		seat.add_keyboard(Default::default(), 200, 25)
+		seat.add_keyboard(xkb_config, 200, 25)
 			.expect("Failed to add keyboard to seat");
 		seat.add_pointer();
 
