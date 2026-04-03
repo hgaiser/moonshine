@@ -591,7 +591,13 @@ impl DmabufHandler for MoonshineCompositor {
 	}
 
 	fn dmabuf_imported(&mut self, _global: &DmabufGlobal, dmabuf: Dmabuf, notifier: ImportNotifier) {
-		tracing::debug!(format = ?dmabuf.format(), num_planes = dmabuf.num_planes(), "DMA-BUF import requested");
+		let format = dmabuf.format();
+		tracing::debug!(
+			client_fourcc = format!("0x{:08X} ({:?})", format.code as u32, format.code),
+			num_planes = dmabuf.num_planes(),
+			render_fourcc = format!("0x{:08X} ({:?})", self.render_fourcc as u32, self.render_fourcc),
+			"Client DMA-BUF import"
+		);
 		if self.renderer.import_dmabuf(&dmabuf, None).is_ok() {
 			tracing::debug!("DMA-BUF import successful");
 			let _ = notifier.successful::<MoonshineCompositor>();

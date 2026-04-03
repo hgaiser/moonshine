@@ -39,7 +39,7 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 		0x34324241 | 0x34324258 => (InputFormat::RGBA, vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
 		0x30334241 => (InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32), // ABGR2101010
 		0x48344241 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT),      // ABGR16161616F
-		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                       // ARGB/XRGB8888 (default)
+		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                       // ARGB/XRGB8888 (fallback)
 	}
 }
 
@@ -408,7 +408,7 @@ impl VideoPipelineInner {
 				let t1_received = std::time::Instant::now();
 
 				tracing::trace!(
-					"Received frame: format={}, modifier={:#x}, {}x{}, planes={}",
+					"Received frame: format=0x{:08X}, modifier={:#x}, {}x{}, planes={}",
 					frame.format,
 					frame.modifier,
 					frame.width,
@@ -520,7 +520,7 @@ impl VideoPipelineInner {
 					// the encoder switch succeeds, so that the converter's
 					// color space stays in sync with the encoder's VUI.
 					if encoder_color_desc != Some(color_desc) {
-						tracing::info!("Switching encoder color description to {color_desc:?}");
+						tracing::info!("Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})");
 						match encoder.set_color_description(color_desc) {
 							Ok(()) => {
 								encoder_color_desc = Some(color_desc);

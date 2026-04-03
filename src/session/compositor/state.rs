@@ -900,6 +900,14 @@ impl MoonshineCompositor {
 			.map(|cm| cm.frame_color_space())
 			.unwrap_or(FrameColorSpace::Srgb);
 		let hdr_metadata = self.color_management.as_ref().and_then(|cm| cm.hdr_metadata());
+		
+		tracing::debug!(
+			"Compositing frame: color_space={:?}, render_fourcc=0x{:08X} ({:?}), num_surfaces={}",
+			color_space,
+			self.render_fourcc as u32,
+			self.render_fourcc,
+			self.space.elements().count()
+		);
 
 		let planes: Vec<ExportedPlane> = client_dmabuf
 			.handles()
