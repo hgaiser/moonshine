@@ -163,6 +163,10 @@ pub struct ColorManagementState {
 	pending: HashMap<WlSurface, Option<ImageDescription>>,
 	/// Current (committed) image description per surface.
 	current: HashMap<WlSurface, ImageDescription>,
+	/// Pending image description per surface from gamescope_swapchain (takes priority).
+	gamescope_pending: HashMap<WlSurface, Option<ImageDescription>>,
+	/// Current (committed) image description per surface from gamescope_swapchain.
+	gamescope_current: HashMap<WlSurface, ImageDescription>,
 	/// Whether HDR mode was negotiated with the Moonlight client.
 	pub hdr: bool,
 }
@@ -182,6 +186,8 @@ impl ColorManagementState {
 		Self {
 			pending: HashMap::new(),
 			current: HashMap::new(),
+			gamescope_pending: HashMap::new(),
+			gamescope_current: HashMap::new(),
 			hdr,
 		}
 	}
@@ -196,6 +202,17 @@ impl ColorManagementState {
 		self.pending.insert(surface.clone(), Some(desc));
 	}
 
+	/// Set a pending image description for a surface from gamescope_swapchain.
+	/// This takes priority over wp_color_management declarations.
+	pub fn set_gamescope_pending(&mut self, surface: &WlSurface, desc: ImageDescription) {
+		tracing::debug!(
+			surface_id = ?surface.id(),
+			color_space = ?desc.to_frame_color_space(),
+			"set_gamescope_pending (takes priority)"
+		);
+		self.gamescope_pending.insert(surface.clone(), Some(desc));
+	}
+
 	/// Clear the pending image description (from `unset_image_description`).
 	pub fn unset_pending(&mut self, surface: &WlSurface) {
 		self.pending.insert(surface.clone(), None);
@@ -203,6 +220,28 @@ impl ColorManagementState {
 
 	/// Apply pending state on surface commit.
 	pub fn commit(&mut self, surface: &WlSurface) {
+		// Apply gamescope_swapchain pending state first.
+		if let Some(pending) = self.gamescope_pending.remove(surface) {
+			match pending {
+				Some(desc) => {
+					tracing::debug!(
+						surface_id = ?surface.id(),
+						color_space = ?desc.to_frame_color_space(),
+						"commit: inserting gamescope color space into current"
+					);
+					self.gamescope_current.insert(surface.clone(), desc);
+				},
+				None => {
+					tracing::debug!(
+						surface_id = ?surface.id(),
+						"commit: removing gamescope color space from current"
+					);
+					self.gamescope_current.remove(surface);
+				},
+			}
+		}
+
+		// Apply wp_color_management pending state.
 		if let Some(pending) = self.pending.remove(surface) {
 			match pending {
 				Some(desc) => {
@@ -229,7 +268,22 @@ impl ColorManagementState {
 	///
 	/// Returns `Bt2020Pq` if any mapped surface has declared BT.2020+PQ,
 	/// otherwise returns `Srgb`.
+	///
+	/// Gamescope swapchain color space declarations take priority over
+	/// wp_color_management declarations.
 	pub fn frame_color_space(&self) -> FrameColorSpace {
+		// Check gamescope_swapchain color spaces first (higher priority).
+		for (surface, desc) in &self.gamescope_current {
+			if desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq {
+				tracing::trace!(
+					surface_id = ?surface.id(),
+					num_gamescope_current = self.gamescope_current.len(),
+					"frame_color_space: Bt2020Pq (from gamescope_swapchain)"
+				);
+				return FrameColorSpace::Bt2020Pq;
+			}
+		}
+		// Fall back to wp_color_management color spaces.
 		for (surface, desc) in &self.current {
 			if desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq {
 				tracing::trace!(
@@ -247,7 +301,37 @@ impl ColorManagementState {
 	///
 	/// Returns `Some(HdrMetadata)` when a surface has declared BT.2020+PQ
 	/// with max_cll or max_fall values.
+	///
+	/// Gamescope swapchain color space declarations take priority over
+	/// wp_color_management declarations.
 	pub fn hdr_metadata(&self) -> Option<HdrMetadata> {
+		let sat = |v: u32| -> u16 { u16::try_from(v).unwrap_or(u16::MAX) };
+
+		// Check gamescope_swapchain metadata first (higher priority).
+		for desc in self.gamescope_current.values() {
+			if desc.to_frame_color_space() != FrameColorSpace::Bt2020Pq {
+				continue;
+			}
+			if desc.max_cll.is_none() && desc.max_fall.is_none() && desc.mastering_luminance.is_none() {
+				continue;
+			}
+			return Some(HdrMetadata {
+				display_primaries: desc.mastering_primaries.map_or([(0, 0); 3], |p| {
+					[
+						(sat(p[0].0), sat(p[0].1)),
+						(sat(p[1].0), sat(p[1].1)),
+						(sat(p[2].0), sat(p[2].1)),
+					]
+				}),
+				white_point: desc.white_point.map_or((0, 0), |(x, y)| (sat(x), sat(y))),
+				max_luminance: desc.mastering_luminance.map_or(0, |(_, max)| max),
+				min_luminance: desc.mastering_luminance.map_or(0, |(min, _)| min),
+				max_cll: sat(desc.max_cll.unwrap_or(0)),
+				max_fall: sat(desc.max_fall.unwrap_or(0)),
+			});
+		}
+
+		// Fall back to wp_color_management metadata.
 		for desc in self.current.values() {
 			if desc.to_frame_color_space() != FrameColorSpace::Bt2020Pq {
 				continue;
@@ -255,7 +339,6 @@ impl ColorManagementState {
 			if desc.max_cll.is_none() && desc.max_fall.is_none() && desc.mastering_luminance.is_none() {
 				continue;
 			}
-			let sat = |v: u32| -> u16 { u16::try_from(v).unwrap_or(u16::MAX) };
 			return Some(HdrMetadata {
 				display_primaries: desc.mastering_primaries.map_or([(0, 0); 3], |p| {
 					[
@@ -278,6 +361,8 @@ impl ColorManagementState {
 	pub fn surface_destroyed(&mut self, surface: &WlSurface) {
 		self.pending.remove(surface);
 		self.current.remove(surface);
+		self.gamescope_pending.remove(surface);
+		self.gamescope_current.remove(surface);
 	}
 }
 

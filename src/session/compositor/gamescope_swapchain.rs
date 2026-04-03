@@ -80,7 +80,7 @@ impl Dispatch<GamescopeSwapchain, SwapchainData> for MoonshineCompositor {
 	fn request(
 		state: &mut Self,
 		_client: &Client,
-		_resource: &GamescopeSwapchain,
+		resource: &GamescopeSwapchain,
 		request: <GamescopeSwapchain as Resource>::Request,
 		data: &SwapchainData,
 		_dhandle: &DisplayHandle,
@@ -98,12 +98,33 @@ impl Dispatch<GamescopeSwapchain, SwapchainData> for MoonshineCompositor {
 				if let Some(cm) = &mut state.color_management {
 					if vk_colorspace == VK_COLOR_SPACE_HDR10_ST2084_EXT {
 						tracing::debug!("Setting surface to BT.2020 + PQ via gamescope swapchain feedback");
-						cm.set_pending(&data.surface, ImageDescription::bt2020_pq());
+						cm.set_gamescope_pending(&data.surface, ImageDescription::bt2020_pq());
 					} else {
 						tracing::debug!("Setting surface to sRGB via gamescope swapchain feedback");
-						cm.set_pending(&data.surface, ImageDescription::srgb());
+						cm.set_gamescope_pending(&data.surface, ImageDescription::srgb());
 					}
 				}
+
+				// Always mark this surface as the override surface so that
+				// compositing uses render_elements_from_surface_tree() instead
+				// of try_direct_scanout() or space elements. This is required
+				// for both xcb mode (where OverrideWindowContent arrives later
+				// and sets the same surface) and native Wayland mode (where
+				// OverrideWindowContent is never sent, xid=0).
+				tracing::debug!("Setting gamescope swapchain surface as override surface");
+				state.override_window_surface(0, data.surface.clone());
+
+				// Inform the gamescope WSI of our compositor's refresh cycle.
+				// This is used by VK_GOOGLE_display_timing consumers to pace frames.
+				let refresh_ns = state
+					.output
+					.preferred_mode()
+					.map(|m| 1_000_000_000_000u64 / m.refresh.max(1) as u64)
+					.unwrap_or(11_111_111); // ~90 fps default
+				let refresh_hi = (refresh_ns >> 32) as u32;
+				let refresh_lo = (refresh_ns & 0xffff_ffff) as u32;
+				tracing::debug!(refresh_ns, "gamescope_swapchain: sending refresh_cycle");
+				let _ = resource.refresh_cycle(refresh_hi, refresh_lo);
 			},
 			Request::OverrideWindowContent {
 				gamescope_xwayland_server_id: _,
@@ -159,7 +180,7 @@ impl Dispatch<GamescopeSwapchain, SwapchainData> for MoonshineCompositor {
 						]),
 						white_point: Some((white_point_x, white_point_y)),
 					};
-					cm.set_pending(&data.surface, desc);
+					cm.set_gamescope_pending(&data.surface, desc);
 				}
 			},
 			Request::SetPresentMode { .. } | Request::SetPresentTime { .. } | Request::Destroy => {},
