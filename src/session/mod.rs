@@ -307,10 +307,11 @@ impl SessionInner {
 
 /// Launch the application as a child process.
 ///
-/// `WAYLAND_DISPLAY` is removed from the child environment so that
-/// games connect via X11 (`DISPLAY`) through XWayland. When HDR is
-/// active, the gamescope WSI layer is configured through
-/// `GAMESCOPE_WAYLAND_DISPLAY` instead.
+/// The child gets both `DISPLAY` for X11/XWayland clients and
+/// `WAYLAND_DISPLAY` for Wayland-native clients, both pointing at the
+/// session compositor rather than the host desktop session. When HDR is
+/// active, the gamescope WSI layer is additionally configured through
+/// `GAMESCOPE_WAYLAND_DISPLAY`.
 fn launch_application(
 	context: &SessionContext,
 	pulse_dir: &std::path::Path,
@@ -353,9 +354,7 @@ fn launch_application(
 	.env("PULSE_SERVER", format!("unix:{}", pulse_dir.join("native").display()))
 	.env("PULSE_RUNTIME_PATH", pulse_dir)
 	.env("DISPLAY", format!(":{}", ready.xdisplay))
-	// Remove WAYLAND_DISPLAY so the game uses X11 via DISPLAY,
-	// and the gamescope WSI layer only needs GAMESCOPE_WAYLAND_DISPLAY.
-	.env_remove("WAYLAND_DISPLAY");
+	.env("WAYLAND_DISPLAY", &ready.wayland_display);
 
 	// Pass gamescope WSI env vars directly to the child process.
 	if let Some(ref gamescope_display) = ready.gamescope_wayland_display {

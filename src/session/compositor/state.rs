@@ -25,7 +25,7 @@ use smithay::desktop::Space;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
-use smithay::reexports::calloop::LoopHandle;
+use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Display, DisplayHandle};
@@ -291,6 +291,10 @@ pub struct MoonshineCompositor {
 	/// Channel to notify the session thread of the XWayland display number
 	/// once it becomes ready.
 	pub xdisplay_tx: Option<mpsc::SyncSender<super::CompositorReady>>,
+	/// Registration token for the compositor's Wayland listening socket.
+	pub wayland_socket_token: Option<RegistrationToken>,
+	/// Name of the compositor's Wayland socket in XDG_RUNTIME_DIR.
+	pub wayland_display: String,
 
 	/// Wayland socket name for the gamescope WSI layer (only set when HDR is active).
 	pub gamescope_wayland_display: Option<String>,
@@ -394,24 +398,15 @@ impl MoonshineCompositor {
 		// Create the Wayland socket for clients to connect.
 		let socket_source = ListeningSocketSource::new_auto().expect("Failed to create Wayland listening socket");
 		let socket_name = socket_source.socket_name().to_os_string();
+		let wayland_display = socket_name.to_string_lossy().into_owned();
 		tracing::debug!("Wayland socket: {:?}", socket_name);
 
-		// Set WAYLAND_DISPLAY for child processes.
-		std::env::set_var("WAYLAND_DISPLAY", &socket_name);
-
 		// Store the socket name for the gamescope WSI layer when HDR is active.
-		// The actual env vars are passed to child processes via cmd.env() in
-		// session/mod.rs, avoiding the unsound std::env::set_var in a
-		// multi-threaded context.
-		let gamescope_wayland_display = if hdr {
-			Some(socket_name.to_string_lossy().into_owned())
-		} else {
-			None
-		};
+		let gamescope_wayland_display = if hdr { Some(wayland_display.clone()) } else { None };
 
 		// Register the socket source with the event loop.
 		let mut display_handle_clone = display_handle.clone();
-		handle
+		let wayland_socket_token = handle
 			.insert_source(socket_source, move |client_stream, _, _state| {
 				tracing::debug!("New Wayland client connected");
 				if let Err(e) = display_handle_clone.insert_client(
@@ -438,6 +433,7 @@ impl MoonshineCompositor {
 		// wl_buffer objects. NVIDIA's Vulkan WSI requires the feedback
 		// protocol to know which device to allocate on.
 		let dmabuf_formats = renderer.dmabuf_formats();
+
 		let render_node_dev = std::fs::metadata(render_node)
 			.map(|m| {
 				use std::os::unix::fs::MetadataExt;
@@ -447,6 +443,7 @@ impl MoonshineCompositor {
 		let default_feedback = DmabufFeedbackBuilder::new(render_node_dev, dmabuf_formats.clone())
 			.build()
 			.expect("Failed to build DmabufFeedback");
+
 		let mut dmabuf_state = DmabufState::new();
 		let dmabuf_global =
 			dmabuf_state.create_global_with_default_feedback::<Self>(&display_handle, &default_feedback);
@@ -526,6 +523,8 @@ impl MoonshineCompositor {
 				xwm: None,
 				xdisplay: None,
 				xdisplay_tx: Some(xdisplay_tx),
+				wayland_socket_token: Some(wayland_socket_token),
+				wayland_display,
 				gamescope_wayland_display,
 				override_surface: None,
 				x11_input_conn: None,
@@ -1002,7 +1001,7 @@ impl MoonshineCompositor {
 
 		// Log key environment state before spawning.
 		tracing::debug!(
-			wayland_display = ?std::env::var("WAYLAND_DISPLAY"),
+			wayland_display = %self.wayland_display,
 			xdg_runtime_dir = ?std::env::var("XDG_RUNTIME_DIR"),
 			"Spawning XWayland"
 		);
@@ -1130,6 +1129,7 @@ impl MoonshineCompositor {
 					if let Some(tx) = data.xdisplay_tx.take() {
 						let _ = tx.send(super::CompositorReady {
 							xdisplay: display_number,
+							wayland_display: data.wayland_display.clone(),
 							gamescope_wayland_display: data.gamescope_wayland_display.clone(),
 						});
 					}
@@ -1216,6 +1216,11 @@ impl MoonshineCompositor {
 	/// ensures all clients are gone before Xwayland's `-terminate` flag
 	/// triggers a clean exit.
 	pub fn shutdown_session_processes(&mut self) {
+		if let Some(token) = self.wayland_socket_token.take() {
+			self.handle.remove(token);
+			tracing::debug!(wayland_display = %self.wayland_display, "Removed Wayland listening socket source");
+		}
+
 		// Stop the application so all X11 clients disconnect from Xwayland.
 		let status = std::process::Command::new("systemctl")
 			.args(["--user", "stop", "moonshine-session.scope"])
