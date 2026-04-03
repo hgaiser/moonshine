@@ -79,6 +79,7 @@ impl Default for Config {
 				title: "Steam".to_string(),
 				command: vec!["/usr/bin/steam".to_string(), "steam://open/bigpicture".to_string()],
 				boxart: None,
+				wayland_native: false,
 			}],
 			application_scanners: vec![ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
 				library: "$HOME/.local/share/Steam".into(),
@@ -157,6 +158,12 @@ pub struct ApplicationConfig {
 
 	/// The command to run.
 	pub command: Vec<String>,
+
+	/// Whether the application is Wayland-native and should have
+	/// WAYLAND_DISPLAY set when launched. When false (default),
+	/// WAYLAND_DISPLAY is unset to force X11 via XWayland.
+	#[serde(default = "default_false")]
+	pub wayland_native: bool,
 }
 
 impl ApplicationConfig {

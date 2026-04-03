@@ -352,10 +352,15 @@ fn launch_application(
 	.args(args)
 	.env("PULSE_SERVER", format!("unix:{}", pulse_dir.join("native").display()))
 	.env("PULSE_RUNTIME_PATH", pulse_dir)
-	.env("DISPLAY", format!(":{}", ready.xdisplay))
-	// Remove WAYLAND_DISPLAY so the game uses X11 via DISPLAY,
-	// and the gamescope WSI layer only needs GAMESCOPE_WAYLAND_DISPLAY.
-	.env_remove("WAYLAND_DISPLAY");
+	.env("DISPLAY", format!(":{}", ready.xdisplay));
+
+	// Conditionally set WAYLAND_DISPLAY based on application config.
+	// Wayland-native apps (e.g., Waydroid) need this; games typically use X11.
+	if context.application.wayland_native {
+		cmd.env("WAYLAND_DISPLAY", ready.wayland_display.clone());
+	} else {
+		cmd.env_remove("WAYLAND_DISPLAY");
+	}
 
 	// Pass gamescope WSI env vars directly to the child process.
 	if let Some(ref gamescope_display) = ready.gamescope_wayland_display {

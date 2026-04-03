@@ -297,6 +297,9 @@ pub struct MoonshineCompositor {
 	/// Wayland socket name for the gamescope WSI layer (only set when HDR is active).
 	pub gamescope_wayland_display: Option<String>,
 
+	/// Wayland socket name for the main compositor.
+	pub wayland_display: String,
+
 	// -- Gamescope WSI layer --
 	/// Override surface from gamescope_swapchain::override_window_content.
 	/// When set, this surface is rendered instead of the original X11 window.
@@ -420,6 +423,7 @@ impl MoonshineCompositor {
 		} else {
 			None
 		};
+		let wayland_display = socket_name.to_string_lossy().into_owned();
 
 		// Register the socket source with the event loop.
 		let mut display_handle_clone = display_handle.clone();
@@ -539,6 +543,7 @@ impl MoonshineCompositor {
 				xdisplay: None,
 				xdisplay_tx: Some(xdisplay_tx),
 				gamescope_wayland_display,
+				wayland_display,
 				override_surface: None,
 				x11_input_conn: None,
 				focused_x11_window: None,
@@ -1143,6 +1148,7 @@ impl MoonshineCompositor {
 						let _ = tx.send(super::CompositorReady {
 							xdisplay: display_number,
 							gamescope_wayland_display: data.gamescope_wayland_display.clone(),
+							wayland_display: data.wayland_display.clone(),
 						});
 					}
 				},
