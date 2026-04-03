@@ -365,6 +365,35 @@ fn launch_application(
 		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
 		// games will not see HDR as available.
 		cmd.env("DXVK_HDR", "1");
+
+		// Create the gamescope frame limiter file so that `frameLimiterAware`
+		// Vulkan applications (DXVK ≥ 2.3, VKD3D-Proton ≥ 2.12) switch to
+		// `vkWaitForPresentKHR`-based frame pacing.  Without this, those apps
+		// would render uncapped even though we send `wp_presentation_feedback`
+		// at the target refresh rate.
+		//
+		// Value 1 = force FIFO (expose only FIFO present mode to the app and
+		// redirect `vkWaitForPresentKHR` to block until compositor ack).
+		//
+		// Use XDG_RUNTIME_DIR (mode 0700, user-private) to avoid the symlink
+		// attack that is possible with a predictable path in world-writable /tmp.
+		// If XDG_RUNTIME_DIR is not available, skip creating the file rather than
+		// falling back to /tmp which would be world-writable.
+		if let Some(limiter_dir) = std::env::var_os("XDG_RUNTIME_DIR")
+			.map(std::path::PathBuf::from)
+			.filter(|p| p.is_dir())
+		{
+			let limiter_path = limiter_dir.join("moonshine-gamescope-limiter");
+			match std::fs::write(&limiter_path, 1u32.to_ne_bytes()) {
+				Ok(()) => {
+					cmd.env("MOONSHINE_LIMITER_FILE", &limiter_path);
+					tracing::debug!("Created gamescope limiter file: {}", limiter_path.display());
+				},
+				Err(e) => tracing::warn!("Failed to create gamescope limiter file: {e}"),
+			}
+		} else {
+			tracing::warn!("XDG_RUNTIME_DIR is not set or not a directory; skipping gamescope limiter file");
+		}
 	}
 
 	cmd.stdout(
