@@ -800,9 +800,14 @@ impl MoonshineCompositor {
 						smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
 					},
 				);
+				let frame_period = self
+					.output
+					.preferred_mode()
+					.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
+					.unwrap_or(std::time::Duration::from_millis(11));
 				feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
 					self.clock.now(),
-					Refresh::Unknown,
+					Refresh::Fixed(frame_period),
 					0,
 					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(),
 				);
@@ -956,9 +961,14 @@ impl MoonshineCompositor {
 				smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
 			},
 		);
+		let frame_period = self
+			.output
+			.preferred_mode()
+			.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
+			.unwrap_or(std::time::Duration::from_millis(11));
 		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
 			self.clock.now(),
-			Refresh::Unknown,
+			Refresh::Fixed(frame_period),
 			0,
 			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
 			),
