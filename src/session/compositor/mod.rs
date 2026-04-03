@@ -148,21 +148,19 @@ fn run_compositor(
 	tracing::debug!("Supported DMA-BUF render formats: {}", render_formats.iter().count());
 
 	// Select preferred render format based on HDR mode.
-	// HDR: prefer 10-bit > FP16 > 8-bit.
-	// 10-bit UNORM is the natural format for PQ (ST 2084) since the compositor
-	// blits without color management — PQ-encoded values are preserved as-is.
-	// FP16 would also work but requires matching transfer function assumptions
-	// in the encoder shader.
-	// SDR: prefer 8-bit ARGB/XRGB.
+	// HDR: prefer 10-bit > FP16 > 8-bit ABGR (to match common Vulkan WSI format).
+	// SDR: prefer 8-bit ABGR/XBGR to match Vulkan WSI and avoid GL R↔B channel swaps.
+	// Vulkan WSI on Wayland defaults to XBGR/ABGR formats, so using ARGB causes
+	// GL to incorrectly swap red/blue channels during blit operations.
 	let preferred_fourccs: Vec<Fourcc> = if config.hdr {
 		vec![
 			Fourcc::Abgr2101010,
 			Fourcc::Abgr16161616f,
-			Fourcc::Argb8888,
-			Fourcc::Xrgb8888,
+			Fourcc::Abgr8888,
+			Fourcc::Xbgr8888,
 		]
 	} else {
-		vec![Fourcc::Argb8888, Fourcc::Xrgb8888]
+		vec![Fourcc::Abgr8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888]
 	};
 	let (render_fourcc, render_modifiers) = preferred_fourccs
 		.iter()
