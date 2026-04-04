@@ -86,269 +86,122 @@ impl LenientClientCertVerifier {
 		Ok(public_key_bytes)
 	}
 
-	/// Verify TLS 1.2 signature manually using ring, bypassing WebPki.
+	/// Verify a signature manually using ring, bypassing WebPki.
 	///
 	/// This supports RSA PKCS1, RSA PSS, ECDSA, and Ed25519 signatures.
+	fn verify_signature_manual(
+		&self,
+		message: &[u8],
+		cert_der: &[u8],
+		dss: &DigitallySignedStruct,
+		tls13: bool,
+	) -> Result<HandshakeSignatureValid, Error> {
+		let public_key_bytes = Self::extract_public_key(cert_der)?;
+
+		match dss.scheme {
+			// RSA PKCS1 signatures
+			SignatureScheme::RSA_PKCS1_SHA256 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &public_key_bytes);
+				self.verify_with_scheme(public_key, message, dss, "RSA_PKCS1_SHA256")
+			},
+			SignatureScheme::RSA_PKCS1_SHA384 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA384, &public_key_bytes);
+				self.verify_with_scheme(public_key, message, dss, "RSA_PKCS1_SHA384")
+			},
+			SignatureScheme::RSA_PKCS1_SHA512 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA512, &public_key_bytes);
+				self.verify_with_scheme(public_key, message, dss, "RSA_PKCS1_SHA512")
+			},
+
+			// RSA PSS signatures
+			SignatureScheme::RSA_PSS_SHA256 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, &public_key_bytes);
+				self.verify_with_scheme(public_key, message, dss, "RSA_PSS_SHA256")
+			},
+			SignatureScheme::RSA_PSS_SHA384 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA384, &public_key_bytes);
+				self.verify_with_scheme(public_key, message, dss, "RSA_PSS_SHA384")
+			},
+			SignatureScheme::RSA_PSS_SHA512 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA512, &public_key_bytes);
+				self.verify_with_scheme(public_key, message, dss, "RSA_PSS_SHA512")
+			},
+
+			// ECDSA signatures (ASN.1 DER-encoded)
+			SignatureScheme::ECDSA_NISTP256_SHA256 => {
+				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &public_key_bytes);
+				self.verify_with_scheme(public_key, message, dss, "ECDSA_NISTP256_SHA256")
+			},
+			SignatureScheme::ECDSA_NISTP384_SHA384 => {
+				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P384_SHA384_ASN1, &public_key_bytes);
+				self.verify_with_scheme(public_key, message, dss, "ECDSA_NISTP384_SHA384")
+			},
+			// ECDSA P-521 is not supported by ring
+			SignatureScheme::ECDSA_NISTP521_SHA512 => {
+				tracing::warn!("ECDSA P-521 is not supported by ring");
+				Err(Error::InvalidCertificate(
+					rustls::CertificateError::UnsupportedSignatureAlgorithmContext {
+						signature_algorithm_id: vec![],
+						supported_algorithms: vec![],
+					},
+				))
+			},
+
+			// Ed25519 signatures
+			SignatureScheme::ED25519 => {
+				let public_key = UnparsedPublicKey::new(&ring::signature::ED25519, &public_key_bytes);
+				self.verify_with_scheme(public_key, message, dss, "ED25519")
+			},
+
+			// Unsupported signature scheme
+			scheme => {
+				let version = if tls13 { "TLS 1.3" } else { "TLS 1.2" };
+				tracing::warn!("Unsupported signature scheme for {}: {:?}", version, scheme);
+				Err(Error::InvalidCertificate(
+					rustls::CertificateError::UnsupportedSignatureAlgorithmContext {
+						signature_algorithm_id: vec![],
+						supported_algorithms: vec![],
+					},
+				))
+			},
+		}
+	}
+
+	/// Helper to verify a signature with a given public key and scheme name.
+	fn verify_with_scheme<B: AsRef<[u8]>>(
+		&self,
+		public_key: UnparsedPublicKey<B>,
+		message: &[u8],
+		dss: &DigitallySignedStruct,
+		scheme_name: &str,
+	) -> Result<HandshakeSignatureValid, Error> {
+		public_key
+			.verify(message, dss.signature())
+			.map(|_| HandshakeSignatureValid::assertion())
+			.map_err(|e| {
+				tracing::debug!("{} signature verification failed: {:?}", scheme_name, e);
+				Error::InvalidCertificate(rustls::CertificateError::BadSignature)
+			})
+	}
+
+	/// Verify TLS 1.2 signature manually using ring, bypassing WebPki.
 	fn verify_tls12_signature_manual(
 		&self,
 		message: &[u8],
 		cert_der: &[u8],
 		dss: &DigitallySignedStruct,
 	) -> Result<HandshakeSignatureValid, Error> {
-		let public_key_bytes = Self::extract_public_key(cert_der)?;
-
-		match dss.scheme {
-			// RSA PKCS1 signatures
-			SignatureScheme::RSA_PKCS1_SHA256 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PKCS1_SHA256 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::RSA_PKCS1_SHA384 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA384, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PKCS1_SHA384 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::RSA_PKCS1_SHA512 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA512, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PKCS1_SHA512 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-
-			// RSA PSS signatures
-			SignatureScheme::RSA_PSS_SHA256 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PSS_SHA256 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::RSA_PSS_SHA384 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA384, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PSS_SHA384 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::RSA_PSS_SHA512 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA512, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PSS_SHA512 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-
-			// ECDSA signatures (ASN.1 DER-encoded)
-			SignatureScheme::ECDSA_NISTP256_SHA256 => {
-				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("ECDSA_NISTP256_SHA256 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::ECDSA_NISTP384_SHA384 => {
-				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P384_SHA384_ASN1, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("ECDSA_NISTP384_SHA384 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			// ECDSA P-521 is not supported by ring
-			SignatureScheme::ECDSA_NISTP521_SHA512 => {
-				tracing::warn!("ECDSA P-521 is not supported by ring");
-				Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding))
-			},
-
-			// Ed25519 signatures
-			SignatureScheme::ED25519 => {
-				let public_key = UnparsedPublicKey::new(&ring::signature::ED25519, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("ED25519 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-
-			// Unsupported signature scheme
-			scheme => {
-				tracing::warn!("Unsupported signature scheme for TLS 1.2: {:?}", scheme);
-				Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding))
-			},
-		}
+		self.verify_signature_manual(message, cert_der, dss, false)
 	}
 
 	/// Verify TLS 1.3 signature manually using ring, bypassing WebPki.
-	///
-	/// This supports RSA PKCS1, RSA PSS, ECDSA, and Ed25519 signatures.
 	fn verify_tls13_signature_manual(
 		&self,
 		message: &[u8],
 		cert_der: &[u8],
 		dss: &DigitallySignedStruct,
 	) -> Result<HandshakeSignatureValid, Error> {
-		// TLS 1.3 requires the signature scheme to be supported
-		// Check against known TLS 1.3 compatible schemes (RFC 8446)
-		let tls13_schemes = [
-			SignatureScheme::RSA_PKCS1_SHA256,
-			SignatureScheme::RSA_PKCS1_SHA384,
-			SignatureScheme::RSA_PKCS1_SHA512,
-			SignatureScheme::RSA_PSS_SHA256,
-			SignatureScheme::RSA_PSS_SHA384,
-			SignatureScheme::RSA_PSS_SHA512,
-			SignatureScheme::ECDSA_NISTP256_SHA256,
-			SignatureScheme::ECDSA_NISTP384_SHA384,
-			SignatureScheme::ECDSA_NISTP521_SHA512,
-			SignatureScheme::ED25519,
-		];
-		if !tls13_schemes.contains(&dss.scheme) {
-			tracing::warn!("Signature scheme not supported in TLS 1.3: {:?}", dss.scheme);
-			return Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding));
-		}
-
-		let public_key_bytes = Self::extract_public_key(cert_der)?;
-
-		match dss.scheme {
-			// RSA PKCS1 signatures
-			SignatureScheme::RSA_PKCS1_SHA256 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PKCS1_SHA256 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::RSA_PKCS1_SHA384 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA384, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PKCS1_SHA384 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::RSA_PKCS1_SHA512 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA512, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PKCS1_SHA512 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-
-			// RSA PSS signatures
-			SignatureScheme::RSA_PSS_SHA256 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PSS_SHA256 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::RSA_PSS_SHA384 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA384, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PSS_SHA384 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::RSA_PSS_SHA512 => {
-				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA512, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("RSA_PSS_SHA512 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-
-			// ECDSA signatures (ASN.1 DER-encoded)
-			SignatureScheme::ECDSA_NISTP256_SHA256 => {
-				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("ECDSA_NISTP256_SHA256 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			SignatureScheme::ECDSA_NISTP384_SHA384 => {
-				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P384_SHA384_ASN1, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("ECDSA_NISTP384_SHA384 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-			// ECDSA P-521 is not supported by ring
-			SignatureScheme::ECDSA_NISTP521_SHA512 => {
-				tracing::warn!("ECDSA P-521 is not supported by ring");
-				Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding))
-			},
-
-			// Ed25519 signatures
-			SignatureScheme::ED25519 => {
-				let public_key = UnparsedPublicKey::new(&ring::signature::ED25519, &public_key_bytes);
-				public_key
-					.verify(message, dss.signature())
-					.map(|_| HandshakeSignatureValid::assertion())
-					.map_err(|e| {
-						tracing::debug!("ED25519 signature verification failed: {:?}", e);
-						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-					})
-			},
-
-			// Unsupported signature scheme
-			scheme => {
-				tracing::warn!("Unsupported signature scheme for TLS 1.3: {:?}", scheme);
-				Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding))
-			},
-		}
+		self.verify_signature_manual(message, cert_der, dss, true)
 	}
 }
 
