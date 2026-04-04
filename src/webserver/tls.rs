@@ -5,27 +5,38 @@ use std::path::Path;
 use std::sync::Arc;
 
 use rustls::client::danger::HandshakeSignatureValid;
-use rustls::crypto::{verify_tls12_signature, verify_tls13_signature, CryptoProvider, WebPkiSupportedAlgorithms};
+use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::DistinguishedName;
 use rustls::{DigitallySignedStruct, Error, ServerConfig, SignatureScheme};
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_rustls::{server::TlsStream, TlsAcceptor as TlsAcceptorTokio};
+use x509_parser::prelude::*;
 
-/// A client certificate verifier that accepts any client certificate.
+use ring::signature::{
+	UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384, RSA_PKCS1_2048_8192_SHA512,
+	RSA_PSS_2048_8192_SHA256, RSA_PSS_2048_8192_SHA384, RSA_PSS_2048_8192_SHA512,
+};
+
+/// A lenient client certificate verifier that mirrors Sunshine's validation behavior.
 ///
-/// This allows the TLS layer to request and capture client certificates
-/// without rejecting connections. Actual authorization (checking if the
-/// certificate belongs to a paired client) happens at the application layer.
+/// This verifier accepts X.509 v1, v2, and v3 certificates, ignoring:
+/// - Certificate version (accepts v1/v2/v3, not just v3)
+/// - Expiration (accepts expired and not-yet-valid certificates)
+/// - Issuer validation (skips chain validation)
 ///
-/// Client certificates are optional — clients without certificates (e.g.,
-/// during pairing) can still connect.
-struct AllowAnyClientCert {
+/// Cryptographic signature verification is still performed during the TLS handshake
+/// via verify_tls12_signature() and verify_tls13_signature().
+///
+/// Actual authorization (checking if the certificate belongs to a paired client)
+/// happens at the application layer via fingerprint matching.
+struct LenientClientCertVerifier {
 	supported_algs: WebPkiSupportedAlgorithms,
 }
 
-impl AllowAnyClientCert {
+impl LenientClientCertVerifier {
 	fn new() -> Self {
 		let provider = CryptoProvider::get_default()
 			.cloned()
@@ -34,15 +45,320 @@ impl AllowAnyClientCert {
 			supported_algs: provider.signature_verification_algorithms,
 		}
 	}
-}
 
-impl fmt::Debug for AllowAnyClientCert {
-	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-		f.debug_struct("AllowAnyClientCert").finish()
+	/// Perform lenient certificate validation, mirroring Sunshine's openssl_verify_cb().
+	///
+	/// This function:
+	/// - Accepts X.509 v1, v2, and v3 certificates
+	/// - Ignores expiration errors (expired, not-yet-valid)
+	/// - Ignores issuer validation errors
+	/// - Logs certificate metadata for debugging
+	fn lenient_validate(&self, cert_der: &[u8]) -> Result<(), Error> {
+		let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
+			tracing::debug!("Failed to parse client certificate: {}", e);
+			Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+		})?;
+
+		let version = cert.version();
+		let subject = cert.subject().to_string();
+		let fingerprint = Sha256::digest(cert_der);
+
+		tracing::debug!(
+			"Accepted client certificate: version={}, subject={}, fingerprint={:x}",
+			version,
+			subject,
+			fingerprint
+		);
+
+		Ok(())
+	}
+
+	/// Extract public key from certificate using x509-parser.
+	///
+	/// This bypasses WebPki's certificate parsing which rejects X.509 v2 certificates.
+	fn extract_public_key(cert_der: &[u8]) -> Result<Vec<u8>, Error> {
+		let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
+			tracing::debug!("Failed to parse certificate for public key extraction: {}", e);
+			Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+		})?;
+
+		let public_key_bytes = cert.public_key().subject_public_key.data.to_vec();
+		Ok(public_key_bytes)
+	}
+
+	/// Verify TLS 1.2 signature manually using ring, bypassing WebPki.
+	///
+	/// This supports RSA PKCS1, RSA PSS, ECDSA, and Ed25519 signatures.
+	fn verify_tls12_signature_manual(
+		&self,
+		message: &[u8],
+		cert_der: &[u8],
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, Error> {
+		let public_key_bytes = Self::extract_public_key(cert_der)?;
+
+		match dss.scheme {
+			// RSA PKCS1 signatures
+			SignatureScheme::RSA_PKCS1_SHA256 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PKCS1_SHA256 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::RSA_PKCS1_SHA384 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA384, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PKCS1_SHA384 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::RSA_PKCS1_SHA512 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA512, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PKCS1_SHA512 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+
+			// RSA PSS signatures
+			SignatureScheme::RSA_PSS_SHA256 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PSS_SHA256 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::RSA_PSS_SHA384 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA384, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PSS_SHA384 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::RSA_PSS_SHA512 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA512, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PSS_SHA512 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+
+			// ECDSA signatures (ASN.1 DER-encoded)
+			SignatureScheme::ECDSA_NISTP256_SHA256 => {
+				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("ECDSA_NISTP256_SHA256 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::ECDSA_NISTP384_SHA384 => {
+				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P384_SHA384_ASN1, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("ECDSA_NISTP384_SHA384 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			// ECDSA P-521 is not supported by ring
+			SignatureScheme::ECDSA_NISTP521_SHA512 => {
+				tracing::warn!("ECDSA P-521 is not supported by ring");
+				Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding))
+			},
+
+			// Ed25519 signatures
+			SignatureScheme::ED25519 => {
+				let public_key = UnparsedPublicKey::new(&ring::signature::ED25519, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("ED25519 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+
+			// Unsupported signature scheme
+			scheme => {
+				tracing::warn!("Unsupported signature scheme for TLS 1.2: {:?}", scheme);
+				Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding))
+			},
+		}
+	}
+
+	/// Verify TLS 1.3 signature manually using ring, bypassing WebPki.
+	///
+	/// This supports RSA PKCS1, RSA PSS, ECDSA, and Ed25519 signatures.
+	fn verify_tls13_signature_manual(
+		&self,
+		message: &[u8],
+		cert_der: &[u8],
+		dss: &DigitallySignedStruct,
+	) -> Result<HandshakeSignatureValid, Error> {
+		// TLS 1.3 requires the signature scheme to be supported
+		// Check against known TLS 1.3 compatible schemes (RFC 8446)
+		let tls13_schemes = [
+			SignatureScheme::RSA_PKCS1_SHA256,
+			SignatureScheme::RSA_PKCS1_SHA384,
+			SignatureScheme::RSA_PKCS1_SHA512,
+			SignatureScheme::RSA_PSS_SHA256,
+			SignatureScheme::RSA_PSS_SHA384,
+			SignatureScheme::RSA_PSS_SHA512,
+			SignatureScheme::ECDSA_NISTP256_SHA256,
+			SignatureScheme::ECDSA_NISTP384_SHA384,
+			SignatureScheme::ECDSA_NISTP521_SHA512,
+			SignatureScheme::ED25519,
+		];
+		if !tls13_schemes.contains(&dss.scheme) {
+			tracing::warn!("Signature scheme not supported in TLS 1.3: {:?}", dss.scheme);
+			return Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding));
+		}
+
+		let public_key_bytes = Self::extract_public_key(cert_der)?;
+
+		match dss.scheme {
+			// RSA PKCS1 signatures
+			SignatureScheme::RSA_PKCS1_SHA256 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PKCS1_SHA256 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::RSA_PKCS1_SHA384 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA384, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PKCS1_SHA384 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::RSA_PKCS1_SHA512 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA512, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PKCS1_SHA512 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+
+			// RSA PSS signatures
+			SignatureScheme::RSA_PSS_SHA256 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA256, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PSS_SHA256 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::RSA_PSS_SHA384 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA384, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PSS_SHA384 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::RSA_PSS_SHA512 => {
+				let public_key = UnparsedPublicKey::new(&RSA_PSS_2048_8192_SHA512, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("RSA_PSS_SHA512 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+
+			// ECDSA signatures (ASN.1 DER-encoded)
+			SignatureScheme::ECDSA_NISTP256_SHA256 => {
+				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("ECDSA_NISTP256_SHA256 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			SignatureScheme::ECDSA_NISTP384_SHA384 => {
+				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P384_SHA384_ASN1, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("ECDSA_NISTP384_SHA384 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+			// ECDSA P-521 is not supported by ring
+			SignatureScheme::ECDSA_NISTP521_SHA512 => {
+				tracing::warn!("ECDSA P-521 is not supported by ring");
+				Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding))
+			},
+
+			// Ed25519 signatures
+			SignatureScheme::ED25519 => {
+				let public_key = UnparsedPublicKey::new(&ring::signature::ED25519, &public_key_bytes);
+				public_key
+					.verify(message, dss.signature())
+					.map(|_| HandshakeSignatureValid::assertion())
+					.map_err(|e| {
+						tracing::debug!("ED25519 signature verification failed: {:?}", e);
+						Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+					})
+			},
+
+			// Unsupported signature scheme
+			scheme => {
+				tracing::warn!("Unsupported signature scheme for TLS 1.3: {:?}", scheme);
+				Err(Error::InvalidCertificate(rustls::CertificateError::BadEncoding))
+			},
+		}
 	}
 }
 
-impl ClientCertVerifier for AllowAnyClientCert {
+impl fmt::Debug for LenientClientCertVerifier {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		f.debug_struct("LenientClientCertVerifier").finish()
+	}
+}
+
+impl ClientCertVerifier for LenientClientCertVerifier {
 	fn offer_client_auth(&self) -> bool {
 		true
 	}
@@ -57,11 +373,11 @@ impl ClientCertVerifier for AllowAnyClientCert {
 
 	fn verify_client_cert(
 		&self,
-		_end_entity: &CertificateDer<'_>,
+		end_entity: &CertificateDer<'_>,
 		_intermediates: &[CertificateDer<'_>],
 		_now: UnixTime,
 	) -> Result<ClientCertVerified, Error> {
-		// Accept any certificate — authorization is checked at the application layer.
+		self.lenient_validate(end_entity.as_ref())?;
 		Ok(ClientCertVerified::assertion())
 	}
 
@@ -71,7 +387,8 @@ impl ClientCertVerifier for AllowAnyClientCert {
 		cert: &CertificateDer<'_>,
 		dss: &DigitallySignedStruct,
 	) -> Result<HandshakeSignatureValid, Error> {
-		verify_tls12_signature(message, cert, dss, &self.supported_algs)
+		// Use manual verification to bypass WebPki's X.509 v2 certificate rejection
+		self.verify_tls12_signature_manual(message, cert.as_ref(), dss)
 	}
 
 	fn verify_tls13_signature(
@@ -80,7 +397,8 @@ impl ClientCertVerifier for AllowAnyClientCert {
 		cert: &CertificateDer<'_>,
 		dss: &DigitallySignedStruct,
 	) -> Result<HandshakeSignatureValid, Error> {
-		verify_tls13_signature(message, cert, dss, &self.supported_algs)
+		// Use manual verification to bypass WebPki's X.509 v2 certificate rejection
+		self.verify_tls13_signature_manual(message, cert.as_ref(), dss)
 	}
 
 	fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -114,7 +432,7 @@ fn load_tls_files<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<Serv
 	let key = load_private_key(private_key.as_ref())?;
 
 	let config = ServerConfig::builder()
-		.with_client_cert_verifier(Arc::new(AllowAnyClientCert::new()))
+		.with_client_cert_verifier(Arc::new(LenientClientCertVerifier::new()))
 		.with_single_cert(certs, key)
 		.map_err(|e| tracing::error!("Failed to create TLS configuration: {}", e))?;
 
