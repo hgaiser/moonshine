@@ -179,7 +179,7 @@ impl LenientClientCertVerifier {
 			.verify(message, dss.signature())
 			.map(|_| HandshakeSignatureValid::assertion())
 			.map_err(|e| {
-				tracing::debug!("{} signature verification failed: {:?}", scheme_name, e);
+				tracing::warn!("{} signature verification failed: {:?}", scheme_name, e);
 				Error::InvalidCertificate(rustls::CertificateError::BadSignature)
 			})
 	}
