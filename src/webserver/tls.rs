@@ -28,7 +28,7 @@ use ring::signature::{
 /// - Issuer validation (skips chain validation)
 ///
 /// Cryptographic signature verification is still performed during the TLS handshake
-/// via verify_tls12_signature() and verify_tls13_signature().
+/// using the verifier's configured signature algorithms and manual signature checks.
 ///
 /// Actual authorization (checking if the certificate belongs to a paired client)
 /// happens at the application layer via fingerprint matching.
