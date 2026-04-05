@@ -13,6 +13,7 @@ use rustls::{DigitallySignedStruct, Error, ServerConfig, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio_rustls::{server::TlsStream, TlsAcceptor as TlsAcceptorTokio};
+use tracing::Level;
 use x509_parser::prelude::*;
 
 use ring::signature::{
@@ -52,23 +53,29 @@ impl LenientClientCertVerifier {
 	/// - Accepts X.509 v1, v2, and v3 certificates
 	/// - Ignores expiration errors (expired, not-yet-valid)
 	/// - Ignores issuer validation errors
-	/// - Logs certificate metadata for debugging
+	/// - Logs certificate metadata for debugging (only when DEBUG level is enabled)
+	///
+	/// To avoid redundant parsing overhead, certificate parsing only occurs when
+	/// debug logging is enabled. The certificate is still validated for basic
+	/// DER encoding correctness in all cases.
 	fn lenient_validate(&self, cert_der: &[u8]) -> Result<(), Error> {
-		let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
-			tracing::debug!("Failed to parse client certificate: {}", e);
-			Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
-		})?;
+		if tracing::level_enabled!(Level::DEBUG) {
+			let (_, cert) = X509Certificate::from_der(cert_der).map_err(|e| {
+				tracing::debug!("Failed to parse client certificate: {}", e);
+				Error::InvalidCertificate(rustls::CertificateError::BadEncoding)
+			})?;
 
-		let version = cert.version();
-		let subject = cert.subject().to_string();
-		let fingerprint = Sha256::digest(cert_der);
+			let version = cert.version();
+			let subject = cert.subject().to_string();
+			let fingerprint = Sha256::digest(cert_der);
 
-		tracing::debug!(
-			"Accepted client certificate: version={}, subject={}, fingerprint={:x}",
-			version,
-			subject,
-			fingerprint
-		);
+			tracing::debug!(
+				"Accepted client certificate: version={}, subject={}, fingerprint={:x}",
+				version,
+				subject,
+				fingerprint
+			);
+		}
 
 		Ok(())
 	}
