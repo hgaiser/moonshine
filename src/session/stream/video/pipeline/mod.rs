@@ -731,10 +731,10 @@ impl VideoPipelineInner {
 
 		let t_start = std::time::Instant::now();
 
-		// Calculate frame processing latency (capture to packetization) in 1/10 ms units
-		// We estimate packetization takes negligible time, so use current time
-		let processing_latency = std::time::Instant::now().duration_since(frame_created_at);
-		let latency_10ms = (processing_latency.as_micros() / 100) as u16;
+		// Calculate frame processing latency (capture to packetization) in 100µs units (1/10 ms)
+		// Clamp to u16::MAX to prevent overflow (~6.55 seconds max)
+		let processing_latency = t_start.duration_since(frame_created_at);
+		let latency_100us = std::cmp::min((processing_latency.as_micros() as u128 / 100) as u16, u16::MAX);
 
 		let shards = packetizer.packetize(
 			&packet.data,
@@ -745,7 +745,7 @@ impl VideoPipelineInner {
 			*frame_number,
 			sequence_number,
 			rtp_timestamp,
-			latency_10ms,
+			latency_100us,
 		)?;
 
 		let t_packetized = std::time::Instant::now();
