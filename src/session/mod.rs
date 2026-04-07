@@ -365,6 +365,10 @@ fn launch_application(
 		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
 		// games will not see HDR as available.
 		cmd.env("DXVK_HDR", "1");
+		// Signal HDR mode to the moonshine-wsi layer so it can advertise HDR
+		// surface formats correctly (the factory global is always present for
+		// SDR sessions too, so we need an explicit capability signal).
+		cmd.env("MOONSHINE_HDR", "1");
 
 		// Create the gamescope frame limiter file so that `frameLimiterAware`
 		// Vulkan applications (DXVK ≥ 2.3, VKD3D-Proton ≥ 2.12) switch to

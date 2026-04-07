@@ -1,0 +1,15 @@
+[package]
+name = "moonshine-wsi"
+version = "0.1.0"
+edition = "2021"
+description = "Moonshine Vulkan swapchain layer — intercepts Vulkan presentation and routes frames to the Moonshine compositor via Wayland."
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649", default-features = false }
+wayland-client = "0.31"
+wayland-backend = { version = "0.3", features = ["client_system"] }
+wayland-scanner = "0.31"
+libc = "0.2"

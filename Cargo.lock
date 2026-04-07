@@ -1202,6 +1202,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "dlib"
+version = "0.5.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
+dependencies = [
+ "libloading",
+]
+
+[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2385,6 +2394,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "moonshine-wsi"
+version = "0.1.0"
+dependencies = [
+ "ash",
+ "libc",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-scanner",
+]
+
+[[package]]
 name = "moxcms"
 version = "0.8.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2736,7 +2756,7 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.3.0"
-source = "git+https://github.com/hgaiser/pixelforge?branch=main#62e851a94102ad8b4653032512121dc5c274cd6f"
+source = "git+https://github.com/hgaiser/pixelforge?rev=fc60c32#fc60c32dcc7684467bd0da3ab6f0cf56975a235d"
 dependencies = [
  "ash",
  "shaderc",
@@ -3302,6 +3322,12 @@ checksum = "93fc1dc3aaa9bfed95e02e6eadabb4baf7e3078b0bd1b4d7b6b0b68378900502"
 dependencies = [
  "winapi-util",
 ]
+
+[[package]]
+name = "scoped-tls"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
 
 [[package]]
 name = "scopeguard"
@@ -4171,8 +4197,21 @@ dependencies = [
  "cc",
  "downcast-rs",
  "rustix 1.1.4",
+ "scoped-tls",
  "smallvec",
  "wayland-sys",
+]
+
+[[package]]
+name = "wayland-client"
+version = "0.31.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab51d9f7c071abeee76007e2b742499e535148035bb835f97aaed1338cf516c3"
+dependencies = [
+ "bitflags",
+ "rustix 1.1.4",
+ "wayland-backend",
+ "wayland-scanner",
 ]
 
 [[package]]
@@ -4243,6 +4282,8 @@ version = "0.31.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "374f6b70e8e0d6bf9461a32988fd553b59ff630964924dad6e4a4eb6bd538d17"
 dependencies = [
+ "dlib",
+ "log",
  "pkg-config",
 ]
 
