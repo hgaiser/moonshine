@@ -218,6 +218,14 @@ pub struct VideoStreamConfig {
 	/// Disabled by default for compatibility with older clients.
 	#[serde(default = "default_false")]
 	pub encrypt: bool,
+
+	/// Whether to emit a WARN log when a single frame takes longer to encode and
+	/// send than the target frame interval (i.e. a latency spike).
+	///
+	/// Disabled by default because spikes are common during normal operation and
+	/// the messages can be very noisy.
+	#[serde(default = "default_false")]
+	pub log_frame_spikes: bool,
 }
 
 impl Default for VideoStreamConfig {
@@ -226,6 +234,7 @@ impl Default for VideoStreamConfig {
 			port: 47998,
 			fec_percentage: 20,
 			encrypt: false,
+			log_frame_spikes: false,
 		}
 	}
 }

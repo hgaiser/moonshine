@@ -239,7 +239,6 @@ async fn run_gamepad_handler(
 					if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
 						gamepads[gamepad.index as usize] = Some(new_gamepad);
 						tracing::info!("Gamepad {} connected.", gamepad.index);
-						tracing::info!("Gamepad info {:#?}", gamepad);
 					}
 				}
 			},

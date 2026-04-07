@@ -131,6 +131,7 @@ impl VideoPipeline {
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
+		log_frame_spikes: bool,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -147,6 +148,7 @@ impl VideoPipeline {
 			chroma_sampling,
 			max_reference_frames,
 			encryption_key,
+			log_frame_spikes,
 		};
 
 		std::thread::Builder::new()
@@ -179,6 +181,7 @@ struct VideoPipelineInner {
 	chroma_sampling: VideoChromaSampling,
 	max_reference_frames: u32,
 	encryption_key: Option<Vec<u8>>,
+	log_frame_spikes: bool,
 }
 
 impl VideoPipelineInner {
@@ -479,6 +482,20 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
+				// Recreate the converter if the input format changed (e.g. GBM pool
+				// ABGR2101010 → direct scanout XBGR8888). The converter's image view
+				// format must match the source image format.
+				if let Some(ref conv) = color_converter {
+					if conv.config().input_format != frame_input_format {
+						tracing::info!(
+							"Input format changed from {:?} to {:?}, recreating color converter",
+							conv.config().input_format,
+							frame_input_format,
+						);
+						color_converter = None;
+					}
+				}
+
 				// Initialize converter if needed.
 				let converter = match &mut color_converter {
 					Some(conv) => conv,
@@ -520,7 +537,9 @@ impl VideoPipelineInner {
 					// the encoder switch succeeds, so that the converter's
 					// color space stays in sync with the encoder's VUI.
 					if encoder_color_desc != Some(color_desc) {
-						tracing::info!("Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})");
+						tracing::info!(
+							"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
+						);
 						match encoder.set_color_description(color_desc) {
 							Ok(()) => {
 								encoder_color_desc = Some(color_desc);
@@ -642,7 +661,7 @@ impl VideoPipelineInner {
 
 				// Warn on spike frames (total > frame interval) so they stand out in logs.
 				let frame_interval_us = 1_000_000 / self.framerate as u128;
-				if total.as_micros() > frame_interval_us {
+				if self.log_frame_spikes && total.as_micros() > frame_interval_us {
 					tracing::warn!(
 						total_us = total.as_micros() as u64,
 						channel_us = channel_wait.as_micros() as u64,
