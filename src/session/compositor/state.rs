@@ -296,16 +296,17 @@ pub struct MoonshineCompositor {
 	/// Name of the compositor's Wayland socket in XDG_RUNTIME_DIR.
 	pub wayland_display: String,
 
-	/// Wayland socket name for the gamescope WSI layer (only set when HDR is active).
+	/// Wayland socket name passed as GAMESCOPE_WAYLAND_DISPLAY for DXVK HDR detection (only set when HDR is active).
 	pub gamescope_wayland_display: Option<String>,
 
-	// -- Gamescope WSI layer --
-	/// Override surface from gamescope_swapchain::override_window_content.
+	// -- WSI layer --
+	/// Override surface from gamescope_swapchain.
 	/// When set, this surface is rendered instead of the original X11 window.
-	pub override_surface: Option<WlSurface>,
+	/// The u32 is the associated X11 window ID (0 for native Wayland).
+	pub override_surface: Option<(WlSurface, u32)>,
 
 	/// X11 connection for setting focus and managing atoms when the game's
-	/// X11 window operates via the gamescope WSI layer.
+	/// X11 window operates via the WSI layer.
 	/// Stores `(connection, root_window, cached_atoms)`.
 	pub x11_input_conn: Option<(smithay::reexports::x11rb::rust_connection::RustConnection, u32, CachedAtoms)>,
 
@@ -406,7 +407,7 @@ impl MoonshineCompositor {
 		let wayland_display = socket_name.to_string_lossy().into_owned();
 		tracing::debug!("Wayland socket: {:?}", socket_name);
 
-		// Store the socket name for the gamescope WSI layer when HDR is active.
+		// Store the socket name for GAMESCOPE_WAYLAND_DISPLAY when HDR is active.
 		let gamescope_wayland_display = if hdr { Some(wayland_display.clone()) } else { None };
 
 		// Register the socket source with the event loop.
@@ -481,9 +482,12 @@ impl MoonshineCompositor {
 			None
 		};
 
-		// Register gamescope swapchain protocol for WSI layer support.
+		// Register swapchain protocol globals for WSI layer support.
+		// Moonshine globals are always needed (for XWayland bypass, refresh_cycle, retire handling).
+		// Gamescope globals are gated on HDR to avoid advertising HDR capability on SDR sessions.
+		super::gamescope_swapchain::register_moonshine_globals(&display_handle);
 		if hdr {
-			super::gamescope_swapchain::register_globals(&display_handle);
+			super::gamescope_swapchain::register_gamescope_globals(&display_handle);
 		}
 
 		(
@@ -574,9 +578,9 @@ impl MoonshineCompositor {
 
 		// Try direct scanout: bypass compositor rendering when a single
 		// fullscreen DMA-BUF surface covers the entire output.
-		// Skip when the gamescope WSI layer has an override surface, as the
-		// override surface needs its own frame callbacks delivered.
-		if self.override_surface.is_none() && self.try_direct_scanout() {
+		// Skip when the WSI layer has an active override surface for the
+		// currently focused window, as that surface needs frame callbacks.
+		if !self.is_override_active() && self.try_direct_scanout() {
 			tracing::trace!("Frame via direct scanout (not override path)");
 			return;
 		}
@@ -603,11 +607,12 @@ impl MoonshineCompositor {
 		// mutable borrow from renderer.bind(). This avoids a borrow
 		// conflict: the framebuffer holds a mutable ref to the dmabuf,
 		// and export_dmabuf would need an immutable ref to the same dmabuf.
+		let frame_cs = self.color_management.as_ref().map(|cm| cm.frame_color_space());
 		let exported_frame = match export_dmabuf(
 			&self.buffer_pool[idx].dmabuf,
 			idx,
 			consumed.clone(),
-			self.color_management.as_ref().map(|cm| cm.frame_color_space()),
+			frame_cs,
 			self.color_management.as_ref().and_then(|cm| cm.hdr_metadata()),
 		) {
 			Ok(frame) => frame,
@@ -617,6 +622,9 @@ impl MoonshineCompositor {
 				return;
 			},
 		};
+
+		// Check before bind() to avoid borrow conflict with self.renderer.
+		let override_active = self.is_override_active();
 
 		// Bind the pre-allocated Dmabuf as a render target.
 		let bind_result = self.renderer.bind(&mut self.buffer_pool[idx].dmabuf);
@@ -686,12 +694,12 @@ impl MoonshineCompositor {
 		let mut elements: Vec<OutputRenderElements> = Vec::with_capacity(cursor_elements.len() + space_elements.len());
 		elements.extend(cursor_elements);
 
-		// If the gamescope WSI layer created an override surface (via
+		// If the WSI layer created an override surface (via
 		// override_window_content), render it instead of the XWayland
-		// space elements. The override surface receives frames directly
-		// from the NVIDIA Vulkan driver.
-		if self.override_surface.as_ref().is_some_and(|s| s.alive()) {
-			let override_surface = self.override_surface.as_ref().unwrap();
+		// space elements — but only when the override's X11 window matches
+		// the currently focused window (or is 0 with no X11 focus).
+		if override_active {
+			let (override_surface, _) = self.override_surface.as_ref().unwrap();
 			let override_elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
 				render_elements_from_surface_tree(
 					&mut self.renderer,
@@ -701,9 +709,12 @@ impl MoonshineCompositor {
 					1.0,
 					Kind::Unspecified,
 				);
+			if override_elements.is_empty() {
+				tracing::debug!("override active but surface has no committed buffer — rendering black");
+			}
 			elements.extend(override_elements.into_iter().map(OutputRenderElements::Space));
 		} else {
-			if self.override_surface.is_some() {
+			if self.override_surface.as_ref().is_some_and(|(s, _)| !s.alive()) {
 				tracing::debug!("Override surface is dead, clearing.");
 				self.override_surface = None;
 			}
@@ -785,7 +796,7 @@ impl MoonshineCompositor {
 		// Also send frame callbacks to the override surface if active,
 		// so the NVIDIA driver's Wayland WSI unblocks and presents the
 		// next frame.
-		if let Some(ref override_surface) = self.override_surface {
+		if let Some((ref override_surface, _)) = self.override_surface {
 			if override_surface.alive() {
 				send_frames_surface_tree(
 					override_surface,
@@ -844,18 +855,23 @@ impl MoonshineCompositor {
 		// Must have exactly one window, no overlapping surfaces.
 		let windows: Vec<_> = self.space.elements().cloned().collect();
 		if windows.len() != 1 {
+			tracing::trace!("Direct scanout: {} windows (need 1)", windows.len());
 			return false;
 		}
 
 		let window = &windows[0];
 		let toplevel = match window.toplevel() {
 			Some(t) => t,
-			None => return false,
+			None => {
+				tracing::trace!("Direct scanout: window has no toplevel");
+				return false;
+			},
 		};
 
 		// The window must be positioned at the origin to avoid an offset frame.
 		if let Some(geo) = self.space.element_geometry(window) {
 			if geo.loc != Point::from((0, 0)) {
+				tracing::trace!("Direct scanout: window not at origin ({:?})", geo.loc);
 				return false;
 			}
 		}
@@ -866,15 +882,18 @@ impl MoonshineCompositor {
 		let scanout_buffer = with_renderer_surface_state(&wl_surface, |state| {
 			let buffer = state.buffer()?;
 			if !matches!(smithay::backend::renderer::buffer_type(buffer), Some(BufferType::Dma)) {
+				tracing::trace!("Direct scanout: buffer is not DMA-BUF");
 				return None;
 			}
 			Some(buffer.clone())
 		});
 
 		let Some(Some(buffer)) = scanout_buffer else {
+			tracing::trace!("Direct scanout: no committed buffer");
 			return false;
 		};
 		let Ok(client_dmabuf) = dmabuf::get_dmabuf(&buffer) else {
+			tracing::trace!("Direct scanout: failed to get DMA-BUF from buffer");
 			return false;
 		};
 		let client_dmabuf = client_dmabuf.clone();
@@ -883,6 +902,13 @@ impl MoonshineCompositor {
 		// no scaling or offset, otherwise the encoder would receive a
 		// partial or stretched frame.
 		if client_dmabuf.width() != self.width || client_dmabuf.height() != self.height {
+			tracing::trace!(
+				"Direct scanout: size mismatch (client {}x{} vs output {}x{})",
+				client_dmabuf.width(),
+				client_dmabuf.height(),
+				self.width,
+				self.height,
+			);
 			return false;
 		}
 
@@ -906,14 +932,6 @@ impl MoonshineCompositor {
 			.map(|cm| cm.frame_color_space())
 			.unwrap_or(FrameColorSpace::Srgb);
 		let hdr_metadata = self.color_management.as_ref().and_then(|cm| cm.hdr_metadata());
-		
-		tracing::debug!(
-			"Compositing frame: color_space={:?}, render_fourcc=0x{:08X} ({:?}), num_surfaces={}",
-			color_space,
-			self.render_fourcc as u32,
-			self.render_fourcc,
-			self.space.elements().count()
-		);
 
 		let planes: Vec<ExportedPlane> = client_dmabuf
 			.handles()
@@ -1000,8 +1018,45 @@ impl MoonshineCompositor {
 	/// Stores the override surface so it gets rendered instead of the
 	/// original X11 window.
 	pub fn override_window_surface(&mut self, x11_window: u32, surface: WlSurface) {
-		tracing::debug!(x11_window, "Storing override surface for X11 window");
-		self.override_surface = Some(surface);
+		// Key the override against the currently focused X11 window rather than
+		// the rendering child window reported by the WSI layer.  Wine/DXVK
+		// renders via a child window whose XID differs from the WM-visible
+		// top-level window tracked in `focused_x11_window`.  Using the child
+		// window XID as the key would cause `is_override_active()` to never
+		// match, leaving the override permanently inactive.
+		//
+		// When `focused_x11_window` is set, use it as the match key.
+		// Fall back to the provided `x11_window` if there is no X11 focus
+		// (e.g. for native Wayland apps using a temporary X11 sub-window).
+		let focus_key = self.focused_x11_window.unwrap_or(x11_window);
+
+		// Clear stale HDR state from the previous override surface when the
+		// surface changes.  DXVK sometimes creates a new X11 window (and thus
+		// a new wl_surface) when toggling HDR mode, so the old surface's
+		// gamescope_current entry must be evicted explicitly — it won't be
+		// cleaned up by create_swapchain (which only sees the new surface).
+		if let Some(old_surface) = self.override_surface.as_ref().map(|(s, _)| s.clone()) {
+			if old_surface != surface {
+				if let Some(cm) = &mut self.color_management {
+					cm.clear_gamescope_current(&old_surface);
+				}
+			}
+		}
+
+		tracing::debug!(x11_window, focus_key, "Storing override surface for X11 window");
+		self.override_surface = Some((surface, focus_key));
+	}
+
+	/// Returns `true` when the WSI layer has an active override surface
+	/// for the currently focused window.
+	pub fn is_override_active(&self) -> bool {
+		self.override_surface.as_ref().is_some_and(|(s, x11_win)| {
+			s.alive()
+				&& match *x11_win {
+					0 => self.focused_x11_window.is_none(),
+					id => self.focused_x11_window == Some(id),
+				}
+		})
 	}
 
 	/// Start the XWayland server so X11 applications can connect.
@@ -1081,55 +1136,23 @@ impl MoonshineCompositor {
 								tracing::debug!(display_number, root, "Opened X11 input connection.");
 
 								// Intern atoms once for the lifetime of this connection.
+								let intern = |name: &[u8], fallback: u32| -> u32 {
+									conn.intern_atom(false, name)
+										.ok()
+										.and_then(|c| c.reply().ok())
+										.map(|r| r.atom)
+										.unwrap_or(fallback)
+								};
+
 								let atoms = CachedAtoms {
-									net_active_window: conn
-										.intern_atom(false, b"_NET_ACTIVE_WINDOW")
-										.ok()
-										.and_then(|c| c.reply().ok())
-										.map(|r| r.atom)
-										.unwrap_or(0),
-									gamescope_focused_app: conn
-										.intern_atom(false, b"GAMESCOPE_FOCUSED_APP")
-										.ok()
-										.and_then(|c| c.reply().ok())
-										.map(|r| r.atom)
-										.unwrap_or(0),
-									gamescope_focusable_apps: conn
-										.intern_atom(false, b"GAMESCOPE_FOCUSABLE_APPS")
-										.ok()
-										.and_then(|c| c.reply().ok())
-										.map(|r| r.atom)
-										.unwrap_or(0),
-									gamescope_focusable_windows: conn
-										.intern_atom(false, b"GAMESCOPE_FOCUSABLE_WINDOWS")
-										.ok()
-										.and_then(|c| c.reply().ok())
-										.map(|r| r.atom)
-										.unwrap_or(0),
-									gamescope_hdr_output_feedback: conn
-										.intern_atom(false, b"GAMESCOPE_HDR_OUTPUT_FEEDBACK")
-										.ok()
-										.and_then(|c| c.reply().ok())
-										.map(|r| r.atom)
-										.unwrap_or(0),
-									gamescope_xwayland_server_id: conn
-										.intern_atom(false, b"GAMESCOPE_XWAYLAND_SERVER_ID")
-										.ok()
-										.and_then(|c| c.reply().ok())
-										.map(|r| r.atom)
-										.unwrap_or(0),
-									xa_window: conn
-										.intern_atom(false, b"WINDOW")
-										.ok()
-										.and_then(|c| c.reply().ok())
-										.map(|r| r.atom)
-										.unwrap_or(33),
-									xa_cardinal: conn
-										.intern_atom(false, b"CARDINAL")
-										.ok()
-										.and_then(|c| c.reply().ok())
-										.map(|r| r.atom)
-										.unwrap_or(6),
+									net_active_window: intern(b"_NET_ACTIVE_WINDOW", 0),
+									gamescope_focused_app: intern(b"GAMESCOPE_FOCUSED_APP", 0),
+									gamescope_focusable_apps: intern(b"GAMESCOPE_FOCUSABLE_APPS", 0),
+									gamescope_focusable_windows: intern(b"GAMESCOPE_FOCUSABLE_WINDOWS", 0),
+									gamescope_hdr_output_feedback: intern(b"GAMESCOPE_HDR_OUTPUT_FEEDBACK", 0),
+									gamescope_xwayland_server_id: intern(b"GAMESCOPE_XWAYLAND_SERVER_ID", 0),
+									xa_window: intern(b"WINDOW", 33),
+									xa_cardinal: intern(b"CARDINAL", 6),
 								};
 
 								data.x11_input_conn = Some((conn, root, atoms));
@@ -1181,53 +1204,18 @@ impl MoonshineCompositor {
 		display_number: u32,
 	) {
 		use smithay::reexports::x11rb::connection::Connection;
+		use smithay::reexports::x11rb::protocol::xproto::{AtomEnum, PropMode};
 		use smithay::reexports::x11rb::wrapper::ConnectionExt as WrapperConnectionExt;
 
-		// Set GAMESCOPE_HDR_OUTPUT_FEEDBACK = 1 on root window.
-		let _ = conn.change_property32(
-			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
-			root,
-			atoms.gamescope_hdr_output_feedback,
-			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
-			&[1u32],
-		);
+		let set_cardinal = |atom: u32, values: &[u32]| {
+			let _ = conn.change_property32(PropMode::REPLACE, root, atom, AtomEnum::CARDINAL, values);
+		};
 
-		// Set GAMESCOPE_XWAYLAND_SERVER_ID = 0 on root window.
-		// The gamescope WSI layer reads this to pass to override_window_content.
-		let _ = conn.change_property32(
-			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
-			root,
-			atoms.gamescope_xwayland_server_id,
-			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
-			&[0u32],
-		);
-
-		// Set GAMESCOPE_FOCUSED_APP = 0 (no game focused yet).
-		let _ = conn.change_property32(
-			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
-			root,
-			atoms.gamescope_focused_app,
-			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
-			&[0u32],
-		);
-
-		// Set GAMESCOPE_FOCUSABLE_APPS = [] (empty, no windows yet).
-		let _ = conn.change_property32(
-			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
-			root,
-			atoms.gamescope_focusable_apps,
-			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
-			&[],
-		);
-
-		// Set GAMESCOPE_FOCUSABLE_WINDOWS = [] (empty, no windows yet).
-		let _ = conn.change_property32(
-			smithay::reexports::x11rb::protocol::xproto::PropMode::REPLACE,
-			root,
-			atoms.gamescope_focusable_windows,
-			smithay::reexports::x11rb::protocol::xproto::AtomEnum::CARDINAL,
-			&[],
-		);
+		set_cardinal(atoms.gamescope_hdr_output_feedback, &[1]);
+		set_cardinal(atoms.gamescope_xwayland_server_id, &[0]);
+		set_cardinal(atoms.gamescope_focused_app, &[0]);
+		set_cardinal(atoms.gamescope_focusable_apps, &[]);
+		set_cardinal(atoms.gamescope_focusable_windows, &[]);
 
 		let _ = conn.flush();
 		tracing::debug!("Set gamescope X11 atoms on root window (display :{display_number})");

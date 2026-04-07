@@ -309,9 +309,11 @@ impl SessionInner {
 ///
 /// The child gets both `DISPLAY` for X11/XWayland clients and
 /// `WAYLAND_DISPLAY` for Wayland-native clients, both pointing at the
-/// session compositor rather than the host desktop session. When HDR is
-/// active, the gamescope WSI layer is additionally configured through
-/// `GAMESCOPE_WAYLAND_DISPLAY`.
+/// session compositor rather than the host desktop session.
+/// `MOONSHINE_WAYLAND_DISPLAY` tells the layer which Wayland socket to
+/// connect to, and `ENABLE_MOONSHINE_WSI=1` activates the layer.
+/// When HDR is active, `GAMESCOPE_WAYLAND_DISPLAY` and `DXVK_HDR` are
+/// also set for DXVK/VKD3D-Proton HDR detection.
 fn launch_application(
 	context: &SessionContext,
 	pulse_dir: &std::path::Path,
@@ -354,13 +356,21 @@ fn launch_application(
 	.env("PULSE_SERVER", format!("unix:{}", pulse_dir.join("native").display()))
 	.env("PULSE_RUNTIME_PATH", pulse_dir)
 	.env("DISPLAY", format!(":{}", ready.xdisplay))
-	.env("WAYLAND_DISPLAY", &ready.wayland_display);
-
-	// Pass gamescope WSI env vars directly to the child process.
+	.env("WAYLAND_DISPLAY", &ready.wayland_display)
+	// The moonshine_swapchain Vulkan layer connects to the compositor via
+	// this socket to obtain the moonshine_swapchain_factory_v2 global.
+	.env("MOONSHINE_WAYLAND_DISPLAY", &ready.wayland_display)
+	// Activate the moonshine WSI Vulkan layer (implicit layer gated by
+	// ENABLE_MOONSHINE_WSI=1 in the layer manifest).
+	.env("ENABLE_MOONSHINE_WSI", "1")
+	// Tell Mesa (and potentially other ICDs) not to block waiting for
+	// wl_surface readiness.  We present to bare wl_surfaces without
+	// xdg_toplevel roles for XWayland bypass.  Set here rather than in the
+	// layer to avoid calling std::env::set_var after threads are spawned.
+	.env("vk_xwayland_wait_ready", "false");
 	if let Some(ref gamescope_display) = ready.gamescope_wayland_display {
 		tracing::debug!(gamescope_display, "Setting GAMESCOPE_WAYLAND_DISPLAY for application");
 		cmd.env("GAMESCOPE_WAYLAND_DISPLAY", gamescope_display);
-		cmd.env("ENABLE_GAMESCOPE_WSI", "1");
 		// DXVK's dxgi.dll gates HDR color space exposure on this env var.
 		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
 		// games will not see HDR as available.

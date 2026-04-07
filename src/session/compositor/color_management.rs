@@ -135,10 +135,11 @@ pub struct CreatorParamsUserData {
 /// User data for `wp_color_management_output_v1` (minimal).
 pub struct ColorOutputData;
 
-/// User data for `wp_color_management_surface_feedback_v1` (minimal).
+/// User data for `wp_color_management_surface_feedback_v1`.
+///
+/// The `_surface` field keeps the `WlSurface` alive for the protocol lifetime.
 pub struct ColorSurfaceFeedbackData {
-	#[allow(dead_code)]
-	pub surface: WlSurface,
+	pub _surface: WlSurface,
 }
 
 /// User data for `wp_image_description_info_v1`.
@@ -163,9 +164,7 @@ pub struct ColorManagementState {
 	pending: HashMap<WlSurface, Option<ImageDescription>>,
 	/// Current (committed) image description per surface.
 	current: HashMap<WlSurface, ImageDescription>,
-	/// Pending image description per surface from gamescope_swapchain (takes priority).
-	gamescope_pending: HashMap<WlSurface, Option<ImageDescription>>,
-	/// Current (committed) image description per surface from gamescope_swapchain.
+	/// Current image description per surface from gamescope/moonshine swapchain.
 	gamescope_current: HashMap<WlSurface, ImageDescription>,
 	/// Whether HDR mode was negotiated with the Moonlight client.
 	pub hdr: bool,
@@ -186,7 +185,6 @@ impl ColorManagementState {
 		Self {
 			pending: HashMap::new(),
 			current: HashMap::new(),
-			gamescope_pending: HashMap::new(),
 			gamescope_current: HashMap::new(),
 			hdr,
 		}
@@ -202,15 +200,16 @@ impl ColorManagementState {
 		self.pending.insert(surface.clone(), Some(desc));
 	}
 
-	/// Set a pending image description for a surface from gamescope_swapchain.
-	/// This takes priority over wp_color_management declarations.
-	pub fn set_gamescope_pending(&mut self, surface: &WlSurface, desc: ImageDescription) {
+	/// Directly set the current gamescope color space for a surface,
+	/// bypassing the pending→commit flow.  Used when the surface will
+	/// never be committed (e.g. a protocol-only bypass surface).
+	pub fn set_gamescope_current(&mut self, surface: &WlSurface, desc: ImageDescription) {
 		tracing::debug!(
 			surface_id = ?surface.id(),
 			color_space = ?desc.to_frame_color_space(),
-			"set_gamescope_pending (takes priority)"
+			"set_gamescope_current (direct)"
 		);
-		self.gamescope_pending.insert(surface.clone(), Some(desc));
+		self.gamescope_current.insert(surface.clone(), desc);
 	}
 
 	/// Clear the pending image description (from `unset_image_description`).
@@ -220,27 +219,6 @@ impl ColorManagementState {
 
 	/// Apply pending state on surface commit.
 	pub fn commit(&mut self, surface: &WlSurface) {
-		// Apply gamescope_swapchain pending state first.
-		if let Some(pending) = self.gamescope_pending.remove(surface) {
-			match pending {
-				Some(desc) => {
-					tracing::debug!(
-						surface_id = ?surface.id(),
-						color_space = ?desc.to_frame_color_space(),
-						"commit: inserting gamescope color space into current"
-					);
-					self.gamescope_current.insert(surface.clone(), desc);
-				},
-				None => {
-					tracing::debug!(
-						surface_id = ?surface.id(),
-						"commit: removing gamescope color space from current"
-					);
-					self.gamescope_current.remove(surface);
-				},
-			}
-		}
-
 		// Apply wp_color_management pending state.
 		if let Some(pending) = self.pending.remove(surface) {
 			match pending {
@@ -264,104 +242,89 @@ impl ColorManagementState {
 		}
 	}
 
+	/// Find the first BT.2020+PQ image description across all tracked surfaces.
+	///
+	/// Gamescope swapchain declarations are checked first (higher priority),
+	/// then wp_color_management declarations.
+	fn first_bt2020pq_desc(&self) -> Option<&ImageDescription> {
+		self.gamescope_current
+			.values()
+			.chain(self.current.values())
+			.find(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq)
+	}
+
 	/// Get the frame color space for the current fullscreen surface.
 	///
 	/// Returns `Bt2020Pq` if any mapped surface has declared BT.2020+PQ,
 	/// otherwise returns `Srgb`.
-	///
-	/// Gamescope swapchain color space declarations take priority over
-	/// wp_color_management declarations.
 	pub fn frame_color_space(&self) -> FrameColorSpace {
-		// Check gamescope_swapchain color spaces first (higher priority).
-		for (surface, desc) in &self.gamescope_current {
-			if desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq {
-				tracing::trace!(
-					surface_id = ?surface.id(),
-					num_gamescope_current = self.gamescope_current.len(),
-					"frame_color_space: Bt2020Pq (from gamescope_swapchain)"
-				);
-				return FrameColorSpace::Bt2020Pq;
-			}
+		if self.first_bt2020pq_desc().is_some() {
+			FrameColorSpace::Bt2020Pq
+		} else {
+			FrameColorSpace::Srgb
 		}
-		// Fall back to wp_color_management color spaces.
-		for (surface, desc) in &self.current {
-			if desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq {
-				tracing::trace!(
-					surface_id = ?surface.id(),
-					num_current = self.current.len(),
-					"frame_color_space: Bt2020Pq"
-				);
-				return FrameColorSpace::Bt2020Pq;
-			}
-		}
-		FrameColorSpace::Srgb
 	}
 
 	/// Get HDR metadata from the current fullscreen surface, if any.
 	///
 	/// Returns `Some(HdrMetadata)` when a surface has declared BT.2020+PQ
 	/// with max_cll or max_fall values.
-	///
-	/// Gamescope swapchain color space declarations take priority over
-	/// wp_color_management declarations.
 	pub fn hdr_metadata(&self) -> Option<HdrMetadata> {
+		// Search all BT.2020+PQ surfaces (gamescope/moonshine swapchain first,
+		// then wp_color_management) for the first one that carries HDR metadata.
+		// Using only `first_bt2020pq_desc()` would stop at the first BT.2020+PQ
+		// surface even if it has no metadata while another one does.
+		let desc = self
+			.gamescope_current
+			.values()
+			.chain(self.current.values())
+			.filter(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq)
+			.find(|desc| desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some())?;
+		// Clamp u32 protocol values to u16 range for the Moonlight HDR metadata.
+		// Well-behaved clients stay within range; clamp rather than truncate.
 		let sat = |v: u32| -> u16 { u16::try_from(v).unwrap_or(u16::MAX) };
+		Some(HdrMetadata {
+			display_primaries: desc.mastering_primaries.map_or([(0, 0); 3], |p| {
+				[
+					(sat(p[0].0), sat(p[0].1)),
+					(sat(p[1].0), sat(p[1].1)),
+					(sat(p[2].0), sat(p[2].1)),
+				]
+			}),
+			white_point: desc.white_point.map_or((0, 0), |(x, y)| (sat(x), sat(y))),
+			max_luminance: desc.mastering_luminance.map_or(0, |(_, max)| max),
+			min_luminance: desc.mastering_luminance.map_or(0, |(min, _)| min),
+			max_cll: sat(desc.max_cll.unwrap_or(0)),
+			max_fall: sat(desc.max_fall.unwrap_or(0)),
+		})
+	}
 
-		// Check gamescope_swapchain metadata first (higher priority).
-		for desc in self.gamescope_current.values() {
-			if desc.to_frame_color_space() != FrameColorSpace::Bt2020Pq {
-				continue;
-			}
-			if desc.max_cll.is_none() && desc.max_fall.is_none() && desc.mastering_luminance.is_none() {
-				continue;
-			}
-			return Some(HdrMetadata {
-				display_primaries: desc.mastering_primaries.map_or([(0, 0); 3], |p| {
-					[
-						(sat(p[0].0), sat(p[0].1)),
-						(sat(p[1].0), sat(p[1].1)),
-						(sat(p[2].0), sat(p[2].1)),
-					]
-				}),
-				white_point: desc.white_point.map_or((0, 0), |(x, y)| (sat(x), sat(y))),
-				max_luminance: desc.mastering_luminance.map_or(0, |(_, max)| max),
-				min_luminance: desc.mastering_luminance.map_or(0, |(min, _)| min),
-				max_cll: sat(desc.max_cll.unwrap_or(0)),
-				max_fall: sat(desc.max_fall.unwrap_or(0)),
-			});
+	/// Clear only the gamescope swapchain HDR state for a surface.
+	///
+	/// This is called in two situations:
+	///
+	/// 1. **Same surface, new swapchain**: `create_swapchain` calls this so that
+	///    stale HDR metadata from the previous swapchain does not linger when
+	///    the same `wl_surface` is reused.
+	///
+	/// 2. **New surface replaces old**: `override_window_surface` calls this for
+	///    the *old* override surface when a different `wl_surface` takes over.
+	///    DXVK sometimes creates a new X11 window (and thus a new `wl_surface`)
+	///    when toggling HDR mode, so the old surface's entry must be evicted here
+	///    — it won't be seen by `create_swapchain`, which only sees the new surface.
+	///
+	/// The HDR state will be re-established by `set_gamescope_current` if the
+	/// new swapchain calls `vkSetHdrMetadataEXT`.
+	pub fn clear_gamescope_current(&mut self, surface: &WlSurface) {
+		if self.gamescope_current.remove(surface).is_some() {
+			tracing::debug!(surface_id = ?surface.id(), "clear_gamescope_current: removed stale HDR state");
 		}
-
-		// Fall back to wp_color_management metadata.
-		for desc in self.current.values() {
-			if desc.to_frame_color_space() != FrameColorSpace::Bt2020Pq {
-				continue;
-			}
-			if desc.max_cll.is_none() && desc.max_fall.is_none() && desc.mastering_luminance.is_none() {
-				continue;
-			}
-			return Some(HdrMetadata {
-				display_primaries: desc.mastering_primaries.map_or([(0, 0); 3], |p| {
-					[
-						(sat(p[0].0), sat(p[0].1)),
-						(sat(p[1].0), sat(p[1].1)),
-						(sat(p[2].0), sat(p[2].1)),
-					]
-				}),
-				white_point: desc.white_point.map_or((0, 0), |(x, y)| (sat(x), sat(y))),
-				max_luminance: desc.mastering_luminance.map_or(0, |(_, max)| max),
-				min_luminance: desc.mastering_luminance.map_or(0, |(min, _)| min),
-				max_cll: sat(desc.max_cll.unwrap_or(0)),
-				max_fall: sat(desc.max_fall.unwrap_or(0)),
-			});
-		}
-		None
 	}
 
 	/// Clean up tracking for a destroyed surface.
 	pub fn surface_destroyed(&mut self, surface: &WlSurface) {
 		self.pending.remove(surface);
 		self.current.remove(surface);
-		self.gamescope_pending.remove(surface);
 		self.gamescope_current.remove(surface);
 	}
 }
@@ -422,7 +385,7 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor
 			},
 
 			wp_color_manager_v1::Request::GetSurfaceFeedback { id, surface } => {
-				data_init.init(id, ColorSurfaceFeedbackData { surface });
+				data_init.init(id, ColorSurfaceFeedbackData { _surface: surface });
 			},
 
 			wp_color_manager_v1::Request::CreateParametricCreator { obj } => {
@@ -745,25 +708,14 @@ impl Dispatch<wp_color_management_surface_feedback_v1::WpColorManagementSurfaceF
 		match request {
 			wp_color_management_surface_feedback_v1::Request::Destroy => {},
 
-			wp_color_management_surface_feedback_v1::Request::GetPreferred { image_description } => {
-				// Preferred: BT.2020+PQ when HDR is active.
+			wp_color_management_surface_feedback_v1::Request::GetPreferred { image_description }
+			| wp_color_management_surface_feedback_v1::Request::GetPreferredParametric { image_description } => {
 				let desc = if state.color_management.as_ref().is_some_and(|cm| cm.hdr) {
 					ImageDescription::bt2020_pq()
 				} else {
 					ImageDescription::srgb()
 				};
 				tracing::debug!(?desc, "GetPreferred: returning image description");
-				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
-				resource.ready(0);
-			},
-
-			wp_color_management_surface_feedback_v1::Request::GetPreferredParametric { image_description } => {
-				// Same as get_preferred for our simple case.
-				let desc = if state.color_management.as_ref().is_some_and(|cm| cm.hdr) {
-					ImageDescription::bt2020_pq()
-				} else {
-					ImageDescription::srgb()
-				};
 				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
 				resource.ready(0);
 			},

@@ -53,7 +53,7 @@ pub struct CompositorReady {
 	pub xdisplay: u32,
 	/// Wayland socket name for the session compositor.
 	pub wayland_display: String,
-	/// Wayland socket name for the gamescope WSI layer (only set when HDR is active).
+	/// Wayland socket name passed as GAMESCOPE_WAYLAND_DISPLAY for DXVK HDR detection (only set when HDR is active).
 	pub gamescope_wayland_display: Option<String>,
 }
 
