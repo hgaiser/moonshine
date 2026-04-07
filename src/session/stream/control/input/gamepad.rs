@@ -81,6 +81,15 @@ impl GamepadInfo {
 		})
 	}
 
+	pub fn default_for_index(index: u8) -> Self {
+		Self {
+			index,
+			kind: GamepadKind::Unknown,
+			capabilities: 0,
+			_supported_buttons: 0,
+		}
+	}
+
 	#[allow(dead_code)]
 	fn has_capability(&self, capability: &GamepadCapability) -> bool {
 		(self.capabilities & *capability as u16) != 0

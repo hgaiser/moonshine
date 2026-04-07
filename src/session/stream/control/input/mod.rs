@@ -238,7 +238,8 @@ async fn run_gamepad_handler(
 				if gamepads[gamepad.index as usize].is_none() {
 					if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
 						gamepads[gamepad.index as usize] = Some(new_gamepad);
-						tracing::debug!("Gamepad {} connected.", gamepad.index);
+						tracing::info!("Gamepad {} connected.", gamepad.index);
+						tracing::info!("Gamepad info {:#?}", gamepad);
 					}
 				}
 			},
@@ -310,7 +311,22 @@ async fn run_gamepad_handler(
 					continue;
 				}
 
-				match gamepads[gamepad_update.index as usize].as_mut() {
+				let idx = gamepad_update.index as usize;
+
+				// Some clients (e.g. Moonlight Android OSC) send GamepadUpdate without a
+				// preceding GamepadInfo. Auto-create a default gamepad in that case.
+				if gamepads[idx].is_none() && gamepad_update.active_gamepad_mask & (1 << gamepad_update.index) != 0 {
+					tracing::debug!(
+						"Received update for gamepad {} before arrival, auto-creating default gamepad.",
+						gamepad_update.index
+					);
+					let synthetic_info = GamepadInfo::default_for_index(gamepad_update.index as u8);
+					if let Ok(new_gamepad) = Gamepad::new(&synthetic_info, feedback_tx.clone()).await {
+						gamepads[idx] = Some(new_gamepad);
+					}
+				}
+
+				match gamepads[idx].as_mut() {
 					Some(gamepad) => gamepad.update(&gamepad_update),
 					None => tracing::warn!(
 						"Received update for gamepad {}, but no gamepad is connected.",
