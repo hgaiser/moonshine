@@ -3,6 +3,9 @@ members = [
 	".",
 	"moonshine-wsi",
 ]
+exclude = [
+	"waydroid-pa-sim",
+]
 resolver = "2"
 
 [package]

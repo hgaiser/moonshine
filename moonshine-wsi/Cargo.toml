@@ -13,3 +13,7 @@ wayland-client = "0.31"
 wayland-backend = { version = "0.3", features = ["client_system"] }
 wayland-scanner = "0.31"
 libc = "0.2"
+
+[package.metadata.cargo-machete]
+# wayland-backend is a direct dep to enable client_system feature for system libwayland-client.so linking.
+ignored = ["wayland-backend"]
