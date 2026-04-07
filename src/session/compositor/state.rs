@@ -317,6 +317,11 @@ pub struct MoonshineCompositor {
 	/// client knows which game has focus.
 	pub focused_app_id: u32,
 
+	/// Cache mapping `(PID, process start time)` → Steam app ID to avoid
+	/// re-reading `/proc/{pid}/environ` on every focus event while still
+	/// distinguishing recycled PIDs from a previous process lifetime.
+	pub pid_app_id_cache: std::collections::HashMap<(u32, u64), u32>,
+
 	/// When true, the next input event should re-set X11 focus to the client
 	/// window via our direct X11 connection. This is needed because XWayland's
 	/// internal `wl_keyboard.enter` handling sets X11 focus on the FRAME
@@ -530,6 +535,7 @@ impl MoonshineCompositor {
 				x11_input_conn: None,
 				focused_x11_window: None,
 				focused_app_id: 0,
+				pid_app_id_cache: std::collections::HashMap::new(),
 				x11_focus_needs_reset: false,
 				held_scanout_buffers: Vec::new(),
 				scanout_fd_map: std::collections::HashMap::new(),

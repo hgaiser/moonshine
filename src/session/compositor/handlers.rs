@@ -29,6 +29,7 @@ use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::Resource;
+use smithay::utils::IsAlive;
 use smithay::utils::{Logical, Point, Rectangle, Serial};
 use smithay::wayland::buffer::BufferHandler;
 use smithay::wayland::compositor::{is_sync_subsurface, CompositorClientState, CompositorHandler, CompositorState};
@@ -58,6 +59,41 @@ use smithay::reexports::x11rb::protocol::xproto::{ConnectionExt as _, InputFocus
 
 impl BufferHandler for MoonshineCompositor {
 	fn buffer_destroyed(&mut self, _buffer: &wl_buffer::WlBuffer) {}
+}
+
+/// Read the Steam game app ID from `/proc/{pid}/environ`.
+///
+/// Proton games launched via Steam inherit `SteamGameId` (or the older
+/// `SteamAppId`) in their process environment.  This provides the numeric
+/// app ID for games whose X11 window class is the executable name (e.g.
+/// `"bg3"`) rather than the conventional `steam_app_<id>` form.
+fn steam_app_id_from_pid(pid: u32) -> Option<u32> {
+	let data = std::fs::read(format!("/proc/{pid}/environ")).ok()?;
+	for var in data.split(|&b| b == 0) {
+		for prefix in [b"SteamGameId=".as_slice(), b"SteamAppId=".as_slice()] {
+			if let Some(val) = var.strip_prefix(prefix) {
+				if let Ok(id) = std::str::from_utf8(val).unwrap_or("").parse::<u32>() {
+					return Some(id);
+				}
+			}
+		}
+	}
+	None
+}
+
+/// Return the `starttime` field (field 22) from `/proc/{pid}/stat`.
+///
+/// Used as the second half of the `(pid, starttime)` key in
+/// `pid_app_id_cache` to detect PID reuse: a recycled PID will have a
+/// different start time than the original process.
+fn pid_start_time(pid: u32) -> Option<u64> {
+	let contents = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+	// Field 2 is the process name in parentheses, which may itself contain
+	// spaces and parentheses.  Find the last ')' to skip it reliably.
+	let after_comm = contents.rsplit_once(')')?.1;
+	// Remaining fields begin at field 3 (state).  Field 22 (starttime) is
+	// index 19 from there (22 - 3 = 19, 0-indexed).
+	after_comm.split_whitespace().nth(19).and_then(|s| s.parse().ok())
 }
 
 // -- SHM Handler --
@@ -269,7 +305,27 @@ impl MoonshineCompositor {
 			let window_app_id: u32 = class
 				.strip_prefix("steam_app_")
 				.and_then(|s| s.parse().ok())
-				.unwrap_or_else(|| if class.eq_ignore_ascii_case("steam") { 769 } else { 0 });
+				.unwrap_or_else(|| {
+					if class.eq_ignore_ascii_case("steam") {
+						769
+					} else {
+						x11.pid().unwrap_or(0)
+					}
+				});
+			// Look up via cache if we only have a PID (no steam_app_ class prefix).
+			let window_app_id = if window_app_id == 0 {
+				x11.pid()
+					.map(|pid| {
+						let key = (pid, pid_start_time(pid).unwrap_or(0));
+						*self
+							.pid_app_id_cache
+							.entry(key)
+							.or_insert_with(|| steam_app_id_from_pid(pid).unwrap_or(0))
+					})
+					.unwrap_or(0)
+			} else {
+				window_app_id
+			};
 
 			if window_app_id != 0 && !focusable_appids.contains(&window_app_id) {
 				focusable_appids.push(window_app_id);
@@ -331,7 +387,13 @@ impl MoonshineCompositor {
 	///
 	/// Priority: game window (steam_app_*) > other non-override windows > nothing.
 	pub(super) fn determine_and_apply_focus(&mut self) {
+		// Three priority levels for focus candidates:
+		//   1. steam_app_XXXXX  — the launched game itself (highest priority)
+		//   2. any other non-Steam window (e.g. class="bg3") — may be a game
+		//      that creates its own X11 class name rather than using Steam's
+		//   3. Steam Big Picture Mode (class="steam") — fallback only
 		let mut game_window: Option<Window> = None;
+		let mut non_steam_window: Option<Window> = None;
 		let mut fallback_window: Option<Window> = None;
 
 		for win in self.space.elements() {
@@ -346,6 +408,10 @@ impl MoonshineCompositor {
 			let class = x11.class();
 			if class.starts_with("steam_app_") {
 				game_window = Some(win.clone());
+			} else if class != "steam" {
+				// Any non-Steam window (e.g. a Proton game using its own class
+				// name) should take priority over Steam Big Picture Mode.
+				non_steam_window = Some(win.clone());
 			} else {
 				fallback_window = Some(win.clone());
 			}
@@ -353,7 +419,20 @@ impl MoonshineCompositor {
 
 		let focus_target = if let Some(game) = game_window {
 			game
+		} else if let Some(non_steam) = non_steam_window {
+			non_steam
 		} else if let Some(fallback) = fallback_window {
+			// Steam BPM is the only candidate.  If a game override surface is
+			// active and still alive, the game window is likely just temporarily
+			// unmapped during startup; don't hand focus back to Steam BPM in
+			// that case.
+			let override_alive = self.override_surface.as_ref().is_some_and(|(s, _)| s.alive());
+			if override_alive {
+				tracing::debug!(
+					"Focus determination: game override active, not switching to Steam BPM while game window is absent"
+				);
+				return;
+			}
 			fallback
 		} else {
 			tracing::debug!("Focus determination: no suitable focus candidate");
@@ -391,7 +470,29 @@ impl MoonshineCompositor {
 				self.focused_app_id = 769;
 				tracing::debug!(app_id = self.focused_app_id, class = %class, "Steam BPM window, using app ID 769");
 			} else {
-				self.focused_app_id = 0;
+				// The game uses its own window class (e.g. "bg3").  Try to
+				// recover the Steam app ID from the process environment so that
+				// GAMESCOPE_FOCUSED_APP is set correctly and Steam Big Picture
+				// Mode yields controller focus to the game.  Use the cache to
+				// avoid re-reading /proc/{pid}/environ on every focus event.
+				self.focused_app_id = x11
+					.pid()
+					.map(|pid| {
+						let key = (pid, pid_start_time(pid).unwrap_or(0));
+						*self
+							.pid_app_id_cache
+							.entry(key)
+							.or_insert_with(|| steam_app_id_from_pid(pid).unwrap_or(0))
+					})
+					.unwrap_or(0);
+				if self.focused_app_id != 0 {
+					tracing::debug!(
+						app_id = self.focused_app_id,
+						class = %class,
+						pid = ?x11.pid(),
+						"Looked up Steam app ID from process environment"
+					);
+				}
 			}
 		}
 
@@ -734,7 +835,15 @@ impl XwmHandler for MoonshineCompositor {
 		}
 	}
 
-	fn destroyed_window(&mut self, _xwm: XwmId, _window: X11Surface) {}
+	fn destroyed_window(&mut self, _xwm: XwmId, window: X11Surface) {
+		// Evict the cache entry for this process so that a later process that
+		// reuses the same PID is not incorrectly tagged with the old app ID
+		// (the (pid, starttime) key already prevents most false hits, but
+		// proactively pruning on window destruction keeps the map bounded).
+		if let Some(pid) = window.pid() {
+			self.pid_app_id_cache.retain(|(p, _), _| *p != pid);
+		}
+	}
 
 	fn property_notify(&mut self, _xwm: XwmId, _window: X11Surface, _property: WmWindowProperty) {
 		// Re-evaluate focus on any property change.
