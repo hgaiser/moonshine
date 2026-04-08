@@ -33,9 +33,9 @@ enum RtpFlag {
 #[repr(C)]
 struct VideoFrameHeader {
 	header_type: u8,
-	padding1: u16,
+	frame_processing_latency: u16,
 	frame_type: u8,
-	padding2: u32,
+	last_payload_len: u32,
 }
 
 const VIDEO_FRAME_HEADER_SIZE: usize = 8;
@@ -43,9 +43,9 @@ const VIDEO_FRAME_HEADER_SIZE: usize = 8;
 impl VideoFrameHeader {
 	fn serialize(&self, buffer: &mut [u8]) {
 		buffer[0] = self.header_type;
-		buffer[1..3].copy_from_slice(&self.padding1.to_le_bytes());
+		buffer[1..3].copy_from_slice(&self.frame_processing_latency.to_le_bytes());
 		buffer[3] = self.frame_type;
-		buffer[4..8].copy_from_slice(&self.padding2.to_le_bytes());
+		buffer[4..8].copy_from_slice(&self.last_payload_len.to_le_bytes());
 	}
 }
 
@@ -168,6 +168,7 @@ impl Packetizer {
 		frame_number: u32,
 		sequence_number: &mut u32,
 		rtp_timestamp: u32,
+		frame_processing_latency: u16,
 	) -> Result<ShardBatch, ()> {
 		tracing::trace!(
 			"Packetizing frame {}, size={}, keyframe={}",
@@ -187,9 +188,9 @@ impl Packetizer {
 
 		let video_frame_header = VideoFrameHeader {
 			header_type: 0x01,
-			padding1: 0,
+			frame_processing_latency,
 			frame_type: if is_key_frame { 2 } else { 1 },
-			padding2: last_shard_size as u32,
+			last_payload_len: last_shard_size as u32,
 		};
 
 		let mut header_bytes = [0u8; VIDEO_FRAME_HEADER_SIZE];
