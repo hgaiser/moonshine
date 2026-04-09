@@ -1,6 +1,6 @@
 [![CI](https://github.com/hgaiser/moonshine/workflows/Test/badge.svg)](https://github.com/hgaiser/moonshine/actions)
 
-# Moonshine
+# Moonshine 🌙
 
 Moonshine lets you stream games from your PC to any device running [Moonlight](https://moonlight-stream.org/).
 Your keyboard, mouse, and controller inputs are sent back to the host so you can play games remotely as if you were sitting in front of it.
