@@ -14,7 +14,7 @@ This means you can play games on the client device, while rendering is done by t
 > ⚠️ **AV1 Warning**: AV1 encoding is experimental. On NVIDIA GPUs, P-frames cannot
 > reference other P-frames, causing all P-frames to reference the I-frame instead. This
 > leads to progressively larger frame sizes over time. Consider using H.264 or H.265
-> until this is resolved.
+> until this is resolved (see [this issue](https://github.com/nvpro-samples/vk_video_samples/issues/217)).
 - **HDR support**: 10-bit encoding with PQ transfer function and BT.2020 color space (via `wp_color_management_v1`).
 - **Input handling**: Mouse, keyboard, and gamepad input (including motion, touchpad, haptics) via [inputtino](https://github.com/games-on-whales/inputtino).
 - **Audio streaming**: PulseAudio-based audio capture with Opus encoding.
