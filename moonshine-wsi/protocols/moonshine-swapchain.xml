@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<protocol name="moonshine_swapchain">
+
+  <copyright>
+    Copyright © 2023 Joshua Ashton for Valve Software
+    Copyright © 2025 Moonshine contributors
+
+    Permission is hereby granted, free of charge, to any person obtaining a
+    copy of this software and associated documentation files (the "Software"),
+    to deal in the Software without restriction, including without limitation
+    the rights to use, copy, modify, merge, publish, distribute, sublicense,
+    and/or sell copies of the Software, and to permit persons to whom the
+    Software is furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice (including the next
+    paragraph) shall be included in all copies or substantial portions of the
+    Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.  IN NO EVENT SHALL
+    THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+    FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
+    DEALINGS IN THE SOFTWARE.
+  </copyright>
+
+  <description summary="Moonshine-specific swapchain protocol">
+    This is a private Moonshine protocol. Regular Wayland clients must not use
+    it.
+
+    It is functionally identical to gamescope_swapchain_factory_v2 /
+    gamescope_swapchain from the Gamescope project, with interface names changed
+    to moonshine_swapchain_factory_v2 / moonshine_swapchain so that the
+    Moonshine-native Vulkan layer can be independent of the Gamescope layer.
+  </description>
+
+  <interface name="moonshine_swapchain_factory_v2" version="1">
+    <request name="destroy" type="destructor"></request>
+
+    <request name="create_swapchain">
+      <description summary="create Moonshine swapchain interface">
+      </description>
+
+      <arg name="surface" type="object" interface="wl_surface"
+           summary="target surface"/>
+      <arg name="callback" type="new_id" interface="moonshine_swapchain"
+           summary="new swapchain object"/>
+    </request>
+  </interface>
+
+  <interface name="moonshine_swapchain" version="1">
+    <request name="destroy" type="destructor"></request>
+
+    <request name="override_window_content">
+      <description summary="override an X11's window wl_surface">
+        Xwayland creates a wl_surface for each X11 window. It sends a
+        WL_SURFACE_ID client message to indicate the mapping between the X11
+        windows and the wl_surface objects.
+
+        This request overrides this mapping for a given X11 window, allowing an
+        X11 client to submit buffers via the Wayland protocol. The override
+        only affects buffer submission. Everything else (e.g. input events)
+        still uses Xwayland's WL_SURFACE_ID.
+      </description>
+      <arg name="xwayland_server_id" type="uint" summary="xwayland server ID"/>
+      <arg name="x11_window" type="uint" summary="X11 window ID"/>
+    </request>
+
+    <request name="swapchain_feedback">
+      <description summary="provide swapchain feedback">
+        Provide swapchain feedback to the compositor.
+
+        Provides image count ahead of time, and colorspace info for HDR.
+      </description>
+      <arg name="image_count" type="uint" summary="image count of swapchain"/>
+      <arg name="vk_format" type="uint" summary="VkFormat of swapchain"/>
+      <arg name="vk_colorspace" type="uint" summary="VkColorSpaceKHR of swapchain"/>
+      <arg name="vk_composite_alpha" type="uint" summary="VkCompositeAlphaFlagBitsKHR of swapchain"/>
+      <arg name="vk_pre_transform" type="uint" summary="VkSurfaceTransformFlagBitsKHR of swapchain"/>
+      <arg name="vk_clipped" type="uint" summary="clipped (VkBool32) of swapchain"/>
+    </request>
+
+    <request name="set_present_mode">
+      <description summary="Communicate the active present mode to the compositor"/>
+      <arg name="vk_present_mode" type="uint" summary="VkPresentModeKHR"/>
+    </request>
+
+    <request name="set_hdr_metadata">
+      <description summary="set HDR metadata for a surface">
+        Forward HDR metadata from Vulkan to the compositor.
+
+        HDR Metadata Infoframe as per CTA 861.G spec.
+
+        display_primary_{red,green,blue}_{x,y} / white_point_{x,y}:
+          Color primaries and white point, coded as unsigned 16-bit values in
+          units of 0.00002 (0xC350 == 1.0).
+
+        max_display_mastering_luminance:
+          Max mastering display luminance in cd/m2 (uint16, 1 cd/m2 units).
+
+        min_display_mastering_luminance:
+          Min mastering display luminance in units of 0.0001 cd/m2.
+
+        max_cll:
+          Max content light level in cd/m2.
+
+        max_fall:
+          Max frame average light level in cd/m2.
+      </description>
+      <arg name="display_primary_red_x" type="uint"/>
+      <arg name="display_primary_red_y" type="uint"/>
+      <arg name="display_primary_green_x" type="uint"/>
+      <arg name="display_primary_green_y" type="uint"/>
+      <arg name="display_primary_blue_x" type="uint"/>
+      <arg name="display_primary_blue_y" type="uint"/>
+      <arg name="white_point_x" type="uint"/>
+      <arg name="white_point_y" type="uint"/>
+      <arg name="max_display_mastering_luminance" type="uint"/>
+      <arg name="min_display_mastering_luminance" type="uint"/>
+      <arg name="max_cll" type="uint"/>
+      <arg name="max_fall" type="uint"/>
+    </request>
+
+    <request name="set_present_time">
+      <description summary="display timing of next commit">
+        Sets the desired presentation time for the next commit (CLOCK_MONOTONIC).
+        Resets to 0 after commit.
+      </description>
+      <arg name="present_id" type="uint" summary="application-provided presentation id"/>
+      <arg name="desired_present_time_hi" type="uint" summary="high 32 bits of desired present time (ns)"/>
+      <arg name="desired_present_time_lo" type="uint" summary="low 32 bits of desired present time (ns)"/>
+    </request>
+
+    <event name="past_present_timing">
+      <description summary="information about past presentation timing"/>
+      <arg name="present_id" type="uint"/>
+      <arg name="desired_present_time_hi" type="uint"/>
+      <arg name="desired_present_time_lo" type="uint"/>
+      <arg name="actual_present_time_hi" type="uint"/>
+      <arg name="actual_present_time_lo" type="uint"/>
+      <arg name="earliest_present_time_hi" type="uint"/>
+      <arg name="earliest_present_time_lo" type="uint"/>
+      <arg name="present_margin_hi" type="uint"/>
+      <arg name="present_margin_lo" type="uint"/>
+    </event>
+
+    <event name="refresh_cycle">
+      <description summary="compositor refresh cycle for this swapchain">
+        Fired when the compositor's refresh period changes.
+      </description>
+      <arg name="refresh_cycle_hi" type="uint" summary="high 32 bits of refresh cycle in nanoseconds"/>
+      <arg name="refresh_cycle_lo" type="uint" summary="low 32 bits of refresh cycle in nanoseconds"/>
+    </event>
+
+    <event name="retired">
+      <description summary="swapchain was remotely retired by the compositor"></description>
+    </event>
+  </interface>
+</protocol>

@@ -252,6 +252,7 @@ impl VideoStreamInner {
 			idr_frame_request_rx,
 			stop_session_manager.clone(),
 			hdr_metadata_tx,
+			self.config.stream.video.log_frame_spikes,
 		)?;
 
 		self.pipeline = Some(pipeline);
