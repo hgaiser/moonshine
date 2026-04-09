@@ -1,6 +1,6 @@
 [package]
 name = "moonshine-wsi"
-version = "0.1.0"
+version.workspace = true
 edition = "2021"
 description = "Moonshine Vulkan swapchain layer — intercepts Vulkan presentation and routes frames to the Moonshine compositor via Wayland."
 
