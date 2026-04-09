@@ -30,13 +30,13 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 The simplest method is to install through the AUR using:
 
 ```
-$ yay -S moonshine`
+yay -S moonshine`
 ```
 
 Start the server with:
 
 ```sh
-$ systemctl --user start moonshine
+systemctl --user start moonshine
 ```
 
 ### Source
@@ -44,7 +44,7 @@ $ systemctl --user start moonshine
 The following dependencies are required to build:
 
 ```sh
-$ sudo pacman -S \
+sudo pacman -S \
    avahi \
    clang \
    cmake \
@@ -64,7 +64,7 @@ $ sudo pacman -S \
 Then compile and run:
 
 ```sh
-$ cargo run --release -- /path/to/config.toml
+cargo run --release -- /path/to/config.toml
 ```
 
 ## Configuration
@@ -84,7 +84,7 @@ http://localhost:47989/pin
 You can also pair from the command line:
 
 ```sh
-$ curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
+curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
 ```
 
 ### Adding applications
