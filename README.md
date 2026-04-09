@@ -30,7 +30,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 The simplest method is to install through the AUR using:
 
 ```
-yay -S moonshine`
+yay -S moonshine
 ```
 
 Start the server with:
@@ -75,11 +75,7 @@ When using the AUR package, it defaults to `$XDG_CONFIG_HOME/moonshine/config.to
 ### Pairing with a client
 
 When you connect with Moonlight for the first time, it will show a PIN.
-A notification will appear on the host that you can click to open the pairing page, or you can visit it manually:
-
-```
-http://localhost:47989/pin
-```
+A notification will appear on the host that you can click to open the pairing page, or you can visit it manually at http://localhost:47989/pin .
 
 You can also pair from the command line:
 
