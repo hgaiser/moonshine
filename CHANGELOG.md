@@ -5,6 +5,28 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.10.0] - 2026-04-09
+
+### Added
+
+- Custom Vulkan swapchain layer (`moonshine-wsi`) replacing the gamescope WSI layer dependency.
+- Native Wayland client support via `WAYLAND_DISPLAY`.
+- Auto-create default gamepad when `GamepadUpdate` arrives before `GamepadInfo`.
+- Set `PULSE_RUNTIME_PATH` for launched applications.
+- Support for headless operation (start service without a graphical session).
+- Expose host processing latency.
+- Relax certificate validation to allow Moonlight TV clients to pair.
+- Support pairing with non-default `uniqueid` values.
+
+### Changed
+
+- Recreate color converter on input format change (HDR <-> SDR changes).
+- Add `log_frame_spikes` configuration option.
+
+### Fixed
+
+- Fix reflected XSS by restricting `uniqueid` to hex format.
+
 ## [v0.9.0] - 2026-03-30
 
 ### Added

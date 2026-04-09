@@ -2332,7 +2332,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -2395,7 +2395,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine-wsi"
-version = "0.9.0"
+version = "0.10.0"
 dependencies = [
  "ash",
  "libc",
