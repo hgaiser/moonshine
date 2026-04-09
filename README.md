@@ -2,30 +2,26 @@
 
 # Moonshine
 
-Moonshine is a headless streaming server which implements the protocol used by [Moonlight](https://moonlight-stream.org/).
-It is intended for streaming games from a server to a client, while receiving input (mouse, keyboard, controller) from the client.
-This means you can play games on the client device, while rendering is done by the server.
+Moonshine lets you stream games from your PC to any device running [Moonlight](https://moonlight-stream.org/).
+Your keyboard, mouse, and controller inputs are sent back to the host so you can play games remotely as if you were sitting in front of it.
 
 ## Features
 
-- **Headless compositor**: Built-in Wayland compositor based on [Smithay](https://github.com/Smithay/smithay), isolating streaming sessions from the host desktop.
-- **Codec support**: H.264, H.265, and AV1 via hardware-accelerated Vulkan Video encoding ([PixelForge](https://github.com/hgaiser/pixelforge)).
+- **Isolated streaming sessions**: Each stream runs in its own compositor, completely separate from your desktop environment. Your host PC can still be used for other things while you stream.
+- **No monitor required**: Works on headless servers — no HDMI dummy plug needed.
+- **Hardware video encoding**: H.264, H.265, and AV1 encoding using the GPU.
 
-> ⚠️ **AV1 Warning**: AV1 encoding is experimental. On NVIDIA GPUs, P-frames cannot
-> reference other P-frames, causing all P-frames to reference the I-frame instead. This
-> leads to progressively larger frame sizes over time. Consider using H.264 or H.265
-> until this is resolved (see [this issue](https://github.com/nvpro-samples/vk_video_samples/issues/217)).
-- **HDR support**: 10-bit encoding with PQ transfer function and BT.2020 color space (via `wp_color_management_v1`).
-- **Input handling**: Mouse, keyboard, and gamepad input (including motion, touchpad, haptics) via [inputtino](https://github.com/games-on-whales/inputtino).
-- **Audio streaming**: PulseAudio-based audio capture with Opus encoding.
-- **No monitor required**: Works on headless servers without a graphical environment or HDMI dummy plug.
+> ⚠️ **AV1 Warning**: AV1 encoding is experimental and has issues on NVIDIA GPUs that cause frame sizes to grow over time ([see issue](https://github.com/nvpro-samples/vk_video_samples/issues/217)). This should be fixed in driver version 595.44.3.0. Until then, stick with H.264 or H.265.
+- **HDR support**: True 10-bit HDR streaming for supported games.
+- **Full input support**: Mouse, keyboard, and gamepad (including motion, touchpad, and haptics).
+- **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
 
-## Requirements and limitations
+## Requirements
 
-1. **Linux**. Although this software should theoretically run on any Linux distribution, it is only tested on Arch Linux.
-1. **systemd**. Moonshine uses `systemd-run` to launch applications in a systemd scope for reliable process cleanup.
-1. **Vulkan Video**. A GPU with Vulkan video encoding support (e.g., NVIDIA RTX series, AMD RDNA2+, Intel Arc).
-1. **Moonlight v6.0.0 or higher**. Older versions are untested and might not work.
+1. **Linux only**. Tested on Arch Linux, but it's been reported to work on other Linux distributions too.
+1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
+1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
+1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
 
 ## Installation
 
@@ -41,7 +37,7 @@ $ makepkg -si
 
 Or, simply `yay -S moonshine` if `yay` is installed.
 
-You can start the server by running the user service:
+Start the server with:
 
 ```sh
 $ systemctl --user start moonshine
@@ -49,26 +45,7 @@ $ systemctl --user start moonshine
 
 ### Source
 
-Alternatively, you can also compile directly from source.
-The following dependencies are required:
-
-```
-avahi
-clang
-cmake
-gcc-libs
-glibc
-libevdev
-libpulse
-make
-opus
-pkg-config
-rust
-shaderc
-vulkan-headers
-```
-
-On systems with `pacman` these can be installed with the following command:
+The following dependencies are required to build:
 
 ```sh
 $ sudo pacman -S \
@@ -84,7 +61,8 @@ $ sudo pacman -S \
    pkg-config \
    rust \
    shaderc \
-   vulkan-headers
+   vulkan-headers \
+   wayland
 ```
 
 Then compile and run:
@@ -95,58 +73,44 @@ $ cargo run --release -- /path/to/config.toml
 
 ## Configuration
 
-A configuration file is generated if the provided path does not exist.
-By default it will be created in `$XDG_CONFIG_HOME/moonshine/config.toml` if you are using the AUR package.
-It is possible to add applications that you want to run (more on that below).
+A configuration file is created automatically if the path you provide doesn't exist.
+When using the AUR package, it defaults to `$XDG_CONFIG_HOME/moonshine/config.toml`.
 
-### Client pairing
+### Pairing with a client
 
-When a client attempts to pair through Moonlight, they are presented with a PIN number.
-A notification will appear on the host (assuming your desktop environment supports notifications) that you can use to automatically go to the page where your PIN number can be filled in.
-Alternatively you can navigate to the following URL on the host:
+When you connect with Moonlight for the first time, it will show a PIN.
+A notification will appear on the host that you can click to open the pairing page, or you can visit it manually:
 
 ```
 http://localhost:47989/pin
 ```
 
-Or, you can also do this in commandline:
+You can also pair from the command line:
 
 ```sh
 $ curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
 ```
 
-Where `<PIN>` should be replaced with the actual PIN number.
+### Adding applications
 
-### Applications
-
-Each application defined in the configuration is launched in a headless session using Moonshine's built-in compositor.
-This ensures that the application runs independently of the host's desktop session.
-
-In `config.toml` each application has the following information:
-
-1. `title`. The title as reported in Moonlight.
-1. `boxart` (optional). A path to the boxart (image) for this title.
-1. `command`. A list of strings representing the command to run. The first entry is the executable, the remaining entries are the arguments.
-
-Example:
+Each application runs in its own isolated streaming session. Add them to `config.toml` like this:
 
 ```toml
 [[application]]
 title = "Steam"
+boxart = "/path/to/steam.png"  # optional
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
 ```
 
+- `title`: The name shown in Moonlight.
+- `boxart` (optional): Path to a cover image.
+- `command`: The command to run. First entry is the executable, the rest are arguments.
+
 ### Application scanners
 
-In addition to defining specific applications, it is also possible to define application scanners.
-These scanners scan for applications on startup.
-Currently, `steam` and `desktop` scanners are implemented.
-The `steam` scanner searches for a Steam library, checks which games are installed in that library and adds applications with the configured `command`.
+Scanners automatically detect installed applications so you don't have to add them manually.
 
-The command has an additional template value that gets substituted when executed, the `{game_id}`.
-This is replaced with the Steam game id.
-
-The following application scanner will run the game through Steam:
+**Steam scanner** — finds all installed Steam games:
 
 ```toml
 [[application_scanner]]
@@ -155,11 +119,7 @@ library = "$HOME/.local/share/Steam"
 command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
 ```
 
-The `desktop` scanner searches explicitly configured directories for `.desktop` files and exposes launchable applications directly from their desktop entry metadata.
-It resolves the application title from `Name`, converts `Exec` into Moonshine's `command`, and attempts to resolve `Icon` into a boxart path.
-
-The scanner skips entries that are hidden, marked `NoDisplay`, have `Type` other than `Application`, or require a terminal unless `include_terminal = true`.
-`TryExec` is treated as advisory metadata: unresolved entries are still included and only logged.
+**Desktop scanner** — finds applications from `.desktop` files:
 
 ```toml
 [[application_scanner]]
@@ -175,26 +135,15 @@ resolve_icons = true
 ## FAQ
 
 1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**
-   There are two main differences between Sunshine and Moonshine:
-   1. Sunshine has a lot more features and wider software support. Moonshine currently only works on Linux.
-   2. Moonshine uses its own built-in headless compositor (based on [Smithay](https://github.com/Smithay/smithay)) to run applications.
-      This has a few benefits:
-      - Moonshine isolates the streaming session from the host desktop session.
-        This means that the host system can be used for other tasks while streaming games.
-        Note that this does not allow multi-seat gaming using controllers, as these are not isolated.
-        It might allow some form of multi-seat gaming using keyboard and mouse since these input events are "injected" into the compositor session.
-      - Moonshine streams applications without needing an active desktop session.
-        This is especially useful for headless servers, i.e. without a graphical environment.
-        This also means that no monitor (or HDMI dummy plug) needs to be connected to the GPU for Moonshine to work.
+   - Sunshine supports more platforms and has more features overall. Moonshine is Linux-only.
+   - Moonshine runs each streaming session in its own isolated environment, separate from your desktop. This means your host PC stays usable while you stream, and it works without an active desktop session.
 
 ## Security
 
-Moonshine is **not designed for use on untrusted networks**.
-The Moonlight/GameStream protocol has inherent security limitations (e.g. AES-ECB in pairing, unauthenticated AES-CBC audio, plaintext RTSP) that cannot be addressed without breaking client compatibility.
-While Moonshine implements mutual TLS for HTTPS endpoints and optional video/audio encryption, these measures do not provide the level of security needed for exposure to the public internet.
+Moonshine is **not designed for use on public networks**.
+The underlying GameStream protocol has limitations that mean traffic is not fully encrypted at the application level.
 
 If you need to stream over the internet, use a VPN such as [Tailscale](https://tailscale.com/), [WireGuard](https://www.wireguard.com/), or [ZeroTier](https://www.zerotier.com/).
-This ensures all traffic between the client and server is encrypted at the network level, regardless of protocol-level limitations.
 
 **Do not expose Moonshine ports directly to the internet.**
 
