@@ -27,15 +27,11 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 ### Arch
 
-The simplest method is to install through the AUR:
+The simplest method is to install through the AUR using:
 
-```sh
-$ git clone https://aur.archlinux.org/moonshine
-$ cd moonshine
-$ makepkg -si
 ```
-
-Or, simply `yay -S moonshine` if `yay` is installed.
+$ yay -S moonshine`
+```
 
 Start the server with:
 
