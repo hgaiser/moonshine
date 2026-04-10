@@ -33,11 +33,20 @@ The simplest method is to install through the AUR using:
 yay -S moonshine
 ```
 
-Start the server with:
+To run Moonshine for your user:
 
-```sh
-systemctl --user start moonshine
-```
+1. **Enable user lingering**:
+   ```sh
+   sudo loginctl enable-linger $USER
+   ```
+   This allows Moonshine to run applications in the user's session even when the user is not logged in.
+
+   If your user is always logged in when you want to stream, you can skip this step.
+
+2. **Enable the service to start on boot and run immediately**:
+   ```sh
+   sudo systemctl enable --now moonshine@$USER
+   ```
 
 ### Source
 
