@@ -230,7 +230,7 @@ pub struct MoonshineCompositor {
 	pub cursor_position: Point<f64, Logical>,
 	pub cursor_status: CursorImageStatus,
 	pub pointer_element: PointerElement,
-	pub last_pointer_activity: std::time::Instant,
+	pub last_pointer_activity: Option<std::time::Instant>,
 
 	// -- Desktop --
 	pub space: Space<smithay::desktop::Window>,
@@ -509,7 +509,7 @@ impl MoonshineCompositor {
 				cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
 				cursor_status: CursorImageStatus::default_named(),
 				pointer_element,
-				last_pointer_activity: std::time::Instant::now(),
+				last_pointer_activity: None,
 				space,
 				clock,
 				handle,
@@ -657,8 +657,11 @@ impl MoonshineCompositor {
 			self.cursor_status = CursorImageStatus::default_named();
 		}
 
-		// Hide cursor if inactive for 3 seconds.
-		let cursor_status = if self.last_pointer_activity.elapsed() > std::time::Duration::from_secs(3) {
+		// Hide cursor if no pointer activity yet or inactive for 3 seconds.
+		let cursor_status = if self
+			.last_pointer_activity
+			.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3))
+		{
 			CursorImageStatus::Hidden
 		} else {
 			self.cursor_status.clone()

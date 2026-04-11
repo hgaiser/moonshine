@@ -56,7 +56,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 	// specific pointer events (non-keyboard) should reset the cursor inactivity timer
 	match event {
 		CompositorInputEvent::KeyDown { .. } | CompositorInputEvent::KeyUp { .. } => {},
-		_ => state.last_pointer_activity = std::time::Instant::now(),
+		_ => state.last_pointer_activity = Some(std::time::Instant::now()),
 	}
 
 	// One-time X11 focus reset when HDR/gamescope WSI mode is active.
