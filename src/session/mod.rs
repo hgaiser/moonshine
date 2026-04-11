@@ -312,8 +312,8 @@ impl SessionInner {
 /// session compositor rather than the host desktop session.
 /// `MOONSHINE_WAYLAND_DISPLAY` tells the layer which Wayland socket to
 /// connect to, and `ENABLE_MOONSHINE_WSI=1` activates the layer.
-/// When HDR is active, `GAMESCOPE_WAYLAND_DISPLAY` and `DXVK_HDR` are
-/// also set for DXVK/VKD3D-Proton HDR detection.
+/// When HDR is active, `DXVK_HDR` and `MOONSHINE_HDR` are also set for
+/// DXVK/VKD3D-Proton HDR detection.
 fn launch_application(
 	context: &SessionContext,
 	pulse_dir: &std::path::Path,
@@ -368,9 +368,7 @@ fn launch_application(
 	// xdg_toplevel roles for XWayland bypass.  Set here rather than in the
 	// layer to avoid calling std::env::set_var after threads are spawned.
 	.env("vk_xwayland_wait_ready", "false");
-	if let Some(ref gamescope_display) = ready.gamescope_wayland_display {
-		tracing::debug!(gamescope_display, "Setting GAMESCOPE_WAYLAND_DISPLAY for application");
-		cmd.env("GAMESCOPE_WAYLAND_DISPLAY", gamescope_display);
+	if ready.hdr {
 		// DXVK's dxgi.dll gates HDR color space exposure on this env var.
 		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
 		// games will not see HDR as available.

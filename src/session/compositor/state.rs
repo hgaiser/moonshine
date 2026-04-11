@@ -296,8 +296,8 @@ pub struct MoonshineCompositor {
 	/// Name of the compositor's Wayland socket in XDG_RUNTIME_DIR.
 	pub wayland_display: String,
 
-	/// Wayland socket name passed as GAMESCOPE_WAYLAND_DISPLAY for DXVK HDR detection (only set when HDR is active).
-	pub gamescope_wayland_display: Option<String>,
+	/// Whether HDR mode is active for this session.
+	pub hdr: bool,
 
 	// -- WSI layer --
 	/// Override surface from gamescope_swapchain.
@@ -407,8 +407,7 @@ impl MoonshineCompositor {
 		let wayland_display = socket_name.to_string_lossy().into_owned();
 		tracing::debug!("Wayland socket: {:?}", socket_name);
 
-		// Store the socket name for GAMESCOPE_WAYLAND_DISPLAY when HDR is active.
-		let gamescope_wayland_display = if hdr { Some(wayland_display.clone()) } else { None };
+		let hdr_active = hdr;
 
 		// Register the socket source with the event loop.
 		let mut display_handle_clone = display_handle.clone();
@@ -534,7 +533,7 @@ impl MoonshineCompositor {
 				xdisplay_tx: Some(xdisplay_tx),
 				wayland_socket_token: Some(wayland_socket_token),
 				wayland_display,
-				gamescope_wayland_display,
+				hdr: hdr_active,
 				override_surface: None,
 				x11_input_conn: None,
 				focused_x11_window: None,
@@ -1177,7 +1176,7 @@ impl MoonshineCompositor {
 						let _ = tx.send(super::CompositorReady {
 							xdisplay: display_number,
 							wayland_display: data.wayland_display.clone(),
-							gamescope_wayland_display: data.gamescope_wayland_display.clone(),
+							hdr: data.hdr,
 						});
 					}
 				},
