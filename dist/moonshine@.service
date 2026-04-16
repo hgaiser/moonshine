@@ -1,0 +1,18 @@
+[Unit]
+Description=Streaming server using the NVIDIA GameStream / Moonlight protocol.
+
+[Service]
+User=%i
+Group=%i
+SupplementaryGroups=input
+ExecStart=/usr/bin/start-moonshine.sh /home/%i/.config/moonshine/config.toml
+Environment=RUST_LOG=info
+Restart=always
+DeviceAllow=/dev/uinput rw
+DeviceAllow=/dev/uhid rw
+DeviceAllow=char-drm rw
+DeviceAllow=char-nvidia rw
+DeviceAllow=char-nvidia-uvm rw
+
+[Install]
+WantedBy=default.target

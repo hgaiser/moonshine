@@ -56,7 +56,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 	// specific pointer events (non-keyboard) should reset the cursor inactivity timer
 	match event {
 		CompositorInputEvent::KeyDown { .. } | CompositorInputEvent::KeyUp { .. } => {},
-		_ => state.last_pointer_activity = std::time::Instant::now(),
+		_ => state.last_pointer_activity = Some(std::time::Instant::now()),
 	}
 
 	// One-time X11 focus reset when HDR/gamescope WSI mode is active.
@@ -254,19 +254,39 @@ fn find_surface_under(
 	<MoonshineCompositor as smithay::input::SeatHandler>::PointerFocus,
 	Point<f64, Logical>,
 )> {
-	if state.override_surface.is_some() {
-		let wid = state.focused_x11_window?;
-		for window in state.space.elements() {
-			if let Some(x11) = window.x11_surface() {
-				if x11.window_id() == wid {
-					let window_loc = state.space.element_geometry(window)?.loc;
-					let pos_within_window = state.cursor_position - window_loc.to_f64();
-					let (surface, surface_offset) = window.surface_under(pos_within_window, WindowSurfaceType::ALL)?;
-					return Some((surface, surface_offset.to_f64() + window_loc.to_f64()));
+	if state.is_override_active() {
+		if let Some(wid) = state.focused_x11_window {
+			// XWayland path: find the focused X11 window and route events there.
+			for window in state.space.elements() {
+				if let Some(x11) = window.x11_surface() {
+					if x11.window_id() == wid {
+						let window_loc = state.space.element_geometry(window)?.loc;
+						let pos_within_window = state.cursor_position - window_loc.to_f64();
+						// Try finding a sub-surface under the cursor first.
+						if let Some((surface, surface_offset)) =
+							window.surface_under(pos_within_window, WindowSurfaceType::ALL)
+						{
+							return Some((surface, surface_offset.to_f64() + window_loc.to_f64()));
+						}
+						// If the X11 window has no buffer (ICD renders to the
+						// bypass surface), use the toplevel wl_surface directly
+						// so pointer events still reach XWayland.
+						if let Some(wl_surface) = x11.wl_surface() {
+							return Some((wl_surface, window_loc.to_f64()));
+						}
+						return None;
+					}
 				}
 			}
+			return None;
+		} else {
+			// Native Wayland path (x11_win == 0): the override surface is a
+			// fullscreen bypass surface at the output origin.  Route pointer
+			// events directly to it so the application receives input.
+			if let Some((ref override_surface, _)) = state.override_surface {
+				return Some((override_surface.clone(), Point::from((0.0, 0.0))));
+			}
 		}
-		return None;
 	}
 
 	let (window, window_loc) = state.space.element_under(state.cursor_position)?;

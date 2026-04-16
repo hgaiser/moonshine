@@ -39,7 +39,7 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 		0x34324241 | 0x34324258 => (InputFormat::RGBA, vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
 		0x30334241 => (InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32), // ABGR2101010
 		0x48344241 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT),      // ABGR16161616F
-		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                       // ARGB/XRGB8888 (default)
+		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                       // ARGB/XRGB8888 (fallback)
 	}
 }
 
@@ -131,6 +131,7 @@ impl VideoPipeline {
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
+		log_frame_spikes: bool,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -147,6 +148,7 @@ impl VideoPipeline {
 			chroma_sampling,
 			max_reference_frames,
 			encryption_key,
+			log_frame_spikes,
 		};
 
 		std::thread::Builder::new()
@@ -179,6 +181,7 @@ struct VideoPipelineInner {
 	chroma_sampling: VideoChromaSampling,
 	max_reference_frames: u32,
 	encryption_key: Option<Vec<u8>>,
+	log_frame_spikes: bool,
 }
 
 impl VideoPipelineInner {
@@ -378,12 +381,14 @@ impl VideoPipelineInner {
 						let encode_result = encoder.encode(encoder.input_image());
 						if let Ok(packets) = encode_result {
 							for packet in packets {
+								// Use current time as frame_created_at for re-encoded IDR (no actual frame)
 								if let Err(()) = self.send_packet(
 									&packet,
 									&packet_tx,
 									&mut packetizer,
 									&mut frame_number,
 									&mut sequence_number,
+									std::time::Instant::now(),
 								) {
 									tracing::warn!("Failed to send IDR re-encode packet");
 								}
@@ -406,7 +411,7 @@ impl VideoPipelineInner {
 				let t1_received = std::time::Instant::now();
 
 				tracing::trace!(
-					"Received frame: format={}, modifier={:#x}, {}x{}, planes={}",
+					"Received frame: format=0x{:08X}, modifier={:#x}, {}x{}, planes={}",
 					frame.format,
 					frame.modifier,
 					frame.width,
@@ -477,6 +482,20 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
+				// Recreate the converter if the input format changed (e.g. GBM pool
+				// ABGR2101010 → direct scanout XBGR8888). The converter's image view
+				// format must match the source image format.
+				if let Some(ref conv) = color_converter {
+					if conv.config().input_format != frame_input_format {
+						tracing::info!(
+							"Input format changed from {:?} to {:?}, recreating color converter",
+							conv.config().input_format,
+							frame_input_format,
+						);
+						color_converter = None;
+					}
+				}
+
 				// Initialize converter if needed.
 				let converter = match &mut color_converter {
 					Some(conv) => conv,
@@ -518,7 +537,9 @@ impl VideoPipelineInner {
 					// the encoder switch succeeds, so that the converter's
 					// color space stays in sync with the encoder's VUI.
 					if encoder_color_desc != Some(color_desc) {
-						tracing::info!("Switching encoder color description to {color_desc:?}");
+						tracing::info!(
+							"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
+						);
 						match encoder.set_color_description(color_desc) {
 							Ok(()) => {
 								encoder_color_desc = Some(color_desc);
@@ -601,6 +622,7 @@ impl VideoPipelineInner {
 								&mut packetizer,
 								&mut frame_number,
 								&mut sequence_number,
+								frame.created_at,
 							) {
 								Ok(durations) => durations,
 								Err(()) => {
@@ -639,7 +661,7 @@ impl VideoPipelineInner {
 
 				// Warn on spike frames (total > frame interval) so they stand out in logs.
 				let frame_interval_us = 1_000_000 / self.framerate as u128;
-				if total.as_micros() > frame_interval_us {
+				if self.log_frame_spikes && total.as_micros() > frame_interval_us {
 					tracing::warn!(
 						total_us = total.as_micros() as u64,
 						channel_us = channel_wait.as_micros() as u64,
@@ -685,12 +707,14 @@ impl VideoPipelineInner {
 		match encoder.flush() {
 			Ok(packets) => {
 				for packet in packets {
+					// Use current time as frame_created_at for flush packets (no actual frame)
 					let _ = self.send_packet(
 						&packet,
 						&packet_tx,
 						&mut packetizer,
 						&mut frame_number,
 						&mut sequence_number,
+						std::time::Instant::now(),
 					);
 				}
 			},
@@ -710,6 +734,7 @@ impl VideoPipelineInner {
 		packetizer: &mut Packetizer,
 		frame_number: &mut u32,
 		sequence_number: &mut u32,
+		frame_created_at: std::time::Instant,
 	) -> Result<(std::time::Duration, std::time::Duration), ()> {
 		// Calculate RTP timestamp from PTS (convert to 90kHz clock)
 		let rtp_timestamp = (packet.pts * 90000 / self.framerate as u64) as u32;
@@ -725,6 +750,11 @@ impl VideoPipelineInner {
 
 		let t_start = std::time::Instant::now();
 
+		// Calculate frame processing latency (capture to packetization) in 100µs units (1/10 ms)
+		// Clamp to u16::MAX to prevent overflow (~6.55 seconds max)
+		let processing_latency = t_start.duration_since(frame_created_at);
+		let latency_100us = std::cmp::min((processing_latency.as_micros() / 100) as u16, u16::MAX);
+
 		let shards = packetizer.packetize(
 			&packet.data,
 			packet.is_key_frame,
@@ -734,6 +764,7 @@ impl VideoPipelineInner {
 			*frame_number,
 			sequence_number,
 			rtp_timestamp,
+			latency_100us,
 		)?;
 
 		let t_packetized = std::time::Instant::now();

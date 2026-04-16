@@ -1,6 +1,16 @@
+[workspace]
+members = [
+	".",
+	"moonshine-wsi",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.10.0"
+
 [package]
 name = "moonshine"
-version = "0.9.0"
+version.workspace = true
 edition = "2021"
 
 [dependencies]
@@ -30,7 +40,7 @@ network-interface = "2.0.5"
 notify-rust = "4.12.0"
 open = "5.3.3"
 opus = "0.3.1"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", branch = "main", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", rev = "fc60c32", features = ["dmabuf"] }
 pkcs8 = "0.10.2"
 pulseaudio = "0.3.1"
 rand = "0.8.5"

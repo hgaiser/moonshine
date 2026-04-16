@@ -1,0 +1,22 @@
+{
+    "file_format_version" : "1.0.0",
+    "layer" : {
+      "name": "VK_LAYER_MOONSHINE_wsi",
+      "type": "GLOBAL",
+      "api_version": "1.3.221",
+      "library_path": "/usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so",
+      "implementation_version": "1",
+      "description": "Moonshine WSI Layer — routes game frames to the Moonshine compositor (x86_64)",
+      "functions": {
+         "vkNegotiateLoaderLayerInterfaceVersion": "vkNegotiateLoaderLayerInterfaceVersion",
+         "vkGetInstanceProcAddr": "moonshine_vk_get_instance_proc_addr",
+         "vkGetDeviceProcAddr": "moonshine_vk_get_device_proc_addr"
+      },
+      "enable_environment": {
+        "ENABLE_MOONSHINE_WSI": "1"
+      },
+      "disable_environment": {
+        "DISABLE_MOONSHINE_WSI": "1"
+      }
+    }
+}
