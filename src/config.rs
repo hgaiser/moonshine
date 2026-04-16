@@ -51,6 +51,9 @@ pub struct Config {
 
 	/// Time in seconds since last ping after which the stream closes.
 	pub stream_timeout: u64,
+
+	#[serde(default)]
+    pub keyboard: KeyboardConfig,
 }
 
 impl Config {
@@ -88,8 +91,29 @@ impl Default for Config {
 			gpu: None,
 			hdr_support: true,
 			stream_timeout: 60,
+			keyboard: KeyboardConfig::default(),
 		}
 	}
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct KeyboardConfig {
+    pub layout: String,
+    pub variant: String,
+    pub model: String,
+    pub options: Option<String>,
+}
+
+impl Default for KeyboardConfig {
+    fn default() -> Self {
+        Self {
+            layout: String::new(),   // leerer String → XKB_DEFAULT_LAYOUT
+            variant: String::new(),
+            model: String::new(),
+            options: None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

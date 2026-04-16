@@ -260,6 +260,7 @@ impl Key {
 			Key::Backslash => Some(43),
 			Key::RightBrace => Some(27),
 			Key::Apostrophe => Some(40),
+			Key::NonUsBackslash => Some(86),
 			_ => None,
 		}
 	}
