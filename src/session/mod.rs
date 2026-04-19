@@ -1,5 +1,6 @@
 use std::process::Command;
 use std::process::{Child, Stdio};
+use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
@@ -189,6 +190,18 @@ impl SessionInner {
 					if let Err(e) = std::thread::Builder::new().name("app-launcher".to_string()).spawn(
 						move || -> Result<Child, ()> {
 							let result = (|| -> Result<Child, ()> {
+								// Stop any existing Steam instance so the fresh
+								// launch connects to our compositor instead of
+								// delegating to the host instance.
+								let is_steam = app_context
+									.application
+									.command
+									.iter()
+									.any(|a| a.ends_with("/steam") || a == "steam");
+								if is_steam {
+									stop_steam();
+								}
+
 								let ready = ready_rx
 									.recv_timeout(std::time::Duration::from_secs(5))
 									.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
@@ -303,6 +316,43 @@ impl SessionInner {
 
 		tracing::debug!("Session stopped.");
 	}
+}
+
+/// Gracefully stop any running Steam instance so a fresh one can connect
+/// to moonshine's compositor.
+fn stop_steam() {
+	let running = Command::new("pgrep")
+		.args(["-x", "steam"])
+		.stdout(Stdio::null())
+		.status()
+		.map(|s| s.success())
+		.unwrap_or(false);
+
+	if !running {
+		return;
+	}
+
+	tracing::info!("Stopping existing Steam instance");
+	let _ = Command::new("pkill")
+		.args(["-x", "steam"])
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status();
+
+	for _ in 0..50 {
+		std::thread::sleep(Duration::from_millis(200));
+		let still_running = Command::new("pgrep")
+			.args(["-x", "steam"])
+			.stdout(Stdio::null())
+			.status()
+			.map(|s| s.success())
+			.unwrap_or(false);
+		if !still_running {
+			tracing::info!("Steam stopped");
+			return;
+		}
+	}
+	tracing::warn!("Steam still running after 10s, proceeding anyway");
 }
 
 /// Launch the application as a child process.
