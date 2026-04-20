@@ -76,6 +76,7 @@ impl Default for Config {
 				title: "Steam".to_string(),
 				command: vec!["/usr/bin/steam".to_string(), "steam://open/bigpicture".to_string()],
 				boxart: None,
+				..Default::default()
 			}],
 			application_scanners: vec![ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {
 				library: "$HOME/.local/share/Steam".into(),
@@ -84,6 +85,8 @@ impl Default for Config {
 					"-bigpicture".to_string(),
 					"steam://rungameid/{game_id}".to_string(),
 				],
+				pre_command: Vec::new(),
+				post_command: Vec::new(),
 			})],
 			gpu: None,
 			hdr_support: true,
@@ -133,6 +136,18 @@ pub struct ApplicationConfig {
 
 	/// The command to run.
 	pub command: Vec<String>,
+
+	/// Command to run before launching the application.
+	/// Runs synchronously — the application launch waits for it to finish.
+	/// Useful for killing conflicting processes, setting GPU power states, etc.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub pre_command: Vec<String>,
+
+	/// Command to run after the streaming session ends.
+	/// Runs in the background — moonshine does not wait for it to finish.
+	/// Useful for restoring system state (e.g. GPU power management).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub post_command: Vec<String>,
 }
 
 impl ApplicationConfig {
@@ -161,6 +176,14 @@ pub struct SteamApplicationScannerConfig {
 
 	/// The command to run.
 	pub command: Vec<String>,
+
+	/// Command to run before launching each scanned application.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub pre_command: Vec<String>,
+
+	/// Command to run after each scanned application's session ends.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub post_command: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

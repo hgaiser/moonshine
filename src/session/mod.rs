@@ -189,6 +189,8 @@ impl SessionInner {
 					if let Err(e) = std::thread::Builder::new().name("app-launcher".to_string()).spawn(
 						move || -> Result<Child, ()> {
 							let result = (|| -> Result<Child, ()> {
+								run_hook("pre_command", &app_context.application.pre_command);
+
 								let ready = ready_rx
 									.recv_timeout(std::time::Duration::from_secs(5))
 									.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
@@ -301,7 +303,37 @@ impl SessionInner {
 			.stderr(Stdio::null())
 			.status();
 
+		run_hook("post_command", &session_context.application.post_command);
+
 		tracing::debug!("Session stopped.");
+	}
+}
+
+/// Run a configured hook command, logging the result.
+/// Skips silently if the command is empty.
+fn run_hook(name: &str, command: &[String]) {
+	if command.is_empty() {
+		return;
+	}
+
+	let Some(program) = command.first() else {
+		return;
+	};
+	let args = &command[1..];
+
+	tracing::info!("{name}: running {:?}", command);
+	match Command::new(program)
+		.args(args)
+		.stdout(Stdio::null())
+		.stderr(Stdio::null())
+		.status()
+	{
+		Ok(status) => {
+			if !status.success() {
+				tracing::warn!("{name}: exited with {status}");
+			}
+		},
+		Err(e) => tracing::warn!("{name}: failed to run: {e}"),
 	}
 }
 
