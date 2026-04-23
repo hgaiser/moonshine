@@ -19,8 +19,8 @@ use smithay::delegate_shm;
 use smithay::delegate_viewporter;
 use smithay::delegate_xdg_shell;
 use smithay::delegate_xwayland_shell;
-use smithay::desktop::{Window, WindowSurface};
 use smithay::desktop::WindowSurfaceType;
+use smithay::desktop::{Window, WindowSurface};
 use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
@@ -281,7 +281,11 @@ impl MoonshineCompositor {
 		// _NET_ACTIVE_WINDOW but still update GAMESCOPE_FOCUSED_APP below so
 		// Steam yields controller focus to the game.
 		if let Some(win_id) = self.focused_x11_window {
-			tracing::debug!(window = win_id, root = root, "sync_x11_focus: setting X11 focus and atoms");
+			tracing::debug!(
+				window = win_id,
+				root = root,
+				"sync_x11_focus: setting X11 focus and atoms"
+			);
 
 			match conn.set_input_focus(InputFocus::PARENT, win_id, x11rb::CURRENT_TIME) {
 				Ok(cookie) => {
@@ -302,7 +306,10 @@ impl MoonshineCompositor {
 				&win_id.to_ne_bytes(),
 			);
 		} else {
-			tracing::debug!(root = root, "sync_x11_focus: no X11 window focused, updating gamescope atoms only");
+			tracing::debug!(
+				root = root,
+				"sync_x11_focus: no X11 window focused, updating gamescope atoms only"
+			);
 		}
 
 		let app_id = self.focused_app_id;
