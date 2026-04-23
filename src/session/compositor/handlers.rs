@@ -19,7 +19,7 @@ use smithay::delegate_shm;
 use smithay::delegate_viewporter;
 use smithay::delegate_xdg_shell;
 use smithay::delegate_xwayland_shell;
-use smithay::desktop::Window;
+use smithay::desktop::{Window, WindowSurface};
 use smithay::desktop::WindowSurfaceType;
 use smithay::input::pointer::{CursorImageStatus, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -165,8 +165,21 @@ impl CompositorHandler for MoonshineCompositor {
 		if let Some(cm) = &mut self.color_management {
 			cm.surface_destroyed(surface);
 		}
+
+		// Evict any dead windows from the space. Wayland toplevel windows
+		// have no explicit unmap callback, so they must be cleaned up here
+		// when their underlying surface is destroyed.
+		let dead: Vec<_> = self.space.elements().filter(|w| !w.alive()).cloned().collect();
+		for w in &dead {
+			self.space.unmap_elem(w);
+		}
+		if !dead.is_empty() {
+			self.determine_and_apply_focus();
+		}
 	}
 }
+
+const STEAM_BPM_APP_ID: u32 = 769;
 
 impl MoonshineCompositor {
 	fn popups_commit(&mut self, _surface: &WlSurface) {
@@ -196,9 +209,17 @@ impl MoonshineCompositor {
 	pub(super) fn set_keyboard_focus_to_window(&mut self, window: &Window) {
 		let serial = smithay::utils::SERIAL_COUNTER.next_serial();
 
-		// Store the X11 window ID for input injection fallback.
+		// Update X11 focus state to match the new target window type.
 		if let Some(x11) = window.x11_surface() {
 			self.focused_x11_window = Some(x11.window_id());
+		} else {
+			// Native Wayland window — clear X11 state so sync_x11_focus() doesn't
+			// call SetInputFocus on BPM's X11 window or leave GAMESCOPE_FOCUSED_APP
+			// set to 769, which would cause Steam to keep claiming controller input.
+			self.focused_x11_window = None;
+			if self.focused_app_id == STEAM_BPM_APP_ID {
+				self.focused_app_id = 0;
+			}
 		}
 
 		// If the X11 window has no wl_surface yet (serial matching still
@@ -255,33 +276,34 @@ impl MoonshineCompositor {
 			tracing::warn!("sync_x11_focus: no x11_input_conn");
 			return;
 		};
-		let Some(win_id) = self.focused_x11_window else {
-			tracing::warn!("sync_x11_focus: no focused_x11_window");
-			return;
-		};
+		// X11-specific focus operations only apply when an X11 window is focused.
+		// When a native Wayland window has focus, skip SetInputFocus and
+		// _NET_ACTIVE_WINDOW but still update GAMESCOPE_FOCUSED_APP below so
+		// Steam yields controller focus to the game.
+		if let Some(win_id) = self.focused_x11_window {
+			tracing::debug!(window = win_id, root = root, "sync_x11_focus: setting X11 focus and atoms");
 
-		tracing::debug!(window = win_id, root = root, "sync_x11_focus: setting focus and atoms");
+			match conn.set_input_focus(InputFocus::PARENT, win_id, x11rb::CURRENT_TIME) {
+				Ok(cookie) => {
+					if let Err(e) = cookie.check() {
+						tracing::warn!(window = win_id, error = %e, "sync_x11_focus: SetInputFocus X11 error");
+					}
+				},
+				Err(e) => tracing::warn!(window = win_id, error = %e, "sync_x11_focus: SetInputFocus connection error"),
+			}
 
-		// Set core X11 input focus.
-		match conn.set_input_focus(InputFocus::PARENT, win_id, x11rb::CURRENT_TIME) {
-			Ok(cookie) => {
-				if let Err(e) = cookie.check() {
-					tracing::warn!(window = win_id, error = %e, "sync_x11_focus: SetInputFocus X11 error");
-				}
-			},
-			Err(e) => tracing::warn!(window = win_id, error = %e, "sync_x11_focus: SetInputFocus connection error"),
+			let _ = conn.change_property(
+				PropMode::REPLACE,
+				*root,
+				atoms.net_active_window,
+				atoms.xa_window,
+				32,
+				1,
+				&win_id.to_ne_bytes(),
+			);
+		} else {
+			tracing::debug!(root = root, "sync_x11_focus: no X11 window focused, updating gamescope atoms only");
 		}
-
-		// Update _NET_ACTIVE_WINDOW on root so Wine detects the focus change.
-		let _ = conn.change_property(
-			PropMode::REPLACE,
-			*root,
-			atoms.net_active_window,
-			atoms.xa_window,
-			32,
-			1,
-			&win_id.to_ne_bytes(),
-		);
 
 		let app_id = self.focused_app_id;
 
@@ -307,7 +329,7 @@ impl MoonshineCompositor {
 				.and_then(|s| s.parse().ok())
 				.unwrap_or_else(|| {
 					if class.eq_ignore_ascii_case("steam") {
-						769
+						STEAM_BPM_APP_ID
 					} else {
 						x11.pid().unwrap_or(0)
 					}
@@ -397,23 +419,33 @@ impl MoonshineCompositor {
 		let mut fallback_window: Option<Window> = None;
 
 		for win in self.space.elements() {
-			let Some(x11) = win.x11_surface() else {
-				continue;
-			};
-
-			if x11.is_override_redirect() {
+			if !win.alive() {
 				continue;
 			}
+			match win.underlying_surface() {
+				WindowSurface::Wayland(_) => {
+					// Native Wayland toplevels are never Steam BPM (which is always
+					// X11). Treat them as non-Steam candidates so they beat BPM.
+					if non_steam_window.is_none() {
+						non_steam_window = Some(win.clone());
+					}
+				},
+				WindowSurface::X11(x11) => {
+					if x11.is_override_redirect() {
+						continue;
+					}
 
-			let class = x11.class();
-			if class.starts_with("steam_app_") {
-				game_window = Some(win.clone());
-			} else if class != "steam" {
-				// Any non-Steam window (e.g. a Proton game using its own class
-				// name) should take priority over Steam Big Picture Mode.
-				non_steam_window = Some(win.clone());
-			} else {
-				fallback_window = Some(win.clone());
+					let class = x11.class();
+					if class.starts_with("steam_app_") {
+						game_window = Some(win.clone());
+					} else if class != "steam" {
+						// Any non-Steam window (e.g. a Proton game using its own class
+						// name) should take priority over Steam Big Picture Mode.
+						non_steam_window = Some(win.clone());
+					} else {
+						fallback_window = Some(win.clone());
+					}
+				},
 			}
 		}
 
@@ -467,7 +499,7 @@ impl MoonshineCompositor {
 				self.focused_app_id = id_str.parse().unwrap_or(0);
 				tracing::debug!(app_id = self.focused_app_id, class = %class, "Extracted app ID from window class");
 			} else if class.eq_ignore_ascii_case("steam") {
-				self.focused_app_id = 769;
+				self.focused_app_id = STEAM_BPM_APP_ID;
 				tracing::debug!(app_id = self.focused_app_id, class = %class, "Steam BPM window, using app ID 769");
 			} else {
 				// The game uses its own window class (e.g. "bg3").  Try to
@@ -564,7 +596,6 @@ impl XdgShellHandler for MoonshineCompositor {
 		let window = Window::new_wayland_window(surface);
 		self.space.map_element(window.clone(), (0, 0), false);
 
-		// Give the new toplevel keyboard focus so it receives key events.
 		self.set_keyboard_focus_to_window(&window);
 	}
 
