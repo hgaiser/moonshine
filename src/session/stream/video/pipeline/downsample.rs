@@ -44,7 +44,11 @@ impl Downsampler {
 		let image_info = vk::ImageCreateInfo::default()
 			.image_type(vk::ImageType::TYPE_2D)
 			.format(vk_format)
-			.extent(vk::Extent3D { width: dst_width, height: dst_height, depth: 1 })
+			.extent(vk::Extent3D {
+				width: dst_width,
+				height: dst_height,
+				depth: 1,
+			})
 			.mip_levels(1)
 			.array_layers(1)
 			.samples(vk::SampleCountFlags::TYPE_1)
@@ -53,8 +57,8 @@ impl Downsampler {
 			.sharing_mode(vk::SharingMode::EXCLUSIVE)
 			.initial_layout(vk::ImageLayout::UNDEFINED);
 
-		let dst_image =
-			unsafe { device.create_image(&image_info, None) }.map_err(|e| format!("Downsampler image creation: {e}"))?;
+		let dst_image = unsafe { device.create_image(&image_info, None) }
+			.map_err(|e| format!("Downsampler image creation: {e}"))?;
 
 		let mem_req = unsafe { device.get_image_memory_requirements(dst_image) };
 		let memory_type_index = context
@@ -81,10 +85,9 @@ impl Downsampler {
 		}
 
 		// Create command pool on the transfer queue family.
-		let pool_info =
-			vk::CommandPoolCreateInfo::default().queue_family_index(context.compute_queue_family()).flags(
-				vk::CommandPoolCreateFlags::TRANSIENT | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER,
-			);
+		let pool_info = vk::CommandPoolCreateInfo::default()
+			.queue_family_index(context.compute_queue_family())
+			.flags(vk::CommandPoolCreateFlags::TRANSIENT | vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
 		let command_pool = unsafe { device.create_command_pool(&pool_info, None) }.map_err(|e| {
 			unsafe {
 				device.free_memory(dst_memory, None);
@@ -136,8 +139,7 @@ impl Downsampler {
 	pub fn blit(&mut self, src_image: vk::Image, src_layout: vk::ImageLayout) -> Result<vk::Image, String> {
 		let device = self.context.device();
 
-		let begin_info =
-			vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+		let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
 		unsafe { device.begin_command_buffer(self.command_buffer, &begin_info) }
 			.map_err(|e| format!("Downsampler begin command buffer: {e}"))?;
 
@@ -192,12 +194,20 @@ impl Downsampler {
 			.src_subresource(subresource_layers)
 			.src_offsets([
 				vk::Offset3D { x: 0, y: 0, z: 0 },
-				vk::Offset3D { x: self.src_width as i32, y: self.src_height as i32, z: 1 },
+				vk::Offset3D {
+					x: self.src_width as i32,
+					y: self.src_height as i32,
+					z: 1,
+				},
 			])
 			.dst_subresource(subresource_layers)
 			.dst_offsets([
 				vk::Offset3D { x: 0, y: 0, z: 0 },
-				vk::Offset3D { x: self.dst_width as i32, y: self.dst_height as i32, z: 1 },
+				vk::Offset3D {
+					x: self.dst_width as i32,
+					y: self.dst_height as i32,
+					z: 1,
+				},
 			]);
 
 		unsafe {
@@ -245,11 +255,12 @@ impl Downsampler {
 				&[src_barrier_back, dst_barrier_back],
 			);
 
-			device.end_command_buffer(self.command_buffer).map_err(|e| format!("Downsampler end command buffer: {e}"))?;
+			device
+				.end_command_buffer(self.command_buffer)
+				.map_err(|e| format!("Downsampler end command buffer: {e}"))?;
 		}
 
-		let submit_info =
-			vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
+		let submit_info = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&self.command_buffer));
 		unsafe {
 			device
 				.queue_submit(self.context.compute_queue(), &[submit_info], self.fence)
@@ -257,7 +268,9 @@ impl Downsampler {
 			device
 				.wait_for_fences(&[self.fence], true, u64::MAX)
 				.map_err(|e| format!("Downsampler fence wait: {e}"))?;
-			device.reset_fences(&[self.fence]).map_err(|e| format!("Downsampler fence reset: {e}"))?;
+			device
+				.reset_fences(&[self.fence])
+				.map_err(|e| format!("Downsampler fence reset: {e}"))?;
 			device
 				.reset_command_buffer(self.command_buffer, vk::CommandBufferResetFlags::empty())
 				.map_err(|e| format!("Downsampler command buffer reset: {e}"))?;

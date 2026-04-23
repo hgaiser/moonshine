@@ -166,8 +166,17 @@ impl SessionInner {
 					// based on the negotiated dynamic range.
 					let hdr = video_stream_context.dynamic_range == VideoDynamicRange::Hdr;
 					let (encode_w, encode_h) = (session_context.resolution.0, session_context.resolution.1);
-					let supersample = self.config.stream.video.supersampled_resolutions.contains(&[encode_w, encode_h]);
-					let (render_w, render_h) = if supersample { (encode_w * 2, encode_h * 2) } else { (encode_w, encode_h) };
+					let supersample = self
+						.config
+						.stream
+						.video
+						.supersampled_resolutions
+						.contains(&[encode_w, encode_h]);
+					let (render_w, render_h) = if supersample {
+						(encode_w * 2, encode_h * 2)
+					} else {
+						(encode_w, encode_h)
+					};
 					let compositor_config = compositor::CompositorConfig {
 						width: render_w,
 						height: render_h,

@@ -502,7 +502,8 @@ impl VideoPipelineInner {
 				}
 
 				// Downscale from compositor render resolution to encode resolution if supersampling active.
-				let (source_image, src_layout) = if self.render_width != self.width || self.render_height != self.height {
+				let (source_image, src_layout) = if self.render_width != self.width || self.render_height != self.height
+				{
 					let ds = match &mut downsampler {
 						Some(d) => d,
 						None => match Downsampler::new(
