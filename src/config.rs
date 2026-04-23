@@ -226,6 +226,12 @@ pub struct VideoStreamConfig {
 	/// the messages can be very noisy.
 	#[serde(default = "default_false")]
 	pub log_frame_spikes: bool,
+
+	/// List of client resolutions (width, height) that will be rendered at 2× and
+	/// downscaled before encoding. Empty list disables supersampling entirely.
+	/// Example: `supersampled_resolutions = [[1280, 800], [1920, 1080]]`
+	#[serde(default)]
+	pub supersampled_resolutions: Vec<[u32; 2]>,
 }
 
 impl Default for VideoStreamConfig {
@@ -235,6 +241,7 @@ impl Default for VideoStreamConfig {
 			fec_percentage: 20,
 			encrypt: false,
 			log_frame_spikes: false,
+			supersampled_resolutions: Vec::new(),
 		}
 	}
 }

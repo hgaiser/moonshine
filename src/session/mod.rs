@@ -165,9 +165,21 @@ impl SessionInner {
 					// Start the headless compositor with HDR format selection
 					// based on the negotiated dynamic range.
 					let hdr = video_stream_context.dynamic_range == VideoDynamicRange::Hdr;
+					let (encode_w, encode_h) = (session_context.resolution.0, session_context.resolution.1);
+					let supersample = self
+						.config
+						.stream
+						.video
+						.supersampled_resolutions
+						.contains(&[encode_w, encode_h]);
+					let (render_w, render_h) = if supersample {
+						(encode_w * 2, encode_h * 2)
+					} else {
+						(encode_w, encode_h)
+					};
 					let compositor_config = compositor::CompositorConfig {
-						width: session_context.resolution.0,
-						height: session_context.resolution.1,
+						width: render_w,
+						height: render_h,
 						refresh_rate: session_context._refresh_rate,
 						gpu: self.config.gpu.clone(),
 						hdr,
@@ -221,6 +233,9 @@ impl SessionInner {
 						metadata: None,
 					});
 
+					let mut video_stream_context = video_stream_context;
+					video_stream_context.render_width = render_w;
+					video_stream_context.render_height = render_h;
 					let video_stream = match VideoStream::new(
 						self.config.clone(),
 						video_stream_context.clone(),
