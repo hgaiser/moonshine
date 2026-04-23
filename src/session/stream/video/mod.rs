@@ -82,6 +82,9 @@ enum VideoStreamCommand {
 pub struct VideoStreamContext {
 	pub width: u32,
 	pub height: u32,
+	/// Compositor render resolution — equals width/height unless supersampling is active.
+	pub render_width: u32,
+	pub render_height: u32,
 	pub fps: u32,
 	pub packet_size: usize,
 	pub bitrate: usize,
@@ -238,6 +241,8 @@ impl VideoStreamInner {
 			frame_rx,
 			self.context.width,
 			self.context.height,
+			self.context.render_width,
+			self.context.render_height,
 			self.context.fps,
 			self.context.bitrate,
 			self.context.packet_size,

@@ -4,7 +4,10 @@
 //! and packetization for network transmission.
 
 mod dmabuf;
+mod downsample;
 mod hdr_sei;
+
+use downsample::Downsampler;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -117,6 +120,8 @@ impl VideoPipeline {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		width: u32,
 		height: u32,
+		render_width: u32,
+		render_height: u32,
 		framerate: u32,
 		bitrate: usize,
 		packet_size: usize,
@@ -138,6 +143,8 @@ impl VideoPipeline {
 		let inner = VideoPipelineInner {
 			width,
 			height,
+			render_width,
+			render_height,
 			framerate,
 			bitrate,
 			packet_size,
@@ -171,6 +178,8 @@ impl VideoPipeline {
 struct VideoPipelineInner {
 	width: u32,
 	height: u32,
+	render_width: u32,
+	render_height: u32,
 	framerate: u32,
 	bitrate: usize,
 	packet_size: usize,
@@ -330,6 +339,9 @@ impl VideoPipelineInner {
 		// Color converter will be initialized on first frame.
 		let mut color_converter: Option<ColorConverter> = None;
 
+		// Downsampler for supersampling: initialized on first frame when render dims differ from encode dims.
+		let mut downsampler: Option<Downsampler> = None;
+
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / self.framerate as f64);
 		let mut last_frame_time = std::time::Instant::now();
@@ -481,6 +493,48 @@ impl VideoPipelineInner {
 				};
 
 				let t2_imported = std::time::Instant::now();
+
+				// Invalidate downsampler if the source format changed.
+				if let Some(ref d) = downsampler {
+					if d.vk_format() != import_vk_format {
+						downsampler = None;
+					}
+				}
+
+				// Downscale from compositor render resolution to encode resolution if supersampling active.
+				let (source_image, src_layout) = if self.render_width != self.width || self.render_height != self.height {
+					let ds = match &mut downsampler {
+						Some(d) => d,
+						None => match Downsampler::new(
+							context.clone(),
+							self.render_width,
+							self.render_height,
+							self.width,
+							self.height,
+							import_vk_format,
+						) {
+							Ok(d) => {
+								downsampler = Some(d);
+								downsampler.as_mut().unwrap()
+							},
+							Err(e) => {
+								tracing::warn!("Failed to create downsampler: {e}");
+								frame.consumed.store(true, Ordering::Release);
+								continue;
+							},
+						},
+					};
+					match ds.blit(source_image, src_layout) {
+						Ok(img) => (img, vk::ImageLayout::GENERAL),
+						Err(e) => {
+							tracing::warn!("Downscale blit failed: {e}");
+							frame.consumed.store(true, Ordering::Release);
+							continue;
+						},
+					}
+				} else {
+					(source_image, src_layout)
+				};
 
 				// Recreate the converter if the input format changed (e.g. GBM pool
 				// ABGR2101010 → direct scanout XBGR8888). The converter's image view
