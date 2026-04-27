@@ -8,8 +8,10 @@
 //! UDP video socket entirely. Intended for iterating on pipeline / driver /
 //! power-management tuning without a phone in hand.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
@@ -25,12 +27,19 @@ use crate::session::stream::{VideoChromaSampling, VideoDynamicRange, VideoFormat
 use crate::session::{SessionContext, SessionKeys};
 
 const BENCH_SCOPE: &str = "moonshine-bench";
+const AMD_VENDOR_ID: &str = "0x1002";
 
 #[derive(Args, Debug, Clone)]
 pub struct BenchArgs {
 	/// Duration of the bench run in seconds.
 	#[arg(long, default_value_t = 30)]
 	pub duration: u64,
+
+	/// Discard frames captured during the first N seconds. Lets first-frame
+	/// allocation, XWayland startup, and shader compile spikes settle before
+	/// we start recording stats.
+	#[arg(long, default_value_t = 2)]
+	pub warmup: u64,
 
 	/// Resolution as WIDTHxHEIGHT (e.g. 1920x1080).
 	#[arg(long, default_value = "1920x1080", value_parser = parse_resolution)]
@@ -56,6 +65,15 @@ pub struct BenchArgs {
 	/// table). The application is launched inside the bench compositor.
 	#[arg(long)]
 	pub app: String,
+
+	/// GPU stat sampling interval in milliseconds. 0 disables sampling.
+	#[arg(long, default_value_t = 100)]
+	pub gpu_stats_interval_ms: u64,
+
+	/// DRM card name to sample (e.g. `card1`). Defaults to auto-detecting the
+	/// first AMD card under /sys/class/drm.
+	#[arg(long)]
+	pub gpu_stats_card: Option<String>,
 }
 
 fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
@@ -76,9 +94,70 @@ fn parse_codec(s: &str) -> Result<VideoFormat, String> {
 	}
 }
 
+/// A LatencySample with the bench-relative timestamp of when it arrived,
+/// so we can filter by warmup window and correlate with GPU samples.
+#[derive(Clone)]
+struct TimedSample {
+	elapsed: Duration,
+	sample: LatencySample,
+}
+
+/// A GPU power state observation at a point in time.
+#[derive(Clone, Copy)]
+struct GpuSample {
+	elapsed: Duration,
+	sclk_mhz: u32,
+	busy_pct: u8,
+}
+
+/// Find the first AMD card under `/sys/class/drm`, ignoring connector entries
+/// like `card1-DP-1`.
+fn auto_detect_amd_card() -> Option<PathBuf> {
+	let entries = std::fs::read_dir("/sys/class/drm").ok()?;
+	for entry in entries.flatten() {
+		let file_name = entry.file_name();
+		let name = file_name.to_string_lossy();
+		// Match `card<N>` exactly — skip connector entries like `card1-DP-1`.
+		if !name.starts_with("card") || !name[4..].chars().all(|c| c.is_ascii_digit()) {
+			continue;
+		}
+		let vendor_path = entry.path().join("device/vendor");
+		if let Ok(vendor) = std::fs::read_to_string(&vendor_path) {
+			if vendor.trim() == AMD_VENDOR_ID {
+				return Some(entry.path());
+			}
+		}
+	}
+	None
+}
+
+/// Read `pp_dpm_sclk` and return the currently active clock in MHz (the line
+/// containing `*`). Returns None on any parse error.
+fn read_active_sclk_mhz(path: &Path) -> Option<u32> {
+	let content = std::fs::read_to_string(path).ok()?;
+	for line in content.lines() {
+		if !line.contains('*') {
+			continue;
+		}
+		// Lines look like: "1: 1330Mhz *"
+		let after_colon = line.split_once(':')?.1.trim().trim_end_matches('*').trim();
+		// Strip trailing "Mhz" / "MHz".
+		let mhz = after_colon
+			.trim_end_matches(|c: char| c.is_alphabetic())
+			.trim();
+		return mhz.parse().ok();
+	}
+	None
+}
+
+/// Read `gpu_busy_percent` and return the value (0-100).
+fn read_busy_percent(path: &Path) -> Option<u8> {
+	std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
 pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManager<i32>) -> Result<(), ()> {
 	tracing::info!(
-		"Starting bench: {}x{} @ {}Hz, {} bps, {:?}, hdr={}, app={}, duration={}s",
+		"Starting bench: {}x{} @ {}Hz, {} bps, {:?}, hdr={}, app={}, duration={}s, warmup={}s",
 		args.resolution.0,
 		args.resolution.1,
 		args.fps,
@@ -87,6 +166,7 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 		args.hdr,
 		args.app,
 		args.duration,
+		args.warmup,
 	);
 
 	let app = config
@@ -102,19 +182,31 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 			);
 		})?;
 
-	// Pulse socket dir — we don't run a server, so apps will see connection
-	// refused on PULSE_SERVER and fall back to silence. This avoids polluting
-	// the host's PulseAudio.
 	let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
 		.unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
 	let pulse_dir = Path::new(&runtime_dir).join("moonshine-bench/pulse");
 	std::fs::create_dir_all(&pulse_dir).map_err(|e| tracing::error!("Failed to create pulse dir: {e}"))?;
 
-	// Session-scoped shutdown so we can tear down the compositor + pipeline
-	// independently of the global CTRL+C handler.
+	// Resolve the GPU sysfs card for stats sampling. None means "don't sample".
+	let gpu_card_path: Option<PathBuf> = if args.gpu_stats_interval_ms == 0 {
+		None
+	} else if let Some(name) = args.gpu_stats_card.as_deref() {
+		Some(PathBuf::from("/sys/class/drm").join(name))
+	} else {
+		match auto_detect_amd_card() {
+			Some(p) => {
+				tracing::info!("GPU stats: auto-detected {}", p.display());
+				Some(p)
+			},
+			None => {
+				tracing::warn!("GPU stats: no AMD card found, sampling disabled");
+				None
+			},
+		}
+	};
+
 	let session_shutdown: ShutdownManager<SessionShutdownReason> = ShutdownManager::new();
 
-	// Compositor.
 	let compositor_config = CompositorConfig {
 		width: args.resolution.0,
 		height: args.resolution.1,
@@ -125,7 +217,6 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 	let (frame_rx, _input_tx, ready_rx) = compositor::start_compositor(compositor_config, session_shutdown.clone())
 		.map_err(|e| tracing::error!("Failed to start compositor: {e}"))?;
 
-	// Launch the application on a worker thread once the compositor is ready.
 	let app_pulse_dir = pulse_dir.clone();
 	let app_resolution = args.resolution;
 	let app_fps = args.fps;
@@ -161,8 +252,6 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 						tracing::warn!("Failed to wait for application: {e}");
 					}
 					tracing::info!("Application exited.");
-					// If the app exits before the bench duration is up, end the
-					// run early — no point capturing an empty compositor.
 					let _ = app_shutdown.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
 				},
 				Err(()) => {
@@ -172,8 +261,7 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 		})
 		.map_err(|e| tracing::error!("Failed to spawn app launcher thread: {e}"))?;
 
-	// Drain the packet channel: the pipeline blocks on packet_tx.blocking_send,
-	// so we need a real receiver, but we don't care about the bytes.
+	// Drain the packet channel: the pipeline blocks on packet_tx.blocking_send.
 	let (packet_tx, mut packet_rx) = mpsc::channel(128);
 	tokio::spawn(async move {
 		while let Some(_batch) = packet_rx.recv().await {
@@ -181,11 +269,8 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 		}
 	});
 
-	// Stats sink: bench gathers per-frame samples here and reports at the end.
 	let (stats_tx, stats_rx) = std::sync::mpsc::channel::<LatencySample>();
 
-	// IDR + HDR plumbing: bench drives neither, just creates the channels the
-	// pipeline expects.
 	let (_idr_tx, idr_rx) = broadcast::channel::<()>(1);
 	let (hdr_metadata_tx, _hdr_metadata_rx) = watch::channel(HdrModeState {
 		enabled: args.hdr,
@@ -199,6 +284,49 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 	};
 
 	let bench_started = Instant::now();
+
+	// Frame stats collector: timestamps each LatencySample as it arrives so
+	// we can filter the warmup window and correlate with GPU samples.
+	let stats_collector = std::thread::Builder::new()
+		.name("bench-stats-collector".to_string())
+		.spawn(move || {
+			let mut samples = Vec::with_capacity(4096);
+			while let Ok(sample) = stats_rx.recv() {
+				samples.push(TimedSample {
+					elapsed: bench_started.elapsed(),
+					sample,
+				});
+			}
+			samples
+		})
+		.map_err(|e| tracing::error!("Failed to spawn stats collector: {e}"))?;
+
+	// GPU sampler: reads sysfs at a fixed interval. Stops when `gpu_stop` is
+	// flipped (we use a flag instead of session_shutdown so the bench can
+	// stop sampling slightly before tearing the session down, leaving us
+	// known-good samples for the report).
+	let gpu_stop = Arc::new(AtomicBool::new(false));
+	let gpu_sampler = gpu_card_path.as_ref().map(|card_path| {
+		let card_path = card_path.clone();
+		let interval = Duration::from_millis(args.gpu_stats_interval_ms);
+		let stop = gpu_stop.clone();
+		std::thread::Builder::new()
+			.name("bench-gpu-sampler".to_string())
+			.spawn(move || {
+				let sclk_path = card_path.join("device/pp_dpm_sclk");
+				let busy_path = card_path.join("device/gpu_busy_percent");
+				let mut samples = Vec::with_capacity(1024);
+				while !stop.load(Ordering::Relaxed) {
+					let elapsed = bench_started.elapsed();
+					let sclk_mhz = read_active_sclk_mhz(&sclk_path).unwrap_or(0);
+					let busy_pct = read_busy_percent(&busy_path).unwrap_or(0);
+					samples.push(GpuSample { elapsed, sclk_mhz, busy_pct });
+					std::thread::sleep(interval);
+				}
+				samples
+			})
+			.expect("Failed to spawn GPU sampler")
+	});
 
 	let _pipeline = VideoPipeline::new(
 		frame_rx,
@@ -223,8 +351,6 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 	)
 	.map_err(|()| tracing::error!("Failed to start video pipeline"))?;
 
-	// Run for the configured duration, or until something else triggers a
-	// shutdown (CTRL+C, app exits, compositor crashes).
 	let session_done = session_shutdown.wait_shutdown_complete();
 	tokio::select! {
 		_ = tokio::time::sleep(Duration::from_secs(args.duration)) => {
@@ -240,67 +366,105 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 
 	let elapsed = bench_started.elapsed();
 
-	// Tear down the session.
+	gpu_stop.store(true, Ordering::Relaxed);
+
 	let _ = session_shutdown.trigger_shutdown(SessionShutdownReason::UserStopped);
 	let _ = tokio::time::timeout(Duration::from_secs(5), session_shutdown.wait_shutdown_complete()).await;
 
-	// Stop the systemd scope so the launched application is killed.
 	let _ = Command::new("systemctl")
 		.args(["--user", "stop", &format!("{BENCH_SCOPE}.scope")])
 		.status();
 
-	// Drain remaining stats samples and report.
-	let mut samples: Vec<LatencySample> = Vec::new();
-	while let Ok(sample) = stats_rx.try_recv() {
-		samples.push(sample);
-	}
+	// stats_tx is held by the pipeline thread; once that thread exits (due to
+	// session shutdown) the channel closes and the collector's recv() returns
+	// Err, ending the loop.
+	let timed_samples = stats_collector
+		.join()
+		.unwrap_or_else(|_| Vec::new());
+	let gpu_samples = gpu_sampler
+		.and_then(|h| h.join().ok())
+		.unwrap_or_default();
 
-	report(&samples, elapsed, &args);
+	report(&timed_samples, &gpu_samples, elapsed, &args);
 
 	Ok(())
 }
 
-fn report(samples: &[LatencySample], elapsed: Duration, args: &BenchArgs) {
+fn report(timed: &[TimedSample], gpu: &[GpuSample], elapsed: Duration, args: &BenchArgs) {
+	let warmup = Duration::from_secs(args.warmup);
+	let frame_samples: Vec<&LatencySample> = timed
+		.iter()
+		.filter(|s| s.elapsed >= warmup)
+		.map(|s| &s.sample)
+		.collect();
+	let gpu_in_window: Vec<&GpuSample> = gpu.iter().filter(|s| s.elapsed >= warmup).collect();
+
 	println!();
 	println!("======================================================================");
 	println!(" moonshine bench report");
 	println!("======================================================================");
-	println!(" config:    {}x{} @ {}Hz, {} bps, {:?}, hdr={}",
-		args.resolution.0, args.resolution.1, args.fps, args.bitrate, args.codec, args.hdr);
-	println!(" duration:  {:.2}s (target {}s)", elapsed.as_secs_f64(), args.duration);
+	println!(
+		" config:    {}x{} @ {}Hz, {} bps, {:?}, hdr={}",
+		args.resolution.0, args.resolution.1, args.fps, args.bitrate, args.codec, args.hdr,
+	);
+	println!(
+		" duration:  {:.2}s elapsed (target {}s, warmup {}s, {} frames discarded)",
+		elapsed.as_secs_f64(),
+		args.duration,
+		args.warmup,
+		timed.len() - frame_samples.len(),
+	);
 
-	if samples.is_empty() {
-		println!(" frames:    0 — no samples collected");
+	if frame_samples.is_empty() {
+		println!(" frames:    0 — no samples after warmup");
 		println!("======================================================================");
 		return;
 	}
 
-	let n = samples.len();
-	let total_bytes: usize = samples.iter().map(|s| s.encoded_bytes).sum();
-	let key_frames = samples.iter().filter(|s| s.is_key_frame).count();
+	let n = frame_samples.len();
+	let total_bytes: usize = frame_samples.iter().map(|s| s.encoded_bytes).sum();
+	let key_frames = frame_samples.iter().filter(|s| s.is_key_frame).count();
 	let frame_interval_us = 1_000_000_u128 / args.fps as u128;
-	let spikes = samples
+	let measured_window = elapsed.saturating_sub(warmup).as_secs_f64().max(0.001);
+	let observed_fps = n as f64 / measured_window;
+	let observed_bitrate = (total_bytes as f64 * 8.0 / measured_window) as u64;
+	let spike_indices: Vec<usize> = frame_samples
 		.iter()
-		.filter(|s| s.total.as_micros() > frame_interval_us)
-		.count();
-	let observed_fps = n as f64 / elapsed.as_secs_f64();
-	let observed_bitrate = (total_bytes as f64 * 8.0 / elapsed.as_secs_f64()) as u64;
+		.enumerate()
+		.filter(|(_, s)| s.total.as_micros() > frame_interval_us)
+		.map(|(i, _)| i)
+		.collect();
 
-	println!(" frames:    {n} ({key_frames} key)  observed_fps={:.2}", observed_fps);
-	println!(" bitrate:   {} bps observed (target {} bps)", observed_bitrate, args.bitrate);
-	println!(" spikes:    {} frames > {}us frame interval ({:.1}%)",
-		spikes, frame_interval_us, 100.0 * spikes as f64 / n as f64);
+	println!(
+		" frames:    {n} ({key_frames} key)  observed_fps={:.2}",
+		observed_fps,
+	);
+	println!(
+		" bitrate:   {} bps observed (target {} bps)",
+		observed_bitrate, args.bitrate,
+	);
+	println!(
+		" spikes:    {} frames > {}us frame interval ({:.1}%)",
+		spike_indices.len(),
+		frame_interval_us,
+		100.0 * spike_indices.len() as f64 / n as f64,
+	);
+
 	println!();
 	println!(" stage         min     p50     p95     p99     max     (microseconds)");
 	println!(" -----         ---     ---     ---     ---     ---");
+	print_stage("channel_wait", frame_samples.iter().map(|s| s.channel_wait));
+	print_stage("import      ", frame_samples.iter().map(|s| s.import));
+	print_stage("convert     ", frame_samples.iter().map(|s| s.convert));
+	print_stage("encode      ", frame_samples.iter().map(|s| s.encode));
+	print_stage("packetize   ", frame_samples.iter().map(|s| s.packetize));
+	print_stage("send        ", frame_samples.iter().map(|s| s.send));
+	print_stage("total       ", frame_samples.iter().map(|s| s.total));
 
-	print_stage("channel_wait", samples.iter().map(|s| s.channel_wait));
-	print_stage("import      ", samples.iter().map(|s| s.import));
-	print_stage("convert     ", samples.iter().map(|s| s.convert));
-	print_stage("encode      ", samples.iter().map(|s| s.encode));
-	print_stage("packetize   ", samples.iter().map(|s| s.packetize));
-	print_stage("send        ", samples.iter().map(|s| s.send));
-	print_stage("total       ", samples.iter().map(|s| s.total));
+	if !gpu_in_window.is_empty() {
+		report_gpu(&gpu_in_window);
+		report_spike_correlation(timed, gpu, args.warmup, frame_interval_us);
+	}
 
 	println!("======================================================================");
 }
@@ -323,3 +487,69 @@ fn print_stage(name: &str, values: impl Iterator<Item = Duration>) {
 	);
 }
 
+fn report_gpu(samples: &[&GpuSample]) {
+	let mut sclk: Vec<u32> = samples.iter().map(|s| s.sclk_mhz).collect();
+	let mut busy: Vec<u8> = samples.iter().map(|s| s.busy_pct).collect();
+	sclk.sort_unstable();
+	busy.sort_unstable();
+	let pick_u32 = |v: &[u32], q: f64| v[((v.len() as f64 * q) as usize).min(v.len() - 1)];
+	let pick_u8 = |v: &[u8], q: f64| v[((v.len() as f64 * q) as usize).min(v.len() - 1)];
+
+	println!();
+	println!(" gpu          min     p50     p95     p99     max     ({} samples)", samples.len());
+	println!(" ---          ---     ---     ---     ---     ---");
+	println!(
+		" sclk MHz   {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
+		sclk[0],
+		pick_u32(&sclk, 0.50),
+		pick_u32(&sclk, 0.95),
+		pick_u32(&sclk, 0.99),
+		sclk[sclk.len() - 1],
+	);
+	println!(
+		" busy %     {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
+		busy[0],
+		pick_u8(&busy, 0.50),
+		pick_u8(&busy, 0.95),
+		pick_u8(&busy, 0.99),
+		busy[busy.len() - 1],
+	);
+}
+
+/// Print up to 10 worst spikes with the GPU power state at that moment, so we
+/// can eyeball whether spikes correlate with low-clock or low-busy states.
+fn report_spike_correlation(timed: &[TimedSample], gpu: &[GpuSample], warmup_secs: u64, frame_interval_us: u128) {
+	if gpu.is_empty() {
+		return;
+	}
+	let warmup = Duration::from_secs(warmup_secs);
+	let mut spikes: Vec<&TimedSample> = timed
+		.iter()
+		.filter(|s| s.elapsed >= warmup && s.sample.total.as_micros() > frame_interval_us)
+		.collect();
+	if spikes.is_empty() {
+		return;
+	}
+	spikes.sort_unstable_by_key(|s| std::cmp::Reverse(s.sample.total));
+	spikes.truncate(10);
+
+	println!();
+	println!(" worst spikes (frame >{}us with nearest GPU sample):", frame_interval_us);
+	println!("    t (s)   total (us)   convert (us)   encode (us)   sclk MHz   busy %");
+	for s in spikes {
+		let nearest = gpu
+			.iter()
+			.min_by_key(|g| g.elapsed.abs_diff(s.elapsed))
+			.copied()
+			.unwrap();
+		println!(
+			"   {:>6.2}     {:>8}      {:>9}     {:>9}     {:>6}    {:>5}",
+			s.elapsed.as_secs_f64(),
+			s.sample.total.as_micros(),
+			s.sample.convert.as_micros(),
+			s.sample.encode.as_micros(),
+			nearest.sclk_mhz,
+			nearest.busy_pct,
+		);
+	}
+}
