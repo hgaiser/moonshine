@@ -378,7 +378,7 @@ impl VideoPipelineInner {
 					// the last frame's data after color conversion).
 					if pending_idr && has_encoded {
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
-						let encode_result = encoder.encode(encoder.input_image());
+						let encode_result = encoder.encode(encoder.input_image(), None);
 						if let Ok(packets) = encode_result {
 							for packet in packets {
 								// Use current time as frame_created_at for re-encoded IDR (no actual frame)
@@ -554,12 +554,16 @@ impl VideoPipelineInner {
 					}
 				}
 
-				// Convert to YUV.
-				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					tracing::warn!("GPU color conversion failed: {e}");
-					frame.consumed.store(true, Ordering::Release);
-					continue;
-				}
+				// Convert to YUV. Returns a semaphore that the encoder waits on
+				// so convert and encode overlap on the GPU.
+				let convert_semaphore = match converter.convert(source_image, src_layout, encoder.input_image()) {
+					Ok(sem) => sem,
+					Err(e) => {
+						tracing::warn!("GPU color conversion failed: {e}");
+						frame.consumed.store(true, Ordering::Release);
+						continue;
+					},
+				};
 
 				// The DMA-BUF content has been read into the encoder's input
 				// image — signal the compositor that this GBM buffer is free.
@@ -591,8 +595,9 @@ impl VideoPipelineInner {
 
 				let t3_converted = std::time::Instant::now();
 
-				// Encode the converted image.
-				let encode_result = encoder.encode(encoder.input_image());
+				// Encode the converted image. The semaphore from convert ensures
+				// the GPU finishes conversion before encoding starts.
+				let encode_result = encoder.encode(encoder.input_image(), Some(convert_semaphore));
 
 				let t4_encoded = std::time::Instant::now();
 
