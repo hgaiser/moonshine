@@ -18,7 +18,7 @@ use async_shutdown::ShutdownManager;
 use clap::Args;
 use tokio::sync::{broadcast, mpsc, watch};
 
-use crate::config::Config;
+use crate::config::{ApplicationConfig, Config};
 use crate::session::compositor::{self, frame::HdrModeState, CompositorConfig};
 use crate::session::launch_application;
 use crate::session::manager::SessionShutdownReason;
@@ -63,8 +63,9 @@ pub struct BenchArgs {
 
 	/// Application title (must match an entry in the config's `[[application]]`
 	/// table). The application is launched inside the bench compositor.
-	#[arg(long)]
-	pub app: String,
+	/// Mutually exclusive with a trailing command.
+	#[arg(long, conflicts_with = "cmd")]
+	pub app: Option<String>,
 
 	/// GPU stat sampling interval in milliseconds. 0 disables sampling.
 	#[arg(long, default_value_t = 100)]
@@ -74,6 +75,12 @@ pub struct BenchArgs {
 	/// first AMD card under /sys/class/drm.
 	#[arg(long)]
 	pub gpu_stats_card: Option<String>,
+
+	/// Inline command to launch in the bench compositor, given after `--`.
+	/// Example: `moonshine cfg bench -- /path/to/run.sh -arg1 -arg2`.
+	/// Mutually exclusive with --app.
+	#[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+	pub cmd: Vec<String>,
 }
 
 fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
@@ -83,6 +90,37 @@ fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
 	let w: u32 = w.parse().map_err(|e| format!("invalid width: {e}"))?;
 	let h: u32 = h.parse().map_err(|e| format!("invalid height: {e}"))?;
 	Ok((w, h))
+}
+
+/// Resolve which application the bench should launch.
+///
+/// Either `--app <name>` picks one from the config, or a trailing command
+/// (after `--`) provides one inline.
+fn resolve_app(config: &Config, args: &BenchArgs) -> Result<ApplicationConfig, ()> {
+	if !args.cmd.is_empty() {
+		let title = args.cmd.first().cloned().unwrap_or_else(|| "bench".to_string());
+		return Ok(ApplicationConfig {
+			title,
+			boxart: None,
+			command: args.cmd.clone(),
+		});
+	}
+	let Some(name) = args.app.as_deref() else {
+		tracing::error!("bench requires either --app <name> or a trailing command after --");
+		return Err(());
+	};
+	config
+		.applications
+		.iter()
+		.find(|a| a.title == name)
+		.cloned()
+		.ok_or_else(|| {
+			tracing::error!(
+				"Application '{}' not found in config. Available: {:?}",
+				name,
+				config.applications.iter().map(|a| &a.title).collect::<Vec<_>>(),
+			);
+		})
 }
 
 fn parse_codec(s: &str) -> Result<VideoFormat, String> {
@@ -156,31 +194,20 @@ fn read_busy_percent(path: &Path) -> Option<u8> {
 }
 
 pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManager<i32>) -> Result<(), ()> {
+	let app = resolve_app(&config, &args)?;
+
 	tracing::info!(
-		"Starting bench: {}x{} @ {}Hz, {} bps, {:?}, hdr={}, app={}, duration={}s, warmup={}s",
+		"Starting bench: {}x{} @ {}Hz, {} bps, {:?}, hdr={}, app={:?}, duration={}s, warmup={}s",
 		args.resolution.0,
 		args.resolution.1,
 		args.fps,
 		args.bitrate,
 		args.codec,
 		args.hdr,
-		args.app,
+		app.command,
 		args.duration,
 		args.warmup,
 	);
-
-	let app = config
-		.applications
-		.iter()
-		.find(|a| a.title == args.app)
-		.cloned()
-		.ok_or_else(|| {
-			tracing::error!(
-				"Application '{}' not found in config. Available: {:?}",
-				args.app,
-				config.applications.iter().map(|a| &a.title).collect::<Vec<_>>(),
-			);
-		})?;
 
 	let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
 		.unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
