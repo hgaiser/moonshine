@@ -192,7 +192,8 @@ impl SessionInner {
 								let ready = ready_rx
 									.recv_timeout(std::time::Duration::from_secs(5))
 									.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
-								let mut child = launch_application(&app_context, &app_pulse_dir, &ready, "moonshine-session")?;
+								let mut child =
+									launch_application(&app_context, &app_pulse_dir, &ready, "moonshine-session")?;
 
 								// Wait for the application to exit.
 								if let Err(e) = child.wait() {

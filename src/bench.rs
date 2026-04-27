@@ -180,9 +180,7 @@ fn read_active_sclk_mhz(path: &Path) -> Option<u32> {
 		// Lines look like: "1: 1330Mhz *"
 		let after_colon = line.split_once(':')?.1.trim().trim_end_matches('*').trim();
 		// Strip trailing "Mhz" / "MHz".
-		let mhz = after_colon
-			.trim_end_matches(|c: char| c.is_alphabetic())
-			.trim();
+		let mhz = after_colon.trim_end_matches(|c: char| c.is_alphabetic()).trim();
 		return mhz.parse().ok();
 	}
 	None
@@ -209,8 +207,8 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 		args.warmup,
 	);
 
-	let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-		.unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
+	let runtime_dir =
+		std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| format!("/run/user/{}", unsafe { libc::getuid() }));
 	let pulse_dir = Path::new(&runtime_dir).join("moonshine-bench/pulse");
 	std::fs::create_dir_all(&pulse_dir).map_err(|e| tracing::error!("Failed to create pulse dir: {e}"))?;
 
@@ -347,7 +345,11 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 					let elapsed = bench_started.elapsed();
 					let sclk_mhz = read_active_sclk_mhz(&sclk_path).unwrap_or(0);
 					let busy_pct = read_busy_percent(&busy_path).unwrap_or(0);
-					samples.push(GpuSample { elapsed, sclk_mhz, busy_pct });
+					samples.push(GpuSample {
+						elapsed,
+						sclk_mhz,
+						busy_pct,
+					});
 					std::thread::sleep(interval);
 				}
 				samples
@@ -405,12 +407,8 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 	// stats_tx is held by the pipeline thread; once that thread exits (due to
 	// session shutdown) the channel closes and the collector's recv() returns
 	// Err, ending the loop.
-	let timed_samples = stats_collector
-		.join()
-		.unwrap_or_else(|_| Vec::new());
-	let gpu_samples = gpu_sampler
-		.and_then(|h| h.join().ok())
-		.unwrap_or_default();
+	let timed_samples = stats_collector.join().unwrap_or_else(|_| Vec::new());
+	let gpu_samples = gpu_sampler.and_then(|h| h.join().ok()).unwrap_or_default();
 
 	report(&timed_samples, &gpu_samples, elapsed, &args);
 
@@ -462,10 +460,7 @@ fn report(timed: &[TimedSample], gpu: &[GpuSample], elapsed: Duration, args: &Be
 		.map(|(i, _)| i)
 		.collect();
 
-	println!(
-		" frames:    {n} ({key_frames} key)  observed_fps={:.2}",
-		observed_fps,
-	);
+	println!(" frames:    {n} ({key_frames} key)  observed_fps={:.2}", observed_fps,);
 	println!(
 		" bitrate:   {} bps observed (target {} bps)",
 		observed_bitrate, args.bitrate,
@@ -523,7 +518,10 @@ fn report_gpu(samples: &[&GpuSample]) {
 	let pick_u8 = |v: &[u8], q: f64| v[((v.len() as f64 * q) as usize).min(v.len() - 1)];
 
 	println!();
-	println!(" gpu          min     p50     p95     p99     max     ({} samples)", samples.len());
+	println!(
+		" gpu          min     p50     p95     p99     max     ({} samples)",
+		samples.len()
+	);
 	println!(" ---          ---     ---     ---     ---     ---");
 	println!(
 		" sclk MHz   {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
@@ -561,7 +559,10 @@ fn report_spike_correlation(timed: &[TimedSample], gpu: &[GpuSample], warmup_sec
 	spikes.truncate(10);
 
 	println!();
-	println!(" worst spikes (frame >{}us with nearest GPU sample):", frame_interval_us);
+	println!(
+		" worst spikes (frame >{}us with nearest GPU sample):",
+		frame_interval_us
+	);
 	println!("    t (s)   total (us)   convert (us)   encode (us)   sclk MHz   busy %");
 	for s in spikes {
 		let nearest = gpu
