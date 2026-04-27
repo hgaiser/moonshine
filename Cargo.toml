@@ -40,7 +40,7 @@ network-interface = "2.0.5"
 notify-rust = "4.12.0"
 open = "5.3.3"
 opus = "0.3.1"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", rev = "fc60c32", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/porkloin/pixelforge", rev = "e1fb696", features = ["dmabuf"] }
 pkcs8 = "0.10.2"
 pulseaudio = "0.3.1"
 rand = "0.8.5"
