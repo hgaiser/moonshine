@@ -46,14 +46,17 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 pub struct VideoPipeline {}
 
 /// A single frame's latency breakdown for periodic summary reporting.
-struct LatencySample {
-	channel_wait: std::time::Duration,
-	import: std::time::Duration,
-	convert: std::time::Duration,
-	encode: std::time::Duration,
-	packetize: std::time::Duration,
-	send: std::time::Duration,
-	total: std::time::Duration,
+#[derive(Clone)]
+pub(crate) struct LatencySample {
+	pub channel_wait: std::time::Duration,
+	pub import: std::time::Duration,
+	pub convert: std::time::Duration,
+	pub encode: std::time::Duration,
+	pub packetize: std::time::Duration,
+	pub send: std::time::Duration,
+	pub total: std::time::Duration,
+	pub encoded_bytes: usize,
+	pub is_key_frame: bool,
 }
 
 /// Log a summary of latency statistics over a batch of samples.
@@ -132,6 +135,7 @@ impl VideoPipeline {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		log_frame_spikes: bool,
+		stats_tx: Option<std::sync::mpsc::Sender<LatencySample>>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -149,6 +153,7 @@ impl VideoPipeline {
 			max_reference_frames,
 			encryption_key,
 			log_frame_spikes,
+			stats_tx,
 		};
 
 		std::thread::Builder::new()
@@ -182,6 +187,9 @@ struct VideoPipelineInner {
 	max_reference_frames: u32,
 	encryption_key: Option<Vec<u8>>,
 	log_frame_spikes: bool,
+	/// Optional sink for per-frame latency samples. Used by the bench harness;
+	/// `None` in normal sessions to avoid extra work on the hot path.
+	stats_tx: Option<std::sync::mpsc::Sender<LatencySample>>,
 }
 
 impl VideoPipelineInner {
@@ -678,7 +686,7 @@ impl VideoPipelineInner {
 					);
 				}
 
-				latency_samples.push(LatencySample {
+				let sample = LatencySample {
 					channel_wait,
 					import: import_dur,
 					convert: convert_dur,
@@ -686,7 +694,16 @@ impl VideoPipelineInner {
 					packetize: packetize_dur,
 					send: send_dur,
 					total,
-				});
+					encoded_bytes,
+					is_key_frame,
+				};
+
+				if let Some(tx) = self.stats_tx.as_ref() {
+					// Bench-mode sink. If the receiver is gone we just stop trying.
+					let _ = tx.send(sample.clone());
+				}
+
+				latency_samples.push(sample);
 
 				// Periodic summary every 5 seconds.
 				if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {

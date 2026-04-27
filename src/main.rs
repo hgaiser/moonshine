@@ -9,13 +9,14 @@ use crate::session::SessionManager;
 use crate::state::State;
 use crate::webserver::Webserver;
 use async_shutdown::ShutdownManager;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use tokio::signal::unix::{signal, SignalKind};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 
 mod app_scanner;
+mod bench;
 mod clients;
 mod config;
 mod crypto;
@@ -30,6 +31,17 @@ mod webserver;
 struct Args {
 	/// Path to configuration file.
 	config: PathBuf,
+
+	#[command(subcommand)]
+	command: Option<Command>,
+}
+
+#[derive(Subcommand, Debug)]
+enum Command {
+	/// Run the full pipeline (compositor + capture + convert + encode) without
+	/// a Moonlight client. Encoded packets are dropped; per-frame latency is
+	/// reported when the run ends.
+	Bench(bench::BenchArgs),
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -111,21 +123,31 @@ async fn main() -> Result<(), ()> {
 		}
 	});
 
-	// Create the main application.
-	let moonshine = Moonshine::new(config, shutdown.clone()).await?;
+	match args.command {
+		Some(Command::Bench(bench_args)) => {
+			let result = bench::run(config, bench_args, shutdown.clone()).await;
+			let _ = shutdown.trigger_shutdown(result.map(|_| 0).unwrap_or(1));
+			let exit_code = shutdown.wait_shutdown_complete().await;
+			std::process::exit(exit_code);
+		},
+		None => {
+			// Create the main application.
+			let moonshine = Moonshine::new(config, shutdown.clone()).await?;
 
-	tracing::info!("Moonshine is ready and waiting for connections.");
+			tracing::info!("Moonshine is ready and waiting for connections.");
 
-	// Wait until something causes a shutdown trigger.
-	shutdown.wait_shutdown_triggered().await;
+			// Wait until something causes a shutdown trigger.
+			shutdown.wait_shutdown_triggered().await;
 
-	// Drop the main moonshine object, triggering other systems to shutdown too.
-	drop(moonshine);
+			// Drop the main moonshine object, triggering other systems to shutdown too.
+			drop(moonshine);
 
-	// Wait until everything was shutdown.
-	let exit_code = shutdown.wait_shutdown_complete().await;
-	tracing::debug!("Successfully waited for shutdown to complete.");
-	std::process::exit(exit_code);
+			// Wait until everything was shutdown.
+			let exit_code = shutdown.wait_shutdown_complete().await;
+			tracing::debug!("Successfully waited for shutdown to complete.");
+			std::process::exit(exit_code);
+		},
+	}
 }
 
 pub struct Moonshine {
