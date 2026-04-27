@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
+use smithay::reexports::wayland_server::Resource;
+
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::gbm::GbmAllocator;
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc, Modifier};
@@ -332,14 +334,22 @@ pub struct MoonshineCompositor {
 
 	// -- Direct scanout --
 	/// Client buffers held alive during direct scanout until the encoder
-	/// signals `consumed`. Each entry pairs a consumed flag, the DMA-BUF
-	/// fd numbers (for `scanout_fd_map` cleanup), and the cloned Smithay
+	/// signals `consumed`. Each entry pairs a consumed flag, the wl_buffer
+	/// ObjectId (for `scanout_buffer_map` cleanup), and the cloned Smithay
 	/// `Buffer` (keeps wl_buffer from being released).
-	held_scanout_buffers: Vec<(Arc<AtomicBool>, Vec<i32>, smithay::backend::renderer::utils::Buffer)>,
-	/// Maps DMA-BUF fd numbers to stable buffer indices for the encoder's
-	/// import cache. Indices start at `BUFFER_POOL_SIZE` to avoid collisions
-	/// with the GBM pool.
-	scanout_fd_map: std::collections::HashMap<i32, usize>,
+	held_scanout_buffers: Vec<(
+		Arc<AtomicBool>,
+		smithay::reexports::wayland_server::backend::ObjectId,
+		smithay::backend::renderer::utils::Buffer,
+	)>,
+	/// Maps wl_buffer ObjectIds to stable buffer indices for pixelforge's
+	/// dmabuf import cache. Keying by ObjectId is robust against protocols
+	/// that re-duplicate fds per commit (e.g. gamescope_swapchain via
+	/// vkd3d-proton); fd-keying produces fresh indices each frame and
+	/// effectively bypasses the cache. Indices start at `BUFFER_POOL_SIZE`
+	/// to avoid collisions with the GBM pool.
+	scanout_buffer_map:
+		std::collections::HashMap<smithay::reexports::wayland_server::backend::ObjectId, usize>,
 	/// Next available scanout buffer index.
 	scanout_next_index: usize,
 }
@@ -541,7 +551,7 @@ impl MoonshineCompositor {
 				pid_app_id_cache: std::collections::HashMap::new(),
 				x11_focus_needs_reset: false,
 				held_scanout_buffers: Vec::new(),
-				scanout_fd_map: std::collections::HashMap::new(),
+				scanout_buffer_map: std::collections::HashMap::new(),
 				scanout_next_index: BUFFER_POOL_SIZE,
 			},
 			display,
@@ -563,12 +573,11 @@ impl MoonshineCompositor {
 		}
 
 		// Release held scanout buffers that the encoder has finished reading.
-		// Remove their FDs from the map so recycled FDs get fresh indices.
-		self.held_scanout_buffers.retain(|(consumed, fds, _)| {
+		// Drop their entries from the buffer→index map; if the same wl_buffer
+		// is re-attached later it'll get a fresh index.
+		self.held_scanout_buffers.retain(|(consumed, buffer_id, _)| {
 			if consumed.load(Ordering::Acquire) {
-				for fd in fds {
-					self.scanout_fd_map.remove(fd);
-				}
+				self.scanout_buffer_map.remove(buffer_id);
 				false
 			} else {
 				true
@@ -925,13 +934,11 @@ impl MoonshineCompositor {
 			return false;
 		}
 
-		// Assign a stable buffer index for the encoder's import cache.
-		let fds: Vec<i32> = client_dmabuf
-			.handles()
-			.map(|h: std::os::unix::io::BorrowedFd<'_>| h.as_raw_fd())
-			.collect();
-		let fd = fds.first().copied().unwrap_or(-1);
-		let buffer_index = *self.scanout_fd_map.entry(fd).or_insert_with(|| {
+		// Assign a stable buffer index for the encoder's import cache, keyed
+		// by the wl_buffer's ObjectId (stable across re-attaches of the same
+		// buffer regardless of how the protocol handles fd duplication).
+		let buffer_id = buffer.id();
+		let buffer_index = *self.scanout_buffer_map.entry(buffer_id.clone()).or_insert_with(|| {
 			let idx = self.scanout_next_index;
 			self.scanout_next_index += 1;
 			idx
@@ -973,7 +980,7 @@ impl MoonshineCompositor {
 		};
 
 		// Hold the client Buffer alive until the encoder finishes reading.
-		self.held_scanout_buffers.push((consumed.clone(), fds, buffer));
+		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
 
 		match self.frame_tx.try_send(exported_frame) {
 			Err(mpsc::TrySendError::Disconnected(_)) => {
@@ -1071,14 +1078,19 @@ impl MoonshineCompositor {
 			return false;
 		}
 
-		let fds: Vec<i32> = client_dmabuf
-			.handles()
-			.map(|h: std::os::unix::io::BorrowedFd<'_>| h.as_raw_fd())
-			.collect();
-		let fd = fds.first().copied().unwrap_or(-1);
-		let buffer_index = *self.scanout_fd_map.entry(fd).or_insert_with(|| {
+		let buffer_id = buffer.id();
+		let buffer_index = *self.scanout_buffer_map.entry(buffer_id.clone()).or_insert_with(|| {
 			let idx = self.scanout_next_index;
 			self.scanout_next_index += 1;
+			tracing::debug!(
+				buffer_index = self.scanout_next_index - 1,
+				fourcc = ?client_dmabuf.format().code,
+				modifier = format!("{:#x}", Into::<u64>::into(client_dmabuf.format().modifier)).as_str(),
+				num_planes = client_dmabuf.num_planes(),
+				width = client_dmabuf.width(),
+				height = client_dmabuf.height(),
+				"Override scanout: importing new buffer",
+			);
 			idx
 		});
 
@@ -1117,7 +1129,7 @@ impl MoonshineCompositor {
 			hdr_metadata,
 		};
 
-		self.held_scanout_buffers.push((consumed.clone(), fds, buffer));
+		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
 
 		match self.frame_tx.try_send(exported_frame) {
 			Err(mpsc::TrySendError::Disconnected(_)) => {
