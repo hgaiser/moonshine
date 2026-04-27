@@ -38,18 +38,43 @@ pub struct SwapchainData {
 /// Common swapchain feedback handling.
 fn handle_swapchain_feedback(
 	state: &mut MoonshineCompositor,
-	_surface: &WlSurface,
+	surface: &WlSurface,
 	vk_colorspace: u32,
 	vk_format: u32,
 ) -> (u32, u32) {
 	tracing::debug!(vk_colorspace, vk_format, "swapchain_feedback");
 
-	// NOTE: We intentionally do NOT set Bt2020Pq here based on the swapchain
-	// color space alone.  DXVK with DXVK_HDR=1 creates HDR swapchains even
-	// for SDR games, so the color space in the swapchain create info doesn't
-	// mean the game is actually outputting PQ data.  We defer the HDR switch
-	// to handle_set_hdr_metadata(), which fires only when the game calls
-	// vkSetHdrMetadataEXT — a reliable signal that the game is truly doing HDR.
+	// Set HDR mode based on swapchain color space.  When the swapchain uses
+	// HDR10_ST2084 (1000104008), the game is outputting PQ-encoded data.
+	// When it switches back to sRGB (0), clear HDR state.
+	// Some games (e.g. Monster Hunter Wilds) never call vkSetHdrMetadataEXT
+	// and rely solely on the swapchain color space to signal HDR.
+	const VK_COLOR_SPACE_SRGB_NONLINEAR: u32 = 0;
+	const VK_COLOR_SPACE_HDR10_ST2084_EXT: u32 = 1000104008;
+
+	if let Some(cm) = &mut state.color_management {
+		match vk_colorspace {
+			VK_COLOR_SPACE_HDR10_ST2084_EXT => {
+				tracing::info!("swapchain_feedback: HDR10_ST2084 detected, activating HDR");
+				cm.set_gamescope_current(
+					surface,
+					super::color_management::ImageDescription {
+						transfer_function: super::color_management::TransferFunction::St2084Pq,
+						primaries: super::color_management::Primaries::Bt2020,
+						max_cll: None,
+						max_fall: None,
+						mastering_luminance: None,
+						mastering_primaries: None,
+						white_point: None,
+					},
+				);
+			},
+			VK_COLOR_SPACE_SRGB_NONLINEAR => {
+				cm.clear_gamescope_current(surface);
+			},
+			_ => {},
+		}
+	}
 
 	// Compute the refresh cycle to return to the WSI layer.
 	let refresh_ns = state
