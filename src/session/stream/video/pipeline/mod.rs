@@ -48,7 +48,7 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 			(InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32) // ABGR/XBGR 2101010
 		},
 		0x48344241 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT), // ABGR16161616F
-		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM), // ARGB/XRGB8888 (fallback)
+		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                  // ARGB/XRGB8888 (fallback)
 	}
 }
 
