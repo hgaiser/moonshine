@@ -8,8 +8,8 @@ use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::{config::Config, session::manager::SessionShutdownReason};
 
 mod packetizer;
-mod pipeline;
-mod shard_batch;
+pub(crate) mod pipeline;
+pub(crate) mod shard_batch;
 use pipeline::VideoPipeline;
 use shard_batch::ShardBatch;
 
@@ -253,6 +253,7 @@ impl VideoStreamInner {
 			stop_session_manager.clone(),
 			hdr_metadata_tx,
 			self.config.stream.video.log_frame_spikes,
+			None,
 		)?;
 
 		self.pipeline = Some(pipeline);

@@ -6,7 +6,7 @@ pub use self::{
 
 mod audio;
 mod control;
-mod video;
+pub(crate) mod video;
 
 #[derive(Debug)]
 #[repr(C)]
