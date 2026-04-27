@@ -576,10 +576,21 @@ impl MoonshineCompositor {
 		});
 
 		// Try direct scanout: bypass compositor rendering when a single
-		// fullscreen DMA-BUF surface covers the entire output.
-		// Skip when the WSI layer has an active override surface for the
-		// currently focused window, as that surface needs frame callbacks.
-		if !self.is_override_active() && self.try_direct_scanout() {
+		// fullscreen DMA-BUF surface covers the entire output. This avoids
+		// the compositor's GLES blit, which otherwise competes with the
+		// game on the gfx queue and inflates per-frame encode latency at
+		// GPU saturation.
+		//
+		// When the WSI layer has an active override surface, scanout from
+		// the override's wl_surface (the gamescope_swapchain image) and
+		// deliver frame callbacks to it. Otherwise scanout from the lone
+		// space toplevel as before.
+		if self.is_override_active() {
+			if self.try_direct_scanout_override() {
+				tracing::trace!("Frame via direct scanout (override path)");
+				return;
+			}
+		} else if self.try_direct_scanout() {
 			tracing::trace!("Frame via direct scanout (not override path)");
 			return;
 		}
@@ -1010,6 +1021,152 @@ impl MoonshineCompositor {
 
 		if let Err(e) = self.display_handle.flush_clients() {
 			tracing::error!("Failed to flush clients after scanout: {e}");
+		}
+
+		true
+	}
+
+	/// Direct DMA-BUF scanout for the gamescope/moonshine override surface.
+	///
+	/// When the WSI layer has installed an override surface (gamescope_swapchain
+	/// or moonshine_swapchain protocol), the game's frames are committed to
+	/// `self.override_surface` rather than to a space toplevel. Without this
+	/// path the compositor falls back to a GLES blit on the gfx queue, which
+	/// competes with the game's rendering at GPU saturation and inflates encode
+	/// latency. This sends the override surface's committed DMA-BUF straight
+	/// to the encoder and delivers frame callbacks to the override surface so
+	/// the WSI layer's `vkQueuePresentKHR` can unblock for the next frame.
+	fn try_direct_scanout_override(&mut self) -> bool {
+		let override_surface = match self.override_surface.as_ref() {
+			Some((s, _)) if s.alive() => s.clone(),
+			_ => return false,
+		};
+
+		let scanout_buffer = with_renderer_surface_state(&override_surface, |state| {
+			let buffer = state.buffer()?;
+			if !matches!(smithay::backend::renderer::buffer_type(buffer), Some(BufferType::Dma)) {
+				tracing::trace!("Override scanout: buffer is not DMA-BUF");
+				return None;
+			}
+			Some(buffer.clone())
+		});
+		let Some(Some(buffer)) = scanout_buffer else {
+			tracing::trace!("Override scanout: no committed buffer");
+			return false;
+		};
+		let Ok(client_dmabuf) = dmabuf::get_dmabuf(&buffer) else {
+			tracing::trace!("Override scanout: failed to get DMA-BUF from buffer");
+			return false;
+		};
+		let client_dmabuf = client_dmabuf.clone();
+
+		if client_dmabuf.width() != self.width || client_dmabuf.height() != self.height {
+			tracing::trace!(
+				"Override scanout: size mismatch (client {}x{} vs output {}x{})",
+				client_dmabuf.width(),
+				client_dmabuf.height(),
+				self.width,
+				self.height,
+			);
+			return false;
+		}
+
+		let fds: Vec<i32> = client_dmabuf
+			.handles()
+			.map(|h: std::os::unix::io::BorrowedFd<'_>| h.as_raw_fd())
+			.collect();
+		let fd = fds.first().copied().unwrap_or(-1);
+		let buffer_index = *self.scanout_fd_map.entry(fd).or_insert_with(|| {
+			let idx = self.scanout_next_index;
+			self.scanout_next_index += 1;
+			idx
+		});
+
+		let consumed = Arc::new(AtomicBool::new(false));
+
+		let color_space = self
+			.color_management
+			.as_ref()
+			.map(|cm| cm.frame_color_space())
+			.unwrap_or(FrameColorSpace::Srgb);
+		let hdr_metadata = self.color_management.as_ref().and_then(|cm| cm.hdr_metadata());
+
+		let planes: Vec<ExportedPlane> = client_dmabuf
+			.handles()
+			.zip(client_dmabuf.offsets())
+			.zip(client_dmabuf.strides())
+			.map(
+				|((handle, offset), stride): ((std::os::unix::io::BorrowedFd<'_>, u32), u32)| ExportedPlane {
+					fd: handle.as_raw_fd(),
+					offset,
+					stride,
+				},
+			)
+			.collect();
+
+		let exported_frame = ExportedFrame {
+			planes,
+			format: client_dmabuf.format().code as u32,
+			modifier: Into::<u64>::into(client_dmabuf.format().modifier),
+			width: client_dmabuf.width(),
+			height: client_dmabuf.height(),
+			created_at: std::time::Instant::now(),
+			buffer_index,
+			consumed: consumed.clone(),
+			color_space,
+			hdr_metadata,
+		};
+
+		self.held_scanout_buffers.push((consumed.clone(), fds, buffer));
+
+		match self.frame_tx.try_send(exported_frame) {
+			Err(mpsc::TrySendError::Disconnected(_)) => {
+				tracing::debug!("Frame channel disconnected, compositor stopping.");
+			},
+			Err(mpsc::TrySendError::Full(_)) => {
+				consumed.store(true, Ordering::Release);
+			},
+			Ok(()) => {
+				self.screen_dirty = false;
+				self.last_frame_sent_at = std::time::Instant::now();
+			},
+		}
+
+		// Frame callbacks must go to the override surface (the game's WSI
+		// layer is waiting on these to unblock vkQueuePresentKHR). Without
+		// this the game would block forever after the first frame.
+		send_frames_surface_tree(
+			&override_surface,
+			&self.output,
+			self.clock.now(),
+			Some(std::time::Duration::ZERO),
+			|_, _| Some(self.output.clone()),
+		);
+
+		let mut feedback = OutputPresentationFeedback::new(&self.output);
+		take_presentation_feedback_surface_tree(
+			&override_surface,
+			&mut feedback,
+			|_, _| Some(self.output.clone()),
+			|_, _| {
+				smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+			},
+		);
+		let frame_period = self
+			.output
+			.preferred_mode()
+			.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
+			.unwrap_or(std::time::Duration::from_millis(11));
+		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
+			self.clock.now(),
+			Refresh::Fixed(frame_period),
+			0,
+			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
+			),
+		);
+
+		if let Err(e) = self.display_handle.flush_clients() {
+			tracing::error!("Failed to flush clients after override scanout: {e}");
 		}
 
 		true
