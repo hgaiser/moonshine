@@ -33,13 +33,22 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	// DRM fourcc values (from drm_fourcc.h):
 	// ARGB8888 = 0x34325241, XRGB8888 = 0x34325258
 	// ABGR8888 = 0x34324241, XBGR8888 = 0x34324258
-	// ABGR2101010 = 0x30334241
+	// ABGR2101010 = 0x30334241, XBGR2101010 = 0x30334258
+	// ARGB2101010 = 0x30335241, XRGB2101010 = 0x30335258
 	// ABGR16161616F = 0x48344241
+	//
+	// X-variants share the same bit layout as their A-counterparts; the
+	// alpha bits are simply ignored. vkd3d-proton's swapchain typically
+	// allocates XBGR2101010 (XB30) for HDR — treating that as the BGRx
+	// fallback (8-bit BGRA) produces rainbow corruption when 10-bit
+	// packed data is read as 8-bit channels.
 	match fourcc {
 		0x34324241 | 0x34324258 => (InputFormat::RGBA, vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
-		0x30334241 => (InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32), // ABGR2101010
-		0x48344241 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT),      // ABGR16161616F
-		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                       // ARGB/XRGB8888 (fallback)
+		0x30334241 | 0x30334258 => {
+			(InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32) // ABGR/XBGR 2101010
+		},
+		0x48344241 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT), // ABGR16161616F
+		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                  // ARGB/XRGB8888 (fallback)
 	}
 }
 

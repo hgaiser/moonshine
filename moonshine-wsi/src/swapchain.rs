@@ -47,7 +47,7 @@ pub unsafe extern "C" fn create_swapchain(
 	// compositor signals HDR support; otherwise pass the app's create-info
 	// through unchanged so the ICD can handle its own color management.
 	let layer_hdr_active = instance_key
-		.and_then(|ik| get_wayland_connection(ik))
+		.and_then(get_wayland_connection)
 		.map(|arc| arc.force_lock().caps.hdr_supported)
 		.unwrap_or(false);
 	let need_remap = layer_hdr_active && app_color_space != ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
