@@ -153,7 +153,10 @@ impl DmaBufImporter {
 		});
 		let evicted = before - self.cache.len();
 		if evicted > 0 {
-			trace!("DmaBufImporter: evicted {evicted} stale cache entries, {} live", self.cache.len());
+			trace!(
+				"DmaBufImporter: evicted {evicted} stale cache entries, {} live",
+				self.cache.len()
+			);
 		}
 	}
 
