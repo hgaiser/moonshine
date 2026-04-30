@@ -1,0 +1,34 @@
+# OpenTelemetry Collector — accepts OTLP from moonshine, fans out to
+# Tempo (traces) and Prometheus (metrics).
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    send_batch_size: 4096
+    timeout: 2s
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  otlphttp/prometheus:
+    endpoint: http://prometheus:9090/api/v1/otlp
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/tempo]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlphttp/prometheus]

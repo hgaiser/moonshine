@@ -57,6 +57,13 @@ impl DmaBufImporter {
 		})
 	}
 
+	/// Number of currently-resident cached imports. Surfaced as the
+	/// `moonshine.dmabuf.cache_size` telemetry gauge so leak-shaped
+	/// accumulation is visible in dashboards.
+	pub fn cache_len(&self) -> usize {
+		self.cached_imports.iter().filter(|c| c.is_some()).count()
+	}
+
 	/// Import a DMA-BUF as a Vulkan image, reusing a cached import when
 	/// the same `buffer_index` has been seen before.
 	///

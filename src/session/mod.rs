@@ -192,7 +192,8 @@ impl SessionInner {
 								let ready = ready_rx
 									.recv_timeout(std::time::Duration::from_secs(5))
 									.map_err(|e| tracing::warn!("Timed out waiting for XWayland display: {e}"))?;
-								let mut child = launch_application(&app_context, &app_pulse_dir, &ready)?;
+								let mut child =
+									launch_application(&app_context, &app_pulse_dir, &ready, "moonshine-session")?;
 
 								// Wait for the application to exit.
 								if let Err(e) = child.wait() {
@@ -314,10 +315,15 @@ impl SessionInner {
 /// connect to, and `ENABLE_MOONSHINE_WSI=1` activates the layer.
 /// When HDR is active, `DXVK_HDR` and `MOONSHINE_HDR` are also set for
 /// DXVK/VKD3D-Proton HDR detection.
-fn launch_application(
+///
+/// `scope_name` is the systemd scope unit name (e.g. `moonshine-session`).
+/// Using a distinct name lets concurrent flavours of the launcher coexist
+/// (e.g. server mode and the bench harness).
+pub(crate) fn launch_application(
 	context: &SessionContext,
 	pulse_dir: &std::path::Path,
 	ready: &compositor::CompositorReady,
+	scope_name: &str,
 ) -> Result<Child, ()> {
 	let Some(program) = context.application.command.first() else {
 		tracing::warn!("Application command is empty.");
@@ -335,8 +341,9 @@ fn launch_application(
 	let log_file = std::fs::File::create(&log_path).map_err(|e| tracing::warn!("Failed to create log file: {e}"))?;
 
 	// Stop any leftover scope from a previous session before starting a new one.
+	let scope_unit = format!("{scope_name}.scope");
 	let _ = Command::new("systemctl")
-		.args(["--user", "stop", "moonshine-session.scope"])
+		.args(["--user", "stop", &scope_unit])
 		.stdout(Stdio::null())
 		.stderr(Stdio::null())
 		.status();
@@ -347,7 +354,7 @@ fn launch_application(
 		"--scope",
 		"--collect",
 		"--unit",
-		"moonshine-session",
+		scope_name,
 		"--property=TimeoutStopSec=5",
 		"--",
 	])
