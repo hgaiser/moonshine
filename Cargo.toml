@@ -63,6 +63,14 @@ tokio-rustls = "0.26.4"
 toml = "1.0.3"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+# OpenTelemetry — used when [telemetry] otlp_endpoint is set in config (or
+# `--otlp-endpoint` is passed to `bench`). Off by default; both the metrics
+# and tracing pipelines no-op when no endpoint is configured.
+opentelemetry = { version = "0.27", features = ["metrics", "trace"] }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "metrics", "trace"] }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics", "trace"] }
+opentelemetry-semantic-conventions = "0.27"
+tracing-opentelemetry = "0.28"
 url = "2.5.8"
 uuid = { version = "1.21.0", features = ["v4"] }
 walkdir = "2.5.0"

@@ -27,7 +27,6 @@ use crate::session::stream::{VideoChromaSampling, VideoDynamicRange, VideoFormat
 use crate::session::{SessionContext, SessionKeys};
 
 const BENCH_SCOPE: &str = "moonshine-bench";
-const AMD_VENDOR_ID: &str = "0x1002";
 
 #[derive(Args, Debug, Clone)]
 pub struct BenchArgs {
@@ -148,51 +147,33 @@ struct GpuSample {
 	busy_pct: u8,
 }
 
-/// Find the first AMD card under `/sys/class/drm`, ignoring connector entries
-/// like `card1-DP-1`.
-fn auto_detect_amd_card() -> Option<PathBuf> {
-	let entries = std::fs::read_dir("/sys/class/drm").ok()?;
-	for entry in entries.flatten() {
-		let file_name = entry.file_name();
-		let name = file_name.to_string_lossy();
-		// Match `card<N>` exactly — skip connector entries like `card1-DP-1`.
-		if !name.starts_with("card") || !name[4..].chars().all(|c| c.is_ascii_digit()) {
-			continue;
-		}
-		let vendor_path = entry.path().join("device/vendor");
-		if let Ok(vendor) = std::fs::read_to_string(&vendor_path) {
-			if vendor.trim() == AMD_VENDOR_ID {
-				return Some(entry.path());
-			}
-		}
-	}
-	None
-}
-
-/// Read `pp_dpm_sclk` and return the currently active clock in MHz (the line
-/// containing `*`). Returns None on any parse error.
-fn read_active_sclk_mhz(path: &Path) -> Option<u32> {
-	let content = std::fs::read_to_string(path).ok()?;
-	for line in content.lines() {
-		if !line.contains('*') {
-			continue;
-		}
-		// Lines look like: "1: 1330Mhz *"
-		let after_colon = line.split_once(':')?.1.trim().trim_end_matches('*').trim();
-		// Strip trailing "Mhz" / "MHz".
-		let mhz = after_colon.trim_end_matches(|c: char| c.is_alphabetic()).trim();
-		return mhz.parse().ok();
-	}
-	None
-}
-
-/// Read `gpu_busy_percent` and return the value (0-100).
-fn read_busy_percent(path: &Path) -> Option<u8> {
-	std::fs::read_to_string(path).ok()?.trim().parse().ok()
-}
+use crate::gpu_stats::{auto_detect_amd_card, read_active_sclk_mhz, read_busy_percent};
 
 pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManager<i32>) -> Result<(), ()> {
 	let app = resolve_app(&config, &args)?;
+
+	// Session-level OTel span wrapping the whole bench run. Per-frame
+	// `frame.encode` spans nest under this, and post-run summary metrics
+	// recorded as fields. When `--otlp-endpoint` is set, this lets a
+	// dashboard show "this bench run" as a single trace entry to drill
+	// into — distinct from real streaming sessions.
+	let bench_span = tracing::info_span!(
+		"bench.session",
+		resolution = format!("{}x{}", args.resolution.0, args.resolution.1),
+		fps = args.fps,
+		bitrate = args.bitrate,
+		codec = ?args.codec,
+		hdr = args.hdr,
+		duration_s = args.duration,
+		warmup_s = args.warmup,
+		// filled by report() at end of run
+		frames = tracing::field::Empty,
+		spikes = tracing::field::Empty,
+		total_p50_us = tracing::field::Empty,
+		total_p99_us = tracing::field::Empty,
+		total_max_us = tracing::field::Empty,
+	);
+	let _bench_span_guard = bench_span.clone().entered();
 
 	tracing::info!(
 		"Starting bench: {}x{} @ {}Hz, {} bps, {:?}, hdr={}, app={:?}, duration={}s, warmup={}s",
@@ -410,12 +391,12 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 	let timed_samples = stats_collector.join().unwrap_or_else(|_| Vec::new());
 	let gpu_samples = gpu_sampler.and_then(|h| h.join().ok()).unwrap_or_default();
 
-	report(&timed_samples, &gpu_samples, elapsed, &args);
+	report(&timed_samples, &gpu_samples, elapsed, &args, &bench_span);
 
 	Ok(())
 }
 
-fn report(timed: &[TimedSample], gpu: &[GpuSample], elapsed: Duration, args: &BenchArgs) {
+fn report(timed: &[TimedSample], gpu: &[GpuSample], elapsed: Duration, args: &BenchArgs, bench_span: &tracing::Span) {
 	let warmup = Duration::from_secs(args.warmup);
 	let frame_samples: Vec<&LatencySample> = timed
 		.iter()
@@ -471,6 +452,17 @@ fn report(timed: &[TimedSample], gpu: &[GpuSample], elapsed: Duration, args: &Be
 		frame_interval_us,
 		100.0 * spike_indices.len() as f64 / n as f64,
 	);
+
+	// Fill the bench session span with summary attributes so dashboards
+	// can show "this bench run had p99=X / spikes=Y" without re-aggregating.
+	let mut totals_us: Vec<u64> = frame_samples.iter().map(|s| s.total.as_micros() as u64).collect();
+	totals_us.sort_unstable();
+	let pick = |q: f64| totals_us[((totals_us.len() as f64 * q) as usize).min(totals_us.len() - 1)];
+	bench_span.record("frames", n as u64);
+	bench_span.record("spikes", spike_indices.len() as u64);
+	bench_span.record("total_p50_us", pick(0.50));
+	bench_span.record("total_p99_us", pick(0.99));
+	bench_span.record("total_max_us", *totals_us.last().unwrap());
 
 	println!();
 	println!(" stage         min     p50     p95     p99     max     (microseconds)");

@@ -1,0 +1,109 @@
+# Local OpenTelemetry stack for moonshine.
+#
+# Spins up an OTel collector (OTLP/gRPC :4317), Tempo (traces), Prometheus
+# (metrics), and Grafana (UI) — pre-provisioned datasources + a starter
+# dashboard. Run from this directory:
+#
+#   docker compose up -d
+#
+# Then point moonshine at the collector by either:
+#
+#   1) Editing config.toml:
+#        [telemetry]
+#        otlp_endpoint = "http://localhost:4317"
+#
+#   2) Or passing on the CLI:
+#        moonshine --otlp-endpoint http://localhost:4317 path/to/config.toml
+#
+# Open http://localhost:3000 (admin / admin) for Grafana. The "Moonshine
+# Streaming Pipeline" dashboard is provisioned out of the box.
+
+# NOTE on Bazzite / podman: bind mounts use `:Z` so SELinux relabels host
+# paths for container access (without it, mounted dirs appear empty inside
+# the container). And inter-service DNS uses static IPs + extra_hosts
+# because aardvark-dns on Bazzite intermittently fails to resolve
+# container names — pinning IPs sidesteps the lookup entirely.
+
+services:
+  otelcol:
+    image: docker.io/otel/opentelemetry-collector-contrib:0.110.0
+    container_name: moonshine-otelcol
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otelcol-config.yaml:/etc/otelcol/config.yaml:ro,Z
+    ports:
+      - "4317:4317" # OTLP/gRPC
+      - "4318:4318" # OTLP/HTTP
+    networks:
+      default:
+        ipv4_address: 172.30.0.12
+    extra_hosts:
+      - "prometheus:172.30.0.10"
+      - "tempo:172.30.0.11"
+    depends_on:
+      - tempo
+      - prometheus
+
+  tempo:
+    image: docker.io/grafana/tempo:2.6.0
+    container_name: moonshine-tempo
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo.yaml:/etc/tempo/tempo.yaml:ro,Z
+      - tempo-data:/var/tempo
+    ports:
+      - "3200:3200" # Tempo HTTP API
+    networks:
+      default:
+        ipv4_address: 172.30.0.11
+
+  prometheus:
+    image: docker.io/prom/prometheus:v2.55.0
+    container_name: moonshine-prometheus
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--enable-feature=otlp-write-receiver"
+      - "--storage.tsdb.retention.time=24h"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro,Z
+      - prometheus-data:/prometheus
+    ports:
+      - "9090:9090"
+    networks:
+      default:
+        ipv4_address: 172.30.0.10
+
+  grafana:
+    image: docker.io/grafana/grafana:11.3.0
+    container_name: moonshine-grafana
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Admin
+      - GF_AUTH_DISABLE_LOGIN_FORM=true
+      - GF_FEATURE_TOGGLES_ENABLE=traceqlEditor
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro,Z
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro,Z
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    networks:
+      default:
+        ipv4_address: 172.30.0.13
+    extra_hosts:
+      - "prometheus:172.30.0.10"
+      - "tempo:172.30.0.11"
+    depends_on:
+      - tempo
+      - prometheus
+
+networks:
+  default:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  tempo-data:
+  prometheus-data:
+  grafana-data:
