@@ -1,0 +1,10 @@
+# Prometheus runs in OTLP-write-receiver mode (enabled via the --enable-feature
+# flag in docker-compose.yml). The collector pushes metrics to it; this config
+# only needs to scrape Prometheus's own self-metrics.
+global:
+  scrape_interval: 10s
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
