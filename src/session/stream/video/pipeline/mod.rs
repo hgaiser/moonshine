@@ -14,6 +14,7 @@ use ash::vk;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::config::RgbDirectMode;
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
@@ -142,6 +143,7 @@ impl VideoPipeline {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		log_frame_spikes: bool,
+		rgb_direct_mode: RgbDirectMode,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -159,6 +161,7 @@ impl VideoPipeline {
 			max_reference_frames,
 			encryption_key,
 			log_frame_spikes,
+			rgb_direct_mode,
 		};
 
 		std::thread::Builder::new()
@@ -192,6 +195,8 @@ struct VideoPipelineInner {
 	max_reference_frames: u32,
 	encryption_key: Option<Vec<u8>>,
 	log_frame_spikes: bool,
+	/// Controls VK_VALVE_video_encode_rgb_conversion usage at encoder creation.
+	rgb_direct_mode: RgbDirectMode,
 }
 
 impl VideoPipelineInner {
@@ -251,10 +256,32 @@ impl VideoPipelineInner {
 
 		// RGB-direct encode skips the compute-shader RGB→YUV pass and lets
 		// the video encoder hardware do the conversion inline. Enabled
-		// whenever the device advertises VK_VALVE_video_encode_rgb_conversion.
-		let use_rgb_input = context.supports_rgb_direct_encode();
-		if use_rgb_input {
-			tracing::info!("RGB-direct encode path active (VK_VALVE_video_encode_rgb_conversion)");
+		// whenever the device advertises VK_VALVE_video_encode_rgb_conversion,
+		// unless overridden via [stream.video] rgb_direct_encode in config.
+		let device_supports_rgb_direct = context.supports_rgb_direct_encode();
+		let use_rgb_input = match self.rgb_direct_mode {
+			RgbDirectMode::Auto => device_supports_rgb_direct,
+			RgbDirectMode::Off => false,
+			RgbDirectMode::Force => {
+				if !device_supports_rgb_direct {
+					return Err(
+						"rgb_direct_encode = \"force\" but VK_VALVE_video_encode_rgb_conversion \
+						is not advertised by this device"
+							.to_string(),
+					);
+				}
+				true
+			},
+		};
+		match (self.rgb_direct_mode, device_supports_rgb_direct, use_rgb_input) {
+			(_, _, true) => tracing::info!("RGB-direct encode path active (VK_VALVE_video_encode_rgb_conversion)"),
+			(RgbDirectMode::Off, true, _) => tracing::info!(
+				"Compute-shader RGB→YUV path active (rgb_direct_encode = \"off\" overrides device support)"
+			),
+			(_, false, _) => tracing::info!(
+				"Compute-shader RGB→YUV path active (VK_VALVE_video_encode_rgb_conversion not supported by this device)"
+			),
+			_ => {},
 		}
 
 		// Convert pixel format.
