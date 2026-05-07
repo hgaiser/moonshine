@@ -16,6 +16,7 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 use crate::telemetry::{FrameAttrs, PipelineLatency, PipelineMetrics, TraceMode};
+#[cfg(feature = "telemetry")]
 use opentelemetry::global as otel_global;
 
 use super::packetizer::Packetizer;
@@ -164,10 +165,15 @@ impl VideoPipeline {
 		// Resolve metrics instruments from the global meter. When telemetry
 		// init didn't run with an OTLP endpoint, the global meter is a
 		// no-op provider and instrument creation is essentially free —
-		// recording into them just drops on the floor.
+		// recording into them just drops on the floor. With the `telemetry`
+		// feature disabled at compile time, `PipelineMetrics::new` is a
+		// no-op stub and `record_frame` calls are dead code.
+		#[cfg(feature = "telemetry")]
 		let metrics = Some(Arc::new(PipelineMetrics::new(&otel_global::meter(
 			"moonshine.pipeline",
 		))));
+		#[cfg(not(feature = "telemetry"))]
+		let metrics = Some(Arc::new(PipelineMetrics::new()));
 		let trace_mode = crate::telemetry::trace_mode();
 
 		let inner = VideoPipelineInner {
@@ -366,6 +372,13 @@ impl VideoPipelineInner {
 		packetizer.warm_up(self.fec_percentage, self.minimum_fec_packets);
 		let mut sequence_number = 0u32;
 		let mut frame_number = 0u32;
+		// Monotonic counter incremented once per encoded frame; used as the
+		// hash input for static-mode trace sampling. `buffer_index` would
+		// have been wrong here because the compositor recycles a small pool
+		// of buffer slots, so it cycles within a session and would bias
+		// sampling to a fixed subset of buffers rather than ~r fraction of
+		// frames over time.
+		let mut sample_counter: u64 = 0;
 
 		// Determine output YUV format based on chroma sampling and dynamic range.
 		let output_format = match (self.chroma_sampling, self.dynamic_range) {
@@ -771,23 +784,21 @@ impl VideoPipelineInner {
 
 				// Trace emission decision based on the configured mode:
 				//   None      — no span at all
-				//   Static(r) — emit on `r` fraction of frames, decided
+				//   Static(r) — emit on ~`r` fraction of frames, decided
 				//                client-side so we don't pay span-creation
-				//                cost on the rejected frames. Hash-based
-				//                so the keep set is deterministic per
-				//                buffer_index — easier to reason about
-				//                than a stateful counter.
+				//                cost on rejected frames. Uses a per-session
+				//                monotonic counter mixed with a Knuth golden
+				//                ratio constant so the keep set is uniformly
+				//                distributed across the run.
 				//   Outliers  — span only when the frame spiked
+				sample_counter = sample_counter.wrapping_add(1);
 				let is_spike = total_us > frame_budget_us;
 				let emit_span = match self.trace_mode {
 					TraceMode::None => false,
 					TraceMode::Static(r) if r >= 1.0 => true,
 					TraceMode::Static(r) if r <= 0.0 => false,
 					TraceMode::Static(r) => {
-						// Cheap deterministic 1-bit decision based on
-						// buffer_index × frame_count. No allocations,
-						// no global state.
-						let h = (frame.buffer_index as u64).wrapping_mul(0x9E3779B97F4A7C15);
+						let h = sample_counter.wrapping_mul(0x9E3779B97F4A7C15);
 						(h as f64 / u64::MAX as f64) < r
 					},
 					TraceMode::Outliers => is_spike,
@@ -830,6 +841,7 @@ impl VideoPipelineInner {
 					// Sample the dmabuf cache size into a gauge once per
 					// summary tick. Lets dashboards alert on unbounded
 					// growth (the leak that fix-dmabuf-leak addresses).
+					#[cfg(feature = "telemetry")]
 					if let (Some(metrics), Some(importer)) = (&self.metrics, &dmabuf_importer) {
 						metrics.dmabuf_cache_size.record(importer.cache_len() as u64, &[]);
 					}

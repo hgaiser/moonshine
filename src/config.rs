@@ -98,10 +98,12 @@ pub struct TelemetryConfigToml {
 impl Config {
 	#[allow(clippy::result_unit_err)]
 	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config, ()> {
-		let config =
-			std::fs::read_to_string(file).map_err(|e| tracing::warn!("Failed to open configuration file: {e}"))?;
+		// Errors here are reported via eprintln! because config load runs
+		// before any tracing subscriber is installed; tracing macros at this
+		// point would silently drop their output.
+		let config = std::fs::read_to_string(file).map_err(|e| eprintln!("Failed to open configuration file: {e}"))?;
 		let config: Config =
-			toml::from_str(&config).map_err(|e| tracing::warn!("Failed to parse configuration file: {e}"))?;
+			toml::from_str(&config).map_err(|e| eprintln!("Failed to parse configuration file: {e}"))?;
 
 		Ok(config)
 	}

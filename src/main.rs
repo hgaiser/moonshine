@@ -9,15 +9,17 @@ use crate::session::SessionManager;
 use crate::state::State;
 use crate::webserver::Webserver;
 use async_shutdown::ShutdownManager;
-use clap::{Parser, Subcommand};
+use clap::Parser;
+#[cfg(feature = "bench")]
+use clap::Subcommand;
 use tokio::signal::unix::{signal, SignalKind};
 
 mod app_scanner;
+#[cfg(feature = "bench")]
 mod bench;
 mod clients;
 mod config;
 mod crypto;
-mod gpu_stats;
 mod publisher;
 mod rtsp;
 mod session;
@@ -35,23 +37,28 @@ struct Args {
 	/// `http://localhost:4317`). Useful for ad-hoc profiling without
 	/// editing config.toml. Empty string disables telemetry even if the
 	/// config enables it.
+	#[cfg(feature = "telemetry")]
 	#[arg(long, global = true)]
 	otlp_endpoint: Option<String>,
 
 	/// Override per-frame trace emission mode: `none`, `outliers`, or
 	/// `static`. Use with `--trace-sample-rate` for `static`.
+	#[cfg(feature = "telemetry")]
 	#[arg(long, global = true, value_parser = parse_trace_mode_cli)]
 	trace_mode: Option<String>,
 
 	/// Static-mode trace sampling rate (0.0–1.0). Only consulted when
 	/// `--trace-mode static`.
+	#[cfg(feature = "telemetry")]
 	#[arg(long, global = true)]
 	trace_sample_rate: Option<f64>,
 
+	#[cfg(feature = "bench")]
 	#[command(subcommand)]
 	command: Option<Command>,
 }
 
+#[cfg(feature = "telemetry")]
 fn parse_trace_mode_cli(s: &str) -> Result<String, String> {
 	match s {
 		"none" | "outliers" | "static" => Ok(s.to_string()),
@@ -59,6 +66,7 @@ fn parse_trace_mode_cli(s: &str) -> Result<String, String> {
 	}
 }
 
+#[cfg(feature = "bench")]
 #[derive(Subcommand, Debug)]
 enum Command {
 	/// Run the full pipeline (compositor + capture + convert + encode) without
@@ -85,41 +93,45 @@ async fn main() -> Result<(), ()> {
 	let provider = rustls::crypto::ring::default_provider();
 	let _ = provider.install_default();
 
+	// Errors during config load and telemetry init must use eprintln!
+	// directly: no tracing subscriber is installed yet (telemetry::init() does
+	// it in one pass, so we can include the OTel layer when configured), and
+	// tracing macros at this point would silently drop their output.
 	let mut config;
 	if args.config.exists() {
 		config = Config::read_from_file(args.config).unwrap_or_else(|()| std::process::exit(1));
 	} else {
-		tracing::info!(
+		eprintln!(
 			"No config file found at {}, creating a default config file.",
 			args.config.display()
 		);
 		config = Config::default();
 
 		let serialized_config =
-			toml::to_string_pretty(&config).map_err(|e| tracing::error!("Failed to serialize config: {e}"))?;
+			toml::to_string_pretty(&config).map_err(|e| eprintln!("Failed to serialize config: {e}"))?;
 
 		let config_dir = args
 			.config
 			.parent()
-			.ok_or_else(|| tracing::error!("Failed to get parent directory of config file."))?;
-		std::fs::create_dir_all(config_dir).map_err(|e| tracing::error!("Failed to create config directory: {e}"))?;
-		std::fs::write(args.config, serialized_config)
-			.map_err(|e| tracing::error!("Failed to save config file: {e}"))?;
+			.ok_or_else(|| eprintln!("Failed to get parent directory of config file."))?;
+		std::fs::create_dir_all(config_dir).map_err(|e| eprintln!("Failed to create config directory: {e}"))?;
+		std::fs::write(args.config, serialized_config).map_err(|e| eprintln!("Failed to save config file: {e}"))?;
 	}
 
 	// Resolve these paths so that the rest of the code doesn't need to.
 	let cert_path = config.webserver.certificate.to_string_lossy().to_string();
-	let cert_path =
-		shellexpand::full(&cert_path).map_err(|e| tracing::error!("Failed to expand certificate path: {e}"))?;
+	let cert_path = shellexpand::full(&cert_path).map_err(|e| eprintln!("Failed to expand certificate path: {e}"))?;
 	config.webserver.certificate = cert_path.to_string().into();
 
 	let private_key_path = config.webserver.private_key.to_string_lossy().to_string();
 	let private_key_path =
-		shellexpand::full(&private_key_path).map_err(|e| tracing::error!("Failed to expand private key path: {e}"))?;
+		shellexpand::full(&private_key_path).map_err(|e| eprintln!("Failed to expand private key path: {e}"))?;
 	config.webserver.private_key = private_key_path.to_string().into();
 
-	// Install the real subscriber + (optional) OTel pipelines. CLI override
-	// wins over config; empty-string CLI override disables.
+	// Install the tracing subscriber, plus (optional) OTel pipelines when
+	// the `telemetry` feature is enabled and a collector endpoint is set.
+	// CLI overrides win over config; empty-string CLI override disables.
+	#[cfg(feature = "telemetry")]
 	let telemetry_cfg = telemetry::TelemetryConfig {
 		otlp_endpoint: args
 			.otlp_endpoint
@@ -139,10 +151,17 @@ async fn main() -> Result<(), ()> {
 				Some("outliers") => telemetry::TraceMode::Outliers,
 				Some("static") => telemetry::TraceMode::Static(cli_rate.unwrap_or(0.05)),
 				Some(_) | None => {
-					if matches!(args.command, Some(Command::Bench(_))) {
-						// Bench is short and we want everything.
-						telemetry::TraceMode::Static(1.0)
-					} else {
+					#[cfg(feature = "bench")]
+					{
+						if matches!(args.command, Some(Command::Bench(_))) {
+							// Bench is short and we want everything.
+							telemetry::TraceMode::Static(1.0)
+						} else {
+							telemetry::TraceMode::Outliers
+						}
+					}
+					#[cfg(not(feature = "bench"))]
+					{
 						telemetry::TraceMode::Outliers
 					}
 				},
@@ -154,7 +173,10 @@ async fn main() -> Result<(), ()> {
 			.map(std::time::Duration::from_millis)
 			.unwrap_or(std::time::Duration::from_secs(10)),
 	};
-	let _telemetry = telemetry::init(&telemetry_cfg).map_err(|e| tracing::error!("telemetry init: {e}"))?;
+	#[cfg(not(feature = "telemetry"))]
+	let telemetry_cfg = telemetry::TelemetryConfig::default();
+
+	let _telemetry = telemetry::init(&telemetry_cfg).map_err(|e| eprintln!("telemetry init: {e}"))?;
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
 
@@ -184,35 +206,33 @@ async fn main() -> Result<(), ()> {
 		}
 	});
 
-	match args.command {
-		Some(Command::Bench(bench_args)) => {
-			let result = bench::run(config, bench_args, shutdown.clone()).await;
-			// Drain pending OTel exports synchronously before exit. Bench
-			// runs are short enough that the BatchSpanProcessor's scheduled
-			// flush can lose the trailing window otherwise.
-			_telemetry.force_flush();
-			let _ = shutdown.trigger_shutdown(result.map(|_| 0).unwrap_or(1));
-			let exit_code = shutdown.wait_shutdown_complete().await;
-			std::process::exit(exit_code);
-		},
-		None => {
-			// Create the main application.
-			let moonshine = Moonshine::new(config, shutdown.clone()).await?;
-
-			tracing::info!("Moonshine is ready and waiting for connections.");
-
-			// Wait until something causes a shutdown trigger.
-			shutdown.wait_shutdown_triggered().await;
-
-			// Drop the main moonshine object, triggering other systems to shutdown too.
-			drop(moonshine);
-
-			// Wait until everything was shutdown.
-			let exit_code = shutdown.wait_shutdown_complete().await;
-			tracing::debug!("Successfully waited for shutdown to complete.");
-			std::process::exit(exit_code);
-		},
+	#[cfg(feature = "bench")]
+	if let Some(Command::Bench(bench_args)) = args.command {
+		let result = bench::run(config, bench_args, shutdown.clone()).await;
+		// Drain pending OTel exports synchronously before exit. Bench
+		// runs are short enough that the BatchSpanProcessor's scheduled
+		// flush can lose the trailing window otherwise.
+		_telemetry.force_flush();
+		let _ = shutdown.trigger_shutdown(result.map(|_| 0).unwrap_or(1));
+		let exit_code = shutdown.wait_shutdown_complete().await;
+		std::process::exit(exit_code);
 	}
+
+	// Create the main application.
+	let moonshine = Moonshine::new(config, shutdown.clone()).await?;
+
+	tracing::info!("Moonshine is ready and waiting for connections.");
+
+	// Wait until something causes a shutdown trigger.
+	shutdown.wait_shutdown_triggered().await;
+
+	// Drop the main moonshine object, triggering other systems to shutdown too.
+	drop(moonshine);
+
+	// Wait until everything was shutdown.
+	let exit_code = shutdown.wait_shutdown_complete().await;
+	tracing::debug!("Successfully waited for shutdown to complete.");
+	std::process::exit(exit_code);
 }
 
 pub struct Moonshine {

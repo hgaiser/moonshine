@@ -155,7 +155,7 @@ resolve_icons = true
 
 ## Benchmarking
 
-Moonshine ships a `bench` subcommand that runs the full host pipeline (compositor + capture + convert + encode) without any Moonlight client connected. Encoded packets are dropped on the floor; per-frame latency samples are aggregated and reported when the run ends. Useful for iterating on driver, power-management, or pipeline changes without a phone in hand.
+Moonshine has a `bench` subcommand that runs the full pipeline (compositor + capture + convert + encode) without any Moonlight client connected. Encoded packets are dropped; per-frame latency samples are aggregated and reported when the run ends. Useful for iterating on driver, power-management, or pipeline changes without needing a client connected.
 
 ```sh
 moonshine /path/to/config.toml bench \
@@ -177,61 +177,14 @@ Bench-specific flags:
 | `--codec {h264,hevc,av1}` | `hevc` | Codec to encode with. |
 | `--hdr` | off | Stream as BT.2020 PQ 10-bit HDR. |
 | `--app <title>` |  | Launch an application from `[[application]]`. Mutually exclusive with the trailing `-- <cmd>` form. |
-| `--gpu-stats-interval-ms <n>` | `100` | AMD-only sysfs sampler for the bench summary table. `0` disables. |
 
 Either `--app <title>` or a trailing `-- <cmd>` is required so the harness has something to run inside the bench compositor.
 
-The summary printed at the end shows per-stage latency percentiles (`channel_wait`, `import`, `convert`, `encode`, `packetize`, `send`) and a totals row, plus spike count and observed FPS. The GPU clock / busy table is AMD-only and skipped automatically on other vendors.
+The summary printed at the end shows per-stage latency percentiles (`channel_wait`, `import`, `convert`, `encode`, `packetize`, `send`) and a totals row, plus spike count and observed FPS.
 
-## Telemetry (OpenTelemetry)
+## Telemetry
 
-Moonshine can ship per-frame traces and aggregated metrics over OTLP/gRPC to any compatible collector (Tempo, Jaeger, SigNoz, an `otelcol` passthrough, etc.). Telemetry is fully off by default and has zero overhead until an endpoint is configured. Pipeline branches that would emit spans are compiled out at runtime.
-
-### Configuration
-
-In `config.toml`:
-
-```toml
-[telemetry]
-otlp_endpoint = "http://localhost:4317"   # set this to enable
-service_name = "moonshine"                # optional
-trace_mode = "outliers"                   # "none" | "outliers" | "static"
-trace_sample_rate = 0.05                  # only used when trace_mode = "static"
-metric_export_interval_ms = 10000
-```
-
-CLI flags override the config (useful for ad-hoc profiling without editing the file). They apply to both the long-running service and the `bench` subcommand:
-
-| Flag | Description |
-| --- | --- |
-| `--otlp-endpoint <url>` | OTLP gRPC endpoint. Empty string disables telemetry even if config enables it. |
-| `--trace-mode {none,outliers,static}` | Per-frame span emission mode. |
-| `--trace-sample-rate <0.0–1.0>` | Static-mode sampling rate. Only consulted when `--trace-mode static`. |
-
-### Trace modes
-
-- **`none`**: no per-frame spans. Metrics still emit if the endpoint is set.
-- **`outliers`** (default): only emit spans for frames that took longer than the frame budget. Catches spikes without the per-frame cost.
-- **`static`**: emit spans for a deterministic percentage of frames (chosen via `--trace-sample-rate`). The bench subcommand defaults to `static 1.0` (full fidelity) since runs are short.
-
-Sampling decisions are made on the host before the span is created, so rejected frames cost nothing.
-
-### What gets emitted
-
-**Traces:** one `frame.encode` span per sampled frame with attributes `codec`, `hdr`, `buffer_index`, `is_key_frame`, `encoded_bytes`, plus per-stage durations (`channel_wait_us`, `import_us`, `convert_us`, `encode_us`, `packetize_us`, `send_us`, `total_us`). Bench runs are wrapped in a `bench.session` parent span carrying the run summary as fields.
-
-**Metrics:**
-
-| Name | Kind | Notes |
-| --- | --- | --- |
-| `moonshine.frames` | counter | Frames encoded, tagged by `codec`/`hdr`. |
-| `moonshine.spikes` | counter | Frames over the frame budget. |
-| `moonshine.total_latency` | histogram (µs) | End-to-end host latency per frame. |
-| `moonshine.stage_latency` | histogram (µs) | Per-stage latency, tagged by `stage`. |
-| `moonshine.encoded_bytes` | histogram | Bytes per frame. |
-| `moonshine.dmabuf.cache_size` | gauge | Resident DMA-BUF imports (leak indicator). |
-
-A worked-example Grafana / Tempo / Prometheus / OTel-collector stack is provided under [`examples/observability`](examples/observability/). Run `docker compose up -d` from that directory and point Moonshine at `http://localhost:4317`.
+Moonshine can optionally ship per-frame traces and aggregated metrics over OTLP/gRPC. Off by default; see [`examples/observability/README.md`](examples/observability/README.md) for setup, configuration, and a worked-example Grafana/Tempo/Prometheus stack.
 
 ## FAQ
 

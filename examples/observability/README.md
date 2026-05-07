@@ -1,16 +1,63 @@
-# Local OpenTelemetry stack for moonshine
+# Telemetry and a local OpenTelemetry stack for moonshine
 
-A self-contained Grafana + Tempo + Prometheus stack wired through an OTel
-collector. Useful for:
+Moonshine can optionally ship per-frame traces and aggregated metrics over OTLP/gRPC to any compatible collector (Tempo, Jaeger, SigNoz, an `otelcol` passthrough, etc.). Telemetry is fully off by default and has zero overhead until an endpoint is configured. Pipeline branches that would emit spans are compiled out at runtime.
 
-- Watching streaming-session latency live (per-frame traces, per-stage
-  histograms, DMA-BUF importer cache size)
-- Catching slow-burn regressions like "host latency creeps from 5ms to
-  55ms over 10 min" before users hit them
-- Comparing benchmark runs (`moonshine bench`) against real-game
-  sessions on the same dashboard
+This directory also ships a self-contained Grafana + Tempo + Prometheus stack wired through an OTel collector, suitable for local profiling without setting up a full observability pipeline.
 
-## Usage
+## Configuration
+
+In `config.toml`:
+
+```toml
+[telemetry]
+otlp_endpoint = "http://localhost:4317"   # set this to enable
+service_name = "moonshine"                # optional
+trace_mode = "outliers"                   # "none" | "outliers" | "static"
+trace_sample_rate = 0.05                  # only consulted when trace_mode = "static"
+metric_export_interval_ms = 10000
+```
+
+CLI flags override the config (useful for ad-hoc profiling without editing the file). They apply to both the long-running service and the `bench` subcommand:
+
+| Flag | Description |
+| --- | --- |
+| `--otlp-endpoint <url>` | OTLP gRPC endpoint. Empty string disables telemetry even if config enables it. |
+| `--trace-mode {none,outliers,static}` | Per-frame span emission mode. |
+| `--trace-sample-rate <0.0–1.0>` | Static-mode sampling rate. Only consulted when `--trace-mode static`. |
+
+### Trace modes
+
+- **`none`**: no per-frame spans. Metrics still emit if the endpoint is set.
+- **`outliers`** (default): only emit spans for frames that took longer than the frame budget. Catches spikes without the per-frame cost. `trace_sample_rate` has no effect in this mode.
+- **`static`**: emit spans for a fixed fraction of frames (set by `trace_sample_rate`). Sampling is deterministic — based on a per-session monotonic frame counter so the keep set is uniformly distributed across the run. The bench subcommand defaults to `static 1.0` (full fidelity) since runs are short.
+
+Sampling decisions are made on the host before the span is created, so rejected frames cost nothing.
+
+## What gets emitted
+
+**Traces** (Tempo):
+
+- One `frame.encode` span per sampled frame, with per-stage timings recorded as attributes on the span: `channel_wait_us`, `import_us`, `convert_us`, `encode_us`, `packetize_us`, `send_us`, `total_us`, plus `codec`, `hdr`, `buffer_index`, `is_key_frame`, `encoded_bytes`.
+- Bench runs are wrapped in a `bench.session` parent span carrying the run summary as fields.
+
+**Metrics** (Prometheus, exported via OTLP):
+
+| Name | Kind | Notes |
+| --- | --- | --- |
+| `moonshine.frames` | counter | Frames encoded, tagged by `codec`/`hdr`. |
+| `moonshine.spikes` | counter | Frames over the frame budget. |
+| `moonshine.total_latency` | histogram (µs) | End-to-end host latency per frame. |
+| `moonshine.stage_latency` | histogram (µs) | Per-stage latency, tagged by `stage`. |
+| `moonshine.encoded_bytes` | histogram | Bytes per frame. |
+| `moonshine.dmabuf.cache_size` | gauge | Resident DMA-BUF imports. |
+
+## Local stack
+
+The stack in this directory is useful for:
+
+- Watching streaming-session latency live (per-frame traces, per-stage histograms, DMA-BUF importer cache size)
+- Catching slow-burn regressions like "host latency creeps from 5ms to 55ms over 10 min" before users hit them
+- Comparing benchmark runs (`moonshine bench`) against real-game sessions on the same dashboard
 
 From this directory:
 
@@ -18,22 +65,13 @@ From this directory:
 docker compose up -d
 ```
 
-Then point moonshine at `http://localhost:4317` either by editing
-`config.toml`:
-
-```toml
-[telemetry]
-otlp_endpoint = "http://localhost:4317"
-trace_sample_rate = 0.05      # optional; 1% of normal frames + all spikes
-```
-
-…or via the global CLI flag:
+Then point moonshine at `http://localhost:4317` (the `[telemetry]` config above), or via CLI:
 
 ```sh
 moonshine --otlp-endpoint http://localhost:4317 ~/.config/moonshine/config.toml
 ```
 
-The same flag applies to the bench harness:
+Same flag works with the bench harness:
 
 ```sh
 moonshine --otlp-endpoint http://localhost:4317 ~/.config/moonshine/config.toml \
@@ -41,38 +79,11 @@ moonshine --otlp-endpoint http://localhost:4317 ~/.config/moonshine/config.toml 
   --app "Cyberpunk Benchmark"
 ```
 
-Open Grafana at <http://localhost:3000> (anonymous-admin enabled). The
-"Moonshine Streaming Pipeline" dashboard is provisioned automatically.
-
-## What gets emitted
-
-**Traces** (Tempo):
-
-- One `frame.encode` span per encoded frame, with attributes:
-  - `codec` (h264/hevc/av1), `hdr` (true/false), `buffer_index`
-  - `channel_wait_us`, `import_us`, `convert_us`, `encode_us`,
-    `packetize_us`, `send_us`, `total_us`, `encoded_bytes`,
-    `is_key_frame`
-- Sampled by `trace_sample_rate` (default 1%); spike frames can be
-  forced into the sampled set by callers (TODO).
-
-**Metrics** (Prometheus, exported via OTLP):
-
-- `moonshine.frames` — counter, frames encoded, tagged by `codec`/`hdr`
-- `moonshine.spikes` — counter, frames over frame budget
-- `moonshine.total_latency` — histogram, end-to-end host latency (µs)
-- `moonshine.stage_latency` — histogram, per-stage latency, tagged by
-  `stage` (channel_wait/import/convert/encode/packetize/send)
-- `moonshine.encoded_bytes` — histogram, bytes per frame
-- `moonshine.dmabuf.cache_size` — gauge, count of resident DMA-BUF
-  imports (the leak indicator from the 2026-04-29 incident)
+Open Grafana at <http://localhost:3000> (anonymous-admin enabled). The "Moonshine Streaming Pipeline" dashboard is provisioned automatically.
 
 ## Bringing your own collector
 
-Everything in this directory is provided as a worked-example. Drop the
-`otelcol`, `tempo`, `prometheus`, and `grafana` services into whatever
-observability stack you already run; or point moonshine at your existing
-OTLP endpoint and ignore this whole directory.
+Everything in this directory is provided as a worked example. Drop the `otelcol`, `tempo`, `prometheus`, and `grafana` services into whatever observability stack you already run, or point moonshine at your existing OTLP endpoint and ignore this whole directory.
 
 ## Cleanup
 

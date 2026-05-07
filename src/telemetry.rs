@@ -1,14 +1,16 @@
-//! OpenTelemetry integration for moonshine.
+//! OpenTelemetry integration for moonshine (optional, feature-gated).
 //!
-//! Two signals are exported when `[telemetry] otlp_endpoint` is set in the
-//! config (or `--otlp-endpoint` is passed to the bench harness):
+//! Two signals are exported when the `telemetry` feature is enabled AND
+//! `[telemetry] otlp_endpoint` is set in the config (or `--otlp-endpoint`
+//! is passed on the CLI):
 //!
-//! - **Traces**: per-frame `frame.encode` root span with child spans for each
-//!   pipeline stage (`channel_wait`, `import`, `convert`, `encode`,
-//!   `packetize`, `send`). Useful for debugging individual outliers — when
-//!   a spike fires you can pull up the trace and see which stage exploded.
-//!   Tail-sampled by default (keep all frames > frame_budget, sample 1% of
-//!   normal frames) so a 120 fps session doesn't drown the collector.
+//! - **Traces**: per-frame `frame.encode` span with per-stage timings
+//!   (`channel_wait_us`, `import_us`, `convert_us`, `encode_us`,
+//!   `packetize_us`, `send_us`, `total_us`) recorded as attributes on the
+//!   span. Useful for debugging individual outliers — when a spike fires
+//!   you can pull up the trace and see which stage exploded. Sampling
+//!   strategy is selected by `TraceMode` (default: `Outliers`, which only
+//!   emits a span on frames that exceed the frame budget).
 //!
 //! - **Metrics**: pre-aggregated histograms / gauges / counters exported on
 //!   a fixed cadence (default 10s). Cheap, full-fidelity, perfect for
@@ -16,24 +18,30 @@
 //!   bench text report shows; metrics let you watch them trend over hours
 //!   instead of computing them once per bench run.
 //!
+//! When the `telemetry` feature is OFF, this module exposes the same public
+//! API but with no-op stubs and no opentelemetry dependencies in the build.
 //! Hot path is never blocked: spans are batched + flushed by a background
 //! tokio task, metrics collected via lock-free instruments. If the
 //! collector goes away, exports drop on the floor and moonshine keeps
 //! streaming.
 
+#[cfg(feature = "telemetry")]
 use opentelemetry::{
 	global,
 	metrics::{Counter, Gauge, Histogram, Meter},
 	trace::TracerProvider as _,
 	KeyValue,
 };
+#[cfg(feature = "telemetry")]
 use opentelemetry_otlp::WithExportConfig;
+#[cfg(feature = "telemetry")]
 use opentelemetry_sdk::{
 	metrics::{PeriodicReader, SdkMeterProvider},
 	runtime,
 	trace::{Sampler, TracerProvider},
 	Resource,
 };
+#[cfg(feature = "telemetry")]
 use opentelemetry_semantic_conventions::resource as semres;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -41,14 +49,14 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 /// Global trace-mode snapshot, populated by `init()` and read by hot
 /// paths that need to branch on it (the video pipeline). Defaults to
-/// `Outliers` when telemetry was never initialized — the right choice
-/// when nothing's listening (cheap), and a sensible fallback when
-/// somebody's listening and didn't pick.
+/// `None` when telemetry was never initialized — the right choice when
+/// nothing's listening (cheap), and a sensible fallback when the
+/// telemetry feature is disabled at compile time.
 static TRACE_MODE: OnceLock<TraceMode> = OnceLock::new();
 
 /// Read the process-global trace mode. Cheap (`OnceLock` load).
 pub fn trace_mode() -> TraceMode {
-	*TRACE_MODE.get().unwrap_or(&TraceMode::Outliers)
+	*TRACE_MODE.get().unwrap_or(&TraceMode::None)
 }
 
 /// What to emit on the trace channel for video-pipeline frames.
@@ -60,19 +68,19 @@ pub fn trace_mode() -> TraceMode {
 pub enum TraceMode {
 	/// No frame-level traces. Compositor/session-level spans (and the
 	/// `bench.session` span) still flow when telemetry is enabled, but
-	/// per-frame work generates nothing. Lowest overhead.
+	/// per-frame work generates nothing. Lowest overhead. Also the value
+	/// when the `telemetry` feature is disabled at compile time.
 	None,
-	/// Emit a `frame.encode` span on every frame and let the sampler
-	/// decide. The `f64` is the keep-rate (0.0–1.0). Easy to reason
-	/// about and gives evenly-distributed samples, but pays the
-	/// allocation/record cost on every frame even when the sampler
-	/// drops the span. Useful for steady-state load profiling.
+	/// Emit a `frame.encode` span on every Nth frame (the f64 is the
+	/// keep-rate, 0.0–1.0). Selection is deterministic based on a
+	/// per-session monotonic counter so the keep set is uniformly
+	/// distributed across the run. Useful for steady-state load profiling.
 	Static(f64),
 	/// Emit a `frame.encode` span ONLY when the frame's total latency
-	/// exceeds the frame-rate budget (i.e. it's already a spike). All
-	/// emitted spans are sampled. Zero per-frame allocation in the
-	/// happy path, full debug detail when something is actually wrong.
-	/// Recommended default for production sessions.
+	/// exceeds the frame-rate budget (i.e. it's already a spike). Zero
+	/// per-frame allocation in the happy path, full debug detail when
+	/// something is actually wrong. Recommended default for production
+	/// sessions.
 	Outliers,
 }
 
@@ -93,7 +101,9 @@ impl TraceMode {
 }
 
 /// Configuration for the OTel pipeline. Constructed from `[telemetry]` in
-/// the config file, or from bench-harness CLI flags.
+/// the config file, or from bench-harness CLI flags. Always present so
+/// `Config` deserializes the same regardless of feature flags; ignored
+/// when the `telemetry` feature is disabled at compile time.
 #[derive(Debug, Clone)]
 pub struct TelemetryConfig {
 	/// OTLP/gRPC endpoint URL (e.g. "http://localhost:4317"). When `None`,
@@ -128,31 +138,41 @@ impl Default for TelemetryConfig {
 /// before returning from main if the program tends to exit faster than
 /// the BatchSpanProcessor's scheduled-delay can drain the queue
 /// (bench-mode, short tests).
+///
+/// When the `telemetry` feature is disabled, this is an empty marker
+/// type with no-op `force_flush`.
 pub struct TelemetryGuard {
+	#[cfg(feature = "telemetry")]
 	tracer_provider: Option<TracerProvider>,
+	#[cfg(feature = "telemetry")]
 	meter_provider: Option<SdkMeterProvider>,
 }
 
 impl TelemetryGuard {
 	/// Synchronously drain pending spans and metrics through their
 	/// exporters. Useful at end of bench mode where the batch processor
-	/// would otherwise lose the last few seconds.
+	/// would otherwise lose the last few seconds. No-op when the
+	/// `telemetry` feature is disabled.
 	pub fn force_flush(&self) {
-		if let Some(tp) = &self.tracer_provider {
-			for r in tp.force_flush() {
-				if let Err(e) = r {
-					tracing::warn!("OTel: tracer flush error: {e}");
+		#[cfg(feature = "telemetry")]
+		{
+			if let Some(tp) = &self.tracer_provider {
+				for r in tp.force_flush() {
+					if let Err(e) = r {
+						tracing::warn!("OTel: tracer flush error: {e}");
+					}
 				}
 			}
-		}
-		if let Some(mp) = &self.meter_provider {
-			if let Err(e) = mp.force_flush() {
-				tracing::warn!("OTel: meter flush error: {e}");
+			if let Some(mp) = &self.meter_provider {
+				if let Err(e) = mp.force_flush() {
+					tracing::warn!("OTel: meter flush error: {e}");
+				}
 			}
 		}
 	}
 }
 
+#[cfg(feature = "telemetry")]
 impl Drop for TelemetryGuard {
 	fn drop(&mut self) {
 		if let Some(tp) = self.tracer_provider.take() {
@@ -167,6 +187,7 @@ impl Drop for TelemetryGuard {
 /// Build the resource attributes attached to every export. Using OTel
 /// semantic conventions where possible so dashboards from other Rust
 /// services can reuse the same field names.
+#[cfg(feature = "telemetry")]
 fn build_resource(service_name: &str) -> Resource {
 	Resource::new([
 		KeyValue::new(semres::SERVICE_NAME, service_name.to_string()),
@@ -184,86 +205,90 @@ fn build_resource(service_name: &str) -> Resource {
 /// Initialize OTel + bridge moonshine's existing `tracing` spans into it.
 /// Returns a guard that must be held alive for the program lifetime.
 ///
-/// When `cfg.otlp_endpoint` is `None`, this still installs the local
-/// stdout `tracing-subscriber` (so logs work) but skips all OTel pipeline
-/// init.
+/// Always installs the basic stdout `tracing-subscriber`. When the
+/// `telemetry` feature is disabled at compile time, OTel pipelines are
+/// not built and the guard is a no-op marker.
 pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard, String> {
 	let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 	let fmt_layer = tracing_subscriber::fmt::layer();
 
-	let Some(endpoint) = &cfg.otlp_endpoint else {
-		// Telemetry off — install only the stdout layer. Force TRACE_MODE
-		// to None regardless of what the user asked for, so the pipeline
-		// hot path's spike-span branch is dead code (no allocations,
-		// no fmt-layer ghost spans going nowhere useful).
+	#[cfg(not(feature = "telemetry"))]
+	{
+		let _ = cfg; // unused without the feature
 		let _ = TRACE_MODE.set(TraceMode::None);
 		tracing_subscriber::registry().with(env_filter).with(fmt_layer).init();
-		return Ok(TelemetryGuard {
-			tracer_provider: None,
-			meter_provider: None,
-		});
-	};
+		Ok(TelemetryGuard {})
+	}
 
-	// Endpoint is set — record the user's chosen mode for the pipeline.
-	let _ = TRACE_MODE.set(cfg.trace_mode);
+	#[cfg(feature = "telemetry")]
+	{
+		let Some(endpoint) = &cfg.otlp_endpoint else {
+			// Telemetry off at runtime — install only the stdout layer.
+			// Force TRACE_MODE to None regardless of what the user asked
+			// for, so the pipeline hot path's spike-span branch is dead
+			// code (no allocations, no fmt-layer ghost spans going
+			// nowhere useful).
+			let _ = TRACE_MODE.set(TraceMode::None);
+			tracing_subscriber::registry().with(env_filter).with(fmt_layer).init();
+			return Ok(TelemetryGuard {
+				tracer_provider: None,
+				meter_provider: None,
+			});
+		};
 
-	let service_name = cfg.service_name.clone().unwrap_or_else(|| "moonshine".to_string());
-	let resource = build_resource(&service_name);
+		// Endpoint is set — record the user's chosen mode for the pipeline.
+		let _ = TRACE_MODE.set(cfg.trace_mode);
 
-	// === Tracer provider ===
-	// Tail sampling: ParentBased(TraceIdRatioBased(rate)). Caller spans
-	// can override per-trace via tracing attributes (`always_sample = true`)
-	// when emitting a known-spike frame.
-	let exporter = opentelemetry_otlp::SpanExporter::builder()
-		.with_tonic()
-		.with_endpoint(endpoint)
-		.build()
-		.map_err(|e| format!("OTel: build span exporter: {e}"))?;
+		let service_name = cfg.service_name.clone().unwrap_or_else(|| "moonshine".to_string());
+		let resource = build_resource(&service_name);
 
-	let sampler_ratio = cfg.trace_mode.sampler_ratio();
-	let tracer_provider = TracerProvider::builder()
-		.with_resource(resource.clone())
-		.with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
-			sampler_ratio,
-		))))
-		.with_batch_exporter(exporter, runtime::Tokio)
-		.build();
+		let exporter = opentelemetry_otlp::SpanExporter::builder()
+			.with_tonic()
+			.with_endpoint(endpoint)
+			.build()
+			.map_err(|e| format!("OTel: build span exporter: {e}"))?;
 
-	let tracer = tracer_provider.tracer(service_name.clone());
-	global::set_tracer_provider(tracer_provider.clone());
+		let sampler_ratio = cfg.trace_mode.sampler_ratio();
+		let tracer_provider = TracerProvider::builder()
+			.with_resource(resource.clone())
+			.with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
+				sampler_ratio,
+			))))
+			.with_batch_exporter(exporter, runtime::Tokio)
+			.build();
 
-	// === Meter provider ===
-	let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
-		.with_tonic()
-		.with_endpoint(endpoint)
-		.build()
-		.map_err(|e| format!("OTel: build metric exporter: {e}"))?;
+		let tracer = tracer_provider.tracer(service_name.clone());
+		global::set_tracer_provider(tracer_provider.clone());
 
-	let reader = PeriodicReader::builder(metric_exporter, runtime::Tokio)
-		.with_interval(cfg.metric_export_interval)
-		.build();
+		let metric_exporter = opentelemetry_otlp::MetricExporter::builder()
+			.with_tonic()
+			.with_endpoint(endpoint)
+			.build()
+			.map_err(|e| format!("OTel: build metric exporter: {e}"))?;
 
-	let meter_provider = SdkMeterProvider::builder()
-		.with_resource(resource)
-		.with_reader(reader)
-		.build();
-	global::set_meter_provider(meter_provider.clone());
+		let reader = PeriodicReader::builder(metric_exporter, runtime::Tokio)
+			.with_interval(cfg.metric_export_interval)
+			.build();
 
-	// === tracing → OTel bridge ===
-	// Existing `tracing::info_span!` calls in the pipeline now also emit
-	// OTel spans without code changes.
-	let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+		let meter_provider = SdkMeterProvider::builder()
+			.with_resource(resource)
+			.with_reader(reader)
+			.build();
+		global::set_meter_provider(meter_provider.clone());
 
-	tracing_subscriber::registry()
-		.with(env_filter)
-		.with(fmt_layer)
-		.with(otel_layer)
-		.init();
+		let otel_layer = tracing_opentelemetry::layer().with_tracer(tracer);
 
-	Ok(TelemetryGuard {
-		tracer_provider: Some(tracer_provider),
-		meter_provider: Some(meter_provider),
-	})
+		tracing_subscriber::registry()
+			.with(env_filter)
+			.with(fmt_layer)
+			.with(otel_layer)
+			.init();
+
+		Ok(TelemetryGuard {
+			tracer_provider: Some(tracer_provider),
+			meter_provider: Some(meter_provider),
+		})
+	}
 }
 
 /// Pre-built metric instruments used by the video pipeline. Cheap to
@@ -274,6 +299,11 @@ pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard, String> {
 /// Attributes (codec/hdr/stage) are pre-built once at construction so
 /// per-frame recording doesn't allocate or re-stringify. The hot path
 /// is just: increment counter / record histogram with a borrowed slice.
+///
+/// When the `telemetry` feature is disabled, this is a zero-sized type
+/// and `record_frame` is a no-op so the pipeline doesn't need cfg gates
+/// at every callsite.
+#[cfg(feature = "telemetry")]
 pub struct PipelineMetrics {
 	pub frames_total: Counter<u64>,
 	pub spikes_total: Counter<u64>,
@@ -283,8 +313,12 @@ pub struct PipelineMetrics {
 	pub dmabuf_cache_size: Gauge<u64>,
 }
 
+#[cfg(not(feature = "telemetry"))]
+pub struct PipelineMetrics;
+
 /// Per-pipeline cached attribute sets. Built once at session start,
 /// borrowed on every frame. Keeps the hot path allocation-free.
+#[cfg(feature = "telemetry")]
 pub struct FrameAttrs {
 	/// `[codec, hdr]` — used for `frames_total`, `spikes_total`,
 	/// `total_latency_us`, `encoded_bytes`.
@@ -293,6 +327,9 @@ pub struct FrameAttrs {
 	/// Avoids rebuilding the stage attribute string per histogram record.
 	pub stages: [(Stage, [KeyValue; 3]); 6],
 }
+
+#[cfg(not(feature = "telemetry"))]
+pub struct FrameAttrs;
 
 #[derive(Copy, Clone, Debug)]
 pub enum Stage {
@@ -305,6 +342,7 @@ pub enum Stage {
 }
 
 impl Stage {
+	#[cfg(feature = "telemetry")]
 	const fn label(self) -> &'static str {
 		match self {
 			Stage::ChannelWait => "channel_wait",
@@ -318,6 +356,7 @@ impl Stage {
 }
 
 impl FrameAttrs {
+	#[cfg(feature = "telemetry")]
 	pub fn new(codec: &str, hdr: bool) -> Self {
 		let mk_stage = |s: Stage| {
 			(
@@ -341,9 +380,15 @@ impl FrameAttrs {
 			],
 		}
 	}
+
+	#[cfg(not(feature = "telemetry"))]
+	pub fn new(_codec: &str, _hdr: bool) -> Self {
+		Self
+	}
 }
 
 impl PipelineMetrics {
+	#[cfg(feature = "telemetry")]
 	pub fn new(meter: &Meter) -> Self {
 		Self {
 			frames_total: meter.u64_counter("moonshine.frames").build(),
@@ -366,27 +411,39 @@ impl PipelineMetrics {
 		}
 	}
 
+	#[cfg(not(feature = "telemetry"))]
+	pub fn new() -> Self {
+		Self
+	}
+
 	/// Record a fully-tagged latency sample. Uses pre-built `FrameAttrs`
 	/// so this hot-path call is ~9 atomic ops + 8 histogram records, no
-	/// allocations.
+	/// allocations. No-op when the `telemetry` feature is disabled.
 	#[inline]
 	pub fn record_frame(&self, attrs: &FrameAttrs, sample: &PipelineLatency) {
-		self.frames_total.add(1, &attrs.frame);
-		self.total_latency_us.record(sample.total_us, &attrs.frame);
-		self.encoded_bytes.record(sample.encoded_bytes as u64, &attrs.frame);
-		let stage_us = [
-			sample.channel_wait_us,
-			sample.import_us,
-			sample.convert_us,
-			sample.encode_us,
-			sample.packetize_us,
-			sample.send_us,
-		];
-		for (i, (_, kvs)) in attrs.stages.iter().enumerate() {
-			self.stage_latency_us.record(stage_us[i], kvs);
+		#[cfg(feature = "telemetry")]
+		{
+			self.frames_total.add(1, &attrs.frame);
+			self.total_latency_us.record(sample.total_us, &attrs.frame);
+			self.encoded_bytes.record(sample.encoded_bytes as u64, &attrs.frame);
+			let stage_us = [
+				sample.channel_wait_us,
+				sample.import_us,
+				sample.convert_us,
+				sample.encode_us,
+				sample.packetize_us,
+				sample.send_us,
+			];
+			for (i, (_, kvs)) in attrs.stages.iter().enumerate() {
+				self.stage_latency_us.record(stage_us[i], kvs);
+			}
+			if sample.total_us > sample.frame_budget_us {
+				self.spikes_total.add(1, &attrs.frame);
+			}
 		}
-		if sample.total_us > sample.frame_budget_us {
-			self.spikes_total.add(1, &attrs.frame);
+		#[cfg(not(feature = "telemetry"))]
+		{
+			let _ = (attrs, sample);
 		}
 	}
 }
@@ -404,17 +461,25 @@ pub struct PipelineLatency {
 	pub frame_budget_us: u64,
 }
 
-// ---- minimal hostname shim so we don't add another dependency just for this
+// Minimal hostname shim (only needed by the OTel feature path) so we don't
+// add another dependency just for this. `CStr::from_bytes_until_nul` avoids
+// the UB risk if `gethostname` truncates without a trailing NUL.
+#[cfg(feature = "telemetry")]
 mod hostname {
 	use std::ffi::CStr;
 	pub fn get() -> std::io::Result<std::ffi::OsString> {
 		let mut buf = vec![0u8; 256];
-		// SAFETY: gethostname writes a NUL-terminated string into buf.
-		let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut _, buf.len()) };
+		// Reserve space for a trailing NUL by passing len-1, then force the
+		// last byte to 0 in case the kernel still truncates inside the
+		// shorter window.
+		// SAFETY: gethostname writes at most `buf.len()-1` bytes into buf.
+		let r = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut _, buf.len() - 1) };
 		if r != 0 {
 			return Err(std::io::Error::last_os_error());
 		}
-		let cstr = unsafe { CStr::from_ptr(buf.as_ptr() as *const _) };
+		*buf.last_mut().unwrap() = 0;
+		let cstr = CStr::from_bytes_until_nul(&buf)
+			.map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "no NUL"))?;
 		Ok(std::ffi::OsString::from(cstr.to_string_lossy().into_owned()))
 	}
 }
