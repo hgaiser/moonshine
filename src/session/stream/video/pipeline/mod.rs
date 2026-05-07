@@ -137,6 +137,82 @@ fn log_latency_summary(samples: &[LatencySample]) {
 	);
 }
 
+/// (min, p50, p95, p99, max) over a per-stage latency series.
+type StagePercentiles = (u64, u64, u64, u64, u64);
+
+/// User-facing diagnostic: emit a multi-line INFO log with a per-stage
+/// latency table over the elapsed window. Format mirrors the bench
+/// summary so users can copy-paste straight into a bug report. Gated
+/// behind `[debug] log_stats_interval_secs` in the config — silent
+/// unless the user opts in.
+fn log_stage_summary_table(samples: &[LatencySample], frame_interval_us: u128) {
+	let n = samples.len();
+	if n == 0 {
+		return;
+	}
+
+	fn percentiles(values: impl Iterator<Item = u64>) -> StagePercentiles {
+		let mut v: Vec<u64> = values.collect();
+		v.sort_unstable();
+		let pick = |q: f64| v[((v.len() as f64 * q) as usize).min(v.len() - 1)];
+		(v[0], pick(0.50), pick(0.95), pick(0.99), v[v.len() - 1])
+	}
+
+	let stages: [(&str, StagePercentiles); 7] = [
+		(
+			"channel_wait",
+			percentiles(samples.iter().map(|s| s.channel_wait.as_micros() as u64)),
+		),
+		(
+			"import      ",
+			percentiles(samples.iter().map(|s| s.import.as_micros() as u64)),
+		),
+		(
+			"convert     ",
+			percentiles(samples.iter().map(|s| s.convert.as_micros() as u64)),
+		),
+		(
+			"encode      ",
+			percentiles(samples.iter().map(|s| s.encode.as_micros() as u64)),
+		),
+		(
+			"packetize   ",
+			percentiles(samples.iter().map(|s| s.packetize.as_micros() as u64)),
+		),
+		(
+			"send        ",
+			percentiles(samples.iter().map(|s| s.send.as_micros() as u64)),
+		),
+		(
+			"total       ",
+			percentiles(samples.iter().map(|s| s.total.as_micros() as u64)),
+		),
+	];
+
+	let spikes = samples
+		.iter()
+		.filter(|s| s.total.as_micros() > frame_interval_us)
+		.count();
+
+	// Format as a single multi-line message so journalctl renders it as
+	// one log entry rather than fragmenting across separate timestamps.
+	let mut out = String::with_capacity(512);
+	out.push_str(&format!("Latency summary over {n} frames:\n"));
+	out.push_str(" stage         min     p50     p95     p99     max     (microseconds)\n");
+	out.push_str(" -----         ---     ---     ---     ---     ---\n");
+	for (name, (min, p50, p95, p99, max)) in stages {
+		out.push_str(&format!(
+			" {name}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}\n",
+			min, p50, p95, p99, max
+		));
+	}
+	out.push_str(&format!(
+		" spikes: {spikes} / {n} frames > {frame_interval_us}us frame budget"
+	));
+
+	tracing::info!("{out}");
+}
+
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
@@ -158,6 +234,7 @@ impl VideoPipeline {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		log_frame_spikes: bool,
+		log_stage_summary_interval: Option<std::time::Duration>,
 		stats_tx: Option<std::sync::mpsc::Sender<LatencySample>>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
@@ -190,6 +267,7 @@ impl VideoPipeline {
 			max_reference_frames,
 			encryption_key,
 			log_frame_spikes,
+			log_stage_summary_interval,
 			stats_tx,
 			metrics,
 			trace_mode,
@@ -226,6 +304,9 @@ struct VideoPipelineInner {
 	max_reference_frames: u32,
 	encryption_key: Option<Vec<u8>>,
 	log_frame_spikes: bool,
+	/// When `Some`, emit a per-stage latency summary at INFO every N
+	/// seconds. `None` keeps the pipeline silent at INFO.
+	log_stage_summary_interval: Option<std::time::Duration>,
 	/// OTel metrics, resolved from the global meter at construction.
 	/// `None` is the path that runs in tests / when no meter is registered.
 	metrics: Option<Arc<PipelineMetrics>>,
@@ -832,9 +913,22 @@ impl VideoPipelineInner {
 
 				latency_samples.push(sample);
 
-				// Periodic summary every 5 seconds.
-				if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
+				// Periodic summary. The DEBUG `log_latency_summary` runs every
+				// 5 s for developers with `RUST_LOG=debug`. When a user opts
+				// into `log_stage_summary_interval_secs` in the config we
+				// additionally emit a multi-line INFO table that's easy to
+				// paste into a bug report — the diagnostic for users without
+				// the OTel + Grafana stack.
+				let debug_tick = last_summary_time.elapsed() >= std::time::Duration::from_secs(5);
+				let info_tick = self
+					.log_stage_summary_interval
+					.map(|d| last_summary_time.elapsed() >= d)
+					.unwrap_or(false);
+				if (debug_tick || info_tick) && !latency_samples.is_empty() {
 					log_latency_summary(&latency_samples);
+					if info_tick {
+						log_stage_summary_table(&latency_samples, frame_interval_us);
+					}
 					latency_samples.clear();
 					last_summary_time = std::time::Instant::now();
 

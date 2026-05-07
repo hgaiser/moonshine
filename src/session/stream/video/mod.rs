@@ -253,6 +253,11 @@ impl VideoStreamInner {
 			stop_session_manager.clone(),
 			hdr_metadata_tx,
 			self.config.stream.video.log_frame_spikes,
+			self.config
+				.debug
+				.log_stats_interval_secs
+				.filter(|s| *s > 0)
+				.map(std::time::Duration::from_secs),
 			None,
 		)?;
 

@@ -288,7 +288,8 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 		idr_rx,
 		session_shutdown.clone(),
 		hdr_metadata_tx,
-		false, // log_frame_spikes (we have our own report)
+		false, // log_frame_spikes (bench has its own end-of-run report)
+		None,  // log_stage_summary_interval (bench has its own end-of-run report)
 		Some(stats_tx),
 	)
 	.map_err(|()| tracing::error!("Failed to start video pipeline"))?;

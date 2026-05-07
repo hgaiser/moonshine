@@ -57,12 +57,34 @@ pub struct Config {
 	/// metrics, no overhead. When set, moonshine ships per-frame traces
 	/// and aggregated histograms/counters/gauges to the configured OTLP
 	/// gRPC endpoint, which the user runs (Tempo, Jaeger, SigNoz, an
-	/// otelcol passthrough, whatever).
+/// otelcol passthrough, whatever).
 	#[serde(default)]
 	pub telemetry: TelemetryConfigToml,
 
+	/// Optional debug / diagnostic settings. All knobs here default to
+	/// off; intended for users investigating performance issues.
+	#[serde(default)]
+	pub debug: DebugConfig,
+
 	#[serde(default)]
 	pub keyboard: KeyboardConfig,
+}
+
+/// Diagnostic/debug knobs. All optional, all default off.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DebugConfig {
+	/// When set, every N seconds the video pipeline emits an INFO-level log
+	/// containing a per-stage latency table over the elapsed window
+	/// (channel_wait / import / convert / encode / packetize / send / total,
+	/// each as min / p50 / p95 / p99 / max in microseconds, plus spike count).
+	/// Useful as a built-in diagnostic for users reporting stutters who
+	/// don't want to set up the OTel + Grafana stack — they can copy the
+	/// summary out of `journalctl --user -u moonshine` directly.
+	///
+	/// `None` (the default) keeps the pipeline silent at INFO. Sub-second
+	/// intervals are rejected.
+	#[serde(default)]
+	pub log_stats_interval_secs: Option<u64>,
 }
 
 /// TOML mirror of `crate::telemetry::TelemetryConfig`. Kept separate so
@@ -135,6 +157,7 @@ impl Default for Config {
 			gpu: None,
 			hdr_support: true,
 			telemetry: TelemetryConfigToml::default(),
+			debug: DebugConfig::default(),
 			stream_timeout: 60,
 			keyboard: KeyboardConfig::default(),
 		}

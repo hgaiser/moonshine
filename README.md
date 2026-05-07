@@ -182,6 +182,15 @@ Either `--app <title>` or a trailing `-- <cmd>` is required so the harness has s
 
 The summary printed at the end shows per-stage latency percentiles (`channel_wait`, `import`, `convert`, `encode`, `packetize`, `send`) and a totals row, plus spike count and observed FPS.
 
+For diagnosing performance, stuttering or latency issues during a streaming session, set:
+
+```toml
+[debug]
+log_stats_interval_secs = 30
+```
+
+…and the running pipeline will log the same per-stage table at INFO every 30 seconds, visible in `journalctl --user -u moonshine`.
+
 ## Telemetry
 
 Moonshine can optionally ship per-frame traces and aggregated metrics over OTLP/gRPC. Off by default; see [`examples/observability/README.md`](examples/observability/README.md) for setup, configuration, and a worked-example Grafana/Tempo/Prometheus stack.
