@@ -251,6 +251,27 @@ pub struct VideoStreamConfig {
 	/// the messages can be very noisy.
 	#[serde(default = "default_false")]
 	pub log_frame_spikes: bool,
+
+	/// Controls use of `VK_VALVE_video_encode_rgb_conversion`, which lets the
+	/// video encoder do RGB→YUV conversion inline (skipping the compute-shader
+	/// convert path). Currently only RADV (AMD on Linux) advertises the
+	/// extension; other drivers fall through to the compute-shader path.
+	///
+	/// - `auto` (default): use it when the device advertises support.
+	/// - `off`: always use the compute-shader path, even when supported.
+	///   Useful as an escape hatch if a driver regresses or for A/B testing.
+	/// - `force`: require it; encoder creation fails loudly if not supported.
+	#[serde(default)]
+	pub rgb_direct_encode: RgbDirectMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum RgbDirectMode {
+	#[default]
+	Auto,
+	Off,
+	Force,
 }
 
 impl Default for VideoStreamConfig {
@@ -260,6 +281,7 @@ impl Default for VideoStreamConfig {
 			fec_percentage: 20,
 			encrypt: false,
 			log_frame_spikes: false,
+			rgb_direct_encode: RgbDirectMode::default(),
 		}
 	}
 }

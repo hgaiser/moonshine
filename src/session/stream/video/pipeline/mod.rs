@@ -5,6 +5,7 @@
 
 mod dmabuf;
 mod hdr_sei;
+mod rgb_blitter;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -13,6 +14,7 @@ use ash::vk;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::config::RgbDirectMode;
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
@@ -141,6 +143,7 @@ impl VideoPipeline {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		log_frame_spikes: bool,
+		rgb_direct_mode: RgbDirectMode,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -158,6 +161,7 @@ impl VideoPipeline {
 			max_reference_frames,
 			encryption_key,
 			log_frame_spikes,
+			rgb_direct_mode,
 		};
 
 		std::thread::Builder::new()
@@ -191,6 +195,8 @@ struct VideoPipelineInner {
 	max_reference_frames: u32,
 	encryption_key: Option<Vec<u8>>,
 	log_frame_spikes: bool,
+	/// Controls VK_VALVE_video_encode_rgb_conversion usage at encoder creation.
+	rgb_direct_mode: RgbDirectMode,
 }
 
 impl VideoPipelineInner {
@@ -210,7 +216,7 @@ impl VideoPipelineInner {
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
 		// Create the encoder.
-		let (context, encoder) = match self.create_encoder() {
+		let (context, encoder, use_rgb_input) = match self.create_encoder() {
 			Ok(result) => result,
 			Err(e) => {
 				tracing::error!("Failed to create video encoder: {e}");
@@ -223,6 +229,7 @@ impl VideoPipelineInner {
 			frame_rx,
 			context,
 			encoder,
+			use_rgb_input,
 			packet_tx,
 			idr_frame_request_rx,
 			stop_session_manager,
@@ -234,7 +241,7 @@ impl VideoPipelineInner {
 		tracing::debug!("Video pipeline stopped.");
 	}
 
-	fn create_encoder(&self) -> Result<(VideoContext, Encoder), String> {
+	fn create_encoder(&self) -> Result<(VideoContext, Encoder, bool), String> {
 		// Create Vulkan video context.
 		let context = VideoContextBuilder::new()
 			.build()
@@ -246,6 +253,36 @@ impl VideoPipelineInner {
 			VideoFormat::Hevc => Codec::H265,
 			VideoFormat::Av1 => Codec::AV1,
 		};
+
+		// RGB-direct encode skips the compute-shader RGB→YUV pass and lets
+		// the video encoder hardware do the conversion inline. Enabled
+		// whenever the device advertises VK_VALVE_video_encode_rgb_conversion,
+		// unless overridden via [stream.video] rgb_direct_encode in config.
+		let device_supports_rgb_direct = context.supports_rgb_direct_encode();
+		let use_rgb_input = match self.rgb_direct_mode {
+			RgbDirectMode::Auto => device_supports_rgb_direct,
+			RgbDirectMode::Off => false,
+			RgbDirectMode::Force => {
+				if !device_supports_rgb_direct {
+					return Err(
+						"rgb_direct_encode = \"force\" but VK_VALVE_video_encode_rgb_conversion \
+						is not advertised by this device"
+							.to_string(),
+					);
+				}
+				true
+			},
+		};
+		match (self.rgb_direct_mode, device_supports_rgb_direct, use_rgb_input) {
+			(_, _, true) => tracing::info!("RGB-direct encode path active (VK_VALVE_video_encode_rgb_conversion)"),
+			(RgbDirectMode::Off, true, _) => tracing::info!(
+				"Compute-shader RGB→YUV path active (rgb_direct_encode = \"off\" overrides device support)"
+			),
+			(_, false, _) => tracing::info!(
+				"Compute-shader RGB→YUV path active (VK_VALVE_video_encode_rgb_conversion not supported by this device)"
+			),
+			_ => {},
+		}
 
 		// Convert pixel format.
 		let pixel_format = match self.chroma_sampling {
@@ -281,11 +318,12 @@ impl VideoPipelineInner {
 		.with_b_frames(0) // No B-frames for low latency
 		.with_max_reference_frames(self.max_reference_frames)
 		.with_virtual_buffer_size_ms(1000 / self.framerate)
-		.with_initial_virtual_buffer_size_ms(0);
+		.with_initial_virtual_buffer_size_ms(0)
+		.with_rgb_input(use_rgb_input);
 
 		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
 
-		Ok((context, encoder))
+		Ok((context, encoder, use_rgb_input))
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -294,6 +332,7 @@ impl VideoPipelineInner {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
+		use_rgb_input: bool,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
@@ -337,7 +376,9 @@ impl VideoPipelineInner {
 		};
 
 		// Color converter will be initialized on first frame.
+		// In RGB-direct mode this stays `None` and we use `rgb_blitter` instead.
 		let mut color_converter: Option<ColorConverter> = None;
+		let mut rgb_blitter: Option<rgb_blitter::RgbBlitter> = None;
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / self.framerate as f64);
@@ -491,83 +532,133 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
-				// Recreate the converter if the input format changed (e.g. GBM pool
-				// ABGR2101010 → direct scanout XBGR8888). The converter's image view
-				// format must match the source image format.
-				if let Some(ref conv) = color_converter {
-					if conv.config().input_format != frame_input_format {
-						tracing::info!(
-							"Input format changed from {:?} to {:?}, recreating color converter",
-							conv.config().input_format,
-							frame_input_format,
-						);
-						color_converter = None;
-					}
-				}
-
-				// Initialize converter if needed.
-				let converter = match &mut color_converter {
-					Some(conv) => conv,
-					None => {
-						let (color_space, full_range) = match self.dynamic_range {
-							VideoDynamicRange::Sdr => (ColorSpace::Bt709, true),
-							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, false),
-						};
-						let mut config =
-							ColorConverterConfig::new(self.width, self.height, frame_input_format, output_format);
-						config.color_space = color_space;
-						config.full_range = full_range;
-						match ColorConverter::new(context.clone(), config) {
-							Ok(conv) => {
-								color_converter = Some(conv);
-								color_converter.as_mut().unwrap()
+				if use_rgb_input {
+					// RGB-direct path: skip the compute-shader converter
+					// and copy the imported DMA-BUF straight into the
+					// encoder's RGB-formatted input image. The encoder
+					// hardware does the RGB→YUV conversion inline.
+					let blitter = match &mut rgb_blitter {
+						Some(b) => b,
+						None => match rgb_blitter::RgbBlitter::new(context.clone(), self.width, self.height) {
+							Ok(b) => {
+								rgb_blitter = Some(b);
+								rgb_blitter.as_mut().unwrap()
 							},
 							Err(e) => {
-								tracing::warn!("Failed to create color converter: {e}");
+								tracing::warn!("Failed to create RGB blitter: {e}");
 								frame.consumed.store(true, Ordering::Release);
 								continue;
 							},
-						}
-					},
-				};
-
-				// In HDR mode, select per-frame color space and encoder VUI
-				// based on the frame's actual color space. SDR frames are
-				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
-				// dynamic VUI switching in the encoder.
-				if self.dynamic_range == VideoDynamicRange::Hdr {
-					let frame_cs = frame.color_space;
-					let (cs, full_range, color_desc) = match frame_cs {
-						FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709()),
-						FrameColorSpace::Bt2020Pq => (ColorSpace::Bt2020, false, ColorDescription::bt2020_pq()),
+						},
 					};
 
-					// Switch encoder VUI first. Only update the converter if
-					// the encoder switch succeeds, so that the converter's
-					// color space stays in sync with the encoder's VUI.
-					if encoder_color_desc != Some(color_desc) {
-						tracing::info!(
-							"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
-						);
-						match encoder.set_color_description(color_desc) {
-							Ok(()) => {
-								encoder_color_desc = Some(color_desc);
-								converter.set_color_space(cs);
-								converter.set_full_range(full_range);
-							},
-							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
+					// In HDR mode, switch encoder VUI per-frame based on
+					// the frame's actual color space. With RGB-direct there
+					// is no software converter to keep in sync; the encoder
+					// handles the color matrix internally.
+					if self.dynamic_range == VideoDynamicRange::Hdr {
+						let frame_cs = frame.color_space;
+						let color_desc = match frame_cs {
+							FrameColorSpace::Srgb => ColorDescription::bt709(),
+							FrameColorSpace::Bt2020Pq => ColorDescription::bt2020_pq(),
+						};
+						if encoder_color_desc != Some(color_desc) {
+							tracing::info!(
+								"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
+							);
+							match encoder.set_color_description(color_desc) {
+								Ok(()) => encoder_color_desc = Some(color_desc),
+								Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
+							}
 						}
-					} else {
-						converter.set_color_space(cs);
-						converter.set_full_range(full_range);
 					}
-				}
 
-				// Convert to YUV.
-				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					tracing::warn!("GPU color conversion failed: {e}");
-					frame.consumed.store(true, Ordering::Release);
-					continue;
+					if let Err(e) = blitter.copy(source_image, src_layout, encoder.input_image()) {
+						tracing::warn!("RGB blit failed: {e}");
+						frame.consumed.store(true, Ordering::Release);
+						continue;
+					}
+				} else {
+					// Compute-shader path: convert RGB → YUV before encoding.
+					// Recreate the converter if the input format changed (e.g.
+					// GBM pool ABGR2101010 → direct scanout XBGR8888). The
+					// converter's image view format must match the source
+					// image format.
+					if let Some(ref conv) = color_converter {
+						if conv.config().input_format != frame_input_format {
+							tracing::info!(
+								"Input format changed from {:?} to {:?}, recreating color converter",
+								conv.config().input_format,
+								frame_input_format,
+							);
+							color_converter = None;
+						}
+					}
+
+					// Initialize converter if needed.
+					let converter = match &mut color_converter {
+						Some(conv) => conv,
+						None => {
+							let (color_space, full_range) = match self.dynamic_range {
+								VideoDynamicRange::Sdr => (ColorSpace::Bt709, true),
+								VideoDynamicRange::Hdr => (ColorSpace::Bt2020, false),
+							};
+							let mut config =
+								ColorConverterConfig::new(self.width, self.height, frame_input_format, output_format);
+							config.color_space = color_space;
+							config.full_range = full_range;
+							match ColorConverter::new(context.clone(), config) {
+								Ok(conv) => {
+									color_converter = Some(conv);
+									color_converter.as_mut().unwrap()
+								},
+								Err(e) => {
+									tracing::warn!("Failed to create color converter: {e}");
+									frame.consumed.store(true, Ordering::Release);
+									continue;
+								},
+							}
+						},
+					};
+
+					// In HDR mode, select per-frame color space and encoder VUI
+					// based on the frame's actual color space. SDR frames are
+					// encoded as BT.709 and HDR frames as BT.2020+PQ, with
+					// dynamic VUI switching in the encoder.
+					if self.dynamic_range == VideoDynamicRange::Hdr {
+						let frame_cs = frame.color_space;
+						let (cs, full_range, color_desc) = match frame_cs {
+							FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709()),
+							FrameColorSpace::Bt2020Pq => (ColorSpace::Bt2020, false, ColorDescription::bt2020_pq()),
+						};
+
+						// Switch encoder VUI first. Only update the converter if
+						// the encoder switch succeeds, so that the converter's
+						// color space stays in sync with the encoder's VUI.
+						if encoder_color_desc != Some(color_desc) {
+							tracing::info!(
+								"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
+							);
+							match encoder.set_color_description(color_desc) {
+								Ok(()) => {
+									encoder_color_desc = Some(color_desc);
+									converter.set_color_space(cs);
+									converter.set_full_range(full_range);
+								},
+								Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
+							}
+						} else {
+							converter.set_color_space(cs);
+							converter.set_full_range(full_range);
+						}
+					}
+
+					// Convert to YUV.
+					if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
+						tracing::warn!("GPU color conversion failed: {e}");
+						frame.consumed.store(true, Ordering::Release);
+						continue;
+					}
 				}
 
 				// The DMA-BUF content has been read into the encoder's input

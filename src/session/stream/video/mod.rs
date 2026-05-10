@@ -253,6 +253,7 @@ impl VideoStreamInner {
 			stop_session_manager.clone(),
 			hdr_metadata_tx,
 			self.config.stream.video.log_frame_spikes,
+			self.config.stream.video.rgb_direct_encode,
 		)?;
 
 		self.pipeline = Some(pipeline);
