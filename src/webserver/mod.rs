@@ -24,7 +24,10 @@ use tokio::net::TcpListener;
 use crate::{
 	clients::ClientManager,
 	config::Config,
-	session::{manager::SessionManager, SessionContext, SessionKeys},
+	session::{
+		manager::{AppLaunchError, SessionManager},
+		SessionContext, SessionKeys, APP_LAUNCH_HTTP_TIMEOUT_SECS,
+	},
 	webserver::tls::TlsAcceptor,
 };
 
@@ -658,7 +661,7 @@ impl Webserver {
 			None => {
 				let message = format!("Expected 'appid' in launch request, got {:?}.", params.keys());
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 		let application_id: i32 = match application_id.parse() {
@@ -666,7 +669,7 @@ impl Webserver {
 			Err(e) => {
 				let message = format!("Failed to parse application ID: {e}");
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 
@@ -675,21 +678,21 @@ impl Webserver {
 			None => {
 				let message = format!("Expected 'mode' in launch request, got {:?}.", params.keys());
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 		let mode_parts: Vec<&str> = mode.split('x').collect();
 		if mode_parts.len() != 3 {
 			let message = format!("Expected mode in format WxHxR, but got '{mode}'.");
 			tracing::warn!("{message}");
-			return bad_request(message);
+			return xml_error(400, &message);
 		}
 		let width: u32 = match mode_parts[0].parse() {
 			Ok(width) => width,
 			Err(e) => {
 				let message = format!("Failed to parse width: {e}");
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 		let height: u32 = match mode_parts[1].parse() {
@@ -697,7 +700,7 @@ impl Webserver {
 			Err(e) => {
 				let message = format!("Failed to parse height: {e}");
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 		let refresh_rate: u32 = match mode_parts[2].parse() {
@@ -705,7 +708,7 @@ impl Webserver {
 			Err(e) => {
 				let message = format!("Failed to parse refresh rate: {e}");
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 
@@ -714,7 +717,7 @@ impl Webserver {
 			None => {
 				let message = format!("Expected 'rikey' in launch request, got {:?}.", params.keys());
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 		let remote_input_key = match hex::decode(remote_input_key) {
@@ -722,7 +725,7 @@ impl Webserver {
 			Err(e) => {
 				let message = format!("Failed to decode remote input key: {e}");
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 
@@ -731,7 +734,7 @@ impl Webserver {
 			None => {
 				let message = format!("Expected 'rikey_id' in launch request, got {:?}.", params.keys());
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 		let remote_input_key_id: i64 = match remote_input_key_id.parse() {
@@ -740,7 +743,7 @@ impl Webserver {
 				let message =
 					format!("Couldn't parse 'rikey_id' in launch request, got '{remote_input_key_id}' with error: {e}");
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 
@@ -763,7 +766,7 @@ impl Webserver {
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 
@@ -773,7 +776,7 @@ impl Webserver {
 				application: application.clone(),
 				application_id,
 				resolution: (width, height),
-				_refresh_rate: refresh_rate,
+				refresh_rate,
 				keys: SessionKeys {
 					remote_input_key,
 					remote_input_key_id,
@@ -784,7 +787,41 @@ impl Webserver {
 			.await;
 
 		if initialize_result.is_err() {
-			return bad_request("Failed to start session".to_string());
+			return xml_error(400, "Failed to start session");
+		}
+
+		match tokio::time::timeout(
+			std::time::Duration::from_secs(APP_LAUNCH_HTTP_TIMEOUT_SECS),
+			self.session_manager.launch_session(),
+		)
+		.await
+		{
+			Ok(Ok(())) => {},
+			Ok(Err(AppLaunchError::CompositorFailed)) | Ok(Err(AppLaunchError::XWaylandTimeout)) => {
+				return xml_error(
+					503,
+					"Compositor failed to start (check Moonshine logs for more information).",
+				);
+			},
+			Ok(Err(AppLaunchError::SpawnFailed)) => {
+				return xml_error(
+					503,
+					"Application failed to start (check Moonshine logs for more information).",
+				);
+			},
+			Ok(Err(AppLaunchError::ExitedEarly)) => {
+				return xml_error(
+					503,
+					"Application failed to start (check Moonshine logs for more information).",
+				);
+			},
+			Err(_) => {
+				tracing::error!("Timed out waiting for application launch result.");
+				return xml_error(
+					503,
+					"Application failed to start (check Moonshine logs for more information).",
+				);
+			},
 		}
 
 		let mut response = "<root status_code=\"200\">".to_string();
@@ -816,7 +853,7 @@ impl Webserver {
 			None => {
 				let message = format!("Expected 'rikey' in resume request, got {:?}.", params.keys());
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 		let remote_input_key = match hex::decode(remote_input_key) {
@@ -824,7 +861,7 @@ impl Webserver {
 			Err(e) => {
 				let message = format!("Failed to decode remote input key: {e}");
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 
@@ -833,7 +870,7 @@ impl Webserver {
 			None => {
 				let message = format!("Expected 'rikey_id' in resume request, got {:?}.", params.keys());
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 		let remote_input_key_id: i64 = match remote_input_key_id.parse() {
@@ -842,7 +879,7 @@ impl Webserver {
 				let message =
 					format!("Couldn't parse 'rikey_id' in resume request, got '{remote_input_key_id}' with error: {e}");
 				tracing::warn!("{message}");
-				return bad_request(message);
+				return xml_error(400, &message);
 			},
 		};
 
@@ -854,7 +891,7 @@ impl Webserver {
 			})
 			.await;
 		if update_result.is_err() {
-			return bad_request("Failed to update session keys".to_string());
+			return xml_error(400, "Failed to update session keys");
 		}
 
 		let mut response = "<root status_code=\"200\">".to_string();
@@ -920,6 +957,32 @@ fn bad_request(message: String) -> Response<Full<Bytes>> {
 		.status(StatusCode::BAD_REQUEST)
 		.body(Full::new(Bytes::from(message)))
 		.unwrap()
+}
+
+fn xml_error(status_code: u16, message: &str) -> Response<Full<Bytes>> {
+	// Always return HTTP 200 so that Moonlight (Qt) reads the response body.
+	// Qt treats HTTP 4xx/5xx as network errors and never reads the body,
+	// so the XML error would be invisible to the client.
+	// The actual status code is embedded in the XML body for Moonlight to parse.
+	let body = format!(
+		"<root status_code=\"{status_code}\" status_message=\"{}\"></root>",
+		escape_xml(message)
+	);
+	match Response::builder()
+		.status(StatusCode::OK)
+		.body(Full::new(Bytes::from(body)))
+	{
+		Ok(mut response) => {
+			response
+				.headers_mut()
+				.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+			response
+		},
+		Err(e) => {
+			tracing::error!("Failed to build error response: {e}");
+			bad_request("Failed to build error response.".to_string())
+		},
+	}
 }
 
 const BOXART_WIDTH: u32 = 600;
