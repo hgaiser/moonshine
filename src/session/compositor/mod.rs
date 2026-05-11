@@ -27,6 +27,7 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::utils::Transform;
 
+use crate::config::KeyboardConfig;
 use crate::session::manager::SessionShutdownReason;
 
 use self::frame::ExportedFrame;
@@ -71,6 +72,7 @@ type CompositorHandles = (
 /// and a receiver for the XWayland display number.
 /// The compositor runs on its own `calloop::EventLoop` thread.
 pub fn start_compositor(
+	keyboard_config: KeyboardConfig,
 	config: CompositorConfig,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) -> Result<CompositorHandles, String> {
@@ -81,7 +83,7 @@ pub fn start_compositor(
 	std::thread::Builder::new()
 		.name("compositor".to_string())
 		.spawn(move || {
-			if let Err(e) = run_compositor(config, frame_tx, input_rx, ready_tx, stop) {
+			if let Err(e) = run_compositor(keyboard_config, config, frame_tx, input_rx, ready_tx, stop) {
 				tracing::error!("Compositor failed: {e}");
 			}
 		})
@@ -92,6 +94,7 @@ pub fn start_compositor(
 
 /// Main compositor loop running on a dedicated thread.
 fn run_compositor(
+	keyboard_config: KeyboardConfig,
 	config: CompositorConfig,
 	frame_tx: mpsc::SyncSender<ExportedFrame>,
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
@@ -268,6 +271,7 @@ fn run_compositor(
 		ready_tx,
 		&render_node,
 		hdr,
+		keyboard_config,
 	);
 
 	// Insert the Wayland display as a calloop event source so client

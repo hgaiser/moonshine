@@ -26,6 +26,7 @@ use smithay::desktop::utils::{take_presentation_feedback_surface_tree, OutputPre
 use std::collections::HashMap;
 
 use smithay::desktop::Space;
+use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::{Seat, SeatState};
 use smithay::output::Output;
@@ -50,6 +51,7 @@ use smithay::xwayland::X11Wm;
 
 use super::cursor::{self, PointerElement, PointerRenderElement};
 use super::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
+use crate::config::KeyboardConfig;
 
 /// Number of pre-allocated GBM buffers. Three allows the compositor to
 /// always have a free buffer: at most two frames are queued in the
@@ -425,6 +427,7 @@ impl MoonshineCompositor {
 		xdisplay_tx: mpsc::SyncSender<super::CompositorReady>,
 		render_node: &std::path::Path,
 		hdr: bool,
+		keyboard_config: KeyboardConfig,
 	) -> (Self, Display<Self>) {
 		let compositor_state = CompositorState::new::<Self>(&display_handle);
 		let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -439,11 +442,29 @@ impl MoonshineCompositor {
 		smithay::wayland::presentation::PresentationState::new::<Self>(&display_handle, 1);
 		let clock = Clock::new();
 
+		let mut xkb_config = XkbConfig::default();
+
+		if !keyboard_config.layout.is_empty() {
+			xkb_config.layout = &keyboard_config.layout;
+		}
+
+		if !keyboard_config.variant.is_empty() {
+			xkb_config.variant = &keyboard_config.variant;
+		}
+
+		if !keyboard_config.model.is_empty() {
+			xkb_config.model = &keyboard_config.model;
+		}
+
+		if let Some(options) = keyboard_config.options.clone().filter(|options| !options.is_empty()) {
+			xkb_config.options = Some(options);
+		}
+
 		let mut space = Space::default();
 
 		// Create seat with keyboard and pointer.
 		let mut seat = seat_state.new_wl_seat(&display_handle, "moonshine");
-		seat.add_keyboard(Default::default(), 200, 25)
+		seat.add_keyboard(xkb_config, 200, 25)
 			.expect("Failed to add keyboard to seat");
 		seat.add_pointer();
 

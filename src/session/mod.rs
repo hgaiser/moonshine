@@ -172,14 +172,17 @@ impl SessionInner {
 						gpu: self.config.gpu.clone(),
 						hdr,
 					};
-					let (frame_rx, input_tx, ready_rx) =
-						match compositor::start_compositor(compositor_config, stop_session_manager.clone()) {
-							Ok(handles) => handles,
-							Err(e) => {
-								tracing::error!("Failed to start compositor: {e}");
-								continue;
-							},
-						};
+					let (frame_rx, input_tx, ready_rx) = match compositor::start_compositor(
+						self.config.keyboard.clone(),
+						compositor_config,
+						stop_session_manager.clone(),
+					) {
+						Ok(handles) => handles,
+						Err(e) => {
+							tracing::error!("Failed to start compositor: {e}");
+							continue;
+						},
+					};
 
 					// Launch the application in a background thread that waits
 					// for XWayland to become ready.
