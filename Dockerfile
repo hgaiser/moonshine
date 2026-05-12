@@ -1,8 +1,7 @@
 FROM archlinux:base
 
 # 1. Configure pacman
-RUN sed -i '/^#\[multilib\]/s/^#//' /etc/pacman.conf && \
-    sed -i '/^#Include = \/etc\/pacman.d\/mirrorlist/s/^#//' /etc/pacman.conf && \
+RUN echo -e "\n[multilib]\nInclude = /etc/pacman.d/mirrorlist" >> /etc/pacman.conf && \
     sed -i 's/^#ParallelDownloads/ParallelDownloads/' /etc/pacman.conf
 
 # 2. Update and install base dependencies, GPU drivers, and audio
@@ -13,7 +12,7 @@ RUN pacman -Syu --noconfirm \
     nvidia-utils lib32-nvidia-utils \
     pipewire pipewire-pulse pipewire-alsa pipewire-jack \
     ttf-liberation ttf-dejavu noto-fonts noto-fonts-cjk \
-    sudo curl wget dbus xorg-xwayland gosu
+    sudo curl wget dbus xorg-xwayland
 
 # 3. Install Steam
 RUN pacman -S --noconfirm steam && \
