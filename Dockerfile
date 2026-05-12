@@ -36,7 +36,16 @@ RUN pacman -S --noconfirm git base-devel && \
     rm -rf /tmp/yay-bin /home/moonshine/.cache/yay && \
     pacman -Scc --noconfirm
 
-# 6. Set up entrypoint
+# 6. Enable systemd services and user lingering.
+# - dbus / avahi: required for zeroconf discovery
+# - moonshine@moonshine: the streaming server (from the AUR package)
+# - linger: starts systemd --user at boot without requiring a login session,
+#   which is required because moonshine uses "systemd-run --user --scope"
+#   to launch applications.
+RUN systemctl enable dbus avahi-daemon moonshine@moonshine && \
+    mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/moonshine
+
+# 7. Set up entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
@@ -45,4 +54,3 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["moonshine", "/home/moonshine/.config/moonshine/config.toml"]
