@@ -12,7 +12,7 @@ RUN pacman -Syu --noconfirm \
     nvidia-utils lib32-nvidia-utils \
     pipewire pipewire-pulse pipewire-alsa pipewire-jack \
     ttf-liberation ttf-dejavu noto-fonts noto-fonts-cjk \
-    sudo curl wget xorg-xwayland
+    sudo curl wget xorg-xwayland avahi
 
 # 3. Install Steam, Lutris, Wine and dependencies
 RUN pacman -S --noconfirm \
