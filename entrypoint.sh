@@ -17,4 +17,4 @@ if [ ! -S /run/dbus/system_bus_socket ]; then
 fi
 
 # Execute CMD as the unprivileged user
-exec gosu moonshine "$@"
+exec sudo -E -u moonshine -- "$@"
