@@ -36,14 +36,13 @@ RUN pacman -S --noconfirm git base-devel && \
     rm -rf /tmp/yay-bin /home/moonshine/.cache/yay && \
     pacman -Scc --noconfirm
 
-# 6. Enable systemd services and user lingering.
-# - dbus / avahi: required for zeroconf discovery
-# - moonshine@moonshine: the streaming server (from the AUR package)
-# - linger: starts systemd --user at boot without requiring a login session,
-#   which is required because moonshine uses "systemd-run --user --scope"
-#   to launch applications.
-RUN systemctl enable dbus avahi-daemon moonshine@moonshine && \
-    mkdir -p /var/lib/systemd/linger && touch /var/lib/systemd/linger/moonshine
+# 6. Install systemd-run shim.
+# Moonshine uses "systemd-run --user --scope" to launch applications,
+# which requires a full systemd user instance. In a container we replace
+# it with a shim that strips the systemd-run flags and execs the command
+# directly. Placed in /usr/local/bin so it shadows /usr/bin/systemd-run.
+COPY systemd-run-shim.sh /usr/local/bin/systemd-run
+RUN chmod +x /usr/local/bin/systemd-run
 
 # 7. Set up entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -54,3 +53,4 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["moonshine", "/home/moonshine/.config/moonshine/config.toml"]

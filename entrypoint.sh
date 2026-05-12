@@ -1,8 +1,7 @@
 #!/bin/bash
-# Pre-systemd initialization.
-# This runs as root before exec'ing into systemd (PID 1).
-# Dynamic setup that depends on the runtime environment (host UID,
-# GPU devices) must happen here because it can't be baked into the image.
+# Moonshine container entrypoint.
+# Sets up the runtime environment and launches moonshine directly.
+# Uses a systemd-run shim to avoid requiring a full systemd instance.
 
 set -e
 
@@ -18,8 +17,18 @@ fi
 # Fix ownership of home directory and any bind-mounted paths within it.
 chown -R "$USER_ID:$GROUP_ID" /home/moonshine
 
-# Create XDG_RUNTIME_DIR (systemd-logind does this on a real system,
-# but in a minimal container it may not be fully functional).
+# Start D-Bus system bus (required by avahi).
+mkdir -p /run/dbus
+if [ ! -S /run/dbus/system_bus_socket ]; then
+    dbus-daemon --system --fork
+fi
+
+# Start Avahi for zeroconf/mDNS discovery.
+if ! pgrep -x "avahi-daemon" > /dev/null; then
+    avahi-daemon --daemonize --no-drop-root 2>/dev/null || true
+fi
+
+# Create XDG_RUNTIME_DIR.
 mkdir -p "/run/user/$USER_ID"
 chown "$USER_ID:$GROUP_ID" "/run/user/$USER_ID"
 chmod 700 "/run/user/$USER_ID"
@@ -29,8 +38,6 @@ mkdir -p /tmp/.X11-unix
 chmod 1777 /tmp/.X11-unix
 
 # Dynamically add the moonshine user to groups that own GPU and input devices.
-# Device files passed via --device retain their host GIDs, which won't match
-# the container's named groups.
 ensure_device_access() {
     local dev="$1"
     if [ -e "$dev" ]; then
@@ -49,8 +56,6 @@ done
 ensure_device_access /dev/uinput
 
 # Auto-detect GPU vendor and disable conflicting EGL/Vulkan ICDs.
-# nvidia-utils registers an EGL vendor that fails fatally when no NVIDIA GPU
-# is present, preventing Mesa (AMD/Intel) from initializing.
 if [ ! -e /dev/nvidia0 ] && [ ! -d /proc/driver/nvidia ]; then
     echo "No NVIDIA GPU detected, disabling NVIDIA EGL/Vulkan ICDs."
     rm -f /usr/share/glvnd/egl_vendor.d/10_nvidia.json
@@ -58,5 +63,17 @@ if [ ! -e /dev/nvidia0 ] && [ ! -d /proc/driver/nvidia ]; then
     rm -f /usr/share/vulkan/implicit_layer.d/nvidia_layers.json
 fi
 
-# Hand off to systemd as PID 1.
-exec /usr/lib/systemd/systemd
+# Set environment for the unprivileged user.
+export HOME=/home/moonshine
+export USER=moonshine
+export XDG_RUNTIME_DIR="/run/user/$USER_ID"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$USER_ID/bus"
+export RUST_LOG="${RUST_LOG:-info}"
+
+# Start a session D-Bus bus for the user (needed by applications like Steam).
+sudo -u moonshine dbus-daemon --session \
+    --address="$DBUS_SESSION_BUS_ADDRESS" \
+    --fork --print-pid 2>/dev/null || true
+
+# Execute moonshine as the unprivileged user.
+exec sudo -E -u moonshine -- "$@"
