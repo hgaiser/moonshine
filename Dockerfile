@@ -14,13 +14,9 @@ RUN pacman -Syu --noconfirm \
     ttf-liberation ttf-dejavu noto-fonts noto-fonts-cjk \
     sudo curl wget xorg-xwayland
 
-# 3. Install Steam
-RUN pacman -S --noconfirm steam && \
-    pacman -Scc --noconfirm
-
-# 4. Install Lutris, Wine and dependencies
+# 3. Install Steam, Lutris, Wine and dependencies
 RUN pacman -S --noconfirm \
-    lutris wine-staging winetricks \
+    steam lutris wine-staging winetricks \
     gamemode lib32-gamemode mangohud lib32-mangohud \
     lib32-giflib lib32-mpg123 openal lib32-openal \
     v4l-utils lib32-v4l-utils lib32-libpulse lib32-libjpeg-turbo \
@@ -28,19 +24,19 @@ RUN pacman -S --noconfirm \
     libxslt lib32-libxslt lib32-gtk3 && \
     pacman -Scc --noconfirm
 
-# 5. Create unprivileged user (needed for AUR builds)
+# 4. Create unprivileged user (needed for AUR builds)
 RUN useradd -m -s /bin/bash -u 1000 moonshine && \
     usermod -aG video,audio,render,input moonshine && \
     echo "moonshine ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
 
-# 6. Install ES-DE & Moonshine via AUR
+# 5. Install ES-DE & Moonshine via AUR
 RUN pacman -S --noconfirm git base-devel && \
     sudo -u moonshine bash -c "git clone https://aur.archlinux.org/yay-bin.git /tmp/yay-bin && cd /tmp/yay-bin && makepkg -si --noconfirm" && \
     sudo -u moonshine bash -c "yay -S --noconfirm emulationstation-de moonshine" && \
     rm -rf /tmp/yay-bin /home/moonshine/.cache/yay && \
     pacman -Scc --noconfirm
 
-# 7. Set up entrypoint
+# 6. Set up entrypoint
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
@@ -49,4 +45,4 @@ ENV NVIDIA_VISIBLE_DEVICES=all
 ENV NVIDIA_DRIVER_CAPABILITIES=all
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
-CMD ["moonshine"]
+CMD ["moonshine", "/home/moonshine/.config/moonshine/config.toml"]
