@@ -43,9 +43,9 @@ use opentelemetry_sdk::{
 };
 #[cfg(feature = "telemetry")]
 use opentelemetry_semantic_conventions::resource as semres;
+use serde::{Deserialize, Serialize};
 use std::sync::OnceLock;
 use std::time::Duration;
-use serde::{Deserialize, Serialize};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Global trace-mode snapshot, populated by `init()` and read by hot
@@ -440,9 +440,7 @@ impl PipelineMetrics {
 				stage_latency_us: meter
 					.u64_histogram("moonshine.stage_latency")
 					.with_unit("us")
-					.with_description(
-						"Per-stage frame latency (channel_wait/import/convert/encode/packetize/send)",
-					)
+					.with_description("Per-stage frame latency (channel_wait/import/convert/encode/packetize/send)")
 					.build(),
 				total_latency_us: meter
 					.u64_histogram("moonshine.total_latency")

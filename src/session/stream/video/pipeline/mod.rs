@@ -178,7 +178,11 @@ fn log_stage_summary_table(samples: &[LatencySample], frame_interval_us: u128) {
 	fn percentiles(values: impl Iterator<Item = u64>) -> StagePercentiles {
 		let mut v: Vec<u64> = values.collect();
 		v.sort_unstable();
-		let pick = |q: f64| v[((v.len() as f64 * q).ceil() as usize).saturating_sub(1).min(v.len() - 1)];
+		let pick = |q: f64| {
+			v[((v.len() as f64 * q).ceil() as usize)
+				.saturating_sub(1)
+				.min(v.len() - 1)]
+		};
 		(v[0], pick(0.50), pick(0.95), pick(0.99), v[v.len() - 1])
 	}
 
