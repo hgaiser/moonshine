@@ -16,8 +16,6 @@ use tokio::sync::{broadcast, mpsc, watch};
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 use crate::telemetry::{FrameAttrs, PipelineLatency, PipelineMetrics, TraceMode};
-#[cfg(feature = "telemetry")]
-use opentelemetry::global as otel_global;
 
 use super::packetizer::Packetizer;
 use super::shard_batch::ShardBatch;
@@ -66,7 +64,33 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	}
 }
 
-pub struct VideoPipeline {}
+/// Handle to the running video pipeline thread.
+///
+/// Holds the `JoinHandle` for the pipeline worker so that:
+/// - The pipeline thread is no longer silently detached; callers can
+///   observe completion.
+/// - `Drop` joins the thread and logs a warning if it panicked, rather
+///   than letting the panic go unnoticed until the process exits.
+///
+/// The thread is driven to completion by channel closure (the frame
+/// receiver and packet sender going away), not by an explicit stop
+/// signal stored here. Callers are expected to trigger the
+/// `SessionShutdownManager` before dropping this handle so the thread
+/// exits promptly rather than blocking `Drop` indefinitely.
+pub struct VideoPipeline {
+	thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for VideoPipeline {
+	fn drop(&mut self) {
+		if let Some(handle) = self.thread.take() {
+			match handle.join() {
+				Ok(()) => tracing::debug!("Video pipeline thread exited cleanly."),
+				Err(_) => tracing::warn!("Video pipeline thread panicked."),
+			}
+		}
+	}
+}
 
 /// A single frame's latency breakdown for periodic summary reporting.
 #[derive(Clone)]
@@ -154,7 +178,7 @@ fn log_stage_summary_table(samples: &[LatencySample], frame_interval_us: u128) {
 	fn percentiles(values: impl Iterator<Item = u64>) -> StagePercentiles {
 		let mut v: Vec<u64> = values.collect();
 		v.sort_unstable();
-		let pick = |q: f64| v[((v.len() as f64 * q) as usize).min(v.len() - 1)];
+		let pick = |q: f64| v[((v.len() as f64 * q).ceil() as usize).saturating_sub(1).min(v.len() - 1)];
 		(v[0], pick(0.50), pick(0.95), pick(0.99), v[v.len() - 1])
 	}
 
@@ -245,11 +269,6 @@ impl VideoPipeline {
 		// recording into them just drops on the floor. With the `telemetry`
 		// feature disabled at compile time, `PipelineMetrics::new` is a
 		// no-op stub and `record_frame` calls are dead code.
-		#[cfg(feature = "telemetry")]
-		let metrics = Some(Arc::new(PipelineMetrics::new(&otel_global::meter(
-			"moonshine.pipeline",
-		))));
-		#[cfg(not(feature = "telemetry"))]
 		let metrics = Some(Arc::new(PipelineMetrics::new()));
 		let trace_mode = crate::telemetry::trace_mode();
 
@@ -273,7 +292,7 @@ impl VideoPipeline {
 			trace_mode,
 		};
 
-		std::thread::Builder::new()
+		let thread = std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
 				inner.run(
@@ -286,7 +305,7 @@ impl VideoPipeline {
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
 
-		Ok(Self {})
+		Ok(Self { thread: Some(thread) })
 	}
 }
 
@@ -459,7 +478,11 @@ impl VideoPipelineInner {
 		// of buffer slots, so it cycles within a session and would bias
 		// sampling to a fixed subset of buffers rather than ~r fraction of
 		// frames over time.
+		// A per-session random salt breaks any correlation between the keep
+		// set and frame-index-aligned patterns (e.g. key frames at fixed
+		// intervals always landing in or out of the sample window).
 		let mut sample_counter: u64 = 0;
+		let sample_salt: u64 = rand::random();
 
 		// Determine output YUV format based on chroma sampling and dynamic range.
 		let output_format = match (self.chroma_sampling, self.dynamic_range) {
@@ -861,6 +884,14 @@ impl VideoPipelineInner {
 				};
 				if let (Some(metrics), Some(attrs)) = (&self.metrics, &frame_attrs) {
 					metrics.record_frame(attrs, &pipeline_lat);
+					// Record the dmabuf cache size on every frame so the gauge
+					// reflects the live value rather than the value at the last
+					// summary tick. One atomic load + one OTel gauge record;
+					// effectively free on the hot path.
+					#[cfg(feature = "telemetry")]
+					if let Some(importer) = &dmabuf_importer {
+						metrics.dmabuf_cache_size.record(importer.cache_len() as u64, &[]);
+					}
 				}
 
 				// Trace emission decision based on the configured mode:
@@ -879,7 +910,7 @@ impl VideoPipelineInner {
 					TraceMode::Static(r) if r >= 1.0 => true,
 					TraceMode::Static(r) if r <= 0.0 => false,
 					TraceMode::Static(r) => {
-						let h = sample_counter.wrapping_mul(0x9E3779B97F4A7C15);
+						let h = sample_counter.wrapping_mul(0x9E3779B97F4A7C15) ^ sample_salt;
 						(h as f64 / u64::MAX as f64) < r
 					},
 					TraceMode::Outliers => is_spike,
@@ -931,14 +962,6 @@ impl VideoPipelineInner {
 					}
 					latency_samples.clear();
 					last_summary_time = std::time::Instant::now();
-
-					// Sample the dmabuf cache size into a gauge once per
-					// summary tick. Lets dashboards alert on unbounded
-					// growth (the leak that fix-dmabuf-leak addresses).
-					#[cfg(feature = "telemetry")]
-					if let (Some(metrics), Some(importer)) = (&self.metrics, &dmabuf_importer) {
-						metrics.dmabuf_cache_size.record(importer.cache_len() as u64, &[]);
-					}
 				}
 
 				if !pending_idr {

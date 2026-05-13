@@ -270,7 +270,10 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 		})
 		.map_err(|e| tracing::error!("Failed to spawn stats collector: {e}"))?;
 
-	let _pipeline = VideoPipeline::new(
+	// `pipeline` holds the JoinHandle for the pipeline thread. Drop at end
+	// of scope joins the thread; session_shutdown is triggered before that
+	// point so the thread exits promptly.
+	let pipeline = VideoPipeline::new(
 		frame_rx,
 		args.resolution.0,
 		args.resolution.1,
@@ -316,10 +319,33 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 		.args(["--user", "stop", &format!("{BENCH_SCOPE}.scope")])
 		.status();
 
+	// Join the pipeline thread before waiting on the stats collector.
+	// The pipeline thread holds stats_tx; dropping it closes the channel
+	// and lets the collector's recv() loop terminate naturally.
+	// spawn_blocking so the async runtime isn't stalled by the join.
+	let _ = tokio::task::spawn_blocking(move || drop(pipeline)).await;
+
 	// stats_tx is held by the pipeline thread; once that thread exits (due to
 	// session shutdown) the channel closes and the collector's recv() returns
-	// Err, ending the loop.
-	let timed_samples = stats_collector.join().unwrap_or_else(|_| Vec::new());
+	// Err, ending the loop. We wrap the join in spawn_blocking so the async
+	// timeout can fire if the pipeline thread hangs (e.g. stuck in a Vulkan
+	// call) and we still get to print whatever samples were collected so far.
+	let timed_samples = match tokio::time::timeout(
+		Duration::from_secs(5),
+		tokio::task::spawn_blocking(move || stats_collector.join().unwrap_or_else(|_| Vec::new())),
+	)
+	.await
+	{
+		Ok(Ok(samples)) => samples,
+		Ok(Err(_)) => {
+			tracing::warn!("Stats collector thread panicked; report will be empty.");
+			Vec::new()
+		},
+		Err(_) => {
+			tracing::warn!("Timed out waiting for stats collector; report may be incomplete.");
+			Vec::new()
+		},
+	};
 
 	report(&timed_samples, elapsed, &args, &bench_span);
 
@@ -386,7 +412,7 @@ fn report(timed: &[TimedSample], elapsed: Duration, args: &BenchArgs, bench_span
 	// can show "this bench run had p99=X / spikes=Y" without re-aggregating.
 	let mut totals_us: Vec<u64> = frame_samples.iter().map(|s| s.total.as_micros() as u64).collect();
 	totals_us.sort_unstable();
-	let pick = |q: f64| totals_us[((totals_us.len() as f64 * q) as usize).min(totals_us.len() - 1)];
+	let pick = |q: f64| totals_us[((totals_us.len() as f64 * q).ceil() as usize).saturating_sub(1).min(totals_us.len() - 1)];
 	bench_span.record("frames", n as u64);
 	bench_span.record("spikes", spike_indices.len() as u64);
 	bench_span.record("total_p50_us", pick(0.50));
@@ -416,7 +442,7 @@ fn print_stage(name: &str, values: impl Iterator<Item = Duration>) {
 		return;
 	}
 	us.sort_unstable();
-	let pick = |q: f64| us[((us.len() as f64 * q) as usize).min(us.len() - 1)];
+	let pick = |q: f64| us[((us.len() as f64 * q).ceil() as usize).saturating_sub(1).min(us.len() - 1)];
 	println!(
 		" {name}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
 		us[0],
