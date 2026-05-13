@@ -79,6 +79,56 @@ Then compile and run:
 cargo run --release -- /path/to/config.toml
 ```
 
+### Docker / Podman
+
+The included `Dockerfile` builds a self-contained Arch Linux image with Steam, Lutris, and ES-DE pre-installed. It supports AMD, NVIDIA, and Intel GPUs out of the box and runs unprivileged.
+
+**Build the image:**
+
+```sh
+docker build -t moonshine .
+```
+
+**Run (AMD / Intel GPU):**
+
+```sh
+docker run -d \
+    --name moonshine \
+    --net host \
+    --ipc host \
+    --device /dev/dri \
+    --device /dev/uinput \
+    -e HOST_UID=$(id -u) \
+    -e HOST_GID=$(id -g) \
+    -v /dev/shm:/dev/shm \
+    -v ~/.local/share/Steam:/home/moonshine/.local/share/Steam \
+    -v ~/.local/share/lutris:/home/moonshine/.local/share/lutris \
+    -v ~/.config/moonshine:/home/moonshine/.config/moonshine \
+    moonshine
+```
+
+**Run (NVIDIA GPU):**
+
+Add `--gpus all` instead of `--device /dev/dri` (requires [nvidia-container-toolkit](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html) on the host):
+
+```sh
+docker run -d \
+    --name moonshine \
+    --net host \
+    --ipc host \
+    --gpus all \
+    --device /dev/uinput \
+    -e HOST_UID=$(id -u) \
+    -e HOST_GID=$(id -g) \
+    -v /dev/shm:/dev/shm \
+    -v ~/.local/share/Steam:/home/moonshine/.local/share/Steam \
+    -v ~/.local/share/lutris:/home/moonshine/.local/share/lutris \
+    -v ~/.config/moonshine:/home/moonshine/.config/moonshine \
+    moonshine
+```
+
+The container works on fully headless servers — no display server or audio daemon is required on the host. A default `config.toml` is created automatically on first run.
+
 ## Configuration
 
 A configuration file is created automatically if the path you provide doesn't exist.
