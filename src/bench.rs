@@ -86,7 +86,15 @@ fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
 /// (after `--`) provides one inline.
 fn resolve_app(config: &Config, args: &BenchArgs) -> Result<ApplicationConfig, ()> {
 	if !args.cmd.is_empty() {
-		let title = args.cmd.first().cloned().unwrap_or_else(|| "bench".to_string());
+		// Use the basename of the executable as the display title rather than
+		// the full path (e.g. "glxgears" instead of "/usr/bin/glxgears").
+		let title = args
+			.cmd
+			.first()
+			.and_then(|p| std::path::Path::new(p).file_name())
+			.and_then(|n| n.to_str())
+			.unwrap_or("bench")
+			.to_string();
 		return Ok(ApplicationConfig {
 			title,
 			boxart: None,
@@ -352,13 +360,21 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 	Ok(())
 }
 
+/// Return the q-th percentile of a **sorted** slice of microsecond values.
+/// `q` must be in (0.0, 1.0]. Uses the "ceiling" formula so that p99 on a
+/// 100-element slice picks index 99 (the last element) rather than 98.
+fn percentile_sorted(sorted: &[u64], q: f64) -> u64 {
+	debug_assert!(!sorted.is_empty());
+	let idx = ((sorted.len() as f64 * q).ceil() as usize)
+		.saturating_sub(1)
+		.min(sorted.len() - 1);
+	sorted[idx]
+}
+
 fn report(timed: &[TimedSample], elapsed: Duration, args: &BenchArgs, bench_span: &tracing::Span) {
 	let warmup = Duration::from_secs(args.warmup);
-	let frame_samples: Vec<&LatencySample> = timed
-		.iter()
-		.filter(|s| s.elapsed >= warmup)
-		.map(|s| &s.sample)
-		.collect();
+	let warm_timed: Vec<&TimedSample> = timed.iter().filter(|s| s.elapsed >= warmup).collect();
+	let frame_samples: Vec<&LatencySample> = warm_timed.iter().map(|s| &s.sample).collect();
 
 	println!();
 	println!("======================================================================");
@@ -373,7 +389,7 @@ fn report(timed: &[TimedSample], elapsed: Duration, args: &BenchArgs, bench_span
 		elapsed.as_secs_f64(),
 		args.duration,
 		args.warmup,
-		timed.len() - frame_samples.len(),
+		timed.len() - warm_timed.len(),
 	);
 
 	if frame_samples.is_empty() {
@@ -412,11 +428,10 @@ fn report(timed: &[TimedSample], elapsed: Duration, args: &BenchArgs, bench_span
 	// can show "this bench run had p99=X / spikes=Y" without re-aggregating.
 	let mut totals_us: Vec<u64> = frame_samples.iter().map(|s| s.total.as_micros() as u64).collect();
 	totals_us.sort_unstable();
-	let pick = |q: f64| totals_us[((totals_us.len() as f64 * q).ceil() as usize).saturating_sub(1).min(totals_us.len() - 1)];
 	bench_span.record("frames", n as u64);
 	bench_span.record("spikes", spike_indices.len() as u64);
-	bench_span.record("total_p50_us", pick(0.50));
-	bench_span.record("total_p99_us", pick(0.99));
+	bench_span.record("total_p50_us", percentile_sorted(&totals_us, 0.50));
+	bench_span.record("total_p99_us", percentile_sorted(&totals_us, 0.99));
 	bench_span.record("total_max_us", *totals_us.last().unwrap());
 
 	println!();
@@ -430,7 +445,7 @@ fn report(timed: &[TimedSample], elapsed: Duration, args: &BenchArgs, bench_span
 	print_stage("send        ", frame_samples.iter().map(|s| s.send));
 	print_stage("total       ", frame_samples.iter().map(|s| s.total));
 
-	report_worst_spikes(timed, args.warmup, frame_interval_us);
+	report_worst_spikes(&warm_timed, frame_interval_us);
 
 	println!("======================================================================");
 }
@@ -442,23 +457,22 @@ fn print_stage(name: &str, values: impl Iterator<Item = Duration>) {
 		return;
 	}
 	us.sort_unstable();
-	let pick = |q: f64| us[((us.len() as f64 * q).ceil() as usize).saturating_sub(1).min(us.len() - 1)];
 	println!(
 		" {name}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}",
 		us[0],
-		pick(0.50),
-		pick(0.95),
-		pick(0.99),
+		percentile_sorted(&us, 0.50),
+		percentile_sorted(&us, 0.95),
+		percentile_sorted(&us, 0.99),
 		us[us.len() - 1],
 	);
 }
 
 /// Print up to 10 worst spikes (frames over the frame budget) for the run.
-fn report_worst_spikes(timed: &[TimedSample], warmup_secs: u64, frame_interval_us: u128) {
-	let warmup = Duration::from_secs(warmup_secs);
-	let mut spikes: Vec<&TimedSample> = timed
+/// `timed` must already be filtered to exclude the warmup window.
+fn report_worst_spikes(timed: &[&TimedSample], frame_interval_us: u128) {
+	let mut spikes: Vec<&&TimedSample> = timed
 		.iter()
-		.filter(|s| s.elapsed >= warmup && s.sample.total.as_micros() > frame_interval_us)
+		.filter(|s| s.sample.total.as_micros() > frame_interval_us)
 		.collect();
 	if spikes.is_empty() {
 		return;
