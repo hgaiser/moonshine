@@ -518,7 +518,15 @@ impl VideoPipelineInner {
 
 		// Rolling latency statistics for periodic summary.
 		let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
-		let mut last_summary_time = std::time::Instant::now();
+		// Separate timers for the two summary paths so they don't interfere:
+		// - last_debug_time: controls the 5-second DEBUG log (log_latency_summary).
+		//   Reads but never clears latency_samples, so the info window is unaffected.
+		// - last_info_time: controls the user-configured INFO table
+		//   (log_stage_summary_table). Only this timer's tick clears latency_samples.
+		//   When no info interval is configured, latency_samples is cleared on the
+		//   debug tick instead (original behaviour).
+		let mut last_debug_time = std::time::Instant::now();
+		let mut last_info_time = std::time::Instant::now();
 
 		// Track the last HDR mode state sent to the control stream.
 		let mut last_hdr_state = HdrModeState {
@@ -950,18 +958,36 @@ impl VideoPipelineInner {
 				// additionally emit a multi-line INFO table that's easy to
 				// paste into a bug report — the diagnostic for users without
 				// the OTel + Grafana stack.
-				let debug_tick = last_summary_time.elapsed() >= std::time::Duration::from_secs(5);
-				let info_tick = self
-					.log_stage_summary_interval
-					.map(|d| last_summary_time.elapsed() >= d)
-					.unwrap_or(false);
-				if (debug_tick || info_tick) && !latency_samples.is_empty() {
-					log_latency_summary(&latency_samples);
+				//
+				// The two ticks are tracked with separate timers: the debug tick
+				// reads latency_samples without clearing them, so samples continue
+				// accumulating for the full configured info interval. Clearing only
+				// happens when the governing timer (info if configured, otherwise
+				// debug) fires.
+				if !latency_samples.is_empty() {
+					let debug_tick = last_debug_time.elapsed() >= std::time::Duration::from_secs(5);
+					let info_tick = self
+						.log_stage_summary_interval
+						.map(|d| last_info_time.elapsed() >= d)
+						.unwrap_or(false);
+
+					if debug_tick {
+						log_latency_summary(&latency_samples);
+						last_debug_time = std::time::Instant::now();
+						// Clear the buffer only when no info interval is configured
+						// (preserving the original no-config behaviour).
+						if self.log_stage_summary_interval.is_none() {
+							latency_samples.clear();
+						}
+					}
 					if info_tick {
 						log_stage_summary_table(&latency_samples, frame_interval_us);
+						latency_samples.clear();
+						last_info_time = std::time::Instant::now();
+						// Reset the debug timer too so the next debug window starts
+						// from now, avoiding an immediate redundant emission.
+						last_debug_time = std::time::Instant::now();
 					}
-					latency_samples.clear();
-					last_summary_time = std::time::Instant::now();
 				}
 
 				if !pending_idr {
