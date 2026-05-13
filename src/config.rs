@@ -1,3 +1,4 @@
+use crate::telemetry::TelemetryConfig;
 use serde::{Deserialize, Serialize};
 use std::{
 	collections::hash_map::DefaultHasher,
@@ -59,7 +60,7 @@ pub struct Config {
 	/// gRPC endpoint, which the user runs (Tempo, Jaeger, SigNoz, an
 /// otelcol passthrough, whatever).
 	#[serde(default)]
-	pub telemetry: TelemetryConfigToml,
+	pub telemetry: TelemetryConfig,
 
 	/// Optional debug / diagnostic settings. All knobs here default to
 	/// off; intended for users investigating performance issues.
@@ -85,36 +86,6 @@ pub struct DebugConfig {
 	/// intervals are rejected.
 	#[serde(default)]
 	pub log_stats_interval_secs: Option<u64>,
-}
-
-/// TOML mirror of `crate::telemetry::TelemetryConfig`. Kept separate so
-/// the telemetry module can stay free of serde / TOML knowledge.
-///
-/// Example:
-///
-/// ```toml
-/// [telemetry]
-/// otlp_endpoint = "http://localhost:4317"
-/// trace_mode = "outliers"           # one of: "none", "outliers", "static"
-/// trace_sample_rate = 0.05          # only used when trace_mode = "static"
-/// metric_export_interval_ms = 10000
-/// ```
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-pub struct TelemetryConfigToml {
-	#[serde(default)]
-	pub otlp_endpoint: Option<String>,
-	#[serde(default)]
-	pub service_name: Option<String>,
-	/// `"none"`, `"outliers"`, or `"static"`. Default: `"outliers"`.
-	#[serde(default)]
-	pub trace_mode: Option<String>,
-	/// Trace sampling rate (0.0–1.0). Only consulted when
-	/// `trace_mode = "static"`.
-	#[serde(default)]
-	pub trace_sample_rate: Option<f64>,
-	/// Metric export interval in milliseconds.
-	#[serde(default)]
-	pub metric_export_interval_ms: Option<u64>,
 }
 
 impl Config {
@@ -156,7 +127,7 @@ impl Default for Config {
 			})],
 			gpu: None,
 			hdr_support: true,
-			telemetry: TelemetryConfigToml::default(),
+			telemetry: TelemetryConfig::default(),
 			debug: DebugConfig::default(),
 			stream_timeout: 60,
 			keyboard: KeyboardConfig::default(),

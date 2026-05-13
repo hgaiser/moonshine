@@ -28,7 +28,7 @@
 #[cfg(feature = "telemetry")]
 use opentelemetry::{
 	global,
-	metrics::{Counter, Gauge, Histogram, Meter},
+	metrics::{Counter, Gauge, Histogram},
 	trace::TracerProvider as _,
 	KeyValue,
 };
@@ -45,6 +45,7 @@ use opentelemetry_sdk::{
 use opentelemetry_semantic_conventions::resource as semres;
 use std::sync::OnceLock;
 use std::time::Duration;
+use serde::{Deserialize, Serialize};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 /// Global trace-mode snapshot, populated by `init()` and read by hot
@@ -104,32 +105,66 @@ impl TraceMode {
 /// the config file, or from bench-harness CLI flags. Always present so
 /// `Config` deserializes the same regardless of feature flags; ignored
 /// when the `telemetry` feature is disabled at compile time.
-#[derive(Debug, Clone)]
+///
+/// Example TOML:
+///
+/// ```toml
+/// [telemetry]
+/// otlp_endpoint = "http://localhost:4317"
+/// trace_mode = "outliers"           # one of: "none", "outliers", "static"
+/// trace_sample_rate = 0.05          # only used when trace_mode = "static"
+/// metric_export_interval_ms = 10000
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct TelemetryConfig {
 	/// OTLP/gRPC endpoint URL (e.g. "http://localhost:4317"). When `None`,
 	/// telemetry is disabled — no spans created, no metrics collected,
 	/// zero overhead beyond a couple of dead-code branches.
+	#[serde(default)]
 	pub otlp_endpoint: Option<String>,
 
 	/// Optional service name override (default: "moonshine").
+	#[serde(default)]
 	pub service_name: Option<String>,
 
-	/// What kind of trace data to emit on the per-frame hot path. See
-	/// `TraceMode` for semantics. Default: `Outliers`.
-	pub trace_mode: TraceMode,
+	/// Trace mode: `"none"`, `"outliers"`, or `"static"`. Default: `"outliers"`.
+	#[serde(default)]
+	pub trace_mode: Option<String>,
 
-	/// Metrics export interval. Defaults to 10s (Prometheus convention).
-	pub metric_export_interval: Duration,
+	/// Trace sampling rate (0.0–1.0). Only consulted when
+	/// `trace_mode = "static"`.
+	#[serde(default)]
+	pub trace_sample_rate: Option<f64>,
+
+	/// Metrics export interval in milliseconds. Defaults to 10 000 ms.
+	#[serde(default)]
+	pub metric_export_interval_ms: Option<u64>,
 }
 
-impl Default for TelemetryConfig {
-	fn default() -> Self {
-		Self {
-			otlp_endpoint: None,
-			service_name: None,
-			trace_mode: TraceMode::Outliers,
-			metric_export_interval: Duration::from_secs(10),
+impl TelemetryConfig {
+	/// Resolve the string `trace_mode` + `trace_sample_rate` fields into a
+	/// typed `TraceMode`. Falls back to `default_mode` when neither field is
+	/// set (allows callers to supply a context-appropriate default, e.g.
+	/// `Static(1.0)` for bench mode vs `Outliers` for normal sessions).
+	pub fn resolve_trace_mode(&self, default_mode: TraceMode) -> TraceMode {
+		match self.trace_mode.as_deref() {
+			Some("none") => TraceMode::None,
+			Some("outliers") => TraceMode::Outliers,
+			Some("static") => TraceMode::Static(self.trace_sample_rate.unwrap_or(0.05)),
+			Some(other) => {
+				tracing::warn!("Unknown trace_mode '{other}', falling back to default.");
+				default_mode
+			},
+			None => default_mode,
 		}
+	}
+
+	/// Metric export interval as a `Duration`. Defaults to 10 s when
+	/// `metric_export_interval_ms` is unset.
+	pub fn metric_export_interval(&self) -> Duration {
+		self.metric_export_interval_ms
+			.map(Duration::from_millis)
+			.unwrap_or(Duration::from_secs(10))
 	}
 }
 
@@ -237,7 +272,8 @@ pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard, String> {
 		};
 
 		// Endpoint is set — record the user's chosen mode for the pipeline.
-		let _ = TRACE_MODE.set(cfg.trace_mode);
+		let resolved_trace_mode = cfg.resolve_trace_mode(TraceMode::Outliers);
+		let _ = TRACE_MODE.set(resolved_trace_mode);
 
 		let service_name = cfg.service_name.clone().unwrap_or_else(|| "moonshine".to_string());
 		let resource = build_resource(&service_name);
@@ -248,7 +284,7 @@ pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard, String> {
 			.build()
 			.map_err(|e| format!("OTel: build span exporter: {e}"))?;
 
-		let sampler_ratio = cfg.trace_mode.sampler_ratio();
+		let sampler_ratio = resolved_trace_mode.sampler_ratio();
 		let tracer_provider = TracerProvider::builder()
 			.with_resource(resource.clone())
 			.with_sampler(Sampler::ParentBased(Box::new(Sampler::TraceIdRatioBased(
@@ -267,7 +303,7 @@ pub fn init(cfg: &TelemetryConfig) -> Result<TelemetryGuard, String> {
 			.map_err(|e| format!("OTel: build metric exporter: {e}"))?;
 
 		let reader = PeriodicReader::builder(metric_exporter, runtime::Tokio)
-			.with_interval(cfg.metric_export_interval)
+			.with_interval(cfg.metric_export_interval())
 			.build();
 
 		let meter_provider = SdkMeterProvider::builder()
@@ -388,31 +424,39 @@ impl FrameAttrs {
 }
 
 impl PipelineMetrics {
-	#[cfg(feature = "telemetry")]
-	pub fn new(meter: &Meter) -> Self {
-		Self {
-			frames_total: meter.u64_counter("moonshine.frames").build(),
-			spikes_total: meter.u64_counter("moonshine.spikes").build(),
-			stage_latency_us: meter
-				.u64_histogram("moonshine.stage_latency")
-				.with_unit("us")
-				.with_description("Per-stage frame latency (channel_wait/import/convert/encode/packetize/send)")
-				.build(),
-			total_latency_us: meter
-				.u64_histogram("moonshine.total_latency")
-				.with_unit("us")
-				.with_description("End-to-end host-processing latency per frame")
-				.build(),
-			encoded_bytes: meter.u64_histogram("moonshine.encoded_bytes").with_unit("By").build(),
-			dmabuf_cache_size: meter
-				.u64_gauge("moonshine.dmabuf.cache_size")
-				.with_description("Number of cached DMA-BUF imports currently resident")
-				.build(),
-		}
-	}
-
-	#[cfg(not(feature = "telemetry"))]
+	/// Construct metrics instruments. When the `telemetry` feature is enabled,
+	/// instruments are resolved from the global OTel meter provider (set up by
+	/// `telemetry::init`). When the provider is a no-op (no endpoint configured),
+	/// recording into the instruments is a no-op. When the feature is disabled
+	/// at compile time, this returns a zero-sized stub and `record_frame` is
+	/// dead code — no `#[cfg]` needed at callsites.
 	pub fn new() -> Self {
+		#[cfg(feature = "telemetry")]
+		{
+			let meter = global::meter("moonshine.pipeline");
+			Self {
+				frames_total: meter.u64_counter("moonshine.frames").build(),
+				spikes_total: meter.u64_counter("moonshine.spikes").build(),
+				stage_latency_us: meter
+					.u64_histogram("moonshine.stage_latency")
+					.with_unit("us")
+					.with_description(
+						"Per-stage frame latency (channel_wait/import/convert/encode/packetize/send)",
+					)
+					.build(),
+				total_latency_us: meter
+					.u64_histogram("moonshine.total_latency")
+					.with_unit("us")
+					.with_description("End-to-end host-processing latency per frame")
+					.build(),
+				encoded_bytes: meter.u64_histogram("moonshine.encoded_bytes").with_unit("By").build(),
+				dmabuf_cache_size: meter
+					.u64_gauge("moonshine.dmabuf.cache_size")
+					.with_description("Number of cached DMA-BUF imports currently resident")
+					.build(),
+			}
+		}
+		#[cfg(not(feature = "telemetry"))]
 		Self
 	}
 
