@@ -130,51 +130,36 @@ async fn main() -> Result<(), ()> {
 
 	// Install the tracing subscriber, plus (optional) OTel pipelines when
 	// the `telemetry` feature is enabled and a collector endpoint is set.
-	// CLI overrides win over config; empty-string CLI override disables.
-	#[cfg(feature = "telemetry")]
-	let telemetry_cfg = telemetry::TelemetryConfig {
-		otlp_endpoint: args
-			.otlp_endpoint
-			.clone()
-			.filter(|s| !s.is_empty())
-			.or_else(|| config.telemetry.otlp_endpoint.clone()),
-		service_name: config.telemetry.service_name.clone(),
-		// Trace mode resolution priority:
-		//   1) --trace-mode CLI (with --trace-sample-rate for static)
-		//   2) [telemetry] trace_mode in config (with trace_sample_rate)
-		//   3) Default: bench → Static(1.0) (full fidelity), else Outliers
-		trace_mode: {
-			let mode_str = args.trace_mode.clone().or_else(|| config.telemetry.trace_mode.clone());
-			let cli_rate = args.trace_sample_rate.or(config.telemetry.trace_sample_rate);
-			match mode_str.as_deref() {
-				Some("none") => telemetry::TraceMode::None,
-				Some("outliers") => telemetry::TraceMode::Outliers,
-				Some("static") => telemetry::TraceMode::Static(cli_rate.unwrap_or(0.05)),
-				Some(_) | None => {
-					#[cfg(feature = "bench")]
-					{
-						if matches!(args.command, Some(Command::Bench(_))) {
-							// Bench is short and we want everything.
-							telemetry::TraceMode::Static(1.0)
-						} else {
-							telemetry::TraceMode::Outliers
-						}
-					}
-					#[cfg(not(feature = "bench"))]
-					{
-						telemetry::TraceMode::Outliers
-					}
-				},
-			}
-		},
-		metric_export_interval: config
-			.telemetry
-			.metric_export_interval_ms
-			.map(std::time::Duration::from_millis)
-			.unwrap_or(std::time::Duration::from_secs(10)),
-	};
+	// Start from the config's [telemetry] table, then apply CLI overrides.
+	// CLI wins; an empty-string --otlp-endpoint disables telemetry even if
+	// the config enables it.
+	let mut telemetry_cfg = config.telemetry.clone();
 	#[cfg(not(feature = "telemetry"))]
-	let telemetry_cfg = telemetry::TelemetryConfig::default();
+	let _ = &mut telemetry_cfg; // silence unused-mut when telemetry feature is off
+	#[cfg(feature = "telemetry")]
+	{
+		// CLI endpoint override: empty string means "disable".
+		if let Some(ep) = args.otlp_endpoint.clone() {
+			telemetry_cfg.otlp_endpoint = if ep.is_empty() { None } else { Some(ep) };
+		}
+		// CLI trace-mode overrides.
+		if let Some(mode) = args.trace_mode.clone() {
+			telemetry_cfg.trace_mode = Some(mode);
+		}
+		if let Some(rate) = args.trace_sample_rate {
+			telemetry_cfg.trace_sample_rate = Some(rate);
+		}
+		// When bench mode is active and no trace_mode was set, default to
+		// full-fidelity static sampling so every frame of the short run
+		// is captured.
+		#[cfg(feature = "bench")]
+		if telemetry_cfg.trace_mode.is_none() {
+			if matches!(args.command, Some(Command::Bench(_))) {
+				telemetry_cfg.trace_mode = Some("static".to_string());
+				telemetry_cfg.trace_sample_rate = Some(1.0);
+			}
+		}
+	}
 
 	let _telemetry = telemetry::init(&telemetry_cfg).map_err(|e| eprintln!("telemetry init: {e}"))?;
 
