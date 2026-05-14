@@ -153,11 +153,9 @@ async fn main() -> Result<(), ()> {
 		// full-fidelity static sampling so every frame of the short run
 		// is captured.
 		#[cfg(feature = "bench")]
-		if telemetry_cfg.trace_mode.is_none() {
-			if matches!(args.command, Some(Command::Bench(_))) {
-				telemetry_cfg.trace_mode = Some("static".to_string());
-				telemetry_cfg.trace_sample_rate = Some(1.0);
-			}
+		if telemetry_cfg.trace_mode.is_none() && matches!(args.command, Some(Command::Bench(_))) {
+			telemetry_cfg.trace_mode = Some("static".to_string());
+			telemetry_cfg.trace_sample_rate = Some(1.0);
 		}
 	}
 
@@ -197,6 +195,7 @@ async fn main() -> Result<(), ()> {
 		// Drain pending OTel exports synchronously before exit. Bench
 		// runs are short enough that the BatchSpanProcessor's scheduled
 		// flush can lose the trailing window otherwise.
+		#[cfg(feature = "telemetry")]
 		_telemetry.force_flush();
 		let _ = shutdown.trigger_shutdown(result.map(|_| 0).unwrap_or(1));
 		let exit_code = shutdown.wait_shutdown_complete().await;

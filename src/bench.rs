@@ -191,7 +191,7 @@ pub async fn run(config: Config, args: BenchArgs, global_shutdown: ShutdownManag
 		gpu: config.gpu.clone(),
 		hdr: args.hdr,
 	};
-	let (frame_rx, _input_tx, ready_rx) = compositor::start_compositor(compositor_config, session_shutdown.clone())
+	let (frame_rx, _input_tx, ready_rx) = compositor::start_compositor(Default::default(), compositor_config, session_shutdown.clone())
 		.map_err(|e| tracing::error!("Failed to start compositor: {e}"))?;
 
 	let app_pulse_dir = pulse_dir.clone();
