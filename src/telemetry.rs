@@ -186,22 +186,19 @@ pub struct TelemetryGuard {
 impl TelemetryGuard {
 	/// Synchronously drain pending spans and metrics through their
 	/// exporters. Useful at end of bench mode where the batch processor
-	/// would otherwise lose the last few seconds. No-op when the
-	/// `telemetry` feature is disabled.
+	/// would otherwise lose the last few seconds.
+	#[cfg(all(feature = "telemetry", feature = "bench"))]
 	pub fn force_flush(&self) {
-		#[cfg(feature = "telemetry")]
-		{
-			if let Some(tp) = &self.tracer_provider {
-				for r in tp.force_flush() {
-					if let Err(e) = r {
-						tracing::warn!("OTel: tracer flush error: {e}");
-					}
+		if let Some(tp) = &self.tracer_provider {
+			for r in tp.force_flush() {
+				if let Err(e) = r {
+					tracing::warn!("OTel: tracer flush error: {e}");
 				}
 			}
-			if let Some(mp) = &self.meter_provider {
-				if let Err(e) = mp.force_flush() {
-					tracing::warn!("OTel: meter flush error: {e}");
-				}
+		}
+		if let Some(mp) = &self.meter_provider {
+			if let Err(e) = mp.force_flush() {
+				tracing::warn!("OTel: meter flush error: {e}");
 			}
 		}
 	}
@@ -349,9 +346,6 @@ pub struct PipelineMetrics {
 	pub dmabuf_cache_size: Gauge<u64>,
 }
 
-#[cfg(not(feature = "telemetry"))]
-pub struct PipelineMetrics;
-
 /// Per-pipeline cached attribute sets. Built once at session start,
 /// borrowed on every frame. Keeps the hot path allocation-free.
 #[cfg(feature = "telemetry")]
@@ -364,9 +358,7 @@ pub struct FrameAttrs {
 	pub stages: [(Stage, [KeyValue; 3]); 6],
 }
 
-#[cfg(not(feature = "telemetry"))]
-pub struct FrameAttrs;
-
+#[cfg(feature = "telemetry")]
 #[derive(Copy, Clone, Debug)]
 pub enum Stage {
 	ChannelWait,
@@ -377,8 +369,8 @@ pub enum Stage {
 	Send,
 }
 
+#[cfg(feature = "telemetry")]
 impl Stage {
-	#[cfg(feature = "telemetry")]
 	const fn label(self) -> &'static str {
 		match self {
 			Stage::ChannelWait => "channel_wait",
@@ -391,8 +383,8 @@ impl Stage {
 	}
 }
 
+#[cfg(feature = "telemetry")]
 impl FrameAttrs {
-	#[cfg(feature = "telemetry")]
 	pub fn new(codec: &str, hdr: bool) -> Self {
 		let mk_stage = |s: Stage| {
 			(
@@ -416,81 +408,62 @@ impl FrameAttrs {
 			],
 		}
 	}
-
-	#[cfg(not(feature = "telemetry"))]
-	pub fn new(_codec: &str, _hdr: bool) -> Self {
-		Self
-	}
 }
 
+#[cfg(feature = "telemetry")]
 impl PipelineMetrics {
-	/// Construct metrics instruments. When the `telemetry` feature is enabled,
-	/// instruments are resolved from the global OTel meter provider (set up by
-	/// `telemetry::init`). When the provider is a no-op (no endpoint configured),
-	/// recording into the instruments is a no-op. When the feature is disabled
-	/// at compile time, this returns a zero-sized stub and `record_frame` is
-	/// dead code — no `#[cfg]` needed at callsites.
+	/// Construct metrics instruments from the global OTel meter provider.
+	#[inline]
 	pub fn new() -> Self {
-		#[cfg(feature = "telemetry")]
-		{
-			let meter = global::meter("moonshine.pipeline");
-			Self {
-				frames_total: meter.u64_counter("moonshine.frames").build(),
-				spikes_total: meter.u64_counter("moonshine.spikes").build(),
-				stage_latency_us: meter
-					.u64_histogram("moonshine.stage_latency")
-					.with_unit("us")
-					.with_description("Per-stage frame latency (channel_wait/import/convert/encode/packetize/send)")
-					.build(),
-				total_latency_us: meter
-					.u64_histogram("moonshine.total_latency")
-					.with_unit("us")
-					.with_description("End-to-end host-processing latency per frame")
-					.build(),
-				encoded_bytes: meter.u64_histogram("moonshine.encoded_bytes").with_unit("By").build(),
-				dmabuf_cache_size: meter
-					.u64_gauge("moonshine.dmabuf.cache_size")
-					.with_description("Number of cached DMA-BUF imports currently resident")
-					.build(),
-			}
+		let meter = global::meter("moonshine.pipeline");
+		Self {
+			frames_total: meter.u64_counter("moonshine.frames").build(),
+			spikes_total: meter.u64_counter("moonshine.spikes").build(),
+			stage_latency_us: meter
+				.u64_histogram("moonshine.stage_latency")
+				.with_unit("us")
+				.with_description("Per-stage frame latency (channel_wait/import/convert/encode/packetize/send)")
+				.build(),
+			total_latency_us: meter
+				.u64_histogram("moonshine.total_latency")
+				.with_unit("us")
+				.with_description("End-to-end host-processing latency per frame")
+				.build(),
+			encoded_bytes: meter.u64_histogram("moonshine.encoded_bytes").with_unit("By").build(),
+			dmabuf_cache_size: meter
+				.u64_gauge("moonshine.dmabuf.cache_size")
+				.with_description("Number of cached DMA-BUF imports currently resident")
+				.build(),
 		}
-		#[cfg(not(feature = "telemetry"))]
-		Self
 	}
 
 	/// Record a fully-tagged latency sample. Uses pre-built `FrameAttrs`
 	/// so this hot-path call is ~9 atomic ops + 8 histogram records, no
-	/// allocations. No-op when the `telemetry` feature is disabled.
+	/// allocations.
 	#[inline]
 	pub fn record_frame(&self, attrs: &FrameAttrs, sample: &PipelineLatency) {
-		#[cfg(feature = "telemetry")]
-		{
-			self.frames_total.add(1, &attrs.frame);
-			self.total_latency_us.record(sample.total_us, &attrs.frame);
-			self.encoded_bytes.record(sample.encoded_bytes as u64, &attrs.frame);
-			let stage_us = [
-				sample.channel_wait_us,
-				sample.import_us,
-				sample.convert_us,
-				sample.encode_us,
-				sample.packetize_us,
-				sample.send_us,
-			];
-			for (i, (_, kvs)) in attrs.stages.iter().enumerate() {
-				self.stage_latency_us.record(stage_us[i], kvs);
-			}
-			if sample.total_us > sample.frame_budget_us {
-				self.spikes_total.add(1, &attrs.frame);
-			}
+		self.frames_total.add(1, &attrs.frame);
+		self.total_latency_us.record(sample.total_us, &attrs.frame);
+		self.encoded_bytes.record(sample.encoded_bytes as u64, &attrs.frame);
+		let stage_us = [
+			sample.channel_wait_us,
+			sample.import_us,
+			sample.convert_us,
+			sample.encode_us,
+			sample.packetize_us,
+			sample.send_us,
+		];
+		for (i, (_, kvs)) in attrs.stages.iter().enumerate() {
+			self.stage_latency_us.record(stage_us[i], kvs);
 		}
-		#[cfg(not(feature = "telemetry"))]
-		{
-			let _ = (attrs, sample);
+		if sample.total_us > sample.frame_budget_us {
+			self.spikes_total.add(1, &attrs.frame);
 		}
 	}
 }
 
 /// Mirror of the existing pipeline `LatencySample` shaped for metric emission.
+#[cfg(feature = "telemetry")]
 pub struct PipelineLatency {
 	pub channel_wait_us: u64,
 	pub import_us: u64,
