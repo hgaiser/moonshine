@@ -60,6 +60,9 @@ pub struct SessionContext {
 
 	/// Audio channel mask (Windows SPEAKER_ bitmask).
 	pub audio_channel_mask: u32,
+
+	/// HDR mode requested by the client at launch time.
+	pub hdr: bool,
 }
 
 enum SessionCommand {
@@ -118,6 +121,7 @@ impl Session {
 			// Compositor handles are stored here after Launch and consumed by Start.
 			compositor_frame_rx: None,
 			compositor_input_tx: None,
+			// HDR mode flag agreed during Start, used to configure streaming.
 			compositor_hdr: false,
 		};
 		tokio::spawn(inner.run(command_rx, context.clone(), stop_session_signal));
@@ -194,7 +198,7 @@ struct SessionInner {
 	compositor_frame_rx: Option<CompositorFrameRx>,
 	/// Input sender to the compositor, populated after Launch, consumed by Start.
 	compositor_input_tx: Option<CompositorInputTx>,
-	/// HDR mode flag agreed during Launch, used to configure streaming at Start.
+	/// HDR mode flag agreed during Start, used to configure streaming.
 	compositor_hdr: bool,
 }
 
@@ -217,15 +221,13 @@ impl SessionInner {
 		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 			match command {
 				SessionCommand::Launch(result_tx, app_shutdown_manager) => {
-					// Build the compositor config. HDR mode is not yet known at /launch time
-					// (it arrives via RTSP ANNOUNCE before PLAY), so we start SDR. If the
-					// client negotiates HDR later, the existing behaviour at Start time applies.
+					// HDR mode is known at /launch time from the client's query string.
 					let compositor_config = compositor::CompositorConfig {
 						width: session_context.resolution.0,
 						height: session_context.resolution.1,
 						refresh_rate: session_context.refresh_rate,
 						gpu: self.config.gpu.clone(),
-						hdr: false,
+						hdr: session_context.hdr,
 					};
 
 					// Channel to pass compositor handles back from the thread to SessionInner.
@@ -370,7 +372,7 @@ impl SessionInner {
 						Some(Ok(Ok((frame_rx, input_tx)))) => {
 							self.compositor_frame_rx = Some(frame_rx);
 							self.compositor_input_tx = Some(input_tx);
-							self.compositor_hdr = false;
+							self.compositor_hdr = session_context.hdr;
 						},
 						Some(Ok(Err(_))) => {
 							// Thread sent an error via result_tx; handles were not produced.
@@ -408,16 +410,9 @@ impl SessionInner {
 						},
 					};
 
-					// Use the HDR mode negotiated during RTSP ANNOUNCE (which arrives
-					// before PLAY / Start). If HDR was requested and the compositor was
-					// started SDR, log a warning about the limitation.
+					// HDR mode from RTSP ANNOUNCE (which arrives before PLAY / Start).
 					let hdr = video_stream_context.dynamic_range == VideoDynamicRange::Hdr;
-					if hdr && !self.compositor_hdr {
-						tracing::warn!(
-							"Client requested HDR but compositor was started in SDR mode at launch time. \
-							HDR metadata will be forwarded but the compositor colour space may not be optimal."
-						);
-					}
+					self.compositor_hdr = hdr;
 
 					// HDR metadata watch channel.
 					let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState {
@@ -440,7 +435,11 @@ impl SessionInner {
 					.await
 					{
 						Ok(video_stream) => video_stream,
-						Err(()) => continue,
+						Err(()) => {
+							tracing::error!("Failed to create video stream, stopping session.");
+							let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::CompositorStopped);
+							continue;
+						},
 					};
 					let Some(listener) = self.listener.take() else {
 						tracing::error!("No listener available for audio stream.");
@@ -455,7 +454,11 @@ impl SessionInner {
 					.await
 					{
 						Ok(audio_stream) => audio_stream,
-						Err(()) => continue,
+						Err(()) => {
+							tracing::error!("Failed to create audio stream, stopping session.");
+							let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::CompositorStopped);
+							continue;
+						},
 					};
 					let control_stream = match ControlStream::new(
 						self.config.clone(),
@@ -470,6 +473,7 @@ impl SessionInner {
 						Ok(control_stream) => control_stream,
 						Err(()) => {
 							tracing::error!("Failed to create control stream, killing session.");
+							let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::CompositorStopped);
 							continue;
 						},
 					};

@@ -761,6 +761,9 @@ impl Webserver {
 		};
 		let audio_channel_mask = surround_audio_info >> 16;
 
+		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);
+		let hdr = hdr_mode != 0;
+
 		let application = match self.config.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
 			None => {
@@ -783,6 +786,7 @@ impl Webserver {
 				},
 				audio_channels,
 				audio_channel_mask,
+				hdr,
 			})
 			.await;
 
@@ -798,18 +802,24 @@ impl Webserver {
 		{
 			Ok(Ok(())) => {},
 			Ok(Err(AppLaunchError::CompositorFailed)) | Ok(Err(AppLaunchError::XWaylandTimeout)) => {
+				// Clean up the partially-initialized session to allow retries.
+				let _ = self.session_manager.stop_session().await;
 				return xml_error(
 					503,
 					"Compositor failed to start (check Moonshine logs for more information).",
 				);
 			},
 			Ok(Err(AppLaunchError::SpawnFailed)) => {
+				// Clean up the partially-initialized session to allow retries.
+				let _ = self.session_manager.stop_session().await;
 				return xml_error(
 					503,
 					"Application failed to start (check Moonshine logs for more information).",
 				);
 			},
 			Ok(Err(AppLaunchError::ExitedEarly)) => {
+				// Clean up the partially-initialized session to allow retries.
+				let _ = self.session_manager.stop_session().await;
 				return xml_error(
 					503,
 					"Application failed to start (check Moonshine logs for more information).",
@@ -817,6 +827,8 @@ impl Webserver {
 			},
 			Err(_) => {
 				tracing::error!("Timed out waiting for application launch result.");
+				// Clean up the partially-initialized session to allow retries.
+				let _ = self.session_manager.stop_session().await;
 				return xml_error(
 					503,
 					"Application failed to start (check Moonshine logs for more information).",
