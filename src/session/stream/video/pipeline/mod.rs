@@ -15,7 +15,9 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
-use crate::telemetry::{FrameAttrs, PipelineLatency, PipelineMetrics, TraceMode};
+use crate::telemetry::TraceMode;
+#[cfg(feature = "telemetry")]
+use crate::telemetry::{FrameAttrs, PipelineLatency, PipelineMetrics};
 
 use super::packetizer::Packetizer;
 use super::shard_batch::ShardBatch;
@@ -31,6 +33,7 @@ use pixelforge::{
 /// Label string for OTel metric attributes. Keeps cardinality low (one
 /// of three known values) so collectors don't have to deal with arbitrary
 /// strings.
+#[cfg(feature = "telemetry")]
 fn codec_label(format: VideoFormat) -> &'static str {
 	match format {
 		VideoFormat::H264 => "h264",
@@ -102,7 +105,9 @@ pub(crate) struct LatencySample {
 	pub packetize: std::time::Duration,
 	pub send: std::time::Duration,
 	pub total: std::time::Duration,
+	#[cfg(feature = "bench")]
 	pub encoded_bytes: usize,
+	#[cfg(feature = "bench")]
 	pub is_key_frame: bool,
 }
 
@@ -273,7 +278,10 @@ impl VideoPipeline {
 		// recording into them just drops on the floor. With the `telemetry`
 		// feature disabled at compile time, `PipelineMetrics::new` is a
 		// no-op stub and `record_frame` calls are dead code.
+		#[cfg(feature = "telemetry")]
 		let metrics = Some(Arc::new(PipelineMetrics::new()));
+		#[cfg(not(feature = "telemetry"))]
+		let _metrics = ();
 		let trace_mode = crate::telemetry::trace_mode();
 
 		let inner = VideoPipelineInner {
@@ -292,6 +300,7 @@ impl VideoPipeline {
 			log_frame_spikes,
 			log_stage_summary_interval,
 			stats_tx,
+			#[cfg(feature = "telemetry")]
 			metrics,
 			trace_mode,
 		};
@@ -332,6 +341,7 @@ struct VideoPipelineInner {
 	log_stage_summary_interval: Option<std::time::Duration>,
 	/// OTel metrics, resolved from the global meter at construction.
 	/// `None` is the path that runs in tests / when no meter is registered.
+	#[cfg(feature = "telemetry")]
 	metrics: Option<Arc<PipelineMetrics>>,
 	/// Snapshot of `crate::telemetry::TraceMode` for the running session.
 	/// Read fresh from the global telemetry config at construction so we
@@ -503,12 +513,15 @@ impl VideoPipelineInner {
 		// don't change across a session, so we build the KeyValue arrays
 		// once and borrow them on every frame. `None` when telemetry is
 		// disabled — zero overhead when the global meter is the no-op.
+		#[cfg(feature = "telemetry")]
 		let frame_attrs = self.metrics.as_ref().map(|_| {
 			FrameAttrs::new(
 				codec_label(self.video_format),
 				self.dynamic_range == VideoDynamicRange::Hdr,
 			)
 		});
+		#[cfg(not(feature = "telemetry"))]
+		let _frame_attrs = ();
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / self.framerate as f64);
@@ -788,6 +801,7 @@ impl VideoPipelineInner {
 				let mut packetize_dur = std::time::Duration::ZERO;
 				let mut send_dur = std::time::Duration::ZERO;
 				let mut encoded_bytes = 0usize;
+				#[cfg(feature = "bench")]
 				let mut is_key_frame = false;
 				match encode_result {
 					Ok(packets) => {
@@ -802,7 +816,10 @@ impl VideoPipelineInner {
 							}
 
 							encoded_bytes += packet.data.len();
-							is_key_frame |= packet.is_key_frame;
+							#[cfg(feature = "bench")]
+							{
+								is_key_frame |= packet.is_key_frame;
+							}
 
 							let (p, s) = match self.send_packet(
 								&packet,
@@ -850,22 +867,42 @@ impl VideoPipelineInner {
 				// Warn on spike frames (total > frame interval) so they stand out in logs.
 				let frame_interval_us = 1_000_000 / self.framerate as u128;
 				if self.log_frame_spikes && total.as_micros() > frame_interval_us {
-					tracing::warn!(
-						total_us = total.as_micros() as u64,
-						channel_us = channel_wait.as_micros() as u64,
-						import_us = import_dur.as_micros() as u64,
-						convert_us = convert_dur.as_micros() as u64,
-						encode_us = encode_dur.as_micros() as u64,
-						packetize_us = packetize_dur.as_micros() as u64,
-						send_us = send_dur.as_micros() as u64,
-						encoded_bytes,
-						is_key_frame,
-						buffer_index = frame.buffer_index,
-						"SPIKE: frame latency exceeds {}us",
-						frame_interval_us
-					);
+					#[cfg(feature = "bench")]
+					{
+						tracing::warn!(
+							total_us = total.as_micros() as u64,
+							channel_us = channel_wait.as_micros() as u64,
+							import_us = import_dur.as_micros() as u64,
+							convert_us = convert_dur.as_micros() as u64,
+							encode_us = encode_dur.as_micros() as u64,
+							packetize_us = packetize_dur.as_micros() as u64,
+							send_us = send_dur.as_micros() as u64,
+							encoded_bytes,
+							is_key_frame,
+							buffer_index = frame.buffer_index,
+							"SPIKE: frame latency exceeds {}us",
+							frame_interval_us
+						);
+					}
+					#[cfg(not(feature = "bench"))]
+					{
+						tracing::warn!(
+							total_us = total.as_micros() as u64,
+							channel_us = channel_wait.as_micros() as u64,
+							import_us = import_dur.as_micros() as u64,
+							convert_us = convert_dur.as_micros() as u64,
+							encode_us = encode_dur.as_micros() as u64,
+							packetize_us = packetize_dur.as_micros() as u64,
+							send_us = send_dur.as_micros() as u64,
+							encoded_bytes,
+							buffer_index = frame.buffer_index,
+							"SPIKE: frame latency exceeds {}us",
+							frame_interval_us
+						);
+					}
 				}
 
+				#[cfg(feature = "bench")]
 				let sample = LatencySample {
 					channel_wait,
 					import: import_dur,
@@ -877,76 +914,125 @@ impl VideoPipelineInner {
 					encoded_bytes,
 					is_key_frame,
 				};
+				#[cfg(not(feature = "bench"))]
+				let sample = LatencySample {
+					channel_wait,
+					import: import_dur,
+					convert: convert_dur,
+					encode: encode_dur,
+					packetize: packetize_dur,
+					send: send_dur,
+					total,
+				};
 
-				// Record into OTel metrics (counters/histograms/gauges).
-				// Cheap by design — pre-built FrameAttrs, lock-free
+				// Record into OTel metrics (counters/histograms/gauges) and emit
+				// spans. Cheap by design — pre-built FrameAttrs, lock-free
 				// instruments, no allocations.
-				let total_us = total.as_micros() as u64;
-				let frame_budget_us = frame_interval_us as u64;
-				let pipeline_lat = PipelineLatency {
-					channel_wait_us: channel_wait.as_micros() as u64,
-					import_us: import_dur.as_micros() as u64,
-					convert_us: convert_dur.as_micros() as u64,
-					encode_us: encode_dur.as_micros() as u64,
-					packetize_us: packetize_dur.as_micros() as u64,
-					send_us: send_dur.as_micros() as u64,
-					total_us,
-					encoded_bytes,
-					frame_budget_us,
-				};
-				if let (Some(metrics), Some(attrs)) = (&self.metrics, &frame_attrs) {
-					metrics.record_frame(attrs, &pipeline_lat);
-					// Record the dmabuf cache size on every frame so the gauge
-					// reflects the live value rather than the value at the last
-					// summary tick. One atomic load + one OTel gauge record;
-					// effectively free on the hot path.
-					#[cfg(feature = "telemetry")]
-					if let Some(importer) = &dmabuf_importer {
-						metrics.dmabuf_cache_size.record(importer.cache_len() as u64, &[]);
-					}
-				}
-
-				// Trace emission decision based on the configured mode:
-				//   None      — no span at all
-				//   Static(r) — emit on ~`r` fraction of frames, decided
-				//                client-side so we don't pay span-creation
-				//                cost on rejected frames. Uses a per-session
-				//                monotonic counter mixed with a Knuth golden
-				//                ratio constant so the keep set is uniformly
-				//                distributed across the run.
-				//   Outliers  — span only when the frame spiked
-				sample_counter = sample_counter.wrapping_add(1);
-				let is_spike = total_us > frame_budget_us;
-				let emit_span = match self.trace_mode {
-					TraceMode::None => false,
-					TraceMode::Static(r) if r >= 1.0 => true,
-					TraceMode::Static(r) if r <= 0.0 => false,
-					TraceMode::Static(r) => {
-						let h = sample_counter.wrapping_mul(0x9E3779B97F4A7C15) ^ sample_salt;
-						(h as f64 / u64::MAX as f64) < r
-					},
-					TraceMode::Outliers => is_spike,
-				};
-				if emit_span {
-					let span = tracing::info_span!(
-						"frame.encode",
-						codec = codec_label(self.video_format),
-						hdr = self.dynamic_range == VideoDynamicRange::Hdr,
-						buffer_index = frame.buffer_index,
-						channel_wait_us = pipeline_lat.channel_wait_us,
-						import_us = pipeline_lat.import_us,
-						convert_us = pipeline_lat.convert_us,
-						encode_us = pipeline_lat.encode_us,
-						packetize_us = pipeline_lat.packetize_us,
-						send_us = pipeline_lat.send_us,
+				#[cfg(feature = "telemetry")]
+				{
+					let total_us = total.as_micros() as u64;
+					let frame_budget_us = frame_interval_us as u64;
+					let pipeline_lat = PipelineLatency {
+						channel_wait_us: channel_wait.as_micros() as u64,
+						import_us: import_dur.as_micros() as u64,
+						convert_us: convert_dur.as_micros() as u64,
+						encode_us: encode_dur.as_micros() as u64,
+						packetize_us: packetize_dur.as_micros() as u64,
+						send_us: send_dur.as_micros() as u64,
 						total_us,
 						encoded_bytes,
-						is_key_frame,
-						spike = is_spike,
-					);
-					// Enter+exit immediately; we don't have nested work
-					// to wrap, only metadata to ship.
-					let _g = span.enter();
+						frame_budget_us,
+					};
+					if let (Some(metrics), Some(attrs)) = (&self.metrics, &frame_attrs) {
+						metrics.record_frame(attrs, &pipeline_lat);
+						// Record the dmabuf cache size on every frame so the gauge
+						// reflects the live value rather than the value at the last
+						// summary tick. One atomic load + one OTel gauge record;
+						// effectively free on the hot path.
+						if let Some(importer) = &dmabuf_importer {
+							metrics.dmabuf_cache_size.record(importer.cache_len() as u64, &[]);
+						}
+					}
+
+					// Trace emission decision based on the configured mode:
+					//   None      — no span at all
+					//   Static(r) — emit on ~`r` fraction of frames, decided
+					//                client-side so we don't pay span-creation
+					//                cost on rejected frames. Uses a per-session
+					//                monotonic counter mixed with a Knuth golden
+					//                ratio constant so the keep set is uniformly
+					//                distributed across the run.
+					//   Outliers  — span only when the frame spiked
+					sample_counter = sample_counter.wrapping_add(1);
+					let is_spike = total_us > frame_budget_us;
+					let emit_span = match self.trace_mode {
+						TraceMode::None => false,
+						TraceMode::Static(r) if r >= 1.0 => true,
+						TraceMode::Static(r) if r <= 0.0 => false,
+						TraceMode::Static(r) => {
+							let h = sample_counter.wrapping_mul(0x9E3779B97F4A7C15) ^ sample_salt;
+							(h as f64 / u64::MAX as f64) < r
+						},
+						TraceMode::Outliers => is_spike,
+					};
+					if emit_span {
+						#[cfg(feature = "bench")]
+						{
+							let span = tracing::info_span!(
+								"frame.encode",
+								codec = codec_label(self.video_format),
+								hdr = self.dynamic_range == VideoDynamicRange::Hdr,
+								buffer_index = frame.buffer_index,
+								channel_wait_us = pipeline_lat.channel_wait_us,
+								import_us = pipeline_lat.import_us,
+								convert_us = pipeline_lat.convert_us,
+								encode_us = pipeline_lat.encode_us,
+								packetize_us = pipeline_lat.packetize_us,
+								send_us = pipeline_lat.send_us,
+								total_us,
+								encoded_bytes,
+								is_key_frame,
+								spike = is_spike,
+							);
+							let _g = span.enter();
+						}
+						#[cfg(not(feature = "bench"))]
+						{
+							let span = tracing::info_span!(
+								"frame.encode",
+								codec = codec_label(self.video_format),
+								hdr = self.dynamic_range == VideoDynamicRange::Hdr,
+								buffer_index = frame.buffer_index,
+								channel_wait_us = pipeline_lat.channel_wait_us,
+								import_us = pipeline_lat.import_us,
+								convert_us = pipeline_lat.convert_us,
+								encode_us = pipeline_lat.encode_us,
+								packetize_us = pipeline_lat.packetize_us,
+								send_us = pipeline_lat.send_us,
+								total_us,
+								encoded_bytes,
+								spike = is_spike,
+							);
+							let _g = span.enter();
+						}
+					}
+				}
+				#[cfg(not(feature = "telemetry"))]
+				{
+					let _ = dmabuf_importer;
+					sample_counter = sample_counter.wrapping_add(1);
+					let is_spike = total.as_micros() as u64 > frame_interval_us as u64;
+					let emit_span = match self.trace_mode {
+						TraceMode::None => false,
+						TraceMode::Static(r) if r >= 1.0 => true,
+						TraceMode::Static(r) if r <= 0.0 => false,
+						TraceMode::Static(r) => {
+							let h = sample_counter.wrapping_mul(0x9E3779B97F4A7C15) ^ sample_salt;
+							(h as f64 / u64::MAX as f64) < r
+						},
+						TraceMode::Outliers => is_spike,
+					};
+					let _ = (is_spike, emit_span);
 				}
 
 				if let Some(tx) = self.stats_tx.as_ref() {
