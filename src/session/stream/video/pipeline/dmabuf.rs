@@ -85,6 +85,7 @@ impl DmaBufImporter {
 	/// Number of currently-resident cached imports. Surfaced as the
 	/// `moonshine.dmabuf.cache_size` telemetry gauge so leak-shaped
 	/// accumulation is visible in dashboards.
+	#[cfg(feature = "telemetry")]
 	pub fn cache_len(&self) -> usize {
 		self.cache.len()
 	}
