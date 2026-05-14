@@ -50,7 +50,7 @@ pub struct Config {
 	#[serde(default = "default_true")]
 	pub hdr_support: bool,
 
-/// Time in seconds since last ping after which the stream closes.
+	/// Time in seconds since last ping after which the stream closes.
 	pub stream_timeout: u64,
 
 	/// Optional OpenTelemetry exporter configuration. When `otlp_endpoint`
@@ -58,7 +58,7 @@ pub struct Config {
 	/// metrics, no overhead. When set, moonshine ships per-frame traces
 	/// and aggregated histograms/counters/gauges to the configured OTLP
 	/// gRPC endpoint, which the user runs (Tempo, Jaeger, SigNoz, an
-/// otelcol passthrough, whatever).
+	/// otelcol passthrough, whatever).
 	#[serde(default)]
 	pub telemetry: TelemetryConfig,
 
