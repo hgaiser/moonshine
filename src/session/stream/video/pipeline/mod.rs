@@ -35,7 +35,7 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	// ABGR8888 = 0x34324241, XBGR8888 = 0x34324258
 	// ABGR2101010 = 0x30334241, XBGR2101010 = 0x30334258
 	// ARGB2101010 = 0x30335241, XRGB2101010 = 0x30335258
-	// ABGR16161616F = 0x48344241
+	// ABGR16161616F = 0x48344241, XBGR16161616F = 0x48344258
 	//
 	// X-variants share the same bit layout as their A-counterparts; the
 	// alpha bits are simply ignored. vkd3d-proton's swapchain typically
@@ -47,8 +47,8 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 		0x30334241 | 0x30334258 => {
 			(InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32) // ABGR/XBGR 2101010
 		},
-		0x48344241 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT), // ABGR16161616F
-		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                  // ARGB/XRGB8888 (fallback)
+		0x48344241 | 0x48344258 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT), // ABGR/XBGR16161616F
+		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                               // ARGB/XRGB8888 (fallback)
 	}
 }
 
