@@ -360,6 +360,8 @@ impl RtspServer {
 		let video_stream_context = VideoStreamContext {
 			width,
 			height,
+			render_width: 0,
+			render_height: 0,
 			fps,
 			packet_size,
 			bitrate,
