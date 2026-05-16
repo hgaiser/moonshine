@@ -146,7 +146,8 @@ impl Moonshine {
 				.ok_or_else(|| tracing::error!("Failed to find parent directory for certificate file."))?;
 			std::fs::create_dir_all(cert_dir)
 				.map_err(|e| tracing::error!("Failed to create certificate directory: {e}"))?;
-			let mut certfile = std::fs::File::create(&config.webserver.certificate).unwrap();
+			let mut certfile = std::fs::File::create(&config.webserver.certificate)
+				.map_err(|e| tracing::error!("Failed to create certificate file: {e}"))?;
 			certfile
 				.write(cert.as_bytes())
 				.map_err(|e| tracing::error!("Failed to write PEM to file: {e}"))?;
@@ -159,13 +160,14 @@ impl Moonshine {
 				.ok_or_else(|| tracing::error!("Failed to find parent directory for private key file."))?;
 			std::fs::create_dir_all(private_key_dir)
 				.map_err(|e| tracing::error!("Failed to create private key directory: {e}"))?;
-			let mut keyfile = std::fs::File::create(&config.webserver.private_key).unwrap();
+			let mut keyfile = std::fs::File::create(&config.webserver.private_key)
+				.map_err(|e| tracing::error!("Failed to create private key file: {e}"))?;
 			keyfile
 				.write(pkey.as_bytes())
 				.map_err(|e| tracing::error!("Failed to write private key to file: {e}"))?;
 
-			tracing::debug!("Saved private key to {}", config.webserver.certificate.display());
-			tracing::debug!("Saved certificate to {}", config.webserver.private_key.display());
+			tracing::debug!("Saved certificate to {}", config.webserver.certificate.display());
+			tracing::debug!("Saved private key to {}", config.webserver.private_key.display());
 
 			Ok((cert, pkey))
 		} else {
