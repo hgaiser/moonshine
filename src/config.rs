@@ -95,8 +95,8 @@ impl Config {
 
 	fn resolve_paths(&mut self) -> Result<(), ()> {
 		let cert_path = self.webserver.certificate.to_string_lossy().to_string();
-		let cert_path = shellexpand::full(&cert_path)
-			.map_err(|e| tracing::warn!("Failed to expand certificate path: {e}"))?;
+		let cert_path =
+			shellexpand::full(&cert_path).map_err(|e| tracing::warn!("Failed to expand certificate path: {e}"))?;
 		self.webserver.certificate = cert_path.to_string().into();
 
 		let private_key_path = self.webserver.private_key.to_string_lossy().to_string();

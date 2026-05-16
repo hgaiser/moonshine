@@ -372,8 +372,7 @@ pub async fn load_or_create_certificate(config: &Config) -> Result<(String, Stri
 	if !cert_path.exists() && !key_path.exists() {
 		tracing::info!("No certificate found, creating a new one.");
 
-		let (cert, pkey) =
-			create_certificate().map_err(|e| tracing::error!("Failed to create certificate: {e}"))?;
+		let (cert, pkey) = create_certificate().map_err(|e| tracing::error!("Failed to create certificate: {e}"))?;
 
 		// Write certificate to file.
 		let cert_dir = cert_path
@@ -381,8 +380,8 @@ pub async fn load_or_create_certificate(config: &Config) -> Result<(String, Stri
 			.ok_or_else(|| tracing::error!("Failed to find parent directory for certificate file."))?;
 		std::fs::create_dir_all(cert_dir)
 			.map_err(|e| tracing::error!("Failed to create certificate directory: {e}"))?;
-		let mut certfile = std::fs::File::create(cert_path)
-			.map_err(|e| tracing::error!("Failed to create certificate file: {e}"))?;
+		let mut certfile =
+			std::fs::File::create(cert_path).map_err(|e| tracing::error!("Failed to create certificate file: {e}"))?;
 		certfile
 			.write(cert.as_bytes())
 			.map_err(|e| tracing::error!("Failed to write PEM to file: {e}"))?;
@@ -391,10 +390,9 @@ pub async fn load_or_create_certificate(config: &Config) -> Result<(String, Stri
 		let key_dir = key_path
 			.parent()
 			.ok_or_else(|| tracing::error!("Failed to find parent directory for private key file."))?;
-		std::fs::create_dir_all(key_dir)
-			.map_err(|e| tracing::error!("Failed to create private key directory: {e}"))?;
-		let mut keyfile = std::fs::File::create(key_path)
-			.map_err(|e| tracing::error!("Failed to create private key file: {e}"))?;
+		std::fs::create_dir_all(key_dir).map_err(|e| tracing::error!("Failed to create private key directory: {e}"))?;
+		let mut keyfile =
+			std::fs::File::create(key_path).map_err(|e| tracing::error!("Failed to create private key file: {e}"))?;
 		keyfile
 			.write(pkey.as_bytes())
 			.map_err(|e| tracing::error!("Failed to write private key to file: {e}"))?;
@@ -407,8 +405,7 @@ pub async fn load_or_create_certificate(config: &Config) -> Result<(String, Stri
 		let cert = std::fs::read_to_string(cert_path)
 			.map_err(|e| tracing::error!("Failed to read server certificate: {e}"))?;
 
-		let pkey = std::fs::read_to_string(key_path)
-			.map_err(|e| tracing::error!("Failed to read private key: {e}"))?;
+		let pkey = std::fs::read_to_string(key_path).map_err(|e| tracing::error!("Failed to read private key: {e}"))?;
 
 		Ok((cert, pkey))
 	}
