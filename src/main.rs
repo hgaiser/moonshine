@@ -103,7 +103,7 @@ pub struct Moonshine {
 /// Dropping this struct will trigger the shutdown of all subsystems, so it should be kept alive until the application is ready to exit.
 impl Moonshine {
 	pub async fn new(config: Config, shutdown: ShutdownManager<i32>) -> Result<Self, ()> {
-		let state = State::new().await?;
+		let state = State::new()?;
 
 		// Load or create the TLS certificate and private key for the webserver.
 		let (cert, pkey) = Self::load_or_create_certificate(&config).await?;
@@ -123,7 +123,7 @@ impl Moonshine {
 		// Run the webserver.
 		let webserver = Webserver::new(
 			config,
-			state.get_uuid().await?,
+			state.get_uuid()?,
 			cert,
 			client_manager.clone(),
 			session_manager.clone(),

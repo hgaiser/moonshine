@@ -1,136 +1,19 @@
-use std::path::{Path, PathBuf};
+use std::collections::HashSet;
+use std::path::PathBuf;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::{mpsc, oneshot};
 
-enum StateCommand {
-	GetUuid(oneshot::Sender<String>),
-	Save(PathBuf, oneshot::Sender<Result<(), ()>>),
-	HasClient(String, oneshot::Sender<bool>),
-	AddClient(String),
-	HasPairedCert(String, oneshot::Sender<bool>),
-	AddPairedCert(String),
-	// RemoveClient(String, oneshot::Sender<bool>),
-}
-
-#[derive(Clone)]
-pub struct State {
-	command_tx: mpsc::Sender<StateCommand>,
-	path: PathBuf,
-}
-
-impl State {
-	pub async fn new() -> Result<Self, ()> {
-		let path = dirs::data_dir()
-			.ok_or_else(|| tracing::error!("Failed to get data directory."))?
-			.join("moonshine")
-			.join("state.toml");
-
-		let (command_tx, command_rx) = mpsc::channel(10);
-
-		let inner: StateInner;
-		if path.exists() {
-			let serialized =
-				std::fs::read_to_string(&path).map_err(|e| tracing::error!("Failed to read state file: {e}"))?;
-			inner = toml::from_str(&serialized)
-				.map_err(|e| tracing::error!("Failed to parse state file at '{}': {e}", path.display()))?;
-
-			tracing::debug!("Successfully loaded state from {:?}", path);
-			tracing::trace!("State: {inner:?}");
-
-			tokio::spawn(inner.run(command_rx));
-		} else {
-			let inner = StateInner::new();
-			tokio::spawn(inner.run(command_rx));
-		}
-
-		let state = Self { command_tx, path };
-		state.save().await?;
-
-		Ok(state)
-	}
-
-	pub async fn get_uuid(&self) -> Result<String, ()> {
-		let (uuid_tx, uuid_rx) = oneshot::channel();
-		self.command_tx
-			.send(StateCommand::GetUuid(uuid_tx))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send GetUuid command: {e}"))?;
-		uuid_rx
-			.await
-			.map_err(|e| tracing::warn!("Failed to receive GetUuid response: {e}"))
-	}
-
-	pub async fn save(&self) -> Result<(), ()> {
-		let (result_tx, result_rx) = oneshot::channel();
-		self.command_tx
-			.send(StateCommand::Save(self.path.clone(), result_tx))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send Save command: {e}"))?;
-		result_rx
-			.await
-			.map_err(|e| tracing::warn!("Failed to receive Save response: {e}"))?
-	}
-
-	pub async fn has_client(&self, client: String) -> Result<bool, ()> {
-		let (result_tx, result_rx) = oneshot::channel();
-		self.command_tx
-			.send(StateCommand::HasClient(client, result_tx))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send HasClient command: {e}"))?;
-		result_rx
-			.await
-			.map_err(|e| tracing::warn!("Failed to receive HasClient response: {e}"))
-	}
-
-	pub async fn add_client(&self, client: String) -> Result<(), ()> {
-		self.command_tx
-			.send(StateCommand::AddClient(client))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send AddClient command: {e}"))?;
-		self.save().await
-	}
-
-	pub async fn has_paired_cert(&self, fingerprint: String) -> Result<bool, ()> {
-		let (result_tx, result_rx) = oneshot::channel();
-		self.command_tx
-			.send(StateCommand::HasPairedCert(fingerprint, result_tx))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send HasPairedCert command: {e}"))?;
-		result_rx
-			.await
-			.map_err(|e| tracing::warn!("Failed to receive HasPairedCert response: {e}"))
-	}
-
-	pub async fn add_paired_cert(&self, fingerprint: String) -> Result<(), ()> {
-		self.command_tx
-			.send(StateCommand::AddPairedCert(fingerprint))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send AddPairedCert command: {e}"))?;
-		self.save().await
-	}
-
-	// pub async fn remove_client(&self, client: String) -> Result<bool, ()> {
-	// 	let (result_tx, result_rx) = oneshot::channel();
-	// 	self.command_tx.send(StateCommand::RemoveClient(client, result_tx)).await
-	// 		.map_err(|e| tracing::error!("Failed to send RemoveClient command: {e}"))?;
-	// 	let result = result_rx.await.map_err(|e| tracing::error!("Failed to receive RemoveClient response: {e}"))?;
-
-	// 	self.save().await?;
-
-	// 	Ok(result)
-	// }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct StateInner {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StateData {
 	unique_id: String,
-	clients: Vec<String>,
 	#[serde(default)]
-	paired_certs: Vec<String>,
+	clients: HashSet<String>,
+	#[serde(default)]
+	paired_certs: HashSet<String>,
 }
 
-impl StateInner {
+impl StateData {
 	fn new() -> Self {
 		Self {
 			unique_id: uuid::Uuid::new_v4().to_string(),
@@ -138,97 +21,123 @@ impl StateInner {
 			paired_certs: Default::default(),
 		}
 	}
+}
 
-	async fn run(mut self, mut command_rx: mpsc::Receiver<StateCommand>) {
-		while let Some(command) = command_rx.recv().await {
-			match command {
-				StateCommand::GetUuid(uuid_tx) => {
-					if uuid_tx.send(self.unique_id.clone()).is_err() {
-						tracing::error!("Failed to send GetUuid result.");
-					}
-				},
+#[derive(Clone)]
+pub struct State {
+	data: Arc<RwLock<StateData>>,
+	path: PathBuf,
+}
 
-				StateCommand::Save(file, result_tx) => {
-					let result = self.save(&file);
-					if result_tx.send(result).is_err() {
-						tracing::error!("Failed to send Save result.");
-					}
-				},
+impl State {
+	pub fn new() -> Result<Self, ()> {
+		let path = dirs::data_dir()
+			.ok_or_else(|| tracing::error!("Failed to get data directory."))?
+			.join("moonshine")
+			.join("state.toml");
 
-				StateCommand::HasClient(client, result_tx) => {
-					if result_tx.send(self.has_client(&client)).is_err() {
-						tracing::error!("Failed to send HasClient result.");
-					}
-				},
+		let data = if path.exists() {
+			let serialized =
+				std::fs::read_to_string(&path).map_err(|e| tracing::error!("Failed to read state file: {e}"))?;
+			let data: StateData = toml::from_str(&serialized)
+				.map_err(|e| tracing::error!("Failed to parse state file at '{}': {e}", path.display()))?;
 
-				StateCommand::AddClient(client) => {
-					// TODO: Return error to caller.
-					let _ = self.add_client(client);
-				},
+			tracing::debug!("Successfully loaded state from {:?}", path);
+			tracing::trace!("State: {data:?}");
 
-				StateCommand::HasPairedCert(fingerprint, result_tx) => {
-					if result_tx.send(self.has_paired_cert(&fingerprint)).is_err() {
-						tracing::error!("Failed to send HasPairedCert result.");
-					}
-				},
+			data
+		} else {
+			StateData::new()
+		};
 
-				StateCommand::AddPairedCert(fingerprint) => {
-					self.add_paired_cert(fingerprint);
-				},
-				// StateCommand::RemoveClient(client, result_tx) => {
-				// 	if result_tx.send(self.remove_client(client)).is_err() {
-				// 		tracing::error!("Failed to send RemoveClient result.");
-				// 	}
-				// },
-			}
-		}
+		let state = Self {
+			data: Arc::new(RwLock::new(data)),
+			path,
+		};
+		state.save()?;
+
+		Ok(state)
 	}
 
-	pub fn save<P: AsRef<Path>>(&self, file: P) -> Result<(), ()> {
-		let parent_dir = file
-			.as_ref()
+	pub fn get_uuid(&self) -> Result<String, ()> {
+		let data = self
+			.data
+			.read()
+			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+		Ok(data.unique_id.clone())
+	}
+
+	pub fn save(&self) -> Result<(), ()> {
+		let data = self
+			.data
+			.read()
+			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+		let parent_dir = self
+			.path
 			.parent()
-			.ok_or_else(|| tracing::warn!("Failed to get state dir for file {:?}", file.as_ref()))?;
+			.ok_or_else(|| tracing::warn!("Failed to get state dir for file {:?}", self.path))?;
 		std::fs::create_dir_all(parent_dir).map_err(|e| tracing::warn!("Failed to create state dir: {e}"))?;
 
 		std::fs::write(
-			file,
-			toml::to_string_pretty(self).map_err(|e| tracing::warn!("Failed to serialize state: {e}"))?,
+			&self.path,
+			toml::to_string_pretty(&*data).map_err(|e| tracing::warn!("Failed to serialize state: {e}"))?,
 		)
 		.map_err(|e| tracing::warn!("Failed to save state file: {e}"))
 	}
 
-	fn has_client(&self, key: &String) -> bool {
-		self.clients.contains(key)
+	pub fn has_client(&self, client: String) -> Result<bool, ()> {
+		let data = self
+			.data
+			.read()
+			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+		Ok(data.clients.contains(&client))
 	}
 
-	fn add_client(&mut self, key: String) -> bool {
-		if self.clients.contains(&key) {
-			tracing::warn!("Failed to add client ('{key}'), client already exists.");
-			false
+	pub fn add_client(&self, client: String) -> Result<bool, ()> {
+		let mut data = self
+			.data
+			.write()
+			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+		if data.clients.contains(&client) {
+			tracing::warn!("Failed to add client ('{client}'), client already exists.");
+			Ok(false)
 		} else {
-			self.clients.push(key);
-			true
+			data.clients.insert(client);
+			self.save()?;
+			Ok(true)
 		}
 	}
 
-	fn has_paired_cert(&self, fingerprint: &str) -> bool {
-		self.paired_certs.iter().any(|fp| fp == fingerprint)
+	pub fn has_paired_cert(&self, fingerprint: String) -> Result<bool, ()> {
+		let data = self
+			.data
+			.read()
+			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+		Ok(data.paired_certs.contains(&fingerprint))
 	}
 
-	fn add_paired_cert(&mut self, fingerprint: String) {
-		if !self.paired_certs.contains(&fingerprint) {
-			self.paired_certs.push(fingerprint);
+	pub fn add_paired_cert(&self, fingerprint: String) -> Result<bool, ()> {
+		let mut data = self
+			.data
+			.write()
+			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+		let inserted = data.paired_certs.insert(fingerprint);
+		if inserted {
+			self.save()?;
+		} else {
+			tracing::warn!("Failed to add paired cert, already exists.");
 		}
+		Ok(inserted)
 	}
 
-	// fn remove_client(&mut self, key: String) -> bool {
-	// 	if !self.clients.contains(&key) {
-	// 		tracing::error!("Failed to remove client ('{key}'), client doesn't exist.");
-	// 		false
-	// 	} else {
-	// 		self.clients.retain(|c| c != &key);
-	// 		true
+	// pub fn remove_client(&self, client: String) -> Result<bool, ()> {
+	// 	let mut data = self.data.write().map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+	// 	if !data.clients.contains(&client) {
+	// 		tracing::error!("Failed to remove client ('{client}'), client doesn't exist.");
+	// 		return Ok(false);
 	// 	}
+	// 	data.clients.shift_remove(&client);
+	// 	self.save()?;
+	// 	Ok(true)
 	// }
 }

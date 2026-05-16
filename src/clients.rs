@@ -302,7 +302,7 @@ impl ClientManagerInner {
 		let mut pending_clients = BTreeMap::new();
 		while let Some(command) = command_rx.recv().await {
 			match command {
-				ClientManagerCommand::IsPaired(command) => match state.has_client(command.id).await {
+				ClientManagerCommand::IsPaired(command) => match state.has_client(command.id) {
 					Ok(result) => {
 						command
 							.response
@@ -319,7 +319,7 @@ impl ClientManagerInner {
 					},
 				},
 
-				ClientManagerCommand::IsCertPaired(command) => match state.has_paired_cert(command.fingerprint).await {
+				ClientManagerCommand::IsCertPaired(command) => match state.has_paired_cert(command.fingerprint) {
 					Ok(result) => {
 						command
 							.response
@@ -447,12 +447,20 @@ impl ClientManagerInner {
 									// Verification succeeded — now persist the client and cert fingerprint.
 									let fingerprint = cert_pem_fingerprint(&client.pem);
 									if let Some(fp) = &fingerprint {
-										if let Err(()) = state.add_paired_cert(fp.clone()).await {
+										if state.add_paired_cert(fp.clone()).is_err() {
 											tracing::warn!("Failed to store paired cert fingerprint: {fp}");
+											command
+												.response
+												.send(Err("Failed to persist paired certificate".to_string()))
+												.map_err(|_| {
+													tracing::error!("Failed to send CheckClientPairingSecret response.")
+												})
+												.ok();
+											continue;
 										}
 									}
 
-									let Ok(has_client) = state.has_client(command.id.clone()).await else {
+									let Ok(has_client) = state.has_client(command.id.clone()) else {
 										command
 											.response
 											.send(Err("Failed to check client paired status.".to_string()))
@@ -465,8 +473,16 @@ impl ClientManagerInner {
 
 									if has_client {
 										tracing::info!("Client '{}' re-paired with updated certificate.", command.id);
-									} else if let Err(()) = state.add_client(command.id.clone()).await {
+									} else if state.add_client(command.id.clone()).is_err() {
 										tracing::warn!("Failed to persist client '{}'.", command.id);
+										command
+											.response
+											.send(Err(format!("Failed to persist client '{}'", command.id)))
+											.map_err(|_| {
+												tracing::error!("Failed to send CheckClientPairingSecret response.")
+											})
+											.ok();
+										continue;
 									}
 
 									command
