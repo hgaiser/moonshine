@@ -40,10 +40,24 @@ pub enum SessionShutdownReason {
 	ApplicationStopped,
 }
 
+/// Error returned when launching an application fails.
+#[derive(Debug)]
+pub enum AppLaunchError {
+	/// The compositor failed to start.
+	CompositorFailed,
+	/// XWayland did not become ready within the timeout.
+	XWaylandTimeout,
+	/// The application process failed to spawn.
+	SpawnFailed,
+	/// The application process exited within the grace period after spawning.
+	ExitedEarly,
+}
+
 pub enum SessionManagerCommand {
 	SetStreamContext(VideoStreamContext, AudioStreamContext),
 	GetSessionContext(oneshot::Sender<Option<SessionContext>>),
-	InitializeSession(SessionContext),
+	InitializeSession(SessionContext, oneshot::Sender<Result<(), ()>>),
+	LaunchSession(oneshot::Sender<Result<(), AppLaunchError>>),
 	StartSession,
 	StopSession(oneshot::Sender<()>),
 	UpdateKeys(SessionKeys),
@@ -98,11 +112,29 @@ impl SessionManager {
 	}
 
 	pub async fn initialize_session(&self, context: SessionContext) -> Result<(), ()> {
+		let (result_tx, result_rx) = oneshot::channel();
 		self.command_tx
-			.send(SessionManagerCommand::InitializeSession(context))
+			.send(SessionManagerCommand::InitializeSession(context, result_tx))
 			.await
 			.map_err(|e| tracing::warn!("Failed to initialize session: {e}"))?;
-		Ok(())
+		result_rx
+			.await
+			.map_err(|e| tracing::warn!("Failed to receive initialize_session result: {e}"))?
+	}
+
+	pub async fn launch_session(&self) -> Result<(), AppLaunchError> {
+		let (result_tx, result_rx) = oneshot::channel();
+		self.command_tx
+			.send(SessionManagerCommand::LaunchSession(result_tx))
+			.await
+			.map_err(|e| {
+				tracing::warn!("Failed to send LaunchSession command: {e}");
+				AppLaunchError::SpawnFailed
+			})?;
+		result_rx.await.unwrap_or_else(|e| {
+			tracing::warn!("Failed to receive LaunchSession result: {e}");
+			Err(AppLaunchError::SpawnFailed)
+		})
 	}
 
 	pub async fn start_session(&self) -> Result<(), ()> {
@@ -189,26 +221,40 @@ impl SessionManagerInner {
 				},
 
 				SessionManagerCommand::GetSessionContext(session_context_tx) => {
-					let context = active_session
-						.as_ref()
-						.map(|s| Some(s.context().clone()))
-						.unwrap_or(None);
+					let context = active_session.as_ref().map(|s| s.context().clone());
 					if session_context_tx.send(context).is_err() {
 						tracing::warn!("Failed to send current session context.");
 					}
 				},
 
-				SessionManagerCommand::InitializeSession(session_context) => {
+				SessionManagerCommand::InitializeSession(session_context, result_tx) => {
 					if active_session.is_some() {
 						tracing::warn!("Can't initialize a session, there is already an active session.");
+						let _ = result_tx.send(Err(()));
 						continue;
 					}
 
 					tracing::info!("Initializing new session");
 					active_session = match Session::new(config.clone(), session_context, stop_session_manager.clone()) {
-						Ok(session) => Some(session),
-						Err(()) => continue,
+						Ok(session) => {
+							let _ = result_tx.send(Ok(()));
+							Some(session)
+						},
+						Err(()) => {
+							let _ = result_tx.send(Err(()));
+							continue;
+						},
 					};
+				},
+
+				SessionManagerCommand::LaunchSession(result_tx) => {
+					let Some(session) = &mut active_session else {
+						tracing::warn!("Can't launch a session, there is no session created yet.");
+						let _ = result_tx.send(Err(AppLaunchError::SpawnFailed));
+						continue;
+					};
+
+					session.launch(result_tx, stop_session_manager.clone()).await;
 				},
 
 				SessionManagerCommand::StartSession => {
