@@ -6,6 +6,7 @@ use std::{
 	str::FromStr,
 };
 
+use crate::ShutdownReason;
 use async_shutdown::ShutdownManager;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
@@ -63,7 +64,7 @@ pub struct Webserver {
 	session_manager: SessionManager,
 	server_certs: String,
 	hdr_supported: bool,
-	shutdown: ShutdownManager<i32>,
+	shutdown: ShutdownManager<ShutdownReason>,
 }
 
 impl Webserver {
@@ -75,7 +76,7 @@ impl Webserver {
 		server_certs: String,
 		client_manager: ClientManager,
 		session_manager: SessionManager,
-		shutdown: ShutdownManager<i32>,
+		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		// Gate HDR advertisement on both the config flag and a runtime
 		// GPU capability probe (10-bit or FP16 render formats).
@@ -117,52 +118,60 @@ impl Webserver {
 			async move {
 				let server = server.clone();
 				let _ = shutdown
-					.wrap_cancel(shutdown.wrap_trigger_shutdown(1, async move {
-						let listener = TcpListener::bind(http_address)
-							.await
-							.map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
-
-						tracing::debug!("HTTP server listening for connections on {http_address}");
-						loop {
-							let (connection, address) = listener
-								.accept()
+					.wrap_cancel(
+						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpShutdown, async move {
+							let listener = TcpListener::bind(http_address)
 								.await
-								.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
-							tracing::trace!("Accepted connection from {address}.");
+								.map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
 
-							let address = connection.local_addr().ok();
-							let mac_address = if let Some(address) = address {
-								get_mac_address(address.ip()).unwrap_or(None)
-							} else {
-								None
-							};
+							tracing::debug!("HTTP server listening for connections on {http_address}");
+							loop {
+								let (connection, address) = listener
+									.accept()
+									.await
+									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
+								tracing::trace!("Accepted connection from {address}.");
 
-							let io = TokioIo::new(connection);
+								let address = connection.local_addr().ok();
+								let mac_address = if let Some(address) = address {
+									get_mac_address(address.ip()).unwrap_or(None)
+								} else {
+									None
+								};
 
-							tokio::spawn({
-								let server = server.clone();
-								let shutdown = server.shutdown.clone();
-								async move {
-									let _ = shutdown
-										.wrap_cancel(async move {
-											let _ = hyper::server::conn::http1::Builder::new()
-												.serve_connection(
-													io,
-													service_fn(|request| {
-														server.serve(request, address, mac_address.clone(), false, None)
-													}),
-												)
-												.await;
-										})
-										.await;
-								}
-							});
-						}
+								let io = TokioIo::new(connection);
 
-						// Is there another way to define the return type of this function?
-						#[allow(unreachable_code)]
-						Ok::<(), ()>(())
-					}))
+								tokio::spawn({
+									let server = server.clone();
+									let shutdown = server.shutdown.clone();
+									async move {
+										let _ = shutdown
+											.wrap_cancel(async move {
+												let _ = hyper::server::conn::http1::Builder::new()
+													.serve_connection(
+														io,
+														service_fn(|request| {
+															server.serve(
+																request,
+																address,
+																mac_address.clone(),
+																false,
+																None,
+															)
+														}),
+													)
+													.await;
+											})
+											.await;
+									}
+								});
+							}
+
+							// Is there another way to define the return type of this function?
+							#[allow(unreachable_code)]
+							Ok::<(), ()>(())
+						}),
+					)
 					.await;
 
 				tracing::debug!("HTTP server shutting down.");
@@ -192,73 +201,75 @@ impl Webserver {
 			let server = server.clone();
 			async move {
 				let _ = shutdown
-					.wrap_cancel(shutdown.wrap_trigger_shutdown(2, async move {
-						let listener = TcpListener::bind(https_address)
-							.await
-							.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
-						let acceptor =
-							TlsAcceptor::from_config(config.webserver.certificate, config.webserver.private_key)?;
-
-						tracing::debug!("HTTPS server listening for connections on {https_address}");
-						loop {
-							let (connection, address) = listener
-								.accept()
+					.wrap_cancel(
+						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpsShutdown, async move {
+							let listener = TcpListener::bind(https_address)
 								.await
-								.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
-							tracing::trace!("Accepted TLS connection from {address}.");
+								.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
+							let acceptor =
+								TlsAcceptor::from_config(config.webserver.certificate, config.webserver.private_key)?;
 
-							let address = connection.local_addr().ok();
-							let mac_address = if let Some(address) = address {
-								get_mac_address(address.ip()).unwrap_or(None)
-							} else {
-								None
-							};
+							tracing::debug!("HTTPS server listening for connections on {https_address}");
+							loop {
+								let (connection, address) = listener
+									.accept()
+									.await
+									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
+								tracing::trace!("Accepted TLS connection from {address}.");
 
-							let connection = match acceptor.accept(connection).await {
-								Ok(connection) => connection,
-								Err(()) => continue,
-							};
+								let address = connection.local_addr().ok();
+								let mac_address = if let Some(address) = address {
+									get_mac_address(address.ip()).unwrap_or(None)
+								} else {
+									None
+								};
 
-							// Extract peer certificate fingerprint from TLS connection for mTLS verification.
-							let peer_cert_fingerprint = connection
-								.get_ref()
-								.1
-								.peer_certificates()
-								.and_then(|certs| certs.first())
-								.map(|cert| hex::encode(Sha256::digest(cert.as_ref())));
+								let connection = match acceptor.accept(connection).await {
+									Ok(connection) => connection,
+									Err(()) => continue,
+								};
 
-							let io = TokioIo::new(connection);
+								// Extract peer certificate fingerprint from TLS connection for mTLS verification.
+								let peer_cert_fingerprint = connection
+									.get_ref()
+									.1
+									.peer_certificates()
+									.and_then(|certs| certs.first())
+									.map(|cert| hex::encode(Sha256::digest(cert.as_ref())));
 
-							tokio::spawn({
-								let server = server.clone();
-								let shutdown = server.shutdown.clone();
-								async move {
-									let _ = shutdown
-										.wrap_cancel(async move {
-											let _ = hyper::server::conn::http1::Builder::new()
-												.serve_connection(
-													io,
-													service_fn(|request| {
-														server.serve(
-															request,
-															address,
-															mac_address.clone(),
-															true,
-															peer_cert_fingerprint.clone(),
-														)
-													}),
-												)
-												.await;
-										})
-										.await;
-								}
-							});
-						}
+								let io = TokioIo::new(connection);
 
-						// Is there another way to define the return type of this function?
-						#[allow(unreachable_code)]
-						Ok::<(), ()>(())
-					}))
+								tokio::spawn({
+									let server = server.clone();
+									let shutdown = server.shutdown.clone();
+									async move {
+										let _ = shutdown
+											.wrap_cancel(async move {
+												let _ = hyper::server::conn::http1::Builder::new()
+													.serve_connection(
+														io,
+														service_fn(|request| {
+															server.serve(
+																request,
+																address,
+																mac_address.clone(),
+																true,
+																peer_cert_fingerprint.clone(),
+															)
+														}),
+													)
+													.await;
+											})
+											.await;
+									}
+								});
+							}
+
+							// Is there another way to define the return type of this function?
+							#[allow(unreachable_code)]
+							Ok::<(), ()>(())
+						}),
+					)
 					.await;
 
 				tracing::debug!("HTTPS server shutting down.");

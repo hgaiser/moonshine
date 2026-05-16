@@ -1,12 +1,14 @@
 use async_shutdown::ShutdownManager;
 use zeroconf::prelude::*;
 
+use crate::ShutdownReason;
+
 pub struct ZeroconfDiscovery {
 	handle: Option<std::thread::JoinHandle<()>>,
 }
 
 impl ZeroconfDiscovery {
-	pub fn spawn(port: u16, name: String, shutdown: ShutdownManager<i32>) -> Self {
+	pub fn spawn(port: u16, name: String, shutdown: ShutdownManager<ShutdownReason>) -> Self {
 		let handle = std::thread::spawn(move || run(port, name, shutdown));
 		Self { handle: Some(handle) }
 	}
@@ -22,7 +24,7 @@ impl Drop for ZeroconfDiscovery {
 	}
 }
 
-fn run(port: u16, name: String, shutdown: ShutdownManager<i32>) {
+fn run(port: u16, name: String, shutdown: ShutdownManager<ShutdownReason>) {
 	let mut service = zeroconf::MdnsService::new(
 		zeroconf::ServiceType::new("nvstream", "tcp").expect("Failed to create service type"),
 		port,

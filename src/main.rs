@@ -27,6 +27,34 @@ mod session;
 mod state;
 mod webserver;
 
+/// Reasons for initiating a global shutdown, used as the type parameter
+/// for `ShutdownManager<ShutdownReason>`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ShutdownReason {
+	/// Application quit signal (Ctrl+C or SIGTERM).
+	/// Primary shutdown trigger initiated by the user.
+	AppQuit = 1,
+
+	/// HTTP webserver is shutting down.
+	HttpShutdown = 2,
+
+	/// HTTPS webserver is shutting down.
+	HttpsShutdown = 3,
+
+	/// RTSP server is shutting down.
+	RtspShutdown = 4,
+
+	/// Session manager guard token (trigger_shutdown_token, not a shutdown trigger).
+	SessionManagerShutdown = 5,
+}
+
+impl ShutdownReason {
+	/// Map a shutdown reason to a process exit code.
+	pub const fn exit_code(self) -> i32 {
+		self as i32
+	}
+}
+
 #[derive(Parser, Debug)]
 #[clap(version)]
 struct Args {
@@ -69,7 +97,7 @@ async fn main() -> Result<(), ()> {
 				}
 			}
 
-			shutdown.trigger_shutdown(1).ok();
+			shutdown.trigger_shutdown(ShutdownReason::AppQuit).ok();
 		}
 	});
 
@@ -87,7 +115,7 @@ async fn main() -> Result<(), ()> {
 	// Wait until everything was shutdown.
 	let exit_code = shutdown.wait_shutdown_complete().await;
 	tracing::debug!("Successfully waited for shutdown to complete.");
-	std::process::exit(exit_code);
+	std::process::exit(exit_code.exit_code());
 }
 
 pub struct Moonshine {
@@ -102,7 +130,7 @@ pub struct Moonshine {
 ///
 /// Dropping this struct will trigger the shutdown of all subsystems, so it should be kept alive until the application is ready to exit.
 impl Moonshine {
-	pub async fn new(config: Config, shutdown: ShutdownManager<i32>) -> Result<Self, ()> {
+	pub async fn new(config: Config, shutdown: ShutdownManager<ShutdownReason>) -> Result<Self, ()> {
 		let state = State::new()?;
 
 		// Load or create the TLS certificate and private key for the webserver.

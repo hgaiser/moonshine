@@ -10,7 +10,7 @@ use hyper::{
 use notify_rust::Notification;
 use tokio::sync::Notify;
 
-use crate::{clients::ClientManager, clients::PendingClient, webserver::bad_request};
+use crate::{clients::ClientManager, clients::PendingClient, webserver::bad_request, ShutdownReason};
 
 /// Handle a pairing request from a client.
 ///
@@ -33,7 +33,7 @@ pub async fn handle_pair_request(
 	server_certs: &str, // Pass as string (PEM)
 	client_manager: &ClientManager,
 	http_port: u16,
-	shutdown: &ShutdownManager<i32>,
+	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
 	if params.contains_key("phrase") {
 		match params.remove("phrase").unwrap().as_str() {
@@ -76,7 +76,7 @@ async fn get_server_cert(
 	server_pem_str: &str,
 	client_manager: &ClientManager,
 	http_port: u16,
-	shutdown: &ShutdownManager<i32>,
+	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
 	let client_cert = match params.remove("clientcert") {
 		Some(client_cert) => client_cert,

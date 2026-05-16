@@ -2,6 +2,7 @@ use async_shutdown::ShutdownManager;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::config::Config;
+use crate::ShutdownReason;
 
 use super::{
 	stream::{AudioStreamContext, VideoStreamContext},
@@ -73,10 +74,10 @@ struct SessionManagerInner {}
 
 impl SessionManager {
 	#[allow(clippy::result_unit_err)]
-	pub fn new(config: Config, shutdown: ShutdownManager<i32>) -> Result<Self, ()> {
+	pub fn new(config: Config, shutdown: ShutdownManager<ShutdownReason>) -> Result<Self, ()> {
 		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner: SessionManagerInner = SessionManagerInner {};
-		let shutdown_token = shutdown.trigger_shutdown_token(2);
+		let shutdown_token = shutdown.trigger_shutdown_token(ShutdownReason::SessionManagerShutdown);
 		let delay_token = shutdown.delay_shutdown_token();
 		tokio::spawn(async move {
 			inner.run(config, command_rx).await;

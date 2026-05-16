@@ -21,6 +21,7 @@ use crate::{
 			ALL_STREAM_CONFIGS,
 		},
 	},
+	ShutdownReason,
 };
 
 #[repr(u8)]
@@ -43,7 +44,7 @@ pub struct RtspServer {
 }
 
 impl RtspServer {
-	pub fn new(config: Config, session_manager: SessionManager, shutdown: ShutdownManager<i32>) -> Self {
+	pub fn new(config: Config, session_manager: SessionManager, shutdown: ShutdownManager<ShutdownReason>) -> Self {
 		let server = Self {
 			config: config.clone(),
 			session_manager,
@@ -53,7 +54,7 @@ impl RtspServer {
 			let server = server.clone();
 			async move {
 				let _ = shutdown
-					.wrap_cancel(shutdown.wrap_trigger_shutdown(3, {
+					.wrap_cancel(shutdown.wrap_trigger_shutdown(ShutdownReason::RtspShutdown, {
 						let server = server.clone();
 						async move {
 							let address = (config.address.as_str(), config.stream.port)
