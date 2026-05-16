@@ -1,6 +1,13 @@
 use std::io::Write;
 use std::path::PathBuf;
 
+use async_shutdown::ShutdownManager;
+use clap::Parser;
+use tokio::signal::unix::{signal, SignalKind};
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
+
 use crate::clients::ClientManager;
 use crate::config::Config;
 use crate::crypto::create_certificate;
@@ -8,12 +15,6 @@ use crate::rtsp::RtspServer;
 use crate::session::SessionManager;
 use crate::state::State;
 use crate::webserver::Webserver;
-use async_shutdown::ShutdownManager;
-use clap::Parser;
-use tokio::signal::unix::{signal, SignalKind};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 mod app_scanner;
 mod clients;
@@ -95,10 +96,14 @@ pub struct Moonshine {
 	_webserver: Webserver,
 }
 
+/// The main application struct, responsible for initializing and managing all subsystems.
+///
+/// Dropping this struct will trigger the shutdown of all subsystems, so it should be kept alive until the application is ready to exit.
 impl Moonshine {
 	pub async fn new(config: Config, shutdown: ShutdownManager<i32>) -> Result<Self, ()> {
 		let state = State::new().await?;
 
+		// Load or create the TLS certificate and private key for the webserver.
 		let (cert, pkey) = Self::load_or_create_certificate(&config).await?;
 
 		// Create a manager for interacting with sessions.
@@ -113,7 +118,7 @@ impl Moonshine {
 		// Publish the Moonshine service using zeroconf.
 		publisher::spawn(config.webserver.port, config.name.clone());
 
-		// Create a handler for the webserver.
+		// Run the webserver.
 		let webserver = Webserver::new(
 			config,
 			state.get_uuid().await?,
