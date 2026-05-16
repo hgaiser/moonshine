@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.11.0] - 2026-05-16
+
+### Added
+
+- Pre/post command hooks for application launches (`pre_command`/`post_command`).
+- Keyboard configuration support.
+- Direct DMA-BUF scanout for override surfaces.
+- HDR detection via swapchain colorspace for games that don't use `vkSetHdrMetadataEXT`.
+- Virtual display dimensions inferred from requested resolution.
+- Steam library scanner handles multiple Steam libraries.
+
+### Changed
+
+- Replace `ring` with `aws-lc-rs` for RSA/TLS cryptography.
+- Completely rewrite compositor focus handling.
+- Hide cursor by default.
+- Switch from user service to system service.
+
+### Fixed
+
+- Handle XBGR16161616F fourcc format.
+- VRAM leak from DMA-BUF import cache by TTL-evicting cached imports on long sessions.
+- No audio in Waydroid by enlarging pulseaudio playback buffer target fill level.
+- Parse HDR from `/launch` request.
+
 ## [v0.10.0] - 2026-04-09
 
 ### Added
