@@ -80,7 +80,7 @@ impl Webserver {
 	) -> Result<Self, ()> {
 		// Gate HDR advertisement on both the config flag and a runtime
 		// GPU capability probe (10-bit or FP16 render formats).
-		let hdr_supported = config.hdr_support && crate::session::compositor::probe_hdr_support(&config.gpu);
+		let hdr_supported = config.hdr && crate::session::compositor::probe_hdr_support(&config.gpu);
 
 		let server = Self {
 			config: config.clone(),

@@ -47,7 +47,7 @@ pub struct Config {
 	/// false to prevent clients from attempting HDR sessions on hardware that
 	/// cannot deliver them.
 	#[serde(default = "default_true")]
-	pub hdr_support: bool,
+	pub hdr: bool,
 
 	/// Time in seconds since last ping after which the stream closes.
 	pub stream_timeout: u64,
@@ -128,7 +128,7 @@ impl Default for Config {
 				post_command: Vec::new(),
 			})],
 			gpu: None,
-			hdr_support: true,
+			hdr: true,
 			stream_timeout: 60,
 			keyboard: KeyboardConfig::default(),
 		}
