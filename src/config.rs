@@ -1,3 +1,4 @@
+use crate::telemetry::TelemetryConfig;
 use serde::{Deserialize, Serialize};
 use std::{
 	collections::hash_map::DefaultHasher,
@@ -52,17 +53,50 @@ pub struct Config {
 	/// Time in seconds since last ping after which the stream closes.
 	pub stream_timeout: u64,
 
+	/// Optional OpenTelemetry exporter configuration. When `otlp_endpoint`
+	/// is unset (default), telemetry is fully disabled — no spans, no
+	/// metrics, no overhead. When set, moonshine ships per-frame traces
+	/// and aggregated histograms/counters/gauges to the configured OTLP
+	/// gRPC endpoint, which the user runs (Tempo, Jaeger, SigNoz, an
+	/// otelcol passthrough, whatever).
+	#[serde(default)]
+	pub telemetry: TelemetryConfig,
+
+	/// Optional debug / diagnostic settings. All knobs here default to
+	/// off; intended for users investigating performance issues.
+	#[serde(default)]
+	pub debug: DebugConfig,
+
 	#[serde(default)]
 	pub keyboard: KeyboardConfig,
+}
+
+/// Diagnostic/debug knobs. All optional, all default off.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DebugConfig {
+	/// When set, every N seconds the video pipeline emits an INFO-level log
+	/// containing a per-stage latency table over the elapsed window
+	/// (channel_wait / import / convert / encode / packetize / send / total,
+	/// each as min / p50 / p95 / p99 / max in microseconds, plus spike count).
+	/// Useful as a built-in diagnostic for users reporting stutters who
+	/// don't want to set up the OTel + Grafana stack — they can copy the
+	/// summary out of `journalctl --user -u moonshine` directly.
+	///
+	/// `None` (the default) keeps the pipeline silent at INFO. Sub-second
+	/// intervals are rejected.
+	#[serde(default)]
+	pub log_stats_interval_secs: Option<u64>,
 }
 
 impl Config {
 	#[allow(clippy::result_unit_err)]
 	pub fn read_from_file<P: AsRef<Path>>(file: P) -> Result<Config, ()> {
-		let config =
-			std::fs::read_to_string(file).map_err(|e| tracing::warn!("Failed to open configuration file: {e}"))?;
+		// Errors here are reported via eprintln! because config load runs
+		// before any tracing subscriber is installed; tracing macros at this
+		// point would silently drop their output.
+		let config = std::fs::read_to_string(file).map_err(|e| eprintln!("Failed to open configuration file: {e}"))?;
 		let config: Config =
-			toml::from_str(&config).map_err(|e| tracing::warn!("Failed to parse configuration file: {e}"))?;
+			toml::from_str(&config).map_err(|e| eprintln!("Failed to parse configuration file: {e}"))?;
 
 		Ok(config)
 	}
@@ -93,6 +127,8 @@ impl Default for Config {
 			})],
 			gpu: None,
 			hdr_support: true,
+			telemetry: TelemetryConfig::default(),
+			debug: DebugConfig::default(),
 			stream_timeout: 60,
 			keyboard: KeyboardConfig::default(),
 		}

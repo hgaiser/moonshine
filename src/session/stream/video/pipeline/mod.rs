@@ -15,6 +15,9 @@ use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
+use crate::telemetry::TraceMode;
+#[cfg(feature = "telemetry")]
+use crate::telemetry::{FrameAttrs, PipelineLatency, PipelineMetrics};
 
 use super::packetizer::Packetizer;
 use super::shard_batch::ShardBatch;
@@ -26,6 +29,18 @@ use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodedPacket, Encoder,
 	InputFormat, OutputFormat, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
+
+/// Label string for OTel metric attributes. Keeps cardinality low (one
+/// of three known values) so collectors don't have to deal with arbitrary
+/// strings.
+#[cfg(feature = "telemetry")]
+fn codec_label(format: VideoFormat) -> &'static str {
+	match format {
+		VideoFormat::H264 => "h264",
+		VideoFormat::Hevc => "hevc",
+		VideoFormat::Av1 => "av1",
+	}
+}
 
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
@@ -52,17 +67,48 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	}
 }
 
-pub struct VideoPipeline {}
+/// Handle to the running video pipeline thread.
+///
+/// Holds the `JoinHandle` for the pipeline worker so that:
+/// - The pipeline thread is no longer silently detached; callers can
+///   observe completion.
+/// - `Drop` joins the thread and logs a warning if it panicked, rather
+///   than letting the panic go unnoticed until the process exits.
+///
+/// The thread is driven to completion by channel closure (the frame
+/// receiver and packet sender going away), not by an explicit stop
+/// signal stored here. Callers are expected to trigger the
+/// `SessionShutdownManager` before dropping this handle so the thread
+/// exits promptly rather than blocking `Drop` indefinitely.
+pub struct VideoPipeline {
+	thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for VideoPipeline {
+	fn drop(&mut self) {
+		if let Some(handle) = self.thread.take() {
+			match handle.join() {
+				Ok(()) => tracing::debug!("Video pipeline thread exited cleanly."),
+				Err(_) => tracing::warn!("Video pipeline thread panicked."),
+			}
+		}
+	}
+}
 
 /// A single frame's latency breakdown for periodic summary reporting.
-struct LatencySample {
-	channel_wait: std::time::Duration,
-	import: std::time::Duration,
-	convert: std::time::Duration,
-	encode: std::time::Duration,
-	packetize: std::time::Duration,
-	send: std::time::Duration,
-	total: std::time::Duration,
+#[derive(Clone)]
+pub(crate) struct LatencySample {
+	pub channel_wait: std::time::Duration,
+	pub import: std::time::Duration,
+	pub convert: std::time::Duration,
+	pub encode: std::time::Duration,
+	pub packetize: std::time::Duration,
+	pub send: std::time::Duration,
+	pub total: std::time::Duration,
+	#[cfg(feature = "bench")]
+	pub encoded_bytes: usize,
+	#[cfg(feature = "bench")]
+	pub is_key_frame: bool,
 }
 
 /// Log a summary of latency statistics over a batch of samples.
@@ -120,6 +166,86 @@ fn log_latency_summary(samples: &[LatencySample]) {
 	);
 }
 
+/// (min, p50, p95, p99, max) over a per-stage latency series.
+type StagePercentiles = (u64, u64, u64, u64, u64);
+
+/// User-facing diagnostic: emit a multi-line INFO log with a per-stage
+/// latency table over the elapsed window. Format mirrors the bench
+/// summary so users can copy-paste straight into a bug report. Gated
+/// behind `[debug] log_stats_interval_secs` in the config — silent
+/// unless the user opts in.
+fn log_stage_summary_table(samples: &[LatencySample], frame_interval_us: u128) {
+	let n = samples.len();
+	if n == 0 {
+		return;
+	}
+
+	fn percentiles(values: impl Iterator<Item = u64>) -> StagePercentiles {
+		let mut v: Vec<u64> = values.collect();
+		v.sort_unstable();
+		let pick = |q: f64| {
+			v[((v.len() as f64 * q).ceil() as usize)
+				.saturating_sub(1)
+				.min(v.len() - 1)]
+		};
+		(v[0], pick(0.50), pick(0.95), pick(0.99), v[v.len() - 1])
+	}
+
+	let stages: [(&str, StagePercentiles); 7] = [
+		(
+			"channel_wait",
+			percentiles(samples.iter().map(|s| s.channel_wait.as_micros() as u64)),
+		),
+		(
+			"import      ",
+			percentiles(samples.iter().map(|s| s.import.as_micros() as u64)),
+		),
+		(
+			"convert     ",
+			percentiles(samples.iter().map(|s| s.convert.as_micros() as u64)),
+		),
+		(
+			"encode      ",
+			percentiles(samples.iter().map(|s| s.encode.as_micros() as u64)),
+		),
+		(
+			"packetize   ",
+			percentiles(samples.iter().map(|s| s.packetize.as_micros() as u64)),
+		),
+		(
+			"send        ",
+			percentiles(samples.iter().map(|s| s.send.as_micros() as u64)),
+		),
+		(
+			"total       ",
+			percentiles(samples.iter().map(|s| s.total.as_micros() as u64)),
+		),
+	];
+
+	let spikes = samples
+		.iter()
+		.filter(|s| s.total.as_micros() > frame_interval_us)
+		.count();
+
+	// Format as a single multi-line message so journalctl renders it as
+	// one log entry rather than fragmenting across separate timestamps.
+	let mut out = String::with_capacity(512);
+	out.push_str(&format!("Latency summary over {n} frames:\n"));
+	out.push_str(" stage         min     p50     p95     p99     max     (microseconds)\n");
+	out.push_str(" -----         ---     ---     ---     ---     ---\n");
+	for (name, (min, p50, p95, p99, max)) in stages {
+		out.push_str(&format!(
+			" {name}  {:>6}  {:>6}  {:>6}  {:>6}  {:>6}\n",
+			min, p50, p95, p99, max
+		));
+	}
+	out.push_str(&format!(
+		" spikes: {spikes} / {n} frames > {frame_interval_us}us frame budget"
+	));
+
+	tracing::info!("{out}");
+}
+
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
@@ -141,8 +267,22 @@ impl VideoPipeline {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		log_frame_spikes: bool,
+		log_stage_summary_interval: Option<std::time::Duration>,
+		stats_tx: Option<std::sync::mpsc::Sender<LatencySample>>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
+
+		// Resolve metrics instruments from the global meter. When telemetry
+		// init didn't run with an OTLP endpoint, the global meter is a
+		// no-op provider and instrument creation is essentially free —
+		// recording into them just drops on the floor. With the `telemetry`
+		// feature disabled at compile time, `PipelineMetrics::new` is a
+		// no-op stub and `record_frame` calls are dead code.
+		#[cfg(feature = "telemetry")]
+		let metrics = Some(Arc::new(PipelineMetrics::new()));
+		#[cfg(not(feature = "telemetry"))]
+		let _metrics = ();
+		let trace_mode = crate::telemetry::trace_mode();
 
 		let inner = VideoPipelineInner {
 			width,
@@ -158,9 +298,14 @@ impl VideoPipeline {
 			max_reference_frames,
 			encryption_key,
 			log_frame_spikes,
+			log_stage_summary_interval,
+			stats_tx,
+			#[cfg(feature = "telemetry")]
+			metrics,
+			trace_mode,
 		};
 
-		std::thread::Builder::new()
+		let thread = std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
 				inner.run(
@@ -173,7 +318,7 @@ impl VideoPipeline {
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
 
-		Ok(Self {})
+		Ok(Self { thread: Some(thread) })
 	}
 }
 
@@ -191,6 +336,20 @@ struct VideoPipelineInner {
 	max_reference_frames: u32,
 	encryption_key: Option<Vec<u8>>,
 	log_frame_spikes: bool,
+	/// When `Some`, emit a per-stage latency summary at INFO every N
+	/// seconds. `None` keeps the pipeline silent at INFO.
+	log_stage_summary_interval: Option<std::time::Duration>,
+	/// OTel metrics, resolved from the global meter at construction.
+	/// `None` is the path that runs in tests / when no meter is registered.
+	#[cfg(feature = "telemetry")]
+	metrics: Option<Arc<PipelineMetrics>>,
+	/// Snapshot of `crate::telemetry::TraceMode` for the running session.
+	/// Read fresh from the global telemetry config at construction so we
+	/// don't pay an Arc deref per frame.
+	trace_mode: TraceMode,
+	/// Optional sink for per-frame latency samples. Used by the bench harness;
+	/// `None` in normal sessions to avoid extra work on the hot path.
+	stats_tx: Option<std::sync::mpsc::Sender<LatencySample>>,
 }
 
 impl VideoPipelineInner {
@@ -327,6 +486,17 @@ impl VideoPipelineInner {
 		packetizer.warm_up(self.fec_percentage, self.minimum_fec_packets);
 		let mut sequence_number = 0u32;
 		let mut frame_number = 0u32;
+		// Monotonic counter incremented once per encoded frame; used as the
+		// hash input for static-mode trace sampling. `buffer_index` would
+		// have been wrong here because the compositor recycles a small pool
+		// of buffer slots, so it cycles within a session and would bias
+		// sampling to a fixed subset of buffers rather than ~r fraction of
+		// frames over time.
+		// A per-session random salt breaks any correlation between the keep
+		// set and frame-index-aligned patterns (e.g. key frames at fixed
+		// intervals always landing in or out of the sample window).
+		let mut sample_counter: u64 = 0;
+		let sample_salt: u64 = rand::random();
 
 		// Determine output YUV format based on chroma sampling and dynamic range.
 		let output_format = match (self.chroma_sampling, self.dynamic_range) {
@@ -338,6 +508,20 @@ impl VideoPipelineInner {
 
 		// Color converter will be initialized on first frame.
 		let mut color_converter: Option<ColorConverter> = None;
+
+		// Pre-built attribute set for the metrics hot path. Codec + hdr
+		// don't change across a session, so we build the KeyValue arrays
+		// once and borrow them on every frame. `None` when telemetry is
+		// disabled — zero overhead when the global meter is the no-op.
+		#[cfg(feature = "telemetry")]
+		let frame_attrs = self.metrics.as_ref().map(|_| {
+			FrameAttrs::new(
+				codec_label(self.video_format),
+				self.dynamic_range == VideoDynamicRange::Hdr,
+			)
+		});
+		#[cfg(not(feature = "telemetry"))]
+		let _frame_attrs = ();
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / self.framerate as f64);
@@ -351,7 +535,15 @@ impl VideoPipelineInner {
 
 		// Rolling latency statistics for periodic summary.
 		let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
-		let mut last_summary_time = std::time::Instant::now();
+		// Separate timers for the two summary paths so they don't interfere:
+		// - last_debug_time: controls the 5-second DEBUG log (log_latency_summary).
+		//   Reads but never clears latency_samples, so the info window is unaffected.
+		// - last_info_time: controls the user-configured INFO table
+		//   (log_stage_summary_table). Only this timer's tick clears latency_samples.
+		//   When no info interval is configured, latency_samples is cleared on the
+		//   debug tick instead (original behaviour).
+		let mut last_debug_time = std::time::Instant::now();
+		let mut last_info_time = std::time::Instant::now();
 
 		// Track the last HDR mode state sent to the control stream.
 		let mut last_hdr_state = HdrModeState {
@@ -609,6 +801,7 @@ impl VideoPipelineInner {
 				let mut packetize_dur = std::time::Duration::ZERO;
 				let mut send_dur = std::time::Duration::ZERO;
 				let mut encoded_bytes = 0usize;
+				#[cfg(feature = "bench")]
 				let mut is_key_frame = false;
 				match encode_result {
 					Ok(packets) => {
@@ -623,7 +816,10 @@ impl VideoPipelineInner {
 							}
 
 							encoded_bytes += packet.data.len();
-							is_key_frame |= packet.is_key_frame;
+							#[cfg(feature = "bench")]
+							{
+								is_key_frame |= packet.is_key_frame;
+							}
 
 							let (p, s) = match self.send_packet(
 								&packet,
@@ -671,23 +867,43 @@ impl VideoPipelineInner {
 				// Warn on spike frames (total > frame interval) so they stand out in logs.
 				let frame_interval_us = 1_000_000 / self.framerate as u128;
 				if self.log_frame_spikes && total.as_micros() > frame_interval_us {
-					tracing::warn!(
-						total_us = total.as_micros() as u64,
-						channel_us = channel_wait.as_micros() as u64,
-						import_us = import_dur.as_micros() as u64,
-						convert_us = convert_dur.as_micros() as u64,
-						encode_us = encode_dur.as_micros() as u64,
-						packetize_us = packetize_dur.as_micros() as u64,
-						send_us = send_dur.as_micros() as u64,
-						encoded_bytes,
-						is_key_frame,
-						buffer_index = frame.buffer_index,
-						"SPIKE: frame latency exceeds {}us",
-						frame_interval_us
-					);
+					#[cfg(feature = "bench")]
+					{
+						tracing::warn!(
+							total_us = total.as_micros() as u64,
+							channel_us = channel_wait.as_micros() as u64,
+							import_us = import_dur.as_micros() as u64,
+							convert_us = convert_dur.as_micros() as u64,
+							encode_us = encode_dur.as_micros() as u64,
+							packetize_us = packetize_dur.as_micros() as u64,
+							send_us = send_dur.as_micros() as u64,
+							encoded_bytes,
+							is_key_frame,
+							buffer_index = frame.buffer_index,
+							"SPIKE: frame latency exceeds {}us",
+							frame_interval_us
+						);
+					}
+					#[cfg(not(feature = "bench"))]
+					{
+						tracing::warn!(
+							total_us = total.as_micros() as u64,
+							channel_us = channel_wait.as_micros() as u64,
+							import_us = import_dur.as_micros() as u64,
+							convert_us = convert_dur.as_micros() as u64,
+							encode_us = encode_dur.as_micros() as u64,
+							packetize_us = packetize_dur.as_micros() as u64,
+							send_us = send_dur.as_micros() as u64,
+							encoded_bytes,
+							buffer_index = frame.buffer_index,
+							"SPIKE: frame latency exceeds {}us",
+							frame_interval_us
+						);
+					}
 				}
 
-				latency_samples.push(LatencySample {
+				#[cfg(feature = "bench")]
+				let sample = LatencySample {
 					channel_wait,
 					import: import_dur,
 					convert: convert_dur,
@@ -695,13 +911,173 @@ impl VideoPipelineInner {
 					packetize: packetize_dur,
 					send: send_dur,
 					total,
-				});
+					encoded_bytes,
+					is_key_frame,
+				};
+				#[cfg(not(feature = "bench"))]
+				let sample = LatencySample {
+					channel_wait,
+					import: import_dur,
+					convert: convert_dur,
+					encode: encode_dur,
+					packetize: packetize_dur,
+					send: send_dur,
+					total,
+				};
 
-				// Periodic summary every 5 seconds.
-				if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
-					log_latency_summary(&latency_samples);
-					latency_samples.clear();
-					last_summary_time = std::time::Instant::now();
+				// Record into OTel metrics (counters/histograms/gauges) and emit
+				// spans. Cheap by design — pre-built FrameAttrs, lock-free
+				// instruments, no allocations.
+				#[cfg(feature = "telemetry")]
+				{
+					let total_us = total.as_micros() as u64;
+					let frame_budget_us = frame_interval_us as u64;
+					let pipeline_lat = PipelineLatency {
+						channel_wait_us: channel_wait.as_micros() as u64,
+						import_us: import_dur.as_micros() as u64,
+						convert_us: convert_dur.as_micros() as u64,
+						encode_us: encode_dur.as_micros() as u64,
+						packetize_us: packetize_dur.as_micros() as u64,
+						send_us: send_dur.as_micros() as u64,
+						total_us,
+						encoded_bytes,
+						frame_budget_us,
+					};
+					if let (Some(metrics), Some(attrs)) = (&self.metrics, &frame_attrs) {
+						metrics.record_frame(attrs, &pipeline_lat);
+						// Record the dmabuf cache size on every frame so the gauge
+						// reflects the live value rather than the value at the last
+						// summary tick. One atomic load + one OTel gauge record;
+						// effectively free on the hot path.
+						if let Some(importer) = &dmabuf_importer {
+							metrics.dmabuf_cache_size.record(importer.cache_len() as u64, &[]);
+						}
+					}
+
+					// Trace emission decision based on the configured mode:
+					//   None      — no span at all
+					//   Static(r) — emit on ~`r` fraction of frames, decided
+					//                client-side so we don't pay span-creation
+					//                cost on rejected frames. Uses a per-session
+					//                monotonic counter mixed with a Knuth golden
+					//                ratio constant so the keep set is uniformly
+					//                distributed across the run.
+					//   Outliers  — span only when the frame spiked
+					sample_counter = sample_counter.wrapping_add(1);
+					let is_spike = total_us > frame_budget_us;
+					let emit_span = match self.trace_mode {
+						TraceMode::None => false,
+						TraceMode::Static(r) if r >= 1.0 => true,
+						TraceMode::Static(r) if r <= 0.0 => false,
+						TraceMode::Static(r) => {
+							let h = sample_counter.wrapping_mul(0x9E3779B97F4A7C15) ^ sample_salt;
+							(h as f64 / u64::MAX as f64) < r
+						},
+						TraceMode::Outliers => is_spike,
+					};
+					if emit_span {
+						#[cfg(feature = "bench")]
+						{
+							let span = tracing::info_span!(
+								"frame.encode",
+								codec = codec_label(self.video_format),
+								hdr = self.dynamic_range == VideoDynamicRange::Hdr,
+								buffer_index = frame.buffer_index,
+								channel_wait_us = pipeline_lat.channel_wait_us,
+								import_us = pipeline_lat.import_us,
+								convert_us = pipeline_lat.convert_us,
+								encode_us = pipeline_lat.encode_us,
+								packetize_us = pipeline_lat.packetize_us,
+								send_us = pipeline_lat.send_us,
+								total_us,
+								encoded_bytes,
+								is_key_frame,
+								spike = is_spike,
+							);
+							let _g = span.enter();
+						}
+						#[cfg(not(feature = "bench"))]
+						{
+							let span = tracing::info_span!(
+								"frame.encode",
+								codec = codec_label(self.video_format),
+								hdr = self.dynamic_range == VideoDynamicRange::Hdr,
+								buffer_index = frame.buffer_index,
+								channel_wait_us = pipeline_lat.channel_wait_us,
+								import_us = pipeline_lat.import_us,
+								convert_us = pipeline_lat.convert_us,
+								encode_us = pipeline_lat.encode_us,
+								packetize_us = pipeline_lat.packetize_us,
+								send_us = pipeline_lat.send_us,
+								total_us,
+								encoded_bytes,
+								spike = is_spike,
+							);
+							let _g = span.enter();
+						}
+					}
+				}
+				#[cfg(not(feature = "telemetry"))]
+				{
+					let _ = dmabuf_importer;
+					sample_counter = sample_counter.wrapping_add(1);
+					let is_spike = total.as_micros() as u64 > frame_interval_us as u64;
+					let emit_span = match self.trace_mode {
+						TraceMode::None => false,
+						TraceMode::Static(r) if r >= 1.0 => true,
+						TraceMode::Static(r) if r <= 0.0 => false,
+						TraceMode::Static(r) => {
+							let h = sample_counter.wrapping_mul(0x9E3779B97F4A7C15) ^ sample_salt;
+							(h as f64 / u64::MAX as f64) < r
+						},
+						TraceMode::Outliers => is_spike,
+					};
+					let _ = (is_spike, emit_span);
+				}
+
+				if let Some(tx) = self.stats_tx.as_ref() {
+					// Bench-mode sink. If the receiver is gone we just stop trying.
+					let _ = tx.send(sample.clone());
+				}
+
+				latency_samples.push(sample);
+
+				// Periodic summary. The DEBUG `log_latency_summary` runs every
+				// 5 s for developers with `RUST_LOG=debug`. When a user opts
+				// into `log_stage_summary_interval_secs` in the config we
+				// additionally emit a multi-line INFO table that's easy to
+				// paste into a bug report — the diagnostic for users without
+				// the OTel + Grafana stack.
+				//
+				// The two ticks are tracked with separate timers: the debug tick
+				// reads latency_samples without clearing them, so samples continue
+				// accumulating for the full configured info interval. Clearing only
+				// happens when the governing timer (info if configured, otherwise
+				// debug) fires.
+				if !latency_samples.is_empty() {
+					let debug_tick = last_debug_time.elapsed() >= std::time::Duration::from_secs(5);
+					let info_tick = self
+						.log_stage_summary_interval
+						.map(|d| last_info_time.elapsed() >= d)
+						.unwrap_or(false);
+
+					if debug_tick {
+						log_latency_summary(&latency_samples);
+						last_debug_time = std::time::Instant::now();
+						// Clear the buffer only when no info interval is configured
+						// (preserving the original no-config behaviour).
+						if self.log_stage_summary_interval.is_none() {
+							latency_samples.clear();
+						}
+					}
+					if info_tick {
+						log_stage_summary_table(&latency_samples, frame_interval_us);
+						latency_samples.clear();
+						last_info_time = std::time::Instant::now();
+						// Reset the debug timer too so the next debug window starts
+						// from now, avoiding an immediate redundant emission.
+						last_debug_time = std::time::Instant::now();
+					}
 				}
 
 				if !pending_idr {

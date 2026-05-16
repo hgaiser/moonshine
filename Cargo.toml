@@ -10,6 +10,20 @@ name = "moonshine"
 version.workspace = true
 edition = "2021"
 
+[features]
+# Off by default — keeps system installs lean. Opt in with `--features bench`
+# for the headless benchmark harness or `--features telemetry` for OTLP/gRPC
+# trace + metric export. Both can be combined.
+default = []
+bench = []
+telemetry = [
+	"dep:opentelemetry",
+	"dep:opentelemetry-otlp",
+	"dep:opentelemetry-semantic-conventions",
+	"dep:opentelemetry_sdk",
+	"dep:tracing-opentelemetry",
+]
+
 [dependencies]
 aes = "0.8.4"
 aes-gcm = "0.10.3"
@@ -42,6 +56,10 @@ mio-timerfd = "0.2.0"
 network-interface = "2.0.5"
 notify-rust = "4.12.0"
 open = "5.3.3"
+opentelemetry = { version = "0.27", features = ["metrics", "trace"], optional = true }
+opentelemetry-otlp = { version = "0.27", features = ["grpc-tonic", "metrics", "trace"], optional = true }
+opentelemetry-semantic-conventions = { version = "0.27", optional = true }
+opentelemetry_sdk = { version = "0.27", features = ["rt-tokio", "metrics", "trace"], optional = true }
 opus = "0.3.1"
 pixelforge = { git = "https://github.com/hgaiser/pixelforge", rev = "fc60c32", features = [
   "dmabuf",
@@ -83,6 +101,7 @@ tokio = { version = "1.49.0", features = [
 tokio-rustls = "0.26.4"
 toml = "1.0.3"
 tracing = "0.1.44"
+tracing-opentelemetry = { version = "0.28", optional = true }
 tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
 url = "2.5.8"
 uuid = { version = "1.21.0", features = ["v4"] }

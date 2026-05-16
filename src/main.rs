@@ -10,12 +10,13 @@ use crate::state::State;
 use crate::webserver::Webserver;
 use async_shutdown::ShutdownManager;
 use clap::Parser;
+#[cfg(feature = "bench")]
+use clap::Subcommand;
 use tokio::signal::unix::{signal, SignalKind};
-use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
 mod app_scanner;
+#[cfg(feature = "bench")]
+mod bench;
 mod clients;
 mod config;
 mod crypto;
@@ -23,6 +24,7 @@ mod publisher;
 mod rtsp;
 mod session;
 mod state;
+mod telemetry;
 mod webserver;
 
 #[derive(Parser, Debug)]
@@ -30,16 +32,57 @@ mod webserver;
 struct Args {
 	/// Path to configuration file.
 	config: PathBuf,
+
+	/// Override the OTLP exporter endpoint from the config (e.g.
+	/// `http://localhost:4317`). Useful for ad-hoc profiling without
+	/// editing config.toml. Empty string disables telemetry even if the
+	/// config enables it.
+	#[cfg(feature = "telemetry")]
+	#[arg(long, global = true)]
+	otlp_endpoint: Option<String>,
+
+	/// Override per-frame trace emission mode: `none`, `outliers`, or
+	/// `static`. Use with `--trace-sample-rate` for `static`.
+	#[cfg(feature = "telemetry")]
+	#[arg(long, global = true, value_parser = parse_trace_mode_cli)]
+	trace_mode: Option<String>,
+
+	/// Static-mode trace sampling rate (0.0–1.0). Only consulted when
+	/// `--trace-mode static`.
+	#[cfg(feature = "telemetry")]
+	#[arg(long, global = true)]
+	trace_sample_rate: Option<f64>,
+
+	#[cfg(feature = "bench")]
+	#[command(subcommand)]
+	command: Option<Command>,
+}
+
+#[cfg(feature = "telemetry")]
+fn parse_trace_mode_cli(s: &str) -> Result<String, String> {
+	match s {
+		"none" | "outliers" | "static" => Ok(s.to_string()),
+		other => Err(format!("expected one of: none, outliers, static (got '{other}')")),
+	}
+}
+
+#[cfg(feature = "bench")]
+#[derive(Subcommand, Debug)]
+enum Command {
+	/// Run the full pipeline (compositor + capture + convert + encode) without
+	/// a Moonlight client. Encoded packets are dropped; per-frame latency is
+	/// reported when the run ends.
+	Bench(bench::BenchArgs),
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
-	tracing_subscriber::registry()
-		.with(tracing_subscriber::fmt::layer())
-		.with(EnvFilter::from_default_env())
-		.init();
+	// Config load runs before telemetry init so `[telemetry]` settings
+	// take effect. tracing! calls during config load won't appear because
+	// no subscriber is installed yet — pre-init failures fall back to
+	// eprintln! below.
 
 	// Ensure rustls has a single crypto provider selected at process start.
 	// When multiple crypto backends (ring, aws-lc-rs) are present the crate
@@ -50,38 +93,73 @@ async fn main() -> Result<(), ()> {
 	let provider = rustls::crypto::ring::default_provider();
 	let _ = provider.install_default();
 
+	// Errors during config load and telemetry init must use eprintln!
+	// directly: no tracing subscriber is installed yet (telemetry::init() does
+	// it in one pass, so we can include the OTel layer when configured), and
+	// tracing macros at this point would silently drop their output.
 	let mut config;
 	if args.config.exists() {
 		config = Config::read_from_file(args.config).unwrap_or_else(|()| std::process::exit(1));
 	} else {
-		tracing::info!(
+		eprintln!(
 			"No config file found at {}, creating a default config file.",
 			args.config.display()
 		);
 		config = Config::default();
 
 		let serialized_config =
-			toml::to_string_pretty(&config).map_err(|e| tracing::error!("Failed to serialize config: {e}"))?;
+			toml::to_string_pretty(&config).map_err(|e| eprintln!("Failed to serialize config: {e}"))?;
 
 		let config_dir = args
 			.config
 			.parent()
-			.ok_or_else(|| tracing::error!("Failed to get parent directory of config file."))?;
-		std::fs::create_dir_all(config_dir).map_err(|e| tracing::error!("Failed to create config directory: {e}"))?;
-		std::fs::write(args.config, serialized_config)
-			.map_err(|e| tracing::error!("Failed to save config file: {e}"))?;
+			.ok_or_else(|| eprintln!("Failed to get parent directory of config file."))?;
+		std::fs::create_dir_all(config_dir).map_err(|e| eprintln!("Failed to create config directory: {e}"))?;
+		std::fs::write(args.config, serialized_config).map_err(|e| eprintln!("Failed to save config file: {e}"))?;
 	}
 
 	// Resolve these paths so that the rest of the code doesn't need to.
 	let cert_path = config.webserver.certificate.to_string_lossy().to_string();
-	let cert_path =
-		shellexpand::full(&cert_path).map_err(|e| tracing::error!("Failed to expand certificate path: {e}"))?;
+	let cert_path = shellexpand::full(&cert_path).map_err(|e| eprintln!("Failed to expand certificate path: {e}"))?;
 	config.webserver.certificate = cert_path.to_string().into();
 
 	let private_key_path = config.webserver.private_key.to_string_lossy().to_string();
 	let private_key_path =
-		shellexpand::full(&private_key_path).map_err(|e| tracing::error!("Failed to expand private key path: {e}"))?;
+		shellexpand::full(&private_key_path).map_err(|e| eprintln!("Failed to expand private key path: {e}"))?;
 	config.webserver.private_key = private_key_path.to_string().into();
+
+	// Install the tracing subscriber, plus (optional) OTel pipelines when
+	// the `telemetry` feature is enabled and a collector endpoint is set.
+	// Start from the config's [telemetry] table, then apply CLI overrides.
+	// CLI wins; an empty-string --otlp-endpoint disables telemetry even if
+	// the config enables it.
+	let mut telemetry_cfg = config.telemetry.clone();
+	#[cfg(not(feature = "telemetry"))]
+	let _ = &mut telemetry_cfg; // silence unused-mut when telemetry feature is off
+	#[cfg(feature = "telemetry")]
+	{
+		// CLI endpoint override: empty string means "disable".
+		if let Some(ep) = args.otlp_endpoint.clone() {
+			telemetry_cfg.otlp_endpoint = if ep.is_empty() { None } else { Some(ep) };
+		}
+		// CLI trace-mode overrides.
+		if let Some(mode) = args.trace_mode.clone() {
+			telemetry_cfg.trace_mode = Some(mode);
+		}
+		if let Some(rate) = args.trace_sample_rate {
+			telemetry_cfg.trace_sample_rate = Some(rate);
+		}
+		// When bench mode is active and no trace_mode was set, default to
+		// full-fidelity static sampling so every frame of the short run
+		// is captured.
+		#[cfg(feature = "bench")]
+		if telemetry_cfg.trace_mode.is_none() && matches!(args.command, Some(Command::Bench(_))) {
+			telemetry_cfg.trace_mode = Some("static".to_string());
+			telemetry_cfg.trace_sample_rate = Some(1.0);
+		}
+	}
+
+	let _telemetry = telemetry::init(&telemetry_cfg).map_err(|e| eprintln!("telemetry init: {e}"))?;
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
 
@@ -110,6 +188,19 @@ async fn main() -> Result<(), ()> {
 			shutdown.trigger_shutdown(1).ok();
 		}
 	});
+
+	#[cfg(feature = "bench")]
+	if let Some(Command::Bench(bench_args)) = args.command {
+		let result = bench::run(config, bench_args, shutdown.clone()).await;
+		// Drain pending OTel exports synchronously before exit. Bench
+		// runs are short enough that the BatchSpanProcessor's scheduled
+		// flush can lose the trailing window otherwise.
+		#[cfg(feature = "telemetry")]
+		_telemetry.force_flush();
+		let _ = shutdown.trigger_shutdown(result.map(|_| 0).unwrap_or(1));
+		let exit_code = shutdown.wait_shutdown_complete().await;
+		std::process::exit(exit_code);
+	}
 
 	// Create the main application.
 	let moonshine = Moonshine::new(config, shutdown.clone()).await?;

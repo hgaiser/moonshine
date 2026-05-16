@@ -153,6 +153,48 @@ include_terminal = false
 resolve_icons = true
 ```
 
+## Benchmarking
+
+Moonshine has a `bench` subcommand that runs the full pipeline (compositor + capture + convert + encode) without any Moonlight client connected. Encoded packets are dropped; per-frame latency samples are aggregated and reported when the run ends. Useful for iterating on driver, power-management, or pipeline changes without needing a client connected.
+
+```sh
+moonshine /path/to/config.toml bench \
+  --duration 30 --warmup 5 \
+  --resolution 2560x1440 --fps 120 --hdr \
+  --codec hevc \
+  -- /path/to/your/runner.sh
+```
+
+Bench-specific flags:
+
+| Flag | Default | Description |
+| --- | --- | --- |
+| `--duration <s>` | `30` | Seconds to record after warmup. |
+| `--warmup <s>` | `2` | Discard the first N seconds (lets first-frame allocation, XWayland, shader compile spikes settle). |
+| `--resolution WxH` | `1920x1080` | Stream resolution. |
+| `--fps <n>` | `60` | Target frame rate. |
+| `--bitrate <bps>` | `50000000` | Encoder target bitrate. |
+| `--codec {h264,hevc,av1}` | `hevc` | Codec to encode with. |
+| `--hdr` | off | Stream as BT.2020 PQ 10-bit HDR. |
+| `--app <title>` |  | Launch an application from `[[application]]`. Mutually exclusive with the trailing `-- <cmd>` form. |
+
+Either `--app <title>` or a trailing `-- <cmd>` is required so the harness has something to run inside the bench compositor.
+
+The summary printed at the end shows per-stage latency percentiles (`channel_wait`, `import`, `convert`, `encode`, `packetize`, `send`) and a totals row, plus spike count and observed FPS.
+
+For diagnosing performance, stuttering or latency issues during a streaming session, set:
+
+```toml
+[debug]
+log_stats_interval_secs = 30
+```
+
+…and the running pipeline will log the same per-stage table at INFO every 30 seconds, visible in `journalctl --user -u moonshine`.
+
+## Telemetry
+
+Moonshine can optionally ship per-frame traces and aggregated metrics over OTLP/gRPC. Off by default; see [`examples/observability/README.md`](examples/observability/README.md) for setup, configuration, and a worked-example Grafana/Tempo/Prometheus stack.
+
 ## FAQ
 
 1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**

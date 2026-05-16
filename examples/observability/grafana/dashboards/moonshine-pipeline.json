@@ -1,0 +1,132 @@
+{
+  "title": "Moonshine Streaming Pipeline",
+  "uid": "moonshine-pipeline",
+  "tags": ["moonshine"],
+  "schemaVersion": 39,
+  "timezone": "browser",
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "templating": {
+    "list": [
+      {
+        "name": "codec",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "prometheus" },
+        "query": "label_values(moonshine_total_latency_microseconds_count, codec)",
+        "includeAll": true,
+        "multi": true,
+        "current": { "text": "All", "value": "$__all" }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Total host latency (p50 / p95 / p99 / max)",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum by (le) (rate(moonshine_total_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))",
+          "legendFormat": "p50",
+          "refId": "A"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(moonshine_total_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))",
+          "legendFormat": "p95",
+          "refId": "B"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(moonshine_total_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))",
+          "legendFormat": "p99",
+          "refId": "C"
+        },
+        {
+          "expr": "max_over_time(histogram_quantile(0.999, sum by (le) (rate(moonshine_total_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))[5m:])",
+          "legendFormat": "p99.9 (5m max)",
+          "refId": "D"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "µs",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Per-stage p99 latency",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum by (stage, le) (rate(moonshine_stage_latency_microseconds_bucket{codec=~\"$codec\"}[1m])))",
+          "legendFormat": "{{stage}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "µs" } }
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Spike rate (frames > frame budget / sec)",
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(moonshine_spikes_total{codec=~\"$codec\"}[30s])",
+          "legendFormat": "{{codec}} hdr={{hdr}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "ops" } }
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Frame rate (encoded frames / sec)",
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 8 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [
+        {
+          "expr": "rate(moonshine_frames_total{codec=~\"$codec\"}[30s])",
+          "legendFormat": "{{codec}} hdr={{hdr}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": { "defaults": { "unit": "fps" } }
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "DMA-BUF importer cache size",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 14 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "description": "Resident DMA-BUF imports — would have caught the 2026-04-29 cache-leak incident in real time.",
+      "targets": [
+        { "expr": "moonshine_dmabuf_cache_size", "legendFormat": "dmabuf cache", "refId": "A" }
+      ],
+      "fieldConfig": { "defaults": { "unit": "short" } }
+    },
+    {
+      "id": 7,
+      "type": "table",
+      "title": "Recent traces (frames)",
+      "gridPos": { "h": 10, "w": 24, "x": 0, "y": 22 },
+      "datasource": { "type": "tempo", "uid": "tempo" },
+      "targets": [
+        {
+          "queryType": "traceql",
+          "tableType": "spans",
+          "limit": 50,
+          "query": "{ resource.service.name=\"moonshine\" && name=\"frame.encode\" } | select(span.total_us, span.convert_us, span.encode_us, span.codec, span.hdr)",
+          "refId": "A"
+        }
+      ]
+    }
+  ]
+}
