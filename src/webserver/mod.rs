@@ -35,7 +35,7 @@ use crate::{
 use self::pairing::handle_pair_request;
 
 mod pairing;
-mod tls;
+pub mod tls;
 
 // The negative fourth value is to indicate that we are following the protocol introduced with Sunshine.
 const SERVERINFO_APP_VERSION: &str = "7.1.431.-1";

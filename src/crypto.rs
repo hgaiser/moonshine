@@ -3,43 +3,6 @@ use aes_gcm::{
 	aead::{Aead, KeyInit},
 	Aes128Gcm, Key, Nonce,
 };
-use rand::RngCore;
-use rcgen::{
-	BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose, SerialNumber,
-};
-use rsa::{
-	pkcs8::{EncodePrivateKey, LineEnding},
-	RsaPrivateKey,
-};
-use std::time::{Duration, SystemTime};
-
-pub fn create_certificate() -> Result<(String, String), Box<dyn std::error::Error>> {
-	// Generate RSA key (2048 bits)
-	let mut rng = rand::rngs::OsRng;
-	let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
-	let key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
-
-	let mut params = CertificateParams::default();
-	params.not_before = SystemTime::now().into();
-	params.not_after = (SystemTime::now() + Duration::from_secs(3650 * 24 * 60 * 60)).into();
-	params.serial_number = Some(SerialNumber::from(rng.next_u64()));
-
-	let mut distinguished_name = DistinguishedName::new();
-	distinguished_name.push(DnType::CommonName, "Moonshine");
-	params.distinguished_name = distinguished_name;
-
-	params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
-	params.key_usages = vec![
-		KeyUsagePurpose::DigitalSignature,
-		KeyUsagePurpose::KeyEncipherment,
-		KeyUsagePurpose::KeyAgreement,
-	];
-
-	let key_pair = KeyPair::from_pem(&key_pem)?;
-	let cert = params.self_signed(&key_pair)?;
-
-	Ok((cert.pem(), key_pem))
-}
 
 pub fn encrypt(plaintext: &[u8], key: &[u8], iv: &[u8], tag: &mut [u8]) -> Result<Vec<u8>, aes_gcm::Error> {
 	let key = Key::<Aes128Gcm>::from_slice(key);

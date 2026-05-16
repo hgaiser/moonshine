@@ -1,4 +1,3 @@
-use std::io::Write;
 use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
@@ -10,7 +9,6 @@ use tracing_subscriber::EnvFilter;
 
 use crate::clients::ClientManager;
 use crate::config::Config;
-use crate::crypto::create_certificate;
 use crate::discovery::ZeroconfDiscovery;
 use crate::rtsp::RtspServer;
 use crate::session::SessionManager;
@@ -134,7 +132,7 @@ impl Moonshine {
 		let state = State::new()?;
 
 		// Load or create the TLS certificate and private key for the webserver.
-		let (cert, pkey) = Self::load_or_create_certificate(&config).await?;
+		let (cert, pkey) = webserver::tls::load_or_create_certificate(&config).await?;
 
 		// Create a manager for interacting with sessions.
 		let session_manager = SessionManager::new(config.clone(), shutdown.clone())?;
@@ -165,55 +163,5 @@ impl Moonshine {
 			_webserver: webserver,
 			_discovery: discovery,
 		})
-	}
-
-	async fn load_or_create_certificate(config: &Config) -> Result<(String, String), ()> {
-		if !config.webserver.certificate.exists() && !config.webserver.private_key.exists() {
-			tracing::info!("No certificate found, creating a new one.");
-
-			let (cert, pkey) =
-				create_certificate().map_err(|e| tracing::error!("Failed to create certificate: {e}"))?;
-
-			// Write certificate to file.
-			let cert_dir = config
-				.webserver
-				.certificate
-				.parent()
-				.ok_or_else(|| tracing::error!("Failed to find parent directory for certificate file."))?;
-			std::fs::create_dir_all(cert_dir)
-				.map_err(|e| tracing::error!("Failed to create certificate directory: {e}"))?;
-			let mut certfile = std::fs::File::create(&config.webserver.certificate)
-				.map_err(|e| tracing::error!("Failed to create certificate file: {e}"))?;
-			certfile
-				.write(cert.as_bytes())
-				.map_err(|e| tracing::error!("Failed to write PEM to file: {e}"))?;
-
-			// Write private key to file.
-			let private_key_dir = config
-				.webserver
-				.private_key
-				.parent()
-				.ok_or_else(|| tracing::error!("Failed to find parent directory for private key file."))?;
-			std::fs::create_dir_all(private_key_dir)
-				.map_err(|e| tracing::error!("Failed to create private key directory: {e}"))?;
-			let mut keyfile = std::fs::File::create(&config.webserver.private_key)
-				.map_err(|e| tracing::error!("Failed to create private key file: {e}"))?;
-			keyfile
-				.write(pkey.as_bytes())
-				.map_err(|e| tracing::error!("Failed to write private key to file: {e}"))?;
-
-			tracing::debug!("Saved certificate to {}", config.webserver.certificate.display());
-			tracing::debug!("Saved private key to {}", config.webserver.private_key.display());
-
-			Ok((cert, pkey))
-		} else {
-			let cert = std::fs::read_to_string(&config.webserver.certificate)
-				.map_err(|e| tracing::error!("Failed to read server certificate: {e}"))?;
-
-			let pkey = std::fs::read_to_string(&config.webserver.private_key)
-				.map_err(|e| tracing::error!("Failed to read private key: {e}"))?;
-
-			Ok((cert, pkey))
-		}
 	}
 }

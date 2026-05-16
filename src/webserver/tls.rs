@@ -1,14 +1,25 @@
 use std::fmt;
 use std::fs::File;
-use std::io::BufReader;
+use std::io::{BufReader, Write};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime};
+
+use rand::RngCore;
+use rcgen::{
+	BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose, SerialNumber,
+};
+use rsa::{
+	pkcs8::{EncodePrivateKey, LineEnding},
+	RsaPrivateKey,
+};
+
+use crate::config::Config;
 
 use rustls::client::danger::HandshakeSignatureValid;
 use rustls::crypto::{CryptoProvider, WebPkiSupportedAlgorithms};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, UnixTime};
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
-use rustls::DistinguishedName;
 use rustls::{DigitallySignedStruct, Error, ServerConfig, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
@@ -229,7 +240,7 @@ impl ClientCertVerifier for LenientClientCertVerifier {
 		false
 	}
 
-	fn root_hint_subjects(&self) -> &[DistinguishedName] {
+	fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
 		&[]
 	}
 
@@ -315,4 +326,90 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ()> {
 	rustls_pemfile::private_key(&mut reader)
 		.map_err(|e| tracing::error!("Failed to load private key: {}", e))?
 		.ok_or_else(|| tracing::error!("No private key found in file"))
+}
+
+/// Generate a self-signed TLS certificate and private key.
+///
+/// Creates a 2048-bit RSA key pair and a self-signed X.509 certificate valid for
+/// 10 years. The certificate includes the following properties:
+/// - Common Name: "Moonshine"
+/// - CA constraint: unconstrained (can sign other certificates)
+/// - Key usages: digital signature, key encipherment, key agreement
+/// - Serial number: random 64-bit value
+pub fn create_certificate() -> Result<(String, String), Box<dyn std::error::Error>> {
+	// Generate RSA key (2048 bits)
+	let mut rng = rand::rngs::OsRng;
+	let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
+	let key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
+
+	let mut params = CertificateParams::default();
+	params.not_before = SystemTime::now().into();
+	params.not_after = (SystemTime::now() + Duration::from_secs(3650 * 24 * 60 * 60)).into();
+	params.serial_number = Some(SerialNumber::from(rng.next_u64()));
+
+	let mut distinguished_name = DistinguishedName::new();
+	distinguished_name.push(DnType::CommonName, "Moonshine");
+	params.distinguished_name = distinguished_name;
+
+	params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+	params.key_usages = vec![
+		KeyUsagePurpose::DigitalSignature,
+		KeyUsagePurpose::KeyEncipherment,
+		KeyUsagePurpose::KeyAgreement,
+	];
+
+	let key_pair = KeyPair::from_pem(&key_pem)?;
+	let cert = params.self_signed(&key_pair)?;
+
+	Ok((cert.pem(), key_pem))
+}
+
+/// Load existing TLS certificate and private key from disk, or create new ones if they don't exist.
+pub async fn load_or_create_certificate(config: &Config) -> Result<(String, String), ()> {
+	let cert_path = &config.webserver.certificate;
+	let key_path = &config.webserver.private_key;
+
+	if !cert_path.exists() && !key_path.exists() {
+		tracing::info!("No certificate found, creating a new one.");
+
+		let (cert, pkey) =
+			create_certificate().map_err(|e| tracing::error!("Failed to create certificate: {e}"))?;
+
+		// Write certificate to file.
+		let cert_dir = cert_path
+			.parent()
+			.ok_or_else(|| tracing::error!("Failed to find parent directory for certificate file."))?;
+		std::fs::create_dir_all(cert_dir)
+			.map_err(|e| tracing::error!("Failed to create certificate directory: {e}"))?;
+		let mut certfile = std::fs::File::create(cert_path)
+			.map_err(|e| tracing::error!("Failed to create certificate file: {e}"))?;
+		certfile
+			.write(cert.as_bytes())
+			.map_err(|e| tracing::error!("Failed to write PEM to file: {e}"))?;
+
+		// Write private key to file.
+		let key_dir = key_path
+			.parent()
+			.ok_or_else(|| tracing::error!("Failed to find parent directory for private key file."))?;
+		std::fs::create_dir_all(key_dir)
+			.map_err(|e| tracing::error!("Failed to create private key directory: {e}"))?;
+		let mut keyfile = std::fs::File::create(key_path)
+			.map_err(|e| tracing::error!("Failed to create private key file: {e}"))?;
+		keyfile
+			.write(pkey.as_bytes())
+			.map_err(|e| tracing::error!("Failed to write private key to file: {e}"))?;
+
+		tracing::debug!("Saved certificate to {}", cert_path.display());
+		tracing::debug!("Saved private key to {}", key_path.display());
+
+		Ok((cert, pkey))
+	} else {
+		let cert = std::fs::read_to_string(cert_path)
+			.map_err(|e| tracing::error!("Failed to read server certificate: {e}"))?;
+
+		let pkey = std::fs::read_to_string(key_path)
+			.map_err(|e| tracing::error!("Failed to read private key: {e}"))?;
+
+		Ok((cert, pkey))
+	}
 }
