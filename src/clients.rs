@@ -1,14 +1,21 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::collections::BTreeMap;
+use std::sync::Arc;
+use std::sync::RwLock;
 
-use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
+use aes::cipher::generic_array::GenericArray;
+use aes::cipher::BlockDecrypt;
+use aes::cipher::BlockEncrypt;
+use aes::cipher::KeyInit;
 use aes::Aes128;
-use async_shutdown::TriggerShutdownToken;
-use aws_lc_rs::{
-	rand::{SecureRandom, SystemRandom},
-	signature::{KeyPair, RsaKeyPair, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256},
-};
-use sha2::{Digest, Sha256};
-use tokio::sync::{mpsc, oneshot, Notify};
+use aws_lc_rs::rand::SecureRandom;
+use aws_lc_rs::rand::SystemRandom;
+use aws_lc_rs::signature::KeyPair;
+use aws_lc_rs::signature::RsaKeyPair;
+use aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256;
+use aws_lc_rs::signature::RSA_PKCS1_SHA256;
+use sha2::Digest;
+use sha2::Sha256;
+use tokio::sync::Notify;
 use x509_parser::prelude::*;
 
 use crate::state::State;
@@ -44,554 +51,170 @@ pub struct PendingClient {
 	pub client_hash: Option<Vec<u8>>,
 }
 
-pub enum ClientManagerCommand {
-	/// Check if a client is already paired.
-	IsPaired(IsPairedCommand),
-
-	/// Check if a client certificate fingerprint is from a paired client.
-	IsCertPaired(IsCertPairedCommand),
-
-	/// Initiate the pairing procedure.
-	StartPairing(StartPairingCommand),
-
-	/// Register a pin for a client.
-	RegisterPin(RegisterPinCommand),
-
-	/// Run a challenge for the client.
-	ClientChallenge(ClientChallengeCommand),
-
-	/// Process the response from the challenge.
-	ServerChallengeResponse(ServerChallengeResponseCommand),
-
-	/// Check to make sure the client pairing secret is as expected.
-	CheckClientPairingSecret(CheckClientPairingSecretCommand),
-}
-
-/// Query the manager to check if this unique id is paired or not.
-pub struct IsPairedCommand {
-	/// Unique id of the client.
-	pub id: String,
-
-	/// Channel used to provide a response.
-	pub response: oneshot::Sender<Result<bool, String>>,
-}
-
-/// Query the manager to check if a certificate fingerprint belongs to a paired client.
-pub struct IsCertPairedCommand {
-	/// SHA-256 fingerprint of the client's DER-encoded certificate.
-	pub fingerprint: String,
-
-	/// Channel used to provide a response.
-	pub response: oneshot::Sender<Result<bool, String>>,
-}
-
-/// Initiate a pairing process for a client.
-pub struct StartPairingCommand {
-	/// Client to start the pairing process for.
-	pub pending_client: PendingClient,
-}
-
-/// Register a pin for a client.
-pub struct RegisterPinCommand {
-	/// Id of the client.
-	pub id: String,
-
-	/// The pin for the client.
-	pub pin: String,
-
-	/// Channel used to provide a response.
-	pub response: oneshot::Sender<Result<(), String>>,
-}
-
-/// Run a challenge for the client.
-pub struct ClientChallengeCommand {
-	/// Id of the client.
-	pub id: String,
-
-	/// Challenge from the client.
-	pub challenge: Vec<u8>,
-
-	/// Channel used to provide a response.
-	pub response: oneshot::Sender<Result<Vec<u8>, String>>,
-}
-
-/// Process the response from the client challenge.
-pub struct ServerChallengeResponseCommand {
-	/// Id of the client.
-	pub id: String,
-
-	/// Challenge response from the client.
-	pub challenge_response: Vec<u8>,
-
-	/// Channel used to provide a response.
-	pub response: oneshot::Sender<Result<Vec<u8>, String>>,
-}
-
-/// Check the secret of the client.
-pub struct CheckClientPairingSecretCommand {
-	/// Id of the client.
-	pub id: String,
-
-	/// Challenge response from the client.
-	pub client_secret: Vec<u8>,
-
-	/// Channel used to provide a response.
-	pub response: oneshot::Sender<Result<(), String>>,
-}
-
+/// Manages client pairing state and operations.
+///
+/// This is a synchronous manager backed by an `Arc<RwLock>`. It holds pending client state
+/// (salt, certificates, challenge/response data) and delegates persistent state to `State`.
 #[derive(Clone)]
 pub struct ClientManager {
-	command_tx: mpsc::Sender<ClientManagerCommand>,
+	inner: Arc<RwLock<ClientManagerData>>,
+	state: State,
+	server_cert_pem: String,
+	server_private_key_pem: String,
+}
+
+struct ClientManagerData {
+	pending_clients: BTreeMap<String, PendingClient>,
 }
 
 impl ClientManager {
-	pub fn new(
-		state: State,
-		server_certs: String,
-		server_pkey: String,
-		shutdown_token: TriggerShutdownToken<i32>,
-	) -> Self {
-		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = ClientManagerInner {
-			server_certs,
-			server_pkey,
-		};
-		tokio::spawn(async move {
-			inner.run(command_rx, state).await;
-			drop(shutdown_token);
-		});
-
-		Self { command_tx }
-	}
-
-	pub async fn is_paired(&self, id: String) -> Result<bool, ()> {
-		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx
-			.send(ClientManagerCommand::IsPaired(IsPairedCommand {
-				id,
-				response: response_tx,
-			}))
-			.await
-			.map_err(|e| tracing::warn!("Failed to check paired status: {e}"))?;
-
-		response_rx
-			.await
-			.map_err(|e| tracing::warn!("Failed to receive IsPaired response: {e}"))?
-			.map_err(|e| tracing::warn!("Failed to check paired status: {e}"))
-	}
-
-	pub async fn is_cert_paired(&self, fingerprint: &str) -> Result<bool, ()> {
-		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx
-			.send(ClientManagerCommand::IsCertPaired(IsCertPairedCommand {
-				fingerprint: fingerprint.to_string(),
-				response: response_tx,
-			}))
-			.await
-			.map_err(|e| tracing::warn!("Failed to check cert paired status: {e}"))?;
-
-		response_rx
-			.await
-			.map_err(|e| tracing::warn!("Failed to receive IsCertPaired response: {e}"))?
-			.map_err(|e| tracing::warn!("Failed to check cert paired status: {e}"))
-	}
-
-	pub async fn start_pairing(&self, pending_client: PendingClient) -> Result<(), ()> {
-		self.command_tx
-			.send(ClientManagerCommand::StartPairing(StartPairingCommand {
-				pending_client,
-			}))
-			.await
-			.map_err(|e| tracing::warn!("Failed to start pairing: {e}"))
-	}
-
-	pub async fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
-		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx
-			.send(ClientManagerCommand::RegisterPin(RegisterPinCommand {
-				id: id.to_string(),
-				pin: pin.to_string(),
-				response: response_tx,
-			}))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send pin to client manager: {e}"))?;
-
-		response_rx
-			.await
-			.map_err(|e| tracing::warn!("Failed to wait for response to RegisterPin command from client manager: {e}"))?
-			.map_err(|e| tracing::warn!("{e}"))
-	}
-
-	pub async fn client_challenge(&self, id: &str, challenge: Vec<u8>) -> Result<Vec<u8>, ()> {
-		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx
-			.send(ClientManagerCommand::ClientChallenge(ClientChallengeCommand {
-				id: id.to_string(),
-				challenge,
-				response: response_tx,
-			}))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send client challenge to client manager: {e}"))?;
-
-		response_rx
-			.await
-			.map_err(|e| {
-				tracing::warn!("Failed to wait for response to client challenge command from client manager: {e}")
-			})?
-			.map_err(|e| tracing::warn!("{e}"))
-	}
-
-	pub async fn server_challenge_response(&self, id: &str, challenge_response: Vec<u8>) -> Result<Vec<u8>, ()> {
-		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx
-			.send(ClientManagerCommand::ServerChallengeResponse(
-				ServerChallengeResponseCommand {
-					id: id.to_string(),
-					challenge_response,
-					response: response_tx,
-				},
-			))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send server challenge response to client manager: {e}"))?;
-
-		response_rx
-			.await
-			.map_err(|e| {
-				tracing::warn!(
-					"Failed to wait for response to server challenge response command from client manager: {e}"
-				)
-			})?
-			.map_err(|e| tracing::warn!("{e}"))
-	}
-
-	pub async fn check_client_pairing_secret(&self, id: &str, client_secret: Vec<u8>) -> Result<(), ()> {
-		let (response_tx, response_rx) = oneshot::channel();
-		self.command_tx
-			.send(ClientManagerCommand::CheckClientPairingSecret(
-				CheckClientPairingSecretCommand {
-					id: id.to_string(),
-					client_secret,
-					response: response_tx,
-				},
-			))
-			.await
-			.map_err(|e| {
-				tracing::warn!("Failed to send check client pairing secret response to client manager: {e}")
-			})?;
-
-		response_rx
-			.await
-			.map_err(|e| {
-				tracing::warn!(
-					"Failed to wait for response to check client pairing secret command from client manager: {e}"
-				)
-			})?
-			.map_err(|e| tracing::warn!("{e}"))
-	}
-}
-
-struct ClientManagerInner {
-	server_certs: String,
-	server_pkey: String,
-}
-
-impl ClientManagerInner {
-	async fn run(self, mut command_rx: mpsc::Receiver<ClientManagerCommand>, state: State) {
-		tracing::debug!("Waiting for commands.");
-
-		let mut pending_clients = BTreeMap::new();
-		while let Some(command) = command_rx.recv().await {
-			match command {
-				ClientManagerCommand::IsPaired(command) => match state.has_client(command.id) {
-					Ok(result) => {
-						command
-							.response
-							.send(Ok(result))
-							.map_err(|_| tracing::error!("Failed to send IsPaired response."))
-							.ok();
-					},
-					Err(()) => {
-						command
-							.response
-							.send(Err("Failed to check client paired status.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send IsPaired response."))
-							.ok();
-					},
-				},
-
-				ClientManagerCommand::IsCertPaired(command) => match state.has_paired_cert(command.fingerprint) {
-					Ok(result) => {
-						command
-							.response
-							.send(Ok(result))
-							.map_err(|_| tracing::error!("Failed to send IsCertPaired response."))
-							.ok();
-					},
-					Err(()) => {
-						command
-							.response
-							.send(Err("Failed to check cert paired status.".to_string()))
-							.map_err(|_| tracing::error!("Failed to send IsCertPaired response."))
-							.ok();
-					},
-				},
-
-				ClientManagerCommand::StartPairing(command) => {
-					pending_clients.insert(command.pending_client.id.clone(), command.pending_client);
-				},
-
-				ClientManagerCommand::RegisterPin(command) => {
-					match pending_clients.get_mut(&command.id) {
-						Some(client) => {
-							let key = match create_key(&client.salt, &command.pin) {
-								Ok(key) => key,
-								Err(e) => {
-									tracing::warn!("Failed to create client key: {e}");
-									command
-										.response
-										.send(Err(e))
-										.map_err(|_| tracing::error!("Failed to send RegisterPin response."))
-										.ok();
-									continue;
-								},
-							};
-							client.key = Some(key);
-							client.pin_notify.notify_waiters();
-							command
-								.response
-								.send(Ok(()))
-								.map_err(|_| tracing::error!("Failed to send RegisterPin error."))
-								.ok();
-						},
-						None => {
-							command
-								.response
-								.send(Err(format!("No known client with id {}", command.id)))
-								.map_err(|_| tracing::error!("Failed to send pin notify error."))
-								.ok();
-						},
-					};
-				},
-
-				ClientManagerCommand::ClientChallenge(command) => {
-					match pending_clients.get_mut(&command.id) {
-						Some(client) => {
-							match self.client_challenge(client, command.challenge).await {
-								Ok(response) => {
-									command
-										.response
-										.send(Ok(response))
-										.map_err(|_| tracing::error!("Failed to send ClientChallenge response."))
-										.ok();
-								},
-								Err(e) => {
-									tracing::warn!("Failed to respond to client challenge: {e}");
-									command
-										.response
-										.send(Err(e))
-										.map_err(|_| tracing::error!("Failed to send ClientChallenge error."))
-										.ok();
-									continue;
-								},
-							};
-						},
-						None => {
-							command
-								.response
-								.send(Err(format!("No known client with id {}", command.id)))
-								.map_err(|_| tracing::error!("Failed to send ClientChallenge response."))
-								.ok();
-						},
-					};
-				},
-
-				ClientManagerCommand::ServerChallengeResponse(command) => {
-					match pending_clients.get_mut(&command.id) {
-						Some(client) => {
-							match self.server_challenge_response(client, command.challenge_response).await {
-								Ok(response) => {
-									command
-										.response
-										.send(Ok(response))
-										.map_err(|_| {
-											tracing::error!("Failed to send ServerChallengeResponse response.")
-										})
-										.ok();
-								},
-								Err(e) => {
-									tracing::warn!("Failed to respond to server challenge: {e}");
-									command
-										.response
-										.send(Err(e))
-										.map_err(|_| tracing::error!("Failed to send ServerChallengeResponse error."))
-										.ok();
-									continue;
-								},
-							};
-						},
-						None => {
-							command
-								.response
-								.send(Err(format!("No known client with id {}", command.id)))
-								.map_err(|_| tracing::error!("Failed to send ServerChallengeResponse response."))
-								.ok();
-						},
-					};
-				},
-
-				ClientManagerCommand::CheckClientPairingSecret(command) => {
-					match pending_clients.get_mut(&command.id) {
-						Some(client) => {
-							match check_client_pairing_secret(client, command.client_secret).await {
-								Ok(()) => {
-									// Verification succeeded — now persist the client and cert fingerprint.
-									let fingerprint = cert_pem_fingerprint(&client.pem);
-									if let Some(fp) = &fingerprint {
-										if state.add_paired_cert(fp.clone()).is_err() {
-											tracing::warn!("Failed to store paired cert fingerprint: {fp}");
-											command
-												.response
-												.send(Err("Failed to persist paired certificate".to_string()))
-												.map_err(|_| {
-													tracing::error!("Failed to send CheckClientPairingSecret response.")
-												})
-												.ok();
-											continue;
-										}
-									}
-
-									let Ok(has_client) = state.has_client(command.id.clone()) else {
-										command
-											.response
-											.send(Err("Failed to check client paired status.".to_string()))
-											.map_err(|_| {
-												tracing::error!("Failed to send CheckClientPairingSecret response.")
-											})
-											.ok();
-										continue;
-									};
-
-									if has_client {
-										tracing::info!("Client '{}' re-paired with updated certificate.", command.id);
-									} else if state.add_client(command.id.clone()).is_err() {
-										tracing::warn!("Failed to persist client '{}'.", command.id);
-										command
-											.response
-											.send(Err(format!("Failed to persist client '{}'", command.id)))
-											.map_err(|_| {
-												tracing::error!("Failed to send CheckClientPairingSecret response.")
-											})
-											.ok();
-										continue;
-									}
-
-									command
-										.response
-										.send(Ok(()))
-										.map_err(|_| {
-											tracing::error!("Failed to send CheckClientPairingSecret response.")
-										})
-										.ok();
-								},
-								Err(e) => {
-									tracing::warn!("Failed to check client pairing secret: {e}");
-									command
-										.response
-										.send(Err(e))
-										.map_err(|_| tracing::error!("Failed to send CheckClientPairingSecret error."))
-										.ok();
-									continue;
-								},
-							};
-						},
-						None => {
-							command
-								.response
-								.send(Err(format!("No known client with id {}", command.id)))
-								.map_err(|_| tracing::error!("Failed to send CheckClientPairingSecret response."))
-								.ok();
-						},
-					};
-				},
-			}
+	pub fn new(state: State, server_cert_pem: String, server_private_key_pem: String) -> Self {
+		Self {
+			inner: Arc::new(RwLock::new(ClientManagerData {
+				pending_clients: BTreeMap::new(),
+			})),
+			state,
+			server_cert_pem,
+			server_private_key_pem,
 		}
-
-		tracing::debug!("Client manager stopped.");
 	}
 
-	async fn client_challenge(&self, client: &mut PendingClient, challenge: Vec<u8>) -> Result<Vec<u8>, String> {
+	pub fn is_paired(&self, id: String) -> Result<bool, ()> {
+		self.state.has_client(id)
+	}
+
+	pub fn is_cert_paired(&self, fingerprint: &str) -> Result<bool, ()> {
+		self.state.has_paired_cert(fingerprint.to_string())
+	}
+
+	pub fn start_pairing(&self, pending_client: PendingClient) -> Result<(), ()> {
+		let mut inner = self.inner.write().map_err(|poison| {
+			tracing::error!("RwLock poisoned: {poison}");
+		})?;
+		inner.pending_clients.insert(pending_client.id.clone(), pending_client);
+		Ok(())
+	}
+
+	pub fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
+		let mut inner = self.inner.write().map_err(|poison| {
+			tracing::error!("RwLock poisoned: {poison}");
+		})?;
+		let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
+			tracing::warn!("No known client with id {id}");
+		})?;
+		let key = create_key(&client.salt, pin).map_err(|e| tracing::warn!("Failed to create client key: {e}"))?;
+		client.key = Some(key);
+		client.pin_notify.notify_waiters();
+		Ok(())
+	}
+
+	pub fn client_challenge(&self, id: &str, challenge: Vec<u8>) -> Result<Vec<u8>, ()> {
+		let mut inner = self.inner.write().map_err(|poison| {
+			tracing::error!("RwLock poisoned: {poison}");
+		})?;
+		let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
+			tracing::warn!("No known client with id {id}");
+		})?;
+
 		let key = match &client.key {
 			Some(key) => key,
 			None => {
-				return Err("Client has not provided a pin yet.".to_string());
+				tracing::warn!("Client has not provided a pin yet.");
+				return Err(());
 			},
 		};
 
-		// Generate a random server secret.
 		let mut server_secret = [0u8; 16];
 		SystemRandom::new()
 			.fill(&mut server_secret)
-			.map_err(|_| "Failed to generate random".to_string())?;
-
+			.map_err(|_| tracing::warn!("Failed to generate random"))?;
 		client.server_secret = Some(server_secret);
 
 		let mut decrypted =
-			aes_decrypt_ecb(&challenge, key).map_err(|e| format!("Failed to decrypt client challenge: {e}"))?;
+			aes_decrypt_ecb(&challenge, key).map_err(|e| tracing::warn!("Failed to decrypt client challenge: {e}"))?;
 
-		// Parse server cert to get signature
-		let signature_bytes = extract_certificate_signature(&self.server_certs)
-			.map_err(|e| format!("Failed to extract server cert signature: {e}"))?;
-
+		let signature_bytes = extract_certificate_signature(&self.server_cert_pem)
+			.map_err(|e| tracing::warn!("Failed to extract server cert signature: {e}"))?;
 		decrypted.extend_from_slice(&signature_bytes);
 		decrypted.extend_from_slice(&server_secret);
 
 		let mut server_challenge = [0u8; 16];
 		SystemRandom::new()
 			.fill(&mut server_challenge)
-			.map_err(|_| "Failed to generate random".to_string())?;
-
+			.map_err(|_| tracing::warn!("Failed to generate random"))?;
 		client.server_challenge = Some(server_challenge);
 
 		let mut hasher = Sha256::new();
-		hasher.update(decrypted.as_slice());
+		hasher.update(&decrypted);
 		let challenge_response_hash = hasher.finalize();
 
-		// Construct decrypted payload: hash + server_challenge
 		let mut challenge_response_decrypted = challenge_response_hash.to_vec();
 		challenge_response_decrypted.extend(server_challenge);
 
-		let challenge_response = aes_encrypt_ecb(&challenge_response_decrypted, key)
-			.map_err(|e| format!("Failed to encrypt client challenge response: {e}"))?;
-
-		Ok(challenge_response)
+		aes_encrypt_ecb(&challenge_response_decrypted, key)
+			.map_err(|e| tracing::warn!("Failed to encrypt client challenge response: {e}"))
 	}
 
-	async fn server_challenge_response(
-		&self,
-		client: &mut PendingClient,
-		challenge_response: Vec<u8>,
-	) -> Result<Vec<u8>, String> {
+	pub fn server_challenge_response(&self, id: &str, challenge_response: Vec<u8>) -> Result<Vec<u8>, ()> {
+		let mut inner = self.inner.write().map_err(|poison| {
+			tracing::error!("RwLock poisoned: {poison}");
+		})?;
+		let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
+			tracing::warn!("No known client with id {id}");
+		})?;
+
 		let key = match &client.key {
 			Some(key) => key,
 			None => {
-				return Err("Client has not provided a pin yet.".to_string());
+				tracing::warn!("Client has not provided a pin yet.");
+				return Err(());
 			},
 		};
 
 		let decrypted = aes_decrypt_ecb(&challenge_response, key)
-			.map_err(|e| format!("Failed to decrypt server challenge response: {e}"))?;
+			.map_err(|e| tracing::warn!("Failed to decrypt server challenge response: {e}"))?;
 		client.client_hash = Some(decrypted);
 
-		let server_secret = client
-			.server_secret
-			.ok_or("Client does not have a server secret.".to_string())?;
+		let server_secret = client.server_secret.ok_or_else(|| {
+			tracing::warn!("Client does not have a server secret.");
+		})?;
 
 		let mut pairing_secret = server_secret.to_vec();
-		let signed =
-			sign(&server_secret, &self.server_pkey).map_err(|e| format!("Failed to sign server secret: {e}"))?;
+		let signed = sign(&server_secret, &self.server_private_key_pem)
+			.map_err(|e| tracing::warn!("Failed to sign server secret: {e}"))?;
 		pairing_secret.extend(signed);
 
 		Ok(pairing_secret)
+	}
+
+	pub fn check_client_pairing_secret(&self, id: &str, client_secret: Vec<u8>) -> Result<(), ()> {
+		let mut inner = self.inner.write().map_err(|poison| {
+			tracing::error!("RwLock poisoned: {poison}");
+		})?;
+		let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
+			tracing::warn!("No known client with id {id}");
+		})?;
+		verify_pairing_secret(client, client_secret)
+			.map_err(|e| tracing::warn!("Failed to verify client pairing secret: {e}"))?;
+
+		let fingerprint = cert_pem_fingerprint(&client.pem);
+		if let Some(fp) = &fingerprint {
+			self.state
+				.add_paired_cert(fp.clone())
+				.map_err(|_| tracing::warn!("Failed to persist paired certificate: {fp}"))?;
+		}
+
+		let has_client = self
+			.state
+			.has_client(id.to_string())
+			.map_err(|_| tracing::warn!("Failed to check client paired status"))?;
+		if !has_client {
+			self.state
+				.add_client(id.to_string())
+				.map_err(|_| tracing::warn!("Failed to persist client '{id}'"))?;
+		}
+
+		Ok(())
 	}
 }
 
@@ -610,7 +233,6 @@ fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
 }
 
 fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
-	// Extract key from PEM using rustls-pemfile
 	let key_bytes = {
 		let mut reader = std::io::Cursor::new(key_pem.as_bytes());
 		match rustls_pemfile::private_key(&mut reader) {
@@ -620,7 +242,6 @@ fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
 		}
 	};
 
-	// We strictly use RSA for Moonshine hosting
 	let key_pair = RsaKeyPair::from_pkcs8(&key_bytes).map_err(|e| format!("Failed to load RSA key pair: {}", e))?;
 
 	let rng = SystemRandom::new();
@@ -652,12 +273,10 @@ fn verify_client_signature(pem: &str, secret: &[u8], signature: &[u8]) -> Result
 	})
 }
 
-async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> Result<(), String> {
+fn verify_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> Result<(), String> {
 	let client_hash = match &client.client_hash {
 		Some(client_hash) => client_hash,
-		None => {
-			return Err("We did not yet receive a client hash.".to_string());
-		},
+		None => return Err("We did not yet receive a client hash.".to_string()),
 	};
 
 	let server_challenge = match client.server_challenge {
@@ -667,7 +286,6 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 		},
 	};
 
-	// We expect at least 16 bytes.
 	if client_secret.len() < 16 {
 		return Err(format!(
 			"Expected client pairing secret to be at least 16 bytes, but got {}",
@@ -682,7 +300,6 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 
 	let signature_bytes = extract_certificate_signature(&client.pem)
 		.map_err(|e| format!("Failed to extract client cert signature: {e}"))?;
-
 	data.extend(signature_bytes);
 	data.extend(client_secret_payload);
 
@@ -694,7 +311,6 @@ async fn check_client_pairing_secret(client: &mut PendingClient, client_secret: 
 		return Err("Client hash is not as expected, MITM?".to_string());
 	}
 
-	// Verify the client's signature over the secret using the client's X.509 public key.
 	verify_client_signature(&client.pem, client_secret_payload, client_signature)?;
 
 	Ok(())
@@ -730,7 +346,6 @@ fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 	Ok(decrypted)
 }
 
-/// Compute SHA-256 fingerprint of a client certificate given in PEM format.
 fn cert_pem_fingerprint(pem: &str) -> Option<String> {
 	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).ok()?;
 	Some(hex::encode(Sha256::digest(&pem_obj.contents)))

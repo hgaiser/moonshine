@@ -112,7 +112,7 @@ impl Moonshine {
 		let session_manager = SessionManager::new(config.clone(), shutdown.clone())?;
 
 		// Create a manager for saving and loading client state.
-		let client_manager = ClientManager::new(state.clone(), cert.clone(), pkey, shutdown.trigger_shutdown_token(3));
+		let client_manager = ClientManager::new(state.clone(), cert.clone(), pkey);
 
 		// Run the RTSP server.
 		let rtsp_server = RtspServer::new(config.clone(), session_manager.clone(), shutdown.clone());

@@ -158,7 +158,7 @@ async fn get_server_cert(
 		};
 		let notify = pending_client.pin_notify.clone();
 
-		match client_manager.start_pairing(pending_client).await {
+		match client_manager.start_pairing(pending_client) {
 			Ok(()) => {},
 			Err(()) => {
 				let message = "Failed to start pairing client".to_string();
@@ -252,7 +252,7 @@ async fn client_challenge(
 		},
 	};
 
-	let challenge_response = match client_manager.client_challenge(&unique_id, challenge).await {
+	let challenge_response = match client_manager.client_challenge(&unique_id, challenge) {
 		Ok(challenge_response) => challenge_response,
 		Err(()) => {
 			return bad_request("Failed to process client challenge".to_string());
@@ -311,10 +311,7 @@ async fn server_challenge_response(
 		},
 	};
 
-	let pairing_secret = match client_manager
-		.server_challenge_response(&unique_id, server_challenge_response)
-		.await
-	{
+	let pairing_secret = match client_manager.server_challenge_response(&unique_id, server_challenge_response) {
 		Ok(pairing_secret) => pairing_secret,
 		Err(()) => {
 			return bad_request("Failed to process server challenge response".to_string());
@@ -391,7 +388,6 @@ async fn client_pairing_secret(
 
 	if client_manager
 		.check_client_pairing_secret(&unique_id, client_pairing_secret)
-		.await
 		.is_err()
 	{
 		return bad_request("Failed to check client pairing secret".to_string());

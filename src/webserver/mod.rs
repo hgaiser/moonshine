@@ -501,7 +501,7 @@ impl Webserver {
 		// Seems we should only say we paired when using HTTPS.
 		let paired = if https {
 			match params.get("uniqueid") {
-				Some(unique_id) if self.client_manager.is_paired(unique_id.clone()).await.unwrap_or(false) => "1",
+				Some(unique_id) if self.client_manager.is_paired(unique_id.clone()).unwrap_or(false) => "1",
 				Some(_) | None => "0",
 			}
 		} else {
@@ -606,7 +606,7 @@ impl Webserver {
 			},
 		};
 
-		let response = self.client_manager.register_pin(unique_id, pin).await;
+		let response = self.client_manager.register_pin(unique_id, pin);
 		match response {
 			Ok(()) => {
 				tracing::info!("PIN registered successfully.");
@@ -948,7 +948,7 @@ impl Webserver {
 	/// or `Some(response)` with a 401 response if not.
 	async fn verify_paired_client(&self, peer_cert_fingerprint: &Option<String>) -> Option<Response<Full<Bytes>>> {
 		match peer_cert_fingerprint {
-			Some(fingerprint) => match self.client_manager.is_cert_paired(fingerprint).await {
+			Some(fingerprint) => match self.client_manager.is_cert_paired(fingerprint) {
 				Ok(true) => None,
 				Ok(false) => {
 					tracing::warn!("Client certificate not recognized (fingerprint: {fingerprint})");
