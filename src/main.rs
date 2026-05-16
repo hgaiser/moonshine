@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 use crate::clients::ClientManager;
 use crate::config::Config;
 use crate::crypto::create_certificate;
+use crate::discovery::ZeroconfDiscovery;
 use crate::rtsp::RtspServer;
 use crate::session::SessionManager;
 use crate::state::State;
@@ -20,7 +21,7 @@ mod app_scanner;
 mod clients;
 mod config;
 mod crypto;
-mod publisher;
+mod discovery;
 mod rtsp;
 mod session;
 mod state;
@@ -94,6 +95,7 @@ pub struct Moonshine {
 	_session_manager: SessionManager,
 	_client_manager: ClientManager,
 	_webserver: Webserver,
+	_discovery: ZeroconfDiscovery,
 }
 
 /// The main application struct, responsible for initializing and managing all subsystems.
@@ -115,8 +117,8 @@ impl Moonshine {
 		// Run the RTSP server.
 		let rtsp_server = RtspServer::new(config.clone(), session_manager.clone(), shutdown.clone());
 
-		// Publish the Moonshine service using zeroconf.
-		publisher::spawn(config.webserver.port, config.name.clone());
+		// Advertise the Moonshine service via mDNS/zeroconf.
+		let discovery = ZeroconfDiscovery::spawn(config.webserver.port, config.name.clone(), shutdown.clone());
 
 		// Run the webserver.
 		let webserver = Webserver::new(
@@ -133,6 +135,7 @@ impl Moonshine {
 			_session_manager: session_manager,
 			_client_manager: client_manager,
 			_webserver: webserver,
+			_discovery: discovery,
 		})
 	}
 
