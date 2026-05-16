@@ -95,13 +95,11 @@ impl Config {
 
 	fn resolve_paths(&mut self) {
 		let cert_path = self.webserver.certificate.to_string_lossy().to_string();
-		let cert_path =
-			shellexpand::full(&cert_path).expect("Failed to expand certificate path");
+		let cert_path = shellexpand::full(&cert_path).expect("Failed to expand certificate path");
 		self.webserver.certificate = cert_path.to_string().into();
 
 		let private_key_path = self.webserver.private_key.to_string_lossy().to_string();
-		let private_key_path =
-			shellexpand::full(&private_key_path).expect("Failed to expand private key path");
+		let private_key_path = shellexpand::full(&private_key_path).expect("Failed to expand private key path");
 		self.webserver.private_key = private_key_path.to_string().into();
 	}
 }

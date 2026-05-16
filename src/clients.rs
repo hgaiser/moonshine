@@ -3,9 +3,9 @@ use std::{collections::BTreeMap, sync::Arc};
 use aes::cipher::{generic_array::GenericArray, BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
 use async_shutdown::TriggerShutdownToken;
-use ring::{
+use aws_lc_rs::{
 	rand::{SecureRandom, SystemRandom},
-	signature::{RsaKeyPair, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256},
+	signature::{KeyPair, RsaKeyPair, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_SHA256},
 };
 use sha2::{Digest, Sha256};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -608,7 +608,7 @@ fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
 	let key_pair = RsaKeyPair::from_pkcs8(&key_bytes).map_err(|e| format!("Failed to load RSA key pair: {}", e))?;
 
 	let rng = SystemRandom::new();
-	let mut signature = vec![0; key_pair.public().modulus_len()];
+	let mut signature = vec![0; key_pair.public_key().modulus_len()];
 
 	key_pair
 		.sign(&RSA_PKCS1_SHA256, &rng, data, &mut signature)
@@ -630,7 +630,7 @@ fn verify_client_signature(pem: &str, secret: &[u8], signature: &[u8]) -> Result
 		.parse_x509()
 		.map_err(|e| format!("Failed to parse X509: {}", e))?;
 	let public_key_bytes = cert.tbs_certificate.subject_pki.subject_public_key.data;
-	let public_key = ring::signature::UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key_bytes);
+	let public_key = aws_lc_rs::signature::UnparsedPublicKey::new(&RSA_PKCS1_2048_8192_SHA256, public_key_bytes);
 	public_key.verify(secret, signature).map_err(|_| {
 		"Client certificate signature verification failed: signature does not match the client's public key".to_string()
 	})

@@ -16,7 +16,7 @@ use tokio_rustls::{server::TlsStream, TlsAcceptor as TlsAcceptorTokio};
 use tracing::Level;
 use x509_parser::prelude::*;
 
-use ring::signature::{
+use aws_lc_rs::signature::{
 	UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384, RSA_PKCS1_2048_8192_SHA512,
 	RSA_PSS_2048_8192_SHA256, RSA_PSS_2048_8192_SHA384, RSA_PSS_2048_8192_SHA512,
 };
@@ -41,7 +41,7 @@ impl LenientClientCertVerifier {
 	fn new() -> Self {
 		let provider = CryptoProvider::get_default()
 			.cloned()
-			.unwrap_or_else(|| Arc::new(rustls::crypto::ring::default_provider()));
+			.unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
 		Self {
 			supported_algs: provider.signature_verification_algorithms,
 		}
@@ -93,7 +93,7 @@ impl LenientClientCertVerifier {
 		Ok(public_key_bytes)
 	}
 
-	/// Verify a signature manually using ring, bypassing WebPki.
+	/// Verify a signature manually using aws-lc-rs, bypassing WebPki.
 	///
 	/// This supports RSA PKCS1, RSA PSS, ECDSA, and Ed25519 signatures.
 	fn verify_signature_manual(
@@ -136,16 +136,18 @@ impl LenientClientCertVerifier {
 
 			// ECDSA signatures (ASN.1 DER-encoded)
 			SignatureScheme::ECDSA_NISTP256_SHA256 => {
-				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P256_SHA256_ASN1, &public_key_bytes);
+				let public_key =
+					UnparsedPublicKey::new(&aws_lc_rs::signature::ECDSA_P256_SHA256_ASN1, &public_key_bytes);
 				self.verify_with_scheme(public_key, message, dss, "ECDSA_NISTP256_SHA256")
 			},
 			SignatureScheme::ECDSA_NISTP384_SHA384 => {
-				let public_key = UnparsedPublicKey::new(&ring::signature::ECDSA_P384_SHA384_ASN1, &public_key_bytes);
+				let public_key =
+					UnparsedPublicKey::new(&aws_lc_rs::signature::ECDSA_P384_SHA384_ASN1, &public_key_bytes);
 				self.verify_with_scheme(public_key, message, dss, "ECDSA_NISTP384_SHA384")
 			},
-			// ECDSA P-521 is not supported by ring
+			// ECDSA P-521 is not supported by aws-lc-rs
 			SignatureScheme::ECDSA_NISTP521_SHA512 => {
-				tracing::warn!("ECDSA P-521 is not supported by ring");
+				tracing::warn!("ECDSA P-521 is not supported by aws-lc-rs");
 				Err(Error::InvalidCertificate(
 					rustls::CertificateError::UnsupportedSignatureAlgorithmContext {
 						signature_algorithm_id: vec![],
@@ -156,7 +158,7 @@ impl LenientClientCertVerifier {
 
 			// Ed25519 signatures
 			SignatureScheme::ED25519 => {
-				let public_key = UnparsedPublicKey::new(&ring::signature::ED25519, &public_key_bytes);
+				let public_key = UnparsedPublicKey::new(&aws_lc_rs::signature::ED25519, &public_key_bytes);
 				self.verify_with_scheme(public_key, message, dss, "ED25519")
 			},
 
@@ -191,7 +193,7 @@ impl LenientClientCertVerifier {
 			})
 	}
 
-	/// Verify TLS 1.2 signature manually using ring, bypassing WebPki.
+	/// Verify TLS 1.2 signature manually using aws-lc-rs, bypassing WebPki.
 	fn verify_tls12_signature_manual(
 		&self,
 		message: &[u8],
@@ -201,7 +203,7 @@ impl LenientClientCertVerifier {
 		self.verify_signature_manual(message, cert_der, dss, false)
 	}
 
-	/// Verify TLS 1.3 signature manually using ring, bypassing WebPki.
+	/// Verify TLS 1.3 signature manually using aws-lc-rs, bypassing WebPki.
 	fn verify_tls13_signature_manual(
 		&self,
 		message: &[u8],

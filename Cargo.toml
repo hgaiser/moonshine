@@ -51,10 +51,10 @@ pulseaudio = "0.3.1"
 rand = "0.8.5"
 rcgen = "0.14.7"
 fec-rs = { version = "0.1.0", features = ["parallel"] }
-ring = "0.17.14"
+aws-lc-rs = "1.16.2"
 rsa = "0.9.10"
 rtsp-types = "0.1.3"
-rustls = { version = "0.23.37", default-features = false, features = ["ring"] }
+rustls = "0.23.40"
 rustls-pemfile = "2.2.0"
 sdp-types = "0.1.8"
 serde = "1.0.228"
