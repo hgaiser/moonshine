@@ -66,6 +66,44 @@ impl Config {
 
 		Ok(config)
 	}
+
+	pub async fn load_or_create(path: &PathBuf) -> Result<Config, ()> {
+		let mut config = if path.exists() {
+			Self::read_from_file(path)?
+		} else {
+			tracing::info!(
+				"No config file found at {}, creating a default config file.",
+				path.display()
+			);
+			let config = Self::default();
+
+			let serialized =
+				toml::to_string_pretty(&config).map_err(|e| tracing::error!("Failed to serialize config: {e}"))?;
+
+			let dir = path
+				.parent()
+				.ok_or_else(|| tracing::error!("Failed to get parent directory of config file."))?;
+			std::fs::create_dir_all(dir).map_err(|e| tracing::error!("Failed to create config directory: {e}"))?;
+			std::fs::write(path, serialized).map_err(|e| tracing::error!("Failed to save config file: {e}"))?;
+
+			config
+		};
+
+		config.resolve_paths();
+		Ok(config)
+	}
+
+	fn resolve_paths(&mut self) {
+		let cert_path = self.webserver.certificate.to_string_lossy().to_string();
+		let cert_path =
+			shellexpand::full(&cert_path).expect("Failed to expand certificate path");
+		self.webserver.certificate = cert_path.to_string().into();
+
+		let private_key_path = self.webserver.private_key.to_string_lossy().to_string();
+		let private_key_path =
+			shellexpand::full(&private_key_path).expect("Failed to expand private key path");
+		self.webserver.private_key = private_key_path.to_string().into();
+	}
 }
 
 impl Default for Config {

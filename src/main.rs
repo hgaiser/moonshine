@@ -41,47 +41,7 @@ async fn main() -> Result<(), ()> {
 		.with(EnvFilter::from_default_env())
 		.init();
 
-	// Ensure rustls has a single crypto provider selected at process start.
-	// When multiple crypto backends (ring, aws-lc-rs) are present the crate
-	// requires an explicit choice. Install the default provider now.
-	// Prefer the `ring` provider explicitly to avoid runtime ambiguity
-	// when multiple crypto backends are present in the dependency graph.
-	// Construct the provider from the `ring` module and install it.
-	let provider = rustls::crypto::ring::default_provider();
-	let _ = provider.install_default();
-
-	let mut config;
-	if args.config.exists() {
-		config = Config::read_from_file(args.config).unwrap_or_else(|()| std::process::exit(1));
-	} else {
-		tracing::info!(
-			"No config file found at {}, creating a default config file.",
-			args.config.display()
-		);
-		config = Config::default();
-
-		let serialized_config =
-			toml::to_string_pretty(&config).map_err(|e| tracing::error!("Failed to serialize config: {e}"))?;
-
-		let config_dir = args
-			.config
-			.parent()
-			.ok_or_else(|| tracing::error!("Failed to get parent directory of config file."))?;
-		std::fs::create_dir_all(config_dir).map_err(|e| tracing::error!("Failed to create config directory: {e}"))?;
-		std::fs::write(args.config, serialized_config)
-			.map_err(|e| tracing::error!("Failed to save config file: {e}"))?;
-	}
-
-	// Resolve these paths so that the rest of the code doesn't need to.
-	let cert_path = config.webserver.certificate.to_string_lossy().to_string();
-	let cert_path =
-		shellexpand::full(&cert_path).map_err(|e| tracing::error!("Failed to expand certificate path: {e}"))?;
-	config.webserver.certificate = cert_path.to_string().into();
-
-	let private_key_path = config.webserver.private_key.to_string_lossy().to_string();
-	let private_key_path =
-		shellexpand::full(&private_key_path).map_err(|e| tracing::error!("Failed to expand private key path: {e}"))?;
-	config.webserver.private_key = private_key_path.to_string().into();
+	let mut config = Config::load_or_create(&args.config).await?;
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
 
