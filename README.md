@@ -65,7 +65,6 @@ sudo pacman -S \
    opus \
    pkg-config \
    rust \
-   shaderc \
    vulkan-headers \
    wayland
 ```
