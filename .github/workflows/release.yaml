@@ -6,6 +6,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  DEBIAN_FRONTEND: noninteractive
 
 permissions:
   contents: write
@@ -13,22 +14,48 @@ permissions:
 jobs:
   build:
     name: Build binary
-    runs-on: ubuntu-latest
-
-    container:
-      image: archlinux:base-devel
+    runs-on: ubuntu-22.04
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
-    - name: Install dependencies
-      uses: ./.github/actions/install-dependencies
+    - name: Install build dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          clang \
+          cmake \
+          git \
+          libavahi-client-dev \
+          libdbus-1-dev \
+          libdrm-dev \
+          libevdev-dev \
+          libgbm-dev \
+          libopus-dev \
+          libsystemd-dev \
+          libwayland-dev \
+          libxkbcommon-dev \
+          ninja-build \
+          pkg-config \
+          python3
+      shell: bash
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
 
     - name: Build
+      run: cargo build --release --workspace
+      shell: bash
+
+    - name: Inspect runtime dependencies
       run: |
-        source /etc/profile
-        cargo build --release --workspace
+        echo "::group::moonshine ldd"
+        ldd target/release/moonshine
+        echo "::endgroup::"
+        echo "::group::libmoonshine_wsi.so ldd"
+        ldd target/release/libmoonshine_wsi.so
+        echo "::endgroup::"
       shell: bash
 
     - name: Compress
