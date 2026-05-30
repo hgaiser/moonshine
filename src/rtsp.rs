@@ -17,8 +17,8 @@ use crate::{
 	session::{
 		manager::SessionManager,
 		stream::{
-			AudioConfig, AudioStreamContext, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamContext,
-			ALL_STREAM_CONFIGS,
+			AudioChannels, AudioConfig, AudioStreamContext, VideoChromaSampling, VideoDynamicRange, VideoFormat,
+			VideoStreamContext, ALL_STREAM_CONFIGS,
 		},
 	},
 	ShutdownReason,
@@ -154,11 +154,14 @@ impl RtspServer {
 			// We must apply the same rotation for normal quality 5.1 and 7.1 configs.
 			let mut mapping = config.mapping;
 			let is_normal_surround = i == 2 || i == 4; // SURROUND51 or SURROUND71
-			if is_normal_surround && config.channels >= 6 {
+			if is_normal_surround && config.channels >= AudioChannels::Surround51 {
 				mapping[3..config.channels as usize].rotate_left(1);
 			}
 
-			let mut params = format!("{}{}{}", config.channels, config.streams, config.coupled_streams);
+			let mut params = format!(
+				"{}{}{}",
+				config.channels as usize, config.streams, config.coupled_streams
+			);
 			for &m in mapping.iter().take(config.channels as usize) {
 				params.push_str(&format!("{}", m));
 			}
@@ -372,6 +375,8 @@ impl RtspServer {
 			max_reference_frames,
 			encrypt_video: self.config.stream.video.encrypt
 				&& (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
+			fec_percentage: self.config.stream.video.fec_percentage,
+			log_frame_spikes: self.config.stream.video.log_frame_spikes,
 		};
 
 		let packet_duration: u32 = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
@@ -399,13 +404,13 @@ impl RtspServer {
 			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.AudioQuality").unwrap_or(1);
 
 		let (channels, channel_mask) = if surround_enable != 0 {
-			(surround_channels, surround_mask)
+			(AudioChannels::from(surround_channels), surround_mask)
 		} else {
 			// Fall back to the values from the HTTP launch request.
 			let ctx = self.session_manager.get_session_context().await;
 			match ctx {
 				Ok(Some(session_ctx)) => (session_ctx.audio_channels, session_ctx.audio_channel_mask),
-				_ => (2, 0x3),
+				_ => (AudioChannels::Stereo, 0x3),
 			}
 		};
 		let high_quality = audio_quality != 0;

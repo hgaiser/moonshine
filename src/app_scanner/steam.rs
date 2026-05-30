@@ -70,6 +70,9 @@ pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result
 					.map(|cmd| cmd.replace("{game_id}", &app.app_id.to_string()))
 					.collect(),
 				boxart: None,
+				stdout: config.stdout.clone(),
+				stderr: config.stderr.clone(),
+				launch_timeout_secs: config.launch_timeout_secs,
 			};
 
 			// Search for boxart.

@@ -6,7 +6,7 @@ User=%i
 Group=%i
 SupplementaryGroups=input
 ExecStart=/usr/bin/start-moonshine.sh /home/%i/.config/moonshine/config.toml
-Environment=RUST_LOG=info
+Environment=MOONSHINE_LOG=info
 Restart=always
 DeviceAllow=/dev/uinput rw
 DeviceAllow=/dev/uhid rw

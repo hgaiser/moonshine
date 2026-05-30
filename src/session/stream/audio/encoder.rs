@@ -1,10 +1,11 @@
 use async_shutdown::ShutdownManager;
 use fec_rs::ReedSolomon;
-use tokio::sync::mpsc::{self, error::TryRecvError};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 
 use crate::{
 	crypto::encrypt_cbc,
-	session::{manager::SessionShutdownReason, stream::RtpHeader, SessionKeys},
+	session::{manager::SessionShutdownReason, stream::RtpHeader, SessionKeysReceiver},
 };
 
 use super::{pulse_server::AudioFrame, OpusStreamConfig};
@@ -12,7 +13,7 @@ use super::{pulse_server::AudioFrame, OpusStreamConfig};
 const NR_DATA_SHARDS: usize = 4;
 const NR_PARITY_SHARDS: usize = 2;
 const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
-const MAX_SHARD_SIZE: usize = 2048_usize.div_ceil(16) * 16; // Where does this come from?
+const MAX_SHARD_SIZE: usize = 2048_usize.div_ceil(16) * 16;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -24,26 +25,21 @@ struct AudioFecHeader {
 	pub ssrc: u32,
 }
 
-enum AudioEncoderCommand {
-	UpdateKeys(SessionKeys),
-}
-
-pub struct AudioEncoder {
-	command_tx: mpsc::Sender<AudioEncoderCommand>,
-}
+pub struct AudioEncoder {}
 
 impl AudioEncoder {
 	#[allow(clippy::too_many_arguments)]
-	pub fn new(
+	pub fn spawn(
 		sample_rate: u32,
 		stream_config: &OpusStreamConfig,
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
-		keys: SessionKeys,
+		keys_rx: SessionKeysReceiver,
 		encrypt: bool,
 		packet_tx: mpsc::Sender<Vec<u8>>,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-	) -> Result<Self, ()> {
+		stop: ShutdownManager<SessionShutdownReason>,
+		start_notify: Arc<tokio::sync::Notify>,
+	) -> Result<(), ()> {
 		tracing::debug!("Starting audio encoder.");
 		tracing::debug!(
 			"Creating audio encoder with sample rate {}, {} channels ({} streams, {} coupled).",
@@ -73,56 +69,54 @@ impl AudioEncoder {
 		let fec_encoder = ReedSolomon::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
 			.map_err(|e| tracing::warn!("Failed to create FEC encoder: {e}"))?;
 
-		let (command_tx, command_rx) = mpsc::channel(10);
 		let inner = AudioEncoderInner {};
 		std::thread::Builder::new()
 			.name("audio-encode".to_string())
 			.spawn(move || {
 				inner.run(
-					command_rx,
 					frame_rx,
 					frame_recycle_tx,
 					fec_encoder,
 					encoder,
-					keys,
+					keys_rx,
 					encrypt,
 					packet_tx,
-					stop_session_manager,
+					stop,
+					start_notify,
 				)
 			})
 			.map_err(|e| tracing::error!("Failed to start audio encode thread: {e}"))?;
 
-		Ok(Self { command_tx })
-	}
-
-	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
-		self.command_tx
-			.send(AudioEncoderCommand::UpdateKeys(keys))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
+		Ok(())
 	}
 }
 
 struct AudioEncoderInner {}
 
 impl AudioEncoderInner {
-	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
+	#[allow(clippy::too_many_arguments)]
 	fn run(
 		self,
-		mut command_rx: mpsc::Receiver<AudioEncoderCommand>,
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		mut fec_encoder: ReedSolomon,
 		mut encoder: opus::MSEncoder,
-		mut keys: SessionKeys,
+		keys_rx: SessionKeysReceiver,
 		encrypt: bool,
 		packet_tx: mpsc::Sender<Vec<u8>>,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		stop: ShutdownManager<SessionShutdownReason>,
+		start_notify: Arc<tokio::sync::Notify>,
 	) {
 		// Trigger session shutdown when the audio encoder stops.
-		let _session_stop_token =
-			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::AudioEncoderStopped);
-		let _delay_stop = stop_session_manager.delay_shutdown_token();
+		let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioEncoderStopped);
+		let _delay_stop = stop.delay_shutdown_token();
+
+		// Wait for the start signal before entering the encode loop.
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.expect("Failed to build tokio runtime for audio encoder");
+		rt.block_on(start_notify.notified());
 
 		let mut sequence_number = 0u16;
 		let stream_start_time = std::time::Instant::now();
@@ -157,23 +151,7 @@ impl AudioEncoderInner {
 			});
 		}
 
-		while !stop_session_manager.is_shutdown_triggered() {
-			// Check if there's a command.
-			match command_rx.try_recv() {
-				Ok(command) => match command {
-					AudioEncoderCommand::UpdateKeys(new_keys) => {
-						tracing::debug!("Updating session keys.");
-						keys = new_keys;
-					},
-				},
-				Err(TryRecvError::Disconnected) => {
-					// If for whatever reason AudioStream is dropped, this channel is dropped unexpectedly.
-					tracing::debug!("Audio encoder command channel closed.");
-					break;
-				},
-				Err(TryRecvError::Empty) => {},
-			};
-
+		while !stop.is_shutdown_triggered() {
 			let frame = match frame_rx.recv() {
 				Ok(frame) => frame,
 				Err(_) => {
@@ -200,6 +178,9 @@ impl AudioEncoderInner {
 				},
 			};
 
+			// Read current keys from watch channel.
+			let keys = &*keys_rx.borrow();
+
 			// Encrypt the audio data if encryption is enabled.
 			let payload = if encrypt {
 				let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
@@ -225,8 +206,8 @@ impl AudioEncoderInner {
 			{
 				// Set the RTP header in the memory of the shard.
 				let rtp_header = unsafe { &mut *(shard.as_mut_ptr() as *mut RtpHeader) };
-				rtp_header.header = 0x80u8.to_be(); // What is this?
-				rtp_header.packet_type = 97u8.to_be(); // RTP_PAYLOAD_TYPE_AUDIO
+				rtp_header.header = 0x80u8.to_be();
+				rtp_header.packet_type = 97u8.to_be();
 				rtp_header.sequence_number = sequence_number.to_be();
 				rtp_header.timestamp = timestamp.to_be();
 				rtp_header.ssrc = 0;
@@ -252,7 +233,7 @@ impl AudioEncoderInner {
 
 			// Crop the shard to the length that we want to send it.
 			let data_shard_size = std::mem::size_of::<RtpHeader>() + payload.len();
-			let data_shard = shard[..data_shard_size].to_vec(); // TODO: Can we avoid this copy?
+			let data_shard = shard[..data_shard_size].to_vec();
 
 			if packet_tx.blocking_send(data_shard).is_err() {
 				tracing::debug!("Failed to send packet over channel, channel is likely closed.");
@@ -305,14 +286,14 @@ impl AudioEncoderInner {
 						};
 						fec_header.shard_index = (shard_index as u8).to_be();
 						fec_header.payload_type = 97u8.to_be();
-						fec_header.base_sequence_number = base_sequence_number; // Already in big-endian
-						fec_header.base_timestamp = base_timestamp; // Already in big-endian
+						fec_header.base_sequence_number = base_sequence_number;
+						fec_header.base_timestamp = base_timestamp;
 						fec_header.ssrc = 0u32;
 					}
 
 					let parity_shard_size =
 						std::mem::size_of::<RtpHeader>() + std::mem::size_of::<AudioFecHeader>() + payload.len();
-					let parity_shard = shard[..parity_shard_size].to_vec(); // TODO: Can we avoid this copy?
+					let parity_shard = shard[..parity_shard_size].to_vec();
 
 					if packet_tx.blocking_send(parity_shard).is_err() {
 						tracing::debug!("Failed to send packet over channel, channel is likely closed.");

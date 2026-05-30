@@ -24,12 +24,12 @@ impl StateData {
 }
 
 #[derive(Clone)]
-pub struct State {
+pub struct PersistentState {
 	data: Arc<RwLock<StateData>>,
 	path: PathBuf,
 }
 
-impl State {
+impl PersistentState {
 	pub fn new() -> Result<Self, ()> {
 		let path = dirs::data_dir()
 			.ok_or_else(|| tracing::error!("Failed to get data directory."))?
@@ -94,18 +94,23 @@ impl State {
 	}
 
 	pub fn add_client(&self, client: String) -> Result<bool, ()> {
-		let mut data = self
-			.data
-			.write()
-			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
-		if data.clients.contains(&client) {
-			tracing::warn!("Failed to add client ('{client}'), client already exists.");
-			Ok(false)
-		} else {
-			data.clients.insert(client);
+		let has_client = {
+			let mut data = self
+				.data
+				.write()
+				.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+			if data.clients.contains(&client) {
+				tracing::warn!("Failed to add client ('{client}'), client already exists.");
+				false
+			} else {
+				data.clients.insert(client);
+				true
+			}
+		};
+		if has_client {
 			self.save()?;
-			Ok(true)
 		}
+		Ok(has_client)
 	}
 
 	pub fn has_paired_cert(&self, fingerprint: String) -> Result<bool, ()> {
@@ -117,11 +122,13 @@ impl State {
 	}
 
 	pub fn add_paired_cert(&self, fingerprint: String) -> Result<bool, ()> {
-		let mut data = self
-			.data
-			.write()
-			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
-		let inserted = data.paired_certs.insert(fingerprint);
+		let inserted = {
+			let mut data = self
+				.data
+				.write()
+				.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+			data.paired_certs.insert(fingerprint)
+		};
 		if inserted {
 			self.save()?;
 		} else {

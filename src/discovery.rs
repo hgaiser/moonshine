@@ -24,11 +24,18 @@ impl Drop for ZeroconfDiscovery {
 	}
 }
 
+/// Runs the mDNS publisher in a separate thread, advertising the service until shutdown is triggered.
+///
+/// Errors do not trigger a global shutdown as this service is not considered critical for the main functionality.
 fn run(port: u16, name: String, shutdown: ShutdownManager<ShutdownReason>) {
-	let mut service = zeroconf::MdnsService::new(
-		zeroconf::ServiceType::new("nvstream", "tcp").expect("Failed to create service type"),
-		port,
-	);
+	let service_type = match zeroconf::ServiceType::new("nvstream", "tcp") {
+		Ok(service_type) => service_type,
+		Err(e) => {
+			tracing::error!("Failed to advertise Moonshine service: {e}");
+			return;
+		},
+	};
+	let mut service = zeroconf::MdnsService::new(service_type, port);
 
 	service.set_registered_callback(Box::new(on_service_registered));
 	service.set_name(&name);

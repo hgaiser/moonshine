@@ -48,6 +48,17 @@ pub struct HdrModeState {
 	pub metadata: Option<HdrMetadata>,
 }
 
+impl HdrModeState {
+	/// Create an initial HDR mode state with the given enabled flag.
+	/// Metadata is `None` until the video pipeline provides it.
+	pub fn new(enabled: bool) -> Self {
+		Self {
+			enabled,
+			metadata: None,
+		}
+	}
+}
+
 impl HdrMetadata {
 	/// Reasonable fallback metadata for HDR10 when applications don't provide
 	/// their own. Uses BT.2020 primaries, D65 white point, and a conservative

@@ -12,6 +12,30 @@ use tokio::sync::Notify;
 
 use crate::{clients::ClientManager, clients::PendingClient, webserver::bad_request, ShutdownReason};
 
+/// Extract a required query parameter, or return a 400 bad-request response.
+macro_rules! require_param {
+	($params:expr, $key:expr) => {
+		match $params.remove($key) {
+			Some(v) => v,
+			None => {
+				let msg = format!("Expected '{}' in request, got {:?}.", $key, $params.keys());
+				tracing::warn!("{msg}");
+				return bad_request(msg);
+			},
+		}
+	};
+}
+
+/// Build a `<root status_code="200"><paired>1</paired>…</root>` XML response.
+fn paired_xml_response(inner: impl std::fmt::Display) -> Response<Full<Bytes>> {
+	let body = format!("<root status_code=\"200\"><paired>1</paired>{inner}</root>");
+	let mut response = Response::new(Full::new(Bytes::from(body)));
+	response
+		.headers_mut()
+		.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+	response
+}
+
 /// Handle a pairing request from a client.
 ///
 /// This request consists of multiple steps, all are handled by this function.
@@ -49,7 +73,7 @@ pub async fn handle_pair_request(
 				)
 				.await
 			},
-			"pairchallenge" => pair_challenge(params).await,
+			"pairchallenge" => pair_challenge(params),
 			unknown => {
 				let message = format!("Unknown pair phrase received: {}", unknown);
 				tracing::warn!("{message}");
@@ -57,11 +81,11 @@ pub async fn handle_pair_request(
 			},
 		}
 	} else if params.contains_key("clientchallenge") {
-		client_challenge(params, client_manager).await
+		client_challenge(params, client_manager)
 	} else if params.contains_key("serverchallengeresp") {
-		server_challenge_response(params, client_manager).await
+		server_challenge_response(params, client_manager)
 	} else if params.contains_key("clientpairingsecret") {
-		client_pairing_secret(params, client_manager).await
+		client_pairing_secret(params, client_manager)
 	} else {
 		let message = format!("Unknown pair command with params: {:?}", params);
 		tracing::warn!("{message}");
@@ -78,21 +102,11 @@ async fn get_server_cert(
 	http_port: u16,
 	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
-	let client_cert = match params.remove("clientcert") {
-		Some(client_cert) => client_cert,
-		None => {
-			let message = format!(
-				"Expected 'clientcert' in get server cert request, got {:?}.",
-				params.keys()
-			);
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
+	let client_cert = require_param!(params, "clientcert");
 	let client_cert = match hex::decode(client_cert) {
 		Ok(cert) => cert,
 		Err(e) => {
-			let message = format!("{e}");
+			let message = e.to_string();
 			tracing::warn!("{message}");
 			return bad_request(message);
 		},
@@ -108,30 +122,13 @@ async fn get_server_cert(
 		},
 	};
 
-	let unique_id = match params.remove("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			let message = format!(
-				"Expected 'uniqueid' in get server cert request, got {:?}.",
-				params.keys()
-			);
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
+	let unique_id = require_param!(params, "uniqueid");
 
-	let salt = match params.remove("salt") {
-		Some(salt) => salt,
-		None => {
-			let message = format!("Expected 'salt' in get server cert request, got {:?}.", params.keys());
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
+	let salt = require_param!(params, "salt");
 	let salt = match hex::decode(salt) {
 		Ok(salt) => salt,
 		Err(e) => {
-			let message = format!("{e}");
+			let message = e.to_string();
 			tracing::warn!("{message}");
 			return bad_request(message);
 		},
@@ -203,46 +200,12 @@ async fn get_server_cert(
 		},
 	}
 
-	let mut response = "<root status_code=\"200\">".to_string();
-	response += "<paired>1</paired>";
-
-	response += &format!("<plaincert>{}</plaincert>", hex::encode(server_pem_str));
-	response += "</root>";
-
-	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response
-		.headers_mut()
-		.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
-
-	response
+	paired_xml_response(format!("<plaincert>{}</plaincert>", hex::encode(server_pem_str)))
 }
 
-async fn client_challenge(
-	mut params: HashMap<String, String>,
-	client_manager: &ClientManager,
-) -> Response<Full<Bytes>> {
-	let unique_id = match params.remove("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			let message = format!(
-				"Expected 'uniqueid' in get server cert request, got {:?}.",
-				params.keys()
-			);
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
-	let challenge = match params.remove("clientchallenge") {
-		Some(challenge) => challenge,
-		None => {
-			let message = format!(
-				"Expected 'clientchallenge' in get server cert request, got {:?}.",
-				params.keys()
-			);
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
+fn client_challenge(mut params: HashMap<String, String>, client_manager: &ClientManager) -> Response<Full<Bytes>> {
+	let unique_id = require_param!(params, "uniqueid");
+	let challenge = require_param!(params, "clientchallenge");
 	let challenge = match hex::decode(challenge) {
 		Ok(challenge) => challenge,
 		Err(e) => {
@@ -259,37 +222,17 @@ async fn client_challenge(
 		},
 	};
 
-	let mut response = "<root status_code=\"200\">".to_string();
-	response += "<paired>1</paired>";
-	response += &format!(
+	paired_xml_response(format!(
 		"<challengeresponse>{}</challengeresponse>",
 		hex::encode(challenge_response)
-	);
-	response += "</root>";
-
-	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response
-		.headers_mut()
-		.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
-
-	response
+	))
 }
 
-async fn server_challenge_response(
+fn server_challenge_response(
 	mut params: HashMap<String, String>,
 	client_manager: &ClientManager,
 ) -> Response<Full<Bytes>> {
-	let server_challenge_response = match params.remove("serverchallengeresp") {
-		Some(server_challenge_response) => server_challenge_response,
-		None => {
-			let message = format!(
-				"Expected 'serverchallengeresp' in server challenge response request, got {:?}.",
-				params.keys()
-			);
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
+	let server_challenge_response = require_param!(params, "serverchallengeresp");
 	let server_challenge_response = match hex::decode(server_challenge_response) {
 		Ok(server_challenge_response) => server_challenge_response,
 		Err(e) => {
@@ -299,17 +242,7 @@ async fn server_challenge_response(
 		},
 	};
 
-	let unique_id = match params.remove("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			let message = format!(
-				"Expected 'uniqueid' in get server cert request, got {:?}.",
-				params.keys()
-			);
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
+	let unique_id = require_param!(params, "uniqueid");
 
 	let pairing_secret = match client_manager.server_challenge_response(&unique_id, server_challenge_response) {
 		Ok(pairing_secret) => pairing_secret,
@@ -318,20 +251,13 @@ async fn server_challenge_response(
 		},
 	};
 
-	let mut response = "<root status_code=\"200\">".to_string();
-	response += "<paired>1</paired>";
-	response += &format!("<pairingsecret>{}</pairingsecret>", hex::encode(pairing_secret));
-	response += "</root>";
-
-	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response
-		.headers_mut()
-		.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
-
-	response
+	paired_xml_response(format!(
+		"<pairingsecret>{}</pairingsecret>",
+		hex::encode(pairing_secret)
+	))
 }
 
-async fn pair_challenge(params: HashMap<String, String>) -> Response<Full<Bytes>> {
+fn pair_challenge(params: HashMap<String, String>) -> Response<Full<Bytes>> {
 	if !params.contains_key("uniqueid") {
 		let message = format!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
 		tracing::warn!("{message}");
@@ -340,34 +266,11 @@ async fn pair_challenge(params: HashMap<String, String>) -> Response<Full<Bytes>
 
 	// Client is not persisted here; it is only persisted after the
 	// RSA signature verification succeeds in the clientpairingsecret step.
-
-	let mut response = "<root status_code=\"200\">".to_string();
-	response += "<paired>1</paired>";
-	response += "</root>";
-
-	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response
-		.headers_mut()
-		.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
-
-	response
+	paired_xml_response("")
 }
 
-async fn client_pairing_secret(
-	mut params: HashMap<String, String>,
-	client_manager: &ClientManager,
-) -> Response<Full<Bytes>> {
-	let client_pairing_secret = match params.remove("clientpairingsecret") {
-		Some(client_pairing_secret) => client_pairing_secret,
-		None => {
-			let message = format!(
-				"Expected 'clientpairingsecret' in client pairing secret request, got {:?}.",
-				params.keys()
-			);
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
+fn client_pairing_secret(mut params: HashMap<String, String>, client_manager: &ClientManager) -> Response<Full<Bytes>> {
+	let client_pairing_secret = require_param!(params, "clientpairingsecret");
 	let client_pairing_secret = match hex::decode(client_pairing_secret) {
 		Ok(client_pairing_secret) => client_pairing_secret,
 		Err(e) => {
@@ -377,14 +280,7 @@ async fn client_pairing_secret(
 		},
 	};
 
-	let unique_id = match params.remove("uniqueid") {
-		Some(unique_id) => unique_id,
-		None => {
-			let message = format!("Expected 'uniqueid' in pair challenge, got {:?}.", params.keys());
-			tracing::warn!("{message}");
-			return bad_request(message);
-		},
-	};
+	let unique_id = require_param!(params, "uniqueid");
 
 	if client_manager
 		.check_client_pairing_secret(&unique_id, client_pairing_secret)
@@ -393,14 +289,5 @@ async fn client_pairing_secret(
 		return bad_request("Failed to check client pairing secret".to_string());
 	}
 
-	let mut response = "<root status_code=\"200\">".to_string();
-	response += "<paired>1</paired>";
-	response += "</root>";
-
-	let mut response = Response::new(Full::new(Bytes::from(response)));
-	response
-		.headers_mut()
-		.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
-
-	response
+	paired_xml_response("")
 }

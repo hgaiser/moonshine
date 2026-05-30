@@ -11,8 +11,7 @@ use crate::clients::ClientManager;
 use crate::config::Config;
 use crate::discovery::ZeroconfDiscovery;
 use crate::rtsp::RtspServer;
-use crate::session::SessionManager;
-use crate::state::State;
+use crate::session::manager::SessionManager;
 use crate::webserver::Webserver;
 
 mod app_scanner;
@@ -25,12 +24,14 @@ mod session;
 mod state;
 mod webserver;
 
-/// Reasons for initiating a global shutdown, used as the type parameter
-/// for `ShutdownManager<ShutdownReason>`.
+/// Reasons for initiating a global shutdown.
+///
+/// Used as the type parameter for `ShutdownManager<ShutdownReason>`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShutdownReason {
 	/// Application quit signal (Ctrl+C or SIGTERM).
-	/// Primary shutdown trigger initiated by the user.
+	///
+	/// Usually means a shutdown trigger initiated by the user.
 	AppQuit = 1,
 
 	/// HTTP webserver is shutting down.
@@ -46,40 +47,35 @@ pub enum ShutdownReason {
 	SessionManagerShutdown = 5,
 }
 
-impl ShutdownReason {
-	/// Map a shutdown reason to a process exit code.
-	pub const fn exit_code(self) -> i32 {
-		self as i32
-	}
-}
-
 #[derive(Parser, Debug)]
 #[clap(version)]
 struct Args {
-	/// Path to configuration file.
+	/// Path to the configuration file.
 	config: PathBuf,
 }
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<(), ()> {
+	// Parse command-line arguments.
 	let args = Args::parse();
 
+	// Initialize logging with tracing_subscriber, using the MOONSHINE_LOG environment variable for filtering.
 	tracing_subscriber::registry()
 		.with(tracing_subscriber::fmt::layer())
-		.with(EnvFilter::from_default_env())
+		.with(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("error")))
 		.init();
 
-	let mut config = Config::load_or_create(&args.config).await?;
-
+	// Load or create the configuration file.
+	let mut config = Config::load_or_create(&args.config)?;
 	tracing::debug!("Using configuration:\n{:#?}", config);
 
+	// Scan for applications and add them to the configuration.
 	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
 	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
 	config.applications.extend(scanned_applications);
-
 	app_scanner::resolve_missing_boxart(&mut config.applications);
 
-	// Spawn a task to wait for CTRL+C and trigger a shutdown.
+	// Spawn task to wait for CTRL+C and trigger a shutdown.
 	let shutdown = ShutdownManager::new();
 	tokio::spawn({
 		let shutdown = shutdown.clone();
@@ -88,7 +84,7 @@ async fn main() -> Result<(), ()> {
 
 			tokio::select! {
 				_ = tokio::signal::ctrl_c() => {
-					tracing::info!("Received CTRL+C, shutting down...");
+					tracing::info!("Received SIGINT, shutting down...");
 				},
 				_ = terminate.recv() => {
 					tracing::info!("Received SIGTERM, shutting down...");
@@ -99,69 +95,60 @@ async fn main() -> Result<(), ()> {
 		}
 	});
 
-	// Create the main application.
-	let moonshine = Moonshine::new(config, shutdown.clone()).await?;
-
+	// Create the main application, which will initialize all subsystems.
+	let moonshine = Moonshine::new(config, shutdown.clone())?;
 	tracing::info!("Moonshine is ready and waiting for connections.");
 
 	// Wait until something causes a shutdown trigger.
 	shutdown.wait_shutdown_triggered().await;
 
-	// Drop the main moonshine object, triggering other systems to shutdown too.
+	// Drop the main moonshine object, triggering subsystems to shutdown too.
 	drop(moonshine);
 
 	// Wait until everything was shutdown.
 	let exit_code = shutdown.wait_shutdown_complete().await;
 	tracing::debug!("Successfully waited for shutdown to complete.");
-	std::process::exit(exit_code.exit_code());
-}
-
-pub struct Moonshine {
-	_rtsp_server: RtspServer,
-	_session_manager: SessionManager,
-	_client_manager: ClientManager,
-	_webserver: Webserver,
-	_discovery: ZeroconfDiscovery,
+	std::process::exit(exit_code as i32);
 }
 
 /// The main application struct, responsible for initializing and managing all subsystems.
 ///
-/// Dropping this struct will trigger the shutdown of all subsystems, so it should be kept alive until the application is ready to exit.
+/// This struct acts as a drop guard for all subsystems. Dropping this struct will trigger application shutdown.
+pub struct Moonshine {
+	// RTSP server for handling streaming connections.
+	_rtsp_server: RtspServer,
+	// Manager for interacting with sessions.
+	_session_manager: SessionManager,
+	// Manager for saving and loading client state.
+	_client_manager: ClientManager,
+	// Server for handling HTTP(S) requests.
+	_webserver: Webserver,
+	// Zeroconf/mDNS discovery service.
+	_discovery: ZeroconfDiscovery,
+}
+
 impl Moonshine {
-	pub async fn new(config: Config, shutdown: ShutdownManager<ShutdownReason>) -> Result<Self, ()> {
-		let state = State::new()?;
-
+	#[allow(clippy::result_unit_err)]
+	pub fn new(config: Config, shutdown: ShutdownManager<ShutdownReason>) -> Result<Self, ()> {
 		// Load or create the TLS certificate and private key for the webserver.
-		let (cert, pkey) = webserver::tls::load_or_create_certificate(&config).await?;
+		let (cert, pkey) = webserver::tls::load_or_create_certificate(&config)?;
 
-		// Create a manager for interacting with sessions.
 		let session_manager = SessionManager::new(config.clone(), shutdown.clone())?;
-
-		// Create a manager for saving and loading client state.
-		let client_manager = ClientManager::new(state.clone(), cert.clone(), pkey);
-
-		// Run the RTSP server.
-		let rtsp_server = RtspServer::new(config.clone(), session_manager.clone(), shutdown.clone());
-
-		// Advertise the Moonshine service via mDNS/zeroconf.
-		let discovery = ZeroconfDiscovery::spawn(config.webserver.port, config.name.clone(), shutdown.clone());
-
-		// Run the webserver.
-		let webserver = Webserver::new(
-			config,
-			state.get_uuid()?,
-			cert,
-			client_manager.clone(),
-			session_manager.clone(),
-			shutdown,
-		)?;
+		let client_manager = ClientManager::new(cert.clone(), pkey.clone())?;
 
 		Ok(Self {
-			_rtsp_server: rtsp_server,
-			_session_manager: session_manager,
-			_client_manager: client_manager,
-			_webserver: webserver,
-			_discovery: discovery,
+			_rtsp_server: RtspServer::new(config.clone(), session_manager.clone(), shutdown.clone()),
+			_session_manager: session_manager.clone(),
+			_client_manager: client_manager.clone(),
+			_webserver: Webserver::new(
+				config.clone(),
+				client_manager.persistent_state().get_uuid()?.to_string(),
+				cert,
+				client_manager,
+				session_manager,
+				shutdown.clone(),
+			)?,
+			_discovery: ZeroconfDiscovery::spawn(config.webserver.port, config.name, shutdown),
 		})
 	}
 }

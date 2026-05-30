@@ -6,19 +6,20 @@
 mod dmabuf;
 mod hdr_sei;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use ash::vk;
 use async_shutdown::ShutdownManager;
-use tokio::sync::{broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch, Notify};
 
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
+use crate::session::SessionKeysReceiver;
 
 use super::packetizer::Packetizer;
 use super::shard_batch::ShardBatch;
-use super::{VideoChromaSampling, VideoDynamicRange, VideoFormat};
+use super::{VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamContext};
 
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
@@ -124,41 +125,17 @@ impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
-		width: u32,
-		height: u32,
-		framerate: u32,
-		bitrate: usize,
-		packet_size: usize,
-		minimum_fec_packets: u32,
-		fec_percentage: u8,
-		video_format: VideoFormat,
-		dynamic_range: VideoDynamicRange,
-		chroma_sampling: VideoChromaSampling,
-		max_reference_frames: u32,
-		encryption_key: Option<Vec<u8>>,
+		context: VideoStreamContext,
+		keys_rx: SessionKeysReceiver,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		log_frame_spikes: bool,
+		start_notify: Arc<Notify>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
-		let inner = VideoPipelineInner {
-			width,
-			height,
-			framerate,
-			bitrate,
-			packet_size,
-			minimum_fec_packets,
-			fec_percentage,
-			video_format,
-			dynamic_range,
-			chroma_sampling,
-			max_reference_frames,
-			encryption_key,
-			log_frame_spikes,
-		};
+		let inner = VideoPipelineInner { context, keys_rx };
 
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
@@ -169,6 +146,7 @@ impl VideoPipeline {
 					idr_frame_request_rx,
 					stop_session_manager,
 					hdr_metadata_tx,
+					start_notify,
 				);
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
@@ -178,19 +156,8 @@ impl VideoPipeline {
 }
 
 struct VideoPipelineInner {
-	width: u32,
-	height: u32,
-	framerate: u32,
-	bitrate: usize,
-	packet_size: usize,
-	minimum_fec_packets: u32,
-	fec_percentage: u8,
-	video_format: VideoFormat,
-	dynamic_range: VideoDynamicRange,
-	chroma_sampling: VideoChromaSampling,
-	max_reference_frames: u32,
-	encryption_key: Option<Vec<u8>>,
-	log_frame_spikes: bool,
+	context: VideoStreamContext,
+	keys_rx: SessionKeysReceiver,
 }
 
 impl VideoPipelineInner {
@@ -201,6 +168,7 @@ impl VideoPipelineInner {
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
+		start_notify: Arc<Notify>,
 	) {
 		tracing::debug!("Starting video pipeline.");
 
@@ -208,6 +176,13 @@ impl VideoPipelineInner {
 		let _session_stop_token =
 			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoEncoderStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
+
+		// Wait for the start signal before entering the encode loop.
+		let rt = tokio::runtime::Builder::new_current_thread()
+			.enable_all()
+			.build()
+			.expect("Failed to build tokio runtime for video pipeline");
+		rt.block_on(start_notify.notified());
 
 		// Create the encoder.
 		let (context, encoder) = match self.create_encoder() {
@@ -235,52 +210,54 @@ impl VideoPipelineInner {
 	}
 
 	fn create_encoder(&self) -> Result<(VideoContext, Encoder), String> {
+		let ctx = &self.context;
+
 		// Create Vulkan video context.
 		let context = VideoContextBuilder::new()
 			.build()
 			.map_err(|e| format!("Failed to create video context: {e}"))?;
 
 		// Convert our video format to pixelforge's codec.
-		let codec = match self.video_format {
+		let codec = match ctx.video_format {
 			VideoFormat::H264 => Codec::H264,
 			VideoFormat::Hevc => Codec::H265,
 			VideoFormat::Av1 => Codec::AV1,
 		};
 
 		// Convert pixel format.
-		let pixel_format = match self.chroma_sampling {
+		let pixel_format = match ctx.chroma_sampling_type {
 			VideoChromaSampling::Yuv420 => PixelFormat::Yuv420,
 			VideoChromaSampling::Yuv444 => PixelFormat::Yuv444,
 		};
 
 		// Convert bit depth based on dynamic range.
-		let bit_depth = match self.dynamic_range {
+		let bit_depth = match ctx.dynamic_range {
 			VideoDynamicRange::Sdr => pixelforge::EncodeBitDepth::Eight,
 			VideoDynamicRange::Hdr => pixelforge::EncodeBitDepth::Ten,
 		};
 
 		// Select color description for VUI signaling.
-		let color_description = match self.dynamic_range {
+		let color_description = match ctx.dynamic_range {
 			VideoDynamicRange::Sdr => ColorDescription::bt709(),
 			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq(),
 		};
 
 		// Create encode configuration.
 		let config = match codec {
-			Codec::H264 => EncodeConfig::h264(self.width, self.height),
-			Codec::H265 => EncodeConfig::h265(self.width, self.height),
-			Codec::AV1 => EncodeConfig::av1(self.width, self.height),
+			Codec::H264 => EncodeConfig::h264(ctx.width, ctx.height),
+			Codec::H265 => EncodeConfig::h265(ctx.width, ctx.height),
+			Codec::AV1 => EncodeConfig::av1(ctx.width, ctx.height),
 		}
 		.with_pixel_format(pixel_format)
 		.with_bit_depth(bit_depth)
 		.with_color_description(color_description)
 		.with_rate_control(RateControlMode::Cbr)
-		.with_target_bitrate(self.bitrate as u32)
-		.with_frame_rate(self.framerate, 1)
+		.with_target_bitrate(ctx.bitrate as u32)
+		.with_frame_rate(ctx.fps, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
 		.with_b_frames(0) // No B-frames for low latency
-		.with_max_reference_frames(self.max_reference_frames)
-		.with_virtual_buffer_size_ms(1000 / self.framerate)
+		.with_max_reference_frames(ctx.max_reference_frames)
+		.with_virtual_buffer_size_ms(1000 / ctx.fps)
 		.with_initial_virtual_buffer_size_ms(0);
 
 		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
@@ -299,37 +276,15 @@ impl VideoPipelineInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 	) -> Result<(), String> {
-		// Flag to request an IDR frame.
-		let idr_requested = Arc::new(AtomicBool::new(false));
-		let idr_requested_clone = idr_requested.clone();
+		let ctx = &self.context;
 
-		// Start a thread to listen for IDR requests.
-		// Uses blocking_recv() so the thread sleeps until a request arrives.
-		std::thread::spawn(move || loop {
-			match idr_frame_request_rx.blocking_recv() {
-				Ok(_) => {
-					tracing::debug!("Received request for IDR frame.");
-					idr_requested_clone.store(true, Ordering::SeqCst);
-				},
-				Err(broadcast::error::RecvError::Lagged(n)) => {
-					tracing::debug!("IDR frame channel lagged by {n} messages.");
-					idr_requested_clone.store(true, Ordering::SeqCst);
-				},
-				Err(broadcast::error::RecvError::Closed) => {
-					tracing::debug!("IDR frame channel closed.");
-					break;
-				},
-			}
-		});
-
-		let mut packetizer = Packetizer::new(self.encryption_key.as_deref())
-			.map_err(|()| "Failed to create packetizer: invalid encryption key length".to_string())?;
-		packetizer.warm_up(self.fec_percentage, self.minimum_fec_packets);
+		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
+		packetizer.warm_up(ctx.fec_percentage, ctx.minimum_fec_packets);
 		let mut sequence_number = 0u32;
 		let mut frame_number = 0u32;
 
 		// Determine output YUV format based on chroma sampling and dynamic range.
-		let output_format = match (self.chroma_sampling, self.dynamic_range) {
+		let output_format = match (ctx.chroma_sampling_type, ctx.dynamic_range) {
 			(VideoChromaSampling::Yuv420, VideoDynamicRange::Sdr) => OutputFormat::NV12,
 			(VideoChromaSampling::Yuv420, VideoDynamicRange::Hdr) => OutputFormat::P010,
 			(VideoChromaSampling::Yuv444, VideoDynamicRange::Sdr) => OutputFormat::YUV444,
@@ -340,7 +295,7 @@ impl VideoPipelineInner {
 		let mut color_converter: Option<ColorConverter> = None;
 
 		// Encoding loop - receives frames from compositor.
-		let frame_interval = std::time::Duration::from_secs_f64(1.0 / self.framerate as f64);
+		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
 		let mut last_frame_time = std::time::Instant::now();
 
 		// DMA-BUF importer for zero-copy capture (initialized on first DMA-BUF frame).
@@ -355,7 +310,7 @@ impl VideoPipelineInner {
 
 		// Track the last HDR mode state sent to the control stream.
 		let mut last_hdr_state = HdrModeState {
-			enabled: self.dynamic_range == VideoDynamicRange::Hdr,
+			enabled: ctx.dynamic_range == VideoDynamicRange::Hdr,
 			metadata: None,
 		};
 
@@ -363,18 +318,28 @@ impl VideoPipelineInner {
 		// to match what the encoder was created with. When the required
 		// color_desc differs, we call set_color_description() to update
 		// the SPS/sequence header.
-		let mut encoder_color_desc: Option<ColorDescription> = Some(match self.dynamic_range {
+		let mut encoder_color_desc: Option<ColorDescription> = Some(match ctx.dynamic_range {
 			VideoDynamicRange::Sdr => ColorDescription::bt709(),
 			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq(),
 		});
 
 		while !stop_session_manager.is_shutdown_triggered() {
-			// Check for IDR request.
+			// Drain any pending IDR requests.
 			let mut pending_idr = false;
-			if idr_requested.swap(false, Ordering::SeqCst) {
-				encoder.request_idr();
-				tracing::debug!("IDR frame requested");
-				pending_idr = true;
+			loop {
+				match idr_frame_request_rx.try_recv() {
+					Ok(()) => {
+						tracing::debug!("IDR frame requested");
+						encoder.request_idr();
+						pending_idr = true;
+					},
+					Err(broadcast::error::TryRecvError::Lagged(n)) => {
+						tracing::debug!("IDR frame channel lagged by {n} messages.");
+						encoder.request_idr();
+						pending_idr = true;
+					},
+					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
+				}
 			}
 
 			// Try to receive a frame from compositor (with timeout).
@@ -509,12 +474,12 @@ impl VideoPipelineInner {
 				let converter = match &mut color_converter {
 					Some(conv) => conv,
 					None => {
-						let (color_space, full_range) = match self.dynamic_range {
+						let (color_space, full_range) = match ctx.dynamic_range {
 							VideoDynamicRange::Sdr => (ColorSpace::Bt709, true),
 							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, false),
 						};
 						let mut config =
-							ColorConverterConfig::new(self.width, self.height, frame_input_format, output_format);
+							ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
 						config.color_space = color_space;
 						config.full_range = full_range;
 						match ColorConverter::new(context.clone(), config) {
@@ -535,7 +500,7 @@ impl VideoPipelineInner {
 				// based on the frame's actual color space. SDR frames are
 				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
 				// dynamic VUI switching in the encoder.
-				if self.dynamic_range == VideoDynamicRange::Hdr {
+				if ctx.dynamic_range == VideoDynamicRange::Hdr {
 					let frame_cs = frame.color_space;
 					let (cs, full_range, color_desc) = match frame_cs {
 						FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709()),
@@ -577,7 +542,7 @@ impl VideoPipelineInner {
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
 				// frame is encoded as BT.2020+PQ (true) or BT.709 (false).
-				if self.dynamic_range == VideoDynamicRange::Hdr {
+				if ctx.dynamic_range == VideoDynamicRange::Hdr {
 					let hdr_enabled = encoder_color_desc == Some(ColorDescription::bt2020_pq());
 					let new_state = HdrModeState {
 						enabled: hdr_enabled,
@@ -618,7 +583,7 @@ impl VideoPipelineInner {
 							// SDR frames encoded as BT.709 should not carry HDR SEI.
 							if packet.is_key_frame && encoder_color_desc == Some(ColorDescription::bt2020_pq()) {
 								if let Some(ref m) = last_hdr_state.metadata {
-									packet.data = hdr_sei::inject_hdr_metadata(&packet.data, m, self.video_format);
+									packet.data = hdr_sei::inject_hdr_metadata(&packet.data, m, ctx.video_format);
 								}
 							}
 
@@ -669,8 +634,8 @@ impl VideoPipelineInner {
 				);
 
 				// Warn on spike frames (total > frame interval) so they stand out in logs.
-				let frame_interval_us = 1_000_000 / self.framerate as u128;
-				if self.log_frame_spikes && total.as_micros() > frame_interval_us {
+				let frame_interval_us = 1_000_000 / ctx.fps as u128;
+				if ctx.log_frame_spikes && total.as_micros() > frame_interval_us {
 					tracing::warn!(
 						total_us = total.as_micros() as u64,
 						channel_us = channel_wait.as_micros() as u64,
@@ -745,8 +710,10 @@ impl VideoPipelineInner {
 		sequence_number: &mut u32,
 		frame_created_at: std::time::Instant,
 	) -> Result<(std::time::Duration, std::time::Duration), ()> {
+		let ctx = &self.context;
+
 		// Calculate RTP timestamp from PTS (convert to 90kHz clock)
-		let rtp_timestamp = (packet.pts * 90000 / self.framerate as u64) as u32;
+		let rtp_timestamp = (packet.pts * 90000 / ctx.fps as u64) as u32;
 
 		tracing::trace!(
 			"Sending packet: size={}, keyframe={}, pts={}",
@@ -767,9 +734,9 @@ impl VideoPipelineInner {
 		let shards = packetizer.packetize(
 			&packet.data,
 			packet.is_key_frame,
-			self.packet_size,
-			self.minimum_fec_packets,
-			self.fec_percentage,
+			ctx.packet_size,
+			ctx.minimum_fec_packets,
+			ctx.fec_percentage,
 			*frame_number,
 			sequence_number,
 			rtp_timestamp,

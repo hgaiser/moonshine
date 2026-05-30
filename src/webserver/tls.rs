@@ -365,7 +365,7 @@ pub fn create_certificate() -> Result<(String, String), Box<dyn std::error::Erro
 }
 
 /// Load existing TLS certificate and private key from disk, or create new ones if they don't exist.
-pub async fn load_or_create_certificate(config: &Config) -> Result<(String, String), ()> {
+pub fn load_or_create_certificate(config: &Config) -> Result<(String, String), ()> {
 	let cert_path = &config.webserver.certificate;
 	let key_path = &config.webserver.private_key;
 

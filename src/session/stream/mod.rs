@@ -1,6 +1,6 @@
 pub use self::{
-	audio::{AudioConfig, AudioStream, AudioStreamContext, ALL_STREAM_CONFIGS},
-	control::ControlStream,
+	audio::{AudioChannels, AudioConfig, AudioStream, AudioStreamContext, ALL_STREAM_CONFIGS},
+	control::{ControlStream, ControlStreamContext},
 	video::{VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStream, VideoStreamContext},
 };
 

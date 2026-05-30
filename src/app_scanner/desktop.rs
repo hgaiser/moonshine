@@ -98,7 +98,11 @@ fn parse_desktop_application(
 		title,
 		boxart,
 		command,
-		..Default::default()
+		pre_command: config.pre_command.clone(),
+		post_command: config.post_command.clone(),
+		stdout: config.stdout.clone(),
+		stderr: config.stderr.clone(),
+		launch_timeout_secs: config.launch_timeout_secs,
 	}))
 }
 
@@ -631,6 +635,11 @@ mod tests {
 			directories,
 			include_terminal: false,
 			resolve_icons: true,
+			pre_command: vec![],
+			post_command: vec![],
+			stdout: None,
+			stderr: None,
+			launch_timeout_secs: 10,
 		}
 	}
 

@@ -7,22 +7,24 @@ use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::time;
 
+use async_shutdown::ShutdownManager;
 use bytes::BytesMut;
 use mio::net::UnixListener;
 use pulseaudio::protocol::{self as pulse};
 
 use dyn_buffer::DynPlaybackBuffer;
 
+use crate::session::manager::SessionShutdownReason;
+
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
-const WAKER: mio::Token = mio::Token(0);
-const LISTENER: mio::Token = mio::Token(1);
-const CLOCK: mio::Token = mio::Token(2);
+const LISTENER: mio::Token = mio::Token(0);
+const CLOCK: mio::Token = mio::Token(1);
 
 /// The server emits samples at this rate to the encoder.
 pub const CAPTURE_SAMPLE_RATE: u32 = 48000;
 
-/// Clock tick rate — determines audio frame size sent to the encoder.
+/// Clock tick rate. Determines audio frame size sent to the encoder.
 /// For 5ms frames: 200 Hz; for 10ms frames: 100 Hz.
 const DEFAULT_CLOCK_RATE_HZ: u32 = 200;
 
@@ -84,12 +86,10 @@ struct ServerState {
 
 pub struct PulseServer {
 	listener: UnixListener,
-	socket_path: PathBuf,
 	poll: mio::Poll,
 	clock: mio_timerfd::TimerFd,
 	clock_rate_hz: u32,
 
-	close_rx: crossbeam_channel::Receiver<()>,
 	frame_tx: crossbeam_channel::Sender<AudioFrame>,
 	frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
 	spare_frame: Option<AudioFrame>,
@@ -101,22 +101,18 @@ pub struct PulseServer {
 }
 
 impl PulseServer {
-	pub fn new(
+	pub fn spawn(
 		listener: std::os::unix::net::UnixListener,
+		_socket_path: PathBuf,
 		channels: u8,
 		packet_duration_ms: u32,
 		frame_tx: crossbeam_channel::Sender<AudioFrame>,
 		frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
-	) -> Result<(Self, crossbeam_channel::Sender<()>, mio::Waker), Error> {
-		let socket_path = listener
-			.local_addr()?
-			.as_pathname()
-			.ok_or("listener has no pathname")?
-			.to_path_buf();
+		stop: ShutdownManager<SessionShutdownReason>,
+	) -> Result<(), Error> {
 		listener.set_nonblocking(true)?;
 		let listener = UnixListener::from_std(listener);
 		let poll = mio::Poll::new()?;
-		let waker = mio::Waker::new(poll.registry(), WAKER)?;
 
 		let clock_rate_hz = match packet_duration_ms {
 			5 | 10 => 1000 / packet_duration_ms,
@@ -224,39 +220,43 @@ impl PulseServer {
 
 		dummy_sink.formats[0] = default_format_info.clone();
 
-		let (close_tx, close_rx) = crossbeam_channel::bounded(1);
-
-		Ok((
-			Self {
-				listener,
-				socket_path,
-				poll,
-				clock,
-				clock_rate_hz,
-				close_rx,
-				frame_tx,
-				frame_recycle_rx,
-				spare_frame: None,
-				clients: BTreeMap::new(),
-				server_state: ServerState {
-					server_info,
-					sinks: vec![dummy_sink],
-					default_format_info,
-					next_playback_channel_index: 0,
-					next_stream_index: 0,
-					sink_volume: vec![1.0; channels as usize],
-					sink_muted: false,
-					capture_channels: channels,
-					capture_spec,
-				},
-				epoch: time::Instant::now(),
+		let server = Self {
+			listener,
+			poll,
+			clock,
+			clock_rate_hz,
+			frame_tx,
+			frame_recycle_rx,
+			spare_frame: None,
+			clients: BTreeMap::new(),
+			server_state: ServerState {
+				server_info,
+				sinks: vec![dummy_sink],
+				default_format_info,
+				next_playback_channel_index: 0,
+				next_stream_index: 0,
+				sink_volume: vec![1.0; channels as usize],
+				sink_muted: false,
+				capture_channels: channels,
+				capture_spec,
 			},
-			close_tx,
-			waker,
-		))
+			epoch: time::Instant::now(),
+		};
+
+		std::thread::Builder::new()
+			.name("pulse-server".to_string())
+			.spawn(move || {
+				if let Err(e) = server.run(stop.clone()) {
+					tracing::error!("PulseServer error: {e}");
+					let _ = stop.trigger_shutdown(SessionShutdownReason::PulseServerStopped);
+				}
+			})
+			.expect("Failed to spawn pulse server thread");
+
+		Ok(())
 	}
 
-	pub fn run(&mut self) -> Result<(), Error> {
+	fn run(mut self, stop: ShutdownManager<SessionShutdownReason>) -> Result<(), Error> {
 		let mut next_client_token = 1024u64;
 
 		self.poll.registry().register(
@@ -277,9 +277,8 @@ impl PulseServer {
 				Err(e) => return Err(e.into()),
 			}
 
-			match self.close_rx.try_recv() {
-				Ok(()) | Err(crossbeam_channel::TryRecvError::Disconnected) => return Ok(()),
-				_ => (),
+			if stop.is_shutdown_triggered() {
+				return Ok(());
 			}
 
 			for event in events.iter() {
@@ -525,11 +524,5 @@ impl PulseServer {
 		}
 
 		Ok(())
-	}
-}
-
-impl Drop for PulseServer {
-	fn drop(&mut self) {
-		let _ = std::fs::remove_file(&self.socket_path);
 	}
 }

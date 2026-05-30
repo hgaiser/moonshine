@@ -13,6 +13,10 @@ fn default_false() -> bool {
 	false
 }
 
+fn default_launch_timeout() -> u64 {
+	2
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
 	/// Name of the Moonshine host.
@@ -36,24 +40,11 @@ pub struct Config {
 	#[serde(skip_serializing_if = "Vec::is_empty", default)]
 	pub application_scanners: Vec<ApplicationScannerConfig>,
 
-	/// Path to the DRM render node to use (e.g. /dev/dri/renderD128).
-	pub gpu: Option<String>,
-
-	/// Whether to advertise HDR support to clients.
-	///
-	/// When true (the default), the server tells clients that HDR is available.
-	/// At session time the compositor still verifies that an HDR-capable render
-	/// format is available and silently falls back to SDR if not. Set this to
-	/// false to prevent clients from attempting HDR sessions on hardware that
-	/// cannot deliver them.
-	#[serde(default = "default_true")]
-	pub hdr: bool,
+	/// Configuration for the compositor.
+	pub compositor: CompositorConfig,
 
 	/// Time in seconds since last ping after which the stream closes.
 	pub stream_timeout: u64,
-
-	#[serde(default)]
-	pub keyboard: KeyboardConfig,
 }
 
 impl Config {
@@ -67,7 +58,7 @@ impl Config {
 		Ok(config)
 	}
 
-	pub async fn load_or_create(path: &PathBuf) -> Result<Config, ()> {
+	pub fn load_or_create(path: &PathBuf) -> Result<Config, ()> {
 		let mut config = if path.exists() {
 			Self::read_from_file(path)?
 		} else {
@@ -130,31 +121,12 @@ impl Default for Config {
 				],
 				pre_command: Vec::new(),
 				post_command: Vec::new(),
+				stdout: None,
+				stderr: None,
+				launch_timeout_secs: 2,
 			})],
-			gpu: None,
-			hdr: true,
+			compositor: CompositorConfig::default(),
 			stream_timeout: 60,
-			keyboard: KeyboardConfig::default(),
-		}
-	}
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone)]
-#[serde(default)]
-pub struct KeyboardConfig {
-	pub layout: String,
-	pub variant: String,
-	pub model: String,
-	pub options: Option<String>,
-}
-
-impl Default for KeyboardConfig {
-	fn default() -> Self {
-		Self {
-			layout: "us".to_string(),
-			variant: String::new(),
-			model: String::new(),
-			options: None,
 		}
 	}
 }
@@ -214,6 +186,18 @@ pub struct ApplicationConfig {
 	/// Useful for restoring system state (e.g. GPU power management).
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub post_command: Vec<Vec<String>>,
+
+	/// Path to redirect application stdout to. If not set, stdout is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stdout: Option<PathBuf>,
+
+	/// Path to redirect application stderr to. If not set, stderr is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stderr: Option<PathBuf>,
+
+	/// Seconds to wait for the application to reach an active state after launch.
+	#[serde(default = "default_launch_timeout")]
+	pub launch_timeout_secs: u64,
 }
 
 impl ApplicationConfig {
@@ -250,6 +234,18 @@ pub struct SteamApplicationScannerConfig {
 	/// Commands to run after each scanned application's session ends.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub post_command: Vec<Vec<String>>,
+
+	/// Path to redirect application stdout to. If not set, stdout is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stdout: Option<PathBuf>,
+
+	/// Path to redirect application stderr to. If not set, stderr is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stderr: Option<PathBuf>,
+
+	/// Seconds to wait for each scanned application to reach an active state after launch.
+	#[serde(default = "default_launch_timeout")]
+	pub launch_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -264,6 +260,26 @@ pub struct DesktopApplicationScannerConfig {
 	/// Whether to resolve desktop entry icons into Moonshine boxart paths.
 	#[serde(default = "default_true")]
 	pub resolve_icons: bool,
+
+	/// Commands to run before launching each scanned application.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub pre_command: Vec<Vec<String>>,
+
+	/// Commands to run after each scanned application's session ends.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub post_command: Vec<Vec<String>>,
+
+	/// Path to redirect application stdout to. If not set, stdout is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stdout: Option<PathBuf>,
+
+	/// Path to redirect application stderr to. If not set, stderr is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stderr: Option<PathBuf>,
+
+	/// Seconds to wait for each scanned application to reach an active state after launch.
+	#[serde(default = "default_launch_timeout")]
+	pub launch_timeout_secs: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -349,5 +365,43 @@ pub struct ControlStreamConfig {
 impl Default for ControlStreamConfig {
 	fn default() -> Self {
 		Self { port: 47999 }
+	}
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct KeyboardConfig {
+	pub layout: String,
+	pub variant: String,
+	pub model: String,
+	pub options: Option<String>,
+}
+
+impl Default for KeyboardConfig {
+	fn default() -> Self {
+		Self {
+			layout: "us".to_string(),
+			variant: String::new(),
+			model: String::new(),
+			options: None,
+		}
+	}
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompositorConfig {
+	pub gpu: Option<String>,
+	pub hdr: bool,
+	pub keyboard: KeyboardConfig,
+}
+
+impl Default for CompositorConfig {
+	fn default() -> Self {
+		Self {
+			gpu: None,
+			hdr: true,
+			keyboard: KeyboardConfig::default(),
+		}
 	}
 }

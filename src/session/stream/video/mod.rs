@@ -1,11 +1,15 @@
+use std::sync::Arc;
+
 use async_shutdown::ShutdownManager;
 use tokio::{
 	net::UdpSocket,
-	sync::{broadcast, mpsc, watch},
+	sync::{broadcast, mpsc, watch, Notify},
 };
 
+use crate::config::Config;
 use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
-use crate::{config::Config, session::manager::SessionShutdownReason};
+use crate::session::manager::SessionShutdownReason;
+use crate::session::SessionKeysReceiver;
 
 mod packetizer;
 mod pipeline;
@@ -72,12 +76,6 @@ impl TryFrom<u32> for VideoChromaSampling {
 	}
 }
 
-#[derive(Debug)]
-enum VideoStreamCommand {
-	Start,
-	RequestIdrFrame,
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct VideoStreamContext {
 	pub width: u32,
@@ -93,21 +91,45 @@ pub struct VideoStreamContext {
 	pub max_reference_frames: u32,
 	/// Whether the client has enabled video encryption.
 	pub encrypt_video: bool,
+	/// FEC percentage for video packets (from config).
+	pub fec_percentage: u8,
+	/// Whether to log per-frame latency spikes.
+	pub log_frame_spikes: bool,
 }
 
-#[derive(Clone)]
+/// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
+///
+/// The pipeline and packet handler are spawned immediately but block on a `Notify`
+/// until `trigger()` is called on `StartB`.
+pub struct VideoStreamHandle {
+	notify: Arc<Notify>,
+	idr_tx: broadcast::Sender<()>,
+}
+
+impl VideoStreamHandle {
+	/// Signal the video pipeline and packet handler to begin processing.
+	pub fn trigger(&self) {
+		self.notify.notify_waiters();
+	}
+
+	/// Request an IDR (key) frame from the encoder.
+	pub fn request_idr_frame(&self) {
+		let _ = self.idr_tx.send(());
+	}
+}
+
 pub struct VideoStream {
-	command_tx: mpsc::Sender<VideoStreamCommand>,
+	socket: UdpSocket,
+	frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+	hdr_metadata_tx: watch::Sender<HdrModeState>,
 }
 
 impl VideoStream {
 	pub async fn new(
 		config: Config,
-		context: VideoStreamContext,
-		frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
-		encryption_key: Option<Vec<u8>>,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
+		_stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 
@@ -115,202 +137,125 @@ impl VideoStream {
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
-		if context.qos {
-			// 160 corresponds to DSCP CS5 (Video)
-			tracing::debug!("Enabling QoS on video socket.");
-			socket
-				.set_tos_v4(160)
-				.map_err(|e| tracing::warn!("Failed to set QoS on the video socket: {e}"))?;
-		}
-
 		tracing::debug!(
 			"Listening for video messages on {}",
 			socket
 				.local_addr()
-				.map_err(|e| tracing::warn!("Failed to get local address associated with control socket: {e}"))?
+				.map_err(|e| tracing::warn!("Failed to get local address associated with video socket: {e}"))?
 		);
 
-		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = VideoStreamInner {
-			context,
-			config,
-			pipeline: None,
+		Ok(Self {
+			socket,
 			frame_rx,
-			encryption_key,
-			hdr_metadata_tx: Some(hdr_metadata_tx),
-		};
-		tokio::spawn(inner.run(socket, command_rx, stop_session_manager.clone()));
-
-		Ok(Self { command_tx })
+			hdr_metadata_tx,
+		})
 	}
 
-	pub async fn start(&self) -> Result<(), ()> {
-		tracing::debug!("Starting video stream.");
+	#[allow(clippy::too_many_arguments)]
+	pub fn start(
+		self,
+		context: VideoStreamContext,
+		keys_rx: SessionKeysReceiver,
+		stop: ShutdownManager<SessionShutdownReason>,
+	) -> Result<VideoStreamHandle, ()> {
+		let Self {
+			socket,
+			frame_rx,
+			hdr_metadata_tx,
+		} = self;
 
-		self.command_tx
-			.send(VideoStreamCommand::Start)
-			.await
-			.map_err(|e| tracing::warn!("Failed to send Start command: {e}"))
-	}
+		// Apply QoS to UDP socket.
+		if context.qos {
+			let _ = socket.set_tos_v4(160);
+		}
 
-	pub async fn request_idr_frame(&self) -> Result<(), ()> {
-		self.command_tx
-			.send(VideoStreamCommand::RequestIdrFrame)
-			.await
-			.map_err(|e| tracing::warn!("Failed to send RequestIdrFrame command: {e}"))
+		// Gate for pipeline + packet handler.
+		let start_notify = Arc::new(Notify::new());
+
+		// IDR broadcast channel.
+		let (idr_tx, _idr_rx) = broadcast::channel(1);
+
+		// Packet channel.
+		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
+
+		// Spawn packet handler — gated behind start_notify.
+		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone());
+
+		// Spawn pipeline thread — gated behind start_notify.
+		VideoPipeline::new(
+			frame_rx,
+			context,
+			keys_rx,
+			packet_tx,
+			idr_tx.subscribe(),
+			stop.clone(),
+			hdr_metadata_tx,
+			start_notify.clone(),
+		)
+		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
+
+		Ok(VideoStreamHandle {
+			notify: start_notify,
+			idr_tx,
+		})
 	}
 }
 
-struct VideoStreamInner {
-	context: VideoStreamContext,
-	config: Config,
-	pipeline: Option<VideoPipeline>,
-	frame_rx: Option<std::sync::mpsc::Receiver<ExportedFrame>>,
-	encryption_key: Option<Vec<u8>>,
-	hdr_metadata_tx: Option<watch::Sender<HdrModeState>>,
-}
+fn spawn_handle_video_packets(
+	mut packet_rx: mpsc::Receiver<ShardBatch>,
+	socket: UdpSocket,
+	start: Arc<Notify>,
+	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+) {
+	tokio::spawn(async move {
+		start.notified().await;
 
-impl VideoStreamInner {
-	async fn run(
-		mut self,
-		socket: UdpSocket,
-		mut command_rx: mpsc::Receiver<VideoStreamCommand>,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-	) {
+		let mut buf = [0; 1024];
+		let mut client_address = None;
+
 		// Trigger session shutdown if we exit unexpectedly.
-		let _session_stop_token =
-			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoStreamStopped);
+		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
-		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
-		tokio::spawn(handle_video_packets(packet_rx, socket, stop_session_manager.clone()));
-
-		let mut started_streaming = false;
-		let (idr_frame_request_tx, _idr_frame_request_rx) = tokio::sync::broadcast::channel(1);
-		while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
-			match command {
-				VideoStreamCommand::RequestIdrFrame => {
-					tracing::debug!("Received request for IDR frame, next frame will be an IDR frame.");
-					let _ = idr_frame_request_tx
-						.send(())
-						.map_err(|e| tracing::warn!("Failed to send IDR frame request to encoder: {e}"));
+		while !stop_session_manager.is_shutdown_triggered() {
+			tokio::select! {
+				batch = packet_rx.recv() => {
+					match batch {
+						Some(batch) => {
+							if let Some(client_address) = client_address {
+								for shard in batch.shards() {
+									if let Err(e) = socket.send_to(shard, client_address).await {
+										tracing::warn!("Failed to send packet to client: {e}");
+									}
+								}
+							}
+						},
+						None => {
+							tracing::debug!("Video packet channel closed.");
+							break;
+						},
+					}
 				},
-				VideoStreamCommand::Start => {
-					if started_streaming {
-						tracing::warn!("Can't start streaming twice.");
-						continue;
-					}
 
-					if self
-						.start(
-							packet_tx.clone(),
-							idr_frame_request_tx.subscribe(),
-							stop_session_manager.clone(),
-						)
-						.await
-						.is_err()
-					{
-						break;
+				message = socket.recv_from(&mut buf) => {
+					let (len, address) = match message {
+						Ok((len, address)) => (len, address),
+						Err(e) => {
+							tracing::warn!("Failed to receive message: {e}");
+							break;
+						},
+					};
+
+					if &buf[..len] == b"PING" {
+						tracing::trace!("Received video stream PING message from {address}.");
+						client_address = Some(address);
+					} else {
+						tracing::warn!("Received unknown message on video stream of length {len}.");
 					}
-					started_streaming = true;
 				},
 			}
 		}
 
-		tracing::debug!("Video stream stopped.");
-	}
-
-	async fn start(
-		&mut self,
-		packet_tx: mpsc::Sender<ShardBatch>,
-		idr_frame_request_rx: broadcast::Receiver<()>,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-	) -> Result<(), ()> {
-		let frame_rx = self.frame_rx.take().ok_or_else(|| {
-			tracing::warn!("No frame receiver available for video pipeline");
-		})?;
-		let hdr_metadata_tx = self.hdr_metadata_tx.take().ok_or_else(|| {
-			tracing::warn!("No HDR metadata sender available for video pipeline");
-		})?;
-
-		tracing::debug!("Creating video pipeline with compositor frame receiver.");
-		let pipeline = VideoPipeline::new(
-			frame_rx,
-			self.context.width,
-			self.context.height,
-			self.context.fps,
-			self.context.bitrate,
-			self.context.packet_size,
-			self.context.minimum_fec_packets,
-			self.config.stream.video.fec_percentage,
-			self.context.video_format,
-			self.context.dynamic_range,
-			self.context.chroma_sampling_type,
-			self.context.max_reference_frames,
-			self.encryption_key.take(),
-			packet_tx,
-			idr_frame_request_rx,
-			stop_session_manager.clone(),
-			hdr_metadata_tx,
-			self.config.stream.video.log_frame_spikes,
-		)?;
-
-		self.pipeline = Some(pipeline);
-
-		Ok(())
-	}
-}
-
-async fn handle_video_packets(
-	mut packet_rx: mpsc::Receiver<ShardBatch>,
-	socket: UdpSocket,
-	stop_session_manager: ShutdownManager<SessionShutdownReason>,
-) {
-	let mut buf = [0; 1024];
-	let mut client_address = None;
-
-	// Trigger session shutdown if we exit unexpectedly.
-	let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
-	let _delay_stop = stop_session_manager.delay_shutdown_token();
-
-	while !stop_session_manager.is_shutdown_triggered() {
-		tokio::select! {
-			batch = packet_rx.recv() => {
-				match batch {
-					Some(batch) => {
-						if let Some(client_address) = client_address {
-							for shard in batch.shards() {
-								if let Err(e) = socket.send_to(shard, client_address).await {
-									tracing::warn!("Failed to send packet to client: {e}");
-								}
-							}
-						}
-					},
-					None => {
-						tracing::debug!("Video packet channel closed.");
-						break;
-					},
-				}
-			},
-
-			message = socket.recv_from(&mut buf) => {
-				let (len, address) = match message {
-					Ok((len, address)) => (len, address),
-					Err(e) => {
-						tracing::warn!("Failed to receive message: {e}");
-						break;
-					},
-				};
-
-				if &buf[..len] == b"PING" {
-					tracing::trace!("Received video stream PING message from {address}.");
-					client_address = Some(address);
-				} else {
-					tracing::warn!("Received unknown message on video stream of length {len}.");
-				}
-			},
-		}
-	}
-
-	tracing::debug!("Video packet stream stopped.");
+		tracing::debug!("Video packet stream stopped.");
+	});
 }

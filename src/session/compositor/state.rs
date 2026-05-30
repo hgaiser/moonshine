@@ -1496,28 +1496,15 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Shut down the application and XWayland server.
+	/// Shut down XWayland server connections.
 	///
-	/// Stops the application's systemd scope first so that X11 clients
-	/// disconnect, then drops the X11 window manager connection. This
-	/// ensures all clients are gone before Xwayland's `-terminate` flag
-	/// triggers a clean exit.
+	/// Drops the X11 window manager connection so Xwayland sees no remaining
+	/// connections and exits. The application's systemd scope is stopped by
+	/// `Application::Drop` after the compositor thread has exited.
 	pub fn shutdown_session_processes(&mut self) {
 		if let Some(token) = self.wayland_socket_token.take() {
 			self.handle.remove(token);
 			tracing::debug!(wayland_display = %self.wayland_display, "Removed Wayland listening socket source");
-		}
-
-		// Stop the application so all X11 clients disconnect from Xwayland.
-		let status = std::process::Command::new("systemctl")
-			.args(["--user", "stop", "moonshine-session.scope"])
-			.stdout(std::process::Stdio::null())
-			.stderr(std::process::Stdio::null())
-			.status();
-		match status {
-			Ok(s) if s.success() => tracing::debug!("Stopped moonshine-session.scope"),
-			Ok(s) => tracing::debug!("systemctl stop exited with {s}"),
-			Err(e) => tracing::warn!("Failed to stop moonshine-session.scope: {e}"),
 		}
 
 		// Clear the X11 focus control connection so reevaluate_focus
@@ -1527,8 +1514,7 @@ impl MoonshineCompositor {
 		}
 
 		// Drop the X11 window manager, closing the privileged WM
-		// connection to Xwayland. Combined with the client disconnect
-		// above, Xwayland will see no remaining connections.
+		// connection to Xwayland. Xwayland will see no remaining connections.
 		if self.xwm.take().is_some() {
 			tracing::debug!("Dropped X11 window manager");
 		}

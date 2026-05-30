@@ -2,19 +2,23 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
-use tokio::sync::mpsc::{self, error::TryRecvError};
+use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
 use self::{feedback::FeedbackCommand, input::InputHandler};
-use super::{AudioStream, VideoStream};
+use super::audio::AudioStartHandle;
+use super::video::VideoStreamHandle;
 use crate::{
 	config::Config,
 	crypto::{decrypt, encrypt},
 	session::{
-		compositor::frame::{HdrMetadata, HdrModeState},
+		compositor::{
+			frame::{HdrMetadata, HdrModeState},
+			input::CompositorInputEvent,
+		},
 		manager::SessionShutdownReason,
-		SessionContext, SessionKeys,
+		SessionContext, SessionKeysReceiver,
 	},
 };
 
@@ -211,25 +215,40 @@ fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Ve
 	Ok(message.as_bytes())
 }
 
-enum ControlStreamCommand {
-	UpdateKeys(SessionKeys),
+/// Context passed to the control stream from Session.
+#[derive(Clone)]
+pub struct ControlStreamContext {
+	pub keys_rx: SessionKeysReceiver,
+	pub hdr: bool,
+}
+
+impl ControlStreamContext {
+	/// Create a `ControlStreamContext` from a session context and the *effective*
+	/// HDR flag reported by the compositor after launch.
+	///
+	/// `hdr_effective` may differ from `ctx.hdr` when the client requested HDR but
+	/// the GPU does not support an HDR-capable DMA-BUF format (compositor falls back
+	/// to SDR and reports `hdr = false` in `CompositorReady`).
+	pub fn new(ctx: &SessionContext, hdr_effective: bool) -> Self {
+		Self {
+			keys_rx: ctx.keys.clone_rx().expect("session keys not initialized"),
+			hdr: hdr_effective,
+		}
+	}
 }
 
 pub struct ControlStream {
-	command_tx: mpsc::Sender<ControlStreamCommand>,
+	config: Config,
+	stop: ShutdownManager<SessionShutdownReason>,
+	input_handler: InputHandler,
+	host: Host,
 }
 
 impl ControlStream {
-	#[allow(clippy::result_unit_err, clippy::too_many_arguments)]
 	pub fn new(
 		config: Config,
-		video_stream: VideoStream,
-		audio_stream: AudioStream,
-		context: SessionContext,
+		input_tx: calloop::channel::Sender<CompositorInputEvent>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-		input_tx: calloop::channel::Sender<crate::session::compositor::input::CompositorInputEvent>,
-		hdr: bool,
-		hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	) -> Result<Self, ()> {
 		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone())?;
 
@@ -241,51 +260,52 @@ impl ControlStream {
 			config.stream.control.port,
 		);
 
+		let host_config = HostConfig {
+			address: Some(socket_address),
+			peer_count: 1,
+			channel_limit: 1,
+			..Default::default()
+		};
+
+		let host = Host::new(host_config).map_err(|e| tracing::error!("Failed to create enet host: {e}"))?;
+
 		tracing::debug!("Listening for control messages on {:?}", socket_address);
 
-		let (command_tx, command_rx) = mpsc::channel(10);
-		let inner = ControlStreamInner {};
-		tokio::spawn(async move {
-			let host_config = HostConfig {
-				address: Some(socket_address),
-				peer_count: 1,
-				channel_limit: 1,
-				..Default::default()
-			};
-
-			let host = match Host::new(host_config) {
-				Ok(host) => host,
-				Err(e) => {
-					tracing::error!("Failed to create enet host: {e}");
-					return;
-				},
-			};
-
-			inner
-				.run(
-					config,
-					host,
-					command_rx,
-					video_stream,
-					audio_stream,
-					context,
-					input_handler,
-					stop_session_manager.clone(),
-					hdr,
-					hdr_metadata_rx,
-				)
-				.await
-		});
-
-		Ok(Self { command_tx })
+		Ok(Self {
+			config,
+			stop: stop_session_manager,
+			input_handler,
+			host,
+		})
 	}
 
-	pub async fn update_keys(&self, keys: SessionKeys) -> Result<(), ()> {
-		tracing::debug!("Updating session keys.");
-		self.command_tx
-			.send(ControlStreamCommand::UpdateKeys(keys))
-			.await
-			.map_err(|e| tracing::warn!("Failed to send UpdateKeys command: {e}"))
+	pub fn start(
+		self,
+		context: ControlStreamContext,
+		video_handle: VideoStreamHandle,
+		audio_trigger: AudioStartHandle,
+		hdr_metadata_rx: watch::Receiver<HdrModeState>,
+	) {
+		let Self {
+			config,
+			stop: stop_session_manager,
+			input_handler,
+			host,
+		} = self;
+
+		tokio::spawn(async move {
+			run_control_loop(
+				config,
+				host,
+				video_handle,
+				audio_trigger,
+				context,
+				input_handler,
+				stop_session_manager,
+				hdr_metadata_rx,
+			)
+			.await;
+		});
 	}
 }
 
@@ -348,234 +368,185 @@ fn build_termination_payload(error_code: u32) -> Vec<u8> {
 	buf
 }
 
-struct ControlStreamInner {}
-
-impl ControlStreamInner {
-	#[allow(clippy::too_many_arguments)] // TODO: Problem for later..
-	pub async fn run(
-		&self,
-		config: Config,
-		mut host: Host,
-		mut command_rx: mpsc::Receiver<ControlStreamCommand>,
-		video_stream: VideoStream,
-		audio_stream: AudioStream,
-		mut context: SessionContext,
-		input_handler: InputHandler,
-		stop_session_manager: ShutdownManager<SessionShutdownReason>,
-		hdr: bool,
-		mut hdr_metadata_rx: watch::Receiver<HdrModeState>,
-	) {
-		// Trigger session shutdown when the control stream stops.
-		let _session_stop_token =
-			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::ControlStreamStopped);
-		let _delay_stop = stop_session_manager.delay_shutdown_token();
-
-		let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
-
-		// Create a channel over which we can receive feedback messages to send to the connected client.
-		let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
-
-		// Sequence number of feedback messages.
-		let mut sequence_number = 0u32;
-		let mut send_hdr_mode = false;
-
-		while !stop_session_manager.is_shutdown_triggered() {
-			// Check if we received a command.
-			let command = command_rx.try_recv();
-			match command {
-				Ok(command) => match command {
-					ControlStreamCommand::UpdateKeys(keys) => {
-						context.keys = keys;
-					},
-				},
-				Err(TryRecvError::Disconnected) => {
-					tracing::debug!("Control command channel closed.");
-					break;
-				},
-				Err(TryRecvError::Empty) => {},
-			}
-
-			// Check if the timeout has passed.
-			if std::time::Instant::now() > stop_deadline {
-				tracing::info!(
-					"Stopping because we haven't received a ping for {} seconds.",
-					config.stream_timeout
-				);
-				break;
-			}
-
-			// Check for feedback messages.
-			if let Ok(command) = feedback_rx.try_recv() {
-				tracing::debug!("Sending control feedback command: {command:?}");
-				let payload = command.as_packet();
-				let packet = encode_control(&context.keys.remote_input_key, sequence_number, &payload);
-
-				if let Ok(packet) = packet {
-					if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
-						if peer.state() == PeerState::Connected {
-							let _ = peer
-								.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
-								.map_err(|e| tracing::warn!("Failed to send rumble to peer: {e}"));
-						}
-					}
-				}
-
-				sequence_number += 1;
-			}
-
-			match host
-				.service(Duration::from_millis(10))
-				.await
-				.map_err(|e| tracing::error!("Failure in enet host: {e}"))
-			{
-				Ok(Some(Event::Connect { .. })) => {},
-				Ok(Some(Event::Disconnect { .. })) => {},
-				Ok(Some(Event::Receive { ref packet, .. })) => {
-					let mut control_message = match ControlMessage::from_bytes(packet.data()) {
-						Ok(control_message) => control_message,
-						Err(()) => break,
-					};
-					tracing::trace!("Received control message: {control_message:?}");
-
-					// First check for encrypted control messages and decrypt them.
-					let decrypted;
-					if let ControlMessage::Encrypted(message) = control_message {
-						let mut initialization_vector = [0u8; 12];
-						initialization_vector[0..4].copy_from_slice(&message.sequence_number.to_le_bytes());
-						initialization_vector[10] = b'C';
-						initialization_vector[11] = b'C';
-
-						let decrypted_result = decrypt(
-							&message.payload,
-							&context.keys.remote_input_key,
-							&initialization_vector,
-							&message.tag,
-						);
-
-						decrypted = match decrypted_result {
-							Ok(decrypted) => decrypted,
-							Err(e) => {
-								tracing::warn!("Failed to decrypt control message: {:?}", e);
-								continue;
-							},
-						};
-
-						control_message = match ControlMessage::from_bytes(&decrypted) {
-							Ok(decrypted_message) => decrypted_message,
-							Err(()) => continue,
-						};
-
-						tracing::trace!("Decrypted control message: {control_message:?}");
-					}
-
-					match control_message {
-						ControlMessage::Encrypted(_) => {
-							unreachable!("Encrypted control messages should be decrypted already.")
-						},
-						ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
-							if video_stream.request_idr_frame().await.is_err() {
-								break;
-							}
-						},
-						ControlMessage::StartB => {
-							if audio_stream.start(context.keys.clone()).await.is_err() {
-								break;
-							}
-							if video_stream.start().await.is_err() {
-								break;
-							}
-							send_hdr_mode = hdr;
-						},
-						ControlMessage::Ping => {
-							stop_deadline =
-								std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
-						},
-						ControlMessage::InputData(event) => {
-							let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;
-						},
-						ControlMessage::HdrMode => {
-							tracing::info!("Received HdrMode toggle from client");
-						},
-						skipped_message => {
-							tracing::trace!("Skipped control message: {skipped_message:?}");
-						},
-					};
-				},
-				Ok(None) => (),
-				Err(_) => break,
-			}
-
-			// Send HDR mode notification after the host.service() match to avoid double mutable borrow.
-			if send_hdr_mode {
-				send_hdr_mode = false;
-				let state = hdr_metadata_rx.borrow_and_update().clone();
-				let metadata = if state.enabled {
-					Some(state.metadata.unwrap_or_else(HdrMetadata::fallback))
-				} else {
-					None
-				};
-				let hdr_payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
-				let hdr_packet = encode_control(&context.keys.remote_input_key, sequence_number, &hdr_payload);
-				sequence_number += 1;
-
-				if let Ok(hdr_packet) = hdr_packet {
-					if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
-						if peer.state() == PeerState::Connected {
-							let _ = peer
-								.send(0, Packet::new(hdr_packet.as_slice(), PacketMode::ReliableSequenced))
-								.map_err(|e| tracing::warn!("Failed to send HDR mode to peer: {e}"));
-						}
-					}
-					tracing::info!("Sent HDR mode to client: enabled={}", state.enabled);
-				}
-			}
-
-			// Check for HDR metadata updates from the video pipeline.
-			if hdr && hdr_metadata_rx.has_changed().unwrap_or(false) {
-				let state = hdr_metadata_rx.borrow_and_update().clone();
-				let metadata = if state.enabled {
-					Some(state.metadata.unwrap_or_else(HdrMetadata::fallback))
-				} else {
-					None
-				};
-				let hdr_payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
-				let hdr_packet = encode_control(&context.keys.remote_input_key, sequence_number, &hdr_payload);
-				sequence_number += 1;
-
-				if let Ok(hdr_packet) = hdr_packet {
-					if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
-						if peer.state() == PeerState::Connected {
-							let _ = peer
-								.send(0, Packet::new(hdr_packet.as_slice(), PacketMode::ReliableSequenced))
-								.map_err(|e| tracing::warn!("Failed to send HDR metadata update to peer: {e}"));
-						}
-					}
-					tracing::info!("Resent HDR mode to client: enabled={}", state.enabled);
-				}
+/// Send an encrypted control packet to the first peer of `host` if it is connected.
+fn send_to_peer(host: &mut Host, key: &[u8], sequence_number: u32, payload: &[u8], label: &str) {
+	if let Ok(packet) = encode_control(key, sequence_number, payload) {
+		if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
+			if peer.state() == PeerState::Connected {
+				let _ = peer
+					.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
+					.map_err(|e| tracing::warn!("Failed to send {label} to peer: {e}"));
 			}
 		}
-
-		tracing::debug!("Control stream stopped.");
-
-		// Notify the client of graceful termination before closing the connection.
-		// NVST_DISCONN_SERVER_TERMINATED_CLOSED (0x80030023) is recognized by the
-		// client as a graceful shutdown so it does not display an error.
-		let termination_payload = build_termination_payload(0x80030023);
-		if let Ok(packet) = encode_control(&context.keys.remote_input_key, sequence_number, &termination_payload) {
-			if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
-				if peer.state() == PeerState::Connected {
-					let _ = peer
-						.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
-						.map_err(|e| tracing::warn!("Failed to send termination to peer: {e}"));
-				}
-			}
-			let _ = host.flush().await;
-		}
-
-		// Explicitly drop the ENet host before the delay shutdown token
-		// to ensure the socket is released before wait_shutdown_complete
-		// returns. Without this, the next session's control stream may
-		// fail to bind to the same port.
-		drop(host);
 	}
+}
+
+/// Build and send an HDR mode control message, then advance `sequence_number`.
+fn send_hdr_state(host: &mut Host, state: &HdrModeState, key: &[u8], sequence_number: &mut u32, label: &str) {
+	let metadata = if state.enabled {
+		Some(state.metadata.unwrap_or_else(HdrMetadata::fallback))
+	} else {
+		None
+	};
+	let payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
+	send_to_peer(host, key, *sequence_number, &payload, label);
+	*sequence_number += 1;
+	tracing::info!("Sent HDR mode ({label}): enabled={}", state.enabled);
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_control_loop(
+	config: Config,
+	mut host: Host,
+	video_handle: VideoStreamHandle,
+	audio_trigger: AudioStartHandle,
+	context: ControlStreamContext,
+	input_handler: InputHandler,
+	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	mut hdr_metadata_rx: watch::Receiver<HdrModeState>,
+) {
+	// Trigger session shutdown when the control stream stops.
+	let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::ControlStreamStopped);
+	let _delay_stop = stop_session_manager.delay_shutdown_token();
+
+	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
+
+	// Create a channel over which we can receive feedback messages to send to the connected client.
+	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
+
+	// Sequence number of feedback messages.
+	let mut sequence_number = 0u32;
+	let mut send_hdr_mode = false;
+	let mut audio_triggered = false;
+
+	while !stop_session_manager.is_shutdown_triggered() {
+		// Check if the timeout has passed.
+		if std::time::Instant::now() > stop_deadline {
+			tracing::info!(
+				"Stopping because we haven't received a ping for {} seconds.",
+				config.stream_timeout
+			);
+			break;
+		}
+
+		// Check for feedback messages.
+		if let Ok(command) = feedback_rx.try_recv() {
+			tracing::debug!("Sending control feedback command: {command:?}");
+			let payload = command.as_packet();
+			let key = context.keys_rx.borrow().remote_input_key.clone();
+			send_to_peer(&mut host, &key, sequence_number, &payload, "feedback");
+			sequence_number += 1;
+		}
+
+		match host
+			.service(Duration::from_millis(10))
+			.await
+			.map_err(|e| tracing::error!("Failure in enet host: {e}"))
+		{
+			Ok(Some(Event::Connect { .. })) => {},
+			Ok(Some(Event::Disconnect { .. })) => {},
+			Ok(Some(Event::Receive { ref packet, .. })) => {
+				let mut control_message = match ControlMessage::from_bytes(packet.data()) {
+					Ok(control_message) => control_message,
+					Err(()) => break,
+				};
+				tracing::trace!("Received control message: {control_message:?}");
+
+				// First check for encrypted control messages and decrypt them.
+				let decrypted;
+				if let ControlMessage::Encrypted(message) = control_message {
+					let mut initialization_vector = [0u8; 12];
+					initialization_vector[0..4].copy_from_slice(&message.sequence_number.to_le_bytes());
+					initialization_vector[10] = b'C';
+					initialization_vector[11] = b'C';
+
+					let keys = &*context.keys_rx.borrow();
+					let decrypted_result = decrypt(
+						&message.payload,
+						&keys.remote_input_key,
+						&initialization_vector,
+						&message.tag,
+					);
+
+					decrypted = match decrypted_result {
+						Ok(decrypted) => decrypted,
+						Err(e) => {
+							tracing::warn!("Failed to decrypt control message: {:?}", e);
+							continue;
+						},
+					};
+
+					control_message = match ControlMessage::from_bytes(&decrypted) {
+						Ok(decrypted_message) => decrypted_message,
+						Err(()) => continue,
+					};
+
+					tracing::trace!("Decrypted control message: {control_message:?}");
+				}
+
+				match control_message {
+					ControlMessage::Encrypted(_) => {
+						unreachable!("Encrypted control messages should be decrypted already.")
+					},
+					ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
+						video_handle.request_idr_frame();
+					},
+					ControlMessage::StartB => {
+						video_handle.trigger();
+						if !audio_triggered {
+							audio_trigger.trigger();
+							audio_triggered = true;
+						}
+						send_hdr_mode = context.hdr;
+					},
+					ControlMessage::Ping => {
+						stop_deadline =
+							std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
+					},
+					ControlMessage::InputData(event) => {
+						let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;
+					},
+					ControlMessage::HdrMode => {
+						tracing::info!("Received HdrMode toggle from client");
+					},
+					skipped_message => {
+						tracing::trace!("Skipped control message: {skipped_message:?}");
+					},
+				};
+			},
+			Ok(None) => (),
+			Err(_) => break,
+		}
+
+		// Send HDR mode notification after the host.service() match to avoid double mutable borrow.
+		if send_hdr_mode {
+			send_hdr_mode = false;
+			let state = hdr_metadata_rx.borrow_and_update().clone();
+			let key = context.keys_rx.borrow().remote_input_key.clone();
+			send_hdr_state(&mut host, &state, &key, &mut sequence_number, "initial");
+		}
+
+		// Check for HDR metadata updates from the video pipeline.
+		if context.hdr && hdr_metadata_rx.has_changed().unwrap_or(false) {
+			let state = hdr_metadata_rx.borrow_and_update().clone();
+			let key = context.keys_rx.borrow().remote_input_key.clone();
+			send_hdr_state(&mut host, &state, &key, &mut sequence_number, "metadata update");
+		}
+	}
+
+	tracing::debug!("Control stream stopped.");
+
+	// Notify the client of graceful termination before closing the connection.
+	// NVST_DISCONN_SERVER_TERMINATED_CLOSED (0x80030023) is recognized by the
+	// client as a graceful shutdown so it does not display an error.
+	let termination_payload = build_termination_payload(0x80030023);
+	let key = context.keys_rx.borrow().remote_input_key.clone();
+	send_to_peer(&mut host, &key, sequence_number, &termination_payload, "termination");
+	let _ = host.flush().await;
+
+	// Explicitly drop the ENet host before the delay shutdown token
+	// to ensure the socket is released before wait_shutdown_complete
+	// returns. Without this, the next session's control stream may
+	// fail to bind to the same port.
+	drop(host);
 }

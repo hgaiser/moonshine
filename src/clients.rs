@@ -18,7 +18,7 @@ use sha2::Sha256;
 use tokio::sync::Notify;
 use x509_parser::prelude::*;
 
-use crate::state::State;
+use crate::state::PersistentState;
 
 /// A client that is not yet paired, but in the pairing process.
 pub struct PendingClient {
@@ -57,26 +57,24 @@ pub struct PendingClient {
 /// (salt, certificates, challenge/response data) and delegates persistent state to `State`.
 #[derive(Clone)]
 pub struct ClientManager {
-	inner: Arc<RwLock<ClientManagerData>>,
-	state: State,
+	pending_clients: Arc<RwLock<BTreeMap<String, PendingClient>>>,
+	state: PersistentState,
 	server_cert_pem: String,
 	server_private_key_pem: String,
 }
 
-struct ClientManagerData {
-	pending_clients: BTreeMap<String, PendingClient>,
-}
-
 impl ClientManager {
-	pub fn new(state: State, server_cert_pem: String, server_private_key_pem: String) -> Self {
-		Self {
-			inner: Arc::new(RwLock::new(ClientManagerData {
-				pending_clients: BTreeMap::new(),
-			})),
-			state,
+	pub fn new(server_cert_pem: String, server_private_key_pem: String) -> Result<Self, ()> {
+		Ok(Self {
+			pending_clients: Arc::new(RwLock::new(BTreeMap::new())),
+			state: PersistentState::new()?,
 			server_cert_pem,
 			server_private_key_pem,
-		}
+		})
+	}
+
+	pub fn persistent_state(&self) -> &PersistentState {
+		&self.state
 	}
 
 	pub fn is_paired(&self, id: String) -> Result<bool, ()> {
@@ -88,18 +86,18 @@ impl ClientManager {
 	}
 
 	pub fn start_pairing(&self, pending_client: PendingClient) -> Result<(), ()> {
-		let mut inner = self.inner.write().map_err(|poison| {
+		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		inner.pending_clients.insert(pending_client.id.clone(), pending_client);
+		inner.insert(pending_client.id.clone(), pending_client);
 		Ok(())
 	}
 
 	pub fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
-		let mut inner = self.inner.write().map_err(|poison| {
+		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
+		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
 		let key = create_key(&client.salt, pin).map_err(|e| tracing::warn!("Failed to create client key: {e}"))?;
@@ -109,10 +107,10 @@ impl ClientManager {
 	}
 
 	pub fn client_challenge(&self, id: &str, challenge: Vec<u8>) -> Result<Vec<u8>, ()> {
-		let mut inner = self.inner.write().map_err(|poison| {
+		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
+		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
 
@@ -156,10 +154,10 @@ impl ClientManager {
 	}
 
 	pub fn server_challenge_response(&self, id: &str, challenge_response: Vec<u8>) -> Result<Vec<u8>, ()> {
-		let mut inner = self.inner.write().map_err(|poison| {
+		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
+		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
 
@@ -188,10 +186,10 @@ impl ClientManager {
 	}
 
 	pub fn check_client_pairing_secret(&self, id: &str, client_secret: Vec<u8>) -> Result<(), ()> {
-		let mut inner = self.inner.write().map_err(|poison| {
+		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		let client = inner.pending_clients.get_mut(id).ok_or_else(|| {
+		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
 		verify_pairing_secret(client, client_secret)

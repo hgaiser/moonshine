@@ -25,10 +25,7 @@ use tokio::net::TcpListener;
 use crate::{
 	clients::ClientManager,
 	config::Config,
-	session::{
-		manager::{AppLaunchError, SessionManager},
-		SessionContext, SessionKeys, APP_LAUNCH_HTTP_TIMEOUT_SECS,
-	},
+	session::{manager::SessionManager, SessionContext, SessionKeyData, SessionKeys, APP_LAUNCH_HTTP_TIMEOUT_SECS},
 	webserver::tls::TlsAcceptor,
 };
 
@@ -80,7 +77,7 @@ impl Webserver {
 	) -> Result<Self, ()> {
 		// Gate HDR advertisement on both the config flag and a runtime
 		// GPU capability probe (10-bit or FP16 render formats).
-		let hdr_supported = config.hdr && crate::session::compositor::probe_hdr_support(&config.gpu);
+		let hdr_supported = config.compositor.hdr && crate::session::compositor::probe_hdr_support(&config.compositor);
 
 		let server = Self {
 			config: config.clone(),
@@ -299,13 +296,13 @@ impl Webserver {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
 				(&Method::GET, "/applist") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
 					self.app_list()
 				},
 				(&Method::GET, "/appasset") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
 					self.app_asset(params)
@@ -328,19 +325,19 @@ impl Webserver {
 				},
 				// (&Method::GET, "/unpair") => self.unpair(params).await,
 				(&Method::GET, "/launch") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
 					self.launch(params, local_address).await
 				},
 				(&Method::GET, "/resume") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
 					self.resume(params, local_address).await
 				},
 				(&Method::GET, "/cancel") => {
-					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint).await {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
 					self.cancel().await
@@ -373,7 +370,7 @@ impl Webserver {
 					if !self.config.webserver.enable_pairing {
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
-					self.pin(params).await
+					self.pin(params)
 				},
 				(&Method::POST, "/submit-pin") => {
 					if !self.config.webserver.enable_pairing {
@@ -565,7 +562,7 @@ impl Webserver {
 		response
 	}
 
-	async fn pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
+	fn pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
 		let unique_id = params
 			.get("uniqueid")
 			.cloned()
@@ -765,11 +762,7 @@ impl Webserver {
 			.remove("surroundAudioInfo")
 			.and_then(|s| s.parse().ok())
 			.unwrap_or(196610); // Default: stereo (0x30002)
-		let audio_channels = match surround_audio_info & 0xFFFF {
-			6 => 6u8,
-			8 => 8,
-			_ => 2, // Default to stereo for unknown/invalid values.
-		};
+		let audio_channels = crate::session::stream::AudioChannels::from((surround_audio_info & 0xFFFF) as u8);
 		let audio_channel_mask = surround_audio_info >> 16;
 
 		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);
@@ -791,10 +784,7 @@ impl Webserver {
 				application_id,
 				resolution: (width, height),
 				refresh_rate,
-				keys: SessionKeys {
-					remote_input_key,
-					remote_input_key_id,
-				},
+				keys: SessionKeys::new(remote_input_key, remote_input_key_id),
 				audio_channels,
 				audio_channel_mask,
 				hdr,
@@ -812,24 +802,7 @@ impl Webserver {
 		.await
 		{
 			Ok(Ok(())) => {},
-			Ok(Err(AppLaunchError::CompositorFailed)) | Ok(Err(AppLaunchError::XWaylandTimeout)) => {
-				// Clean up the partially-initialized session to allow retries.
-				let _ = self.session_manager.stop_session().await;
-				return xml_error(
-					503,
-					"Compositor failed to start (check Moonshine logs for more information).",
-				);
-			},
-			Ok(Err(AppLaunchError::SpawnFailed)) => {
-				// Clean up the partially-initialized session to allow retries.
-				let _ = self.session_manager.stop_session().await;
-				return xml_error(
-					503,
-					"Application failed to start (check Moonshine logs for more information).",
-				);
-			},
-			Ok(Err(AppLaunchError::ExitedEarly)) => {
-				// Clean up the partially-initialized session to allow retries.
+			Ok(Err(())) => {
 				let _ = self.session_manager.stop_session().await;
 				return xml_error(
 					503,
@@ -906,15 +879,20 @@ impl Webserver {
 			},
 		};
 
-		let update_result = self
+		match self
 			.session_manager
-			.update_keys(SessionKeys {
+			.update_keys(SessionKeyData {
 				remote_input_key,
 				remote_input_key_id,
 			})
-			.await;
-		if update_result.is_err() {
-			return xml_error(400, "Failed to update session keys");
+			.await
+		{
+			Ok(()) => {},
+			Err(()) => {
+				let message = "Failed to update session keys".to_string();
+				tracing::warn!("{message}");
+				return xml_error(400, &message);
+			},
 		}
 
 		let mut response = "<root status_code=\"200\">".to_string();
@@ -957,7 +935,7 @@ impl Webserver {
 	/// Verify that the connecting client has presented a TLS certificate
 	/// that belongs to a paired client. Returns `None` if authorized,
 	/// or `Some(response)` with a 401 response if not.
-	async fn verify_paired_client(&self, peer_cert_fingerprint: &Option<String>) -> Option<Response<Full<Bytes>>> {
+	fn verify_paired_client(&self, peer_cert_fingerprint: &Option<String>) -> Option<Response<Full<Bytes>>> {
 		match peer_cert_fingerprint {
 			Some(fingerprint) => match self.client_manager.is_cert_paired(fingerprint) {
 				Ok(true) => None,

@@ -27,25 +27,19 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::utils::Transform;
 
-use crate::config::KeyboardConfig;
+use crate::config::CompositorConfig;
 use crate::session::manager::SessionShutdownReason;
+use crate::session::SessionContext;
 
 use self::frame::ExportedFrame;
 use self::input::CompositorInputEvent;
 use self::state::MoonshineCompositor;
 
-/// Configuration for the compositor.
-#[derive(Clone, Debug)]
-pub struct CompositorConfig {
-	/// Width of the virtual output in pixels.
+/// Runtime context derived from the client's session request.
+pub struct CompositorContext {
 	pub width: u32,
-	/// Height of the virtual output in pixels.
 	pub height: u32,
-	/// Refresh rate in Hz.
 	pub refresh_rate: u32,
-	/// Optional GPU configuration (path, PCI ID, vendor:device, or vendor name).
-	pub gpu: Option<String>,
-	/// Whether HDR mode is active. When true, prefers 10-bit/FP16 GBM formats.
 	pub hdr: bool,
 }
 
@@ -59,43 +53,106 @@ pub struct CompositorReady {
 	pub hdr: bool,
 }
 
-/// Result type for `start_compositor`.
-type CompositorHandles = (
-	mpsc::Receiver<ExportedFrame>,
-	calloop::channel::Sender<CompositorInputEvent>,
-	mpsc::Receiver<CompositorReady>,
-);
+/// Handles returned by `Compositor::new()` for wiring into streams.
+pub struct CompositorHandles {
+	pub frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+	pub input_tx: calloop::channel::Sender<CompositorInputEvent>,
+}
 
-/// Start the headless compositor on a dedicated thread.
-///
-/// Returns a receiver for exported frames, a sender for input events,
-/// and a receiver for the XWayland display number.
-/// The compositor runs on its own `calloop::EventLoop` thread.
-pub fn start_compositor(
-	keyboard_config: KeyboardConfig,
+/// Unlaunched compositor — holds channel endpoints, can only be launched.
+pub struct Compositor {
 	config: CompositorConfig,
+	context: CompositorContext,
 	stop: ShutdownManager<SessionShutdownReason>,
-) -> Result<CompositorHandles, String> {
-	let (frame_tx, frame_rx) = mpsc::sync_channel::<ExportedFrame>(2);
-	let (input_tx, input_rx) = calloop::channel::channel::<CompositorInputEvent>();
-	let (ready_tx, ready_rx) = mpsc::sync_channel::<CompositorReady>(1);
+	frame_tx: std::sync::mpsc::SyncSender<ExportedFrame>,
+	input_rx: calloop::channel::Channel<CompositorInputEvent>,
+	ready_tx: std::sync::mpsc::SyncSender<CompositorReady>,
+	ready_rx: std::sync::mpsc::Receiver<CompositorReady>,
+}
 
-	std::thread::Builder::new()
-		.name("compositor".to_string())
-		.spawn(move || {
-			if let Err(e) = run_compositor(keyboard_config, config, frame_tx, input_rx, ready_tx, stop) {
-				tracing::error!("Compositor failed: {e}");
-			}
-		})
-		.map_err(|e| format!("Failed to spawn compositor thread: {e}"))?;
+/// Launched compositor — can be queried, cannot be launched again.
+pub struct LaunchedCompositor {
+	ready: CompositorReady,
+}
 
-	Ok((frame_rx, input_tx, ready_rx))
+impl From<&SessionContext> for CompositorContext {
+	fn from(ctx: &SessionContext) -> Self {
+		Self {
+			width: ctx.resolution.0,
+			height: ctx.resolution.1,
+			refresh_rate: ctx.refresh_rate,
+			hdr: ctx.hdr,
+		}
+	}
+}
+
+impl Compositor {
+	pub fn new(
+		config: CompositorConfig,
+		context: CompositorContext,
+		stop: ShutdownManager<SessionShutdownReason>,
+	) -> (Self, CompositorHandles) {
+		let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(2);
+		let (input_tx, input_rx) = calloop::channel::channel();
+		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+
+		(
+			Self {
+				config,
+				context,
+				stop,
+				frame_tx,
+				input_rx,
+				ready_tx,
+				ready_rx,
+			},
+			CompositorHandles { frame_rx, input_tx },
+		)
+	}
+
+	pub fn launch(self) -> Result<LaunchedCompositor, ()> {
+		let Self {
+			config,
+			context,
+			stop,
+			frame_tx,
+			input_rx,
+			ready_tx,
+			ready_rx,
+		} = self;
+
+		std::thread::Builder::new()
+			.name("compositor".to_string())
+			.spawn(move || {
+				if let Err(e) = run_compositor(config, context, frame_tx, input_rx, ready_tx, stop) {
+					tracing::error!("Compositor failed: {e}");
+				}
+			})
+			.map_err(|e| {
+				tracing::error!("Failed to spawn compositor thread: {e}");
+			})?;
+
+		let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(5)).map_err(|e| {
+			tracing::warn!("Timed out waiting for compositor ready: {e}");
+		})?;
+
+		Ok(LaunchedCompositor { ready })
+	}
+}
+
+impl LaunchedCompositor {
+	pub fn ready(&self) -> &CompositorReady {
+		&self.ready
+	}
+	pub fn hdr(&self) -> bool {
+		self.ready.hdr
+	}
 }
 
 /// Main compositor loop running on a dedicated thread.
 fn run_compositor(
-	keyboard_config: KeyboardConfig,
 	config: CompositorConfig,
+	context: CompositorContext,
 	frame_tx: mpsc::SyncSender<ExportedFrame>,
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
 	ready_tx: mpsc::SyncSender<CompositorReady>,
@@ -158,7 +215,7 @@ fn run_compositor(
 	// SDR: prefer 8-bit ABGR/XBGR to match Vulkan WSI and avoid GL R↔B channel swaps.
 	// Vulkan WSI on Wayland defaults to XBGR/ABGR formats, so using ARGB causes
 	// GL to incorrectly swap red/blue channels during blit operations.
-	let preferred_fourccs: Vec<Fourcc> = if config.hdr {
+	let preferred_fourccs: Vec<Fourcc> = if config.hdr && context.hdr {
 		vec![
 			Fourcc::Abgr2101010,
 			Fourcc::Abgr16161616f,
@@ -202,8 +259,8 @@ fn run_compositor(
 	);
 
 	// Derive effective HDR: only if an HDR-capable format was actually selected.
-	let hdr = config.hdr && matches!(render_fourcc, Fourcc::Abgr16161616f | Fourcc::Abgr2101010);
-	if config.hdr && !hdr {
+	let hdr = config.hdr && context.hdr && matches!(render_fourcc, Fourcc::Abgr16161616f | Fourcc::Abgr2101010);
+	if config.hdr && context.hdr && !hdr {
 		tracing::warn!(
 			"HDR requested but no HDR-capable format available (using {:?}), falling back to SDR",
 			render_fourcc
@@ -221,8 +278,8 @@ fn run_compositor(
 
 	// Create a virtual output.
 	let mode = Mode {
-		size: (config.width as i32, config.height as i32).into(),
-		refresh: (config.refresh_rate * 1000) as i32,
+		size: (context.width as i32, context.height as i32).into(),
+		refresh: (context.refresh_rate * 1000) as i32,
 	};
 
 	// Synthesize plausible physical dimensions so games that check the
@@ -231,10 +288,10 @@ fn run_compositor(
 	// the configured resolution's aspect ratio, but fall back to 16:9 if
 	// the configured dimensions are invalid.
 	let diag_mm = 686.0_f64; // 27 inches in mm
-	let aspect = if config.width == 0 || config.height == 0 {
+	let aspect = if context.width == 0 || context.height == 0 {
 		16.0_f64 / 9.0_f64
 	} else {
-		config.width as f64 / config.height as f64
+		context.width as f64 / context.height as f64
 	};
 	let h_mm = ((diag_mm / (1.0 + aspect * aspect).sqrt()) as i32).max(1);
 	let w_mm = ((h_mm as f64 * aspect) as i32).max(1);
@@ -264,14 +321,14 @@ fn run_compositor(
 		gbm_allocator,
 		renderer,
 		frame_tx,
-		config.width,
-		config.height,
+		context.width,
+		context.height,
 		render_fourcc,
 		render_modifiers,
 		ready_tx,
 		&render_node,
 		hdr,
-		keyboard_config,
+		config.keyboard.clone(),
 	);
 
 	// Insert the Wayland display as a calloop event source so client
@@ -327,7 +384,7 @@ fn run_compositor(
 	// the callback doesn't drift the cadence. `ToDuration` would add the
 	// interval *after* the callback returns, progressively skewing the
 	// actual period and producing ~58 Hz instead of 60 Hz.
-	let frame_nanos: u64 = 1_000_000_000u64 / config.refresh_rate as u64;
+	let frame_nanos: u64 = 1_000_000_000u64 / context.refresh_rate as u64;
 	let frame_interval = std::time::Duration::from_nanos(frame_nanos);
 	let mut next_frame = std::time::Instant::now() + frame_interval;
 	let timer = smithay::reexports::calloop::timer::Timer::from_duration(frame_interval);
@@ -350,9 +407,9 @@ fn run_compositor(
 
 	tracing::info!(
 		"Compositor started: {}x{} @ {}Hz",
-		config.width,
-		config.height,
-		config.refresh_rate
+		context.width,
+		context.height,
+		context.refresh_rate
 	);
 
 	// Run the event loop.
@@ -503,8 +560,8 @@ fn find_render_node(gpu_config: &Option<String>) -> Result<std::path::PathBuf, S
 /// Opens the render node, creates a temporary EGL context to query
 /// DMA-BUF render formats, and returns `true` if any 10-bit or FP16
 /// format suitable for HDR is available (Abgr2101010, Abgr16161616f).
-pub fn probe_hdr_support(gpu_config: &Option<String>) -> bool {
-	let render_node = match find_render_node(gpu_config) {
+pub fn probe_hdr_support(config: &CompositorConfig) -> bool {
+	let render_node = match find_render_node(&config.gpu) {
 		Ok(node) => node,
 		Err(e) => {
 			tracing::warn!("HDR probe: failed to find render node: {e}");

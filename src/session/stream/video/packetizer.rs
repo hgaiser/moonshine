@@ -6,6 +6,8 @@ use fec_rs::ReedSolomon;
 use std::collections::{hash_map::Entry, HashMap};
 use std::time::Instant;
 
+use crate::session::SessionKeysReceiver;
+
 use super::shard_batch::{ShardBatch, ShardBuf};
 
 /// Maximum allowed number of shards in the encoder (data + parity).
@@ -108,31 +110,53 @@ fn copy_header_and_data(
 
 pub struct Packetizer {
 	fec_encoders: HashMap<(usize, usize), ReedSolomon>,
-	/// AES-128-GCM cipher for video encryption, `None` when disabled.
+	/// Watch channel for encryption keys — read eagerly per `packetize()` call.
+	keys_rx: SessionKeysReceiver,
+	/// Whether video encryption is enabled by the client.
+	encrypt: bool,
+	/// AES-128-GCM cipher for video encryption, `None` when disabled or uninitialized.
 	cipher: Option<Aes128Gcm>,
+	/// Last seen `remote_input_key_id` — used to detect key rotation.
+	last_key_id: i64,
 	/// Monotonically increasing IV counter (one increment per encrypted shard).
 	gcm_iv_counter: u64,
 }
 
 impl Packetizer {
-	pub fn new(encryption_key: Option<&[u8]>) -> Result<Self, ()> {
-		let cipher = match encryption_key {
-			Some(key) if key.len() != 16 => {
-				tracing::error!("Video encryption key must be exactly 16 bytes, got {}", key.len());
-				return Err(());
-			},
-			Some(key) => {
-				let key = Key::<Aes128Gcm>::from_slice(key);
-				Some(Aes128Gcm::new(key))
-			},
-			None => None,
-		};
-
-		Ok(Self {
+	pub fn new(encrypt: bool, keys_rx: SessionKeysReceiver) -> Self {
+		Self {
 			fec_encoders: HashMap::new(),
-			cipher,
+			keys_rx,
+			encrypt,
+			cipher: None,
+			last_key_id: i64::MIN,
 			gcm_iv_counter: 0,
-		})
+		}
+	}
+
+	/// Update the cipher if the encryption key has rotated.
+	/// Called eagerly at the start of each `packetize()` call.
+	fn maybe_update_cipher(&mut self) {
+		if !self.encrypt {
+			return;
+		}
+		let keys = &*self.keys_rx.borrow();
+		if keys.remote_input_key_id == self.last_key_id {
+			return;
+		}
+		self.last_key_id = keys.remote_input_key_id;
+		if keys.remote_input_key.len() != 16 {
+			tracing::error!(
+				"Video encryption key must be exactly 16 bytes, got {}",
+				keys.remote_input_key.len()
+			);
+			self.cipher = None;
+			return;
+		}
+		let key = Key::<Aes128Gcm>::from_slice(&keys.remote_input_key);
+		self.cipher = Some(Aes128Gcm::new(key));
+		self.gcm_iv_counter = 0;
+		tracing::debug!("Video encryption cipher updated for key_id={}", self.last_key_id);
 	}
 
 	/// Pre-create FEC encoders for all possible block sizes to avoid
@@ -170,6 +194,9 @@ impl Packetizer {
 		rtp_timestamp: u32,
 		frame_processing_latency: u16,
 	) -> Result<ShardBatch, ()> {
+		// Eagerly read current encryption key and update cipher if rotated.
+		self.maybe_update_cipher();
+
 		tracing::trace!(
 			"Packetizing frame {}, size={}, keyframe={}",
 			frame_number,
