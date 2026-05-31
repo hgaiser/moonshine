@@ -478,18 +478,26 @@ impl PulseServer {
 					}
 				}
 
-				let bytes_needed = (stream.buffer_attr.target_length as usize)
-					.saturating_sub(stream.buffer.len_bytes() + stream.requested_bytes);
+				let min_req = stream.buffer_attr.minimum_request_length as usize;
+				let buf_len = stream.buffer.len_bytes();
+				let target = stream.buffer_attr.target_length as usize;
+				let bytes_needed = target.saturating_sub(buf_len + stream.requested_bytes);
 				if matches!(stream.state, StreamState::Playing | StreamState::Corked)
-					&& bytes_needed >= stream.buffer_attr.minimum_request_length as usize
+					&& (bytes_needed >= min_req || buf_len < min_req)
 				{
-					stream.requested_bytes += bytes_needed;
+					// Reset pending requests if buffer is critically low to avoid
+					// a deadlock where unfulfilled requests block new ones forever.
+					if buf_len < min_req {
+						stream.requested_bytes = 0;
+					}
+					let req = target.saturating_sub(buf_len + stream.requested_bytes);
+					stream.requested_bytes += req;
 					pulse::write_command_message(
 						&mut client.socket,
 						u32::MAX,
 						&pulse::Command::Request(pulse::Request {
 							channel: *id,
-							length: bytes_needed as u32,
+							length: req as u32,
 						}),
 						client.protocol_version,
 					)?;
