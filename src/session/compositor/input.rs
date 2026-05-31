@@ -13,6 +13,17 @@ use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerCons
 
 use super::state::MoonshineCompositor;
 
+/// Wheel tick size matching Windows WHEEL_DELTA convention.
+/// Moonlight clients send scroll deltas in high-res units where
+/// 120 = one scroll notch. These are accumulated until reaching
+/// this threshold before emitting a scroll tick.
+const WHEEL_DELTA: i32 = 120;
+
+/// Wayland axis value for one scroll notch.
+/// libinput convention: one notch = 15 (degrees rotation for a 15° click-angle wheel).
+/// See: https://wayland.freedesktop.org/libinput/doc/latest/wheel-api.html
+const AXIS_STEP: f64 = 15.0;
+
 /// Input events sent from the control stream to the compositor.
 ///
 /// These are transport-level events that cross the tokio→calloop boundary.
@@ -210,18 +221,43 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			pointer.frame(state);
 		},
 		CompositorInputEvent::ScrollVertical { amount } => {
-			tracing::trace!(target: "input", "Scroll vertical: {amount}");
+			tracing::trace!(target: "input", "Scroll vertical: raw={amount}, accumulated={}", state.accumulated_vscroll_delta);
 
-			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.axis(state, AxisFrame::new(time).value(Axis::Vertical, -(amount as f64)));
-			pointer.frame(state);
+			// Reset accumulation on direction change so leftover from one
+			// direction doesn't absorb the first event of the opposite direction
+			if state.accumulated_vscroll_delta != 0 &&
+				(state.accumulated_vscroll_delta > 0) != (amount > 0)
+			{
+				state.accumulated_vscroll_delta = 0;
+			}
+			state.accumulated_vscroll_delta += amount as i32;
+			let full_ticks = state.accumulated_vscroll_delta / WHEEL_DELTA;
+			if full_ticks != 0 {
+				tracing::trace!(target: "input", "Scroll vertical: emitting {full_ticks} ticks, remainder={}", state.accumulated_vscroll_delta - full_ticks * WHEEL_DELTA);
+				let pointer = state.seat.get_pointer().expect("pointer should exist");
+				// Negate for Wayland axis convention (positive = scroll up)
+				pointer.axis(state, AxisFrame::new(time).value(Axis::Vertical, -(full_ticks as f64 * AXIS_STEP)));
+				pointer.frame(state);
+				state.accumulated_vscroll_delta -= full_ticks * WHEEL_DELTA;
+			}
 		},
 		CompositorInputEvent::ScrollHorizontal { amount } => {
-			tracing::trace!(target: "input", "Scroll horizontal: {amount}");
+			tracing::trace!(target: "input", "Scroll horizontal: raw={amount}, accumulated={}", state.accumulated_hscroll_delta);
 
-			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.axis(state, AxisFrame::new(time).value(Axis::Horizontal, amount as f64));
-			pointer.frame(state);
+			if state.accumulated_hscroll_delta != 0 &&
+				(state.accumulated_hscroll_delta > 0) != (amount > 0)
+			{
+				state.accumulated_hscroll_delta = 0;
+			}
+			state.accumulated_hscroll_delta += amount as i32;
+			let full_ticks = state.accumulated_hscroll_delta / WHEEL_DELTA;
+			if full_ticks != 0 {
+				tracing::trace!(target: "input", "Scroll horizontal: emitting {full_ticks} ticks, remainder={}", state.accumulated_hscroll_delta - full_ticks * WHEEL_DELTA);
+				let pointer = state.seat.get_pointer().expect("pointer should exist");
+				pointer.axis(state, AxisFrame::new(time).value(Axis::Horizontal, full_ticks as f64 * AXIS_STEP));
+				pointer.frame(state);
+				state.accumulated_hscroll_delta -= full_ticks * WHEEL_DELTA;
+			}
 		},
 	}
 }

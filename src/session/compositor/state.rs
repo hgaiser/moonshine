@@ -332,6 +332,13 @@ pub struct MoonshineCompositor {
 	/// Gamescope: `focus_t::inputFocusWindow` — where pointer/mouse events go.
 	pub pointer_focus_window: Option<smithay::desktop::Window>,
 
+	// -- Scroll accumulation --
+	/// Accumulated vertical scroll delta. Emits a scroll event when
+	/// the absolute value reaches WHEEL_DELTA (120).
+	pub accumulated_vscroll_delta: i32,
+	/// Accumulated horizontal scroll delta.
+	pub accumulated_hscroll_delta: i32,
+
 	/// Monotonically increasing damage sequence counter. Incremented on each
 	/// surface commit for game windows (app_id != 0). Used to detect when
 	/// a game window has drawn since the last focus change.
@@ -613,6 +620,8 @@ impl MoonshineCompositor {
 				map_sequence_counter: 0,
 				last_keyboard_focus_window: None,
 				x11_focus: None,
+				accumulated_vscroll_delta: 0,
+				accumulated_hscroll_delta: 0,
 				focus_state: super::focus::FocusState::default(),
 				window_metadata: HashMap::new(),
 				transient_children: std::collections::HashMap::new(),
