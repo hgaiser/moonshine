@@ -236,7 +236,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 				tracing::trace!(target: "input", "Scroll vertical: emitting {full_ticks} ticks, remainder={}", state.accumulated_vscroll_delta - full_ticks * WHEEL_DELTA);
 				let pointer = state.seat.get_pointer().expect("pointer should exist");
 				// Negate for Wayland axis convention (positive = scroll up)
-				pointer.axis(state, AxisFrame::new(time).value(Axis::Vertical, -(full_ticks as f64 * AXIS_STEP)));
+				pointer.axis(state, AxisFrame::new(time).value(Axis::Vertical, -(full_ticks as f64 * AXIS_STEP)).v120(Axis::Vertical, -(full_ticks * WHEEL_DELTA)));
 				pointer.frame(state);
 				state.accumulated_vscroll_delta -= full_ticks * WHEEL_DELTA;
 			}
@@ -254,7 +254,7 @@ pub fn process_input(event: CompositorInputEvent, state: &mut MoonshineComposito
 			if full_ticks != 0 {
 				tracing::trace!(target: "input", "Scroll horizontal: emitting {full_ticks} ticks, remainder={}", state.accumulated_hscroll_delta - full_ticks * WHEEL_DELTA);
 				let pointer = state.seat.get_pointer().expect("pointer should exist");
-				pointer.axis(state, AxisFrame::new(time).value(Axis::Horizontal, full_ticks as f64 * AXIS_STEP));
+				pointer.axis(state, AxisFrame::new(time).value(Axis::Horizontal, full_ticks as f64 * AXIS_STEP).v120(Axis::Horizontal, full_ticks * WHEEL_DELTA));
 				pointer.frame(state);
 				state.accumulated_hscroll_delta -= full_ticks * WHEEL_DELTA;
 			}
