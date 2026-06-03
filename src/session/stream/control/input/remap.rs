@@ -31,6 +31,10 @@ enum State {
 	Pending { deadline: Instant },
 	/// Threshold reached; Home/Guide is being emitted until the source is released.
 	HomeHeld,
+	/// Threshold reached with auto-release; Home/Guide is tapped until `release_at`.
+	HomeTap { release_at: Instant },
+	/// Home tap finished but the source is still held; swallow it until released.
+	Consumed,
 	/// Source released early; emitting a brief source tap until `release_at`.
 	Tapping { release_at: Instant },
 }
@@ -40,6 +44,9 @@ pub struct HoldToHome {
 	/// Source button mask, or `None` when the remap is disabled.
 	source_mask: Option<u32>,
 	hold: Duration,
+	/// Whether to auto-release Home after a brief tap (true) or hold it until
+	/// the source button is released (false, allowing Home chords).
+	auto_release: bool,
 	state: State,
 }
 
@@ -57,6 +64,7 @@ impl HoldToHome {
 		Self {
 			source_mask,
 			hold: Duration::from_millis(config.home_button_hold_ms),
+			auto_release: config.home_button_auto_release,
 			state: State::Inactive,
 		}
 	}
@@ -91,7 +99,13 @@ impl HoldToHome {
 					};
 					passthrough | source_mask
 				} else if now >= deadline {
-					self.state = State::HomeHeld;
+					self.state = if self.auto_release {
+						State::HomeTap {
+							release_at: now + TAP_DURATION,
+						}
+					} else {
+						State::HomeHeld
+					};
 					passthrough | SPECIAL_FLAG
 				} else {
 					passthrough
@@ -104,6 +118,27 @@ impl HoldToHome {
 					self.state = State::Inactive;
 					passthrough
 				}
+			},
+			State::HomeTap { release_at } => {
+				if now >= release_at {
+					// Auto-release the Home tap. If the source is still held, swallow it
+					// until released so Home is not immediately re-triggered.
+					self.state = if source_pressed {
+						State::Consumed
+					} else {
+						State::Inactive
+					};
+					passthrough
+				} else {
+					// Hold Home until release_at, regardless of further input.
+					passthrough | SPECIAL_FLAG
+				}
+			},
+			State::Consumed => {
+				if !source_pressed {
+					self.state = State::Inactive;
+				}
+				passthrough
 			},
 			State::Tapping { release_at } => {
 				if now >= release_at {
@@ -122,8 +157,9 @@ impl HoldToHome {
 	pub fn next_deadline(&self) -> Option<Instant> {
 		match self.state {
 			State::Pending { deadline } => Some(deadline),
+			State::HomeTap { release_at } => Some(release_at),
 			State::Tapping { release_at } => Some(release_at),
-			State::Inactive | State::HomeHeld => None,
+			State::Inactive | State::HomeHeld | State::Consumed => None,
 		}
 	}
 }
@@ -132,16 +168,17 @@ impl HoldToHome {
 mod tests {
 	use super::*;
 
-	fn cfg(source: HomeButtonSource, hold_ms: u64) -> GamepadConfig {
+	fn cfg(source: HomeButtonSource, hold_ms: u64, auto_release: bool) -> GamepadConfig {
 		GamepadConfig {
 			home_button_source: source,
 			home_button_hold_ms: hold_ms,
+			home_button_auto_release: auto_release,
 		}
 	}
 
 	#[test]
 	fn disabled_passes_flags_through_unchanged() {
-		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 0));
+		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 0, false));
 		let t = Instant::now();
 		assert_eq!(remap.apply(BACK_FLAG | 0x1000, t), BACK_FLAG | 0x1000);
 		assert_eq!(remap.next_deadline(), None);
@@ -149,7 +186,7 @@ mod tests {
 
 	#[test]
 	fn holding_past_threshold_emits_home_and_withholds_source() {
-		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000));
+		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000, false));
 		let t0 = Instant::now();
 
 		// Press: source withheld, timer scheduled.
@@ -166,7 +203,7 @@ mod tests {
 
 	#[test]
 	fn home_held_until_source_released() {
-		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000));
+		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000, false));
 		let t0 = Instant::now();
 		remap.apply(BACK_FLAG, t0);
 		remap.apply(BACK_FLAG, t0 + Duration::from_millis(1000));
@@ -183,8 +220,52 @@ mod tests {
 	}
 
 	#[test]
+	fn auto_release_taps_home_then_releases_while_source_held() {
+		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000, true));
+		let t0 = Instant::now();
+		assert_eq!(remap.apply(BACK_FLAG, t0), 0);
+
+		// Threshold: Home pressed, with a release timer scheduled.
+		let thresh = t0 + Duration::from_millis(1000);
+		assert_eq!(remap.apply(BACK_FLAG, thresh), SPECIAL_FLAG);
+		assert_eq!(remap.next_deadline(), Some(thresh + TAP_DURATION));
+
+		// Within the tap window, source still held: Home stays pressed.
+		assert_eq!(remap.apply(BACK_FLAG, thresh + Duration::from_millis(50)), SPECIAL_FLAG);
+
+		// After the tap window, source STILL held: Home auto-released.
+		assert_eq!(remap.apply(BACK_FLAG, thresh + TAP_DURATION), 0);
+		assert_eq!(remap.next_deadline(), None);
+
+		// Continuing to hold does not re-trigger Home.
+		assert_eq!(remap.apply(BACK_FLAG, thresh + Duration::from_millis(3000)), 0);
+
+		// Releasing the source returns to idle without emitting the source button.
+		assert_eq!(remap.apply(0, thresh + Duration::from_millis(3100)), 0);
+		assert_eq!(remap.next_deadline(), None);
+	}
+
+	#[test]
+	fn auto_release_off_holds_home_for_chords() {
+		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000, false));
+		let t0 = Instant::now();
+		remap.apply(BACK_FLAG, t0);
+
+		let thresh = t0 + Duration::from_millis(1000);
+		assert_eq!(remap.apply(BACK_FLAG, thresh), SPECIAL_FLAG);
+		// No auto-release: no timer, Home stays down while held.
+		assert_eq!(remap.next_deadline(), None);
+		assert_eq!(
+			remap.apply(BACK_FLAG, thresh + Duration::from_millis(5000)),
+			SPECIAL_FLAG
+		);
+		// Released: Home released.
+		assert_eq!(remap.apply(0, thresh + Duration::from_millis(6000)), 0);
+	}
+
+	#[test]
 	fn short_tap_emits_source_button() {
-		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000));
+		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000, false));
 		let t0 = Instant::now();
 
 		// Press then release before threshold.
@@ -203,7 +284,7 @@ mod tests {
 
 	#[test]
 	fn share_source_uses_misc_flag() {
-		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Share, 1000));
+		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Share, 1000, false));
 		let t0 = Instant::now();
 
 		// Back is not the source, so it passes through untouched.
@@ -217,7 +298,7 @@ mod tests {
 
 	#[test]
 	fn real_guide_button_passes_through() {
-		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000));
+		let mut remap = HoldToHome::new(&cfg(HomeButtonSource::Back, 1000, false));
 		let t0 = Instant::now();
 		// A controller with a real guide button: SPECIAL_FLAG passes through untouched.
 		assert_eq!(remap.apply(SPECIAL_FLAG, t0), SPECIAL_FLAG);

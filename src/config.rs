@@ -155,7 +155,7 @@ pub enum HomeButtonSource {
 	Share,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GamepadConfig {
 	/// Which button, when held, emits the Home/Guide button.
@@ -166,6 +166,23 @@ pub struct GamepadConfig {
 	/// withheld; a short tap (released before this duration) still emits the
 	/// original button. Set to 0 to disable the remap entirely (the default).
 	pub home_button_hold_ms: u64,
+
+	/// When the source button is held past the threshold, emit the Home/Guide
+	/// button as a brief tap and release it automatically, even if the source
+	/// button is still held. Enabled by default. Disable this to keep Home held
+	/// for as long as the source button is held, which allows Home/Guide button
+	/// chords (e.g. Home + X).
+	pub home_button_auto_release: bool,
+}
+
+impl Default for GamepadConfig {
+	fn default() -> Self {
+		Self {
+			home_button_source: HomeButtonSource::default(),
+			home_button_hold_ms: 0,
+			home_button_auto_release: true,
+		}
+	}
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
