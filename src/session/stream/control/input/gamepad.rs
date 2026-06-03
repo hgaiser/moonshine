@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use inputtino::{
 	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
 	SwitchJoypad, XboxOneJoypad,
@@ -5,10 +7,13 @@ use inputtino::{
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
+use crate::config::GamepadConfig;
 use crate::session::stream::control::{
 	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
 	FeedbackCommand,
 };
+
+use super::remap::HoldToHome;
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
@@ -290,10 +295,20 @@ impl GamepadBattery {
 
 pub struct Gamepad {
 	gamepad: inputtino::Joypad,
+
+	/// Hold-to-Home button remap state for this gamepad.
+	remap: HoldToHome,
+
+	/// Last raw button flags received, re-applied (remapped) when a hold timer fires.
+	last_button_flags: u32,
 }
 
 impl Gamepad {
-	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
+	pub async fn new(
+		info: &GamepadInfo,
+		feedback_tx: mpsc::Sender<FeedbackCommand>,
+		config: &GamepadConfig,
+	) -> Result<Self, ()> {
 		let id = format!("00:11:22:33:{:02x}", info.index);
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
@@ -406,12 +421,18 @@ impl Gamepad {
 			}
 		});
 
-		Ok(Self { gamepad })
+		Ok(Self {
+			gamepad,
+			remap: HoldToHome::new(config),
+			last_button_flags: 0,
+		})
 	}
 
 	pub fn update(&mut self, update: &GamepadUpdate) {
-		// Send button state.
-		self.gamepad.set_pressed(update.button_flags as i32);
+		// Remap buttons (e.g. hold-to-Home) before they reach the device.
+		self.last_button_flags = update.button_flags;
+		let button_flags = self.remap.apply(update.button_flags, Instant::now());
+		self.gamepad.set_pressed(button_flags as i32);
 
 		// Send analog triggers.
 		self.gamepad
@@ -420,6 +441,19 @@ impl Gamepad {
 			.set_stick(JoypadStickPosition::RS, update.right_stick.0, update.right_stick.1);
 		self.gamepad
 			.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
+	}
+
+	/// Re-apply the remapped button state when a hold-to-Home timer elapses
+	/// (no new gamepad update has arrived to drive the transition).
+	pub fn tick(&mut self, now: Instant) {
+		let button_flags = self.remap.apply(self.last_button_flags, now);
+		self.gamepad.set_pressed(button_flags as i32);
+	}
+
+	/// The next time at which [`Gamepad::tick`] should be called to advance a
+	/// pending hold-to-Home timer, or `None` if nothing is pending.
+	pub fn next_deadline(&self) -> Option<Instant> {
+		self.remap.next_deadline()
 	}
 
 	pub fn touch(&mut self, touch: &GamepadTouch) {

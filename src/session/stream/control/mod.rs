@@ -231,7 +231,7 @@ impl ControlStream {
 		hdr: bool,
 		hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	) -> Result<Self, ()> {
-		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone())?;
+		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone(), config.gamepad.clone())?;
 
 		let socket_address = SocketAddr::new(
 			config

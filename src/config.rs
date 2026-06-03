@@ -54,6 +54,9 @@ pub struct Config {
 
 	#[serde(default)]
 	pub keyboard: KeyboardConfig,
+
+	#[serde(default)]
+	pub gamepad: GamepadConfig,
 }
 
 impl Config {
@@ -135,8 +138,34 @@ impl Default for Config {
 			hdr: true,
 			stream_timeout: 60,
 			keyboard: KeyboardConfig::default(),
+			gamepad: GamepadConfig::default(),
 		}
 	}
+}
+
+/// Which physical gamepad button, when held, emits the Home/Guide button.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeButtonSource {
+	/// The Back/Select/View button (Moonlight BACK_FLAG). Matches Sunshine's default.
+	#[default]
+	Back,
+
+	/// The dedicated Share/Capture button (Moonlight MISC_FLAG).
+	Share,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadConfig {
+	/// Which button, when held, emits the Home/Guide button.
+	pub home_button_source: HomeButtonSource,
+
+	/// How long (in milliseconds) the source button must be held before the
+	/// Home/Guide button is emitted instead. While held, the source button is
+	/// withheld; a short tap (released before this duration) still emits the
+	/// original button. Set to 0 to disable the remap entirely (the default).
+	pub home_button_hold_ms: u64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

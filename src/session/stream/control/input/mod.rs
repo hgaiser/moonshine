@@ -1,7 +1,10 @@
+use std::time::Instant;
+
 use async_shutdown::ShutdownManager;
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
+use crate::config::GamepadConfig;
 use crate::session::{
 	compositor::input::CompositorInputEvent, manager::SessionShutdownReason, stream::control::input::gamepad::Gamepad,
 };
@@ -17,6 +20,7 @@ use super::FeedbackCommand;
 mod gamepad;
 mod keyboard;
 mod mouse;
+mod remap;
 
 #[derive(FromRepr)]
 #[repr(u32)]
@@ -117,6 +121,7 @@ impl InputHandler {
 	pub fn new(
 		input_tx: calloop::channel::Sender<CompositorInputEvent>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		gamepad_config: GamepadConfig,
 	) -> Result<Self, ()> {
 		let (gamepad_tx, gamepad_rx) = mpsc::channel(10);
 
@@ -130,7 +135,7 @@ impl InputHandler {
 				let local = tokio::task::LocalSet::new();
 				local
 					.run_until(async move {
-						run_gamepad_handler(gamepad_rx, stop_session_manager).await;
+						run_gamepad_handler(gamepad_rx, stop_session_manager, gamepad_config).await;
 					})
 					.await;
 			});
@@ -215,6 +220,7 @@ impl InputHandler {
 async fn run_gamepad_handler(
 	mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	gamepad_config: GamepadConfig,
 ) {
 	// Trigger session shutdown when the input handler stops.
 	let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::InputHandlerStopped);
@@ -222,7 +228,36 @@ async fn run_gamepad_handler(
 
 	let mut gamepads: [Option<Gamepad>; 16] = Default::default();
 
-	while let Ok(Some((command, feedback_tx))) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
+	loop {
+		// Wake up to advance the soonest pending hold-to-Home timer, if any.
+		let next_deadline = gamepads.iter().flatten().filter_map(|g| g.next_deadline()).min();
+		let timer = async {
+			match next_deadline {
+				Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
+				None => std::future::pending::<()>().await,
+			}
+		};
+
+		let (command, feedback_tx) = tokio::select! {
+			result = stop_session_manager.wrap_cancel(command_rx.recv()) => {
+				match result {
+					Ok(Some(command)) => command,
+					// Shutdown triggered or channel closed.
+					_ => break,
+				}
+			},
+			_ = timer => {
+				// A hold-to-Home timer fired: advance any gamepad whose deadline has passed.
+				let now = Instant::now();
+				for gamepad in gamepads.iter_mut().flatten() {
+					if gamepad.next_deadline().is_some_and(|deadline| now >= deadline) {
+						gamepad.tick(now);
+					}
+				}
+				continue;
+			},
+		};
+
 		match command {
 			InputEvent::GamepadInfo(gamepad) => {
 				tracing::debug!("Gamepad info: {gamepad:?}");
@@ -236,7 +271,7 @@ async fn run_gamepad_handler(
 				}
 
 				if gamepads[gamepad.index as usize].is_none() {
-					if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx).await {
+					if let Ok(new_gamepad) = Gamepad::new(&gamepad, feedback_tx, &gamepad_config).await {
 						gamepads[gamepad.index as usize] = Some(new_gamepad);
 						tracing::info!("Gamepad {} connected.", gamepad.index);
 					}
@@ -320,7 +355,7 @@ async fn run_gamepad_handler(
 						gamepad_update.index
 					);
 					let synthetic_info = GamepadInfo::default_for_index(gamepad_update.index as u8);
-					if let Ok(new_gamepad) = Gamepad::new(&synthetic_info, feedback_tx.clone()).await {
+					if let Ok(new_gamepad) = Gamepad::new(&synthetic_info, feedback_tx.clone(), &gamepad_config).await {
 						gamepads[idx] = Some(new_gamepad);
 					}
 				}
@@ -333,7 +368,8 @@ async fn run_gamepad_handler(
 					),
 				}
 
-				// Disconnect gamepads that are no longer active.
+				// Disconnect gamepads that are no longer active. The remap state is
+				// owned by the Gamepad, so dropping it resets the hold-to-Home state.
 				for (i, gamepad) in gamepads.iter_mut().enumerate() {
 					if gamepad.is_some() && gamepad_update.active_gamepad_mask & (1 << i) == 0 {
 						tracing::debug!("Gamepad {} disconnected.", i);
