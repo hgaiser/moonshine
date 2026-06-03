@@ -198,16 +198,19 @@ pub struct InstanceDispatch {
 pub struct DeviceDispatch {
 	pub get_device_proc_addr: PFN_vkGetDeviceProcAddr,
 	pub destroy_device: unsafe extern "C" fn(VkDevice, *const VkAllocationCallbacks),
-	pub create_swapchain: unsafe extern "C" fn(
-		VkDevice,
-		*const VkSwapchainCreateInfoKHR,
-		*const VkAllocationCallbacks,
-		*mut VkSwapchain,
-	) -> VkResult,
-	pub destroy_swapchain: unsafe extern "C" fn(VkDevice, VkSwapchain, *const VkAllocationCallbacks),
-	pub queue_present: unsafe extern "C" fn(VkQueue, *const VkPresentInfoKHR) -> VkResult,
-	pub acquire_next_image:
+	pub create_swapchain: Option<
+		unsafe extern "C" fn(
+			VkDevice,
+			*const VkSwapchainCreateInfoKHR,
+			*const VkAllocationCallbacks,
+			*mut VkSwapchain,
+		) -> VkResult,
+	>,
+	pub destroy_swapchain: Option<unsafe extern "C" fn(VkDevice, VkSwapchain, *const VkAllocationCallbacks)>,
+	pub queue_present: Option<unsafe extern "C" fn(VkQueue, *const VkPresentInfoKHR) -> VkResult>,
+	pub acquire_next_image: Option<
 		unsafe extern "C" fn(VkDevice, VkSwapchain, u64, ash::vk::Semaphore, ash::vk::Fence, *mut u32) -> VkResult,
+	>,
 	pub set_hdr_metadata: Option<unsafe extern "C" fn(VkDevice, u32, *const VkSwapchain, *const VkHdrMetadataEXT)>,
 	pub acquire_next_image2:
 		Option<unsafe extern "C" fn(VkDevice, *const ash::vk::AcquireNextImageInfoKHR, *mut u32) -> VkResult>,

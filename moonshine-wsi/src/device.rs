@@ -137,16 +137,25 @@ unsafe fn build_device_dispatch(
 		}};
 	}
 
-	DeviceDispatch {
+	let dispatch = DeviceDispatch {
 		get_device_proc_addr: next_get_device_proc_addr,
 		destroy_device: load!("vkDestroyDevice"),
-		create_swapchain: load!("vkCreateSwapchainKHR"),
-		destroy_swapchain: load!("vkDestroySwapchainKHR"),
-		queue_present: load!("vkQueuePresentKHR"),
-		acquire_next_image: load!("vkAcquireNextImageKHR"),
+		create_swapchain: load!(opt: "vkCreateSwapchainKHR"),
+		destroy_swapchain: load!(opt: "vkDestroySwapchainKHR"),
+		queue_present: load!(opt: "vkQueuePresentKHR"),
+		acquire_next_image: load!(opt: "vkAcquireNextImageKHR"),
 		set_hdr_metadata: load!(opt: "vkSetHdrMetadataEXT"),
 		acquire_next_image2: load!(opt: "vkAcquireNextImage2KHR"),
 		get_refresh_cycle_duration: load!(opt: "vkGetRefreshCycleDurationGOOGLE"),
 		get_past_presentation_timing: load!(opt: "vkGetPastPresentationTimingGOOGLE"),
+	};
+
+	if dispatch.create_swapchain.is_none() {
+		crate::log_warn!(
+			"vkCreateSwapchainKHR not available — layer will run in degraded mode \
+			(app likely not using VK_KHR_swapchain or layer chain is broken)"
+		);
 	}
+
+	dispatch
 }
