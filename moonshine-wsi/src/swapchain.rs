@@ -62,10 +62,9 @@ pub unsafe extern "C" fn create_swapchain(
 	}
 
 	// Call the next layer/ICD first.
-	let result = with_device(device_key, |data| {
-		(data.dispatch.create_swapchain)(device, p_create_info_for_icd, p_allocator, p_swapchain)
-	})
-	.unwrap_or(VK_ERROR_INITIALIZATION_FAILED);
+	let result = with_device(device_key, |data| data.dispatch.create_swapchain)
+		.and_then(|f| f.map(|fn_ptr| fn_ptr(device, p_create_info_for_icd, p_allocator, p_swapchain)))
+		.unwrap_or(VK_ERROR_INITIALIZATION_FAILED);
 
 	if result != VK_SUCCESS {
 		return result;
@@ -190,7 +189,9 @@ pub unsafe extern "C" fn destroy_swapchain(
 
 	let device_key = device_key_of(device);
 	with_device(device_key, |data| {
-		(data.dispatch.destroy_swapchain)(device, swapchain, p_allocator);
+		if let Some(f) = data.dispatch.destroy_swapchain {
+			f(device, swapchain, p_allocator);
+		}
 	});
 }
 
@@ -294,20 +295,18 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 	// once create_device always inserts DeviceData) fall back to looking up
 	// the dispatch table via the first swapchain rather than returning the
 	// synthetic DEVICE_LOST that would incorrectly break presentation.
-	let result = with_device(queue_key, |data| {
-		(data.dispatch.queue_present)(queue, &effective_present_info)
-	})
-	.or_else(|| {
-		swapchains
-			.first()
-			.and_then(|sw| with_swapchain(SwapchainKey::from_raw(sw.as_raw()), |d| d.device_key))
-			.and_then(|device_key| {
-				with_device(device_key, |data| {
-					(data.dispatch.queue_present)(queue, &effective_present_info)
+	let result = with_device(queue_key, |data| data.dispatch.queue_present)
+		.and_then(|f| f.map(|fn_ptr| fn_ptr(queue, &effective_present_info)))
+		.or_else(|| {
+			swapchains
+				.first()
+				.and_then(|sw| with_swapchain(SwapchainKey::from_raw(sw.as_raw()), |d| d.device_key))
+				.and_then(|device_key| {
+					with_device(device_key, |data| data.dispatch.queue_present)
+						.and_then(|f| f.map(|fn_ptr| fn_ptr(queue, &effective_present_info)))
 				})
-			})
-	})
-	.unwrap_or(VK_ERROR_DEVICE_LOST);
+		})
+		.unwrap_or(VK_ERROR_DEVICE_LOST);
 
 	// If the limiter state changed since swapchain creation and the app is
 	// frame-limiter-aware, force swapchain recreation so it re-queries the
@@ -445,7 +444,7 @@ pub unsafe extern "C" fn acquire_next_image(
 	}
 
 	let device_key = device_key_of(device);
-	if let Some(next) = with_device(device_key, |data| data.dispatch.acquire_next_image) {
+	if let Some(Some(next)) = with_device(device_key, |data| data.dispatch.acquire_next_image) {
 		return next(device, swapchain, timeout, semaphore, fence, p_image_index);
 	}
 	VK_ERROR_INITIALIZATION_FAILED
