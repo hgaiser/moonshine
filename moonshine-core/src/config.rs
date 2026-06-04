@@ -17,6 +17,31 @@ fn default_launch_timeout() -> u64 {
 	2
 }
 
+fn default_stream_use_ipv6() -> StreamUseIpv6 {
+	StreamUseIpv6::No
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamUseIpv6 {
+	/// Always advertise an IPv4 session URL to clients.
+	No,
+
+	/// Always advertise an IPv6 session URL to clients.
+	Yes,
+
+	/// Advertise the same address family the client used for the launch/resume web request.
+	/// If Moonlight launches over IPv4, it receives an IPv4 RTSP URL; if it launches
+	/// over IPv6, it receives an IPv6 RTSP URL.
+	Auto,
+}
+
+impl Default for StreamUseIpv6 {
+	fn default() -> Self {
+		Self::No
+	}
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Config {
 	/// Name of the Moonshine host.
@@ -24,6 +49,10 @@ pub struct Config {
 
 	/// Address to bind to.
 	pub address: String,
+
+	/// Whether to advertise IPv6 session URLs to clients.
+	#[serde(default = "default_stream_use_ipv6")]
+	pub stream_use_ipv6: StreamUseIpv6,
 
 	/// Configuration for the webserver.
 	pub webserver: WebserverConfig,
@@ -106,6 +135,7 @@ impl Default for Config {
 			// Bind dual-stack by default so clients can reach us over IPv4 or IPv6.
 			// The webserver disables IPV6_V6ONLY, so this single address covers both.
 			address: "::".to_string(),
+			stream_use_ipv6: StreamUseIpv6::default(),
 			webserver: Default::default(),
 			stream: Default::default(),
 			applications: vec![ApplicationConfig {
