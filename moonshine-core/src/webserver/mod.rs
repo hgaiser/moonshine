@@ -20,6 +20,7 @@ use image::imageops::FilterType;
 use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
 use sha2::{Digest, Sha256};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 
 use crate::{
@@ -116,8 +117,7 @@ impl Webserver {
 				let _ = shutdown
 					.wrap_cancel(
 						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpShutdown, async move {
-							let listener = TcpListener::bind(http_address)
-								.await
+							let listener = bind_listener(http_address)
 								.map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
 
 							tracing::debug!("HTTP server listening for connections on {http_address}");
@@ -128,7 +128,7 @@ impl Webserver {
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
 								tracing::trace!("Accepted connection from {address}.");
 
-								let address = connection.local_addr().ok();
+								let address = connection.local_addr().ok().map(unmap_v4_mapped);
 								let mac_address = if let Some(address) = address {
 									get_mac_address(address.ip()).unwrap_or(None)
 								} else {
@@ -199,8 +199,7 @@ impl Webserver {
 				let _ = shutdown
 					.wrap_cancel(
 						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpsShutdown, async move {
-							let listener = TcpListener::bind(https_address)
-								.await
+							let listener = bind_listener(https_address)
 								.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
 							let acceptor =
 								TlsAcceptor::from_config(config.webserver.certificate, config.webserver.private_key)?;
@@ -213,7 +212,7 @@ impl Webserver {
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
 								tracing::trace!("Accepted TLS connection from {address}.");
 
-								let address = connection.local_addr().ok();
+								let address = connection.local_addr().ok().map(unmap_v4_mapped);
 								let mac_address = if let Some(address) = address {
 									get_mac_address(address.ip()).unwrap_or(None)
 								} else {
@@ -824,7 +823,7 @@ impl Webserver {
 		if let Some(addr) = local_address {
 			response += &format!(
 				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
-				addr.ip(),
+				rtsp_host(addr.ip()),
 				self.config.stream.port
 			);
 		}
@@ -898,7 +897,7 @@ impl Webserver {
 		if let Some(addr) = local_address {
 			response += &format!(
 				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
-				addr.ip(),
+				rtsp_host(addr.ip()),
 				self.config.stream.port
 			);
 		}
@@ -949,6 +948,45 @@ impl Webserver {
 				Some(unauthorized("No client certificate provided."))
 			},
 		}
+	}
+}
+
+/// Bind a TCP listener for the webserver. When the address is IPv6 we disable
+/// `IPV6_V6ONLY` so the single socket also accepts IPv4-mapped connections. This
+/// lets clients reach us over whichever family mDNS advertised (avahi publishes
+/// both an A and AAAA record), avoiding the "online/offline" flip-flop that
+/// happens when one family has no listener.
+fn bind_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+	let socket = Socket::new(Domain::for_address(address), Type::STREAM, Some(Protocol::TCP))?;
+	if address.is_ipv6() {
+		socket.set_only_v6(false)?;
+	}
+	socket.set_reuse_address(true)?;
+	socket.bind(&address.into())?;
+	socket.listen(1024)?;
+	socket.set_nonblocking(true)?;
+	TcpListener::from_std(socket.into())
+}
+
+/// Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) back to plain IPv4.
+/// Connections arriving over IPv4 on a dual-stack socket report such an address;
+/// normalizing keeps MAC lookups and session URLs using the real IPv4 address.
+fn unmap_v4_mapped(addr: SocketAddr) -> SocketAddr {
+	match addr.ip() {
+		IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+			Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+			None => addr,
+		},
+		IpAddr::V4(_) => addr,
+	}
+}
+
+/// Format an IP address for use as the host part of an RTSP URL. IPv6 addresses
+/// must be wrapped in brackets (`rtsp://[::1]:48010`) to be a valid URL.
+fn rtsp_host(ip: IpAddr) -> String {
+	match ip {
+		IpAddr::V4(v4) => v4.to_string(),
+		IpAddr::V6(v6) => format!("[{v6}]"),
 	}
 }
 
