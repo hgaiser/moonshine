@@ -45,10 +45,6 @@ pub struct Config {
 
 	/// Time in seconds since last ping after which the stream closes.
 	pub(crate) stream_timeout: u64,
-
-	/// Configuration for gamepad input remapping (e.g. hold-to-Home).
-	#[serde(default)]
-	pub(crate) gamepad: GamepadConfig,
 }
 
 impl Config {
@@ -131,49 +127,6 @@ impl Default for Config {
 			})],
 			compositor: CompositorConfig::default(),
 			stream_timeout: 60,
-			gamepad: GamepadConfig::default(),
-		}
-	}
-}
-
-/// Which physical gamepad button, when held, emits the Home/Guide button.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HomeButtonSource {
-	/// The Back/Select/View button (Moonlight BACK_FLAG). Matches Sunshine's default.
-	#[default]
-	Back,
-
-	/// The dedicated Share/Capture button (Moonlight MISC_FLAG).
-	Share,
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GamepadConfig {
-	/// Which button, when held, emits the Home/Guide button.
-	pub home_button_source: HomeButtonSource,
-
-	/// How long (in milliseconds) the source button must be held before the
-	/// Home/Guide button is emitted instead. While held, the source button is
-	/// withheld; a short tap (released before this duration) still emits the
-	/// original button. Set to 0 to disable the remap entirely (the default).
-	pub home_button_hold_ms: u64,
-
-	/// When the source button is held past the threshold, emit the Home/Guide
-	/// button as a brief tap and release it automatically, even if the source
-	/// button is still held. Enabled by default. Disable this to keep Home held
-	/// for as long as the source button is held, which allows Home/Guide button
-	/// chords (e.g. Home + X).
-	pub home_button_auto_release: bool,
-}
-
-impl Default for GamepadConfig {
-	fn default() -> Self {
-		Self {
-			home_button_source: HomeButtonSource::default(),
-			home_button_hold_ms: 0,
-			home_button_auto_release: true,
 		}
 	}
 }
@@ -399,11 +352,60 @@ impl Default for AudioStreamConfig {
 pub struct ControlStreamConfig {
 	/// Port to use for streaming control data.
 	pub(crate) port: u16,
+
+	/// Configuration for gamepad input remapping (e.g. hold-to-Home).
+	#[serde(default)]
+	pub(crate) gamepad: GamepadConfig,
 }
 
 impl Default for ControlStreamConfig {
 	fn default() -> Self {
-		Self { port: 47999 }
+		Self {
+			port: 47999,
+			gamepad: GamepadConfig::default(),
+		}
+	}
+}
+
+/// Which physical gamepad button, when held, emits the Home/Guide button.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeButtonSource {
+	/// The Back/Select/View button (Moonlight BACK_FLAG). Matches Sunshine's default.
+	#[default]
+	Back,
+
+	/// The dedicated Share/Capture button (Moonlight MISC_FLAG).
+	Share,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadConfig {
+	/// Which button, when held, emits the Home/Guide button.
+	pub home_button_source: HomeButtonSource,
+
+	/// How long (in milliseconds) the source button must be held before the
+	/// Home/Guide button is emitted instead. While held, the source button is
+	/// withheld; a short tap (released before this duration) still emits the
+	/// original button. Set to 0 to disable the remap entirely (the default).
+	pub home_button_hold_ms: u64,
+
+	/// When the source button is held past the threshold, emit the Home/Guide
+	/// button as a brief tap and release it automatically, even if the source
+	/// button is still held. Enabled by default. Disable this to keep Home held
+	/// for as long as the source button is held, which allows Home/Guide button
+	/// chords (e.g. Home + X).
+	pub home_button_auto_release: bool,
+}
+
+impl Default for GamepadConfig {
+	fn default() -> Self {
+		Self {
+			home_button_source: HomeButtonSource::default(),
+			home_button_hold_ms: 0,
+			home_button_auto_release: true,
+		}
 	}
 }
 

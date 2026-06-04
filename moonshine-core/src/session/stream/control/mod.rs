@@ -247,7 +247,11 @@ impl ControlStream {
 		input_tx: calloop::channel::Sender<CompositorInputEvent>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone(), config.gamepad.clone())?;
+		let input_handler = InputHandler::new(
+			input_tx,
+			stop_session_manager.clone(),
+			config.stream.control.gamepad.clone(),
+		)?;
 
 		let socket_address = SocketAddr::new(
 			config
