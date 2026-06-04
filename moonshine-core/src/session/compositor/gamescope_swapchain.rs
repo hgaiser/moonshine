@@ -50,24 +50,29 @@ fn handle_swapchain_feedback(
 	// Some games (e.g. Monster Hunter Wilds) never call vkSetHdrMetadataEXT
 	// and rely solely on the swapchain color space to signal HDR.
 	const VK_COLOR_SPACE_SRGB_NONLINEAR: u32 = 0;
+	const VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT: u32 = 1000104002;
 	const VK_COLOR_SPACE_HDR10_ST2084_EXT: u32 = 1000104008;
+	const VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT: u32 = 1000104014;
 
 	if let Some(cm) = &mut state.color_management {
 		match vk_colorspace {
+			// HDR10: the game submits BT.2020 + PQ data directly.
+			// Use `set_gamescope_colorspace` (not `set_gamescope_current`) so that
+			// mastering metadata from a prior `vkSetHdrMetadataEXT` is preserved.
 			VK_COLOR_SPACE_HDR10_ST2084_EXT => {
 				tracing::info!("swapchain_feedback: HDR10_ST2084 detected, activating HDR");
-				cm.set_gamescope_current(
-					surface,
-					super::color_management::ImageDescription {
-						transfer_function: super::color_management::TransferFunction::St2084Pq,
-						primaries: super::color_management::Primaries::Bt2020,
-						max_cll: None,
-						max_fall: None,
-						mastering_luminance: None,
-						mastering_primaries: None,
-						white_point: None,
-					},
-				);
+				cm.set_gamescope_colorspace(surface, TransferFunction::St2084Pq, Primaries::Bt2020);
+			},
+			// scRGB (extended sRGB, fp16): used by DXGI HDR games such as Control.
+			// Unlike the wp_color_manager `create_windows_scrgb` path (where DXVK
+			// pre-converts to BT.2020+PQ), the buffers arriving via gamescope swapchain
+			// feedback are still linear BT.709 with values > 1.0 for HDR highlights.
+			// Tag them as scRGB-linear so the encoder applies the BT.709→BT.2020 gamut
+			// mapping + PQ OETF instead of treating them as already-encoded BT.2020+PQ
+			// (which over-saturates and crushes highlights).
+			VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT | VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT => {
+				tracing::info!("swapchain_feedback: extended sRGB (scRGB) detected, activating HDR");
+				cm.set_gamescope_colorspace(surface, TransferFunction::LinearExtended, Primaries::Srgb);
 			},
 			VK_COLOR_SPACE_SRGB_NONLINEAR => {
 				cm.clear_gamescope_current(surface);

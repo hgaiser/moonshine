@@ -39,6 +39,9 @@ use crate::session::compositor::state::MoonshineCompositor;
 pub(crate) enum TransferFunction {
 	Gamma22,
 	St2084Pq,
+	/// Linear light with extended range (scRGB). Values may exceed 1.0 to
+	/// represent HDR highlights above SDR white. Paired with BT.709 primaries.
+	LinearExtended,
 }
 
 /// Color primaries as declared by a client.
@@ -91,10 +94,10 @@ impl ImageDescription {
 	}
 
 	pub fn to_frame_color_space(self) -> FrameColorSpace {
-		if self.primaries == Primaries::Bt2020 && self.transfer_function == TransferFunction::St2084Pq {
-			FrameColorSpace::Bt2020Pq
-		} else {
-			FrameColorSpace::Srgb
+		match (self.primaries, self.transfer_function) {
+			(Primaries::Bt2020, TransferFunction::St2084Pq) => FrameColorSpace::Bt2020Pq,
+			(Primaries::Srgb, TransferFunction::LinearExtended) => FrameColorSpace::Bt709Linear,
+			_ => FrameColorSpace::Srgb,
 		}
 	}
 }
@@ -212,6 +215,36 @@ impl ColorManagementState {
 		self.gamescope_current.insert(surface.clone(), desc);
 	}
 
+	/// Update only the transfer function and primaries of a surface's gamescope
+	/// color description, **preserving** any HDR mastering metadata previously
+	/// set via [`set_gamescope_current`] (i.e. `vkSetHdrMetadataEXT`).
+	///
+	/// `swapchain_feedback` reports the swapchain color space but carries no
+	/// mastering metadata. Calling `set_gamescope_current` from that path would
+	/// reset `max_cll`/`max_fall`/mastering luminance to `None`, discarding the
+	/// values the game provided through `vkSetHdrMetadataEXT` — which can arrive
+	/// before the colorspace event. Preserving them here ensures the client
+	/// receives the game's real HDR10 metadata instead of a generic fallback.
+	pub fn set_gamescope_colorspace(
+		&mut self,
+		surface: &WlSurface,
+		transfer_function: TransferFunction,
+		primaries: Primaries,
+	) {
+		let desc = self
+			.gamescope_current
+			.entry(surface.clone())
+			.or_insert_with(ImageDescription::srgb);
+		desc.transfer_function = transfer_function;
+		desc.primaries = primaries;
+		tracing::debug!(
+			surface_id = ?surface.id(),
+			color_space = ?desc.to_frame_color_space(),
+			has_metadata = desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some(),
+			"set_gamescope_colorspace (preserving metadata)"
+		);
+	}
+
 	/// Clear the pending image description (from `unset_image_description`).
 	pub fn unset_pending(&mut self, surface: &WlSurface) {
 		self.pending.insert(surface.clone(), None);
@@ -242,27 +275,19 @@ impl ColorManagementState {
 		}
 	}
 
-	/// Find the first BT.2020+PQ image description across all tracked surfaces.
+	/// Get the frame color space for the current fullscreen surface.
 	///
-	/// Gamescope swapchain declarations are checked first (higher priority),
-	/// then wp_color_management declarations.
-	fn first_bt2020pq_desc(&self) -> Option<&ImageDescription> {
+	/// Returns the first non-sRGB color space declared by any mapped surface
+	/// (BT.2020+PQ or scRGB-linear), otherwise `Srgb`. Gamescope swapchain
+	/// declarations are checked first (higher priority), then wp_color_management
+	/// declarations.
+	pub fn frame_color_space(&self) -> FrameColorSpace {
 		self.gamescope_current
 			.values()
 			.chain(self.current.values())
-			.find(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq)
-	}
-
-	/// Get the frame color space for the current fullscreen surface.
-	///
-	/// Returns `Bt2020Pq` if any mapped surface has declared BT.2020+PQ,
-	/// otherwise returns `Srgb`.
-	pub fn frame_color_space(&self) -> FrameColorSpace {
-		if self.first_bt2020pq_desc().is_some() {
-			FrameColorSpace::Bt2020Pq
-		} else {
-			FrameColorSpace::Srgb
-		}
+			.map(|desc| desc.to_frame_color_space())
+			.find(|cs| *cs != FrameColorSpace::Srgb)
+			.unwrap_or(FrameColorSpace::Srgb)
 	}
 
 	/// Get HDR metadata from the current fullscreen surface, if any.
@@ -620,6 +645,12 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionUse
 						info.tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
 						// PQ: 0–10000 cd/m², SDR reference white 203 cd/m².
 						info.luminances(0, 10000, 203);
+						info.target_luminance(0, 10000);
+					},
+					TransferFunction::LinearExtended => {
+						info.tf_named(wp_color_manager_v1::TransferFunction::ExtLinear);
+						// scRGB: linear with extended range, 1.0 == 80 cd/m² (IEC 61966-2-2).
+						info.luminances(0, 10000, 80);
 						info.target_luminance(0, 10000);
 					},
 				}

@@ -13,7 +13,7 @@ use ash::vk;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
+use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 use crate::session::SessionKeysReceiver;
 
@@ -511,9 +511,16 @@ impl VideoPipelineInner {
 				// dynamic VUI switching in the encoder.
 				if ctx.dynamic_range == VideoDynamicRange::Hdr {
 					let frame_cs = frame.color_space;
-					let (cs, full_range, color_desc) = match frame_cs {
-						FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709()),
-						FrameColorSpace::Bt2020Pq => (ColorSpace::Bt2020, false, ColorDescription::bt2020_pq()),
+					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
+					// scRGB 1.0 == 80 cd/m². The other paths ignore it.
+					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
+						FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709(), 203.0),
+						FrameColorSpace::Bt2020Pq => {
+							(ColorSpace::Bt2020, false, ColorDescription::bt2020_pq(), 203.0)
+						},
+						FrameColorSpace::Bt709Linear => {
+							(ColorSpace::Bt709LinearToBt2020Pq, false, ColorDescription::bt2020_pq(), 80.0)
+						},
 					};
 
 					// Switch encoder VUI first. Only update the converter if
@@ -528,12 +535,14 @@ impl VideoPipelineInner {
 								encoder_color_desc = Some(color_desc);
 								converter.set_color_space(cs);
 								converter.set_full_range(full_range);
+								converter.set_sdr_reference_white_nits(sdr_white_nits);
 							},
 							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
 						}
 					} else {
 						converter.set_color_space(cs);
 						converter.set_full_range(full_range);
+						converter.set_sdr_reference_white_nits(sdr_white_nits);
 					}
 				}
 
@@ -591,9 +600,12 @@ impl VideoPipelineInner {
 							// but only when encoding as BT.2020+PQ (HDR frames).
 							// SDR frames encoded as BT.709 should not carry HDR SEI.
 							if packet.is_key_frame && encoder_color_desc == Some(ColorDescription::bt2020_pq()) {
-								if let Some(ref m) = last_hdr_state.metadata {
-									packet.data = hdr_sei::inject_hdr_metadata(&packet.data, m, ctx.video_format);
-								}
+								// Fall back to default HDR10 metadata when the content provides
+								// none (e.g. scRGB swapchains carry no mastering metadata), so the
+								// bitstream stays consistent with the control-stream HDR metadata,
+								// which also falls back to `HdrMetadata::fallback`.
+								let m = last_hdr_state.metadata.unwrap_or_else(HdrMetadata::fallback);
+								packet.data = hdr_sei::inject_hdr_metadata(&packet.data, &m, ctx.video_format);
 							}
 
 							encoded_bytes += packet.data.len();
