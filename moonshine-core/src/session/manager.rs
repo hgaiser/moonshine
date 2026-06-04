@@ -226,8 +226,12 @@ impl SessionManager {
 				Err(())
 			},
 			Some(SessionState::Active(_)) => {
-				tracing::warn!("SetStreamContext rejected: session already active (Active state)");
-				Err(())
+				// Client is resuming an already-running session (reconnect). The video,
+				// audio, and control streams are still running and re-learn the client's
+				// address from its PINGs (with refreshed keys via `/resume`), so there is
+				// nothing to rebuild — accept the re-ANNOUNCE without storing new contexts.
+				tracing::info!("Resuming active session: accepting RTSP ANNOUNCE from reconnecting client.");
+				Ok(())
 			},
 			None => {
 				tracing::warn!("SetStreamContext rejected: no active session");
@@ -351,9 +355,11 @@ impl SessionManager {
 					return Err(());
 				},
 				Some(SessionState::Active(active)) => {
+					// Resume (reconnect): the streams are already running, so PLAY is a
+					// no-op — the client picks up the existing streams once it PINGs.
 					guard.session = Some(SessionState::Active(active));
-					tracing::warn!("StartSession rejected: session already active");
-					return Err(());
+					tracing::info!("Resuming active session: streams already running, treating PLAY as no-op.");
+					return Ok(());
 				},
 				None => {
 					tracing::warn!("StartSession rejected: no active session");
