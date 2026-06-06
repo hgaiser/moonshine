@@ -1,38 +1,45 @@
+use std::sync::Arc;
+
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
 use tokio::sync::watch;
 
+use crate::session::compositor::CompositorConfig;
+use crate::session::stream::audio::AudioChannels;
+use crate::session::stream::audio::AudioStream;
+use crate::session::stream::audio::AudioStreamContext;
+use crate::session::stream::control::ControlStream;
+use crate::session::stream::control::ControlStreamContext;
+use crate::session::stream::video::FrameStats;
+use crate::session::stream::video::VideoStream;
+use crate::session::stream::video::VideoStreamContext;
+
 use self::application::Application;
+use self::application::ApplicationConfig;
 use self::application::ApplicationContext;
 use self::compositor::frame::HdrModeState;
 use self::compositor::Compositor;
 use self::compositor::LaunchedCompositor;
-use self::stream::AudioChannels;
-use self::stream::AudioStream;
-use self::stream::AudioStreamContext;
-use self::stream::ControlStream;
-use self::stream::ControlStreamContext;
-use self::stream::VideoStream;
-use self::stream::VideoStreamContext;
-use crate::config::ApplicationConfig;
-use crate::config::Config;
+use self::stream::audio::AudioStreamConfig;
+use self::stream::control::ControlStreamConfig;
+use self::stream::video::VideoStreamConfig;
 
-pub(crate) mod application;
-pub(crate) mod compositor;
+pub mod application;
+pub mod compositor;
 pub mod manager;
-pub(crate) mod stream;
+pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.
 pub(crate) const APP_LAUNCH_HTTP_TIMEOUT_SECS: u64 = 60;
 
 /// Raw session encryption key data.
 #[derive(Clone, Debug)]
-pub(crate) struct SessionKeyData {
+pub struct SessionKeyData {
 	/// AES GCM key used for encoding video / audio / control messages.
-	pub(crate) remote_input_key: Vec<u8>,
+	pub remote_input_key: Vec<u8>,
 
 	/// AES GCM initialization vector for video / audio / control messages.
-	pub(crate) remote_input_key_id: i64,
+	pub remote_input_key_id: i64,
 }
 
 pub(crate) type SessionKeysReceiver = watch::Receiver<SessionKeyData>;
@@ -40,7 +47,7 @@ pub(crate) type SessionKeysSender = watch::Sender<SessionKeyData>;
 
 /// Session keys — either raw keys or a watch receiver.
 #[derive(Clone, Debug)]
-pub(crate) enum SessionKeys {
+pub enum SessionKeys {
 	Keys(SessionKeyData),
 	Rx(SessionKeysReceiver),
 }
@@ -67,7 +74,7 @@ impl SessionKeys {
 /// that is needed to start the compositor, application, and streams.
 #[derive(Clone, Debug)]
 #[allow(dead_code)]
-pub(crate) struct SessionContext {
+pub struct SessionContext {
 	/// Application to launch.
 	pub application: ApplicationConfig,
 
@@ -128,19 +135,33 @@ pub(crate) struct InitializedSession {
 }
 
 impl InitializedSession {
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn new(
-		config: Config,
+		compositor_config: CompositorConfig,
+		video_config: VideoStreamConfig,
+		audio_config: AudioStreamConfig,
+		control_config: ControlStreamConfig,
+		address: String,
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) -> Result<Self, ()> {
 		// Create HDR metadata watch channel.
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
 
 		// Create compositor, audio stream, video stream, and control stream.
-		let (compositor, handles) = Compositor::new(config.compositor.clone(), (&context).into(), stop.clone());
-		let audio = AudioStream::new(config.clone(), stop.clone()).await?;
-		let video_stream = VideoStream::new(config.clone(), handles.frame_rx, hdr_metadata_tx, stop.clone()).await?;
-		let control_stream = ControlStream::new(config.clone(), handles.input_tx, stop.clone())?;
+		let (compositor, handles) = Compositor::new(compositor_config, (&context).into(), stop.clone());
+		let audio = AudioStream::new(audio_config, address.clone(), stop.clone()).await?;
+		let video_stream = VideoStream::new(
+			video_config.clone(),
+			address.clone(),
+			handles.frame_rx,
+			hdr_metadata_tx,
+			stop.clone(),
+			stats_tx,
+		)
+		.await?;
+		let control_stream = ControlStream::new(control_config, address, handles.input_tx, stop.clone())?;
 
 		Ok(Self {
 			context,
@@ -213,10 +234,12 @@ impl LaunchedSession {
 
 	pub(crate) fn start(
 		self,
+		video_config: VideoStreamConfig,
+		stream_timeout: u64,
 		video_ctx: VideoStreamContext,
 		audio_ctx: AudioStreamContext,
 		stop: ShutdownManager<SessionShutdownReason>,
-	) -> Result<ActiveSession, ()> {
+	) -> Result<(ActiveSession, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>), ()> {
 		let Self {
 			context,
 			launched_compositor,
@@ -238,7 +261,7 @@ impl LaunchedSession {
 
 		// Start video stream — gated, returns VideoStreamHandle.
 		let video_handle = video_stream
-			.start(video_ctx, keys_rx.clone(), stop.clone())
+			.start(video_config, video_ctx, keys_rx.clone(), stop.clone())
 			.map_err(|()| tracing::error!("Failed to start video stream"))?;
 
 		// Start audio stream — gated, returns AudioStartHandle.
@@ -246,14 +269,28 @@ impl LaunchedSession {
 			.start(audio_ctx, keys_rx)
 			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
 
+		// Clone the start notifies for external triggering (e.g. bench binary).
+		let video_start_notify = video_handle.clone_start_notify();
+		let audio_start_notify = audio_trigger.clone_start_notify();
+
 		// Start control stream — receives both handles.
 		let control_ctx = ControlStreamContext::new(&context, hdr_effective);
-		control_stream.start(control_ctx, video_handle, audio_trigger, hdr_metadata_rx);
+		control_stream.start(
+			stream_timeout,
+			control_ctx,
+			video_handle,
+			audio_trigger,
+			hdr_metadata_rx,
+		);
 
-		Ok(ActiveSession {
-			context,
-			_application: application,
-		})
+		Ok((
+			ActiveSession {
+				context,
+				_application: application,
+			},
+			video_start_notify,
+			audio_start_notify,
+		))
 	}
 }
 

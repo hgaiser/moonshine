@@ -1,17 +1,63 @@
-use std::{
-	collections::HashMap,
-	env, fs,
-	path::{Path, PathBuf},
-};
+use std::collections::HashMap;
+use std::env;
+use std::fs;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
-use crate::config::{ApplicationConfig, DesktopApplicationScannerConfig};
+use crate::session::application::ApplicationConfig;
+
+fn default_true() -> bool {
+	true
+}
+
+fn default_false() -> bool {
+	false
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DesktopApplicationScannerConfig {
+	/// Directories to scan recursively for `.desktop` files.
+	pub directories: Vec<PathBuf>,
+
+	/// Whether terminal-based entries should be included.
+	#[serde(default = "default_false")]
+	pub include_terminal: bool,
+
+	/// Whether to resolve desktop entry icons into Moonshine boxart paths.
+	#[serde(default = "default_true")]
+	pub resolve_icons: bool,
+
+	/// Commands to run before launching each scanned application.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub pre_command: Vec<Vec<String>>,
+
+	/// Commands to run after each scanned application's session ends.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub post_command: Vec<Vec<String>>,
+
+	/// Path to redirect application stdout to. If not set, stdout is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stdout: Option<PathBuf>,
+
+	/// Path to redirect application stderr to. If not set, stderr is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stderr: Option<PathBuf>,
+
+	/// Seconds to wait for each scanned application to reach an active state after launch.
+	#[serde(default = "crate::session::application::default_launch_timeout")]
+	pub launch_timeout_secs: u64,
+}
 
 const SUPPORTED_IMAGE_EXTENSIONS: [&str; 6] = ["png", "jpg", "jpeg", "webp", "bmp", "ico"];
 const SKIPPED_EXEC_FIELD_CODES: [char; 10] = ['f', 'F', 'u', 'U', 'd', 'D', 'n', 'N', 'v', 'm'];
 
-pub fn scan_desktop_applications(config: &DesktopApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
+pub(crate) fn scan_desktop_applications(
+	config: &DesktopApplicationScannerConfig,
+) -> Result<Vec<ApplicationConfig>, ()> {
 	let mut applications = Vec::new();
 	let mut dedupe_keys = std::collections::HashSet::new();
 	let mut icon_resolver = IconResolver::new(config.resolve_icons);
@@ -411,19 +457,9 @@ fn is_executable(path: &Path) -> bool {
 		return false;
 	}
 
-	#[cfg(unix)]
-	{
-		use std::os::unix::fs::PermissionsExt;
-
-		match fs::metadata(path) {
-			Ok(metadata) => metadata.permissions().mode() & 0o111 != 0,
-			Err(_) => false,
-		}
-	}
-
-	#[cfg(not(unix))]
-	{
-		true
+	match fs::metadata(path) {
+		Ok(metadata) => metadata.permissions().mode() & 0o111 != 0,
+		Err(_) => false,
 	}
 }
 

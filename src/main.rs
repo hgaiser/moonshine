@@ -80,15 +80,35 @@ impl Moonshine {
 	pub fn new(config: Config, shutdown: ShutdownManager<ShutdownReason>) -> Result<Self, ()> {
 		let (cert, pkey) = moonshine_core::tls::load_or_create_certificate(&config)?;
 
-		let session_manager = SessionManager::new(config.clone(), shutdown.clone())?;
+		let session_manager = SessionManager::new(
+			config.compositor.clone(),
+			config.stream.video.clone(),
+			config.stream.audio.clone(),
+			config.stream.control.clone(),
+			config.address.clone(),
+			config.stream.timeout,
+			shutdown.clone(),
+		)?;
 		let client_manager = ClientManager::new(cert.clone(), pkey.clone())?;
 
 		Ok(Self {
-			_rtsp_server: RtspServer::new(config.clone(), session_manager.clone(), shutdown.clone()),
+			_rtsp_server: RtspServer::new(
+				config.address.clone(),
+				config.stream.port,
+				config.stream.video.clone(),
+				config.stream.audio.clone(),
+				config.stream.control.clone(),
+				session_manager.clone(),
+				shutdown.clone(),
+			),
 			_session_manager: session_manager.clone(),
 			_client_manager: client_manager.clone(),
 			_webserver: Webserver::new(
-				config.clone(),
+				config.name.clone(),
+				config.stream.port,
+				config.webserver.clone(),
+				config.applications.clone(),
+				config.compositor.clone(),
 				client_manager.persistent_state().get_uuid()?.to_string(),
 				cert,
 				client_manager,

@@ -3,12 +3,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
+use serde::{Deserialize, Serialize};
 use strum_macros::Display;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::sync::Notify;
 
-use crate::config::Config;
 use crate::session::manager::SessionShutdownReason;
 use crate::session::SessionKeysReceiver;
 
@@ -19,9 +19,23 @@ mod buffer;
 mod encoder;
 mod pulse_server;
 
+/// Configuration for the audio stream.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioStreamConfig {
+	/// Port to use for streaming audio data.
+	pub port: u16,
+}
+
+impl Default for AudioStreamConfig {
+	fn default() -> Self {
+		Self { port: 48000 }
+	}
+}
+
 /// Number of audio channels requested by the client.
 #[derive(Clone, Copy, Debug, Default, Display, PartialEq, PartialOrd)]
-pub(crate) enum AudioChannels {
+pub enum AudioChannels {
 	#[default]
 	Stereo = 2,
 	Surround51 = 6,
@@ -40,7 +54,7 @@ impl From<u8> for AudioChannels {
 
 /// Opus multistream configuration for a specific channel layout.
 #[derive(Clone, Debug)]
-pub(crate) struct OpusStreamConfig {
+pub struct OpusStreamConfig {
 	pub channels: AudioChannels,
 	pub streams: u8,
 	pub coupled_streams: u8,
@@ -98,7 +112,7 @@ pub(crate) const OPUS_HIGH_SURROUND71: OpusStreamConfig = OpusStreamConfig {
 };
 
 /// All standard configurations, ordered for RTSP DESCRIBE emission.
-pub(crate) const ALL_STREAM_CONFIGS: [&OpusStreamConfig; 6] = [
+pub(crate) const ALL_AUDIO_CONFIGS: [&OpusStreamConfig; 6] = [
 	&OPUS_STEREO,
 	&OPUS_HIGH_STEREO,
 	&OPUS_SURROUND51,
@@ -109,7 +123,7 @@ pub(crate) const ALL_STREAM_CONFIGS: [&OpusStreamConfig; 6] = [
 
 /// Audio configuration negotiated between client and server.
 #[derive(Clone, Debug)]
-pub(crate) struct AudioConfig {
+pub struct AudioConfig {
 	pub channels: AudioChannels,
 	pub channel_mask: u32,
 	pub high_quality: bool,
@@ -148,7 +162,7 @@ impl AudioConfig {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct AudioStreamContext {
+pub struct AudioStreamContext {
 	/// Duration of each audio packet in milliseconds, typically 20ms for Opus.
 	pub packet_duration_ms: u32,
 	/// Whether to enable QoS on the audio socket.
@@ -173,6 +187,11 @@ impl AudioStartHandle {
 	pub fn trigger(&self) {
 		self.notify.notify_waiters();
 	}
+
+	/// Clone the start notify for external triggering (e.g. bench binary).
+	pub fn clone_start_notify(&self) -> Arc<Notify> {
+		self.notify.clone()
+	}
 }
 
 pub(crate) struct AudioStream {
@@ -183,10 +202,14 @@ pub(crate) struct AudioStream {
 }
 
 impl AudioStream {
-	pub async fn new(config: Config, stop: ShutdownManager<SessionShutdownReason>) -> Result<Self, ()> {
+	pub async fn new(
+		config: AudioStreamConfig,
+		address: String,
+		stop: ShutdownManager<SessionShutdownReason>,
+	) -> Result<Self, ()> {
 		tracing::debug!("Initializing audio stream.");
 
-		let udp_socket = UdpSocket::bind((config.address, config.stream.audio.port))
+		let udp_socket = UdpSocket::bind((address, config.port))
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
