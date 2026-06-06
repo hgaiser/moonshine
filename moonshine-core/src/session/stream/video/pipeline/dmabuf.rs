@@ -3,16 +3,21 @@
 //! This module provides the ability to import Linux DMA-BUF file descriptors as
 //! Vulkan images for direct video encoding without CPU-side copies.
 //!
-//! `DmaBufImporter` caches imported Vulkan resources per compositor buffer index
-//! so that pre-allocated GBM buffers are imported only once. Subsequent frames
-//! from the same buffer reuse the cached `VkImage` and `VkDeviceMemory`,
-//! eliminating per-frame Vulkan object creation and layout transitions.
+//! `DmaBufImporter` caches imported Vulkan resources per DMA-BUF file descriptor
+//! so that the same underlying buffer is imported only once. Subsequent frames
+//! reusing the same DMA-BUF reuse the cached `VkImage` and `VkDeviceMemory`,
+//! eliminating per-frame `vkCreateImage` + `vkAllocateMemory(DMA-BUF import)`
+//! calls that can cost 0.5\u20131.5ms on NVIDIA drivers.
 //!
-//! The cache evicts entries that have not been touched in `CACHE_TTL`. During
-//! real-game streaming, gamescope assigns monotonically-growing `buffer_index`
-//! values (~76/sec at 120 fps), so without eviction the cache (and its backing
-//! VRAM) would grow unboundedly across a session. With TTL eviction, only the
-//! actively-cycling buffers stay resident; old indexes are reclaimed.
+//! Keying by FD rather than `wl_buffer` ObjectId is critical: the NVIDIA
+//! Wayland WSI creates a new `wl_buffer` wrapper each frame even though the
+//! underlying DMA-BUF fd is stable. ObjectId-keying would miss the cache
+//! every frame; FD-keying catches the reuse.
+//!
+//! The cache evicts entries that have not been touched in `CACHE_TTL`. The
+//! compositor holds client buffers alive until the encoder signals `consumed`,
+//! so the fd is guaranteed valid during import. The 2s TTL ensures any
+//! in-flight GPU work completes before cached Vulkan resources are freed.
 
 use ash::vk;
 use pixelforge::VideoContext;
@@ -55,16 +60,15 @@ struct CachedImport {
 
 /// Importer for DMA-BUF file descriptors into Vulkan images.
 ///
-/// Owns a per-buffer-index cache of `VkImage` + `VkDeviceMemory` with TTL
-/// eviction. Layout transitions are deferred to the consumer
-/// (e.g. `ColorConverter`/`RgbBlitter`) to avoid a separate GPU submission
-/// per first-time import.
+/// Owns a per-FD cache of `VkImage` + `VkDeviceMemory` with TTL eviction.
+/// Layout transitions are deferred to the consumer (e.g. `ColorConverter`)
+/// to avoid a separate GPU submission per first-time import.
 pub(crate) struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
-	/// Per-buffer-index cache. Switched from `Vec<Option<…>>` to a HashMap so
-	/// monotonically-growing `buffer_index` values don't grow a sparse Vec.
-	cache: HashMap<usize, CachedImport>,
+	/// Per-FD cache — keyed by the DMA-BUF fd so the same underlying buffer
+	/// is reused even when the driver wraps it in new `wl_buffer` objects.
+	cache: HashMap<RawFd, CachedImport>,
 	/// Calls since the last stale-entry sweep.
 	calls_since_sweep: u32,
 }
@@ -83,7 +87,7 @@ impl DmaBufImporter {
 	}
 
 	/// Import a DMA-BUF as a Vulkan image, reusing a cached import when
-	/// the same `buffer_index` has been seen before.
+	/// the same DMA-BUF fd has been seen before.
 	///
 	/// The `format` parameter specifies the Vulkan format matching the DMA-BUF
 	/// pixel format (e.g. `B8G8R8A8_UNORM` for SDR, `A2B10G10R10_UNORM_PACK32`
@@ -95,7 +99,7 @@ impl DmaBufImporter {
 	/// the appropriate `src_layout` to `ColorConverter::convert`).
 	pub fn import_or_reuse(
 		&mut self,
-		buffer_index: usize,
+		fd: RawFd,
 		width: u32,
 		height: u32,
 		format: vk::Format,
@@ -108,21 +112,21 @@ impl DmaBufImporter {
 		}
 
 		let now = Instant::now();
-		if let Some(cached) = self.cache.get_mut(&buffer_index) {
+		if let Some(cached) = self.cache.get_mut(&fd) {
 			cached.last_used = now;
 			return Ok((cached.image, false));
 		}
 
-		// First time seeing this buffer — full import.
+		// First time seeing this DMA-BUF — full import.
 		debug!(
-			"First import for buffer {buffer_index}: {}x{}, format={:?}, fd={}, stride={}, modifier={:#x}",
-			width, height, format, planes[0].fd, planes[0].stride, planes[0].modifier
+			"First import for fd {fd}: {}x{}, format={:?}, stride={}, modifier={:#x}",
+			width, height, format, planes[0].stride, planes[0].modifier
 		);
 
 		let (image, memory) = self.import_internal(width, height, format, planes)?;
 
 		self.cache.insert(
-			buffer_index,
+			fd,
 			CachedImport {
 				image,
 				memory,

@@ -443,21 +443,16 @@ impl VideoPipelineInner {
 				// Determine Vulkan format and input format from the frame's DRM fourcc.
 				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
 
-				// Import the DMA-BUF (reuses cached VkImage for known buffer indices).
-				let (source_image, needs_transition) = match importer.import_or_reuse(
-					frame.buffer_index,
-					frame.width,
-					frame.height,
-					import_vk_format,
-					planes,
-				) {
-					Ok(result) => result,
-					Err(e) => {
-						tracing::warn!("Failed to import DMA-BUF: {e}");
-						frame.consumed.store(true, Ordering::Release);
-						continue;
-					},
-				};
+				// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
+				let (source_image, needs_transition) =
+					match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
+						Ok(result) => result,
+						Err(e) => {
+							tracing::warn!("Failed to import DMA-BUF: {e}");
+							frame.consumed.store(true, Ordering::Release);
+							continue;
+						},
+					};
 
 				// First-time imports are in UNDEFINED layout; the converter
 				// will handle the transition inside its command buffer.
