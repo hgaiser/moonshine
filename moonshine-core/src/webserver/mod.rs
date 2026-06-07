@@ -681,7 +681,9 @@ impl Webserver {
 	async fn unpair(&self, _params: HashMap<String, String>) -> Response<Full<Bytes>> {
 		let xml = r#"<root status_code="200"/>"#;
 		let mut response = Response::new(Full::new(Bytes::from(xml)));
-		response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+		response
+			.headers_mut()
+			.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 		response
 	}
 
