@@ -367,7 +367,7 @@ impl Webserver {
 					)
 					.await
 				},
-				// (&Method::GET, "/unpair") => self.unpair(params).await,
+				(&Method::GET, "/unpair") => self.unpair(params).await,
 				(&Method::GET, "/launch") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
@@ -422,6 +422,7 @@ impl Webserver {
 					}
 					self.submit_pin(request).await
 				},
+				(&Method::GET, "/unpair") => self.unpair(params).await,
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
@@ -677,31 +678,12 @@ impl Webserver {
 		}
 	}
 
-	// This is disabled, because all moonlight clients seem to share the same uniqueid.
-	// This means that if we 'unpair', we unpair all moonlight clients.
-	// TODO: Collaborate with moonlight to give clients a truly unique ID.
-	// async fn unpair(
-	// 	&self,
-	// 	mut params: HashMap<String, String>,
-	// ) -> Response<Full<Bytes>> {
-	// 	let unique_id = match params.remove("uniqueid") {
-	// 		Some(unique_id) => unique_id,
-	// 		None => {
-	// 			let message = format!("Expected 'uniqueid' in unpair request, got {:?}.", params.keys());
-	// 			tracing::warn!("{message}");
-	// 			return bad_request(message);
-	// 		}
-	// 	};
-
-	// 	match self.client_manager.remove_client(&unique_id).await {
-	// 		Ok(()) =>
-	// 			Response::builder()
-	// 				.status(StatusCode::OK)
-	// 				.body(Full::new(Bytes::from("Successfully unpaired.".to_string())))
-	// 				.unwrap(),
-	// 		Err(()) => bad_request("Failed to remove client".to_string()),
-	// 	}
-	// }
+	async fn unpair(&self, _params: HashMap<String, String>) -> Response<Full<Bytes>> {
+		let xml = r#"<root status_code="200"/>"#;
+		let mut response = Response::new(Full::new(Bytes::from(xml)));
+		response.headers_mut().insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+		response
+	}
 
 	async fn launch(
 		&self,
