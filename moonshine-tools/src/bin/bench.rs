@@ -366,7 +366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 								accum = accum.print_and_reset_interval();
 							}
 
-							if duration_deadline.map_or(false, |d| Instant::now() >= d) {
+							if duration_deadline.is_some_and(|d| Instant::now() >= d) {
 								tracing::info!("Duration reached, stopping...");
 								break;
 							}
