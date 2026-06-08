@@ -4,7 +4,9 @@ use std::time;
 use pulseaudio::protocol::{self as pulse, ClientInfoList};
 
 use crate::session::stream::audio::pulse_server::dyn_buffer::DynPlaybackBuffer;
-use crate::session::stream::audio::pulse_server::{Client, Error, PlaybackStream, ServerState, StreamState, SINK_NAME, pop_missing};
+use crate::session::stream::audio::pulse_server::{
+	pop_missing, Client, Error, PlaybackStream, ServerState, StreamState, SINK_NAME,
+};
 
 pub(super) fn handle_command(
 	client: &mut Client,

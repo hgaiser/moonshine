@@ -478,7 +478,9 @@ impl PulseServer {
 							&ZERO_VOL[..stream.volume.len()],
 						)
 					} else {
-						stream.buffer.drain_and_mix(num_frames as usize, &mut frame.buf, &stream.volume)
+						stream
+							.buffer
+							.drain_and_mix(num_frames as usize, &mut frame.buf, &stream.volume)
 					};
 
 					if !drained {
@@ -487,13 +489,14 @@ impl PulseServer {
 						pulse::write_command_message(
 							&mut client.socket,
 							u32::MAX,
-							&pulse::Command::Underflow(pulse::Underflow { channel: *id, offset: 0 }),
+							&pulse::Command::Underflow(pulse::Underflow {
+								channel: *id,
+								offset: 0,
+							}),
 							client.protocol_version,
 						)?;
 
-						if stream.buffer_attr.pre_buffering > 0
-							&& matches!(stream.state, StreamState::Playing)
-						{
+						if stream.buffer_attr.pre_buffering > 0 && matches!(stream.state, StreamState::Playing) {
 							stream.state = StreamState::Prebuffering(stream.buffer_attr.pre_buffering as u64);
 							// Seed missing = pre_buffering so pop_missing fires immediately
 							// in the REQUEST phase below (same tick, no one-tick delay).
@@ -519,7 +522,10 @@ impl PulseServer {
 				// ── Request phase ────────────────────────────────────────────────────
 				// Issue a REQUEST if enough demand has accumulated.
 				// Draining streams are excluded — they are emptying, not refilling.
-				if matches!(stream.state, StreamState::Playing | StreamState::Corked | StreamState::Prebuffering(_)) {
+				if matches!(
+					stream.state,
+					StreamState::Playing | StreamState::Corked | StreamState::Prebuffering(_)
+				) {
 					let min_req = stream.buffer_attr.minimum_request_length as usize;
 					let in_prebuf = matches!(stream.state, StreamState::Prebuffering(_));
 					let req = pop_missing(&mut stream.missing, &mut stream.requested, min_req, in_prebuf);
@@ -527,7 +533,10 @@ impl PulseServer {
 						pulse::write_command_message(
 							&mut client.socket,
 							u32::MAX,
-							&pulse::Command::Request(pulse::Request { channel: *id, length: req as u32 }),
+							&pulse::Command::Request(pulse::Request {
+								channel: *id,
+								length: req as u32,
+							}),
 							client.protocol_version,
 						)?;
 					}
