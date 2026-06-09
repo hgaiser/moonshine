@@ -20,10 +20,12 @@ use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 
 use crate::{
 	clients::ClientManager,
+	config::StreamUseIpv6,
 	session::{
 		application::ApplicationConfig, compositor::CompositorConfig, manager::SessionManager, SessionContext,
 		SessionKeyData, SessionKeys, APP_LAUNCH_HTTP_TIMEOUT_SECS,
@@ -97,6 +99,7 @@ enum ServerCodecModeSupport {
 pub struct Webserver {
 	hostname: String,
 	rtsp_port: u16,
+	stream_use_ipv6: StreamUseIpv6,
 	webserver_config: WebserverConfig,
 	applications: Vec<ApplicationConfig>,
 	unique_id: String,
@@ -112,7 +115,9 @@ impl Webserver {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		hostname: String,
+		address: String,
 		rtsp_port: u16,
+		stream_use_ipv6: StreamUseIpv6,
 		webserver_config: WebserverConfig,
 		applications: Vec<ApplicationConfig>,
 		compositor_config: CompositorConfig,
@@ -130,6 +135,7 @@ impl Webserver {
 		let server = Self {
 			hostname,
 			rtsp_port,
+			stream_use_ipv6,
 			webserver_config,
 			applications,
 			unique_id,
@@ -141,16 +147,17 @@ impl Webserver {
 		};
 
 		// Run HTTP webserver.
-		let http_address = ("0.0.0.0", server.webserver_config.port)
+		let http_address = (address.as_str(), server.webserver_config.port)
 			.to_socket_addrs()
 			.map_err(|e| {
 				tracing::error!(
-					"Failed to resolve address '0.0.0.0:{}': {e}",
+					"Failed to resolve address '{}' port {}: {e}",
+					address,
 					server.webserver_config.port
 				)
 			})?
 			.next()
-			.ok_or_else(|| tracing::error!("Failed to resolve address '0.0.0.0:{}'", server.webserver_config.port))?;
+			.ok_or_else(|| tracing::error!("Failed to resolve address '{}' port {}", address, server.webserver_config.port))?;
 
 		tokio::spawn({
 			let server = server.clone();
@@ -161,8 +168,7 @@ impl Webserver {
 				let _ = shutdown
 					.wrap_cancel(
 						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpShutdown, async move {
-							let listener = TcpListener::bind(http_address)
-								.await
+							let listener = bind_listener(http_address)
 								.map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
 
 							tracing::debug!("HTTP server listening for connections on {http_address}");
@@ -173,7 +179,7 @@ impl Webserver {
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
 								tracing::trace!("Accepted connection from {address}.");
 
-								let address = connection.local_addr().ok();
+								let address = connection.local_addr().ok().map(unmap_v4_mapped);
 								let mac_address = if let Some(address) = address {
 									get_mac_address(address.ip()).unwrap_or(None)
 								} else {
@@ -220,18 +226,20 @@ impl Webserver {
 		});
 
 		// Run HTTPS webserver.
-		let https_address = ("0.0.0.0", server.webserver_config.port_https)
+		let https_address = (address.as_str(), server.webserver_config.port_https)
 			.to_socket_addrs()
 			.map_err(|e| {
 				tracing::error!(
-					"Failed to resolve address '0.0.0.0:{}': {e}",
+					"Failed to resolve address '{}' port {}: {e}",
+					address,
 					server.webserver_config.port_https
 				)
 			})?
 			.next()
 			.ok_or_else(|| {
 				tracing::error!(
-					"Failed to resolve address '0.0.0.0:{}'",
+					"Failed to resolve address '{}' port {}",
+					address,
 					server.webserver_config.port_https
 				)
 			})?;
@@ -242,8 +250,7 @@ impl Webserver {
 				let _ = shutdown
 					.wrap_cancel(
 						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpsShutdown, async move {
-							let listener = TcpListener::bind(https_address)
-								.await
+							let listener = bind_listener(https_address)
 								.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
 							let acceptor = TlsAcceptor::from_config(
 								server.webserver_config.certificate.clone(),
@@ -258,7 +265,7 @@ impl Webserver {
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
 								tracing::trace!("Accepted TLS connection from {address}.");
 
-								let address = connection.local_addr().ok();
+								let address = connection.local_addr().ok().map(unmap_v4_mapped);
 								let mac_address = if let Some(address) = address {
 									get_mac_address(address.ip()).unwrap_or(None)
 								} else {
@@ -851,7 +858,12 @@ impl Webserver {
 		let mut response = "<root status_code=\"200\">".to_string();
 		response += "<gamesession>1</gamesession>";
 		if let Some(addr) = local_address {
-			response += &format!("<sessionUrl0>rtsp://{}:{}</sessionUrl0>", addr.ip(), self.rtsp_port);
+			let session_ip = session_url_ip(self.stream_use_ipv6, addr);
+			response += &format!(
+				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
+				rtsp_host(session_ip),
+				self.rtsp_port
+			);
 		}
 		response += "</root>";
 
@@ -921,7 +933,12 @@ impl Webserver {
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		if let Some(addr) = local_address {
-			response += &format!("<sessionUrl0>rtsp://{}:{}</sessionUrl0>", addr.ip(), self.rtsp_port);
+			let session_ip = session_url_ip(self.stream_use_ipv6, addr);
+			response += &format!(
+				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
+				rtsp_host(session_ip),
+				self.rtsp_port
+			);
 		}
 		response += "<resume>1</resume>";
 		response += "</root>";
@@ -971,6 +988,96 @@ impl Webserver {
 			},
 		}
 	}
+}
+
+/// Bind a TCP listener for the webserver. When the address is IPv6 we disable
+/// `IPV6_V6ONLY` so the single socket also accepts IPv4-mapped connections. This
+/// lets clients reach us over whichever family mDNS advertised (avahi publishes
+/// both an A and AAAA record), avoiding the "online/offline" flip-flop that
+/// happens when one family has no listener.
+fn bind_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+	let socket = Socket::new(Domain::for_address(address), Type::STREAM, Some(Protocol::TCP))?;
+	if address.is_ipv6() {
+		socket.set_only_v6(false)?;
+	}
+	socket.set_reuse_address(true)?;
+	socket.bind(&address.into())?;
+	socket.listen(1024)?;
+	socket.set_nonblocking(true)?;
+	TcpListener::from_std(socket.into())
+}
+
+/// Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) back to plain IPv4.
+/// Connections arriving over IPv4 on a dual-stack socket report such an address;
+/// normalizing keeps MAC lookups and session URLs using the real IPv4 address.
+fn unmap_v4_mapped(addr: SocketAddr) -> SocketAddr {
+	match addr.ip() {
+		IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+			Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+			None => addr,
+		},
+		IpAddr::V4(_) => addr,
+	}
+}
+
+/// Format an IP address for use as the host part of an RTSP URL. IPv6 addresses
+/// must be wrapped in brackets (`rtsp://[::1]:48010`) to be a valid URL.
+fn rtsp_host(ip: IpAddr) -> String {
+	match ip {
+		IpAddr::V4(v4) => v4.to_string(),
+		IpAddr::V6(v6) => format!("[{v6}]"),
+	}
+}
+
+fn session_url_ip(stream_use_ipv6: StreamUseIpv6, local_address: SocketAddr) -> IpAddr {
+	let local_ip = local_address.ip();
+	match stream_use_ipv6 {
+		StreamUseIpv6::Auto => local_ip,
+		StreamUseIpv6::No if local_ip.is_ipv4() => local_ip,
+		StreamUseIpv6::Yes if local_ip.is_ipv6() => local_ip,
+		StreamUseIpv6::No => interface_ip_for_family(local_ip, StreamUseIpv6::No)
+			.or_else(|| first_interface_ip(StreamUseIpv6::No))
+			.unwrap_or_else(|| {
+				tracing::warn!("Configured stream_use_ipv6 is no, but no IPv4 address was found; using {local_ip}.");
+				local_ip
+			}),
+		StreamUseIpv6::Yes => interface_ip_for_family(local_ip, StreamUseIpv6::Yes)
+			.or_else(|| first_interface_ip(StreamUseIpv6::Yes))
+			.unwrap_or_else(|| {
+				tracing::warn!("Configured stream_use_ipv6 is yes, but no IPv6 address was found; using {local_ip}.");
+				local_ip
+			}),
+	}
+}
+
+fn interface_ip_for_family(local_ip: IpAddr, stream_use_ipv6: StreamUseIpv6) -> Option<IpAddr> {
+	let interfaces = network_interface::NetworkInterface::show().ok()?;
+	for interface in interfaces {
+		if interface.addr.iter().any(|address| address.ip() == local_ip) {
+			return interface
+				.addr
+				.into_iter()
+				.map(|address| address.ip())
+				.find(|ip| ip_matches_stream_ipv6(*ip, stream_use_ipv6) && !ip.is_loopback());
+		}
+	}
+	None
+}
+
+fn first_interface_ip(stream_use_ipv6: StreamUseIpv6) -> Option<IpAddr> {
+	let interfaces = network_interface::NetworkInterface::show().ok()?;
+	interfaces
+		.into_iter()
+		.flat_map(|interface| interface.addr)
+		.map(|address| address.ip())
+		.find(|ip| ip_matches_stream_ipv6(*ip, stream_use_ipv6) && !ip.is_loopback())
+}
+
+fn ip_matches_stream_ipv6(ip: IpAddr, stream_use_ipv6: StreamUseIpv6) -> bool {
+	matches!(
+		(ip, stream_use_ipv6),
+		(IpAddr::V4(_), StreamUseIpv6::No) | (IpAddr::V6(_), StreamUseIpv6::Yes)
+	)
 }
 
 fn bad_request(message: String) -> Response<Full<Bytes>> {
