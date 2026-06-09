@@ -25,7 +25,6 @@ use tokio::net::TcpListener;
 
 use crate::{
 	clients::ClientManager,
-	config::StreamUseIpv6,
 	session::{
 		application::ApplicationConfig, compositor::CompositorConfig, manager::SessionManager, SessionContext,
 		SessionKeyData, SessionKeys, APP_LAUNCH_HTTP_TIMEOUT_SECS,
@@ -97,9 +96,8 @@ enum ServerCodecModeSupport {
 
 #[derive(Clone)]
 pub struct Webserver {
-	hostname: String,
+	name: String,
 	rtsp_port: u16,
-	stream_use_ipv6: StreamUseIpv6,
 	webserver_config: WebserverConfig,
 	applications: Vec<ApplicationConfig>,
 	unique_id: String,
@@ -114,10 +112,9 @@ impl Webserver {
 	#[allow(clippy::result_unit_err)]
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		hostname: String,
+		name: String,
 		address: String,
 		rtsp_port: u16,
-		stream_use_ipv6: StreamUseIpv6,
 		webserver_config: WebserverConfig,
 		applications: Vec<ApplicationConfig>,
 		compositor_config: CompositorConfig,
@@ -133,9 +130,8 @@ impl Webserver {
 		let hdr_supported = compositor_config.hdr && super::session::compositor::probe_hdr_support(&compositor_config);
 
 		let server = Self {
-			hostname,
+			name,
 			rtsp_port,
-			stream_use_ipv6,
 			webserver_config,
 			applications,
 			unique_id,
@@ -157,7 +153,13 @@ impl Webserver {
 				)
 			})?
 			.next()
-			.ok_or_else(|| tracing::error!("Failed to resolve address '{}' port {}", address, server.webserver_config.port))?;
+			.ok_or_else(|| {
+				tracing::error!(
+					"Failed to resolve address '{}' port {}",
+					address,
+					server.webserver_config.port
+				)
+			})?;
 
 		tokio::spawn({
 			let server = server.clone();
@@ -570,7 +572,7 @@ impl Webserver {
 
 		// TODO: Check the use of some of these values, we leave most of them blank and Moonlight doesn't care.
 		let mut response = "<root status_code=\"200\">".to_string();
-		response += &format!("<hostname>{}</hostname>", escape_xml(&self.hostname));
+		response += &format!("<hostname>{}</hostname>", escape_xml(&self.name));
 		response += &format!("<appversion>{}</appversion>", SERVERINFO_APP_VERSION);
 		response += &format!("<GfeVersion>{}</GfeVersion>", SERVERINFO_GFE_VERSION);
 		response += &format!("<uniqueid>{}</uniqueid>", self.unique_id);
@@ -858,10 +860,9 @@ impl Webserver {
 		let mut response = "<root status_code=\"200\">".to_string();
 		response += "<gamesession>1</gamesession>";
 		if let Some(addr) = local_address {
-			let session_ip = session_url_ip(self.stream_use_ipv6, addr);
 			response += &format!(
 				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
-				rtsp_host(session_ip),
+				rtsp_host(addr.ip()),
 				self.rtsp_port
 			);
 		}
@@ -933,10 +934,9 @@ impl Webserver {
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		if let Some(addr) = local_address {
-			let session_ip = session_url_ip(self.stream_use_ipv6, addr);
 			response += &format!(
 				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
-				rtsp_host(session_ip),
+				rtsp_host(addr.ip()),
 				self.rtsp_port
 			);
 		}
@@ -1027,57 +1027,6 @@ fn rtsp_host(ip: IpAddr) -> String {
 		IpAddr::V4(v4) => v4.to_string(),
 		IpAddr::V6(v6) => format!("[{v6}]"),
 	}
-}
-
-fn session_url_ip(stream_use_ipv6: StreamUseIpv6, local_address: SocketAddr) -> IpAddr {
-	let local_ip = local_address.ip();
-	match stream_use_ipv6 {
-		StreamUseIpv6::Auto => local_ip,
-		StreamUseIpv6::No if local_ip.is_ipv4() => local_ip,
-		StreamUseIpv6::Yes if local_ip.is_ipv6() => local_ip,
-		StreamUseIpv6::No => interface_ip_for_family(local_ip, StreamUseIpv6::No)
-			.or_else(|| first_interface_ip(StreamUseIpv6::No))
-			.unwrap_or_else(|| {
-				tracing::warn!("Configured stream_use_ipv6 is no, but no IPv4 address was found; using {local_ip}.");
-				local_ip
-			}),
-		StreamUseIpv6::Yes => interface_ip_for_family(local_ip, StreamUseIpv6::Yes)
-			.or_else(|| first_interface_ip(StreamUseIpv6::Yes))
-			.unwrap_or_else(|| {
-				tracing::warn!("Configured stream_use_ipv6 is yes, but no IPv6 address was found; using {local_ip}.");
-				local_ip
-			}),
-	}
-}
-
-fn interface_ip_for_family(local_ip: IpAddr, stream_use_ipv6: StreamUseIpv6) -> Option<IpAddr> {
-	let interfaces = network_interface::NetworkInterface::show().ok()?;
-	for interface in interfaces {
-		if interface.addr.iter().any(|address| address.ip() == local_ip) {
-			return interface
-				.addr
-				.into_iter()
-				.map(|address| address.ip())
-				.find(|ip| ip_matches_stream_ipv6(*ip, stream_use_ipv6) && !ip.is_loopback());
-		}
-	}
-	None
-}
-
-fn first_interface_ip(stream_use_ipv6: StreamUseIpv6) -> Option<IpAddr> {
-	let interfaces = network_interface::NetworkInterface::show().ok()?;
-	interfaces
-		.into_iter()
-		.flat_map(|interface| interface.addr)
-		.map(|address| address.ip())
-		.find(|ip| ip_matches_stream_ipv6(*ip, stream_use_ipv6) && !ip.is_loopback())
-}
-
-fn ip_matches_stream_ipv6(ip: IpAddr, stream_use_ipv6: StreamUseIpv6) -> bool {
-	matches!(
-		(ip, stream_use_ipv6),
-		(IpAddr::V4(_), StreamUseIpv6::No) | (IpAddr::V6(_), StreamUseIpv6::Yes)
-	)
 }
 
 fn bad_request(message: String) -> Response<Full<Bytes>> {

@@ -107,7 +107,6 @@ impl Moonshine {
 				config.name.clone(),
 				config.address.clone(),
 				config.stream.port,
-				config.stream_use_ipv6,
 				config.webserver.clone(),
 				config.applications.clone(),
 				config.compositor.clone(),

@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::{IpAddr, SocketAddr}, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
@@ -172,7 +172,8 @@ async fn get_server_cert(
 
 	// Emit a notification, allowing the user to automatically open the PIN page.
 	if let Some(local_address) = local_address {
-		let pin_url = format!("http://{}:{}/pin?uniqueid={}", local_address.ip(), http_port, unique_id);
+		let pin_address = SocketAddr::new(local_address.ip(), http_port);
+		let pin_url = format!("http://{pin_address}/pin?uniqueid={unique_id}");
 		tracing::info!("Waiting for pin to be sent at {pin_url}");
 
 		let _ = std::thread::Builder::new()
