@@ -1,5 +1,5 @@
 use std::sync::Arc;
- use std::collections::HashMap;
+use std::collections::HashMap;
 
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
