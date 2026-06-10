@@ -93,6 +93,19 @@ impl ImageDescription {
 		}
 	}
 
+	#[cfg(test)]
+	pub fn scrgb_linear() -> Self {
+		Self {
+			transfer_function: TransferFunction::ScrgbLinear,
+			primaries: Primaries::Srgb,
+			max_cll: None,
+			max_fall: None,
+			mastering_luminance: None,
+			mastering_primaries: None,
+			white_point: None,
+		}
+	}
+
 	pub fn to_frame_color_space(self) -> FrameColorSpace {
 		match (self.primaries, self.transfer_function) {
 			(Primaries::Bt2020, TransferFunction::St2084Pq) => FrameColorSpace::Bt2020Pq,
@@ -890,5 +903,49 @@ impl Dispatch<wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1
 
 			_ => {},
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{FrameColorSpace, ImageDescription, Primaries, TransferFunction};
+
+	#[test]
+	fn srgb_helper_maps_to_srgb_frame_color_space() {
+		assert_eq!(ImageDescription::srgb().to_frame_color_space(), FrameColorSpace::Srgb);
+	}
+
+	#[test]
+	fn bt2020_pq_helper_maps_to_bt2020pq_frame_color_space() {
+		let desc = ImageDescription::bt2020_pq();
+		assert_eq!(desc.primaries, Primaries::Bt2020);
+		assert_eq!(desc.transfer_function, TransferFunction::St2084Pq);
+		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::Bt2020Pq);
+	}
+
+	#[test]
+	fn scrgb_linear_helper_maps_to_scrgb_frame_color_space() {
+		let desc = ImageDescription::scrgb_linear();
+		// scRGB uses BT.709 primaries, which share values with sRGB.
+		assert_eq!(desc.primaries, Primaries::Srgb);
+		assert_eq!(desc.transfer_function, TransferFunction::ScrgbLinear);
+		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::ScrgbLinear);
+	}
+
+	#[test]
+	fn unrecognized_color_combination_falls_back_to_sdr() {
+		// Gamma22 with BT.2020 primaries is nonsensical; the fallback arm must
+		// route such descriptors to Srgb so SDR behaviour is preserved rather
+		// than misclassifying them as HDR.
+		let desc = ImageDescription {
+			primaries: Primaries::Bt2020,
+			transfer_function: TransferFunction::Gamma22,
+			max_cll: None,
+			max_fall: None,
+			mastering_luminance: None,
+			mastering_primaries: None,
+			white_point: None,
+		};
+		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::Srgb);
 	}
 }

@@ -804,3 +804,70 @@ impl VideoPipelineInner {
 		Ok((t_packetized - t_start, t_sent - t_packetized))
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::{drm_fourcc_to_input, BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS};
+	use ash::vk;
+	use pixelforge::InputFormat;
+
+	// DRM fourccs — kept in the test module to document the byte ordering
+	// explicitly and guard against accidental typos in the production match.
+	// Layout: fourcc_code(a, b, c, d) = a | b<<8 | c<<16 | d<<24.
+	const ABGR8888: u32 = 0x34324241; // "AB24"
+	const XBGR8888: u32 = 0x34324258; // "XB24"
+	const ABGR2101010: u32 = 0x30334241; // "AB30"
+	const XBGR2101010: u32 = 0x30334258; // "XB30"
+	const ABGR16161616F: u32 = 0x48344241; // "AB4H"
+	const XBGR16161616F: u32 = 0x48344258; // "XB4H"
+
+	#[test]
+	fn drm_fourcc_abgr_xbgr_8bit_maps_to_rgba() {
+		// 8-bit ABGR/XBGR share the same bit layout (alpha vs. padding) and
+		// map to R8G8B8A8_UNORM.
+		for fourcc in [ABGR8888, XBGR8888] {
+			let (fmt, vk) = drm_fourcc_to_input(fourcc);
+			assert_eq!(fmt, InputFormat::RGBA);
+			assert_eq!(vk, vk::Format::R8G8B8A8_UNORM);
+		}
+	}
+
+	#[test]
+	fn drm_fourcc_abgr_xbgr_10bit_maps_to_a2b10g10r10() {
+		for fourcc in [ABGR2101010, XBGR2101010] {
+			let (fmt, vk) = drm_fourcc_to_input(fourcc);
+			assert_eq!(fmt, InputFormat::ABGR2101010);
+			assert_eq!(vk, vk::Format::A2B10G10R10_UNORM_PACK32);
+		}
+	}
+
+	#[test]
+	fn drm_fourcc_abgr_xbgr_fp16_maps_to_rgba16f() {
+		// Regression guard for the XBGR16161616F (XB4H) case: NVIDIA's Wayland
+		// WSI emits the X-variant for FP16 scRGB swapchains, and handling only
+		// the A-variant caused 16F buffers to fall through to the 8-bit BGRx
+		// fallback and produce garbled pixels.
+		for fourcc in [ABGR16161616F, XBGR16161616F] {
+			let (fmt, vk) = drm_fourcc_to_input(fourcc);
+			assert_eq!(fmt, InputFormat::RGBA16F);
+			assert_eq!(vk, vk::Format::R16G16B16A16_SFLOAT);
+		}
+	}
+
+	#[test]
+	fn drm_fourcc_unknown_falls_back_to_bgrx() {
+		// Anything outside the known set must fall back to the 8-bit BGRx
+		// assumption — matches the `_ =>` arm in the production match.
+		let (fmt, vk) = drm_fourcc_to_input(0xDEADBEEF);
+		assert_eq!(fmt, InputFormat::BGRx);
+		assert_eq!(vk, vk::Format::B8G8R8A8_UNORM);
+	}
+
+	#[test]
+	fn sdr_reference_white_constants_match_specs() {
+		// scRGB (IEC 61966-2-2): 1.0 == 80 cd/m².
+		assert_eq!(SCRGB_REFERENCE_WHITE_NITS, 80.0);
+		// ITU-R BT.2408: 203 cd/m² diffuse white for SDR-in-HDR.
+		assert_eq!(BT2408_SDR_REFERENCE_NITS, 203.0);
+	}
+}
