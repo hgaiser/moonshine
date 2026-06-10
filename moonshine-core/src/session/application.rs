@@ -107,6 +107,8 @@ pub(crate) struct ApplicationContext {
 	pub wayland_display: String,
 	/// Effective HDR mode — `true` only when the compositor confirmed an HDR-capable DMA-BUF format is in use.
 	pub hdr: bool,
+	/// Environment variables to pass on
+	pub extra_env: HashMap<String, String>,
 }
 
 pub(crate) struct Application {
@@ -207,6 +209,10 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 		// SDR sessions too, so we need an explicit capability signal).
 		envs.push("MOONSHINE_HDR=1".to_string());
 	}
+
+	for (key, value) in &context.extra_env {
+        envs.push(format!("{key}={value}"));
+    }
 
 	Ok(envs)
 }
