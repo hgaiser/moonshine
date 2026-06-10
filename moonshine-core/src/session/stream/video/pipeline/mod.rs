@@ -30,6 +30,11 @@ use pixelforge::{
 	InputFormat, OutputFormat, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
 
+/// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
+const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
+/// SDR reference white for HDR transport, per ITU-R BT.2408 (203 cd/m²).
+const BT2408_SDR_REFERENCE_NITS: f32 = 203.0;
+
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
 fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
@@ -514,13 +519,23 @@ impl VideoPipelineInner {
 					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
 					// scRGB 1.0 == 80 cd/m². The other paths ignore it.
 					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
-						FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709(), 203.0),
-						FrameColorSpace::Bt2020Pq => (ColorSpace::Bt2020, false, ColorDescription::bt2020_pq(), 203.0),
+						FrameColorSpace::Srgb => (
+							ColorSpace::Bt709,
+							true,
+							ColorDescription::bt709(),
+							BT2408_SDR_REFERENCE_NITS,
+						),
+						FrameColorSpace::Bt2020Pq => (
+							ColorSpace::Bt2020,
+							false,
+							ColorDescription::bt2020_pq(),
+							BT2408_SDR_REFERENCE_NITS,
+						),
 						FrameColorSpace::ScrgbLinear => (
 							ColorSpace::Bt709LinearToBt2020Pq,
 							false,
 							ColorDescription::bt2020_pq(),
-							80.0,
+							SCRGB_REFERENCE_WHITE_NITS,
 						),
 					};
 
