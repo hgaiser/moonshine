@@ -515,12 +515,13 @@ impl VideoPipelineInner {
 					// scRGB 1.0 == 80 cd/m². The other paths ignore it.
 					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
 						FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709(), 203.0),
-						FrameColorSpace::Bt2020Pq => {
-							(ColorSpace::Bt2020, false, ColorDescription::bt2020_pq(), 203.0)
-						},
-						FrameColorSpace::Bt709Linear => {
-							(ColorSpace::Bt709LinearToBt2020Pq, false, ColorDescription::bt2020_pq(), 80.0)
-						},
+						FrameColorSpace::Bt2020Pq => (ColorSpace::Bt2020, false, ColorDescription::bt2020_pq(), 203.0),
+						FrameColorSpace::Bt709Linear => (
+							ColorSpace::Bt709LinearToBt2020Pq,
+							false,
+							ColorDescription::bt2020_pq(),
+							80.0,
+						),
 					};
 
 					// Switch encoder VUI first. Only update the converter if
