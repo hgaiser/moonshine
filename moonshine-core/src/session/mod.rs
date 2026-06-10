@@ -1,5 +1,5 @@
-use std::sync::Arc;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
@@ -203,10 +203,13 @@ impl InitializedSession {
 				hdr: ready.hdr,
 				// Populate extra_env with width, height and refreshrate values of the client for e.g. scripting
 				extra_env: HashMap::from([
-			        ("MOONSHINE_CLIENT_WIDTH".to_string(), context.resolution.0.to_string()),
-			        ("MOONSHINE_CLIENT_HEIGHT".to_string(), context.resolution.1.to_string()),
-			        ("MOONSHINE_CLIENT_FRAMERATE".to_string(), context.refresh_rate.to_string()),
-			    ]),
+			    	("MOONSHINE_CLIENT_WIDTH".to_string(), context.resolution.0.to_string()),
+			    	("MOONSHINE_CLIENT_HEIGHT".to_string(), context.resolution.1.to_string()),
+			    	(
+			    		"MOONSHINE_CLIENT_FRAMERATE".to_string(),
+			    		context.refresh_rate.to_string()
+		    		),
+				]),
 			},
 		)
 		.await?;
