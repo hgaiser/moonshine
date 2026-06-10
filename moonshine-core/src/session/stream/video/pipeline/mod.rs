@@ -516,7 +516,7 @@ impl VideoPipelineInner {
 					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
 						FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709(), 203.0),
 						FrameColorSpace::Bt2020Pq => (ColorSpace::Bt2020, false, ColorDescription::bt2020_pq(), 203.0),
-						FrameColorSpace::Bt709Linear => (
+						FrameColorSpace::ScrgbLinear => (
 							ColorSpace::Bt709LinearToBt2020Pq,
 							false,
 							ColorDescription::bt2020_pq(),

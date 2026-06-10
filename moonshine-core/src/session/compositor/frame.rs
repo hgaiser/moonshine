@@ -26,7 +26,7 @@ pub(crate) enum FrameColorSpace {
 	/// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`. The encoder must apply a
 	/// BT.709→BT.2020 gamut mapping and PQ OETF before YUV conversion (it is
 	/// *not* a passthrough), so it is tracked separately from `Bt2020Pq`.
-	Bt709Linear,
+	ScrgbLinear,
 }
 
 /// Static HDR metadata (HDR10).

@@ -72,7 +72,7 @@ fn handle_swapchain_feedback(
 			// (which over-saturates and crushes highlights).
 			VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT | VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT => {
 				tracing::info!("swapchain_feedback: extended sRGB (scRGB) detected, activating HDR");
-				cm.set_gamescope_colorspace(surface, TransferFunction::LinearExtended, Primaries::Srgb);
+				cm.set_gamescope_colorspace(surface, TransferFunction::ScrgbLinear, Primaries::Srgb);
 			},
 			VK_COLOR_SPACE_SRGB_NONLINEAR => {
 				cm.clear_gamescope_current(surface);

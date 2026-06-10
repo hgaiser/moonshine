@@ -41,7 +41,7 @@ pub(crate) enum TransferFunction {
 	St2084Pq,
 	/// Linear light with extended range (scRGB). Values may exceed 1.0 to
 	/// represent HDR highlights above SDR white. Paired with BT.709 primaries.
-	LinearExtended,
+	ScrgbLinear,
 }
 
 /// Color primaries as declared by a client.
@@ -96,7 +96,7 @@ impl ImageDescription {
 	pub fn to_frame_color_space(self) -> FrameColorSpace {
 		match (self.primaries, self.transfer_function) {
 			(Primaries::Bt2020, TransferFunction::St2084Pq) => FrameColorSpace::Bt2020Pq,
-			(Primaries::Srgb, TransferFunction::LinearExtended) => FrameColorSpace::Bt709Linear,
+			(Primaries::Srgb, TransferFunction::ScrgbLinear) => FrameColorSpace::ScrgbLinear,
 			_ => FrameColorSpace::Srgb,
 		}
 	}
@@ -647,7 +647,7 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionUse
 						info.luminances(0, 10000, 203);
 						info.target_luminance(0, 10000);
 					},
-					TransferFunction::LinearExtended => {
+					TransferFunction::ScrgbLinear => {
 						info.tf_named(wp_color_manager_v1::TransferFunction::ExtLinear);
 						// scRGB: linear with extended range, 1.0 == 80 cd/m² (IEC 61966-2-2).
 						info.luminances(0, 10000, 80);
