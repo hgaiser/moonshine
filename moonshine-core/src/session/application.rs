@@ -211,7 +211,7 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 	}
 
 	for (key, value) in &context.extra_env {
-    	envs.push(format!("{key}={value}"));
+		envs.push(format!("{key}={value}"));
 	}
 
 	Ok(envs)
