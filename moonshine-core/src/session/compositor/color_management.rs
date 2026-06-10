@@ -277,14 +277,22 @@ impl ColorManagementState {
 
 	/// Get the frame color space for the current fullscreen surface.
 	///
-	/// Returns the first non-sRGB color space declared by any mapped surface
-	/// (BT.2020+PQ or scRGB-linear), otherwise `Srgb`. Gamescope swapchain
-	/// declarations are checked first (higher priority), then wp_color_management
-	/// declarations.
+	/// When multiple HDR surfaces are declared, already-encoded BT.2020+PQ is
+	/// preferred over scRGB-linear: it is a passthrough path, whereas scRGB
+	/// requires a gamut+PQ conversion, so picking PQ avoids an unnecessary
+	/// conversion when both are present. Falls back to `Srgb` when no surface
+	/// declares an HDR color space. Gamescope swapchain declarations are checked
+	/// before wp_color_management declarations within each pass.
 	pub fn frame_color_space(&self) -> FrameColorSpace {
-		self.gamescope_current
-			.values()
-			.chain(self.current.values())
+		let color_spaces = || self.gamescope_current.values().chain(self.current.values());
+
+		// First pass: prefer already-encoded BT.2020+PQ (passthrough).
+		if color_spaces().any(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq) {
+			return FrameColorSpace::Bt2020Pq;
+		}
+
+		// Second pass: fall back to scRGB-linear, then sRGB.
+		color_spaces()
 			.map(|desc| desc.to_frame_color_space())
 			.find(|cs| *cs != FrameColorSpace::Srgb)
 			.unwrap_or(FrameColorSpace::Srgb)
