@@ -52,7 +52,7 @@ pub(crate) enum Primaries {
 }
 
 /// A resolved image description created from parametric parameters.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImageDescription {
 	pub transfer_function: TransferFunction,
 	pub primaries: Primaries,
@@ -207,7 +207,7 @@ impl ColorManagementState {
 
 	/// Set a pending image description for a surface (from `set_image_description`).
 	pub fn set_pending(&mut self, surface: &WlSurface, desc: ImageDescription) {
-		tracing::debug!(
+		tracing::trace!(
 			surface_id = ?surface.id(),
 			color_space = ?desc.to_frame_color_space(),
 			"set_pending"
@@ -299,20 +299,26 @@ impl ColorManagementState {
 		if let Some(pending) = self.pending.remove(surface) {
 			match pending {
 				Some(desc) => {
-					tracing::debug!(
-						surface_id = ?surface.id(),
-						color_space = ?desc.to_frame_color_space(),
-						num_current = self.current.len(),
-						"commit: inserting into current"
-					);
-					self.current.insert(surface.clone(), desc);
+					// Some clients (e.g. Forza Horizon via vkd3d-proton)
+					// re-set an identical description every frame; log only
+					// actual changes to keep debug output readable.
+					let prev = self.current.insert(surface.clone(), desc);
+					if prev != Some(desc) {
+						tracing::debug!(
+							surface_id = ?surface.id(),
+							color_space = ?desc.to_frame_color_space(),
+							num_current = self.current.len(),
+							"commit: inserting into current"
+						);
+					}
 				},
 				None => {
-					tracing::debug!(
-						surface_id = ?surface.id(),
-						"commit: removing from current"
-					);
-					self.current.remove(surface);
+					if self.current.remove(surface).is_some() {
+						tracing::debug!(
+							surface_id = ?surface.id(),
+							"commit: removing from current"
+						);
+					}
 				},
 			}
 		}
@@ -452,7 +458,7 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor
 		_dhandle: &DisplayHandle,
 		data_init: &mut DataInit<'_, Self>,
 	) {
-		tracing::debug!(?request, "wp_color_manager_v1 request");
+		tracing::trace!(?request, "wp_color_manager_v1 request");
 		match request {
 			wp_color_manager_v1::Request::Destroy => {},
 
@@ -523,7 +529,7 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, ColorS
 				render_intent: _,
 			} => {
 				if let Some(desc_data) = image_description.data::<ImageDescriptionUserData>() {
-					tracing::debug!(
+					tracing::trace!(
 						?desc_data.desc,
 						"Surface set image description"
 					);
@@ -573,7 +579,7 @@ impl Dispatch<wp_image_description_creator_params_v1::WpImageDescriptionCreatorP
 					mastering_primaries: params.mastering_primaries,
 					white_point: params.white_point,
 				};
-				tracing::debug!(?desc, "Created parametric image description");
+				tracing::trace!(?desc, "Created parametric image description");
 
 				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
 				// Signal that the image description is ready.
@@ -583,7 +589,10 @@ impl Dispatch<wp_image_description_creator_params_v1::WpImageDescriptionCreatorP
 			wp_image_description_creator_params_v1::Request::SetTfNamed { tf } => {
 				let tf = match tf.into_result() {
 					Ok(wp_color_manager_v1::TransferFunction::St2084Pq) => TransferFunction::St2084Pq,
-					Ok(wp_color_manager_v1::TransferFunction::Gamma22) => TransferFunction::Gamma22,
+					// sRGB's piecewise EOTF is close enough to pure gamma 2.2
+					// for SDR passthrough; both named TFs are advertised.
+					Ok(wp_color_manager_v1::TransferFunction::Gamma22)
+					| Ok(wp_color_manager_v1::TransferFunction::Srgb) => TransferFunction::Gamma22,
 					other => {
 						tracing::debug!(?other, "Unsupported transfer function, defaulting to gamma22");
 						TransferFunction::Gamma22
