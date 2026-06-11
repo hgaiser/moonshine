@@ -94,9 +94,9 @@ impl Default for Config {
 	fn default() -> Self {
 		Self {
 			name: "Moonshine".to_string(),
-			// Bind dual-stack by default so clients can reach us over IPv4 or IPv6.
-			// The webserver disables IPV6_V6ONLY, so this single address covers both.
-			address: "::".to_string(),
+			// IPv4-only by default; set to `::` to bind dual-stack (the webserver
+			// disables IPV6_V6ONLY, so that single address covers both).
+			address: "0.0.0.0".to_string(),
 			webserver: Default::default(),
 			stream: Default::default(),
 			applications: vec![ApplicationConfig {
