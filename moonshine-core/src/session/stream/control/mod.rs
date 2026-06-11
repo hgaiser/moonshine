@@ -2,12 +2,13 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
+use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
 use self::{feedback::FeedbackCommand, input::InputHandler};
-use crate::config::Config;
+use crate::config::GamepadConfig;
 use crate::crypto::{decrypt, encrypt};
 use crate::session::compositor::{
 	frame::{HdrMetadata, HdrModeState},
@@ -21,6 +22,26 @@ use crate::session::SessionKeysReceiver;
 
 mod feedback;
 mod input;
+
+/// Configuration for the control stream.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ControlStreamConfig {
+	/// Port to use for streaming control data.
+	pub port: u16,
+
+	/// Configuration for gamepad input remapping (e.g. hold-to-Home).
+	pub gamepad: GamepadConfig,
+}
+
+impl Default for ControlStreamConfig {
+	fn default() -> Self {
+		Self {
+			port: 47999,
+			gamepad: GamepadConfig::default(),
+		}
+	}
+}
 
 const ENCRYPTION_TAG_LENGTH: usize = 16;
 // Sequence number + tag + control message id.
@@ -235,7 +256,6 @@ impl ControlStreamContext {
 }
 
 pub(crate) struct ControlStream {
-	config: Config,
 	stop: ShutdownManager<SessionShutdownReason>,
 	input_handler: InputHandler,
 	host: Host,
@@ -243,22 +263,22 @@ pub(crate) struct ControlStream {
 
 impl ControlStream {
 	pub fn new(
-		config: Config,
+		config: ControlStreamConfig,
+		address: String,
 		input_tx: calloop::channel::Sender<CompositorInputEvent>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		let input_handler = InputHandler::new(
 			input_tx,
 			stop_session_manager.clone(),
-			config.stream.control.gamepad.clone(),
+			config.gamepad.clone(),
 		)?;
 
 		let socket_address = SocketAddr::new(
-			config
-				.address
+			address
 				.parse()
-				.map_err(|e| tracing::warn!("Failed to parse address ({}): {e}", config.address))?,
-			config.stream.control.port,
+				.map_err(|e| tracing::warn!("Failed to parse address ({}): {e}", address))?,
+			config.port,
 		);
 
 		let host_config = HostConfig {
@@ -273,7 +293,6 @@ impl ControlStream {
 		tracing::debug!("Listening for control messages on {:?}", socket_address);
 
 		Ok(Self {
-			config,
 			stop: stop_session_manager,
 			input_handler,
 			host,
@@ -282,13 +301,13 @@ impl ControlStream {
 
 	pub fn start(
 		self,
+		stream_timeout: u64,
 		context: ControlStreamContext,
 		video_handle: VideoStreamHandle,
 		audio_trigger: AudioStartHandle,
 		hdr_metadata_rx: watch::Receiver<HdrModeState>,
 	) {
 		let Self {
-			config,
 			stop: stop_session_manager,
 			input_handler,
 			host,
@@ -296,7 +315,7 @@ impl ControlStream {
 
 		tokio::spawn(async move {
 			run_control_loop(
-				config,
+				stream_timeout,
 				host,
 				video_handle,
 				audio_trigger,
@@ -397,7 +416,7 @@ fn send_hdr_state(host: &mut Host, state: &HdrModeState, key: &[u8], sequence_nu
 
 #[allow(clippy::too_many_arguments)]
 async fn run_control_loop(
-	config: Config,
+	stream_timeout: u64,
 	mut host: Host,
 	video_handle: VideoStreamHandle,
 	audio_trigger: AudioStartHandle,
@@ -410,7 +429,7 @@ async fn run_control_loop(
 	let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::ControlStreamStopped);
 	let _delay_stop = stop_session_manager.delay_shutdown_token();
 
-	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
+	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 
 	// Create a channel over which we can receive feedback messages to send to the connected client.
 	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
@@ -425,7 +444,7 @@ async fn run_control_loop(
 		if std::time::Instant::now() > stop_deadline {
 			tracing::info!(
 				"Stopping because we haven't received a ping for {} seconds.",
-				config.stream_timeout
+				stream_timeout
 			);
 			break;
 		}
@@ -501,8 +520,7 @@ async fn run_control_loop(
 						send_hdr_mode = context.hdr;
 					},
 					ControlMessage::Ping => {
-						stop_deadline =
-							std::time::Instant::now() + std::time::Duration::from_secs(config.stream_timeout);
+						stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 					},
 					ControlMessage::InputData(event) => {
 						let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;

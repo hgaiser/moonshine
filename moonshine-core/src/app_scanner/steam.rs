@@ -3,12 +3,42 @@ use std::{
 	str::FromStr,
 };
 
+use serde::{Deserialize, Serialize};
 use steamlocate::SteamDir;
 use walkdir::WalkDir;
 
-use crate::config::{ApplicationConfig, SteamApplicationScannerConfig};
+use crate::session::application::ApplicationConfig;
 
-pub fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SteamApplicationScannerConfig {
+	/// Path to a Steam library (ie. `~/.local/share/Steam`).
+	pub library: PathBuf,
+
+	/// The command to run.
+	pub command: Vec<String>,
+
+	/// Commands to run before launching each scanned application.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub pre_command: Vec<Vec<String>>,
+
+	/// Commands to run after each scanned application's session ends.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub post_command: Vec<Vec<String>>,
+
+	/// Path to redirect application stdout to. If not set, stdout is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stdout: Option<PathBuf>,
+
+	/// Path to redirect application stderr to. If not set, stderr is discarded.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub stderr: Option<PathBuf>,
+
+	/// Seconds to wait for each scanned application to reach an active state after launch.
+	#[serde(default = "crate::session::application::default_launch_timeout")]
+	pub launch_timeout_secs: u64,
+}
+
+pub(crate) fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
 	// Expand the library path.
 	let library_str = config.library.to_string_lossy();
 	let library = shellexpand::full(&library_str)

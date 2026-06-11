@@ -1,11 +1,15 @@
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
-use tokio::sync::{watch, Mutex};
+use tokio::sync::{broadcast, watch, Mutex};
 
-use crate::config::Config;
-use crate::session::stream::AudioStreamContext;
-use crate::session::stream::VideoStreamContext;
+use crate::session::compositor::CompositorConfig;
+use crate::session::stream::audio::AudioStreamConfig;
+use crate::session::stream::audio::AudioStreamContext;
+use crate::session::stream::control::ControlStreamConfig;
+use crate::session::stream::video::VideoStreamConfig;
+use crate::session::stream::video::VideoStreamContext;
+use crate::session::FrameStats;
 use crate::session::InitializedSession;
 use crate::session::SessionContext;
 use crate::session::SessionKeyData;
@@ -17,7 +21,7 @@ use crate::ShutdownReason;
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum SessionShutdownReason {
+pub enum SessionShutdownReason {
 	/// Session manager is shutting down.
 	ManagerShutdown,
 	/// The session was stopped by the user.
@@ -41,8 +45,23 @@ pub(crate) enum SessionShutdownReason {
 }
 
 struct SessionManagerInner {
-	/// Configuration for the session manager.
-	config: Config,
+	/// Configuration for the compositor.
+	compositor_config: CompositorConfig,
+
+	/// Configuration for the video stream.
+	video_config: VideoStreamConfig,
+
+	/// Configuration for the audio stream.
+	audio_config: AudioStreamConfig,
+
+	/// Configuration for the control stream.
+	control_config: ControlStreamConfig,
+
+	/// Address to bind streams to.
+	address: String,
+
+	/// Time in seconds since last ping after which the stream closes.
+	stream_timeout: u64,
 
 	/// The currently active session, if any.
 	session: Option<SessionState>,
@@ -59,8 +78,17 @@ struct SessionManagerInner {
 	video_stream_context: Option<VideoStreamContext>,
 	audio_stream_context: Option<AudioStreamContext>,
 
+	/// Broadcast sender for per-frame encoding statistics.
+	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+
 	/// Watchdog task for monitoring unexpected session shutdowns.
 	stop_watcher: Option<tokio::task::JoinHandle<()>>,
+
+	/// Notify to trigger the video pipeline start (used by bench / external callers).
+	video_start_notify: Option<Arc<tokio::sync::Notify>>,
+
+	/// Notify to trigger the audio pipeline start (used by bench / external callers).
+	audio_start_notify: Option<Arc<tokio::sync::Notify>>,
 
 	/// Shutdown manager for the entire application.
 	shutdown: ShutdownManager<ShutdownReason>,
@@ -85,6 +113,8 @@ impl SessionManagerInner {
 		self.keys_tx = None;
 		self.video_stream_context = None;
 		self.audio_stream_context = None;
+		self.video_start_notify = None;
+		self.audio_start_notify = None;
 		self.stop = ShutdownManager::new();
 	}
 }
@@ -108,35 +138,77 @@ impl Drop for SessionManagerInner {
 #[derive(Clone)]
 pub struct SessionManager {
 	inner: Arc<Mutex<SessionManagerInner>>,
+	stats_tx: broadcast::Sender<FrameStats>,
 }
 
 impl SessionManager {
-	pub fn new(config: Config, shutdown: ShutdownManager<ShutdownReason>) -> Result<Self, ()> {
+	#[allow(clippy::too_many_arguments)]
+	pub fn new(
+		compositor_config: CompositorConfig,
+		video_config: VideoStreamConfig,
+		audio_config: AudioStreamConfig,
+		control_config: ControlStreamConfig,
+		address: String,
+		stream_timeout: u64,
+		shutdown: ShutdownManager<ShutdownReason>,
+	) -> Result<Self, ()> {
 		let trigger_token = shutdown.trigger_shutdown_token(ShutdownReason::SessionManagerShutdown);
 		let delay_token = shutdown.delay_shutdown_token().map_err(|e| {
 			tracing::error!("Failed to create delay shutdown token: {e:?}");
 		})?;
 
 		let inner = SessionManagerInner {
-			config,
+			compositor_config,
+			video_config,
+			audio_config,
+			control_config,
+			address,
+			stream_timeout,
 			session: None,
 			stop: ShutdownManager::new(),
 			keys_tx: None,
 			video_stream_context: None,
 			audio_stream_context: None,
+			stats_tx: tokio::sync::broadcast::channel(256).0,
 			stop_watcher: None,
+			video_start_notify: None,
+			audio_start_notify: None,
 			shutdown: shutdown.clone(),
 			_trigger_token: trigger_token,
 			_delay_token: delay_token,
 		};
 
+		let stats_tx = inner.stats_tx.clone();
 		let inner = Arc::new(Mutex::new(inner));
 
-		Ok(Self { inner })
+		Ok(Self { inner, stats_tx })
+	}
+
+	/// Returns a receiver for per-frame encoding statistics.
+	///
+	/// Call **before** `initialize_session()` to receive stats from the start.
+	/// Multiple receivers can be created — each receives a copy of every message.
+	pub fn bench_stats_receiver(&self) -> tokio::sync::broadcast::Receiver<FrameStats> {
+		self.stats_tx.subscribe()
+	}
+
+	/// Trigger the video and audio pipelines to start encoding.
+	///
+	/// In the normal flow, this is triggered by the control stream when the
+	/// client sends `StartB`. Call this from external callers (e.g. bench binary)
+	/// that have no Moonlight client. Must be called after `start_session()`.
+	pub async fn trigger_streams_start(&self) {
+		let inner = self.inner.lock().await;
+		if let Some(notify) = inner.video_start_notify.as_ref() {
+			notify.notify_waiters();
+		}
+		if let Some(notify) = inner.audio_start_notify.as_ref() {
+			notify.notify_waiters();
+		}
 	}
 
 	/// Set the video and audio stream contexts after receiving RTSP ANNOUNCE.
-	pub(crate) async fn set_stream_context(
+	pub async fn set_stream_context(
 		&self,
 		video_stream_context: VideoStreamContext,
 		audio_stream_context: AudioStreamContext,
@@ -165,7 +237,7 @@ impl SessionManager {
 	}
 
 	/// Get the current session context if there is an active session; otherwise return `None`.
-	pub(crate) async fn get_session_context(&self) -> Result<Option<SessionContext>, ()> {
+	pub async fn get_session_context(&self) -> Result<Option<SessionContext>, ()> {
 		let guard = self.inner.lock().await;
 		Ok(guard.session.as_ref().map(|s| s.context().clone()))
 	}
@@ -173,7 +245,7 @@ impl SessionManager {
 	/// Initialize a new session with the provided context.
 	///
 	/// The session is not launched until `launch_session` is called.
-	pub(crate) async fn initialize_session(&self, mut context: SessionContext) -> Result<(), ()> {
+	pub async fn initialize_session(&self, mut context: SessionContext) -> Result<(), ()> {
 		let mut guard = self.inner.lock().await;
 
 		if guard.session.is_some() || guard.keys_tx.is_some() {
@@ -192,9 +264,24 @@ impl SessionManager {
 		let (tx, rx) = watch::channel(session_keys);
 		context.keys = SessionKeys::Rx(rx);
 
-		let config = guard.config.clone();
+		let compositor_config = guard.compositor_config.clone();
+		let video_config = guard.video_config.clone();
+		let audio_config = guard.audio_config.clone();
+		let control_config = guard.control_config.clone();
+		let address = guard.address.clone();
 		let stop = guard.stop.clone();
-		let session = InitializedSession::new(config, context, stop).await?;
+		let stats_tx = guard.stats_tx.clone();
+		let session = InitializedSession::new(
+			compositor_config,
+			video_config,
+			audio_config,
+			control_config,
+			address,
+			context,
+			stop,
+			stats_tx,
+		)
+		.await?;
 		guard.session = Some(SessionState::Initialized(session));
 
 		spawn_session_watchdog(&self.inner, &mut guard);
@@ -206,7 +293,7 @@ impl SessionManager {
 	}
 
 	/// Launch the session by starting the compositor and application, but don't start streams until RTSP ANNOUNCE is received.
-	pub(crate) async fn launch_session(&self) -> Result<(), ()> {
+	pub async fn launch_session(&self) -> Result<(), ()> {
 		let session = {
 			let mut guard = self.inner.lock().await;
 			match guard.session.take() {
@@ -249,7 +336,7 @@ impl SessionManager {
 	///
 	/// Returns `Ok(())` only after all three streams (video, audio, control) are
 	/// successfully constructed. Returns `Err(())` if any stream fails to initialize.
-	pub(crate) async fn start_session(&self) -> Result<(), ()> {
+	pub async fn start_session(&self) -> Result<(), ()> {
 		let (launched, video_stream_context, audio_stream_context, stop) = {
 			let mut guard = self.inner.lock().await;
 			let video_stream_context = guard.video_stream_context.take();
@@ -284,9 +371,19 @@ impl SessionManager {
 
 		tracing::info!("Starting session streams.");
 		let mut guard = self.inner.lock().await;
-		match launched.start(video_stream_context, audio_stream_context, stop) {
-			Ok(active) => {
+		let video_config = guard.video_config.clone();
+		let stream_timeout = guard.stream_timeout;
+		match launched.start(
+			video_config,
+			stream_timeout,
+			video_stream_context,
+			audio_stream_context,
+			stop,
+		) {
+			Ok((active, video_notify, audio_notify)) => {
 				guard.session = Some(SessionState::Active(active));
+				guard.video_start_notify = Some(video_notify);
+				guard.audio_start_notify = Some(audio_notify);
 				tracing::info!("Session streams started successfully.");
 				Ok(())
 			},
@@ -299,7 +396,7 @@ impl SessionManager {
 	}
 
 	/// Stop the session and return to Uninitialized state.
-	pub(crate) async fn stop_session(&self) -> Result<(), ()> {
+	pub async fn stop_session(&self) -> Result<(), ()> {
 		let (stop, shutdown) = {
 			let mut guard = self.inner.lock().await;
 			match guard.session {

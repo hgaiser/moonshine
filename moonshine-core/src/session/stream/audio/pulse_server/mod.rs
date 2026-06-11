@@ -57,7 +57,16 @@ struct PlaybackStream {
 	buffer: DynPlaybackBuffer,
 	volume: Vec<f32>,
 	muted: bool,
-	requested_bytes: usize,
+	/// Bytes consumed by the audio clock since the last REQUEST was sent.
+	/// Grows on every successful drain. Zeroed atomically when a REQUEST is issued.
+	/// Mirrors `pa_memblockq::missing` (signed to allow temporary negative values
+	/// from flush/seek, though in practice it never goes negative here).
+	missing: i64,
+
+	/// Bytes we have sent a REQUEST for but have not yet received from the client.
+	/// Grows when a REQUEST is sent. Shrinks when the client writes data.
+	/// Mirrors `pa_memblockq::requested`.
+	requested: usize,
 	played_bytes: u64,
 	write_offset: u64,
 	read_offset: u64,
@@ -98,6 +107,28 @@ pub(crate) struct PulseServer {
 	server_state: ServerState,
 
 	epoch: time::Instant,
+}
+
+/// Mirrors `pa_memblockq_pop_missing`.
+///
+/// Transfers accumulated demand (`missing`) into in-flight credit (`requested`)
+/// and returns the number of bytes to include in the next REQUEST message.
+/// Returns 0 if there is nothing to request yet.
+///
+/// The `in_prebuf` flag bypasses the `min_req` gate — when re-filling after
+/// an underrun the server should not wait for a full `min_req` chunk to
+/// accumulate before asking; any positive demand should be requested immediately.
+fn pop_missing(missing: &mut i64, requested: &mut usize, min_req: usize, in_prebuf: bool) -> usize {
+	if *missing <= 0 {
+		return 0;
+	}
+	if (*missing as usize) < min_req && !in_prebuf {
+		return 0;
+	}
+	let l = *missing as usize;
+	*requested += l;
+	*missing = 0;
+	l
 }
 
 impl PulseServer {
@@ -434,6 +465,9 @@ impl PulseServer {
 		for client in self.clients.values_mut() {
 			done_draining.clear();
 			for (id, stream) in client.playback_streams.iter_mut() {
+				// ── Drain phase ─────────────────────────────────────────────────────
+				// Only Playing and Draining streams consume audio data each tick.
+				// Prebuffering and Corked streams do not drain.
 				if matches!(stream.state, StreamState::Playing | StreamState::Draining(_)) {
 					let buffer_len = stream.buffer.len_bytes();
 
@@ -450,6 +484,7 @@ impl PulseServer {
 					};
 
 					if !drained {
+						// Buffer underrun: notify client and (re-)enter prebuffering.
 						tracing::warn!("Buffer underrun for stream {}", id);
 						pulse::write_command_message(
 							&mut client.socket,
@@ -463,35 +498,48 @@ impl PulseServer {
 
 						if stream.buffer_attr.pre_buffering > 0 && matches!(stream.state, StreamState::Playing) {
 							stream.state = StreamState::Prebuffering(stream.buffer_attr.pre_buffering as u64);
+							// Seed missing = pre_buffering so pop_missing fires immediately
+							// in the REQUEST phase below (same tick, no one-tick delay).
+							// Reset requested — any stale in-flight credit is discarded.
+							stream.missing = stream.buffer_attr.pre_buffering as i64;
+							stream.requested = 0;
 						}
+						// Fall through to REQUEST phase — do NOT continue.
+					} else {
+						// Successful drain: accumulate demand.
+						// Mirrors pa_memblockq::read_index_changed → missing += delta.
+						let read_len = buffer_len - stream.buffer.len_bytes();
+						stream.read_offset += read_len as u64;
+						stream.played_bytes += read_len as u64;
+						stream.missing += read_len as i64;
 
-						continue;
-					}
-
-					let read_len = buffer_len - stream.buffer.len_bytes();
-					stream.read_offset += read_len as u64;
-					stream.played_bytes += read_len as u64;
-
-					if matches!(stream.state, StreamState::Draining(_)) && stream.buffer.is_empty() {
-						done_draining.push(*id);
+						if matches!(stream.state, StreamState::Draining(_)) && stream.buffer.is_empty() {
+							done_draining.push(*id);
+						}
 					}
 				}
 
-				let bytes_needed = (stream.buffer_attr.target_length as usize)
-					.saturating_sub(stream.buffer.len_bytes() + stream.requested_bytes);
-				if matches!(stream.state, StreamState::Playing | StreamState::Corked)
-					&& bytes_needed >= stream.buffer_attr.minimum_request_length as usize
-				{
-					stream.requested_bytes += bytes_needed;
-					pulse::write_command_message(
-						&mut client.socket,
-						u32::MAX,
-						&pulse::Command::Request(pulse::Request {
-							channel: *id,
-							length: bytes_needed as u32,
-						}),
-						client.protocol_version,
-					)?;
+				// ── Request phase ────────────────────────────────────────────────────
+				// Issue a REQUEST if enough demand has accumulated.
+				// Draining streams are excluded — they are emptying, not refilling.
+				if matches!(
+					stream.state,
+					StreamState::Playing | StreamState::Corked | StreamState::Prebuffering(_)
+				) {
+					let min_req = stream.buffer_attr.minimum_request_length as usize;
+					let in_prebuf = matches!(stream.state, StreamState::Prebuffering(_));
+					let req = pop_missing(&mut stream.missing, &mut stream.requested, min_req, in_prebuf);
+					if req > 0 {
+						pulse::write_command_message(
+							&mut client.socket,
+							u32::MAX,
+							&pulse::Command::Request(pulse::Request {
+								channel: *id,
+								length: req as u32,
+							}),
+							client.protocol_version,
+						)?;
+					}
 				}
 			}
 

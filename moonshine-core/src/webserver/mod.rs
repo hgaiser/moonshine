@@ -6,7 +6,6 @@ use std::{
 	str::FromStr,
 };
 
-use crate::ShutdownReason;
 use async_shutdown::ShutdownManager;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
@@ -19,19 +18,61 @@ use hyper_util::rt::tokio::TokioIo;
 use image::imageops::FilterType;
 use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpListener;
 
 use crate::{
 	clients::ClientManager,
-	config::Config,
-	session::{manager::SessionManager, SessionContext, SessionKeyData, SessionKeys, APP_LAUNCH_HTTP_TIMEOUT_SECS},
+	session::{
+		application::ApplicationConfig, compositor::CompositorConfig, manager::SessionManager, SessionContext,
+		SessionKeyData, SessionKeys, APP_LAUNCH_HTTP_TIMEOUT_SECS,
+	},
 	tls::TlsAcceptor,
+	ShutdownReason,
 };
 
 use self::pairing::handle_pair_request;
 
+use super::session::stream::audio::AudioChannels;
+
 mod pairing;
+
+/// Configuration for the embedded webserver.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WebserverConfig {
+	/// Port of the webserver.
+	pub port: u16,
+
+	/// Port of the HTTPS webserver.
+	pub port_https: u16,
+
+	/// Whether to allow new clients to pair.
+	#[serde(default = "default_enable_pairing")]
+	pub enable_pairing: bool,
+
+	/// Path to the certificate for SSL encryption.
+	pub certificate: PathBuf,
+
+	/// Path to the private key for SSL encryption.
+	pub private_key: PathBuf,
+}
+
+fn default_enable_pairing() -> bool {
+	true
+}
+
+impl Default for WebserverConfig {
+	fn default() -> Self {
+		Self {
+			port: 47989,
+			port_https: 47984,
+			enable_pairing: default_enable_pairing(),
+			certificate: "$HOME/.config/moonshine/cert.pem".into(),
+			private_key: "$HOME/.config/moonshine/key.pem".into(),
+		}
+	}
+}
 
 // The negative fourth value is to indicate that we are following the protocol introduced with Sunshine.
 const SERVERINFO_APP_VERSION: &str = "7.1.431.-1";
@@ -54,7 +95,10 @@ enum ServerCodecModeSupport {
 
 #[derive(Clone)]
 pub struct Webserver {
-	config: Config,
+	hostname: String,
+	rtsp_port: u16,
+	webserver_config: WebserverConfig,
+	applications: Vec<ApplicationConfig>,
 	unique_id: String,
 	client_manager: ClientManager,
 	session_manager: SessionManager,
@@ -65,8 +109,13 @@ pub struct Webserver {
 
 impl Webserver {
 	#[allow(clippy::result_unit_err)]
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		config: Config,
+		hostname: String,
+		rtsp_port: u16,
+		webserver_config: WebserverConfig,
+		applications: Vec<ApplicationConfig>,
+		compositor_config: CompositorConfig,
 		unique_id: String,
 		// Passing certificate content as string.
 		server_certs: String,
@@ -76,10 +125,13 @@ impl Webserver {
 	) -> Result<Self, ()> {
 		// Gate HDR advertisement on both the config flag and a runtime
 		// GPU capability probe (10-bit or FP16 render formats).
-		let hdr_supported = config.compositor.hdr && super::session::compositor::probe_hdr_support(&config.compositor);
+		let hdr_supported = compositor_config.hdr && super::session::compositor::probe_hdr_support(&compositor_config);
 
 		let server = Self {
-			config: config.clone(),
+			hostname,
+			rtsp_port,
+			webserver_config,
+			applications,
 			unique_id,
 			client_manager,
 			session_manager,
@@ -89,23 +141,16 @@ impl Webserver {
 		};
 
 		// Run HTTP webserver.
-		let http_address = (config.address.clone(), config.webserver.port)
+		let http_address = ("0.0.0.0", server.webserver_config.port)
 			.to_socket_addrs()
 			.map_err(|e| {
 				tracing::error!(
-					"Failed to resolve address '{}:{}': {e}",
-					config.address,
-					config.webserver.port
+					"Failed to resolve address '0.0.0.0:{}': {e}",
+					server.webserver_config.port
 				)
 			})?
 			.next()
-			.ok_or_else(|| {
-				tracing::error!(
-					"Failed to resolve address '{}:{}'",
-					config.address,
-					config.webserver.port
-				)
-			})?;
+			.ok_or_else(|| tracing::error!("Failed to resolve address '0.0.0.0:{}'", server.webserver_config.port))?;
 
 		tokio::spawn({
 			let server = server.clone();
@@ -175,21 +220,19 @@ impl Webserver {
 		});
 
 		// Run HTTPS webserver.
-		let https_address = (config.address.clone(), config.webserver.port_https)
+		let https_address = ("0.0.0.0", server.webserver_config.port_https)
 			.to_socket_addrs()
 			.map_err(|e| {
 				tracing::error!(
-					"Failed to resolve address '{}:{}': {e}",
-					config.address,
-					config.webserver.port_https
+					"Failed to resolve address '0.0.0.0:{}': {e}",
+					server.webserver_config.port_https
 				)
 			})?
 			.next()
 			.ok_or_else(|| {
 				tracing::error!(
-					"Failed to resolve address '{}:{}'",
-					config.address,
-					config.webserver.port_https
+					"Failed to resolve address '0.0.0.0:{}'",
+					server.webserver_config.port_https
 				)
 			})?;
 
@@ -202,8 +245,10 @@ impl Webserver {
 							let listener = TcpListener::bind(https_address)
 								.await
 								.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
-							let acceptor =
-								TlsAcceptor::from_config(config.webserver.certificate, config.webserver.private_key)?;
+							let acceptor = TlsAcceptor::from_config(
+								server.webserver_config.certificate.clone(),
+								server.webserver_config.private_key.clone(),
+							)?;
 
 							tracing::debug!("HTTPS server listening for connections on {https_address}");
 							loop {
@@ -307,7 +352,7 @@ impl Webserver {
 					self.app_asset(params)
 				},
 				(&Method::GET, "/pair") => {
-					if !self.config.webserver.enable_pairing {
+					if !self.webserver_config.enable_pairing {
 						tracing::warn!("Pairing is disabled in configuration.");
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
@@ -317,12 +362,12 @@ impl Webserver {
 						local_address,
 						&self.server_certs,
 						&self.client_manager,
-						self.config.webserver.port,
+						self.webserver_config.port,
 						&self.shutdown,
 					)
 					.await
 				},
-				// (&Method::GET, "/unpair") => self.unpair(params).await,
+				(&Method::GET, "/unpair") => self.unpair(params).await,
 				(&Method::GET, "/launch") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
@@ -350,7 +395,7 @@ impl Webserver {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
 				(&Method::GET, "/pair") => {
-					if !self.config.webserver.enable_pairing {
+					if !self.webserver_config.enable_pairing {
 						tracing::warn!("Pairing is disabled in configuration.");
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
@@ -360,23 +405,24 @@ impl Webserver {
 						local_address,
 						&self.server_certs,
 						&self.client_manager,
-						self.config.webserver.port,
+						self.webserver_config.port,
 						&self.shutdown,
 					)
 					.await
 				},
 				(&Method::GET, "/pin") => {
-					if !self.config.webserver.enable_pairing {
+					if !self.webserver_config.enable_pairing {
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
 					self.pin(params)
 				},
 				(&Method::POST, "/submit-pin") => {
-					if !self.config.webserver.enable_pairing {
+					if !self.webserver_config.enable_pairing {
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
 					self.submit_pin(request).await
 				},
+				(&Method::GET, "/unpair") => self.unpair(params).await,
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
@@ -389,7 +435,7 @@ impl Webserver {
 
 	fn app_list(&self) -> Response<Full<Bytes>> {
 		let mut response = "<root status_code=\"200\">".to_string();
-		for application in self.config.applications.iter() {
+		for application in self.applications.iter() {
 			response += "<App>";
 
 			let hdr_supported = u8::from(self.hdr_supported);
@@ -427,7 +473,7 @@ impl Webserver {
 			},
 		};
 
-		let application = match self.config.applications.iter().find(|&a| a.id() == application_id) {
+		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
@@ -517,11 +563,11 @@ impl Webserver {
 
 		// TODO: Check the use of some of these values, we leave most of them blank and Moonlight doesn't care.
 		let mut response = "<root status_code=\"200\">".to_string();
-		response += &format!("<hostname>{}</hostname>", escape_xml(&self.config.name));
+		response += &format!("<hostname>{}</hostname>", escape_xml(&self.hostname));
 		response += &format!("<appversion>{}</appversion>", SERVERINFO_APP_VERSION);
 		response += &format!("<GfeVersion>{}</GfeVersion>", SERVERINFO_GFE_VERSION);
 		response += &format!("<uniqueid>{}</uniqueid>", self.unique_id);
-		response += &format!("<HttpsPort>{}</HttpsPort>", self.config.webserver.port_https);
+		response += &format!("<HttpsPort>{}</HttpsPort>", self.webserver_config.port_https);
 		response += "<ExternalPort></ExternalPort>";
 		response += &format!("<mac>{}</mac>", mac_address.unwrap_or("".to_string()));
 		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
@@ -632,31 +678,14 @@ impl Webserver {
 		}
 	}
 
-	// This is disabled, because all moonlight clients seem to share the same uniqueid.
-	// This means that if we 'unpair', we unpair all moonlight clients.
-	// TODO: Collaborate with moonlight to give clients a truly unique ID.
-	// async fn unpair(
-	// 	&self,
-	// 	mut params: HashMap<String, String>,
-	// ) -> Response<Full<Bytes>> {
-	// 	let unique_id = match params.remove("uniqueid") {
-	// 		Some(unique_id) => unique_id,
-	// 		None => {
-	// 			let message = format!("Expected 'uniqueid' in unpair request, got {:?}.", params.keys());
-	// 			tracing::warn!("{message}");
-	// 			return bad_request(message);
-	// 		}
-	// 	};
-
-	// 	match self.client_manager.remove_client(&unique_id).await {
-	// 		Ok(()) =>
-	// 			Response::builder()
-	// 				.status(StatusCode::OK)
-	// 				.body(Full::new(Bytes::from("Successfully unpaired.".to_string())))
-	// 				.unwrap(),
-	// 		Err(()) => bad_request("Failed to remove client".to_string()),
-	// 	}
-	// }
+	async fn unpair(&self, _params: HashMap<String, String>) -> Response<Full<Bytes>> {
+		let xml = r#"<root status_code="200"/>"#;
+		let mut response = Response::new(Full::new(Bytes::from(xml)));
+		response
+			.headers_mut()
+			.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
+		response
+	}
 
 	async fn launch(
 		&self,
@@ -761,13 +790,13 @@ impl Webserver {
 			.remove("surroundAudioInfo")
 			.and_then(|s| s.parse().ok())
 			.unwrap_or(196610); // Default: stereo (0x30002)
-		let audio_channels = super::session::stream::AudioChannels::from((surround_audio_info & 0xFFFF) as u8);
+		let audio_channels = AudioChannels::from((surround_audio_info & 0xFFFF) as u8);
 		let audio_channel_mask = surround_audio_info >> 16;
 
 		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);
 		let hdr = hdr_mode != 0;
 
-		let application = match self.config.applications.iter().find(|&a| a.id() == application_id) {
+		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
@@ -822,11 +851,7 @@ impl Webserver {
 		let mut response = "<root status_code=\"200\">".to_string();
 		response += "<gamesession>1</gamesession>";
 		if let Some(addr) = local_address {
-			response += &format!(
-				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
-				addr.ip(),
-				self.config.stream.port
-			);
+			response += &format!("<sessionUrl0>rtsp://{}:{}</sessionUrl0>", addr.ip(), self.rtsp_port);
 		}
 		response += "</root>";
 
@@ -896,11 +921,7 @@ impl Webserver {
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		if let Some(addr) = local_address {
-			response += &format!(
-				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
-				addr.ip(),
-				self.config.stream.port
-			);
+			response += &format!("<sessionUrl0>rtsp://{}:{}</sessionUrl0>", addr.ip(), self.rtsp_port);
 		}
 		response += "<resume>1</resume>";
 		response += "</root>";

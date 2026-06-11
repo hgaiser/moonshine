@@ -213,14 +213,24 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			tracing::trace!(target: "input", "Scroll vertical: {amount}");
 
 			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.axis(state, AxisFrame::new(time).value(Axis::Vertical, -(amount as f64)));
+			pointer.axis(
+				state,
+				AxisFrame::new(time)
+					.value(Axis::Vertical, -(amount as f64) / 120.0 * 15.0)
+					.v120(Axis::Vertical, -amount as i32),
+			);
 			pointer.frame(state);
 		},
 		CompositorInputEvent::ScrollHorizontal { amount } => {
 			tracing::trace!(target: "input", "Scroll horizontal: {amount}");
 
 			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.axis(state, AxisFrame::new(time).value(Axis::Horizontal, amount as f64));
+			pointer.axis(
+				state,
+				AxisFrame::new(time)
+					.value(Axis::Horizontal, amount as f64 / 120.0 * 15.0)
+					.v120(Axis::Horizontal, amount as i32),
+			);
 			pointer.frame(state);
 		},
 	}

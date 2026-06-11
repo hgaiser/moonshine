@@ -19,7 +19,9 @@ use crate::session::SessionKeysReceiver;
 
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::shard_batch::ShardBatch;
-use crate::session::stream::video::{VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamContext};
+use crate::session::stream::video::{
+	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
+};
 
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
@@ -125,6 +127,7 @@ impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
 		packet_tx: mpsc::Sender<ShardBatch>,
@@ -132,10 +135,15 @@ impl VideoPipeline {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
+		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
-		let inner = VideoPipelineInner { context, keys_rx };
+		let inner = VideoPipelineInner {
+			config,
+			context,
+			keys_rx,
+		};
 
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
@@ -147,6 +155,7 @@ impl VideoPipeline {
 					stop_session_manager,
 					hdr_metadata_tx,
 					start_notify,
+					stats_tx,
 				);
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
@@ -156,12 +165,14 @@ impl VideoPipeline {
 }
 
 struct VideoPipelineInner {
+	config: VideoStreamConfig,
 	context: VideoStreamContext,
 	keys_rx: SessionKeysReceiver,
 }
 
 impl VideoPipelineInner {
-	pub fn run(
+	#[allow(clippy::too_many_arguments)]
+	fn run(
 		self,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		packet_tx: mpsc::Sender<ShardBatch>,
@@ -169,6 +180,7 @@ impl VideoPipelineInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
+		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) {
 		tracing::debug!("Starting video pipeline.");
 
@@ -202,6 +214,7 @@ impl VideoPipelineInner {
 			idr_frame_request_rx,
 			stop_session_manager,
 			hdr_metadata_tx,
+			stats_tx,
 		) {
 			tracing::error!("Video encoding loop failed: {e}");
 		}
@@ -275,11 +288,12 @@ impl VideoPipelineInner {
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
+		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) -> Result<(), String> {
 		let ctx = &self.context;
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
-		packetizer.warm_up(ctx.fec_percentage, ctx.minimum_fec_packets);
+		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
 		let mut sequence_number = 0u32;
 		let mut frame_number = 0u32;
 
@@ -429,21 +443,16 @@ impl VideoPipelineInner {
 				// Determine Vulkan format and input format from the frame's DRM fourcc.
 				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
 
-				// Import the DMA-BUF (reuses cached VkImage for known buffer indices).
-				let (source_image, needs_transition) = match importer.import_or_reuse(
-					frame.buffer_index,
-					frame.width,
-					frame.height,
-					import_vk_format,
-					planes,
-				) {
-					Ok(result) => result,
-					Err(e) => {
-						tracing::warn!("Failed to import DMA-BUF: {e}");
-						frame.consumed.store(true, Ordering::Release);
-						continue;
-					},
-				};
+				// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
+				let (source_image, needs_transition) =
+					match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
+						Ok(result) => result,
+						Err(e) => {
+							tracing::warn!("Failed to import DMA-BUF: {e}");
+							frame.consumed.store(true, Ordering::Release);
+							continue;
+						},
+					};
 
 				// First-time imports are in UNDEFINED layout; the converter
 				// will handle the transition inside its command buffer.
@@ -635,7 +644,7 @@ impl VideoPipelineInner {
 
 				// Warn on spike frames (total > frame interval) so they stand out in logs.
 				let frame_interval_us = 1_000_000 / ctx.fps as u128;
-				if ctx.log_frame_spikes && total.as_micros() > frame_interval_us {
+				if self.config.log_frame_spikes && total.as_micros() > frame_interval_us {
 					tracing::warn!(
 						total_us = total.as_micros() as u64,
 						channel_us = channel_wait.as_micros() as u64,
@@ -660,6 +669,18 @@ impl VideoPipelineInner {
 					packetize: packetize_dur,
 					send: send_dur,
 					total,
+				});
+
+				let _ = stats_tx.send(FrameStats {
+					channel_wait,
+					import: import_dur,
+					convert: convert_dur,
+					encode: encode_dur,
+					packetize: packetize_dur,
+					send: send_dur,
+					total,
+					encoded_bytes,
+					is_key_frame,
 				});
 
 				// Periodic summary every 5 seconds.
@@ -736,7 +757,7 @@ impl VideoPipelineInner {
 			packet.is_key_frame,
 			ctx.packet_size,
 			ctx.minimum_fec_packets,
-			ctx.fec_percentage,
+			self.config.fec_percentage,
 			*frame_number,
 			sequence_number,
 			rtp_timestamp,
