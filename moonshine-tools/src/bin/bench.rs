@@ -386,7 +386,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 				break;
 			},
 			_ = tokio::time::sleep(duration_remaining) => {
-				if duration_remaining.as_secs() > 0 {
+				if duration_deadline.is_some_and(|d| Instant::now() >= d) {
 					tracing::info!("Duration reached, stopping...");
 					break;
 				}
