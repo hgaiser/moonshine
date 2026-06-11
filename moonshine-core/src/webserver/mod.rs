@@ -20,6 +20,7 @@ use image::ImageFormat;
 use network_interface::NetworkInterfaceConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 
 use crate::{
@@ -95,7 +96,7 @@ enum ServerCodecModeSupport {
 
 #[derive(Clone)]
 pub struct Webserver {
-	hostname: String,
+	name: String,
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
 	applications: Vec<ApplicationConfig>,
@@ -111,7 +112,8 @@ impl Webserver {
 	#[allow(clippy::result_unit_err)]
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		hostname: String,
+		name: String,
+		address: String,
 		rtsp_port: u16,
 		webserver_config: WebserverConfig,
 		applications: Vec<ApplicationConfig>,
@@ -128,7 +130,7 @@ impl Webserver {
 		let hdr_supported = compositor_config.hdr && super::session::compositor::probe_hdr_support(&compositor_config);
 
 		let server = Self {
-			hostname,
+			name,
 			rtsp_port,
 			webserver_config,
 			applications,
@@ -141,16 +143,23 @@ impl Webserver {
 		};
 
 		// Run HTTP webserver.
-		let http_address = ("0.0.0.0", server.webserver_config.port)
+		let http_address = (address.as_str(), server.webserver_config.port)
 			.to_socket_addrs()
 			.map_err(|e| {
 				tracing::error!(
-					"Failed to resolve address '0.0.0.0:{}': {e}",
+					"Failed to resolve address '{}' port {}: {e}",
+					address,
 					server.webserver_config.port
 				)
 			})?
 			.next()
-			.ok_or_else(|| tracing::error!("Failed to resolve address '0.0.0.0:{}'", server.webserver_config.port))?;
+			.ok_or_else(|| {
+				tracing::error!(
+					"Failed to resolve address '{}' port {}",
+					address,
+					server.webserver_config.port
+				)
+			})?;
 
 		tokio::spawn({
 			let server = server.clone();
@@ -161,8 +170,7 @@ impl Webserver {
 				let _ = shutdown
 					.wrap_cancel(
 						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpShutdown, async move {
-							let listener = TcpListener::bind(http_address)
-								.await
+							let listener = bind_listener(http_address)
 								.map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
 
 							tracing::debug!("HTTP server listening for connections on {http_address}");
@@ -173,7 +181,7 @@ impl Webserver {
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
 								tracing::trace!("Accepted connection from {address}.");
 
-								let address = connection.local_addr().ok();
+								let address = connection.local_addr().ok().map(unmap_v4_mapped);
 								let mac_address = if let Some(address) = address {
 									get_mac_address(address.ip()).unwrap_or(None)
 								} else {
@@ -220,18 +228,20 @@ impl Webserver {
 		});
 
 		// Run HTTPS webserver.
-		let https_address = ("0.0.0.0", server.webserver_config.port_https)
+		let https_address = (address.as_str(), server.webserver_config.port_https)
 			.to_socket_addrs()
 			.map_err(|e| {
 				tracing::error!(
-					"Failed to resolve address '0.0.0.0:{}': {e}",
+					"Failed to resolve address '{}' port {}: {e}",
+					address,
 					server.webserver_config.port_https
 				)
 			})?
 			.next()
 			.ok_or_else(|| {
 				tracing::error!(
-					"Failed to resolve address '0.0.0.0:{}'",
+					"Failed to resolve address '{}' port {}",
+					address,
 					server.webserver_config.port_https
 				)
 			})?;
@@ -242,8 +252,7 @@ impl Webserver {
 				let _ = shutdown
 					.wrap_cancel(
 						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpsShutdown, async move {
-							let listener = TcpListener::bind(https_address)
-								.await
+							let listener = bind_listener(https_address)
 								.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
 							let acceptor = TlsAcceptor::from_config(
 								server.webserver_config.certificate.clone(),
@@ -258,7 +267,7 @@ impl Webserver {
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
 								tracing::trace!("Accepted TLS connection from {address}.");
 
-								let address = connection.local_addr().ok();
+								let address = connection.local_addr().ok().map(unmap_v4_mapped);
 								let mac_address = if let Some(address) = address {
 									get_mac_address(address.ip()).unwrap_or(None)
 								} else {
@@ -566,7 +575,7 @@ impl Webserver {
 
 		// TODO: Check the use of some of these values, we leave most of them blank and Moonlight doesn't care.
 		let mut response = "<root status_code=\"200\">".to_string();
-		response += &format!("<hostname>{}</hostname>", escape_xml(&self.hostname));
+		response += &format!("<hostname>{}</hostname>", escape_xml(&self.name));
 		response += &format!("<appversion>{}</appversion>", SERVERINFO_APP_VERSION);
 		response += &format!("<GfeVersion>{}</GfeVersion>", SERVERINFO_GFE_VERSION);
 		response += &format!("<uniqueid>{}</uniqueid>", self.unique_id);
@@ -854,7 +863,11 @@ impl Webserver {
 		let mut response = "<root status_code=\"200\">".to_string();
 		response += "<gamesession>1</gamesession>";
 		if let Some(addr) = local_address {
-			response += &format!("<sessionUrl0>rtsp://{}:{}</sessionUrl0>", addr.ip(), self.rtsp_port);
+			response += &format!(
+				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
+				rtsp_host(addr.ip()),
+				self.rtsp_port
+			);
 		}
 		response += "</root>";
 
@@ -924,7 +937,11 @@ impl Webserver {
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		if let Some(addr) = local_address {
-			response += &format!("<sessionUrl0>rtsp://{}:{}</sessionUrl0>", addr.ip(), self.rtsp_port);
+			response += &format!(
+				"<sessionUrl0>rtsp://{}:{}</sessionUrl0>",
+				rtsp_host(addr.ip()),
+				self.rtsp_port
+			);
 		}
 		response += "<resume>1</resume>";
 		response += "</root>";
@@ -973,6 +990,45 @@ impl Webserver {
 				Some(unauthorized("No client certificate provided."))
 			},
 		}
+	}
+}
+
+/// Bind a TCP listener for the webserver. When the address is IPv6 we disable
+/// `IPV6_V6ONLY` so the single socket also accepts IPv4-mapped connections. This
+/// lets clients reach us over whichever family mDNS advertised (avahi publishes
+/// both an A and AAAA record), avoiding the "online/offline" flip-flop that
+/// happens when one family has no listener.
+fn bind_listener(address: SocketAddr) -> std::io::Result<TcpListener> {
+	let socket = Socket::new(Domain::for_address(address), Type::STREAM, Some(Protocol::TCP))?;
+	if address.is_ipv6() {
+		socket.set_only_v6(false)?;
+	}
+	socket.set_reuse_address(true)?;
+	socket.bind(&address.into())?;
+	socket.listen(1024)?;
+	socket.set_nonblocking(true)?;
+	TcpListener::from_std(socket.into())
+}
+
+/// Collapse an IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) back to plain IPv4.
+/// Connections arriving over IPv4 on a dual-stack socket report such an address;
+/// normalizing keeps MAC lookups and session URLs using the real IPv4 address.
+fn unmap_v4_mapped(addr: SocketAddr) -> SocketAddr {
+	match addr.ip() {
+		IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+			Some(v4) => SocketAddr::new(IpAddr::V4(v4), addr.port()),
+			None => addr,
+		},
+		IpAddr::V4(_) => addr,
+	}
+}
+
+/// Format an IP address for use as the host part of an RTSP URL. IPv6 addresses
+/// must be wrapped in brackets (`rtsp://[::1]:48010`) to be a valid URL.
+fn rtsp_host(ip: IpAddr) -> String {
+	match ip {
+		IpAddr::V4(v4) => v4.to_string(),
+		IpAddr::V6(v6) => format!("[{v6}]"),
 	}
 }
 

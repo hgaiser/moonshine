@@ -2335,6 +2335,7 @@ dependencies = [
  "shellexpand",
  "shlex",
  "smithay",
+ "socket2 0.5.10",
  "steamlocate",
  "strum_macros",
  "tempfile",
