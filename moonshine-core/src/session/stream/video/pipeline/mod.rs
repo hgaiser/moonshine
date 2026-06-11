@@ -27,7 +27,7 @@ use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodedPacket, Encoder,
-	InputFormat, OutputFormat, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
+	InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
 
 /// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
@@ -57,6 +57,21 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 		},
 		0x48344241 | 0x48344258 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT), // ABGR/XBGR16161616F
 		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                               // ARGB/XRGB8888 (fallback)
+	}
+}
+
+/// Whether a pixelforge error indicates Vulkan device loss.
+///
+/// Device loss is unrecoverable on the existing device: every subsequent GPU
+/// operation fails the same way, so the encoding loop must exit (shutting the
+/// session down) instead of retrying forever and freezing the stream.
+fn is_device_lost(e: &PixelForgeError) -> bool {
+	match e {
+		PixelForgeError::Vulkan(result) => *result == vk::Result::ERROR_DEVICE_LOST,
+		// Other variants (e.g. CommandBuffer) stringify the underlying
+		// vk::Result, whose ash display text is "The logical device has been
+		// lost. See <...>".
+		_ => e.to_string().contains("device has been lost"),
 	}
 }
 
@@ -564,8 +579,11 @@ impl VideoPipelineInner {
 
 				// Convert to YUV.
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					tracing::warn!("GPU color conversion failed: {e}");
 					frame.consumed.store(true, Ordering::Release);
+					if is_device_lost(&e) {
+						return Err(format!("GPU color conversion failed: {e}"));
+					}
+					tracing::warn!("GPU color conversion failed: {e}");
 					continue;
 				}
 
@@ -646,6 +664,9 @@ impl VideoPipelineInner {
 						}
 					},
 					Err(e) => {
+						if is_device_lost(&e) {
+							return Err(format!("Failed to encode frame: {e}"));
+						}
 						tracing::warn!("Failed to encode frame: {e}");
 					},
 				}
@@ -807,9 +828,9 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
-	use super::{drm_fourcc_to_input, BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS};
+	use super::{drm_fourcc_to_input, is_device_lost, BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS};
 	use ash::vk;
-	use pixelforge::InputFormat;
+	use pixelforge::{InputFormat, PixelForgeError};
 
 	// DRM fourccs — kept in the test module to document the byte ordering
 	// explicitly and guard against accidental typos in the production match.
@@ -861,6 +882,26 @@ mod tests {
 		let (fmt, vk) = drm_fourcc_to_input(0xDEADBEEF);
 		assert_eq!(fmt, InputFormat::BGRx);
 		assert_eq!(vk, vk::Format::B8G8R8A8_UNORM);
+	}
+
+	#[test]
+	fn device_lost_is_detected_in_both_error_shapes() {
+		// Structured variant.
+		assert!(is_device_lost(&PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST)));
+		// String variant: pixelforge wraps the vk::Result display text, e.g.
+		// CommandBuffer("The logical device has been lost. See <...>") —
+		// the shape observed when a stale DMA-BUF import faults the GPU.
+		assert!(is_device_lost(&PixelForgeError::CommandBuffer(
+			vk::Result::ERROR_DEVICE_LOST.to_string()
+		)));
+	}
+
+	#[test]
+	fn recoverable_errors_are_not_device_lost() {
+		assert!(!is_device_lost(&PixelForgeError::Vulkan(vk::Result::TIMEOUT)));
+		assert!(!is_device_lost(&PixelForgeError::CommandBuffer(
+			"submit failed".to_string()
+		)));
 	}
 
 	#[test]

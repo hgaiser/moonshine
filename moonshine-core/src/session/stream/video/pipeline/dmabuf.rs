@@ -14,6 +14,13 @@
 //! underlying DMA-BUF fd is stable. ObjectId-keying would miss the cache
 //! every frame; FD-keying catches the reuse.
 //!
+//! The kernel also recycles fd numbers for *new* buffers (e.g. when a game
+//! recreates its swapchain after switching HDR format from PQ to scRGB), so a
+//! cache hit on the fd alone may actually be a different buffer. A hit is only
+//! trusted when the import parameters (dimensions, format, plane layout,
+//! modifier) also match; mismatched entries are retired and freed after
+//! `CACHE_TTL`, once any in-flight GPU work using them has completed.
+//!
 //! The cache evicts entries that have not been touched in `CACHE_TTL`. The
 //! compositor holds client buffers alive until the encoder signals `consumed`,
 //! so the fd is guaranteed valid during import. The 2s TTL ensures any
@@ -51,10 +58,42 @@ pub(crate) struct DmaBufPlane {
 	pub modifier: u64,
 }
 
+/// Identifying parameters of a DMA-BUF import. A cached image may only be
+/// reused when all of these match the new request; a mismatch on the same fd
+/// means the fd number was recycled for a different buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ImportParams {
+	width: u32,
+	height: u32,
+	format: vk::Format,
+	modifier: u64,
+	plane_count: usize,
+	/// (offset, stride) per plane.
+	plane_layouts: [(u32, u32); 4],
+}
+
+impl ImportParams {
+	fn new(width: u32, height: u32, format: vk::Format, planes: &[DmaBufPlane]) -> Self {
+		let mut plane_layouts = [(0, 0); 4];
+		for (i, p) in planes.iter().take(4).enumerate() {
+			plane_layouts[i] = (p.offset, p.stride);
+		}
+		Self {
+			width,
+			height,
+			format,
+			modifier: planes.first().map_or(0, |p| p.modifier),
+			plane_count: planes.len().min(4),
+			plane_layouts,
+		}
+	}
+}
+
 /// Cached Vulkan resources for a single compositor buffer slot.
 struct CachedImport {
 	image: vk::Image,
 	memory: vk::DeviceMemory,
+	params: ImportParams,
 	last_used: Instant,
 }
 
@@ -69,6 +108,9 @@ pub(crate) struct DmaBufImporter {
 	/// Per-FD cache — keyed by the DMA-BUF fd so the same underlying buffer
 	/// is reused even when the driver wraps it in new `wl_buffer` objects.
 	cache: HashMap<RawFd, CachedImport>,
+	/// Imports whose fd was recycled for a different buffer, awaiting TTL
+	/// expiry before destruction (in-flight GPU work may still reference them).
+	retired: Vec<CachedImport>,
 	/// Calls since the last stale-entry sweep.
 	calls_since_sweep: u32,
 }
@@ -82,12 +124,13 @@ impl DmaBufImporter {
 			context,
 			external_memory_fd,
 			cache: HashMap::new(),
+			retired: Vec::new(),
 			calls_since_sweep: 0,
 		})
 	}
 
 	/// Import a DMA-BUF as a Vulkan image, reusing a cached import when
-	/// the same DMA-BUF fd has been seen before.
+	/// the same DMA-BUF fd has been seen before with the same parameters.
 	///
 	/// The `format` parameter specifies the Vulkan format matching the DMA-BUF
 	/// pixel format (e.g. `B8G8R8A8_UNORM` for SDR, `A2B10G10R10_UNORM_PACK32`
@@ -111,10 +154,28 @@ impl DmaBufImporter {
 			self.evict_stale();
 		}
 
+		let params = ImportParams::new(width, height, format, planes);
+
 		let now = Instant::now();
 		if let Some(cached) = self.cache.get_mut(&fd) {
-			cached.last_used = now;
-			return Ok((cached.image, false));
+			if cached.params == params {
+				cached.last_used = now;
+				return Ok((cached.image, false));
+			}
+		}
+
+		// A leftover entry here means the fd number was recycled for a
+		// different buffer (e.g. a swapchain recreation when the game switches
+		// HDR format). Reusing the stale image would make the GPU read the old
+		// buffer with the wrong format/stride — a device-lost fault. Retire it
+		// for TTL-deferred destruction in case prior GPU work still uses it.
+		if let Some(mut stale) = self.cache.remove(&fd) {
+			debug!(
+				"fd {fd} now refers to a different buffer ({:?} -> {:?}); retiring stale import",
+				stale.params, params
+			);
+			stale.last_used = now;
+			self.retired.push(stale);
 		}
 
 		// First time seeing this DMA-BUF — full import.
@@ -130,6 +191,7 @@ impl DmaBufImporter {
 			CachedImport {
 				image,
 				memory,
+				params,
 				last_used: now,
 			},
 		);
@@ -143,8 +205,7 @@ impl DmaBufImporter {
 	fn evict_stale(&mut self) {
 		let cutoff = Instant::now() - CACHE_TTL;
 		let device = self.context.device();
-		let before = self.cache.len();
-		self.cache.retain(|_, v| {
+		let destroy_if_expired = |v: &CachedImport| {
 			if v.last_used < cutoff {
 				unsafe {
 					device.destroy_image(v.image, None);
@@ -154,8 +215,11 @@ impl DmaBufImporter {
 			} else {
 				true
 			}
-		});
-		let evicted = before - self.cache.len();
+		};
+		let before = self.cache.len() + self.retired.len();
+		self.cache.retain(|_, v| destroy_if_expired(v));
+		self.retired.retain(destroy_if_expired);
+		let evicted = before - self.cache.len() - self.retired.len();
 		if evicted > 0 {
 			trace!(
 				"DmaBufImporter: evicted {evicted} stale cache entries, {} live",
@@ -292,10 +356,49 @@ impl Drop for DmaBufImporter {
 	fn drop(&mut self) {
 		let device = self.context.device();
 		unsafe {
-			for (_, cached) in self.cache.drain() {
+			for cached in self.cache.drain().map(|(_, v)| v).chain(self.retired.drain(..)) {
 				device.destroy_image(cached.image, None);
 				device.free_memory(cached.memory, None);
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{DmaBufPlane, ImportParams};
+	use ash::vk;
+
+	fn plane(offset: u32, stride: u32) -> DmaBufPlane {
+		DmaBufPlane {
+			fd: 42,
+			offset,
+			stride,
+			modifier: 0xdead,
+		}
+	}
+
+	#[test]
+	fn import_params_match_for_identical_buffer() {
+		let a = ImportParams::new(1920, 1080, vk::Format::A2B10G10R10_UNORM_PACK32, &[plane(0, 7680)]);
+		let b = ImportParams::new(1920, 1080, vk::Format::A2B10G10R10_UNORM_PACK32, &[plane(0, 7680)]);
+		assert_eq!(a, b);
+	}
+
+	#[test]
+	fn import_params_detect_recycled_fd_after_format_switch() {
+		// PQ→scRGB swapchain recreation: the new FP16 buffer can land on the
+		// same fd number as the destroyed 10-bit buffer, with a different
+		// format and stride. The cache must not treat this as a hit.
+		let pq = ImportParams::new(1920, 1080, vk::Format::A2B10G10R10_UNORM_PACK32, &[plane(0, 7680)]);
+		let scrgb = ImportParams::new(1920, 1080, vk::Format::R16G16B16A16_SFLOAT, &[plane(0, 15360)]);
+		assert_ne!(pq, scrgb);
+	}
+
+	#[test]
+	fn import_params_detect_stride_only_change() {
+		let a = ImportParams::new(1920, 1080, vk::Format::R16G16B16A16_SFLOAT, &[plane(0, 15360)]);
+		let b = ImportParams::new(1920, 1080, vk::Format::R16G16B16A16_SFLOAT, &[plane(0, 16384)]);
+		assert_ne!(a, b);
 	}
 }
