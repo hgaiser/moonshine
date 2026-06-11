@@ -75,7 +75,6 @@ xcursor = "0.3.10"
 wayland-scanner = "0.31"
 
 # Session (video stream)
-# scRGB-linear→BT.2020+PQ support via the `Bt709LinearToBt2020Pq` color space (PR hgaiser/pixelforge#15).
 pixelforge = { git = "https://github.com/hgaiser/pixelforge", rev = "d33166e4d22e3cb8c0b9cad16be705183737174b", features = ["dmabuf"] }
 
 # Session (audio stream)
