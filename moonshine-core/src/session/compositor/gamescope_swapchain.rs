@@ -64,12 +64,11 @@ fn handle_swapchain_feedback(
 				cm.set_gamescope_colorspace(surface, TransferFunction::St2084Pq, Primaries::Bt2020);
 			},
 			// scRGB (extended sRGB, fp16): used by DXGI HDR games such as Control.
-			// Unlike the wp_color_manager `create_windows_scrgb` path (where DXVK
-			// pre-converts to BT.2020+PQ), the buffers arriving via gamescope swapchain
-			// feedback are still linear BT.709 with values > 1.0 for HDR highlights.
-			// Tag them as scRGB-linear so the encoder applies the BT.709→BT.2020 gamut
-			// mapping + PQ OETF instead of treating them as already-encoded BT.2020+PQ
-			// (which over-saturates and crushes highlights).
+			// The buffers arriving via gamescope swapchain feedback are linear
+			// BT.709 with values > 1.0 for HDR highlights. Tag them as scRGB-linear
+			// so the encoder applies the BT.709→BT.2020 gamut mapping + PQ OETF
+			// instead of treating them as already-encoded BT.2020+PQ (which
+			// over-saturates and crushes highlights).
 			VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT | VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT => {
 				tracing::info!("swapchain_feedback: extended sRGB (scRGB) detected, activating HDR");
 				cm.set_gamescope_colorspace(surface, TransferFunction::ScrgbLinear, Primaries::Srgb);

@@ -93,7 +93,6 @@ impl ImageDescription {
 		}
 	}
 
-	#[cfg(test)]
 	pub fn scrgb_linear() -> Self {
 		Self {
 			transfer_function: TransferFunction::ScrgbLinear,
@@ -448,12 +447,14 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor
 			},
 
 			wp_color_manager_v1::Request::CreateWindowsScrgb { image_description } => {
-				// Windows scRGB officially means BT.709 primaries + extended linear,
-				// but Proton/DXVK's gamescope WSI layer converts the scRGB surface data
-				// to BT.2020+PQ before submitting the buffer. We therefore map it to
-				// Bt2020Pq so the encoder treats the content as passthrough HDR rather
-				// than applying an unnecessary sRGB→BT.2020+PQ conversion.
-				let desc = ImageDescription::bt2020_pq();
+				// Windows scRGB is linear light with sRGB/BT.709 primaries (values
+				// > 1.0 for HDR highlights). Tag it scRGB-linear so the encoder
+				// applies the BT.709→BT.2020 gamut mapping + PQ OETF. DXVK content
+				// never arrives here: Mesa's Vulkan WSI expresses scRGB as a
+				// parametric ext_linear description (which we don't advertise, so
+				// DXVK falls back to an HDR10 swapchain and pre-converts). Only
+				// clients implementing windows_scrgb directly (e.g. mpv) use this.
+				let desc = ImageDescription::scrgb_linear();
 				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
 				resource.ready(0);
 			},
