@@ -86,14 +86,23 @@ struct LatencySample {
 	packetize: std::time::Duration,
 	send: std::time::Duration,
 	total: std::time::Duration,
+	encoded_bytes: usize,
+	is_key_frame: bool,
 }
 
 /// Log a summary of latency statistics over a batch of samples.
-fn log_latency_summary(samples: &[LatencySample]) {
+///
+/// `elapsed` is the wall-clock time the batch was collected over, used to
+/// derive throughput (fps, bitrate).
+fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) {
 	let n = samples.len();
 	if n == 0 {
 		return;
 	}
+
+	let elapsed_s = elapsed.as_secs_f64().max(f64::EPSILON);
+	let bytes_total: usize = samples.iter().map(|s| s.encoded_bytes).sum();
+	let keyframes = samples.iter().filter(|s| s.is_key_frame).count();
 
 	let mut totals: Vec<u64> = samples.iter().map(|s| s.total.as_micros() as u64).collect();
 	totals.sort_unstable();
@@ -122,6 +131,9 @@ fn log_latency_summary(samples: &[LatencySample]) {
 
 	tracing::debug!(
 		frames = n,
+		fps = (n as f64 / elapsed_s).round() as u32,
+		bitrate_kbps = ((bytes_total * 8) as f64 / elapsed_s / 1000.0).round() as u64,
+		keyframes,
 		total_p50_us = p50(&totals),
 		total_p95_us = p95(&totals),
 		total_p99_us = p99(&totals),
@@ -718,6 +730,8 @@ impl VideoPipelineInner {
 					packetize: packetize_dur,
 					send: send_dur,
 					total,
+					encoded_bytes,
+					is_key_frame,
 				});
 
 				let _ = stats_tx.send(FrameStats {
@@ -734,7 +748,7 @@ impl VideoPipelineInner {
 
 				// Periodic summary every 5 seconds.
 				if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
-					log_latency_summary(&latency_samples);
+					log_latency_summary(&latency_samples, last_summary_time.elapsed());
 					latency_samples.clear();
 					last_summary_time = std::time::Instant::now();
 				}
