@@ -54,7 +54,6 @@ The following dependencies are required to build:
 
 ```sh
 sudo pacman -S \
-   avahi \
    clang \
    cmake \
    gcc-libs \
