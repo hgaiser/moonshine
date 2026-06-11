@@ -347,7 +347,7 @@ impl Webserver {
 
 		let response = if https {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
 				(&Method::GET, "/applist") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
@@ -402,7 +402,7 @@ impl Webserver {
 			}
 		} else {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
 				(&Method::GET, "/pair") => {
 					if !self.webserver_config.enable_pairing {
 						tracing::warn!("Pairing is disabled in configuration.");
@@ -548,6 +548,7 @@ impl Webserver {
 	async fn server_info(
 		&self,
 		params: HashMap<String, String>,
+		local_address: Option<SocketAddr>,
 		mac_address: Option<String>,
 		https: bool,
 	) -> Response<Full<Bytes>> {
@@ -570,6 +571,8 @@ impl Webserver {
 			"0"
 		};
 
+		let local_ip = local_address.map(|addr| addr.ip().to_string()).unwrap_or_default();
+
 		// TODO: Check the use of some of these values, we leave most of them blank and Moonlight doesn't care.
 		let mut response = "<root status_code=\"200\">".to_string();
 		response += &format!("<hostname>{}</hostname>", escape_xml(&self.name));
@@ -580,7 +583,7 @@ impl Webserver {
 		response += "<ExternalPort></ExternalPort>";
 		response += &format!("<mac>{}</mac>", mac_address.unwrap_or("".to_string()));
 		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
-		response += "<LocalIP></LocalIP>";
+		response += &format!("<LocalIP>{}</LocalIP>", escape_xml(local_ip));
 		let server_codec_mode_support = (ServerCodecModeSupport::H264 as u32)
 			| (ServerCodecModeSupport::H264High8444 as u32)
 			| (ServerCodecModeSupport::Hevc as u32)
