@@ -9,7 +9,7 @@ use tracing_subscriber::EnvFilter;
 
 use moonshine_core::clients::ClientManager;
 use moonshine_core::config::Config;
-use moonshine_core::discovery::ZeroconfDiscovery;
+use moonshine_core::discovery::MdnsDiscovery;
 use moonshine_core::rtsp::RtspServer;
 use moonshine_core::session::manager::SessionManager;
 use moonshine_core::webserver::Webserver;
@@ -72,7 +72,7 @@ pub struct Moonshine {
 	_session_manager: SessionManager,
 	_client_manager: ClientManager,
 	_webserver: Webserver,
-	_discovery: ZeroconfDiscovery,
+	_discovery: MdnsDiscovery,
 }
 
 impl Moonshine {
@@ -115,7 +115,7 @@ impl Moonshine {
 				session_manager,
 				shutdown.clone(),
 			)?,
-			_discovery: ZeroconfDiscovery::spawn(config.webserver.port, config.name, shutdown),
+			_discovery: MdnsDiscovery::spawn(&config.address, config.webserver.port, &config.name),
 		})
 	}
 }
