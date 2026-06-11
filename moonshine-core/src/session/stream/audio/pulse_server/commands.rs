@@ -4,7 +4,9 @@ use std::time;
 use pulseaudio::protocol::{self as pulse, ClientInfoList};
 
 use crate::session::stream::audio::pulse_server::dyn_buffer::DynPlaybackBuffer;
-use crate::session::stream::audio::pulse_server::{Client, Error, PlaybackStream, ServerState, StreamState, SINK_NAME};
+use crate::session::stream::audio::pulse_server::{
+	pop_missing, Client, Error, PlaybackStream, ServerState, StreamState, SINK_NAME,
+};
 
 pub(super) fn handle_command(
 	client: &mut Client,
@@ -146,7 +148,10 @@ pub(super) fn handle_command(
 				buffer: DynPlaybackBuffer::new(stream_spec, stream_channel_map, server.capture_spec),
 				volume,
 				muted,
-				requested_bytes: target_length as usize,
+				// Mirrors pa_memblockq_set_tlength: seed missing = tlength so the first
+				// pop_missing() immediately issues the initial REQUEST for a full buffer-fill.
+				missing: target_length as i64,
+				requested: 0,
 				played_bytes: 0,
 				write_offset: 0,
 				read_offset: 0,
@@ -164,6 +169,15 @@ pub(super) fn handle_command(
 
 			client.playback_streams.insert(channel, stream);
 
+			// Pop the initial missing demand so the wire reply carries the correct seeding
+			// REQUEST size, mirroring PA's playback_stream_new() → pop_missing() call.
+			let initial_req = {
+				let stream = client.playback_streams.get_mut(&channel).unwrap();
+				let in_prebuf = matches!(stream.state, StreamState::Prebuffering(_));
+				let min_req = stream.buffer_attr.minimum_request_length as usize;
+				pop_missing(&mut stream.missing, &mut stream.requested, min_req, in_prebuf)
+			};
+
 			let sink_name = CString::new(SINK_NAME).unwrap();
 			let reply = pulse::CreatePlaybackStreamReply {
 				channel,
@@ -171,7 +185,7 @@ pub(super) fn handle_command(
 				sample_spec: stream_spec,
 				channel_map: stream_channel_map,
 				buffer_attr,
-				requested_bytes: target_length,
+				requested_bytes: initial_req as u32,
 				sink_name: Some(sink_name),
 				format: server.default_format_info.clone(),
 				stream_latency: 10000,
@@ -223,25 +237,34 @@ pub(super) fn handle_command(
 					}
 				} else {
 					// Uncork: resume from corked state.
+					// Mirrors PA's PA_SINK_INPUT_MESSAGE_SET_STATE handler:
+					//   prebuf_force() sets in_prebuf=true, then handle_seek() → pop_missing()
+					//   immediately issues a seeding REQUEST from the command handler (not
+					//   deferred to the audio clock) for low startup latency.
 					if stream.state == StreamState::Corked {
-						let needed = stream
-							.buffer_attr
-							.target_length
-							.saturating_sub(stream.buffer.len_bytes() as u32);
+						let buf_len = stream.buffer.len_bytes();
+						let target = stream.buffer_attr.target_length as usize;
+						let min_req = stream.buffer_attr.minimum_request_length as usize;
 
-						stream.state = if needed > 0 {
+						// Reset accounting — any pre-cork in-flight requests are stale.
+						stream.missing = (target.saturating_sub(buf_len)) as i64;
+						stream.requested = 0;
+
+						// pop_missing with in_prebuf=true bypasses the min_req gate,
+						// ensuring an immediate REQUEST even when missing < min_req.
+						let req = pop_missing(&mut stream.missing, &mut stream.requested, min_req, true);
+
+						stream.state = if req > 0 {
 							pulse::write_command_message(
 								&mut client.socket,
 								u32::MAX,
 								&pulse::Command::Request(pulse::Request {
 									channel: params.channel,
-									length: needed,
+									length: req as u32,
 								}),
 								client.protocol_version,
 							)?;
-
-							stream.requested_bytes = needed as usize;
-							StreamState::Prebuffering(needed as u64)
+							StreamState::Prebuffering(req as u64)
 						} else {
 							StreamState::Playing
 						};
@@ -255,7 +278,12 @@ pub(super) fn handle_command(
 		pulse::Command::FlushPlaybackStream(channel) => {
 			if let Some(stream) = client.playback_streams.get_mut(&channel) {
 				stream.buffer.clear();
-				stream.requested_bytes = 0;
+				// Discard all in-flight credit and accumulated demand, then re-seed
+				// missing = target_length so pop_missing immediately issues a fresh
+				// REQUEST on the next clock tick — mirroring PA's flush + handle_seek
+				// path which calls pop_missing right after flushing the queue.
+				stream.missing = stream.buffer_attr.target_length as i64;
+				stream.requested = 0;
 				stream.played_bytes = 0;
 				stream.read_offset = stream.write_offset;
 			}
@@ -331,6 +359,11 @@ pub(super) fn handle_command(
 			if let Some(stream) = client.playback_streams.get_mut(&channel) {
 				if matches!(stream.state, StreamState::Playing) {
 					stream.state = StreamState::Prebuffering(stream.buffer_attr.pre_buffering as u64);
+					// Mirror the underflow re-entry path: seed missing so pop_missing
+					// immediately issues a seeding REQUEST on the next clock tick, and
+					// discard stale in-flight credit accumulated while Playing.
+					stream.missing = stream.buffer_attr.pre_buffering as i64;
+					stream.requested = 0;
 				}
 			}
 			pulse::write_ack_message(&mut client.socket, seq)?;
@@ -364,6 +397,12 @@ pub(super) fn handle_command(
 				stream.buffer_attr = params.buffer_attr;
 				let sample_spec = stream.buffer.sample_spec();
 				configure_buffer(&mut stream.buffer_attr, &sample_spec);
+
+				// Re-seed missing based on the new target so the next pop_missing()
+				// issues a correctly-sized REQUEST.
+				let new_target = stream.buffer_attr.target_length as usize;
+				let buf_len = stream.buffer.len_bytes();
+				stream.missing = (new_target.saturating_sub(buf_len + stream.requested)) as i64;
 
 				write_reply(
 					&mut client.socket,
@@ -504,7 +543,7 @@ pub(super) fn handle_stream_write(client: &mut Client, desc: pulse::Descriptor, 
 	}
 
 	stream.buffer.write(payload);
-	stream.requested_bytes = stream.requested_bytes.saturating_sub(payload.len());
+	stream.requested = stream.requested.saturating_sub(payload.len());
 	stream.write_offset += payload.len() as u64;
 
 	Ok(())

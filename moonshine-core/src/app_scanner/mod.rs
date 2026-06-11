@@ -1,9 +1,25 @@
 use std::collections::HashSet;
 
-use crate::config::{ApplicationConfig, ApplicationScannerConfig};
+use serde::{Deserialize, Serialize};
 
-mod desktop;
-mod steam;
+use desktop::DesktopApplicationScannerConfig;
+use steam::SteamApplicationScannerConfig;
+
+pub mod desktop;
+pub mod steam;
+
+use crate::session::application::ApplicationConfig;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "type")]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationScannerConfig {
+	/// Scans a 'libraryfolders.vdf' file from a Steam library directory.
+	Steam(SteamApplicationScannerConfig),
+
+	/// Scans directories containing freedesktop .desktop launchers.
+	Desktop(DesktopApplicationScannerConfig),
+}
 
 pub fn scan_applications(application_scanners: &Vec<ApplicationScannerConfig>) -> Vec<ApplicationConfig> {
 	let mut applications = Vec::new();

@@ -18,6 +18,7 @@ mod x11_focus;
 use std::sync::mpsc;
 
 use async_shutdown::ShutdownManager;
+use serde::{Deserialize, Serialize};
 use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
 use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
@@ -27,13 +28,57 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::utils::Transform;
 
-use crate::config::CompositorConfig;
 use crate::session::manager::SessionShutdownReason;
 use crate::session::SessionContext;
 
 use self::frame::ExportedFrame;
 use self::input::CompositorInputEvent;
 use self::state::MoonshineCompositor;
+
+/// Keyboard configuration for the compositor's XKB state.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(default)]
+pub struct KeyboardConfig {
+	pub layout: String,
+	pub variant: String,
+	pub model: String,
+	pub options: Option<String>,
+}
+
+impl Default for KeyboardConfig {
+	fn default() -> Self {
+		Self {
+			layout: "us".to_string(),
+			variant: String::new(),
+			model: String::new(),
+			options: None,
+		}
+	}
+}
+
+/// Configuration for the embedded headless compositor.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompositorConfig {
+	/// Optional GPU device identifier for compositor rendering.
+	pub gpu: Option<String>,
+
+	/// Whether to enable HDR mode in the compositor if the client supports it.
+	pub hdr: bool,
+
+	/// Keyboard configuration for the compositor's XKB state.
+	pub keyboard: KeyboardConfig,
+}
+
+impl Default for CompositorConfig {
+	fn default() -> Self {
+		Self {
+			gpu: None,
+			hdr: true,
+			keyboard: KeyboardConfig::default(),
+		}
+	}
+}
 
 /// Runtime context derived from the client's session request.
 pub(crate) struct CompositorContext {

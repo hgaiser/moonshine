@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
+use serde::{Deserialize, Serialize};
 use tokio::{
 	net::UdpSocket,
 	sync::{broadcast, mpsc, watch, Notify},
 };
 
-use crate::config::Config;
 use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 use crate::session::SessionKeysReceiver;
@@ -17,8 +17,64 @@ mod shard_batch;
 use pipeline::VideoPipeline;
 use shard_batch::ShardBatch;
 
+/// Configuration for the video stream.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VideoStreamConfig {
+	/// Port to use for streaming video data.
+	pub port: u16,
+
+	/// What percentage of data packets should be parity packets.
+	pub fec_percentage: u8,
+
+	/// Whether to enable video stream encryption (AES-128-GCM).
+	#[serde(default)]
+	pub encrypt: bool,
+
+	/// Whether to emit a WARN log when a single frame takes longer to encode and
+	/// packetize than the frame budget.
+	#[serde(default)]
+	pub log_frame_spikes: bool,
+}
+
+impl Default for VideoStreamConfig {
+	fn default() -> Self {
+		Self {
+			port: 47998,
+			fec_percentage: 20,
+			encrypt: false,
+			log_frame_spikes: false,
+		}
+	}
+}
+
+/// Per-frame encoding statistics emitted by the video pipeline.
+///
+/// Sent via `broadcast` channel, receivable through `SessionManager::bench_stats_receiver()`.
+#[derive(Clone, Debug)]
+pub struct FrameStats {
+	/// Time the frame spent waiting in the compositor's output channel.
+	pub channel_wait: std::time::Duration,
+	/// Time spent importing the DMA-BUF into Vulkan.
+	pub import: std::time::Duration,
+	/// Time spent on GPU color conversion.
+	pub convert: std::time::Duration,
+	/// Time spent encoding the frame.
+	pub encode: std::time::Duration,
+	/// Time spent packetizing the encoded data.
+	pub packetize: std::time::Duration,
+	/// Time spent sending the packets over the channel.
+	pub send: std::time::Duration,
+	/// Total end-to-end latency for this frame.
+	pub total: std::time::Duration,
+	/// Number of bytes encoded for this frame.
+	pub encoded_bytes: usize,
+	/// Whether this frame is a key (IDR) frame.
+	pub is_key_frame: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum VideoFormat {
+pub enum VideoFormat {
 	#[default]
 	H264,
 	Hevc,
@@ -39,7 +95,7 @@ impl TryFrom<u32> for VideoFormat {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum VideoDynamicRange {
+pub enum VideoDynamicRange {
 	#[default]
 	Sdr,
 	Hdr,
@@ -58,7 +114,7 @@ impl TryFrom<u32> for VideoDynamicRange {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum VideoChromaSampling {
+pub enum VideoChromaSampling {
 	#[default]
 	Yuv420,
 	Yuv444,
@@ -77,30 +133,49 @@ impl TryFrom<u32> for VideoChromaSampling {
 }
 
 #[derive(Clone, Debug, Default)]
-pub(crate) struct VideoStreamContext {
+pub struct VideoStreamContext {
+	/// Width of the video stream in pixels.
 	pub width: u32,
+
+	/// Height of the video stream in pixels.
 	pub height: u32,
+
+	/// Frames per second of the video stream.
 	pub fps: u32,
+
+	/// Size of each encoded packet in bytes.
 	pub packet_size: usize,
+
+	/// Target bitrate for the video stream in bits per second.
 	pub bitrate: usize,
+
+	/// Minimum number of FEC packets to include for each frame.
 	pub minimum_fec_packets: u32,
+
+	/// Whether to apply QoS markings to video stream packets.
 	pub qos: bool,
+
+	/// Video format to use for encoding the stream.
 	pub video_format: VideoFormat,
+
+	/// Dynamic range of the video stream.
 	pub dynamic_range: VideoDynamicRange,
+
+	/// Chroma sampling type for the video stream.
 	pub chroma_sampling_type: VideoChromaSampling,
+
+	/// Maximum number of reference frames for the video encoder.
 	pub max_reference_frames: u32,
+
 	/// Whether the client has enabled video encryption.
 	pub encrypt_video: bool,
-	/// FEC percentage for video packets (from config).
-	pub fec_percentage: u8,
-	/// Whether to log per-frame latency spikes.
-	pub log_frame_spikes: bool,
 }
 
 /// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
 ///
 /// The pipeline and packet handler are spawned immediately but block on a `Notify`
 /// until `trigger()` is called on `StartB`.
+#[derive(Clone)]
 pub(crate) struct VideoStreamHandle {
 	notify: Arc<Notify>,
 	idr_tx: broadcast::Sender<()>,
@@ -116,24 +191,32 @@ impl VideoStreamHandle {
 	pub fn request_idr_frame(&self) {
 		let _ = self.idr_tx.send(());
 	}
+
+	/// Clone the start notify for external triggering (e.g. bench binary).
+	pub fn clone_start_notify(&self) -> Arc<Notify> {
+		self.notify.clone()
+	}
 }
 
 pub(crate) struct VideoStream {
 	socket: UdpSocket,
 	frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
+	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 }
 
 impl VideoStream {
 	pub async fn new(
-		config: Config,
+		config: VideoStreamConfig,
+		address: String,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
+		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 
-		let socket = UdpSocket::bind((config.address.as_str(), config.stream.video.port))
+		let socket = UdpSocket::bind((address.as_str(), config.port))
 			.await
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
@@ -148,12 +231,14 @@ impl VideoStream {
 			socket,
 			frame_rx,
 			hdr_metadata_tx,
+			stats_tx,
 		})
 	}
 
 	#[allow(clippy::too_many_arguments)]
 	pub fn start(
 		self,
+		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
 		stop: ShutdownManager<SessionShutdownReason>,
@@ -162,6 +247,7 @@ impl VideoStream {
 			socket,
 			frame_rx,
 			hdr_metadata_tx,
+			stats_tx,
 		} = self;
 
 		// Apply QoS to UDP socket.
@@ -184,6 +270,7 @@ impl VideoStream {
 		// Spawn pipeline thread — gated behind start_notify.
 		VideoPipeline::new(
 			frame_rx,
+			config,
 			context,
 			keys_rx,
 			packet_tx,
@@ -191,6 +278,7 @@ impl VideoStream {
 			stop.clone(),
 			hdr_metadata_tx,
 			start_notify.clone(),
+			stats_tx,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 

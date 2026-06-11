@@ -49,7 +49,7 @@ use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
-use crate::config::KeyboardConfig;
+use super::KeyboardConfig;
 use crate::session::compositor::cursor::{self, PointerElement, PointerRenderElement};
 use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
 

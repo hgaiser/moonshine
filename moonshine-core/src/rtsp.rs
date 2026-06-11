@@ -1,28 +1,28 @@
-use async_shutdown::ShutdownManager;
-use rtsp_types::{
-	headers::{self, Transport},
-	Method,
-};
-use std::{
-	net::{SocketAddr, ToSocketAddrs},
-	str::FromStr,
-};
-use tokio::{
-	io::{AsyncReadExt, AsyncWriteExt},
-	net::{TcpListener, TcpStream},
-};
+use std::net::{IpAddr, SocketAddr};
+use std::str::FromStr;
 
-use crate::{
-	config::Config,
-	session::{
-		manager::SessionManager,
-		stream::{
-			AudioChannels, AudioConfig, AudioStreamContext, VideoChromaSampling, VideoDynamicRange, VideoFormat,
-			VideoStreamContext, ALL_STREAM_CONFIGS,
-		},
-	},
-	ShutdownReason,
-};
+use async_shutdown::ShutdownManager;
+use rtsp_types::headers;
+use rtsp_types::headers::Transport;
+use rtsp_types::Method;
+use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio::net::TcpStream;
+
+use crate::session::manager::SessionManager;
+use crate::session::stream::audio::AudioChannels;
+use crate::session::stream::audio::AudioConfig;
+use crate::session::stream::audio::AudioStreamConfig;
+use crate::session::stream::audio::AudioStreamContext;
+use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
+use crate::session::stream::control::ControlStreamConfig;
+use crate::session::stream::video::VideoChromaSampling;
+use crate::session::stream::video::VideoDynamicRange;
+use crate::session::stream::video::VideoFormat;
+use crate::session::stream::video::VideoStreamConfig;
+use crate::session::stream::video::VideoStreamContext;
+use crate::ShutdownReason;
 
 #[repr(u8)]
 enum ServerCapabilities {
@@ -39,14 +39,30 @@ enum EncryptionFlags {
 
 #[derive(Clone)]
 pub struct RtspServer {
-	config: Config,
+	address: String,
+	rtsp_port: u16,
+	video_config: VideoStreamConfig,
+	audio_config: AudioStreamConfig,
+	control_config: ControlStreamConfig,
 	session_manager: SessionManager,
 }
 
 impl RtspServer {
-	pub fn new(config: Config, session_manager: SessionManager, shutdown: ShutdownManager<ShutdownReason>) -> Self {
+	pub fn new(
+		address: String,
+		rtsp_port: u16,
+		video_config: VideoStreamConfig,
+		audio_config: AudioStreamConfig,
+		control_config: ControlStreamConfig,
+		session_manager: SessionManager,
+		shutdown: ShutdownManager<ShutdownReason>,
+	) -> Self {
 		let server = Self {
-			config: config.clone(),
+			address,
+			rtsp_port,
+			video_config: video_config.clone(),
+			audio_config: audio_config.clone(),
+			control_config: control_config.clone(),
 			session_manager,
 		};
 
@@ -57,29 +73,16 @@ impl RtspServer {
 					.wrap_cancel(shutdown.wrap_trigger_shutdown(ShutdownReason::RtspShutdown, {
 						let server = server.clone();
 						async move {
-							let address = (config.address.as_str(), config.stream.port)
-								.to_socket_addrs()
-								.map_err(|e| {
-									tracing::error!(
-										"Failed to resolve address {}:{}: {}",
-										config.address,
-										config.stream.port,
-										e
-									)
-								})?
-								.next()
-								.ok_or_else(|| {
-									tracing::error!(
-										"Failed to resolve address {}:{}",
-										config.address,
-										config.stream.port
-									)
-								})?;
-							let listener = TcpListener::bind(address)
+							let ip = server
+								.address
+								.parse::<IpAddr>()
+								.map_err(|e| tracing::error!("Failed to parse address '{}': {}", server.address, e))?;
+							let socket_addr = SocketAddr::new(ip, server.rtsp_port);
+							let listener = TcpListener::bind(socket_addr)
 								.await
-								.map_err(|e| tracing::error!("Failed to bind to address {}: {}", address, e))?;
+								.map_err(|e| tracing::error!("Failed to bind to address {}: {}", socket_addr, e))?;
 
-							tracing::debug!("RTSP server listening on {}", address);
+							tracing::debug!("RTSP server listening on {}", socket_addr);
 
 							loop {
 								let (connection, address) = listener
@@ -116,7 +119,7 @@ impl RtspServer {
 
 	fn encryption_flags_supported(&self) -> u8 {
 		let mut flags = EncryptionFlags::ControlV2 as u8 | EncryptionFlags::Audio as u8;
-		if self.config.stream.video.encrypt {
+		if self.video_config.encrypt {
 			flags |= EncryptionFlags::Video as u8;
 		}
 		flags
@@ -148,7 +151,7 @@ impl RtspServer {
 		// Moonlight selects the appropriate config at ANNOUNCE based on channel count and quality.
 		// Values are packed as single digits with no separators, matching moonlight-common-c's
 		// parseOpusConfigFromParamString() which reads one digit character at a time.
-		for (i, config) in ALL_STREAM_CONFIGS.iter().enumerate() {
+		for (i, config) in ALL_AUDIO_CONFIGS.iter().enumerate() {
 			// GFE advertises an incorrect mapping for normal quality surround configurations,
 			// rotating LFE (index 3) to the end. Moonlight undoes this rotation after parsing.
 			// We must apply the same rotation for normal quality 5.1 and 7.1 configs.
@@ -222,9 +225,9 @@ impl RtspServer {
 
 					// Example query: streamid=control/13/0
 					let (stream_id, port) = match query.1.split('/').next() {
-						Some("video") => ("video", self.config.stream.video.port),
-						Some("audio") => ("audio", self.config.stream.audio.port),
-						Some("control") => ("control", self.config.stream.control.port),
+						Some("video") => ("video", self.video_config.port),
+						Some("audio") => ("audio", self.audio_config.port),
+						Some("control") => ("control", self.control_config.port),
 						Some(stream) => {
 							tracing::warn!("Unknown stream '{stream}'");
 							return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
@@ -373,10 +376,7 @@ impl RtspServer {
 			dynamic_range,
 			chroma_sampling_type,
 			max_reference_frames,
-			encrypt_video: self.config.stream.video.encrypt
-				&& (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
-			fec_percentage: self.config.stream.video.fec_percentage,
-			log_frame_spikes: self.config.stream.video.log_frame_spikes,
+			encrypt_video: self.video_config.encrypt && (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
 		};
 
 		let packet_duration: u32 = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
