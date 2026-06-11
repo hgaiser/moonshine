@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::IpAddr;
 
 use mdns_sd::{IfKind, ServiceDaemon, ServiceInfo};
+use network_interface::NetworkInterfaceConfig;
 
 const SERVICE_TYPE: &str = "_nvstream._tcp.local.";
 
@@ -46,11 +47,7 @@ fn register(address: &str, port: u16, name: &str) -> Result<(ServiceDaemon, Stri
 	let hostname = format!("{machine_name}-moonshine.local.");
 
 	let mode = advertise_mode(address);
-	if mode == Advertise::Ipv4Only {
-		daemon.disable_interface(IfKind::IPv6)?;
-	}
-
-	let service = match mode {
+	let mut service = match mode {
 		Advertise::Fixed(ip) => ServiceInfo::new(
 			SERVICE_TYPE,
 			name,
@@ -70,11 +67,62 @@ fn register(address: &str, port: u16, name: &str) -> Result<(ServiceDaemon, Stri
 		.enable_addr_auto(),
 	};
 
+	match mode {
+		Advertise::All => service.set_interfaces(auto_service_interfaces(true)),
+		Advertise::Ipv4Only => service.set_interfaces(auto_service_interfaces(false)),
+		Advertise::Fixed(_) => {},
+	}
+
 	let fullname = service.get_fullname().to_string();
 	daemon.register(service)?;
 	tracing::debug!("Advertising service '{fullname}' with hostname '{hostname}'.");
 
 	Ok((daemon, fullname))
+}
+
+fn auto_service_interfaces(include_ipv6: bool) -> Vec<IfKind> {
+	let mut ipv4_indexes = Vec::new();
+	let mut ipv6_indexes = Vec::new();
+
+	match network_interface::NetworkInterface::show() {
+		Ok(interfaces) => {
+			for interface in interfaces {
+				if interface.internal {
+					continue;
+				}
+
+				for addr in interface.addr {
+					match addr.ip() {
+						IpAddr::V4(ip) if !ip.is_loopback() && !ipv4_indexes.contains(&interface.index) => {
+							ipv4_indexes.push(interface.index);
+						},
+						IpAddr::V6(ip)
+							if include_ipv6 && !ip.is_loopback() && !ipv6_indexes.contains(&interface.index) =>
+						{
+							ipv6_indexes.push(interface.index);
+						},
+						_ => {},
+					}
+				}
+			}
+		},
+		Err(e) => tracing::warn!("Failed to retrieve network interfaces for mDNS advertisement: {e}"),
+	}
+
+	if ipv4_indexes.is_empty() && ipv6_indexes.is_empty() {
+		let fallback = if include_ipv6 { IfKind::All } else { IfKind::IPv4 };
+		tracing::warn!(
+			"No non-loopback interface found for mDNS advertisement; falling back to {:?} interfaces.",
+			fallback
+		);
+		return vec![fallback];
+	}
+
+	ipv4_indexes
+		.into_iter()
+		.map(IfKind::IndexV4)
+		.chain(ipv6_indexes.into_iter().map(IfKind::IndexV6))
+		.collect()
 }
 
 impl Drop for MdnsDiscovery {
