@@ -56,8 +56,8 @@ url = "2.5.8"
 notify-rust = "4.12.0"
 
 # Discovery
-gethostname = "1.0"
-mdns-sd = "0.20"
+gethostname = "1.1.0"
+mdns-sd = "0.20.0"
 
 # Session (compositor)
 ash = { git = "https://github.com/ash-rs/ash", rev = "55dd56906bbb5760e9e9e6c56f45be67f67e0649" }
