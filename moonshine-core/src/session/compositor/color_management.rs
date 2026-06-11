@@ -215,28 +215,18 @@ impl ColorManagementState {
 		self.pending.insert(surface.clone(), Some(desc));
 	}
 
-	/// Directly set the current gamescope color space for a surface,
-	/// bypassing the pending→commit flow.  Used when the surface will
-	/// never be committed (e.g. a protocol-only bypass surface).
-	pub fn set_gamescope_current(&mut self, surface: &WlSurface, desc: ImageDescription) {
-		tracing::debug!(
-			surface_id = ?surface.id(),
-			color_space = ?desc.to_frame_color_space(),
-			"set_gamescope_current (direct)"
-		);
-		self.gamescope_current.insert(surface.clone(), desc);
-	}
-
 	/// Update only the transfer function and primaries of a surface's gamescope
 	/// color description, **preserving** any HDR mastering metadata previously
-	/// set via [`set_gamescope_current`] (i.e. `vkSetHdrMetadataEXT`).
+	/// set via [`set_gamescope_hdr_metadata`] (i.e. `vkSetHdrMetadataEXT`).
 	///
 	/// `swapchain_feedback` reports the swapchain color space but carries no
-	/// mastering metadata. Calling `set_gamescope_current` from that path would
+	/// mastering metadata. Replacing the whole description from that path would
 	/// reset `max_cll`/`max_fall`/mastering luminance to `None`, discarding the
 	/// values the game provided through `vkSetHdrMetadataEXT` — which can arrive
 	/// before the colorspace event. Preserving them here ensures the client
 	/// receives the game's real HDR10 metadata instead of a generic fallback.
+	///
+	/// [`set_gamescope_hdr_metadata`]: Self::set_gamescope_hdr_metadata
 	pub fn set_gamescope_colorspace(
 		&mut self,
 		surface: &WlSurface,
@@ -254,6 +244,47 @@ impl ColorManagementState {
 			color_space = ?desc.to_frame_color_space(),
 			has_metadata = desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some(),
 			"set_gamescope_colorspace (preserving metadata)"
+		);
+	}
+
+	/// Update only the HDR mastering metadata of a surface's gamescope color
+	/// description, **preserving** the transfer function and primaries
+	/// previously set via [`set_gamescope_colorspace`].
+	///
+	/// This is the mirror image of [`set_gamescope_colorspace`]:
+	/// `vkSetHdrMetadataEXT` carries only mastering metadata, while the
+	/// transfer function is determined by the swapchain color space. Games
+	/// like Cyberpunk 2077 set HDR metadata *after* their scRGB swapchain is
+	/// created; replacing the whole description here would mislabel the linear
+	/// scRGB buffers as PQ-encoded (over-saturating the stream). When no color
+	/// space has been declared yet, defaults to BT.2020+PQ — the DXVK HDR10
+	/// path, where the swapchain blitter outputs genuinely PQ-encoded data.
+	///
+	/// [`set_gamescope_colorspace`]: Self::set_gamescope_colorspace
+	pub fn set_gamescope_hdr_metadata(
+		&mut self,
+		surface: &WlSurface,
+		max_cll: u32,
+		max_fall: u32,
+		mastering_luminance: (u32, u32),
+		mastering_primaries: [(u32, u32); 3],
+		white_point: (u32, u32),
+	) {
+		let desc = self
+			.gamescope_current
+			.entry(surface.clone())
+			.or_insert_with(ImageDescription::bt2020_pq);
+		desc.max_cll = Some(max_cll);
+		desc.max_fall = Some(max_fall);
+		desc.mastering_luminance = Some(mastering_luminance);
+		desc.mastering_primaries = Some(mastering_primaries);
+		desc.white_point = Some(white_point);
+		tracing::debug!(
+			surface_id = ?surface.id(),
+			color_space = ?desc.to_frame_color_space(),
+			max_cll,
+			max_fall,
+			"set_gamescope_hdr_metadata (preserving colorspace)"
 		);
 	}
 
@@ -312,18 +343,21 @@ impl ColorManagementState {
 
 	/// Get HDR metadata from the current fullscreen surface, if any.
 	///
-	/// Returns `Some(HdrMetadata)` when a surface has declared BT.2020+PQ
-	/// with max_cll or max_fall values.
+	/// Returns `Some(HdrMetadata)` when a surface has declared an HDR color
+	/// space (BT.2020+PQ or scRGB-linear) together with mastering metadata.
+	/// scRGB surfaces are included because their content reaches the client
+	/// as BT.2020+PQ after conversion, so the game's metadata (e.g. from
+	/// `vkSetHdrMetadataEXT`) still describes the transported stream.
 	pub fn hdr_metadata(&self) -> Option<HdrMetadata> {
-		// Search all BT.2020+PQ surfaces (gamescope/moonshine swapchain first,
-		// then wp_color_management) for the first one that carries HDR metadata.
-		// Using only `first_bt2020pq_desc()` would stop at the first BT.2020+PQ
-		// surface even if it has no metadata while another one does.
+		// Search all HDR surfaces (gamescope/moonshine swapchain first, then
+		// wp_color_management) for the first one that carries HDR metadata —
+		// not just the first HDR surface, which may have none while another
+		// one does.
 		let desc = self
 			.gamescope_current
 			.values()
 			.chain(self.current.values())
-			.filter(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq)
+			.filter(|desc| desc.to_frame_color_space() != FrameColorSpace::Srgb)
 			.find(|desc| desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some())?;
 		// Clamp u32 protocol values to u16 range for the Moonlight HDR metadata.
 		// Well-behaved clients stay within range; clamp rather than truncate.
@@ -358,8 +392,9 @@ impl ColorManagementState {
 	///    when toggling HDR mode, so the old surface's entry must be evicted here
 	///    — it won't be seen by `create_swapchain`, which only sees the new surface.
 	///
-	/// The HDR state will be re-established by `set_gamescope_current` if the
-	/// new swapchain calls `vkSetHdrMetadataEXT`.
+	/// The HDR state will be re-established by `set_gamescope_colorspace` /
+	/// `set_gamescope_hdr_metadata` when the new swapchain reports its color
+	/// space or calls `vkSetHdrMetadataEXT`.
 	pub fn clear_gamescope_current(&mut self, surface: &WlSurface) {
 		if self.gamescope_current.remove(surface).is_some() {
 			tracing::debug!(surface_id = ?surface.id(), "clear_gamescope_current: removed stale HDR state");
