@@ -15,7 +15,18 @@ pub(crate) enum FrameColorSpace {
 	#[default]
 	Srgb,
 	/// HDR10 (BT.2020 primaries, PQ EOTF, BT.2020 NCL matrix).
+	///
+	/// The pixel data is already BT.2020+PQ encoded; the encoder converts it
+	/// straight to YUV (passthrough).
 	Bt2020Pq,
+	/// scRGB (BT.709 primaries, linear light, typically FP16 with values > 1.0
+	/// for HDR highlights).
+	///
+	/// Used by DXGI HDR games whose swapchain negotiates
+	/// `VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT`. The encoder must apply a
+	/// BT.709→BT.2020 gamut mapping and PQ OETF before YUV conversion (it is
+	/// *not* a passthrough), so it is tracked separately from `Bt2020Pq`.
+	ScrgbLinear,
 }
 
 /// Static HDR metadata (HDR10).

@@ -39,6 +39,9 @@ use crate::session::compositor::state::MoonshineCompositor;
 pub(crate) enum TransferFunction {
 	Gamma22,
 	St2084Pq,
+	/// Linear light with extended range (scRGB). Values may exceed 1.0 to
+	/// represent HDR highlights above SDR white. Paired with BT.709 primaries.
+	ScrgbLinear,
 }
 
 /// Color primaries as declared by a client.
@@ -49,7 +52,7 @@ pub(crate) enum Primaries {
 }
 
 /// A resolved image description created from parametric parameters.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ImageDescription {
 	pub transfer_function: TransferFunction,
 	pub primaries: Primaries,
@@ -90,11 +93,23 @@ impl ImageDescription {
 		}
 	}
 
+	pub fn scrgb_linear() -> Self {
+		Self {
+			transfer_function: TransferFunction::ScrgbLinear,
+			primaries: Primaries::Srgb,
+			max_cll: None,
+			max_fall: None,
+			mastering_luminance: None,
+			mastering_primaries: None,
+			white_point: None,
+		}
+	}
+
 	pub fn to_frame_color_space(self) -> FrameColorSpace {
-		if self.primaries == Primaries::Bt2020 && self.transfer_function == TransferFunction::St2084Pq {
-			FrameColorSpace::Bt2020Pq
-		} else {
-			FrameColorSpace::Srgb
+		match (self.primaries, self.transfer_function) {
+			(Primaries::Bt2020, TransferFunction::St2084Pq) => FrameColorSpace::Bt2020Pq,
+			(Primaries::Srgb, TransferFunction::ScrgbLinear) => FrameColorSpace::ScrgbLinear,
+			_ => FrameColorSpace::Srgb,
 		}
 	}
 }
@@ -192,7 +207,7 @@ impl ColorManagementState {
 
 	/// Set a pending image description for a surface (from `set_image_description`).
 	pub fn set_pending(&mut self, surface: &WlSurface, desc: ImageDescription) {
-		tracing::debug!(
+		tracing::trace!(
 			surface_id = ?surface.id(),
 			color_space = ?desc.to_frame_color_space(),
 			"set_pending"
@@ -200,16 +215,77 @@ impl ColorManagementState {
 		self.pending.insert(surface.clone(), Some(desc));
 	}
 
-	/// Directly set the current gamescope color space for a surface,
-	/// bypassing the pending→commit flow.  Used when the surface will
-	/// never be committed (e.g. a protocol-only bypass surface).
-	pub fn set_gamescope_current(&mut self, surface: &WlSurface, desc: ImageDescription) {
+	/// Update only the transfer function and primaries of a surface's gamescope
+	/// color description, **preserving** any HDR mastering metadata previously
+	/// set via [`set_gamescope_hdr_metadata`] (i.e. `vkSetHdrMetadataEXT`).
+	///
+	/// `swapchain_feedback` reports the swapchain color space but carries no
+	/// mastering metadata. Replacing the whole description from that path would
+	/// reset `max_cll`/`max_fall`/mastering luminance to `None`, discarding the
+	/// values the game provided through `vkSetHdrMetadataEXT` — which can arrive
+	/// before the colorspace event. Preserving them here ensures the client
+	/// receives the game's real HDR10 metadata instead of a generic fallback.
+	///
+	/// [`set_gamescope_hdr_metadata`]: Self::set_gamescope_hdr_metadata
+	pub fn set_gamescope_colorspace(
+		&mut self,
+		surface: &WlSurface,
+		transfer_function: TransferFunction,
+		primaries: Primaries,
+	) {
+		let desc = self
+			.gamescope_current
+			.entry(surface.clone())
+			.or_insert_with(ImageDescription::srgb);
+		desc.transfer_function = transfer_function;
+		desc.primaries = primaries;
 		tracing::debug!(
 			surface_id = ?surface.id(),
 			color_space = ?desc.to_frame_color_space(),
-			"set_gamescope_current (direct)"
+			has_metadata = desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some(),
+			"set_gamescope_colorspace (preserving metadata)"
 		);
-		self.gamescope_current.insert(surface.clone(), desc);
+	}
+
+	/// Update only the HDR mastering metadata of a surface's gamescope color
+	/// description, **preserving** the transfer function and primaries
+	/// previously set via [`set_gamescope_colorspace`].
+	///
+	/// This is the mirror image of [`set_gamescope_colorspace`]:
+	/// `vkSetHdrMetadataEXT` carries only mastering metadata, while the
+	/// transfer function is determined by the swapchain color space. Games
+	/// like Cyberpunk 2077 set HDR metadata *after* their scRGB swapchain is
+	/// created; replacing the whole description here would mislabel the linear
+	/// scRGB buffers as PQ-encoded (over-saturating the stream). When no color
+	/// space has been declared yet, defaults to BT.2020+PQ — the DXVK HDR10
+	/// path, where the swapchain blitter outputs genuinely PQ-encoded data.
+	///
+	/// [`set_gamescope_colorspace`]: Self::set_gamescope_colorspace
+	pub fn set_gamescope_hdr_metadata(
+		&mut self,
+		surface: &WlSurface,
+		max_cll: u32,
+		max_fall: u32,
+		mastering_luminance: (u32, u32),
+		mastering_primaries: [(u32, u32); 3],
+		white_point: (u32, u32),
+	) {
+		let desc = self
+			.gamescope_current
+			.entry(surface.clone())
+			.or_insert_with(ImageDescription::bt2020_pq);
+		desc.max_cll = Some(max_cll);
+		desc.max_fall = Some(max_fall);
+		desc.mastering_luminance = Some(mastering_luminance);
+		desc.mastering_primaries = Some(mastering_primaries);
+		desc.white_point = Some(white_point);
+		tracing::debug!(
+			surface_id = ?surface.id(),
+			color_space = ?desc.to_frame_color_space(),
+			max_cll,
+			max_fall,
+			"set_gamescope_hdr_metadata (preserving colorspace)"
+		);
 	}
 
 	/// Clear the pending image description (from `unset_image_description`).
@@ -223,62 +299,71 @@ impl ColorManagementState {
 		if let Some(pending) = self.pending.remove(surface) {
 			match pending {
 				Some(desc) => {
-					tracing::debug!(
-						surface_id = ?surface.id(),
-						color_space = ?desc.to_frame_color_space(),
-						num_current = self.current.len(),
-						"commit: inserting into current"
-					);
-					self.current.insert(surface.clone(), desc);
+					// Some clients (e.g. Forza Horizon via vkd3d-proton)
+					// re-set an identical description every frame; log only
+					// actual changes to keep debug output readable.
+					let prev = self.current.insert(surface.clone(), desc);
+					if prev != Some(desc) {
+						tracing::debug!(
+							surface_id = ?surface.id(),
+							color_space = ?desc.to_frame_color_space(),
+							num_current = self.current.len(),
+							"commit: inserting into current"
+						);
+					}
 				},
 				None => {
-					tracing::debug!(
-						surface_id = ?surface.id(),
-						"commit: removing from current"
-					);
-					self.current.remove(surface);
+					if self.current.remove(surface).is_some() {
+						tracing::debug!(
+							surface_id = ?surface.id(),
+							"commit: removing from current"
+						);
+					}
 				},
 			}
 		}
 	}
 
-	/// Find the first BT.2020+PQ image description across all tracked surfaces.
-	///
-	/// Gamescope swapchain declarations are checked first (higher priority),
-	/// then wp_color_management declarations.
-	fn first_bt2020pq_desc(&self) -> Option<&ImageDescription> {
-		self.gamescope_current
-			.values()
-			.chain(self.current.values())
-			.find(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq)
-	}
-
 	/// Get the frame color space for the current fullscreen surface.
 	///
-	/// Returns `Bt2020Pq` if any mapped surface has declared BT.2020+PQ,
-	/// otherwise returns `Srgb`.
+	/// When multiple HDR surfaces are declared, already-encoded BT.2020+PQ is
+	/// preferred over scRGB-linear: it is a passthrough path, whereas scRGB
+	/// requires a gamut+PQ conversion, so picking PQ avoids an unnecessary
+	/// conversion when both are present. Falls back to `Srgb` when no surface
+	/// declares an HDR color space. Gamescope swapchain declarations are checked
+	/// before wp_color_management declarations within each pass.
 	pub fn frame_color_space(&self) -> FrameColorSpace {
-		if self.first_bt2020pq_desc().is_some() {
-			FrameColorSpace::Bt2020Pq
-		} else {
-			FrameColorSpace::Srgb
+		let color_spaces = || self.gamescope_current.values().chain(self.current.values());
+
+		// First pass: prefer already-encoded BT.2020+PQ (passthrough).
+		if color_spaces().any(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq) {
+			return FrameColorSpace::Bt2020Pq;
 		}
+
+		// Second pass: fall back to scRGB-linear, then sRGB.
+		color_spaces()
+			.map(|desc| desc.to_frame_color_space())
+			.find(|cs| *cs != FrameColorSpace::Srgb)
+			.unwrap_or(FrameColorSpace::Srgb)
 	}
 
 	/// Get HDR metadata from the current fullscreen surface, if any.
 	///
-	/// Returns `Some(HdrMetadata)` when a surface has declared BT.2020+PQ
-	/// with max_cll or max_fall values.
+	/// Returns `Some(HdrMetadata)` when a surface has declared an HDR color
+	/// space (BT.2020+PQ or scRGB-linear) together with mastering metadata.
+	/// scRGB surfaces are included because their content reaches the client
+	/// as BT.2020+PQ after conversion, so the game's metadata (e.g. from
+	/// `vkSetHdrMetadataEXT`) still describes the transported stream.
 	pub fn hdr_metadata(&self) -> Option<HdrMetadata> {
-		// Search all BT.2020+PQ surfaces (gamescope/moonshine swapchain first,
-		// then wp_color_management) for the first one that carries HDR metadata.
-		// Using only `first_bt2020pq_desc()` would stop at the first BT.2020+PQ
-		// surface even if it has no metadata while another one does.
+		// Search all HDR surfaces (gamescope/moonshine swapchain first, then
+		// wp_color_management) for the first one that carries HDR metadata —
+		// not just the first HDR surface, which may have none while another
+		// one does.
 		let desc = self
 			.gamescope_current
 			.values()
 			.chain(self.current.values())
-			.filter(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq)
+			.filter(|desc| desc.to_frame_color_space() != FrameColorSpace::Srgb)
 			.find(|desc| desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some())?;
 		// Clamp u32 protocol values to u16 range for the Moonlight HDR metadata.
 		// Well-behaved clients stay within range; clamp rather than truncate.
@@ -313,8 +398,9 @@ impl ColorManagementState {
 	///    when toggling HDR mode, so the old surface's entry must be evicted here
 	///    — it won't be seen by `create_swapchain`, which only sees the new surface.
 	///
-	/// The HDR state will be re-established by `set_gamescope_current` if the
-	/// new swapchain calls `vkSetHdrMetadataEXT`.
+	/// The HDR state will be re-established by `set_gamescope_colorspace` /
+	/// `set_gamescope_hdr_metadata` when the new swapchain reports its color
+	/// space or calls `vkSetHdrMetadataEXT`.
 	pub fn clear_gamescope_current(&mut self, surface: &WlSurface) {
 		if self.gamescope_current.remove(surface).is_some() {
 			tracing::debug!(surface_id = ?surface.id(), "clear_gamescope_current: removed stale HDR state");
@@ -372,7 +458,7 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor
 		_dhandle: &DisplayHandle,
 		data_init: &mut DataInit<'_, Self>,
 	) {
-		tracing::debug!(?request, "wp_color_manager_v1 request");
+		tracing::trace!(?request, "wp_color_manager_v1 request");
 		match request {
 			wp_color_manager_v1::Request::Destroy => {},
 
@@ -402,12 +488,14 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor
 			},
 
 			wp_color_manager_v1::Request::CreateWindowsScrgb { image_description } => {
-				// Windows scRGB officially means BT.709 primaries + extended linear,
-				// but Proton/DXVK's gamescope WSI layer converts the scRGB surface data
-				// to BT.2020+PQ before submitting the buffer. We therefore map it to
-				// Bt2020Pq so the encoder treats the content as passthrough HDR rather
-				// than applying an unnecessary sRGB→BT.2020+PQ conversion.
-				let desc = ImageDescription::bt2020_pq();
+				// Windows scRGB is linear light with sRGB/BT.709 primaries (values
+				// > 1.0 for HDR highlights). Tag it scRGB-linear so the encoder
+				// applies the BT.709→BT.2020 gamut mapping + PQ OETF. DXVK content
+				// never arrives here: Mesa's Vulkan WSI expresses scRGB as a
+				// parametric ext_linear description (which we don't advertise, so
+				// DXVK falls back to an HDR10 swapchain and pre-converts). Only
+				// clients implementing windows_scrgb directly (e.g. mpv) use this.
+				let desc = ImageDescription::scrgb_linear();
 				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
 				resource.ready(0);
 			},
@@ -441,7 +529,7 @@ impl Dispatch<wp_color_management_surface_v1::WpColorManagementSurfaceV1, ColorS
 				render_intent: _,
 			} => {
 				if let Some(desc_data) = image_description.data::<ImageDescriptionUserData>() {
-					tracing::debug!(
+					tracing::trace!(
 						?desc_data.desc,
 						"Surface set image description"
 					);
@@ -491,7 +579,7 @@ impl Dispatch<wp_image_description_creator_params_v1::WpImageDescriptionCreatorP
 					mastering_primaries: params.mastering_primaries,
 					white_point: params.white_point,
 				};
-				tracing::debug!(?desc, "Created parametric image description");
+				tracing::trace!(?desc, "Created parametric image description");
 
 				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
 				// Signal that the image description is ready.
@@ -501,7 +589,10 @@ impl Dispatch<wp_image_description_creator_params_v1::WpImageDescriptionCreatorP
 			wp_image_description_creator_params_v1::Request::SetTfNamed { tf } => {
 				let tf = match tf.into_result() {
 					Ok(wp_color_manager_v1::TransferFunction::St2084Pq) => TransferFunction::St2084Pq,
-					Ok(wp_color_manager_v1::TransferFunction::Gamma22) => TransferFunction::Gamma22,
+					// sRGB's piecewise EOTF is close enough to pure gamma 2.2
+					// for SDR passthrough; both named TFs are advertised.
+					Ok(wp_color_manager_v1::TransferFunction::Gamma22)
+					| Ok(wp_color_manager_v1::TransferFunction::Srgb) => TransferFunction::Gamma22,
 					other => {
 						tracing::debug!(?other, "Unsupported transfer function, defaulting to gamma22");
 						TransferFunction::Gamma22
@@ -620,6 +711,12 @@ impl Dispatch<wp_image_description_v1::WpImageDescriptionV1, ImageDescriptionUse
 						info.tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
 						// PQ: 0–10000 cd/m², SDR reference white 203 cd/m².
 						info.luminances(0, 10000, 203);
+						info.target_luminance(0, 10000);
+					},
+					TransferFunction::ScrgbLinear => {
+						info.tf_named(wp_color_manager_v1::TransferFunction::ExtLinear);
+						// scRGB: linear with extended range, 1.0 == 80 cd/m² (IEC 61966-2-2).
+						info.luminances(0, 10000, 80);
 						info.target_luminance(0, 10000);
 					},
 				}
@@ -851,5 +948,49 @@ impl Dispatch<wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1
 
 			_ => {},
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{FrameColorSpace, ImageDescription, Primaries, TransferFunction};
+
+	#[test]
+	fn srgb_helper_maps_to_srgb_frame_color_space() {
+		assert_eq!(ImageDescription::srgb().to_frame_color_space(), FrameColorSpace::Srgb);
+	}
+
+	#[test]
+	fn bt2020_pq_helper_maps_to_bt2020pq_frame_color_space() {
+		let desc = ImageDescription::bt2020_pq();
+		assert_eq!(desc.primaries, Primaries::Bt2020);
+		assert_eq!(desc.transfer_function, TransferFunction::St2084Pq);
+		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::Bt2020Pq);
+	}
+
+	#[test]
+	fn scrgb_linear_helper_maps_to_scrgb_frame_color_space() {
+		let desc = ImageDescription::scrgb_linear();
+		// scRGB uses BT.709 primaries, which share values with sRGB.
+		assert_eq!(desc.primaries, Primaries::Srgb);
+		assert_eq!(desc.transfer_function, TransferFunction::ScrgbLinear);
+		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::ScrgbLinear);
+	}
+
+	#[test]
+	fn unrecognized_color_combination_falls_back_to_sdr() {
+		// Gamma22 with BT.2020 primaries is nonsensical; the fallback arm must
+		// route such descriptors to Srgb so SDR behaviour is preserved rather
+		// than misclassifying them as HDR.
+		let desc = ImageDescription {
+			primaries: Primaries::Bt2020,
+			transfer_function: TransferFunction::Gamma22,
+			max_cll: None,
+			max_fall: None,
+			mastering_luminance: None,
+			mastering_primaries: None,
+			white_point: None,
+		};
+		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::Srgb);
 	}
 }

@@ -256,14 +256,17 @@ fn run_compositor(
 	tracing::debug!("Supported DMA-BUF render formats: {}", render_formats.iter().count());
 
 	// Select preferred render format based on HDR mode.
-	// HDR: prefer 10-bit > FP16 > 8-bit ABGR (to match common Vulkan WSI format).
+	// HDR: prefer FP16 > 10-bit > 8-bit ABGR. FP16 is required for scRGB
+	// (EXTENDED_SRGB_LINEAR) content whose HDR highlights carry values > 1.0 that a
+	// 10-bit UNORM render buffer would clamp at composite time; it also holds
+	// BT.2020+PQ content (values in [0,1]) losslessly for the passthrough path.
 	// SDR: prefer 8-bit ABGR/XBGR to match Vulkan WSI and avoid GL R↔B channel swaps.
 	// Vulkan WSI on Wayland defaults to XBGR/ABGR formats, so using ARGB causes
 	// GL to incorrectly swap red/blue channels during blit operations.
 	let preferred_fourccs: Vec<Fourcc> = if config.hdr && context.hdr {
 		vec![
-			Fourcc::Abgr2101010,
 			Fourcc::Abgr16161616f,
+			Fourcc::Abgr2101010,
 			Fourcc::Abgr8888,
 			Fourcc::Xbgr8888,
 		]

@@ -12,7 +12,7 @@
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
 
-use crate::session::compositor::color_management::{ImageDescription, Primaries, TransferFunction};
+use crate::session::compositor::color_management::{Primaries, TransferFunction};
 use crate::session::compositor::protocols::gamescope_swapchain::GamescopeSwapchain;
 use crate::session::compositor::protocols::gamescope_swapchain_factory_v2::GamescopeSwapchainFactoryV2;
 use crate::session::compositor::protocols::moonshine_swapchain::MoonshineSwapchain;
@@ -50,24 +50,28 @@ fn handle_swapchain_feedback(
 	// Some games (e.g. Monster Hunter Wilds) never call vkSetHdrMetadataEXT
 	// and rely solely on the swapchain color space to signal HDR.
 	const VK_COLOR_SPACE_SRGB_NONLINEAR: u32 = 0;
+	const VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT: u32 = 1000104002;
 	const VK_COLOR_SPACE_HDR10_ST2084_EXT: u32 = 1000104008;
+	const VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT: u32 = 1000104014;
 
 	if let Some(cm) = &mut state.color_management {
 		match vk_colorspace {
+			// HDR10: the game submits BT.2020 + PQ data directly.
+			// `set_gamescope_colorspace` preserves mastering metadata from a
+			// prior `vkSetHdrMetadataEXT`.
 			VK_COLOR_SPACE_HDR10_ST2084_EXT => {
 				tracing::info!("swapchain_feedback: HDR10_ST2084 detected, activating HDR");
-				cm.set_gamescope_current(
-					surface,
-					super::color_management::ImageDescription {
-						transfer_function: super::color_management::TransferFunction::St2084Pq,
-						primaries: super::color_management::Primaries::Bt2020,
-						max_cll: None,
-						max_fall: None,
-						mastering_luminance: None,
-						mastering_primaries: None,
-						white_point: None,
-					},
-				);
+				cm.set_gamescope_colorspace(surface, TransferFunction::St2084Pq, Primaries::Bt2020);
+			},
+			// scRGB (extended sRGB, fp16): used by DXGI HDR games such as Control.
+			// The buffers arriving via gamescope swapchain feedback are linear
+			// BT.709 with values > 1.0 for HDR highlights. Tag them as scRGB-linear
+			// so the encoder applies the BT.709→BT.2020 gamut mapping + PQ OETF
+			// instead of treating them as already-encoded BT.2020+PQ (which
+			// over-saturates and crushes highlights).
+			VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT | VK_COLOR_SPACE_EXTENDED_SRGB_NONLINEAR_EXT => {
+				tracing::info!("swapchain_feedback: extended sRGB (scRGB) detected, activating HDR");
+				cm.set_gamescope_colorspace(surface, TransferFunction::ScrgbLinear, Primaries::Srgb);
 			},
 			VK_COLOR_SPACE_SRGB_NONLINEAR => {
 				cm.clear_gamescope_current(surface);
@@ -120,29 +124,32 @@ fn handle_set_hdr_metadata(
 		"set_hdr_metadata"
 	);
 
-	// The WSI layer remaps HDR→sRGB for the ICD, but DXVK doesn't see the
-	// remap and performs sRGB→PQ conversion in its swapchain blitter.  The
-	// pixel data arriving at the compositor is genuinely PQ-encoded, so we
-	// set Bt2020Pq here.
+	// `vkSetHdrMetadataEXT` carries only mastering metadata; the transfer
+	// function comes from the swapchain color space. Update just the metadata,
+	// preserving a colorspace already established by `swapchain_feedback` —
+	// e.g. Cyberpunk sets HDR metadata *after* its scRGB swapchain is created,
+	// and overwriting the description here would mislabel the linear scRGB
+	// buffers as PQ-encoded. When no colorspace was declared yet this defaults
+	// to BT.2020+PQ: the WSI layer remaps HDR→sRGB for the ICD, but DXVK
+	// doesn't see the remap and performs sRGB→PQ conversion in its swapchain
+	// blitter, so the pixel data arriving at the compositor is PQ-encoded.
 	if let Some(cm) = &mut state.color_management {
-		let desc = ImageDescription {
-			transfer_function: TransferFunction::St2084Pq,
-			primaries: Primaries::Bt2020,
-			max_cll: Some(max_cll),
-			max_fall: Some(max_fall),
+		cm.set_gamescope_hdr_metadata(
+			surface,
+			max_cll,
+			max_fall,
 			// max is in 1 cd/m², min is in 0.0001 cd/m²; normalize both to 0.0001 cd/m² units.
-			mastering_luminance: Some((
+			(
 				min_display_mastering_luminance,
 				max_display_mastering_luminance.saturating_mul(10000),
-			)),
-			mastering_primaries: Some([
+			),
+			[
 				(display_primary_red_x, display_primary_red_y),
 				(display_primary_green_x, display_primary_green_y),
 				(display_primary_blue_x, display_primary_blue_y),
-			]),
-			white_point: Some((white_point_x, white_point_y)),
-		};
-		cm.set_gamescope_current(surface, desc);
+			],
+			(white_point_x, white_point_y),
+		);
 	}
 }
 

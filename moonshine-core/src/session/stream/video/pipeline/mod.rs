@@ -13,7 +13,7 @@ use ash::vk;
 use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc, watch, Notify};
 
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrModeState};
+use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 use crate::session::SessionKeysReceiver;
 
@@ -27,8 +27,13 @@ use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodedPacket, Encoder,
-	InputFormat, OutputFormat, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
+	InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
+
+/// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
+const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
+/// SDR reference white for HDR transport, per ITU-R BT.2408 (203 cd/m²).
+const BT2408_SDR_REFERENCE_NITS: f32 = 203.0;
 
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
@@ -55,6 +60,21 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	}
 }
 
+/// Whether a pixelforge error indicates Vulkan device loss.
+///
+/// Device loss is unrecoverable on the existing device: every subsequent GPU
+/// operation fails the same way, so the encoding loop must exit (shutting the
+/// session down) instead of retrying forever and freezing the stream.
+fn is_device_lost(e: &PixelForgeError) -> bool {
+	match e {
+		PixelForgeError::Vulkan(result) => *result == vk::Result::ERROR_DEVICE_LOST,
+		// Other variants (e.g. CommandBuffer) stringify the underlying
+		// vk::Result, whose ash display text is "The logical device has been
+		// lost. See <...>".
+		_ => e.to_string().contains("device has been lost"),
+	}
+}
+
 pub(crate) struct VideoPipeline {}
 
 /// A single frame's latency breakdown for periodic summary reporting.
@@ -66,14 +86,23 @@ struct LatencySample {
 	packetize: std::time::Duration,
 	send: std::time::Duration,
 	total: std::time::Duration,
+	encoded_bytes: usize,
+	is_key_frame: bool,
 }
 
 /// Log a summary of latency statistics over a batch of samples.
-fn log_latency_summary(samples: &[LatencySample]) {
+///
+/// `elapsed` is the wall-clock time the batch was collected over, used to
+/// derive throughput (fps, bitrate).
+fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) {
 	let n = samples.len();
 	if n == 0 {
 		return;
 	}
+
+	let elapsed_s = elapsed.as_secs_f64().max(f64::EPSILON);
+	let bytes_total: usize = samples.iter().map(|s| s.encoded_bytes).sum();
+	let keyframes = samples.iter().filter(|s| s.is_key_frame).count();
 
 	let mut totals: Vec<u64> = samples.iter().map(|s| s.total.as_micros() as u64).collect();
 	totals.sort_unstable();
@@ -102,6 +131,9 @@ fn log_latency_summary(samples: &[LatencySample]) {
 
 	tracing::debug!(
 		frames = n,
+		fps = (n as f64 / elapsed_s).round() as u32,
+		bitrate_kbps = ((bytes_total * 8) as f64 / elapsed_s / 1000.0).round() as u64,
+		keyframes,
 		total_p50_us = p50(&totals),
 		total_p95_us = p95(&totals),
 		total_p99_us = p99(&totals),
@@ -511,9 +543,27 @@ impl VideoPipelineInner {
 				// dynamic VUI switching in the encoder.
 				if ctx.dynamic_range == VideoDynamicRange::Hdr {
 					let frame_cs = frame.color_space;
-					let (cs, full_range, color_desc) = match frame_cs {
-						FrameColorSpace::Srgb => (ColorSpace::Bt709, true, ColorDescription::bt709()),
-						FrameColorSpace::Bt2020Pq => (ColorSpace::Bt2020, false, ColorDescription::bt2020_pq()),
+					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
+					// scRGB 1.0 == 80 cd/m². The other paths ignore it.
+					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
+						FrameColorSpace::Srgb => (
+							ColorSpace::Bt709,
+							true,
+							ColorDescription::bt709(),
+							BT2408_SDR_REFERENCE_NITS,
+						),
+						FrameColorSpace::Bt2020Pq => (
+							ColorSpace::Bt2020,
+							false,
+							ColorDescription::bt2020_pq(),
+							BT2408_SDR_REFERENCE_NITS,
+						),
+						FrameColorSpace::ScrgbLinear => (
+							ColorSpace::Bt709LinearToBt2020Pq,
+							false,
+							ColorDescription::bt2020_pq(),
+							SCRGB_REFERENCE_WHITE_NITS,
+						),
 					};
 
 					// Switch encoder VUI first. Only update the converter if
@@ -528,19 +578,24 @@ impl VideoPipelineInner {
 								encoder_color_desc = Some(color_desc);
 								converter.set_color_space(cs);
 								converter.set_full_range(full_range);
+								converter.set_sdr_reference_white_nits(sdr_white_nits);
 							},
 							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
 						}
 					} else {
 						converter.set_color_space(cs);
 						converter.set_full_range(full_range);
+						converter.set_sdr_reference_white_nits(sdr_white_nits);
 					}
 				}
 
 				// Convert to YUV.
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					tracing::warn!("GPU color conversion failed: {e}");
 					frame.consumed.store(true, Ordering::Release);
+					if is_device_lost(&e) {
+						return Err(format!("GPU color conversion failed: {e}"));
+					}
+					tracing::warn!("GPU color conversion failed: {e}");
 					continue;
 				}
 
@@ -591,9 +646,12 @@ impl VideoPipelineInner {
 							// but only when encoding as BT.2020+PQ (HDR frames).
 							// SDR frames encoded as BT.709 should not carry HDR SEI.
 							if packet.is_key_frame && encoder_color_desc == Some(ColorDescription::bt2020_pq()) {
-								if let Some(ref m) = last_hdr_state.metadata {
-									packet.data = hdr_sei::inject_hdr_metadata(&packet.data, m, ctx.video_format);
-								}
+								// Fall back to default HDR10 metadata when the content provides
+								// none (e.g. scRGB swapchains carry no mastering metadata), so the
+								// bitstream stays consistent with the control-stream HDR metadata,
+								// which also falls back to `HdrMetadata::fallback`.
+								let m = last_hdr_state.metadata.unwrap_or_else(HdrMetadata::fallback);
+								packet.data = hdr_sei::inject_hdr_metadata(&packet.data, &m, ctx.video_format);
 							}
 
 							encoded_bytes += packet.data.len();
@@ -618,6 +676,9 @@ impl VideoPipelineInner {
 						}
 					},
 					Err(e) => {
+						if is_device_lost(&e) {
+							return Err(format!("Failed to encode frame: {e}"));
+						}
 						tracing::warn!("Failed to encode frame: {e}");
 					},
 				}
@@ -669,6 +730,8 @@ impl VideoPipelineInner {
 					packetize: packetize_dur,
 					send: send_dur,
 					total,
+					encoded_bytes,
+					is_key_frame,
 				});
 
 				let _ = stats_tx.send(FrameStats {
@@ -685,7 +748,7 @@ impl VideoPipelineInner {
 
 				// Periodic summary every 5 seconds.
 				if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
-					log_latency_summary(&latency_samples);
+					log_latency_summary(&latency_samples, last_summary_time.elapsed());
 					latency_samples.clear();
 					last_summary_time = std::time::Instant::now();
 				}
@@ -774,5 +837,92 @@ impl VideoPipelineInner {
 		let t_sent = std::time::Instant::now();
 
 		Ok((t_packetized - t_start, t_sent - t_packetized))
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{drm_fourcc_to_input, is_device_lost, BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS};
+	use ash::vk;
+	use pixelforge::{InputFormat, PixelForgeError};
+
+	// DRM fourccs — kept in the test module to document the byte ordering
+	// explicitly and guard against accidental typos in the production match.
+	// Layout: fourcc_code(a, b, c, d) = a | b<<8 | c<<16 | d<<24.
+	const ABGR8888: u32 = 0x34324241; // "AB24"
+	const XBGR8888: u32 = 0x34324258; // "XB24"
+	const ABGR2101010: u32 = 0x30334241; // "AB30"
+	const XBGR2101010: u32 = 0x30334258; // "XB30"
+	const ABGR16161616F: u32 = 0x48344241; // "AB4H"
+	const XBGR16161616F: u32 = 0x48344258; // "XB4H"
+
+	#[test]
+	fn drm_fourcc_abgr_xbgr_8bit_maps_to_rgba() {
+		// 8-bit ABGR/XBGR share the same bit layout (alpha vs. padding) and
+		// map to R8G8B8A8_UNORM.
+		for fourcc in [ABGR8888, XBGR8888] {
+			let (fmt, vk) = drm_fourcc_to_input(fourcc);
+			assert_eq!(fmt, InputFormat::RGBA);
+			assert_eq!(vk, vk::Format::R8G8B8A8_UNORM);
+		}
+	}
+
+	#[test]
+	fn drm_fourcc_abgr_xbgr_10bit_maps_to_a2b10g10r10() {
+		for fourcc in [ABGR2101010, XBGR2101010] {
+			let (fmt, vk) = drm_fourcc_to_input(fourcc);
+			assert_eq!(fmt, InputFormat::ABGR2101010);
+			assert_eq!(vk, vk::Format::A2B10G10R10_UNORM_PACK32);
+		}
+	}
+
+	#[test]
+	fn drm_fourcc_abgr_xbgr_fp16_maps_to_rgba16f() {
+		// Regression guard for the XBGR16161616F (XB4H) case: NVIDIA's Wayland
+		// WSI emits the X-variant for FP16 scRGB swapchains, and handling only
+		// the A-variant caused 16F buffers to fall through to the 8-bit BGRx
+		// fallback and produce garbled pixels.
+		for fourcc in [ABGR16161616F, XBGR16161616F] {
+			let (fmt, vk) = drm_fourcc_to_input(fourcc);
+			assert_eq!(fmt, InputFormat::RGBA16F);
+			assert_eq!(vk, vk::Format::R16G16B16A16_SFLOAT);
+		}
+	}
+
+	#[test]
+	fn drm_fourcc_unknown_falls_back_to_bgrx() {
+		// Anything outside the known set must fall back to the 8-bit BGRx
+		// assumption — matches the `_ =>` arm in the production match.
+		let (fmt, vk) = drm_fourcc_to_input(0xDEADBEEF);
+		assert_eq!(fmt, InputFormat::BGRx);
+		assert_eq!(vk, vk::Format::B8G8R8A8_UNORM);
+	}
+
+	#[test]
+	fn device_lost_is_detected_in_both_error_shapes() {
+		// Structured variant.
+		assert!(is_device_lost(&PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST)));
+		// String variant: pixelforge wraps the vk::Result display text, e.g.
+		// CommandBuffer("The logical device has been lost. See <...>") —
+		// the shape observed when a stale DMA-BUF import faults the GPU.
+		assert!(is_device_lost(&PixelForgeError::CommandBuffer(
+			vk::Result::ERROR_DEVICE_LOST.to_string()
+		)));
+	}
+
+	#[test]
+	fn recoverable_errors_are_not_device_lost() {
+		assert!(!is_device_lost(&PixelForgeError::Vulkan(vk::Result::TIMEOUT)));
+		assert!(!is_device_lost(&PixelForgeError::CommandBuffer(
+			"submit failed".to_string()
+		)));
+	}
+
+	#[test]
+	fn sdr_reference_white_constants_match_specs() {
+		// scRGB (IEC 61966-2-2): 1.0 == 80 cd/m².
+		assert_eq!(SCRGB_REFERENCE_WHITE_NITS, 80.0);
+		// ITU-R BT.2408: 203 cd/m² diffuse white for SDR-in-HDR.
+		assert_eq!(BT2408_SDR_REFERENCE_NITS, 203.0);
 	}
 }
