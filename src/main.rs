@@ -26,28 +26,9 @@ struct Args {
 async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
-	// Some dependencies emit DEBUG logs at frame rate, drowning out
-	// moonshine's own debug output:
-	// - pixelforge: convert/encode timings and slice dumps per encoded frame
-	//   (the same timing data is aggregated by the video pipeline into a
-	//   5-second percentile summary);
-	// - smithay's GLES renderer: GL driver debug-callback messages ("Buffer
-	//   detailed info: ..." on NVIDIA) per rendered frame.
-	// Default those targets to `info` unless MOONSHINE_LOG configures them
-	// explicitly (e.g. `MOONSHINE_LOG=debug,pixelforge=debug`).
-	let mut log_filter = std::env::var("MOONSHINE_LOG").unwrap_or_else(|_| "error".to_string());
-	for (target, directive) in [
-		("pixelforge", "pixelforge=info"),
-		("smithay", "smithay::backend::renderer::gles=info"),
-	] {
-		if !log_filter.contains(target) {
-			log_filter.push(',');
-			log_filter.push_str(directive);
-		}
-	}
 	tracing_subscriber::registry()
 		.with(tracing_subscriber::fmt::layer())
-		.with(EnvFilter::try_new(&log_filter).unwrap_or_else(|_| EnvFilter::new("error")))
+		.with(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("error")))
 		.init();
 
 	let mut config = Config::load_or_create(&args.config)?;
