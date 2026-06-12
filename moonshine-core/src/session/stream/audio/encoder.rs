@@ -183,23 +183,24 @@ impl AudioEncoderInner {
 			let keys = &*keys_rx.borrow();
 
 			// Encrypt the audio data if encryption is enabled.
-			let payload = if encrypt {
-				let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
-				let mut iv = iv.to_be_bytes().to_vec();
-				iv.extend([0u8; 12]);
-				match encrypt_cbc(&encoded_audio[..encoded_size], &keys.remote_input_key, &iv) {
-					Ok(payload) => payload,
-					Err(e) => {
-						tracing::warn!("Failed to encrypt audio: {e}");
-						let _ = frame_recycle_tx.try_send(AudioFrame {
-							buf: frame.buf,
-							capture_ts_ms: 0,
-						});
-						continue;
-					},
-				}
-			} else {
-				encoded_audio[..encoded_size].to_vec()
+			let payload = match encrypt {
+				true => {
+					let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
+					let mut iv = iv.to_be_bytes().to_vec();
+					iv.extend([0u8; 12]);
+					match encrypt_cbc(&encoded_audio[..encoded_size], &keys.remote_input_key, &iv) {
+						Ok(payload) => payload,
+						Err(e) => {
+							tracing::warn!("Failed to encrypt audio: {e}");
+							let _ = frame_recycle_tx.try_send(AudioFrame {
+								buf: frame.buf,
+								capture_ts_ms: 0,
+							});
+							continue;
+						},
+					}
+				},
+				false => encoded_audio[..encoded_size].to_vec(),
 			};
 
 			let shard = &mut shards[sequence_number as usize % NR_DATA_SHARDS];

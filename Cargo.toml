@@ -12,11 +12,11 @@ edition = "2021"
 
 [dependencies]
 async-shutdown = "0.2.2"
-clap = { version = "4.5.60", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive"] }
 moonshine-core = { path = "moonshine-core" }
-tokio = { version = "1.49.0", features = ["rt-multi-thread", "signal", "sync", "macros"] }
+tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal", "sync", "macros"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
 [patch.crates-io]
 smithay = { git = "https://github.com/hgaiser/smithay", tag = "v0.7.0-moonshine" }

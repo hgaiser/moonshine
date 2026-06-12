@@ -5,10 +5,10 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
-use rand::RngCore;
 use rcgen::{
 	BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose, SerialNumber,
 };
+use rsa::rand_core::RngCore;
 use rsa::{
 	pkcs8::{EncodePrivateKey, LineEnding},
 	RsaPrivateKey,
@@ -81,10 +81,10 @@ impl LenientClientCertVerifier {
 			let fingerprint = Sha256::digest(cert_der);
 
 			tracing::debug!(
-				"Accepted client certificate: version={}, subject={}, fingerprint={:x}",
+				"Accepted client certificate: version={}, subject={}, fingerprint={}",
 				version,
 				subject,
-				fingerprint
+				hex::encode(fingerprint)
 			);
 		}
 
@@ -337,8 +337,8 @@ fn load_private_key(path: &Path) -> Result<PrivateKeyDer<'static>, ()> {
 /// - Key usages: digital signature, key encipherment, key agreement
 /// - Serial number: random 64-bit value
 pub(crate) fn create_certificate() -> Result<(String, String), Box<dyn std::error::Error>> {
-	// Generate RSA key (2048 bits)
-	let mut rng = rand::rngs::OsRng;
+	// rsa depends on rand_core 0.6, so we use its bundled OsRng
+	let mut rng = rsa::rand_core::OsRng;
 	let private_key = RsaPrivateKey::new(&mut rng, 2048)?;
 	let key_pem = private_key.to_pkcs8_pem(LineEnding::LF)?.to_string();
 

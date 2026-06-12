@@ -11,6 +11,6 @@ path = "src/bin/bench.rs"
 clap = { version = "4", features = ["derive"] }
 moonshine-core = { path = "../moonshine-core" }
 async-shutdown = "0.2.2"
-tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread", "signal", "time"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }

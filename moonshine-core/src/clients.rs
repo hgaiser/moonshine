@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 
-use aes::cipher::generic_array::GenericArray;
-use aes::cipher::BlockDecrypt;
-use aes::cipher::BlockEncrypt;
+use aes::cipher::Array;
+use aes::cipher::BlockCipherDecrypt;
+use aes::cipher::BlockCipherEncrypt;
 use aes::cipher::KeyInit;
 use aes::Aes128;
 use aws_lc_rs::rand::SecureRandom;
@@ -311,31 +311,31 @@ fn verify_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> 
 }
 
 fn aes_encrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
-	let cipher = Aes128::new(GenericArray::from_slice(key));
+	let key: Array<u8, _> = (*key).into();
+	let cipher = Aes128::new(&key);
 	if !data.len().is_multiple_of(16) {
 		return Err(format!("Data length {} not a multiple of 16", data.len()));
 	}
 
 	let mut encrypted = data.to_vec();
 	for block in encrypted.chunks_mut(16) {
-		let mut gblock = GenericArray::clone_from_slice(block);
-		cipher.encrypt_block(&mut gblock);
-		block.copy_from_slice(&gblock);
+		let gblock: &mut aes::cipher::Array<u8, _> = block.try_into().map_err(|_| "Invalid block length")?;
+		cipher.encrypt_block(gblock);
 	}
 	Ok(encrypted)
 }
 
 fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
-	let cipher = Aes128::new(GenericArray::from_slice(key));
+	let key: Array<u8, _> = (*key).into();
+	let cipher = Aes128::new(&key);
 	if !data.len().is_multiple_of(16) {
 		return Err(format!("Data length {} not a multiple of 16", data.len()));
 	}
 
 	let mut decrypted = data.to_vec();
 	for block in decrypted.chunks_mut(16) {
-		let mut gblock = GenericArray::clone_from_slice(block);
-		cipher.decrypt_block(&mut gblock);
-		block.copy_from_slice(&gblock);
+		let gblock: &mut aes::cipher::Array<u8, _> = block.try_into().map_err(|_| "Invalid block length")?;
+		cipher.decrypt_block(gblock);
 	}
 	Ok(decrypted)
 }
