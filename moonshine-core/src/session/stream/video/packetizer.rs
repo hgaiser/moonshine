@@ -381,7 +381,7 @@ impl Packetizer {
 				}
 			}
 
-			all_shards.extend_from(&shard_buf.into_batch());
+			all_shards.extend(shard_buf.into_batch());
 
 			tracing::trace!("Finished sending frame {frame_number}.");
 

@@ -32,12 +32,15 @@ impl ShardBatch {
 	/// Append all shards from `other` into this batch.
 	///
 	/// Both batches must have the same shard_size (or `self` must be empty).
-	pub fn extend_from(&mut self, other: &ShardBatch) {
-		debug_assert!(self.shard_size == 0 || self.shard_size == other.shard_size);
+	/// When `self` is still empty — the common single-block case — `other`'s
+	/// buffer is moved in directly rather than copied.
+	pub fn extend(&mut self, mut other: ShardBatch) {
 		if self.shard_size == 0 {
-			self.shard_size = other.shard_size;
+			*self = other;
+			return;
 		}
-		self.data.extend_from_slice(&other.data);
+		debug_assert!(self.shard_size == other.shard_size);
+		self.data.append(&mut other.data);
 	}
 }
 
