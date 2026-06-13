@@ -19,8 +19,9 @@ use ash::vk::Handle as _;
 use crate::dispatch::*;
 use crate::state::{
 	get_wayland_connection, insert_swapchain, is_forcing_fifo, is_frame_limiter_aware, remove_swapchain, with_device,
-	with_surface, with_swapchain, MutexExt, SurfaceKey, SwapchainData, SwapchainKey,
+	with_surface, with_swapchain, with_swapchain_mut, MutexExt, SurfaceKey, SwapchainData, SwapchainKey,
 };
+use crate::xcb::{xcb_get_largest_obscuring_child, xcb_get_toplevel_window, xcb_get_window_rect};
 
 pub unsafe extern "C" fn create_swapchain(
 	device: VkDevice,
@@ -51,6 +52,13 @@ pub unsafe extern "C" fn create_swapchain(
 		.map(|arc| arc.force_lock().caps.hdr_supported)
 		.unwrap_or(false);
 	let need_remap = layer_hdr_active && app_color_space != ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
+
+	// Compute surface_key early for bypass checks.
+	let surface_key = SurfaceKey::from_raw(create_info.surface.as_raw());
+
+	// Determine whether XWayland bypass is allowed for this surface.
+	let bypass_allowed = can_bypass_xwayland(surface_key);
+
 	let p_create_info_for_icd;
 	let mut patched_create_info;
 	if need_remap {
@@ -72,7 +80,6 @@ pub unsafe extern "C" fn create_swapchain(
 
 	let swapchain = *p_swapchain;
 	let swapchain_key = SwapchainKey::from_raw(swapchain.as_raw());
-	let surface_key = SurfaceKey::from_raw(create_info.surface.as_raw());
 	// The requested minimum; the driver may allocate more images than this.
 	let min_image_count = create_info.min_image_count;
 
@@ -105,6 +112,7 @@ pub unsafe extern "C" fn create_swapchain(
 					refresh_cycle_ns: 0,
 					retired: false,
 					force_fifo_at_creation: is_forcing_fifo(),
+					is_bypassing_xwayland: false,
 					past_timings: VecDeque::new(),
 				},
 			);
@@ -144,11 +152,12 @@ pub unsafe extern "C" fn create_swapchain(
 
 		// Map the bypass wl_surface to the X11 window so the
 		// compositor renders it in place of the XWayland surface.
-		// The ICD renders directly to the wl_surface; this
-		// override tells the compositor which window it belongs to.
-		if let Some(xid) = xcb_window {
-			crate::log_debug!("vkCreateSwapchainKHR: override_window_content x11_window={}", xid);
-			ms.override_window_content(0, xid);
+		// Only do this when bypass safety checks pass.
+		if bypass_allowed {
+			if let Some(xid) = xcb_window {
+				crate::log_debug!("vkCreateSwapchainKHR: override_window_content x11_window={}", xid);
+				ms.override_window_content(0, xid);
+			}
 		}
 
 		wl.flush();
@@ -169,6 +178,7 @@ pub unsafe extern "C" fn create_swapchain(
 			refresh_cycle_ns: 0,
 			retired: false,
 			force_fifo_at_creation: is_forcing_fifo(),
+			is_bypassing_xwayland: bypass_allowed,
 			past_timings: VecDeque::new(),
 		},
 	);
@@ -338,7 +348,95 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 		}
 	}
 
+	// Re-evaluate XWayland bypass safety for each swapchain.  If bypass is
+	// no longer allowed, force the app to recreate the swapchain.
+	for (i, sw) in swapchains.iter().enumerate() {
+		let sw_key = SwapchainKey::from_raw(sw.as_raw());
+		let was_bypassing = with_swapchain(sw_key, |sd| sd.is_bypassing_xwayland).unwrap_or(false);
+
+		if was_bypassing {
+			let surface = with_swapchain(sw_key, |sd| sd._surface);
+			if let Some(surf) = surface {
+				let surf_key = SurfaceKey::from_raw(surf.as_raw());
+				let still_allowed = can_bypass_xwayland(surf_key);
+				if !still_allowed {
+					with_swapchain_mut(sw_key, |sd| sd.is_bypassing_xwayland = false);
+					if !present_info.p_results.is_null() {
+						let results = std::slice::from_raw_parts_mut(
+							present_info.p_results,
+							present_info.swapchain_count as usize,
+						);
+						if results[i] >= ash::vk::Result::SUCCESS {
+							results[i] = VK_ERROR_OUT_OF_DATE_KHR;
+						}
+					}
+					return VK_ERROR_OUT_OF_DATE_KHR;
+				}
+			}
+		}
+	}
+
 	result
+}
+
+// ---------------------------------------------------------------------------
+// XWayland bypass safety checks
+// ---------------------------------------------------------------------------
+
+/// Check whether it is safe to bypass XWayland for the given surface.
+///
+/// Returns `true` only when the X11 child window is the toplevel, its geometry
+/// matches the toplevel, and no obscuring child covers the window.
+unsafe fn can_bypass_xwayland(surface_key: SurfaceKey) -> bool {
+	let (xcb_connection, xcb_window) = match with_surface(surface_key, |s| (s.xcb_connection, s.xcb_window)) {
+		Some(v) => v,
+		None => return false,
+	};
+	if xcb_connection.is_null() {
+		return false;
+	}
+	let xcb_window = match xcb_window {
+		Some(w) => w,
+		None => return false,
+	};
+
+	let (child_x, child_y, child_w, child_h) = match xcb_get_window_rect(xcb_connection, xcb_window) {
+		Some(v) => v,
+		None => return false,
+	};
+
+	let toplevel = match xcb_get_toplevel_window(xcb_connection, xcb_window) {
+		Some(v) => v,
+		None => return false,
+	};
+
+	if xcb_window == toplevel {
+		return true;
+	}
+
+	let (top_x, top_y, top_w, top_h) = match xcb_get_window_rect(xcb_connection, toplevel) {
+		Some(v) => v,
+		None => return false,
+	};
+
+	// Size mismatch > 2px means the child is not filling the toplevel.
+	if (child_w as i32 - top_w as i32).abs() > 2 || (child_h as i32 - top_h as i32).abs() > 2 {
+		return false;
+	}
+
+	// Position mismatch > 1px means the child is offset from the toplevel.
+	if (child_x as i32 - top_x as i32).abs() > 1 || (child_y as i32 - top_y as i32).abs() > 1 {
+		return false;
+	}
+
+	// If a viewable child covers more than 1×1, skip bypass.
+	if let Some(Some((ow, oh))) = xcb_get_largest_obscuring_child(xcb_connection, toplevel) {
+		if ow > 1 && oh > 1 {
+			return false;
+		}
+	}
+
+	true
 }
 
 // ---------------------------------------------------------------------------

@@ -106,6 +106,23 @@ pub unsafe extern "C" fn create_xcb_surface(
 	let instance_key = instance_key_of(instance);
 	let create_info = &*p_create_info;
 
+	// Runtime toggle to disable the XWayland bypass entirely.
+	if std::env::var("MOONSHINE_WSI_DISABLE_BYPASS")
+		.ok()
+		.map(|v| v.trim() == "1")
+		.unwrap_or(false)
+	{
+		crate::log_info!("XWayland bypass disabled by MOONSHINE_WSI_DISABLE_BYPASS");
+		return with_instance(instance_key, |data| {
+			if let Some(next) = data.dispatch.create_xcb_surface {
+				next(instance, p_create_info, p_allocator, p_surface)
+			} else {
+				VK_ERROR_FEATURE_NOT_PRESENT
+			}
+		})
+		.unwrap_or(VK_ERROR_INITIALIZATION_FAILED);
+	}
+
 	// Try XWayland bypass: create a wl_surface on the Moonshine compositor.
 	let bypass_result = try_xwayland_bypass(
 		instance,
