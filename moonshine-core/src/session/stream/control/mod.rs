@@ -439,7 +439,9 @@ async fn run_control_loop(
 	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 
 	// Create a channel over which we can receive feedback messages to send to the connected client.
-	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
+	// Sized generously: the inputtino IO thread can produce feedback (rumble, LED,
+	// trigger effects) in bursts and blocks if this channel fills up.
+	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(64);
 
 	// Sequence number of feedback messages.
 	let mut sequence_number = 0u32;
@@ -456,8 +458,9 @@ async fn run_control_loop(
 			break;
 		}
 
-		// Check for feedback messages.
-		if let Ok(command) = feedback_rx.try_recv() {
+		// Drain all pending feedback messages so a burst doesn't back up the
+		// channel (and stall the inputtino IO thread that produces them).
+		while let Ok(command) = feedback_rx.try_recv() {
 			tracing::debug!("Sending control feedback command: {command:?}");
 			let payload = command.as_packet();
 			let key = context.keys_rx.borrow().remote_input_key.clone();
