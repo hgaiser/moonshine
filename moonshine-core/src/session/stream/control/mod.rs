@@ -9,7 +9,7 @@ use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
 use self::input::gamepad::GamepadConfig;
 use self::{feedback::FeedbackCommand, input::InputHandler};
-use crate::crypto::{decrypt, encrypt};
+use crate::crypto::GcmCipher;
 use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::{
@@ -227,33 +227,29 @@ impl EncryptedControlMessage {
 	}
 }
 
-fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Vec<u8>, ()> {
+fn encode_control(
+	cipher: &mut GcmCipher,
+	key: &[u8],
+	key_id: i64,
+	sequence_number: u32,
+	payload: &[u8],
+) -> Result<Vec<u8>, ()> {
 	let mut initialization_vector = [0u8; 12];
 	initialization_vector[0..4].copy_from_slice(&sequence_number.to_le_bytes());
 	initialization_vector[10] = b'H';
 	initialization_vector[11] = b'C';
 
-	if key.len() != 16 {
-		tracing::warn!("Key length has {} bytes, but expected {} bytes.", key.len(), 16);
-		return Err(());
-	}
-
-	let mut tag = [0u8; 16];
-	let payload = encrypt(payload, key, &initialization_vector, &mut tag)
-		.map_err(|e| tracing::warn!("Failed to encrypt control data: {e}"))?;
-
-	if payload.is_empty() {
-		tracing::warn!("Failed to encrypt control data.");
-		return Err(());
-	}
+	// Encrypt in place; AES-GCM ciphertext is the same length as the plaintext.
+	let mut buffer = payload.to_vec();
+	let tag = cipher.encrypt(key, key_id, &initialization_vector, &mut buffer)?;
 
 	let message = EncryptedControlMessage {
 		length: std::mem::size_of::<u32>() as u16 // Sequence number.
 			 + ENCRYPTION_TAG_LENGTH as u16   // Tag.
-			 + payload.len() as u16, // Payload.
+			 + buffer.len() as u16, // Payload.
 		sequence_number,
 		tag,
-		payload,
+		payload: buffer,
 	};
 
 	Ok(message.as_bytes())
@@ -411,15 +407,18 @@ fn build_termination_payload(error_code: u32) -> Vec<u8> {
 }
 
 /// Send an encrypted control packet to the connected peer if it exists and is connected.
+#[allow(clippy::too_many_arguments)]
 fn send_to_peer(
 	host: &mut Host,
+	cipher: &mut GcmCipher,
 	peer_id: tokio_enet::PeerId,
 	key: &[u8],
+	key_id: i64,
 	sequence_number: u32,
 	payload: &[u8],
 	label: &str,
 ) {
-	if let Ok(packet) = encode_control(key, sequence_number, payload)
+	if let Ok(packet) = encode_control(cipher, key, key_id, sequence_number, payload)
 		&& let Some(peer) = host.peer_mut(peer_id)
 		&& peer.state() == PeerState::Connected
 	{
@@ -430,11 +429,14 @@ fn send_to_peer(
 }
 
 /// Build and send an HDR mode control message, then advance `sequence_number`.
+#[allow(clippy::too_many_arguments)]
 fn send_hdr_state(
 	host: &mut Host,
+	cipher: &mut GcmCipher,
 	peer_id: tokio_enet::PeerId,
 	state: &HdrModeState,
 	key: &[u8],
+	key_id: i64,
 	sequence_number: &mut u32,
 	label: &str,
 ) {
@@ -444,7 +446,7 @@ fn send_hdr_state(
 		None
 	};
 	let payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
-	send_to_peer(host, peer_id, key, *sequence_number, &payload, label);
+	send_to_peer(host, cipher, peer_id, key, key_id, *sequence_number, &payload, label);
 	*sequence_number += 1;
 	tracing::debug!("Sent HDR mode ({label}) to client: enabled={}", state.enabled);
 }
@@ -478,6 +480,10 @@ async fn run_control_loop(
 	// Track which peer slot the client is connected to.
 	let mut connected_peer: Option<tokio_enet::PeerId> = None;
 
+	// Cached AES-GCM cipher, shared by the input (decrypt) and feedback (encrypt)
+	// directions, rebuilt only when the input key rotates.
+	let mut cipher = GcmCipher::new();
+
 	while !stop_session_manager.is_shutdown_triggered() {
 		// Check if the timeout has passed.
 		if std::time::Instant::now() > stop_deadline {
@@ -494,8 +500,20 @@ async fn run_control_loop(
 			if let Some(peer_id) = connected_peer {
 				tracing::debug!("Sending control feedback command: {command:?}");
 				let payload = command.as_packet();
-				let key = context.keys_rx.borrow().remote_input_key.clone();
-				send_to_peer(&mut host, peer_id, &key, sequence_number, &payload, "feedback");
+				let (key, key_id) = {
+					let keys = context.keys_rx.borrow();
+					(keys.remote_input_key.clone(), keys.remote_input_key_id)
+				};
+				send_to_peer(
+					&mut host,
+					&mut cipher,
+					peer_id,
+					&key,
+					key_id,
+					sequence_number,
+					&payload,
+					"feedback",
+				);
 				sequence_number += 1;
 			}
 		}
@@ -530,21 +548,24 @@ async fn run_control_loop(
 					initialization_vector[10] = b'C';
 					initialization_vector[11] = b'C';
 
-					let keys = &*context.keys_rx.borrow();
-					let decrypted_result = decrypt(
-						&message.payload,
-						&keys.remote_input_key,
-						&initialization_vector,
-						&message.tag,
-					);
-
-					decrypted = match decrypted_result {
-						Ok(decrypted) => decrypted,
-						Err(e) => {
-							tracing::warn!("Failed to decrypt control message: {:?}", e);
+					// Decrypt the ciphertext in place using the cached cipher.
+					let mut buffer = message.payload;
+					{
+						let keys = context.keys_rx.borrow();
+						if cipher
+							.decrypt(
+								&keys.remote_input_key,
+								keys.remote_input_key_id,
+								&initialization_vector,
+								&message.tag,
+								&mut buffer,
+							)
+							.is_err()
+						{
 							continue;
-						},
-					};
+						}
+					}
+					decrypted = buffer;
 
 					control_message = match ControlMessage::from_bytes(&decrypted) {
 						Ok(decrypted_message) => decrypted_message,
@@ -595,9 +616,21 @@ async fn run_control_loop(
 			send_hdr_mode = false;
 			if let Some(peer_id) = connected_peer {
 				let state = hdr_metadata_rx.borrow_and_update().clone();
-				let key = context.keys_rx.borrow().remote_input_key.clone();
+				let (key, key_id) = {
+					let keys = context.keys_rx.borrow();
+					(keys.remote_input_key.clone(), keys.remote_input_key_id)
+				};
 				tracing::info!("Informing client: HDR session");
-				send_hdr_state(&mut host, peer_id, &state, &key, &mut sequence_number, "initial");
+				send_hdr_state(
+					&mut host,
+					&mut cipher,
+					peer_id,
+					&state,
+					&key,
+					key_id,
+					&mut sequence_number,
+					"initial",
+				);
 			}
 		}
 
@@ -607,12 +640,17 @@ async fn run_control_loop(
 			&& let Some(peer_id) = connected_peer
 		{
 			let state = hdr_metadata_rx.borrow_and_update().clone();
-			let key = context.keys_rx.borrow().remote_input_key.clone();
+			let (key, key_id) = {
+				let keys = context.keys_rx.borrow();
+				(keys.remote_input_key.clone(), keys.remote_input_key_id)
+			};
 			send_hdr_state(
 				&mut host,
+				&mut cipher,
 				peer_id,
 				&state,
 				&key,
+				key_id,
 				&mut sequence_number,
 				"metadata update",
 			);
@@ -626,11 +664,16 @@ async fn run_control_loop(
 	// client as a graceful shutdown so it does not display an error.
 	let termination_payload = build_termination_payload(0x80030023);
 	if let Some(peer_id) = connected_peer {
-		let key = context.keys_rx.borrow().remote_input_key.clone();
+		let (key, key_id) = {
+			let keys = context.keys_rx.borrow();
+			(keys.remote_input_key.clone(), keys.remote_input_key_id)
+		};
 		send_to_peer(
 			&mut host,
+			&mut cipher,
 			peer_id,
 			&key,
+			key_id,
 			sequence_number,
 			&termination_payload,
 			"termination",
