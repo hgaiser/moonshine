@@ -164,6 +164,7 @@ impl VideoPipeline {
 		keys_rx: SessionKeysReceiver,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
+		reset_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
@@ -184,6 +185,7 @@ impl VideoPipeline {
 					frame_rx,
 					packet_tx,
 					idr_frame_request_rx,
+					reset_request_rx,
 					stop_session_manager,
 					hdr_metadata_tx,
 					start_notify,
@@ -209,6 +211,7 @@ impl VideoPipelineInner {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
+		reset_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
@@ -244,6 +247,7 @@ impl VideoPipelineInner {
 			encoder,
 			packet_tx,
 			idr_frame_request_rx,
+			reset_request_rx,
 			stop_session_manager,
 			hdr_metadata_tx,
 			stats_tx,
@@ -318,6 +322,7 @@ impl VideoPipelineInner {
 		mut encoder: Encoder,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
+		mut reset_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -370,8 +375,35 @@ impl VideoPipelineInner {
 		});
 
 		while !stop_session_manager.is_shutdown_triggered() {
-			// Drain any pending IDR requests.
 			let mut pending_idr = false;
+
+			// Drain any pending stream-reset requests (client reconnect/resume).
+			//
+			// Moonlight starts every (re)connected session with its frame counter at 1
+			// and waits for an IDR. Because we keep the pipeline running across a resume,
+			// `frame_number` keeps climbing, so a reconnecting client would see the first
+			// frame's index as a huge jump from its expected 1 — counted as ~100% frame
+			// loss within its sampling window, which immediately trips CONN_STATUS_POOR
+			// ("Your network connection isn't performing well"). Reset the frame and RTP
+			// sequence counters and force an IDR so the resumed client sees a clean stream
+			// starting from frame 1.
+			let mut pending_reset = false;
+			loop {
+				match reset_request_rx.try_recv() {
+					Ok(()) => pending_reset = true,
+					Err(broadcast::error::TryRecvError::Lagged(_)) => pending_reset = true,
+					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
+				}
+			}
+			if pending_reset {
+				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
+				frame_number = 0;
+				sequence_number = 0;
+				encoder.request_idr();
+				pending_idr = true;
+			}
+
+			// Drain any pending IDR requests.
 			loop {
 				match idr_frame_request_rx.try_recv() {
 					Ok(()) => {

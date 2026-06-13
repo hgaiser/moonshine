@@ -179,6 +179,7 @@ pub struct VideoStreamContext {
 pub(crate) struct VideoStreamHandle {
 	notify: Arc<Notify>,
 	idr_tx: broadcast::Sender<()>,
+	reset_tx: broadcast::Sender<()>,
 }
 
 impl VideoStreamHandle {
@@ -190,6 +191,17 @@ impl VideoStreamHandle {
 	/// Request an IDR (key) frame from the encoder.
 	pub fn request_idr_frame(&self) {
 		let _ = self.idr_tx.send(());
+	}
+
+	/// Reset the stream's frame/sequence counters for a resuming client.
+	///
+	/// Called when a client reconnects to an already-running session. The pipeline
+	/// keeps incrementing `frame_number` for the lifetime of the session, but a fresh
+	/// Moonlight session expects frame numbers to start at 1; without a reset it counts
+	/// the jump as massive frame loss and reports a poor connection. This also forces an
+	/// IDR so the resumed client has a decodable starting frame.
+	pub fn request_reset(&self) {
+		let _ = self.reset_tx.send(());
 	}
 
 	/// Clone the start notify for external triggering (e.g. bench binary).
@@ -261,6 +273,9 @@ impl VideoStream {
 		// IDR broadcast channel.
 		let (idr_tx, _idr_rx) = broadcast::channel(1);
 
+		// Stream-reset broadcast channel (client reconnect/resume).
+		let (reset_tx, _reset_rx) = broadcast::channel(1);
+
 		// Packet channel.
 		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
 
@@ -275,6 +290,7 @@ impl VideoStream {
 			keys_rx,
 			packet_tx,
 			idr_tx.subscribe(),
+			reset_tx.subscribe(),
 			stop.clone(),
 			hdr_metadata_tx,
 			start_notify.clone(),
@@ -285,6 +301,7 @@ impl VideoStream {
 		Ok(VideoStreamHandle {
 			notify: start_notify,
 			idr_tx,
+			reset_tx,
 		})
 	}
 }

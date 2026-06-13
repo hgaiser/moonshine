@@ -357,8 +357,13 @@ impl SessionManager {
 				Some(SessionState::Active(active)) => {
 					// Resume (reconnect): the streams are already running, so PLAY is a
 					// no-op — the client picks up the existing streams once it PINGs.
+					// The reconnecting client is a fresh Moonlight session that expects
+					// frame numbers to start at 1, so reset the video frame counters and
+					// force an IDR; otherwise it sees the running counter as a huge frame
+					// gap and reports a poor connection.
+					active.reset_video_stream();
 					guard.session = Some(SessionState::Active(active));
-					tracing::info!("Resuming active session: streams already running, treating PLAY as no-op.");
+					tracing::info!("Resuming active session: resetting video frame counter and treating PLAY as no-op.");
 					return Ok(());
 				},
 				None => {
