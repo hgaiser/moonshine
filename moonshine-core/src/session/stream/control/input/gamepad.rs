@@ -144,15 +144,22 @@ impl GamepadInfo {
 	}
 }
 
+// Moonlight touch lifecycle event types (LI_TOUCH_EVENT_*).
+const TOUCH_EVENT_DOWN: u8 = 0x01;
+const TOUCH_EVENT_UP: u8 = 0x02;
+const TOUCH_EVENT_MOVE: u8 = 0x03;
+const TOUCH_EVENT_CANCEL: u8 = 0x04;
+const TOUCH_EVENT_CANCEL_ALL: u8 = 0x07;
+
 #[derive(Debug)]
 pub(crate) struct GamepadTouch {
 	pub index: u8,
-	_event_type: u8,
+	event_type: u8,
 	// zero: [u8; 2], // Alignment/reserved
 	pointer_id: u32,
 	pub x: f32,
 	pub y: f32,
-	pub pressure: f32,
+	_pressure: f32,
 }
 
 impl GamepadTouch {
@@ -177,12 +184,12 @@ impl GamepadTouch {
 
 		Ok(Self {
 			index: buffer[0],
-			_event_type: buffer[1],
+			event_type: buffer[1],
 			// zero: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			pointer_id: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 			x: f32::from_le_bytes(buffer[8..12].try_into().unwrap()).clamp(0.0, 1.0),
 			y: f32::from_le_bytes(buffer[12..16].try_into().unwrap()).clamp(0.0, 1.0),
-			pressure: f32::from_le_bytes(buffer[16..20].try_into().unwrap()).clamp(0.0, 1.0),
+			_pressure: f32::from_le_bytes(buffer[16..20].try_into().unwrap()).clamp(0.0, 1.0),
 		})
 	}
 }
@@ -344,6 +351,9 @@ pub(crate) struct Gamepad {
 	/// The underlying inputtino joypad, used to inject button presses, stick
 	/// positions, triggers, touchpad events, and motion data.
 	gamepad: inputtino::Joypad,
+
+	/// Active touchpad pointer ids, tracked so CancelAll can release them.
+	touch_points: Vec<u32>,
 }
 
 impl Gamepad {
@@ -461,7 +471,10 @@ impl Gamepad {
 			}
 		});
 
-		Ok(Self { gamepad })
+		Ok(Self {
+			gamepad,
+			touch_points: Vec::new(),
+		})
 	}
 
 	/// Apply button flags to the gamepad.
@@ -482,14 +495,30 @@ impl Gamepad {
 
 	pub fn touch(&mut self, touch: &GamepadTouch) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
-			if touch.pressure > 0.5 {
-				gamepad.place_finger(
-					touch.pointer_id,
-					(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
-					(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
-				);
-			} else {
-				gamepad.release_finger(touch.pointer_id);
+			// Drive the touchpad from Moonlight's explicit touch lifecycle event
+			// rather than inferring up/down from pressure, which clients don't
+			// reliably populate (the DualSense touchpad has no pressure sensor).
+			match touch.event_type {
+				TOUCH_EVENT_DOWN | TOUCH_EVENT_MOVE => {
+					gamepad.place_finger(
+						touch.pointer_id,
+						(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
+						(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
+					);
+					if !self.touch_points.contains(&touch.pointer_id) {
+						self.touch_points.push(touch.pointer_id);
+					}
+				},
+				TOUCH_EVENT_UP | TOUCH_EVENT_CANCEL => {
+					gamepad.release_finger(touch.pointer_id);
+					self.touch_points.retain(|id| *id != touch.pointer_id);
+				},
+				TOUCH_EVENT_CANCEL_ALL => {
+					for pointer_id in self.touch_points.drain(..) {
+						gamepad.release_finger(pointer_id);
+					}
+				},
+				_ => {},
 			}
 		}
 	}
