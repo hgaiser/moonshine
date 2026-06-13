@@ -86,7 +86,10 @@ impl TryFrom<u16> for ControlMessageType {
 			x if x == Self::SetMotionEvent as u16 => Ok(Self::SetMotionEvent),
 			x if x == Self::SetRgbLed as u16 => Ok(Self::SetRgbLed),
 			x if x == Self::SetTriggerEffect as u16 => Ok(Self::SetTriggerEffect),
-			_ => Err(()),
+			_ => {
+				tracing::debug!("Ignoring unknown control message type: {v:#06x}");
+				Err(())
+			},
 		}
 	}
 }
@@ -472,7 +475,9 @@ async fn run_control_loop(
 			Ok(Some(Event::Receive { ref packet, .. })) => {
 				let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 					Ok(control_message) => control_message,
-					Err(()) => break,
+					// Ignore messages we can't parse (e.g. types introduced by newer
+					// clients) instead of tearing down the whole session.
+					Err(()) => continue,
 				};
 				tracing::trace!("Received control message: {control_message:?}");
 
