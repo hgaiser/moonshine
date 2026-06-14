@@ -1,4 +1,4 @@
 KERNEL=="uinput", SUBSYSTEM=="misc", OPTIONS+="static_node=uinput", TAG+="uaccess", GROUP="input", MODE="0660"
 KERNEL=="uhid", TAG+="uaccess", GROUP="input", MODE="0660"
-SUBSYSTEM=="hidraw", KERNELS=="uhid", TAG+="uaccess", GROUP="input", MODE="0660"
-SUBSYSTEMS=="input", ATTRS{name}=="Moonshine *", TAG+="uaccess", GROUP="input", MODE="0660"
+SUBSYSTEM=="hidraw", KERNELS=="uhid", ATTRS{name}=="Moonshine *", ENV{ID_SEAT}="seat9", MODE="0666"
+SUBSYSTEMS=="input", ATTRS{name}=="Moonshine *", ENV{ID_SEAT}="seat9", MODE="0666"
