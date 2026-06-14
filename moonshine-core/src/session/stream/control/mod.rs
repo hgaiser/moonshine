@@ -5,7 +5,7 @@ use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
+use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerId, PeerState};
 
 use self::input::gamepad::GamepadConfig;
 use self::{feedback::FeedbackCommand, input::InputHandler};
@@ -391,32 +391,39 @@ fn build_termination_payload(error_code: u32) -> Vec<u8> {
 	buf
 }
 
-/// Send an encrypted control packet to the first peer of `host` if it is connected.
+/// Send an encrypted control packet to the connected peer.
 #[allow(clippy::too_many_arguments)]
 fn send_to_peer(
 	host: &mut Host,
+	peer_id: PeerId,
 	cipher: &mut GcmCipher,
 	key: &[u8],
 	key_id: i64,
 	sequence_number: u32,
 	payload: &[u8],
 	label: &str,
-) {
-	if let Ok(packet) = encode_control(cipher, key, key_id, sequence_number, payload) {
-		if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
-			if peer.state() == PeerState::Connected {
-				let _ = peer
-					.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
-					.map_err(|e| tracing::warn!("Failed to send {label} to peer: {e}"));
-			}
-		}
+) -> bool {
+	let Some(peer) = host.peer_mut(peer_id) else {
+		return false;
+	};
+	if peer.state() != PeerState::Connected {
+		return false;
 	}
+
+	let Ok(packet) = encode_control(cipher, key, key_id, sequence_number, payload) else {
+		return false;
+	};
+
+	peer.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
+		.map_err(|e| tracing::warn!("Failed to send {label} to peer: {e}"))
+		.is_ok()
 }
 
 /// Build and send an HDR mode control message, then advance `sequence_number`.
 #[allow(clippy::too_many_arguments)]
 fn send_hdr_state(
 	host: &mut Host,
+	peer_id: PeerId,
 	cipher: &mut GcmCipher,
 	state: &HdrModeState,
 	key: &[u8],
@@ -430,9 +437,10 @@ fn send_hdr_state(
 		None
 	};
 	let payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
-	send_to_peer(host, cipher, key, key_id, *sequence_number, &payload, label);
-	*sequence_number += 1;
-	tracing::info!("Sent HDR mode ({label}): enabled={}", state.enabled);
+	if send_to_peer(host, peer_id, cipher, key, key_id, *sequence_number, &payload, label) {
+		*sequence_number += 1;
+		tracing::info!("Sent HDR mode ({label}): enabled={}", state.enabled);
+	}
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -461,6 +469,7 @@ async fn run_control_loop(
 	let mut sequence_number = 0u32;
 	let mut send_hdr_mode = false;
 	let mut audio_triggered = false;
+	let mut connected_peer: Option<PeerId> = None;
 
 	// Cached AES-GCM cipher, shared by the input (decrypt) and feedback (encrypt)
 	// directions, rebuilt only when the input key rotates.
@@ -479,14 +488,26 @@ async fn run_control_loop(
 		// Drain all pending feedback messages so a burst doesn't back up the
 		// channel (and stall the inputtino IO thread that produces them).
 		while let Ok(command) = feedback_rx.try_recv() {
-			tracing::debug!("Sending control feedback command: {command:?}");
-			let payload = command.as_packet();
-			let (key, key_id) = {
-				let keys = context.keys_rx.borrow();
-				(keys.remote_input_key.clone(), keys.remote_input_key_id)
-			};
-			send_to_peer(&mut host, &mut cipher, &key, key_id, sequence_number, &payload, "feedback");
-			sequence_number += 1;
+			if let Some(peer_id) = connected_peer {
+				tracing::debug!("Sending control feedback command: {command:?}");
+				let payload = command.as_packet();
+				let (key, key_id) = {
+					let keys = context.keys_rx.borrow();
+					(keys.remote_input_key.clone(), keys.remote_input_key_id)
+				};
+				if send_to_peer(
+					&mut host,
+					peer_id,
+					&mut cipher,
+					&key,
+					key_id,
+					sequence_number,
+					&payload,
+					"feedback",
+				) {
+					sequence_number += 1;
+				}
+			}
 		}
 
 		match host
@@ -494,8 +515,14 @@ async fn run_control_loop(
 			.await
 			.map_err(|e| tracing::error!("Failure in enet host: {e}"))
 		{
-			Ok(Some(Event::Connect { .. })) => {},
-			Ok(Some(Event::Disconnect { .. })) => {},
+			Ok(Some(Event::Connect { peer_id, .. })) => {
+				connected_peer = Some(peer_id);
+			},
+			Ok(Some(Event::Disconnect { peer_id, .. })) => {
+				if connected_peer == Some(peer_id) {
+					connected_peer = None;
+				}
+			},
 			Ok(Some(Event::Receive { ref packet, .. })) => {
 				let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 					Ok(control_message) => control_message,
@@ -576,22 +603,44 @@ async fn run_control_loop(
 		// Send HDR mode notification after the host.service() match to avoid double mutable borrow.
 		if send_hdr_mode {
 			send_hdr_mode = false;
-			let state = hdr_metadata_rx.borrow_and_update().clone();
-			let (key, key_id) = {
-				let keys = context.keys_rx.borrow();
-				(keys.remote_input_key.clone(), keys.remote_input_key_id)
-			};
-			send_hdr_state(&mut host, &mut cipher, &state, &key, key_id, &mut sequence_number, "initial");
+			if let Some(peer_id) = connected_peer {
+				let state = hdr_metadata_rx.borrow_and_update().clone();
+				let (key, key_id) = {
+					let keys = context.keys_rx.borrow();
+					(keys.remote_input_key.clone(), keys.remote_input_key_id)
+				};
+				send_hdr_state(
+					&mut host,
+					peer_id,
+					&mut cipher,
+					&state,
+					&key,
+					key_id,
+					&mut sequence_number,
+					"initial",
+				);
+			}
 		}
 
 		// Check for HDR metadata updates from the video pipeline.
 		if context.hdr && hdr_metadata_rx.has_changed().unwrap_or(false) {
-			let state = hdr_metadata_rx.borrow_and_update().clone();
-			let (key, key_id) = {
-				let keys = context.keys_rx.borrow();
-				(keys.remote_input_key.clone(), keys.remote_input_key_id)
-			};
-			send_hdr_state(&mut host, &mut cipher, &state, &key, key_id, &mut sequence_number, "metadata update");
+			if let Some(peer_id) = connected_peer {
+				let state = hdr_metadata_rx.borrow_and_update().clone();
+				let (key, key_id) = {
+					let keys = context.keys_rx.borrow();
+					(keys.remote_input_key.clone(), keys.remote_input_key_id)
+				};
+				send_hdr_state(
+					&mut host,
+					peer_id,
+					&mut cipher,
+					&state,
+					&key,
+					key_id,
+					&mut sequence_number,
+					"metadata update",
+				);
+			}
 		}
 	}
 
@@ -605,7 +654,18 @@ async fn run_control_loop(
 		let keys = context.keys_rx.borrow();
 		(keys.remote_input_key.clone(), keys.remote_input_key_id)
 	};
-	send_to_peer(&mut host, &mut cipher, &key, key_id, sequence_number, &termination_payload, "termination");
+	if let Some(peer_id) = connected_peer {
+		send_to_peer(
+			&mut host,
+			peer_id,
+			&mut cipher,
+			&key,
+			key_id,
+			sequence_number,
+			&termination_payload,
+			"termination",
+		);
+	}
 	let _ = host.flush().await;
 
 	// Explicitly drop the ENet host before the delay shutdown token

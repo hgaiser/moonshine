@@ -53,8 +53,8 @@ impl GcmCipher {
 		Ok(out)
 	}
 
-	/// Decrypt `buffer` in place using the detached `tag`.
-	pub fn decrypt(&mut self, key: &[u8], key_id: i64, iv: &[u8], tag: &[u8], buffer: &mut [u8]) -> Result<(), ()> {
+	/// Decrypt `buffer` in place using the detached 16-byte tag.
+	pub fn decrypt(&mut self, key: &[u8], key_id: i64, iv: &[u8], tag: &[u8; 16], buffer: &mut [u8]) -> Result<(), ()> {
 		let cipher = self.get(key, key_id)?;
 		cipher
 			.decrypt_in_place_detached(Nonce::from_slice(iv), b"", buffer, GenericArray::from_slice(tag))
