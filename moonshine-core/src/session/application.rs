@@ -107,7 +107,7 @@ pub(crate) struct ApplicationContext {
 	pub wayland_display: String,
 	/// Effective HDR mode — `true` only when the compositor confirmed an HDR-capable DMA-BUF format is in use.
 	pub hdr: bool,
-	/// Environment variables to pass on
+	/// Environment variables to pass on.
 	pub extra_env: HashMap<String, String>,
 }
 
