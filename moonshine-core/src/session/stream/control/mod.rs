@@ -5,7 +5,7 @@ use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
+use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerId, PeerState};
 
 use self::input::gamepad::GamepadConfig;
 use self::{feedback::FeedbackCommand, input::InputHandler};
@@ -406,34 +406,43 @@ fn build_termination_payload(error_code: u32) -> Vec<u8> {
 	buf
 }
 
-/// Send an encrypted control packet to the connected peer if it exists and is connected.
+/// Send an encrypted control packet to the connected peer.
+///
+/// Returns whether the packet was actually handed to ENet, so callers only
+/// advance `sequence_number` for messages the client will really see.
 #[allow(clippy::too_many_arguments)]
 fn send_to_peer(
 	host: &mut Host,
+	peer_id: PeerId,
 	cipher: &mut GcmCipher,
-	peer_id: tokio_enet::PeerId,
 	key: &[u8],
 	key_id: i64,
 	sequence_number: u32,
 	payload: &[u8],
 	label: &str,
-) {
-	if let Ok(packet) = encode_control(cipher, key, key_id, sequence_number, payload)
-		&& let Some(peer) = host.peer_mut(peer_id)
-		&& peer.state() == PeerState::Connected
-	{
-		let _ = peer
-			.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
-			.map_err(|e| tracing::warn!("Failed to send {label} to peer: {e}"));
+) -> bool {
+	let Some(peer) = host.peer_mut(peer_id) else {
+		return false;
+	};
+	if peer.state() != PeerState::Connected {
+		return false;
 	}
+
+	let Ok(packet) = encode_control(cipher, key, key_id, sequence_number, payload) else {
+		return false;
+	};
+
+	peer.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
+		.map_err(|e| tracing::warn!("Failed to send {label} to peer: {e}"))
+		.is_ok()
 }
 
 /// Build and send an HDR mode control message, then advance `sequence_number`.
 #[allow(clippy::too_many_arguments)]
 fn send_hdr_state(
 	host: &mut Host,
+	peer_id: PeerId,
 	cipher: &mut GcmCipher,
-	peer_id: tokio_enet::PeerId,
 	state: &HdrModeState,
 	key: &[u8],
 	key_id: i64,
@@ -446,9 +455,10 @@ fn send_hdr_state(
 		None
 	};
 	let payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
-	send_to_peer(host, cipher, peer_id, key, key_id, *sequence_number, &payload, label);
-	*sequence_number += 1;
-	tracing::debug!("Sent HDR mode ({label}) to client: enabled={}", state.enabled);
+	if send_to_peer(host, peer_id, cipher, key, key_id, *sequence_number, &payload, label) {
+		*sequence_number += 1;
+		tracing::debug!("Sent HDR mode ({label}) to client: enabled={}", state.enabled);
+	}
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -478,7 +488,7 @@ async fn run_control_loop(
 	let mut send_hdr_mode = false;
 	let mut audio_triggered = false;
 	// Track which peer slot the client is connected to.
-	let mut connected_peer: Option<tokio_enet::PeerId> = None;
+	let mut connected_peer: Option<PeerId> = None;
 
 	// Cached AES-GCM cipher, shared by the input (decrypt) and feedback (encrypt)
 	// directions, rebuilt only when the input key rotates.
@@ -504,17 +514,18 @@ async fn run_control_loop(
 					let keys = context.keys_rx.borrow();
 					(keys.remote_input_key.clone(), keys.remote_input_key_id)
 				};
-				send_to_peer(
+				if send_to_peer(
 					&mut host,
-					&mut cipher,
 					peer_id,
+					&mut cipher,
 					&key,
 					key_id,
 					sequence_number,
 					&payload,
 					"feedback",
-				);
-				sequence_number += 1;
+				) {
+					sequence_number += 1;
+				}
 			}
 		}
 
@@ -623,8 +634,8 @@ async fn run_control_loop(
 				tracing::info!("Informing client: HDR session");
 				send_hdr_state(
 					&mut host,
-					&mut cipher,
 					peer_id,
+					&mut cipher,
 					&state,
 					&key,
 					key_id,
@@ -646,8 +657,8 @@ async fn run_control_loop(
 			};
 			send_hdr_state(
 				&mut host,
-				&mut cipher,
 				peer_id,
+				&mut cipher,
 				&state,
 				&key,
 				key_id,
@@ -670,8 +681,8 @@ async fn run_control_loop(
 		};
 		send_to_peer(
 			&mut host,
-			&mut cipher,
 			peer_id,
+			&mut cipher,
 			&key,
 			key_id,
 			sequence_number,
