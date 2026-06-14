@@ -226,8 +226,12 @@ impl SessionManager {
 				Err(())
 			},
 			Some(SessionState::Active(_)) => {
-				tracing::warn!("SetStreamContext rejected: session already active (Active state)");
-				Err(())
+				// Client is resuming an already-running session (reconnect). The video,
+				// audio, and control streams are still running and re-learn the client's
+				// address from its PINGs (with refreshed keys via `/resume`), so there is
+				// nothing to rebuild — accept the re-ANNOUNCE without storing new contexts.
+				tracing::info!("Resuming active session: accepting RTSP ANNOUNCE from reconnecting client.");
+				Ok(())
 			},
 			None => {
 				tracing::warn!("SetStreamContext rejected: no active session");
@@ -351,9 +355,18 @@ impl SessionManager {
 					return Err(());
 				},
 				Some(SessionState::Active(active)) => {
+					// Resume (reconnect): the streams are already running, so PLAY is a
+					// no-op — the client picks up the existing streams once it PINGs.
+					// The reconnecting client is a fresh Moonlight session that expects
+					// frame numbers to start at 1, so reset the video frame counters and
+					// force an IDR; otherwise it sees the running counter as a huge frame
+					// gap and reports a poor connection.
+					active.reset_video_stream();
 					guard.session = Some(SessionState::Active(active));
-					tracing::warn!("StartSession rejected: session already active");
-					return Err(());
+					tracing::info!(
+						"Resuming active session: resetting video frame counter and treating PLAY as no-op."
+					);
+					return Ok(());
 				},
 				None => {
 					tracing::warn!("StartSession rejected: no active session");
