@@ -353,6 +353,7 @@ pub(crate) struct Gamepad {
 	gamepad: inputtino::Joypad,
 
 	/// Active touchpad pointer ids, tracked so CancelAll can release them.
+	/// DualSense reports at most two concurrent touch points, so a Vec stays tiny.
 	touch_points: Vec<u32>,
 }
 
