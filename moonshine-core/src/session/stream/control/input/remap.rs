@@ -6,17 +6,17 @@
 //! NOTE: since Back is withheld until either released or the threshold is
 //! reached, you can't hold the Back button.
 //!
-//! The logic is a pure, time-driven state machine. The caller invokes
-//! `apply()` on every gamepad input event; because Moonlight sends updates
-//! at ~60-120 Hz, deadlines are checked within ~8-16 ms — imperceptible to
-//! human interaction.
+//! The state machine is driven by two paths: `apply()` on every input event,
+//! and `advance()` on a timer when deadlines fire. `source_pressed` is tracked
+//! internally so `advance()` can resolve transitions without stale flags.
 
 use std::time::{Duration, Instant};
 
 use super::gamepad::GamepadConfig;
 
-/// Transition that occurred during the last [`HoldToHome::apply`] call.
-/// Used by the caller to react to state changes (e.g. fire a rumble pulse).
+/// Transition that occurred during the last [`HoldToHome::apply`] or
+/// [`HoldToHome::advance`] call. Used by the caller to react to state changes
+/// (e.g. fire a rumble pulse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldTransition {
 	/// No notable transition.
@@ -51,6 +51,8 @@ pub struct HoldToHome {
 	source_mask: Option<u32>,
 	hold: Duration,
 	state: State,
+	/// Whether the source button was last seen pressed. Updated on every `apply()`.
+	source_pressed: bool,
 }
 
 impl HoldToHome {
@@ -62,6 +64,7 @@ impl HoldToHome {
 			source_mask,
 			hold: Duration::from_millis(config.home_button.hold_ms),
 			state: State::Inactive,
+			source_pressed: false,
 		}
 	}
 
@@ -75,6 +78,7 @@ impl HoldToHome {
 		};
 
 		let source_pressed = flags & source_mask != 0;
+		self.source_pressed = source_pressed;
 		// We manage the source bit ourselves; never pass the raw source bit through.
 		let passthrough = flags & !source_mask;
 
@@ -119,6 +123,47 @@ impl HoldToHome {
 					(passthrough | source_mask, HoldTransition::None)
 				}
 			},
+		}
+	}
+
+	/// Advance the state machine using internally tracked button state. Called
+	/// by the timer task when a deadline fires. Returns the flags to apply and
+	/// any transition that occurred.
+	pub fn advance(&mut self, now: Instant) -> (u32, HoldTransition) {
+		let source_mask = match self.source_mask {
+			Some(mask) => mask,
+			None => return (0, HoldTransition::None),
+		};
+
+		let passthrough = 0;
+		match self.state {
+			State::Pending { deadline } => {
+				if now >= deadline && self.source_pressed {
+					self.state = State::HomeHeld;
+					(passthrough | SPECIAL_FLAG, HoldTransition::HomeActivated)
+				} else {
+					(0, HoldTransition::None)
+				}
+			},
+			State::Tapping { release_at } => {
+				if now >= release_at {
+					self.state = State::Inactive;
+					(0, HoldTransition::None)
+				} else {
+					(passthrough | source_mask, HoldTransition::None)
+				}
+			},
+			_ => (0, HoldTransition::None),
+		}
+	}
+
+	/// The next time at which `advance()` should be called, or `None` if
+	/// nothing is pending.
+	pub fn next_deadline(&self) -> Option<Instant> {
+		match self.state {
+			State::Pending { deadline } => Some(deadline),
+			State::Tapping { release_at } => Some(release_at),
+			State::Inactive | State::HomeHeld => None,
 		}
 	}
 }

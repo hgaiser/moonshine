@@ -1,5 +1,3 @@
-use std::time::Instant;
-
 use inputtino::{
 	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
 	SwitchJoypad, XboxOneJoypad,
@@ -12,8 +10,6 @@ use crate::session::stream::control::{
 	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
 	FeedbackCommand,
 };
-
-use super::remap::{HoldToHome, HoldTransition};
 
 /// Configuration for the hold-to-Home gamepad button remap.
 ///
@@ -239,6 +235,10 @@ impl GamepadUpdate {
 			),
 		})
 	}
+
+	pub fn button_flags(&self) -> u32 {
+		self.button_flags
+	}
 }
 
 #[derive(Debug)]
@@ -337,34 +337,10 @@ pub(crate) struct Gamepad {
 	/// The underlying inputtino joypad, used to inject button presses, stick
 	/// positions, triggers, touchpad events, and motion data.
 	gamepad: inputtino::Joypad,
-
-	/// Gamepad index assigned by the client (0-15).
-	index: u8,
-
-	/// Hold-to-Home button remap state machine for this gamepad.
-	remap: HoldToHome,
-
-	/// Channel to send feedback commands (rumble, LED, trigger effects, motion)
-	/// back to the client.
-	feedback_tx: mpsc::Sender<FeedbackCommand>,
-
-	/// Rumble intensity for the hold-to-Home activation pulse (0.0-1.0).
-	home_rumble_intensity: f64,
-
-	/// Duration of the hold-to-Home activation rumble pulse.
-	home_rumble_duration: std::time::Duration,
-
-	/// Instant at which the hold-to-Home rumble pulse should be turned off,
-	/// or `None` if no pulse is active.
-	home_rumble_off_at: Option<Instant>,
 }
 
 impl Gamepad {
-	pub async fn new(
-		info: &GamepadInfo,
-		feedback_tx: mpsc::Sender<FeedbackCommand>,
-		config: &GamepadConfig,
-	) -> Result<Self, ()> {
+	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
 		let id = format!("00:11:22:33:{:02x}", info.index);
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
@@ -478,53 +454,16 @@ impl Gamepad {
 			}
 		});
 
-		Ok(Self {
-			gamepad,
-			index: info.index,
-			remap: HoldToHome::new(config),
-			feedback_tx,
-			home_rumble_intensity: config.home_button.rumble_intensity,
-			home_rumble_duration: std::time::Duration::from_millis(config.home_button.rumble_duration_ms),
-			home_rumble_off_at: None,
-		})
+		Ok(Self { gamepad })
 	}
 
-	fn send_rumble(&self, low_frequency: u16, high_frequency: u16) {
-		let _ = self.feedback_tx.try_send(FeedbackCommand::Rumble(RumbleCommand {
-			id: self.index as u16,
-			low_frequency,
-			high_frequency,
-		}));
-	}
-
-	fn check_rumble(&mut self, now: Instant) {
-		if let Some(off_at) = self.home_rumble_off_at {
-			if now >= off_at {
-				self.send_rumble(0, 0);
-				self.home_rumble_off_at = None;
-			}
-		}
-	}
-
-	pub fn update(&mut self, update: &GamepadUpdate) {
-		let now = Instant::now();
-
-		self.check_rumble(now);
-
-		// Remap buttons (e.g. hold-to-Home) before they reach the device.
-		let (button_flags, transition) = self.remap.apply(update.button_flags, now);
+	/// Apply button flags to the gamepad.
+	pub fn set_pressed(&self, button_flags: u32) {
 		self.gamepad.set_pressed(button_flags as i32);
+	}
 
-		if transition == HoldTransition::HomeActivated
-			&& self.home_rumble_off_at.is_none()
-			&& self.home_rumble_intensity > 0.0
-			&& !self.home_rumble_duration.is_zero()
-		{
-			let intensity = (self.home_rumble_intensity * u16::MAX as f64) as u16;
-			self.send_rumble(intensity, intensity);
-			self.home_rumble_off_at = Some(now + self.home_rumble_duration);
-		}
-
+	/// Apply a gamepad update (sticks, triggers) to the device.
+	pub fn apply_update(&self, update: &GamepadUpdate) {
 		// Send analog triggers.
 		self.gamepad
 			.set_stick(JoypadStickPosition::LS, update.left_stick.0, update.left_stick.1);
