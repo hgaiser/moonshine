@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
@@ -27,7 +28,9 @@ async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
 	tracing_subscriber::registry()
-		.with(tracing_subscriber::fmt::layer())
+		// Only color when stdout is a terminal: under systemd the escape codes
+		// make journald store every MESSAGE as a byte array instead of a string.
+		.with(tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal()))
 		.with(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("error")))
 		.init();
 
