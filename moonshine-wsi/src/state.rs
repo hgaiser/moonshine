@@ -403,6 +403,8 @@ pub struct SwapchainData {
 	pub retired: bool,
 	/// Whether `is_forcing_fifo()` was true at swapchain creation time.
 	pub force_fifo_at_creation: bool,
+	/// Whether XWayland bypass was allowed when this swapchain was created.
+	pub is_bypassing_xwayland: bool,
 	/// Ring buffer of past presentation timings.
 	pub past_timings: VecDeque<PastPresentTiming>,
 }

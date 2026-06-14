@@ -18,5 +18,4 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal", "sync", "
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 
-[patch.crates-io]
-smithay = { git = "https://github.com/hgaiser/smithay", tag = "v0.7.0-moonshine" }
+

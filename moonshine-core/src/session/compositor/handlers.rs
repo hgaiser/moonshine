@@ -7,19 +7,9 @@ use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::backend::renderer::ImportDma;
-use smithay::delegate_compositor;
-use smithay::delegate_data_device;
-use smithay::delegate_dmabuf;
-use smithay::delegate_output;
-use smithay::delegate_pointer_constraints;
-use smithay::delegate_presentation;
-use smithay::delegate_relative_pointer;
-use smithay::delegate_seat;
-use smithay::delegate_shm;
-use smithay::delegate_viewporter;
-use smithay::delegate_xdg_shell;
-use smithay::delegate_xwayland_shell;
+use smithay::delegate_dispatch2;
 use smithay::desktop::Window;
+use smithay::input::dnd::DndGrabHandler;
 use smithay::input::pointer::{CursorImageStatus, MotionEvent, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
@@ -35,9 +25,7 @@ use smithay::wayland::compositor::{is_sync_subsurface, CompositorClientState, Co
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraintsHandler};
-use smithay::wayland::selection::data_device::{
-	ClientDndGrabHandler, DataDeviceHandler, DataDeviceState, ServerDndGrabHandler,
-};
+use smithay::wayland::selection::data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler};
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
@@ -1341,7 +1329,12 @@ impl XdgShellHandler for MoonshineCompositor {
 		};
 
 		// Read fullscreen state before surface is consumed by new_wayland_window.
-		let fullscreen = surface.current_state().states.contains(XdgToplevelState::Fullscreen);
+		let fullscreen = surface.with_committed_state(|state| {
+			state
+				.as_ref()
+				.map(|s| s.states.contains(XdgToplevelState::Fullscreen))
+				.unwrap_or(false)
+		});
 
 		let window = Window::new_wayland_window(surface);
 		self.space.map_element(window.clone(), (0, 0), false);
@@ -1386,14 +1379,20 @@ impl XdgShellHandler for MoonshineCompositor {
 		let target = surface.wl_surface();
 		if let Some(window) = self.find_window_by_surface(target) {
 			if let Some(meta) = self.window_metadata.get_mut(&window) {
-				let state = surface.current_state();
-				let is_fullscreen = state.states.contains(XdgToplevelState::Fullscreen);
-				if is_fullscreen != meta.fullscreen {
-					meta.fullscreen = is_fullscreen;
-					if let Some(size) = state.size {
-						meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
+				surface.with_committed_state(|state| {
+					let is_fullscreen = state
+						.as_ref()
+						.map(|s| s.states.contains(XdgToplevelState::Fullscreen))
+						.unwrap_or(false);
+					if is_fullscreen != meta.fullscreen {
+						meta.fullscreen = is_fullscreen;
+						if let Some(s) = state {
+							if let Some(size) = s.size {
+								meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
+							}
+						}
 					}
-				}
+				});
 			}
 		}
 		self.reevaluate_focus();
@@ -1404,14 +1403,20 @@ impl XdgShellHandler for MoonshineCompositor {
 		let target = surface.wl_surface();
 		if let Some(window) = self.find_window_by_surface(target) {
 			if let Some(meta) = self.window_metadata.get_mut(&window) {
-				let state = surface.current_state();
-				let is_fullscreen = state.states.contains(XdgToplevelState::Fullscreen);
-				if !is_fullscreen && meta.fullscreen {
-					meta.fullscreen = false;
-					if let Some(size) = state.size {
-						meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
+				surface.with_committed_state(|state| {
+					let is_fullscreen = state
+						.as_ref()
+						.map(|s| s.states.contains(XdgToplevelState::Fullscreen))
+						.unwrap_or(false);
+					if !is_fullscreen && meta.fullscreen {
+						meta.fullscreen = false;
+						if let Some(s) = state {
+							if let Some(size) = s.size {
+								meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
+							}
+						}
 					}
-				}
+				});
 			}
 		}
 		self.reevaluate_focus();
@@ -1476,13 +1481,13 @@ impl SelectionHandler for MoonshineCompositor {
 }
 
 impl DataDeviceHandler for MoonshineCompositor {
-	fn data_device_state(&self) -> &DataDeviceState {
-		&self.data_device_state
+	fn data_device_state(&mut self) -> &mut DataDeviceState {
+		&mut self.data_device_state
 	}
 }
 
-impl ClientDndGrabHandler for MoonshineCompositor {}
-impl ServerDndGrabHandler for MoonshineCompositor {}
+impl WaylandDndGrabHandler for MoonshineCompositor {}
+impl DndGrabHandler for MoonshineCompositor {}
 
 // -- Output Handler --
 
@@ -1505,6 +1510,8 @@ impl PointerConstraintsHandler for MoonshineCompositor {
 			}
 		}
 	}
+
+	fn remove_constraint(&mut self, _surface: &WlSurface, _pointer: &PointerHandle<Self>) {}
 
 	fn cursor_position_hint(
 		&mut self,
@@ -1531,20 +1538,7 @@ impl PointerConstraintsHandler for MoonshineCompositor {
 	}
 }
 
-// -- Delegate macros --
-
-delegate_compositor!(MoonshineCompositor);
-delegate_dmabuf!(MoonshineCompositor);
-delegate_shm!(MoonshineCompositor);
-delegate_xdg_shell!(MoonshineCompositor);
-delegate_seat!(MoonshineCompositor);
-delegate_data_device!(MoonshineCompositor);
-delegate_output!(MoonshineCompositor);
-delegate_relative_pointer!(MoonshineCompositor);
-delegate_pointer_constraints!(MoonshineCompositor);
-delegate_xwayland_shell!(MoonshineCompositor);
-delegate_viewporter!(MoonshineCompositor);
-delegate_presentation!(MoonshineCompositor);
+delegate_dispatch2!(MoonshineCompositor);
 
 // -- DMA-BUF Handler --
 
@@ -1772,52 +1766,22 @@ impl XwmHandler for MoonshineCompositor {
 		self.reevaluate_focus();
 	}
 
-	fn client_message_event(&mut self, _xwm: XwmId, type_name: &str, window: u32, data: [u32; 5]) {
+	fn active_window_request(
+		&mut self,
+		_xwm: XwmId,
+		window: X11Surface,
+		_timestamp: u32,
+		_currently_active_window: Option<X11Surface>,
+	) {
 		// Honor _NET_ACTIVE_WINDOW requests sent by clients (e.g. Wine/Proton games).
-		// These are ClientMessage events sent to the root window with
-		// SubstructureRedirectMask|SubstructureNotifyMask. Smithay's XWM is the
-		// exclusive receiver; this callback is invoked for unhandled messages.
-		if type_name == "_NET_ACTIVE_WINDOW" {
-			tracing::debug!(
-				target: "focus",
-				window_id = window,
-				"_NET_ACTIVE_WINDOW request received via XwmHandler"
-			);
-			self.focus_state.set_requested_focus(window);
-			// Act on the request immediately — without this, explicit focus
-			// requests from Wine/Proton can sit pending forever until some
-			// unrelated focus event triggers reevaluate_focus().
-			self.reevaluate_focus();
-		} else if type_name == "_NET_SYSTEM_TRAY_OPCODE" {
-			// Identify system tray icon windows sent via the XEMBED tray protocol.
-			// Wine's explorer.exe sends REQUEST_DOCK (opcode=0) to the tray selection
-			// owner with the icon window XID in data[2]. We mark these windows so they
-			// are excluded from focus candidates via WindowFlags::SYS_TRAY_ICON.
-			const SYSTEM_TRAY_REQUEST_DOCK: u32 = 0;
-			if data[1] == SYSTEM_TRAY_REQUEST_DOCK {
-				let icon_window_id = data[2];
-				if icon_window_id == 0 {
-					return;
-				}
-				tracing::debug!(
-					target: "focus",
-					icon_window_id,
-					"sysTray: REQUEST_DOCK received, marking as tray icon"
-				);
-				self.sys_tray_icons.insert(icon_window_id);
-				// Also update metadata if the window is already known
-				if let Some((_, meta)) = self
-					.window_metadata
-					.iter_mut()
-					.find(|(w, _)| w.x11_surface().is_some_and(|x| x.window_id() == icon_window_id))
-				{
-					meta.flags.insert(WindowFlags::SYS_TRAY_ICON);
-				}
-				// Re-evaluate focus immediately so the tray icon is excluded
-				// from the candidate list and GAMESCOPE focusable properties.
-				self.reevaluate_focus();
-			}
-		}
+		let window_id = window.window_id();
+		tracing::debug!(
+			target: "focus",
+			window_id,
+			"_NET_ACTIVE_WINDOW request received via XwmHandler"
+		);
+		self.focus_state.set_requested_focus(window_id);
+		self.reevaluate_focus();
 	}
 
 	fn new_window(&mut self, _xwm: XwmId, window: X11Surface) {
