@@ -4,7 +4,6 @@ use aes_gcm::{
 };
 use fec_rs::ReedSolomon;
 use std::collections::{hash_map::Entry, HashMap};
-use std::time::Instant;
 
 use crate::session::SessionKeysReceiver;
 
@@ -248,13 +247,6 @@ impl Packetizer {
 		// Accumulate all blocks into a single batch.
 		let mut all_shards = ShardBatch::empty();
 
-		let mut total_alloc_us = 0u128;
-		let mut total_data_write_us = 0u128;
-		let mut total_fec_encoder_us = 0u128;
-		let mut total_fec_compute_us = 0u128;
-		let mut total_fec_headers_us = 0u128;
-		let mut total_extend_us = 0u128;
-
 		for block_index in 0..nr_blocks {
 			let start = block_index * nr_data_shards_per_block;
 			let mut end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
@@ -271,13 +263,11 @@ impl Packetizer {
 				.max(minimum_fec_packets as usize)
 				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
 
-			let t_fec_encoder = Instant::now();
 			let encoder = if nr_parity_shards > 0 {
 				Some(self.get_fec_encoder(nr_data_shards, nr_parity_shards)?)
 			} else {
 				None
 			};
-			total_fec_encoder_us += t_fec_encoder.elapsed().as_micros();
 
 			// Recompute the actual FEC percentage in case of a rounding error or when there are 0 parity shards.
 			let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
@@ -288,11 +278,7 @@ impl Packetizer {
 
 			// Single allocation for all shards in this block (data + parity), zeroed.
 			let total_shards = nr_data_shards + nr_parity_shards;
-			let t_alloc = Instant::now();
 			let mut shard_buf = ShardBuf::new(total_shards, requested_shard_size, prefix_size);
-			total_alloc_us += t_alloc.elapsed().as_micros();
-
-			let t_data_write = Instant::now();
 
 			// Write data shards directly into the flat buffer.
 			for (block_shard_index, data_shard_index) in (start..end).enumerate() {
@@ -339,21 +325,13 @@ impl Packetizer {
 
 			// Parity shards are already zeroed from ShardBuf::new().
 
-			total_data_write_us += t_data_write.elapsed().as_micros();
-
 			if let Some(encoder) = encoder {
 				// Create FEC-compatible slice views into the flat buffer.
 				let mut fec_slices = shard_buf.as_fec_slices();
 
-				let t_fec_compute = Instant::now();
-
 				encoder
 					.encode(&mut fec_slices)
 					.map_err(|e| tracing::warn!("Failed to encode packet as FEC shards: {e}"))?;
-
-				total_fec_compute_us += t_fec_compute.elapsed().as_micros();
-
-				let t_fec_headers = Instant::now();
 
 				// Write headers for parity shards. FEC overwrites the entire shard
 				// content, so we patch the fields Moonlight needs afterward.
@@ -376,8 +354,6 @@ impl Packetizer {
 
 					*sequence_number += 1;
 				}
-
-				total_fec_headers_us += t_fec_headers.elapsed().as_micros();
 			}
 
 			// Encrypt each shard if video encryption is enabled.
@@ -405,9 +381,7 @@ impl Packetizer {
 				}
 			}
 
-			let t_extend = Instant::now();
-			all_shards.extend_from(&shard_buf.into_batch());
-			total_extend_us += t_extend.elapsed().as_micros();
+			all_shards.extend(shard_buf.into_batch());
 
 			tracing::trace!("Finished sending frame {frame_number}.");
 
@@ -415,10 +389,6 @@ impl Packetizer {
 				break;
 			}
 		}
-
-		tracing::trace!(
-			"Packetize breakdown: alloc_us={total_alloc_us} data_write_us={total_data_write_us} fec_encoder_us={total_fec_encoder_us} fec_compute_us={total_fec_compute_us} fec_headers_us={total_fec_headers_us} extend_us={total_extend_us}",
-		);
 
 		Ok(all_shards)
 	}
