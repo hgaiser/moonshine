@@ -133,6 +133,7 @@ pub(crate) struct InitializedSession {
 	video_stream: VideoStream,
 	control_stream: ControlStream,
 	hdr_metadata_rx: watch::Receiver<HdrModeState>,
+	stop: ShutdownManager<SessionShutdownReason>,
 }
 
 impl InitializedSession {
@@ -171,6 +172,7 @@ impl InitializedSession {
 			video_stream,
 			control_stream,
 			hdr_metadata_rx,
+			stop,
 		})
 	}
 
@@ -187,6 +189,7 @@ impl InitializedSession {
 			video_stream,
 			control_stream,
 			hdr_metadata_rx,
+			stop,
 		} = self;
 
 		let launched_compositor = compositor.launch()?;
@@ -202,6 +205,7 @@ impl InitializedSession {
 				wayland_display: ready.wayland_display.clone(),
 				hdr: ready.hdr,
 			},
+			stop,
 		)
 		.await?;
 

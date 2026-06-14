@@ -26,6 +26,8 @@ pub enum SessionShutdownReason {
 	ManagerShutdown,
 	/// The session was stopped by the user.
 	UserStopped,
+	/// The launched application exited.
+	ApplicationStopped,
 	/// Video packet handler stopped unexpectedly.
 	VideoPacketHandlerStopped,
 	/// Video encoder stopped unexpectedly.
