@@ -1,11 +1,9 @@
-use std::time::Instant;
-
 use async_shutdown::ShutdownManager;
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
 use self::gamepad::Gamepad;
-use crate::config::GamepadConfig;
+use self::gamepad::GamepadConfig;
 use crate::session::compositor::input::CompositorInputEvent;
 use crate::session::manager::SessionShutdownReason;
 
@@ -17,7 +15,7 @@ use self::{
 
 use crate::session::stream::control::FeedbackCommand;
 
-mod gamepad;
+pub(crate) mod gamepad;
 mod keyboard;
 mod mouse;
 mod remap;
@@ -228,36 +226,7 @@ async fn run_gamepad_handler(
 
 	let mut gamepads: [Option<Gamepad>; 16] = Default::default();
 
-	loop {
-		// Wake up to advance the soonest pending hold-to-Home timer, if any.
-		let next_deadline = gamepads.iter().flatten().filter_map(|g| g.next_deadline()).min();
-		let timer = async {
-			match next_deadline {
-				Some(deadline) => tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await,
-				None => std::future::pending::<()>().await,
-			}
-		};
-
-		let (command, feedback_tx) = tokio::select! {
-			result = stop_session_manager.wrap_cancel(command_rx.recv()) => {
-				match result {
-					Ok(Some(command)) => command,
-					// Shutdown triggered or channel closed.
-					_ => break,
-				}
-			},
-			_ = timer => {
-				// A hold-to-Home timer fired: advance any gamepad whose deadline has passed.
-				let now = Instant::now();
-				for gamepad in gamepads.iter_mut().flatten() {
-					if gamepad.next_deadline().is_some_and(|deadline| now >= deadline) {
-						gamepad.tick(now);
-					}
-				}
-				continue;
-			},
-		};
-
+	while let Ok(Some((command, feedback_tx))) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 		match command {
 			InputEvent::GamepadInfo(gamepad) => {
 				tracing::debug!("Gamepad info: {gamepad:?}");

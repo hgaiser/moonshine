@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
+use self::input::gamepad::GamepadConfig;
 use self::{feedback::FeedbackCommand, input::InputHandler};
-use crate::config::GamepadConfig;
 use crate::crypto::{decrypt, encrypt};
 use crate::session::compositor::{
 	frame::{HdrMetadata, HdrModeState},
@@ -21,7 +21,7 @@ use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
 
 mod feedback;
-mod input;
+pub(crate) mod input;
 
 /// Configuration for the control stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -268,11 +268,7 @@ impl ControlStream {
 		input_tx: calloop::channel::Sender<CompositorInputEvent>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		let input_handler = InputHandler::new(
-			input_tx,
-			stop_session_manager.clone(),
-			config.gamepad.clone(),
-		)?;
+		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone(), config.gamepad.clone())?;
 
 		let socket_address = SocketAddr::new(
 			address

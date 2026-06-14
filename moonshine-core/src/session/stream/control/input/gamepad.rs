@@ -4,16 +4,56 @@ use inputtino::{
 	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
 	SwitchJoypad, XboxOneJoypad,
 };
+use serde::{Deserialize, Serialize};
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
-use crate::config::GamepadConfig;
 use crate::session::stream::control::{
 	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
 	FeedbackCommand,
 };
 
-use super::remap::HoldToHome;
+use super::remap::{HoldToHome, HoldTransition};
+
+/// Configuration for the hold-to-Home gamepad button remap.
+///
+/// When enabled, holding the Back/Select button for `hold_ms` emits the
+/// Home/Guide button instead. A short tap (released early) still sends Back.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct HomeButtonConfig {
+	/// How long (in milliseconds) the Back button must be held before the
+	/// Home/Guide button is emitted instead. While held, the Back button is
+	/// withheld; a short tap (released before this duration) still emits Back.
+	/// Set to 0 to disable the remap entirely (the default).
+	pub hold_ms: u64,
+
+	/// Duration (in milliseconds) of the tactile rumble pulse fired when
+	/// hold-to-Home activates. Set to 0 to disable the rumble pulse.
+	pub rumble_duration_ms: u64,
+
+	/// Rumble intensity for the hold-to-Home activation pulse (0.0-1.0).
+	/// 0.0 means no rumble; 1.0 is maximum intensity.
+	pub rumble_intensity: f64,
+}
+
+impl Default for HomeButtonConfig {
+	fn default() -> Self {
+		Self {
+			hold_ms: 0,
+			rumble_duration_ms: 50,
+			rumble_intensity: 0.5,
+		}
+	}
+}
+
+/// Configuration for gamepad input handling.
+#[derive(Default, Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct GamepadConfig {
+	/// Configuration for the hold-to-Home button remap.
+	pub home_button: HomeButtonConfig,
+}
 
 #[derive(Debug, FromRepr)]
 #[repr(u8)]
@@ -294,13 +334,29 @@ impl GamepadBattery {
 }
 
 pub(crate) struct Gamepad {
+	/// The underlying inputtino joypad, used to inject button presses, stick
+	/// positions, triggers, touchpad events, and motion data.
 	gamepad: inputtino::Joypad,
 
-	/// Hold-to-Home button remap state for this gamepad.
+	/// Gamepad index assigned by the client (0-15).
+	index: u8,
+
+	/// Hold-to-Home button remap state machine for this gamepad.
 	remap: HoldToHome,
 
-	/// Last raw button flags received, re-applied (remapped) when a hold timer fires.
-	last_button_flags: u32,
+	/// Channel to send feedback commands (rumble, LED, trigger effects, motion)
+	/// back to the client.
+	feedback_tx: mpsc::Sender<FeedbackCommand>,
+
+	/// Rumble intensity for the hold-to-Home activation pulse (0.0-1.0).
+	home_rumble_intensity: f64,
+
+	/// Duration of the hold-to-Home activation rumble pulse.
+	home_rumble_duration: std::time::Duration,
+
+	/// Instant at which the hold-to-Home rumble pulse should be turned off,
+	/// or `None` if no pulse is active.
+	home_rumble_off_at: Option<Instant>,
 }
 
 impl Gamepad {
@@ -410,10 +466,11 @@ impl Gamepad {
 			),
 		};
 
+		let feedback_tx_for_rumble = feedback_tx.clone();
 		gamepad.set_on_rumble({
 			let index = info.index;
 			move |low_frequency, high_frequency| {
-				let _ = feedback_tx.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
+				let _ = feedback_tx_for_rumble.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
 					id: index as u16,
 					low_frequency: low_frequency as u16,
 					high_frequency: high_frequency as u16,
@@ -423,16 +480,50 @@ impl Gamepad {
 
 		Ok(Self {
 			gamepad,
+			index: info.index,
 			remap: HoldToHome::new(config),
-			last_button_flags: 0,
+			feedback_tx,
+			home_rumble_intensity: config.home_button.rumble_intensity,
+			home_rumble_duration: std::time::Duration::from_millis(config.home_button.rumble_duration_ms),
+			home_rumble_off_at: None,
 		})
 	}
 
+	fn send_rumble(&self, low_frequency: u16, high_frequency: u16) {
+		let _ = self.feedback_tx.try_send(FeedbackCommand::Rumble(RumbleCommand {
+			id: self.index as u16,
+			low_frequency,
+			high_frequency,
+		}));
+	}
+
+	fn check_rumble(&mut self, now: Instant) {
+		if let Some(off_at) = self.home_rumble_off_at {
+			if now >= off_at {
+				self.send_rumble(0, 0);
+				self.home_rumble_off_at = None;
+			}
+		}
+	}
+
 	pub fn update(&mut self, update: &GamepadUpdate) {
+		let now = Instant::now();
+
+		self.check_rumble(now);
+
 		// Remap buttons (e.g. hold-to-Home) before they reach the device.
-		self.last_button_flags = update.button_flags;
-		let button_flags = self.remap.apply(update.button_flags, Instant::now());
+		let (button_flags, transition) = self.remap.apply(update.button_flags, now);
 		self.gamepad.set_pressed(button_flags as i32);
+
+		if transition == HoldTransition::HomeActivated
+			&& self.home_rumble_off_at.is_none()
+			&& self.home_rumble_intensity > 0.0
+			&& !self.home_rumble_duration.is_zero()
+		{
+			let intensity = (self.home_rumble_intensity * u16::MAX as f64) as u16;
+			self.send_rumble(intensity, intensity);
+			self.home_rumble_off_at = Some(now + self.home_rumble_duration);
+		}
 
 		// Send analog triggers.
 		self.gamepad
@@ -441,19 +532,6 @@ impl Gamepad {
 			.set_stick(JoypadStickPosition::RS, update.right_stick.0, update.right_stick.1);
 		self.gamepad
 			.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
-	}
-
-	/// Re-apply the remapped button state when a hold-to-Home timer elapses
-	/// (no new gamepad update has arrived to drive the transition).
-	pub fn tick(&mut self, now: Instant) {
-		let button_flags = self.remap.apply(self.last_button_flags, now);
-		self.gamepad.set_pressed(button_flags as i32);
-	}
-
-	/// The next time at which [`Gamepad::tick`] should be called to advance a
-	/// pending hold-to-Home timer, or `None` if nothing is pending.
-	pub fn next_deadline(&self) -> Option<Instant> {
-		self.remap.next_deadline()
 	}
 
 	pub fn touch(&mut self, touch: &GamepadTouch) {

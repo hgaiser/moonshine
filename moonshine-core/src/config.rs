@@ -5,6 +5,7 @@ pub use crate::app_scanner::steam::SteamApplicationScannerConfig;
 pub use crate::app_scanner::ApplicationScannerConfig;
 pub use crate::session::application::ApplicationConfig;
 use crate::session::compositor::CompositorConfig;
+pub use crate::session::stream::control::input::gamepad::GamepadConfig;
 use crate::session::stream::StreamConfig;
 use crate::webserver::WebserverConfig;
 
@@ -115,31 +116,6 @@ impl Default for Config {
 				launch_timeout_secs: 2,
 			})],
 			compositor: CompositorConfig::default(),
-		}
-	}
-}
-
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(default)]
-pub struct GamepadConfig {
-	/// How long (in milliseconds) the Back button must be held before the
-	/// Home/Guide button is emitted instead. While held, the Back button is
-	/// withheld; a short tap (released before this duration) still emits Back.
-	/// Set to 0 to disable the remap entirely (the default).
-	pub home_button_hold_ms: u64,
-
-	/// When the Back button is held past the threshold, emit the Home/Guide
-	/// button as a brief tap and release it automatically, even if Back is
-	/// still held. Enabled by default. Disable this to keep Home held for as
-	/// long as Back is held, which allows Home/Guide button chords (e.g. Home + X).
-	pub home_button_auto_release: bool,
-}
-
-impl Default for GamepadConfig {
-	fn default() -> Self {
-		Self {
-			home_button_hold_ms: 0,
-			home_button_auto_release: true,
 		}
 	}
 }
