@@ -354,21 +354,26 @@ async fn run_gamepad_handler(
 		match command {
 			InputEvent::GamepadInfo(gamepad) => {
 				tracing::debug!("Gamepad info: {gamepad:?}");
-				let mut gamepads = gamepads.lock().await;
-				if gamepad.index as usize >= gamepads.len() {
+				let idx = gamepad.index as usize;
+				if idx >= 16 {
 					tracing::warn!(
-						"Received info for gamepad {}, but we only have {} slots.",
-						gamepad.index,
-						gamepads.len()
+						"Received info for gamepad {}, but we only have 16 slots.",
+						gamepad.index
 					);
 					continue;
 				}
 
-				if gamepads[gamepad.index as usize].is_none() {
+				let needs_create = {
+					let gamepads = gamepads.lock().await;
+					gamepads[idx].is_none()
+				};
+
+				if needs_create {
 					if let Ok(new_slot) =
 						GamepadSlot::new(&gamepad, feedback_tx, &gamepad_config, timer_wake.clone()).await
 					{
-						gamepads[gamepad.index as usize] = Some(new_slot);
+						let mut gamepads = gamepads.lock().await;
+						gamepads[idx] = Some(new_slot);
 						tracing::info!("Gamepad {} connected.", gamepad.index);
 					}
 				}
@@ -435,21 +440,23 @@ async fn run_gamepad_handler(
 			},
 			InputEvent::GamepadUpdate(gamepad_update) => {
 				tracing::trace!("Gamepad update: {gamepad_update:?}");
-				let mut gamepads = gamepads.lock().await;
-				if gamepad_update.index as usize >= gamepads.len() {
+				let idx = gamepad_update.index as usize;
+				if idx >= 16 {
 					tracing::warn!(
-						"Received update for gamepad {}, but we only have {} gamepads.",
-						gamepad_update.index,
-						gamepads.len()
+						"Received update for gamepad {}, but we only have 16 gamepads.",
+						gamepad_update.index
 					);
 					continue;
 				}
 
-				let idx = gamepad_update.index as usize;
-
 				// Some clients (e.g. Moonlight Android OSC) send GamepadUpdate without a
 				// preceding GamepadInfo. Auto-create a default gamepad in that case.
-				if gamepads[idx].is_none() && gamepad_update.active_gamepad_mask & (1 << gamepad_update.index) != 0 {
+				let needs_create = {
+					let gamepads = gamepads.lock().await;
+					gamepads[idx].is_none() && gamepad_update.active_gamepad_mask & (1 << gamepad_update.index) != 0
+				};
+
+				if needs_create {
 					tracing::debug!(
 						"Received update for gamepad {} before arrival, auto-creating default gamepad.",
 						gamepad_update.index
@@ -463,10 +470,12 @@ async fn run_gamepad_handler(
 					)
 					.await
 					{
+						let mut gamepads = gamepads.lock().await;
 						gamepads[idx] = Some(new_slot);
 					}
 				}
 
+				let mut gamepads = gamepads.lock().await;
 				match gamepads[idx].as_mut() {
 					Some(slot) => {
 						let now = Instant::now();

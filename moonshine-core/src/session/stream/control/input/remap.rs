@@ -53,6 +53,12 @@ pub struct HoldToHome {
 	state: State,
 	/// Whether the source button was last seen pressed. Updated on every `apply()`.
 	source_pressed: bool,
+	/// Whether to drop the physical Home/Guide button from passthrough.
+	suppress_home: bool,
+	/// The last passthrough flags (all buttons except source and optionally Home).
+	/// Stored so `advance()` can reuse them when the timer fires, preserving
+	/// other button state that might not be re-sent by the client.
+	last_passthrough: u32,
 }
 
 impl HoldToHome {
@@ -65,6 +71,8 @@ impl HoldToHome {
 			hold: Duration::from_millis(config.home_button.hold_ms),
 			state: State::Inactive,
 			source_pressed: false,
+			suppress_home: config.home_button.suppress_home,
+			last_passthrough: 0,
 		}
 	}
 
@@ -80,7 +88,13 @@ impl HoldToHome {
 		let source_pressed = flags & source_mask != 0;
 		self.source_pressed = source_pressed;
 		// We manage the source bit ourselves; never pass the raw source bit through.
-		let passthrough = flags & !source_mask;
+		// Optionally suppress the physical Home/Guide button too.
+		let passthrough = if self.suppress_home {
+			flags & !source_mask & !SPECIAL_FLAG
+		} else {
+			flags & !source_mask
+		};
+		self.last_passthrough = passthrough;
 
 		match self.state {
 			State::Inactive => {
@@ -135,7 +149,7 @@ impl HoldToHome {
 			None => return (0, HoldTransition::None),
 		};
 
-		let passthrough = 0;
+		let passthrough = self.last_passthrough;
 		match self.state {
 			State::Pending { deadline } => {
 				if now >= deadline && self.source_pressed {
@@ -148,7 +162,7 @@ impl HoldToHome {
 			State::Tapping { release_at } => {
 				if now >= release_at {
 					self.state = State::Inactive;
-					(0, HoldTransition::None)
+					(passthrough, HoldTransition::None)
 				} else {
 					(passthrough | source_mask, HoldTransition::None)
 				}

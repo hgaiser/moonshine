@@ -31,6 +31,12 @@ pub struct HomeButtonConfig {
 	/// Rumble intensity for the hold-to-Home activation pulse (0.0-1.0).
 	/// 0.0 means no rumble; 1.0 is maximum intensity.
 	pub rumble_intensity: f64,
+
+	/// Suppress the physical Home/Guide button from the client gamepad.
+	/// When enabled, an actual Home press from the client is dropped so it
+	/// doesn't trigger the host's overlay (Steam, desktop, etc.). The
+	/// hold-to-Home remap-generated Home is unaffected.
+	pub suppress_home: bool,
 }
 
 impl Default for HomeButtonConfig {
@@ -39,6 +45,7 @@ impl Default for HomeButtonConfig {
 			hold_ms: 0,
 			rumble_duration_ms: 50,
 			rumble_intensity: 0.5,
+			suppress_home: false,
 		}
 	}
 }
