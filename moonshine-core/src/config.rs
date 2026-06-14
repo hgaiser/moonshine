@@ -5,6 +5,7 @@ pub use crate::app_scanner::steam::SteamApplicationScannerConfig;
 pub use crate::app_scanner::ApplicationScannerConfig;
 pub use crate::session::application::ApplicationConfig;
 use crate::session::compositor::CompositorConfig;
+pub use crate::session::stream::control::input::gamepad::GamepadConfig;
 use crate::session::stream::StreamConfig;
 use crate::webserver::WebserverConfig;
 
