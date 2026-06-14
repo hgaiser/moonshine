@@ -363,7 +363,9 @@ impl SessionManager {
 					// gap and reports a poor connection.
 					active.reset_video_stream();
 					guard.session = Some(SessionState::Active(active));
-					tracing::info!("Resuming active session: resetting video frame counter and treating PLAY as no-op.");
+					tracing::info!(
+						"Resuming active session: resetting video frame counter and treating PLAY as no-op."
+					);
 					return Ok(());
 				},
 				None => {

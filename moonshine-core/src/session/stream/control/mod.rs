@@ -272,7 +272,7 @@ impl ControlStream {
 
 		let host_config = HostConfig {
 			address: Some(socket_address),
-			peer_count: 1,
+			peer_count: 128,
 			channel_limit: 1,
 			..Default::default()
 		};
@@ -377,10 +377,17 @@ fn build_termination_payload(error_code: u32) -> Vec<u8> {
 	buf
 }
 
-/// Send an encrypted control packet to the first peer of `host` if it is connected.
-fn send_to_peer(host: &mut Host, key: &[u8], sequence_number: u32, payload: &[u8], label: &str) {
+/// Send an encrypted control packet to the connected peer if it exists and is connected.
+fn send_to_peer(
+	host: &mut Host,
+	peer_id: tokio_enet::PeerId,
+	key: &[u8],
+	sequence_number: u32,
+	payload: &[u8],
+	label: &str,
+) {
 	if let Ok(packet) = encode_control(key, sequence_number, payload) {
-		if let Some(peer) = host.peer_mut(tokio_enet::PeerId(0)) {
+		if let Some(peer) = host.peer_mut(peer_id) {
 			if peer.state() == PeerState::Connected {
 				let _ = peer
 					.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
@@ -391,14 +398,21 @@ fn send_to_peer(host: &mut Host, key: &[u8], sequence_number: u32, payload: &[u8
 }
 
 /// Build and send an HDR mode control message, then advance `sequence_number`.
-fn send_hdr_state(host: &mut Host, state: &HdrModeState, key: &[u8], sequence_number: &mut u32, label: &str) {
+fn send_hdr_state(
+	host: &mut Host,
+	peer_id: tokio_enet::PeerId,
+	state: &HdrModeState,
+	key: &[u8],
+	sequence_number: &mut u32,
+	label: &str,
+) {
 	let metadata = if state.enabled {
 		Some(state.metadata.unwrap_or_else(HdrMetadata::fallback))
 	} else {
 		None
 	};
 	let payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
-	send_to_peer(host, key, *sequence_number, &payload, label);
+	send_to_peer(host, peer_id, key, *sequence_number, &payload, label);
 	*sequence_number += 1;
 	tracing::info!("Sent HDR mode ({label}): enabled={}", state.enabled);
 }
@@ -427,6 +441,8 @@ async fn run_control_loop(
 	let mut sequence_number = 0u32;
 	let mut send_hdr_mode = false;
 	let mut audio_triggered = false;
+	// Track which peer slot the client is connected to.
+	let mut connected_peer: Option<tokio_enet::PeerId> = None;
 
 	while !stop_session_manager.is_shutdown_triggered() {
 		// Check if the timeout has passed.
@@ -440,11 +456,13 @@ async fn run_control_loop(
 
 		// Check for feedback messages.
 		if let Ok(command) = feedback_rx.try_recv() {
-			tracing::debug!("Sending control feedback command: {command:?}");
-			let payload = command.as_packet();
-			let key = context.keys_rx.borrow().remote_input_key.clone();
-			send_to_peer(&mut host, &key, sequence_number, &payload, "feedback");
-			sequence_number += 1;
+			if let Some(peer_id) = connected_peer {
+				tracing::debug!("Sending control feedback command: {command:?}");
+				let payload = command.as_packet();
+				let key = context.keys_rx.borrow().remote_input_key.clone();
+				send_to_peer(&mut host, peer_id, &key, sequence_number, &payload, "feedback");
+				sequence_number += 1;
+			}
 		}
 
 		match host
@@ -452,8 +470,14 @@ async fn run_control_loop(
 			.await
 			.map_err(|e| tracing::error!("Failure in enet host: {e}"))
 		{
-			Ok(Some(Event::Connect { .. })) => {},
-			Ok(Some(Event::Disconnect { .. })) => {},
+			Ok(Some(Event::Connect { peer_id, .. })) => {
+				connected_peer = Some(peer_id);
+			},
+			Ok(Some(Event::Disconnect { peer_id, .. })) => {
+				if connected_peer == Some(peer_id) {
+					connected_peer = None;
+				}
+			},
 			Ok(Some(Event::Receive { ref packet, .. })) => {
 				let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 					Ok(control_message) => control_message,
@@ -529,16 +553,27 @@ async fn run_control_loop(
 		// Send HDR mode notification after the host.service() match to avoid double mutable borrow.
 		if send_hdr_mode {
 			send_hdr_mode = false;
-			let state = hdr_metadata_rx.borrow_and_update().clone();
-			let key = context.keys_rx.borrow().remote_input_key.clone();
-			send_hdr_state(&mut host, &state, &key, &mut sequence_number, "initial");
+			if let Some(peer_id) = connected_peer {
+				let state = hdr_metadata_rx.borrow_and_update().clone();
+				let key = context.keys_rx.borrow().remote_input_key.clone();
+				send_hdr_state(&mut host, peer_id, &state, &key, &mut sequence_number, "initial");
+			}
 		}
 
 		// Check for HDR metadata updates from the video pipeline.
 		if context.hdr && hdr_metadata_rx.has_changed().unwrap_or(false) {
-			let state = hdr_metadata_rx.borrow_and_update().clone();
-			let key = context.keys_rx.borrow().remote_input_key.clone();
-			send_hdr_state(&mut host, &state, &key, &mut sequence_number, "metadata update");
+			if let Some(peer_id) = connected_peer {
+				let state = hdr_metadata_rx.borrow_and_update().clone();
+				let key = context.keys_rx.borrow().remote_input_key.clone();
+				send_hdr_state(
+					&mut host,
+					peer_id,
+					&state,
+					&key,
+					&mut sequence_number,
+					"metadata update",
+				);
+			}
 		}
 	}
 
@@ -548,8 +583,17 @@ async fn run_control_loop(
 	// NVST_DISCONN_SERVER_TERMINATED_CLOSED (0x80030023) is recognized by the
 	// client as a graceful shutdown so it does not display an error.
 	let termination_payload = build_termination_payload(0x80030023);
-	let key = context.keys_rx.borrow().remote_input_key.clone();
-	send_to_peer(&mut host, &key, sequence_number, &termination_payload, "termination");
+	if let Some(peer_id) = connected_peer {
+		let key = context.keys_rx.borrow().remote_input_key.clone();
+		send_to_peer(
+			&mut host,
+			peer_id,
+			&key,
+			sequence_number,
+			&termination_payload,
+			"termination",
+		);
+	}
 	let _ = host.flush().await;
 
 	// Explicitly drop the ENet host before the delay shutdown token
