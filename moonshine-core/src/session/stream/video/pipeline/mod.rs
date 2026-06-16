@@ -31,6 +31,17 @@ use pixelforge::{
 	VideoContextBuilder,
 };
 
+/// Bound on the encode→consumer frame-context queue.
+///
+/// This is the backpressure point for the whole pipeline: when the consumer
+/// falls behind (e.g. downstream network send blocks), this fills and the
+/// encoding thread blocks on `frame_ctx_tx.send`, which stops it submitting new
+/// frames instead of letting per-frame context (and stale frames) pile up
+/// without bound. Sized a little above pixelforge's encode pipeline depth (2) to
+/// absorb normal scheduling/network jitter without throttling the encoder, while
+/// keeping at most a few frames of buffering so backpressure stays prompt.
+const FRAME_CTX_QUEUE_DEPTH: usize = 8;
+
 /// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
 const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 /// SDR reference white for HDR transport, per ITU-R BT.2408 (203 cd/m²).
@@ -158,7 +169,10 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 
 /// Per-submitted-frame context handed to the packet consumer thread, in
 /// submission order. Each `FrameContext` corresponds to exactly one encoded
-/// packet (no B-frames, so packets emerge in submission order).
+/// packet: pixelforge produces exactly one `EncodedPacket` per `encode()` call
+/// (one submission → one readback → one packet), and with no B-frames packets
+/// emerge in submission order. The FIFO pairing in `run_packet_consumer` relies
+/// on this 1:1 ordering.
 struct FrameContext {
 	/// When the source frame was captured (for end-to-end latency).
 	created_at: std::time::Instant,
@@ -252,9 +266,11 @@ fn run_packet_consumer(
 		frame_number += 1;
 
 		let t_start = std::time::Instant::now();
-		// Capture-to-packetization latency in 100µs units, clamped to u16::MAX.
+		// Capture-to-packetization latency in 100µs units, clamped to u16::MAX
+		// (~6.55s). Clamp in the wider u128 *before* the cast, otherwise the
+		// `as u16` would wrap for latencies > ~6.55s and report a tiny value.
 		let processing_latency = t_start.duration_since(fctx.created_at);
-		let latency_100us = std::cmp::min((processing_latency.as_micros() / 100) as u16, u16::MAX);
+		let latency_100us = (processing_latency.as_micros() / 100).min(u16::MAX as u128) as u16;
 
 		let shards = match packetizer.packetize(
 			&packet.data,
@@ -268,6 +284,9 @@ fn run_packet_consumer(
 			latency_100us,
 		) {
 			Ok(shards) => shards,
+			// Drop just this frame rather than tearing down the session: the
+			// client sees a gap (the frame number was already consumed) and
+			// requests an IDR, which recovers the stream.
 			Err(()) => {
 				tracing::warn!("Failed to packetize encoded frame");
 				continue;
@@ -276,6 +295,10 @@ fn run_packet_consumer(
 
 		let t_packetized = std::time::Instant::now();
 
+		// A closed packet channel means the network sender is gone, i.e. the
+		// session is already tearing down. Stop the consumer; the encoding thread
+		// then sees its `frame_ctx_tx` fail and exits too, which drops the
+		// video-pipeline shutdown token and tears the session down.
 		if packet_tx.blocking_send(shards).is_err() {
 			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
 			break;
@@ -523,7 +546,10 @@ impl VideoPipelineInner {
 		let packet_rx = encoder
 			.take_packet_receiver()
 			.ok_or_else(|| "encoder packet receiver already taken".to_string())?;
-		let (frame_ctx_tx, frame_ctx_rx) = std::sync::mpsc::channel::<ConsumerMsg>();
+		// Bounded so a slow consumer applies backpressure to the encoding thread
+		// rather than letting per-frame context grow without bound; see
+		// `FRAME_CTX_QUEUE_DEPTH`.
+		let (frame_ctx_tx, frame_ctx_rx) = std::sync::mpsc::sync_channel::<ConsumerMsg>(FRAME_CTX_QUEUE_DEPTH);
 		let consumer = {
 			let ctx = self.context.clone();
 			let config = self.config.clone();
