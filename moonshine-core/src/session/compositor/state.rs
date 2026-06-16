@@ -158,10 +158,11 @@ impl RenderElement<GlesRenderer> for OutputRenderElements {
 		dst: smithay::utils::Rectangle<i32, smithay::utils::Physical>,
 		damage: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
 		opaque_regions: &[smithay::utils::Rectangle<i32, smithay::utils::Physical>],
+		cache: Option<&smithay::utils::user_data::UserDataMap>,
 	) -> Result<(), GlesError> {
 		match self {
-			Self::Space(e) => e.draw(frame, src, dst, damage, opaque_regions),
-			Self::Pointer(e) => e.draw(frame, src, dst, damage, opaque_regions),
+			Self::Space(e) => e.draw(frame, src, dst, damage, opaque_regions, cache),
+			Self::Pointer(e) => e.draw(frame, src, dst, damage, opaque_regions, cache),
 		}
 	}
 
@@ -1483,8 +1484,13 @@ impl MoonshineCompositor {
 					// Set the client compositor scale to 1.0 (no HiDPI scaling for XWayland).
 					data.client_compositor_state(&client).set_client_scale(1.0);
 
-					let wm = smithay::xwayland::X11Wm::start_wm(data.handle.clone(), x11_socket, client.clone())
-						.expect("Failed to start X11 window manager.");
+					let wm = smithay::xwayland::X11Wm::start_wm(
+						data.handle.clone(),
+						&data.display_handle,
+						x11_socket,
+						client.clone(),
+					)
+					.expect("Failed to start X11 window manager.");
 
 					tracing::debug!(display_number, "XWayland ready.");
 

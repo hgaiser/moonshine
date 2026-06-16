@@ -39,13 +39,13 @@ pub struct DesktopApplicationScannerConfig {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub post_command: Vec<Vec<String>>,
 
-	/// Path to redirect application stdout to. If not set, stdout is discarded.
+	/// systemd StandardOutput value for launched applications.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub stdout: Option<PathBuf>,
+	pub stdout: Option<String>,
 
-	/// Path to redirect application stderr to. If not set, stderr is discarded.
+	/// systemd StandardError value for launched applications.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub stderr: Option<PathBuf>,
+	pub stderr: Option<String>,
 
 	/// Seconds to wait for each scanned application to reach an active state after launch.
 	#[serde(default = "crate::session::application::default_launch_timeout")]

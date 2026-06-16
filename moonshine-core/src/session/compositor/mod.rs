@@ -351,6 +351,7 @@ fn run_compositor(
 			subpixel: Subpixel::Unknown,
 			make: "Moonshine".into(),
 			model: "Virtual Output".into(),
+			serial_number: "".into(),
 		},
 	);
 	output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
