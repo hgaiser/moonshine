@@ -34,13 +34,13 @@ pub struct ApplicationConfig {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub post_command: Vec<Vec<String>>,
 
-	/// Path to redirect application stdout to. If not set, stdout is discarded.
+	/// systemd StandardOutput value. If not set, defaults to "null".
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub stdout: Option<PathBuf>,
+	pub stdout: Option<String>,
 
-	/// Path to redirect application stderr to. If not set, stderr is discarded.
+	/// systemd StandardError value. If not set, defaults to "null".
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub stderr: Option<PathBuf>,
+	pub stderr: Option<String>,
 
 	/// Seconds to wait for the application to reach an active state after launch.
 	#[serde(default = "default_launch_timeout")]
@@ -91,8 +91,8 @@ pub(crate) struct LaunchOptions<'a> {
 	pub timeout: Duration,
 	pub pre_commands: &'a Vec<Vec<String>>,
 	pub post_commands: &'a Vec<Vec<String>>,
-	pub stdout_path: &'a Option<PathBuf>,
-	pub stderr_path: &'a Option<PathBuf>,
+	pub stdout_value: &'a Option<String>,
+	pub stderr_value: &'a Option<String>,
 }
 
 /// Runtime context required to launch an application.
@@ -142,8 +142,8 @@ impl Application {
 			timeout: Duration::from_secs(config.launch_timeout_secs),
 			pre_commands: &config.pre_command,
 			post_commands: &config.post_command,
-			stdout_path: &config.stdout,
-			stderr_path: &config.stderr,
+			stdout_value: &config.stdout,
+			stderr_value: &config.stderr,
 		};
 
 		match start_transient_service(&conn, &options).await {
@@ -380,27 +380,16 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 		("ExecStart", build_exec_array(&[main_entry])?),
 		("TimeoutStopUSec", zvariant::Value::U64(5_000_000)),
 		("CollectMode", zvariant::Value::Str("inactive-or-failed".into())),
+		// StandardOutput/StandardError: systemd expects `s` (string)
+		// Valid values: inherit, null, tty, journal, kmsg, journal+console,
+		// file:path, append:path, truncate:path, socket, fd:name
 		(
 			"StandardOutput",
-			zvariant::Value::Str(
-				options
-					.stdout_path
-					.as_ref()
-					.map(|p| format!("append:{}", p.display()))
-					.unwrap_or_else(|| "null".to_string())
-					.into(),
-			),
+			zvariant::Value::Str(options.stdout_value.as_deref().unwrap_or("null").into()),
 		),
 		(
 			"StandardError",
-			zvariant::Value::Str(
-				options
-					.stderr_path
-					.as_ref()
-					.map(|p| format!("append:{}", p.display()))
-					.unwrap_or_else(|| "null".to_string())
-					.into(),
-			),
+			zvariant::Value::Str(options.stderr_value.as_deref().unwrap_or("null").into()),
 		),
 	];
 
