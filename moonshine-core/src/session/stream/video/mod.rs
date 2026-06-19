@@ -179,6 +179,9 @@ pub struct VideoStreamContext {
 pub(crate) struct VideoStreamHandle {
 	notify: Arc<Notify>,
 	idr_tx: broadcast::Sender<()>,
+	/// Reference frame invalidation requests, carrying the inclusive
+	/// `[first, last]` client frame-index range the client could not decode.
+	invalidate_tx: broadcast::Sender<(u32, u32)>,
 	reset_tx: broadcast::Sender<()>,
 }
 
@@ -191,6 +194,16 @@ impl VideoStreamHandle {
 	/// Request an IDR (key) frame from the encoder.
 	pub fn request_idr_frame(&self) {
 		let _ = self.idr_tx.send(());
+	}
+
+	/// Request reference frame invalidation for the inclusive client frame-index
+	/// range `[first, last]` the client reported it could not decode.
+	///
+	/// The encoder drops the affected references and recovers by predicting from
+	/// a surviving reference where possible, falling back to an IDR only when no
+	/// reference survives — much cheaper than always re-sending a keyframe.
+	pub fn invalidate_reference_frames(&self, first: u32, last: u32) {
+		let _ = self.invalidate_tx.send((first, last));
 	}
 
 	/// Reset the stream's frame/sequence counters for a resuming client.
@@ -273,6 +286,10 @@ impl VideoStream {
 		// IDR broadcast channel.
 		let (idr_tx, _idr_rx) = broadcast::channel(1);
 
+		// Reference frame invalidation broadcast channel. Sized for a small burst
+		// of loss reports; the encode loop drains all pending each iteration.
+		let (invalidate_tx, _invalidate_rx) = broadcast::channel(16);
+
 		// Stream-reset broadcast channel (client reconnect/resume).
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
 
@@ -290,6 +307,7 @@ impl VideoStream {
 			keys_rx,
 			packet_tx,
 			idr_tx.subscribe(),
+			invalidate_tx.subscribe(),
 			reset_tx.subscribe(),
 			stop.clone(),
 			hdr_metadata_tx,
@@ -301,6 +319,7 @@ impl VideoStream {
 		Ok(VideoStreamHandle {
 			notify: start_notify,
 			idr_tx,
+			invalidate_tx,
 			reset_tx,
 		})
 	}

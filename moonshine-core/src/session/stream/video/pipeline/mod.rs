@@ -390,6 +390,7 @@ impl VideoPipeline {
 		keys_rx: SessionKeysReceiver,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
+		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
 		reset_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -417,6 +418,7 @@ impl VideoPipeline {
 					frame_rx,
 					packet_tx,
 					idr_frame_request_rx,
+					invalidate_request_rx,
 					reset_request_rx,
 					stop_session_manager,
 					hdr_metadata_tx,
@@ -444,6 +446,7 @@ impl VideoPipelineInner {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
+		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
 		reset_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -481,6 +484,7 @@ impl VideoPipelineInner {
 			encoder,
 			packet_tx,
 			idr_frame_request_rx,
+			invalidate_request_rx,
 			reset_request_rx,
 			stop_session_manager,
 			hdr_metadata_tx,
@@ -557,6 +561,7 @@ impl VideoPipelineInner {
 		mut encoder: Encoder,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
+		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
 		mut reset_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -626,6 +631,20 @@ impl VideoPipelineInner {
 		// Whether at least one frame has been encoded (for IDR re-encode).
 		let mut has_encoded = false;
 
+		// Reference frame invalidation maps the client's frame indices (what the
+		// packet consumer stamps into outgoing packets) to pixelforge's display
+		// order (`pts`). The consumer numbers successfully-sent frames from 1
+		// within an epoch, and pixelforge's display order increments once per
+		// submitted frame, so within an epoch:
+		//     display_order = frame_number_base + (client_frame_index - 1).
+		// `submitted_count` is the display order the next submitted frame will
+		// carry; `frame_number_base` is the display order of the first frame of
+		// the current epoch and advances on reset (which restarts the consumer's
+		// numbering). A rare readback drop can skew this by a frame, which at
+		// worst over-invalidates into a (safe) IDR.
+		let mut submitted_count: u64 = 0;
+		let mut frame_number_base: u64 = 0;
+
 		// Track the last HDR mode state sent to the control stream.
 		let mut last_hdr_state = HdrModeState {
 			enabled: ctx.dynamic_range == VideoDynamicRange::Hdr,
@@ -666,6 +685,9 @@ impl VideoPipelineInner {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
 				// Counters live on the consumer task; reset them in order.
 				let _ = frame_ctx_tx.blocking_send(ConsumerMsg::ResetCounters);
+				// The next submitted frame becomes the consumer's frame 1 of the
+				// new epoch; anchor the invalidation index mapping to it.
+				frame_number_base = submitted_count;
 				encoder.request_idr();
 				pending_idr = true;
 			}
@@ -680,6 +702,29 @@ impl VideoPipelineInner {
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						tracing::debug!("IDR frame channel lagged by {n} messages.");
+						encoder.request_idr();
+						pending_idr = true;
+					},
+					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
+				}
+			}
+
+			// Drain any pending reference-frame-invalidation requests. Each takes
+			// effect on the next submitted frame, which then predicts from a
+			// surviving reference instead of forcing an IDR (the encoder still
+			// falls back to an IDR when no reference survives).
+			loop {
+				match invalidate_request_rx.try_recv() {
+					Ok((first, _last)) => {
+						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
+						tracing::debug!(
+							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
+						);
+						encoder.invalidate_reference_frames(first_display_order);
+					},
+					Err(broadcast::error::TryRecvError::Lagged(n)) => {
+						// Missed some loss reports; force an IDR to be safe.
+						tracing::debug!("Invalidation channel lagged by {n} messages; forcing IDR.");
 						encoder.request_idr();
 						pending_idr = true;
 					},
@@ -714,6 +759,7 @@ impl VideoPipelineInner {
 								};
 								// Count this frame in flight; the consumer decrements when done.
 								in_flight.fetch_add(1, Ordering::Relaxed);
+								submitted_count += 1;
 								let _ = frame_ctx_tx.blocking_send(ConsumerMsg::Frame(fctx, future));
 							},
 							Err(e) => tracing::warn!("Failed to re-encode frame for IDR request: {e}"),
@@ -976,6 +1022,7 @@ impl VideoPipelineInner {
 						};
 						// Count this frame in flight; the consumer decrements when done.
 						in_flight.fetch_add(1, Ordering::Relaxed);
+						submitted_count += 1;
 						if frame_ctx_tx.blocking_send(ConsumerMsg::Frame(fctx, future)).is_err() {
 							tracing::debug!("Packet consumer gone; stopping encoding loop.");
 							break;
