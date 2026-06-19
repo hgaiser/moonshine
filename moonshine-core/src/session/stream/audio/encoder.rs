@@ -117,7 +117,10 @@ impl AudioEncoderInner {
 			.enable_all()
 			.build()
 			.expect("Failed to build tokio runtime for audio encoder");
-		rt.block_on(start_notify.notified());
+		if rt.block_on(stop.wrap_cancel(start_notify.notified())).is_err() {
+			tracing::debug!("Audio encoder stopped before start signal.");
+			return;
+		}
 
 		let mut sequence_number = 0u16;
 		let stream_start_time = std::time::Instant::now();
@@ -153,9 +156,10 @@ impl AudioEncoderInner {
 		}
 
 		while !stop.is_shutdown_triggered() {
-			let frame = match frame_rx.recv() {
+			let frame = match frame_rx.recv_timeout(std::time::Duration::from_millis(100)) {
 				Ok(frame) => frame,
-				Err(_) => {
+				Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+				Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
 					tracing::debug!("PulseServer channel closed.");
 					break;
 				},
