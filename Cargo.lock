@@ -2821,9 +2821,10 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.6.0"
-source = "git+https://github.com/urwrstkn8mare/pixelforge?branch=feat%2Fencode-pipelining#b2a0e160fefebfaad6b428e3482d859033403393"
+source = "git+https://github.com/urwrstkn8mare/pixelforge?branch=feat%2Fencode-pipelining#6c82a5b0cf2d261e59660f2b97434466368b295c"
 dependencies = [
  "ash",
+ "futures-channel",
  "thiserror 1.0.69",
  "tracing",
 ]

@@ -6,7 +6,7 @@
 mod dmabuf;
 mod hdr_sei;
 
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ash::vk;
@@ -26,21 +26,23 @@ use crate::session::stream::video::{
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
-	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodedPacketReceiver,
-	Encoder, InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext,
-	VideoContextBuilder,
+	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
+	InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
 };
 
-/// Bound on the encode→consumer frame-context queue.
+/// Maximum number of frames in flight (submitted to the encoder but not yet
+/// packetized and sent) before we start dropping new captures.
 ///
-/// This is the backpressure point for the whole pipeline: when the consumer
-/// falls behind (e.g. downstream network send blocks), this fills and the
-/// encoding thread blocks on `frame_ctx_tx.send`, which stops it submitting new
-/// frames instead of letting per-frame context (and stale frames) pile up
-/// without bound. Sized a little above pixelforge's encode pipeline depth (2) to
-/// absorb normal scheduling/network jitter without throttling the encoder, while
-/// keeping at most a few frames of buffering so backpressure stays prompt.
-const FRAME_CTX_QUEUE_DEPTH: usize = 8;
+/// This is the pipeline's backpressure policy, chosen for low latency: rather
+/// than block the encoding thread and let already-captured frames queue up
+/// (growing end-to-end latency), when the consumer (packetize/network-send)
+/// falls this far behind we *drop the new capture before encoding it* so the
+/// stream stays realtime. Dropping pre-encode keeps the encoded P-frame chain
+/// valid — a dropped frame never enters the encoder's reference state, unlike
+/// discarding an already-encoded packet, which would break decoding until the
+/// next IDR. Sized just above pixelforge's encode pipeline depth (2) to keep the
+/// GPU fed plus one slot of slack, bounding added latency to ~3 frames.
+const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 /// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
 const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
@@ -168,11 +170,9 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 }
 
 /// Per-submitted-frame context handed to the packet consumer thread, in
-/// submission order. Each `FrameContext` corresponds to exactly one encoded
-/// packet: pixelforge produces exactly one `EncodedPacket` per `encode()` call
-/// (one submission → one readback → one packet), and with no B-frames packets
-/// emerge in submission order. The FIFO pairing in `run_packet_consumer` relies
-/// on this 1:1 ordering.
+/// submission order. It travels alongside that frame's [`EncodeFuture`] in a
+/// single [`ConsumerMsg::Frame`], so the packet is paired with its context by
+/// construction — there is no separate packet channel to keep in lockstep.
 struct FrameContext {
 	/// When the source frame was captured (for end-to-end latency).
 	created_at: std::time::Instant,
@@ -195,27 +195,45 @@ struct FrameContext {
 /// Message from the encoding thread to the packet consumer thread, in
 /// submission order.
 enum ConsumerMsg {
-	/// A submitted frame's context, to be paired with the next encoded packet.
-	Frame(FrameContext),
+	/// A submitted frame's context together with the [`EncodeFuture`] that
+	/// resolves with its encoded packet. Awaiting the future yields the packet
+	/// for exactly this frame, so context and packet are paired by construction.
+	Frame(FrameContext, EncodeFuture),
 	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
 	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
 	/// effect before any frame submitted after the reset.
 	ResetCounters,
 }
 
-/// Packet consumer thread: pairs each pushed encoded packet with its
-/// `FrameContext` (FIFO), injects HDR SEI if needed, packetizes and sends it
-/// over the network channel, and emits latency stats.
+/// Decrements the in-flight frame counter when dropped, on every exit path of a
+/// consumer-loop iteration (success or early `continue`). This is what tells the
+/// encoding thread a slot has freed up so it can stop dropping new captures.
+struct InFlightGuard(Arc<AtomicUsize>);
+
+impl Drop for InFlightGuard {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::Relaxed);
+	}
+}
+
+/// Packet consumer thread: for each submitted frame, awaits its
+/// [`EncodeFuture`] to get the encoded packet, injects HDR SEI if needed,
+/// packetizes and sends it over the network channel, and emits latency stats.
 ///
 /// Running this off the encoding thread is what realizes the latency win of the
-/// asynchronous encoder: a packet is delivered by pixelforge's readback thread
-/// at roughly the GPU encode time and sent here immediately, rather than waiting
-/// for the encoding thread's next loop iteration.
-fn run_packet_consumer(
-	packet_rx: EncodedPacketReceiver,
-	ctx_rx: std::sync::mpsc::Receiver<ConsumerMsg>,
+/// asynchronous encoder: a packet is resolved by pixelforge's readback thread at
+/// roughly the GPU encode time and sent here immediately, rather than waiting for
+/// the encoding thread's next loop iteration. Pairing is implicit — each message
+/// carries both the context and the future for the same frame.
+///
+/// `in_flight` counts frames submitted but not yet finished here; each fully
+/// processed (or dropped) frame decrements it via [`InFlightGuard`], which is the
+/// signal the encoding thread's drop-to-catch-up gate reads.
+async fn run_packet_consumer(
+	mut ctx_rx: mpsc::Receiver<ConsumerMsg>,
 	packet_tx: mpsc::Sender<ShardBatch>,
 	stats_tx: broadcast::Sender<FrameStats>,
+	in_flight: Arc<AtomicUsize>,
 	mut packetizer: Packetizer,
 	ctx: VideoStreamContext,
 	config: VideoStreamConfig,
@@ -228,24 +246,26 @@ fn run_packet_consumer(
 
 	// Driven by the message channel: one `Frame` per submitted frame. When the
 	// encoding thread drops its sender, this loop ends after the last frame.
-	for msg in ctx_rx {
-		let fctx = match msg {
+	while let Some(msg) = ctx_rx.recv().await {
+		let (fctx, future) = match msg {
 			ConsumerMsg::ResetCounters => {
 				frame_number = 0;
 				sequence_number = 0;
 				continue;
 			},
-			ConsumerMsg::Frame(fctx) => fctx,
+			ConsumerMsg::Frame(fctx, future) => (fctx, future),
 		};
 
-		let mut packet = match packet_rx.recv() {
-			Ok(Ok(packet)) => packet,
-			Ok(Err(e)) => {
+		// This frame is in flight until the iteration ends; release its slot on
+		// every exit path (including the early `continue`s below).
+		let _in_flight = InFlightGuard(in_flight.clone());
+
+		let mut packet = match future.await {
+			Ok(packet) => packet,
+			Err(e) => {
 				tracing::warn!("Failed to read back encoded frame: {e}");
 				continue;
 			},
-			// The encoder (and its readback thread) is gone; nothing more to do.
-			Err(_) => break,
 		};
 
 		// Inject HDR metadata into the bitstream on key frames, but only when
@@ -299,7 +319,7 @@ fn run_packet_consumer(
 		// session is already tearing down. Stop the consumer; the encoding thread
 		// then sees its `frame_ctx_tx` fail and exits too, which drops the
 		// video-pipeline shutdown token and tears the session down.
-		if packet_tx.blocking_send(shards).is_err() {
+		if packet_tx.send(shards).await.is_err() {
 			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
 			break;
 		}
@@ -384,10 +404,16 @@ impl VideoPipeline {
 			keys_rx,
 		};
 
+		// Capture the main (multi-threaded) runtime handle so the OS-threaded
+		// encoding loop can spawn the async packet consumer as a task on it. `new`
+		// is called from within the session runtime, so `current()` is valid here.
+		let runtime = tokio::runtime::Handle::current();
+
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
 				inner.run(
+					runtime,
 					frame_rx,
 					packet_tx,
 					idr_frame_request_rx,
@@ -414,6 +440,7 @@ impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run(
 		self,
+		runtime: tokio::runtime::Handle,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
@@ -448,6 +475,7 @@ impl VideoPipelineInner {
 
 		// Start the capture and encoding loop.
 		if let Err(e) = self.run_encoding_loop(
+			runtime,
 			frame_rx,
 			context,
 			encoder,
@@ -523,6 +551,7 @@ impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run_encoding_loop(
 		&self,
+		runtime: tokio::runtime::Handle,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
@@ -538,28 +567,43 @@ impl VideoPipelineInner {
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
 		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
 
-		// The encoder is asynchronous: it submits frames without blocking and a
-		// background readback thread delivers finished packets. Take that receiver
-		// and run packetization/sending on a dedicated consumer thread so packets
-		// go out as soon as the GPU finishes, independent of this loop's cadence.
-		// Per-frame context is handed over in submission order via `frame_ctx_tx`.
-		let packet_rx = encoder
-			.take_packet_receiver()
-			.ok_or_else(|| "encoder packet receiver already taken".to_string())?;
-		// Bounded so a slow consumer applies backpressure to the encoding thread
-		// rather than letting per-frame context grow without bound; see
-		// `FRAME_CTX_QUEUE_DEPTH`.
-		let (frame_ctx_tx, frame_ctx_rx) = std::sync::mpsc::sync_channel::<ConsumerMsg>(FRAME_CTX_QUEUE_DEPTH);
+		// The encoder is asynchronous: each `encode()` returns a future that
+		// resolves with that frame's packet once the GPU finishes. We hand each
+		// future, together with its per-frame context, to a dedicated consumer
+		// thread (in submission order via `frame_ctx_tx`) which awaits it and
+		// packetizes/sends — so packets go out as soon as the GPU finishes,
+		// independent of this loop's cadence.
+		//
+		// `in_flight` counts frames submitted but not yet finished by the consumer.
+		// The encoding thread reads it to decide when to drop new captures (see
+		// `MAX_FRAMES_IN_FLIGHT`); the consumer decrements it per frame. The channel
+		// is sized just above that gate so it never actually blocks the producer —
+		// admission is governed by the drop gate, not by the channel filling.
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMsg>(MAX_FRAMES_IN_FLIGHT + 2);
 		let consumer = {
 			let ctx = self.context.clone();
 			let config = self.config.clone();
-			std::thread::Builder::new()
-				.name("video-packet-consumer".to_string())
-				.spawn(move || {
-					run_packet_consumer(packet_rx, frame_ctx_rx, packet_tx, stats_tx, packetizer, ctx, config);
-				})
-				.map_err(|e| format!("Failed to start packet consumer thread: {e}"))?
+			let in_flight = in_flight.clone();
+			// The packetize/send half is pure async work (await the encode future,
+			// packetize, send) with no blocking GPU calls, so it runs as a task on
+			// moonshine's main runtime — a green thread multiplexed with the rest of
+			// the session — rather than its own OS thread. Only this capture/encode
+			// loop needs a real thread, as it blocks on the frame channel and the
+			// Vulkan submit path.
+			runtime.spawn(run_packet_consumer(
+				frame_ctx_rx,
+				packet_tx,
+				stats_tx,
+				in_flight,
+				packetizer,
+				ctx,
+				config,
+			))
 		};
+
+		// Rate-limits the drop-to-catch-up warning.
+		let mut last_drop_warn: Option<std::time::Instant> = None;
 
 		// Determine output YUV format based on chroma sampling and dynamic range.
 		let output_format = match (ctx.chroma_sampling_type, ctx.dynamic_range) {
@@ -620,8 +664,8 @@ impl VideoPipelineInner {
 			}
 			if pending_reset {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
-				// Counters live on the consumer thread; reset them in order.
-				let _ = frame_ctx_tx.send(ConsumerMsg::ResetCounters);
+				// Counters live on the consumer task; reset them in order.
+				let _ = frame_ctx_tx.blocking_send(ConsumerMsg::ResetCounters);
 				encoder.request_idr();
 				pending_idr = true;
 			}
@@ -656,9 +700,9 @@ impl VideoPipelineInner {
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
 						match encoder.encode(encoder.input_image()) {
-							Ok(()) => {
+							Ok(future) => {
 								let inject_hdr = encoder_color_desc == Some(ColorDescription::bt2020_pq());
-								let _ = frame_ctx_tx.send(ConsumerMsg::Frame(FrameContext {
+								let fctx = FrameContext {
 									created_at: now,
 									channel_wait: std::time::Duration::ZERO,
 									import: std::time::Duration::ZERO,
@@ -667,7 +711,10 @@ impl VideoPipelineInner {
 									inject_hdr,
 									hdr_metadata: last_hdr_state.metadata,
 									buffer_index: usize::MAX,
-								}));
+								};
+								// Count this frame in flight; the consumer decrements when done.
+								in_flight.fetch_add(1, Ordering::Relaxed);
+								let _ = frame_ctx_tx.blocking_send(ConsumerMsg::Frame(fctx, future));
 							},
 							Err(e) => tracing::warn!("Failed to re-encode frame for IDR request: {e}"),
 						}
@@ -685,6 +732,24 @@ impl VideoPipelineInner {
 			};
 
 			if let Some(frame) = received_frame {
+				// Drop-to-catch-up: if the consumer (packetize/network-send) is too
+				// far behind, skip this capture *before* encoding it so the stream
+				// stays realtime instead of accumulating latency. Dropping pre-encode
+				// keeps the encoded P-frame chain valid (a skipped frame never enters
+				// the encoder's reference state). The IDR re-encode path is never
+				// gated — the client needs that keyframe.
+				if in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT {
+					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+						tracing::warn!(
+							"Video encode backpressure: packet consumer is behind; dropping captured \
+							 frames before encode to stay realtime."
+						);
+						last_drop_warn = Some(std::time::Instant::now());
+					}
+					frame.consumed.store(true, Ordering::Release);
+					continue;
+				}
+
 				let t1_received = std::time::Instant::now();
 
 				tracing::trace!(
@@ -894,24 +959,24 @@ impl VideoPipelineInner {
 				let t4_encoded = std::time::Instant::now();
 
 				match encode_result {
-					Ok(()) => {
-						// Hand this frame's context to the consumer thread, which
-						// pairs it (FIFO) with the packet, injects HDR SEI if
+					Ok(future) => {
+						// Hand this frame's context plus its packet future to the
+						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
 						let inject_hdr = encoder_color_desc == Some(ColorDescription::bt2020_pq());
-						if frame_ctx_tx
-							.send(ConsumerMsg::Frame(FrameContext {
-								created_at: frame.created_at,
-								channel_wait: t1_received.duration_since(frame.created_at),
-								import: t2_imported.duration_since(t1_received),
-								convert: t3_converted.duration_since(t2_imported),
-								submit: t4_encoded.duration_since(t3_converted),
-								inject_hdr,
-								hdr_metadata: last_hdr_state.metadata,
-								buffer_index: frame.buffer_index,
-							}))
-							.is_err()
-						{
+						let fctx = FrameContext {
+							created_at: frame.created_at,
+							channel_wait: t1_received.duration_since(frame.created_at),
+							import: t2_imported.duration_since(t1_received),
+							convert: t3_converted.duration_since(t2_imported),
+							submit: t4_encoded.duration_since(t3_converted),
+							inject_hdr,
+							hdr_metadata: last_hdr_state.metadata,
+							buffer_index: frame.buffer_index,
+						};
+						// Count this frame in flight; the consumer decrements when done.
+						in_flight.fetch_add(1, Ordering::Relaxed);
+						if frame_ctx_tx.blocking_send(ConsumerMsg::Frame(fctx, future)).is_err() {
 							tracing::debug!("Packet consumer gone; stopping encoding loop.");
 							break;
 						}
@@ -938,8 +1003,10 @@ impl VideoPipelineInner {
 			tracing::warn!("Failed to flush encoder: {e}");
 		}
 		drop(frame_ctx_tx);
-		if let Err(e) = consumer.join() {
-			tracing::warn!("Packet consumer thread panicked: {e:?}");
+		// Wait for the consumer task to drain and send the remaining packets. This
+		// runs on a plain OS thread outside the runtime, so block on the task handle.
+		if let Err(e) = runtime.block_on(consumer) {
+			tracing::warn!("Packet consumer task panicked: {e:?}");
 		}
 
 		Ok(())
