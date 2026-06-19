@@ -59,8 +59,12 @@ pub struct FrameStats {
 	pub import: std::time::Duration,
 	/// Time spent on GPU color conversion.
 	pub convert: std::time::Duration,
-	/// Time spent encoding the frame.
-	pub encode: std::time::Duration,
+	/// Time spent submitting the frame to the asynchronous encoder.
+	pub submit: std::time::Duration,
+	/// Time between submit completion and the packet consumer awaiting the encode future.
+	pub consumer_queue: std::time::Duration,
+	/// Time from submit completion until the asynchronous encode/readback future has resolved.
+	pub encode_wait: std::time::Duration,
 	/// Time spent packetizing the encoded data.
 	pub packetize: std::time::Duration,
 	/// Time spent sending the packets over the channel.
@@ -188,7 +192,8 @@ pub(crate) struct VideoStreamHandle {
 impl VideoStreamHandle {
 	/// Signal the video pipeline and packet handler to begin processing.
 	pub fn trigger(&self) {
-		self.notify.notify_waiters();
+		self.notify.notify_one();
+		self.notify.notify_one();
 	}
 
 	/// Request an IDR (key) frame from the encoder.
@@ -343,9 +348,9 @@ fn spawn_handle_video_packets(
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			tokio::select! {
-				batch = packet_rx.recv() => {
+				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Some(batch) => {
+						Ok(Some(batch)) => {
 							if let Some(client_address) = client_address {
 								for shard in batch.shards() {
 									if let Err(e) = socket.send_to(shard, client_address).await {
@@ -354,20 +359,22 @@ fn spawn_handle_video_packets(
 								}
 							}
 						},
-						None => {
+						Ok(None) => {
 							tracing::debug!("Video packet channel closed.");
 							break;
 						},
+						Err(_) => break,
 					}
 				},
 
-				message = socket.recv_from(&mut buf) => {
+				message = stop_session_manager.wrap_cancel(socket.recv_from(&mut buf)) => {
 					let (len, address) = match message {
-						Ok((len, address)) => (len, address),
-						Err(e) => {
+						Ok(Ok((len, address))) => (len, address),
+						Ok(Err(e)) => {
 							tracing::warn!("Failed to receive message: {e}");
 							break;
 						},
+						Err(_) => break,
 					};
 
 					if &buf[..len] == b"PING" {

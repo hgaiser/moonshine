@@ -96,7 +96,9 @@ struct LatencySample {
 	channel_wait: std::time::Duration,
 	import: std::time::Duration,
 	convert: std::time::Duration,
-	encode: std::time::Duration,
+	submit: std::time::Duration,
+	consumer_queue: std::time::Duration,
+	encode_wait: std::time::Duration,
 	packetize: std::time::Duration,
 	send: std::time::Duration,
 	total: std::time::Duration,
@@ -130,8 +132,14 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 	let mut converts: Vec<u64> = samples.iter().map(|s| s.convert.as_micros() as u64).collect();
 	converts.sort_unstable();
 
-	let mut encodes: Vec<u64> = samples.iter().map(|s| s.encode.as_micros() as u64).collect();
-	encodes.sort_unstable();
+	let mut submits: Vec<u64> = samples.iter().map(|s| s.submit.as_micros() as u64).collect();
+	submits.sort_unstable();
+
+	let mut consumer_queues: Vec<u64> = samples.iter().map(|s| s.consumer_queue.as_micros() as u64).collect();
+	consumer_queues.sort_unstable();
+
+	let mut encode_waits: Vec<u64> = samples.iter().map(|s| s.encode_wait.as_micros() as u64).collect();
+	encode_waits.sort_unstable();
 
 	let mut packetizes: Vec<u64> = samples.iter().map(|s| s.packetize.as_micros() as u64).collect();
 	packetizes.sort_unstable();
@@ -158,9 +166,15 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 		convert_p50_us = p50(&converts),
 		convert_p95_us = p95(&converts),
 		convert_p99_us = p99(&converts),
-		encode_p50_us = p50(&encodes),
-		encode_p95_us = p95(&encodes),
-		encode_p99_us = p99(&encodes),
+		submit_p50_us = p50(&submits),
+		submit_p95_us = p95(&submits),
+		submit_p99_us = p99(&submits),
+		consumer_queue_p50_us = p50(&consumer_queues),
+		consumer_queue_p95_us = p95(&consumer_queues),
+		consumer_queue_p99_us = p99(&consumer_queues),
+		encode_wait_p50_us = p50(&encode_waits),
+		encode_wait_p95_us = p95(&encode_waits),
+		encode_wait_p99_us = p99(&encode_waits),
 		packetize_p50_us = p50(&packetizes),
 		send_p50_us = p50(&sends),
 		send_p95_us = p95(&sends),
@@ -182,6 +196,8 @@ struct FrameContext {
 	convert: std::time::Duration,
 	/// Time spent in the (now non-blocking) `encode` submit call.
 	submit: std::time::Duration,
+	/// When the submit call returned and the frame was ready for packet consumption.
+	submitted_at: std::time::Instant,
 	/// Whether HDR SEI metadata should be injected on key frames for this frame
 	/// (true when the encoder's VUI is BT.2020+PQ).
 	inject_hdr: bool,
@@ -260,6 +276,8 @@ async fn run_packet_consumer(
 		// every exit path (including the early `continue`s below).
 		let _in_flight = InFlightGuard(in_flight.clone());
 
+		let t_wait_started = std::time::Instant::now();
+		let consumer_queue_dur = t_wait_started.saturating_duration_since(fctx.submitted_at);
 		let mut packet = match future.await {
 			Ok(packet) => packet,
 			Err(e) => {
@@ -267,6 +285,8 @@ async fn run_packet_consumer(
 				continue;
 			},
 		};
+		let t_packet_ready = std::time::Instant::now();
+		let encode_wait_dur = t_packet_ready.saturating_duration_since(fctx.submitted_at);
 
 		// Inject HDR metadata into the bitstream on key frames, but only when
 		// encoding as BT.2020+PQ. SDR frames encoded as BT.709 carry no HDR SEI.
@@ -338,6 +358,8 @@ async fn run_packet_consumer(
 				import_us = fctx.import.as_micros() as u64,
 				convert_us = fctx.convert.as_micros() as u64,
 				submit_us = fctx.submit.as_micros() as u64,
+				consumer_queue_us = consumer_queue_dur.as_micros() as u64,
+				encode_wait_us = encode_wait_dur.as_micros() as u64,
 				packetize_us = packetize_dur.as_micros() as u64,
 				send_us = send_dur.as_micros() as u64,
 				encoded_bytes,
@@ -352,7 +374,9 @@ async fn run_packet_consumer(
 			channel_wait: fctx.channel_wait,
 			import: fctx.import,
 			convert: fctx.convert,
-			encode: fctx.submit,
+			submit: fctx.submit,
+			consumer_queue: consumer_queue_dur,
+			encode_wait: encode_wait_dur,
 			packetize: packetize_dur,
 			send: send_dur,
 			total,
@@ -364,7 +388,9 @@ async fn run_packet_consumer(
 			channel_wait: fctx.channel_wait,
 			import: fctx.import,
 			convert: fctx.convert,
-			encode: fctx.submit,
+			submit: fctx.submit,
+			consumer_queue: consumer_queue_dur,
+			encode_wait: encode_wait_dur,
 			packetize: packetize_dur,
 			send: send_dur,
 			total,
@@ -465,7 +491,13 @@ impl VideoPipelineInner {
 			.enable_all()
 			.build()
 			.expect("Failed to build tokio runtime for video pipeline");
-		rt.block_on(start_notify.notified());
+		if rt
+			.block_on(stop_session_manager.wrap_cancel(start_notify.notified()))
+			.is_err()
+		{
+			tracing::debug!("Video pipeline stopped before start signal.");
+			return;
+		}
 
 		// Create the encoder.
 		let (context, encoder) = match self.create_encoder() {
@@ -746,13 +778,15 @@ impl VideoPipelineInner {
 						let now = std::time::Instant::now();
 						match encoder.encode(encoder.input_image()) {
 							Ok(future) => {
+								let submitted_at = std::time::Instant::now();
 								let inject_hdr = encoder_color_desc == Some(ColorDescription::bt2020_pq());
 								let fctx = FrameContext {
 									created_at: now,
 									channel_wait: std::time::Duration::ZERO,
 									import: std::time::Duration::ZERO,
 									convert: std::time::Duration::ZERO,
-									submit: now.elapsed(),
+									submit: submitted_at.duration_since(now),
+									submitted_at,
 									inject_hdr,
 									hdr_metadata: last_hdr_state.metadata,
 									buffer_index: usize::MAX,
@@ -1016,6 +1050,7 @@ impl VideoPipelineInner {
 							import: t2_imported.duration_since(t1_received),
 							convert: t3_converted.duration_since(t2_imported),
 							submit: t4_encoded.duration_since(t3_converted),
+							submitted_at: t4_encoded,
 							inject_hdr,
 							hdr_metadata: last_hdr_state.metadata,
 							buffer_index: frame.buffer_index,
