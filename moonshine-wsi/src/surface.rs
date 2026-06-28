@@ -397,10 +397,10 @@ static LAYER_EXTENSIONS: &[ash::vk::ExtensionProperties] = &[
 
 /// Convert a byte-string literal to a fixed-size `c_char` array at compile time.
 const fn ext_name(name: &[u8]) -> [std::ffi::c_char; 256] {
-	let mut buf = [0i8; 256];
+	let mut buf = [0 as std::ffi::c_char; 256];
 	let mut i = 0;
 	while i < name.len() && i < 255 {
-		buf[i] = name[i] as i8;
+		buf[i] = name[i] as std::ffi::c_char;
 		i += 1;
 	}
 	buf
@@ -726,7 +726,7 @@ mod tests {
 	#[test]
 	fn ext_name_zero_padded() {
 		let name = ext_name(b"X\0");
-		assert_eq!(name[0], b'X' as i8);
+		assert_eq!(name[0], b'X' as std::ffi::c_char);
 		assert_eq!(name[1], 0);
 		assert_eq!(name[255], 0);
 	}

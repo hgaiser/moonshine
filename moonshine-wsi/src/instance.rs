@@ -59,7 +59,7 @@ pub unsafe extern "C" fn create_instance(
 	// Only inject the extra WSI extensions when active.  In the degraded path
 	// the application's original create-info is passed through unchanged.
 	let create_info = &*p_create_info;
-	let mut exts: Vec<*const i8> = std::slice::from_raw_parts(
+	let mut exts: Vec<*const std::ffi::c_char> = std::slice::from_raw_parts(
 		create_info.pp_enabled_extension_names,
 		create_info.enabled_extension_count as usize,
 	)
@@ -222,11 +222,11 @@ unsafe fn build_instance_dispatch(
 ) -> InstanceDispatch {
 	macro_rules! load {
 		($name:literal) => {{
-			let pfn = next_get_proc_addr(instance, concat!($name, "\0").as_ptr() as *const i8);
+			let pfn = next_get_proc_addr(instance, concat!($name, "\0").as_ptr() as *const std::ffi::c_char);
 			std::mem::transmute(pfn.expect(concat!("failed to load ", $name)))
 		}};
 		(opt: $name:literal) => {{
-			let pfn = next_get_proc_addr(instance, concat!($name, "\0").as_ptr() as *const i8);
+			let pfn = next_get_proc_addr(instance, concat!($name, "\0").as_ptr() as *const std::ffi::c_char);
 			pfn.map(|f| std::mem::transmute(f))
 		}};
 	}
