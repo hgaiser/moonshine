@@ -41,7 +41,7 @@ pub type PFN_vkGetDeviceProcAddr = unsafe extern "C" fn(VkDevice, *const std::ff
 ///
 /// # Safety
 /// Each non-null pointer in `exts` must point to a valid null-terminated C string.
-pub unsafe fn has_extension(exts: &[*const i8], name: &std::ffi::CStr) -> bool {
+pub unsafe fn has_extension(exts: &[*const std::ffi::c_char], name: &std::ffi::CStr) -> bool {
 	exts.iter()
 		.any(|&p| !p.is_null() && std::ffi::CStr::from_ptr(p) == name)
 }

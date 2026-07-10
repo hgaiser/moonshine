@@ -26,7 +26,7 @@ pub unsafe extern "C" fn create_device(
 
 	// Inject VK_EXT_swapchain_maintenance1 if not already enabled.
 	let create_info = &*p_create_info;
-	let mut exts: Vec<*const i8> = std::slice::from_raw_parts(
+	let mut exts: Vec<*const std::ffi::c_char> = std::slice::from_raw_parts(
 		create_info.pp_enabled_extension_names,
 		create_info.enabled_extension_count as usize,
 	)
@@ -128,11 +128,11 @@ unsafe fn build_device_dispatch(
 ) -> DeviceDispatch {
 	macro_rules! load {
 		($name:literal) => {{
-			let pfn = next_get_device_proc_addr(device, concat!($name, "\0").as_ptr() as *const i8);
+			let pfn = next_get_device_proc_addr(device, concat!($name, "\0").as_ptr() as *const std::ffi::c_char);
 			std::mem::transmute(pfn.expect(concat!("failed to load ", $name)))
 		}};
 		(opt: $name:literal) => {{
-			let pfn = next_get_device_proc_addr(device, concat!($name, "\0").as_ptr() as *const i8);
+			let pfn = next_get_device_proc_addr(device, concat!($name, "\0").as_ptr() as *const std::ffi::c_char);
 			pfn.map(|p| std::mem::transmute(p))
 		}};
 	}
