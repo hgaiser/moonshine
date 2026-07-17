@@ -194,7 +194,7 @@ struct FrameContext {
 	channel_wait: std::time::Duration,
 	import: std::time::Duration,
 	convert: std::time::Duration,
-	/// Time spent in the (now non-blocking) `encode` submit call.
+	/// Time spent in the `encode` submit call.
 	submit: std::time::Duration,
 	/// When the submit call returned and the frame was ready for packet consumption.
 	submitted_at: std::time::Instant,
