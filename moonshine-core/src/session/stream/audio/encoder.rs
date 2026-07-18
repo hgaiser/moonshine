@@ -156,10 +156,9 @@ impl AudioEncoderInner {
 		}
 
 		while !stop.is_shutdown_triggered() {
-			let frame = match frame_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+			let frame = match frame_rx.recv() {
 				Ok(frame) => frame,
-				Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-				Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+				Err(_) => {
 					tracing::debug!("PulseServer channel closed.");
 					break;
 				},
