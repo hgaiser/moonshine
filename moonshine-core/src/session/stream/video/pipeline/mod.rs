@@ -186,7 +186,7 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 
 /// Per-submitted-frame context handed to the packet consumer thread, in
 /// submission order. It travels alongside that frame's [`EncodeFuture`] in a
-/// single [`ConsumerMsg::Frame`], so the packet is paired with its context by
+/// single [`ConsumerMessage::Frame`], so the packet is paired with its context by
 /// construction — there is no separate packet channel to keep in lockstep.
 struct FrameContext {
 	/// When the source frame was captured (for end-to-end latency).
@@ -211,7 +211,7 @@ struct FrameContext {
 
 /// Message from the encoding thread to the packet consumer thread, in
 /// submission order.
-enum ConsumerMsg {
+enum ConsumerMessage {
 	/// A submitted frame's context together with the [`EncodeFuture`] that
 	/// resolves with its encoded packet. Awaiting the future yields the packet
 	/// for exactly this frame, so context and packet are paired by construction.
@@ -247,7 +247,7 @@ impl Drop for InFlightGuard {
 /// processed (or dropped) frame decrements it via [`InFlightGuard`], which is the
 /// signal the encoding thread's drop-to-catch-up gate reads.
 async fn run_packet_consumer(
-	mut ctx_rx: mpsc::Receiver<ConsumerMsg>,
+	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
 	packet_tx: mpsc::Sender<ShardBatch>,
 	stats_tx: broadcast::Sender<FrameStats>,
 	in_flight: Arc<AtomicUsize>,
@@ -265,12 +265,12 @@ async fn run_packet_consumer(
 	// encoding thread drops its sender, this loop ends after the last frame.
 	while let Some(msg) = ctx_rx.recv().await {
 		let (fctx, future) = match msg {
-			ConsumerMsg::ResetCounters => {
+			ConsumerMessage::ResetCounters => {
 				frame_number = 0;
 				sequence_number = 0;
 				continue;
 			},
-			ConsumerMsg::Frame(fctx, future) => (fctx, future),
+			ConsumerMessage::Frame(fctx, future) => (fctx, future),
 		};
 
 		// This frame is in flight until the iteration ends; release its slot on
@@ -618,7 +618,7 @@ impl VideoPipelineInner {
 		// is sized just above that gate so it never actually blocks the producer —
 		// admission is governed by the drop gate, not by the channel filling.
 		let in_flight = Arc::new(AtomicUsize::new(0));
-		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMsg>(MAX_FRAMES_IN_FLIGHT + 2);
+		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
 		let consumer = {
 			let ctx = self.context.clone();
 			let config = self.config.clone();
@@ -717,7 +717,7 @@ impl VideoPipelineInner {
 			if pending_reset {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
 				// Counters live on the consumer task; reset them in order.
-				let _ = frame_ctx_tx.blocking_send(ConsumerMsg::ResetCounters);
+				let _ = frame_ctx_tx.blocking_send(ConsumerMessage::ResetCounters);
 				// The next submitted frame becomes the consumer's frame 1 of the
 				// new epoch; anchor the invalidation index mapping to it.
 				frame_number_base = submitted_count;
@@ -795,7 +795,7 @@ impl VideoPipelineInner {
 								// Count this frame in flight; the consumer decrements when done.
 								in_flight.fetch_add(1, Ordering::Relaxed);
 								submitted_count += 1;
-								let _ = frame_ctx_tx.blocking_send(ConsumerMsg::Frame(fctx, future));
+								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(fctx, future));
 							},
 							Err(e) => tracing::warn!("Failed to re-encode frame for IDR request: {e}"),
 						}
@@ -1059,7 +1059,7 @@ impl VideoPipelineInner {
 						// Count this frame in flight; the consumer decrements when done.
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
-						if frame_ctx_tx.blocking_send(ConsumerMsg::Frame(fctx, future)).is_err() {
+						if frame_ctx_tx.blocking_send(ConsumerMessage::Frame(fctx, future)).is_err() {
 							tracing::debug!("Packet consumer gone; stopping encoding loop.");
 							break;
 						}
