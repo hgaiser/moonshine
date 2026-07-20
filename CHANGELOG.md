@@ -5,6 +5,65 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.12.0] - 20-07-2026
+
+### Added
+
+- scRGB HDR streaming by converting `EXTENDED_SRGB_LINEAR` to BT.2020+PQ (#102, @urwrstkn8mare).
+- XWayland bypass safety checks and runtime toggle.
+- Configurable hold-to-Home gamepad button remapping with `suppress_home` and rumble feedback (#98, @urwrstkn8mare).
+- Simple benchmark tool (`moonshine-bench`) (#107).
+- mDNS advertise mode selection (#111, @urwrstkn8mare).
+- Reply to `/unpair` with HTTP 200 status code.
+- Improved DMA-BUF import time.
+- Limit info logging to moonshine logs in `moonshine@.service`.
+- Option to force stream to IPv4 (@urwrstkn8mare).
+- Auto-release GitHub workflow (@urwrstkn8mare).
+- `modules-load.d` configuration for virtual input devices (#101, @urwrstkn8mare).
+- Color-space mapping and DRM fourcc unit tests (#102, @urwrstkn8mare).
+
+### Changed
+
+- Replace Avahi/zeroconf with embedded `mdns-sd` responder (#111, @urwrstkn8mare).
+- Replace custom Steam library parsing with `steamlocate` crate.
+- Move certificate functions to `webserver::tls`.
+- Rename config `hdr_support` to `hdr`.
+- Simplify `ClientManager`.
+- Add custom `ShutdownReason`.
+- Move core components to `moonshine-core` crate.
+- Nest gamepad configuration under `stream.control` (@urwrstkn8mare).
+- Prefer BT.2020+PQ over scRGB-linear when both are declared (#102, @urwrstkn8mare).
+- Rename `Bt709Linear`/`LinearExtended` to `ScrgbLinear` (#102, @urwrstkn8mare).
+- Simplify network config to allow either IPv4 or dual-stack.
+- Update pixelforge to 0.4.0.
+- Update dependencies.
+- Codebase cleanup and refactoring (#95).
+
+### Fixed
+
+- Stream would hang when changing HDR formats (#102, @urwrstkn8mare).
+- Preserve scRGB colorspace when `vkSetHdrMetadataEXT` arrives after swapchain feedback (#102, @urwrstkn8mare).
+- Map `create_windows_scrgb` to scRGB-linear (#102, @urwrstkn8mare).
+- Reduce log spam from FH6 HDR (#102, @urwrstkn8mare).
+- Return `localip` in `/serverinfo` (#111, @urwrstkn8mare).
+- mDNS interface filtering (#111, @urwrstkn8mare).
+- Stop session when launched app exits (#104, @urwrstkn8mare).
+- Bind webserver dual-stack so IPv4 and IPv6 clients can both reach it (#100, @urwrstkn8mare).
+- Reset video frame counter when a client resumes (#103, @urwrstkn8mare).
+- Resume active session on RTSP reconnect instead of erroring (#103, @urwrstkn8mare).
+- Correct scrolling units conversion.
+- Replace `requested_bytes` with missing/requested split to prevent PulseAudio request deadlock.
+- Propagate pairing failure to client.
+- Use dedicated thread for zeroconf discovery.
+- Set Enet `peer_count=128` to allow quick reconnects.
+- Use timers and events to handle hold-to-home properly (#98, @urwrstkn8mare).
+- Use upstream smithay to fix Witcher 3 input issue (#108).
+- Only write ANSI color escapes when stdout is a terminal (#105, @jrfernandez).
+- Benchmark hanging forever when no frames arrive before the duration deadline (#112, @urwrstkn8mare).
+- Use platform-agnostic `c_char` type instead of `i8` for ARM compatibility (#117, @neobrain).
+- Pass stdout and stderr options to systemd unchanged.
+- Improve DEBUG logging legibility (#102, @urwrstkn8mare).
+
 ## [v0.11.0] - 2026-05-16
 
 ### Added
