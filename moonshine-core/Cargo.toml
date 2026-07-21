@@ -36,7 +36,7 @@ notify-rust = "4.17.0"
 open = "5.3.5"
 opus = "0.3.1"
 pkcs8 = "0.11.0"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", rev = "199bce28a543ad16508a60f3b3f48f4684bfacb8", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", rev = "d60ce3af5266e12a398b756f2a0585f772f01f1c", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"

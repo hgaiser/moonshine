@@ -548,7 +548,7 @@ impl VideoPipelineInner {
 					Some(conv) => conv,
 					None => {
 						let (color_space, full_range) = match ctx.dynamic_range {
-							VideoDynamicRange::Sdr => (ColorSpace::Bt709, true),
+							VideoDynamicRange::Sdr => (ColorSpace::Bt709, false),
 							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, false),
 						};
 						let mut config =
@@ -580,7 +580,7 @@ impl VideoPipelineInner {
 					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
 						FrameColorSpace::Srgb => (
 							ColorSpace::Bt709,
-							true,
+							false,
 							ColorDescription::bt709(),
 							BT2408_SDR_REFERENCE_NITS,
 						),
