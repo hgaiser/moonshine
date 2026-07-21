@@ -10,8 +10,6 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 - **Isolated streaming sessions**: Each stream runs in its own compositor, completely separate from your desktop environment. Your host PC can still be used for other things while you stream.
 - **No monitor required**: Works on headless servers — no HDMI dummy plug needed.
 - **Hardware video encoding**: H.264, H.265, and AV1 encoding using the GPU.
-
-> ⚠️ **AV1 Warning**: AV1 encoding is experimental and has issues on NVIDIA GPUs that cause frame sizes to grow over time ([see issue](https://github.com/nvpro-samples/vk_video_samples/issues/217)). This should be fixed in driver version 595.44.3.0. Until then, stick with H.264 or H.265.
 - **HDR support**: True 10-bit HDR streaming for supported games.
 - **Full input support**: Mouse, keyboard, and gamepad (including motion, touchpad, and haptics).
 - **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
@@ -157,6 +155,9 @@ resolve_icons = true
 1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**
    - Sunshine supports more platforms and has more features overall. Moonshine is Linux-only.
    - Moonshine runs each streaming session in its own isolated environment, separate from your desktop. This means your host PC stays usable while you stream, and it works without an active desktop session.
+2. **Can I use Moonshine to stream to two clients simultaneously?**
+
+   This is currently not a supported feature and not a focus of Moonshine. If you are interested in adding support for this, feel free to open an issue or discuss on [Discord](https://discord.com/invite/moonlight-stream-352065098472488960).
 
 ## Security
 
