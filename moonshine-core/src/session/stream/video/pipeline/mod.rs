@@ -287,7 +287,7 @@ impl VideoPipelineInner {
 
 		// Select color description for VUI signaling.
 		let color_description = match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription::bt709(),
+			VideoDynamicRange::Sdr => ColorDescription { full_range: false, ..ColorDescription::bt709() },
 			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq(),
 		};
 
@@ -370,7 +370,7 @@ impl VideoPipelineInner {
 		// color_desc differs, we call set_color_description() to update
 		// the SPS/sequence header.
 		let mut encoder_color_desc: Option<ColorDescription> = Some(match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription::bt709(),
+			VideoDynamicRange::Sdr => ColorDescription { full_range: false, ..ColorDescription::bt709() },
 			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq(),
 		});
 
@@ -548,7 +548,7 @@ impl VideoPipelineInner {
 					Some(conv) => conv,
 					None => {
 						let (color_space, full_range) = match ctx.dynamic_range {
-							VideoDynamicRange::Sdr => (ColorSpace::Bt709, true),
+							VideoDynamicRange::Sdr => (ColorSpace::Bt709, false),
 							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, false),
 						};
 						let mut config =
@@ -580,8 +580,8 @@ impl VideoPipelineInner {
 					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
 						FrameColorSpace::Srgb => (
 							ColorSpace::Bt709,
-							true,
-							ColorDescription::bt709(),
+							false,
+							ColorDescription { full_range: false, ..ColorDescription::bt709() },
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::Bt2020Pq => (
