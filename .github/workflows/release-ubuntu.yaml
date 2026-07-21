@@ -1,0 +1,58 @@
+name: Release Ubuntu
+
+on:
+  release:
+    types: [published]
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build .deb + AppImage
+    runs-on: ubuntu-24.04
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    - name: Install system dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y \
+          build-essential clang cmake \
+          libc++-dev libevdev-dev libgbm-dev libglib2.0-dev \
+          libopus-dev libpulse-dev libshaderc-dev libvulkan-dev \
+          libwayland-dev libxkbcommon-dev \
+          pkg-config
+
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Build binaries
+      run: |
+        cargo build --release
+        cargo build --release -p moonshine-wsi
+
+    - name: Package .deb
+      run: |
+        VER="${{ github.ref_name }}"
+        VER="${VER#v}"
+        ./packaging/deb/build.sh "${VER}"
+
+    - name: Package AppImage
+      run: |
+        VER="${{ github.ref_name }}"
+        VER="${VER#v}"
+        ./packaging/appimage/build.sh "${VER}"
+
+    - name: Upload artifacts
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          moonshine_*.deb
+          Moonshine-*.AppImage

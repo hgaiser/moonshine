@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Moonshine
+GenericName=Game Streaming Server
+Comment=Stream games from your PC to Moonlight clients with isolated Wayland sessions
+Icon=dev.lizardbyte.app.Moonshine
+Exec=moonshine
+Terminal=true
+Categories=Game;
+Keywords=game;streaming;moonlight;remote;play;
+StartupNotify=false

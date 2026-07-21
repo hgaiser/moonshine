@@ -1,0 +1,54 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="console-application">
+  <id>dev.lizardbyte.app.Moonshine</id>
+  <name>Moonshine</name>
+  <summary>Game streaming server for Moonlight clients</summary>
+  <metadata_license>MIT</metadata_license>
+  <project_license>MIT</project_license>
+  <developer_name>Moonshine contributors</developer_name>
+  <url type="homepage">https://github.com/hgaiser/moonshine</url>
+  <url type="bugtracker">https://github.com/hgaiser/moonshine/issues</url>
+  <url type="vcs-browser">https://github.com/hgaiser/moonshine</url>
+
+  <description>
+    <p>
+      Moonshine lets you stream games from your PC to any device running the Moonlight client.
+      Your keyboard, mouse, and controller inputs are sent back to the host so you can play
+      games remotely as if you were sitting in front of it.
+    </p>
+    <ul>
+      <li>Isolated streaming sessions: Each stream runs in its own compositor, completely separate from your desktop</li>
+      <li>No monitor required: Works on headless servers without HDMI dummy plugs</li>
+      <li>Hardware video encoding: H.264, H.265, and AV1 encoding using the GPU</li>
+      <li>HDR support: True 10-bit HDR streaming for supported games</li>
+      <li>Full input support: Mouse, keyboard, and gamepad including motion, touchpad, and haptics</li>
+      <li>Audio streaming: Stereo and surround sound with low-latency Opus encoding</li>
+    </ul>
+  </description>
+
+  <provides>
+    <binary>moonshine</binary>
+  </provides>
+
+  <recommends>
+    <control>pointing</control>
+    <control>keyboard</control>
+    <control>gamepad</control>
+  </recommends>
+
+  <screenshots>
+    <screenshot type="default">
+      <caption>Moonshine streaming session</caption>
+    </screenshot>
+  </screenshots>
+
+  <releases>
+    <release version="0.12.0" date="2026-07-20">
+      <description>
+        <p>Initial Ubuntu/Debian packaging release.</p>
+      </description>
+    </release>
+  </releases>
+
+  <content_rating type="oars-1.1" />
+</component>

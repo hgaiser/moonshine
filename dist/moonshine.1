@@ -1,0 +1,47 @@
+.TH MOONSHINE 1 "July 2026" "moonshine 0.12.0" "User Commands"
+.SH NAME
+moonshine \- Game streaming server for Moonlight clients
+.SH SYNOPSIS
+.B moonshine
+[\fIOPTIONS\fR] \fICONTIG\fR
+.SH DESCRIPTION
+Moonshine lets you stream games from your PC to any device running the
+Moonlight client. Each stream runs in its own isolated Wayland compositor,
+completely separate from your desktop environment.
+.SH OPTIONS
+.TP
+.BR <CONFIG>
+Path to the configuration file. A default config is created at
+\fB$XDG_CONFIG_HOME/moonshine/config.toml\fR if the path does not exist.
+.TP
+.BR \-h ", " \-\-help
+Print help information.
+.TP
+.BR \-V ", " \-\-version
+Print version information.
+.SH ENVIRONMENT
+.TP
+.B MOONSHINE_LOG
+Control log output. Example: \fBMOONSHINE_LOG=moonshine=info\fR
+.SH FILES
+.TP
+.B $XDG_CONFIG_HOME/moonshine/config.toml
+Default configuration file location.
+.SH REQUIREMENTS
+.IP \[bu] 2
+Linux with systemd
+.IP \[bu]
+GPU with Vulkan video encoding (NVIDIA RTX, AMD RDNA2+, or Intel Arc)
+.IP \[bu]
+Moonlight v6.0.0 or higher on the client
+.SH EXAMPLES
+.TP
+Start with default config:
+.B moonshine ~/.config/moonshine/config.toml
+.TP
+Enable systemd service:
+.B sudo systemctl enable \-\-now moonshine@$USER
+.SH "SEE ALSO"
+.BR moonlight (1)
+.SH AUTHOR
+Moonshine contributors. Upstream: https://github.com/hgaiser/moonshine
