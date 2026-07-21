@@ -102,7 +102,7 @@ enum ControlMessage<'a> {
 	FrameStats,
 	InputData(&'a [u8]),
 	RequestIdrFrame,
-	InvalidateReferenceFrames,
+	InvalidateReferenceFrames { first: u32, last: u32 },
 	StartB,
 	RumbleTriggers,
 	SetMotionEvent,
@@ -167,7 +167,22 @@ impl<'a> ControlMessage<'a> {
 
 				Ok(Self::InputData(&buffer[8..]))
 			},
-			ControlMessageType::InvalidateReferenceFrames => Ok(Self::InvalidateReferenceFrames),
+			ControlMessageType::InvalidateReferenceFrames => {
+				// Body (after the 4-byte type/length header), little-endian:
+				//   firstFrameIndex(4), reserved1(4), lastFrameIndex(4), reserved2[3](12)
+				// The client asks the host to stop referencing frames in the
+				// range [first, last]. If the body is malformed, invalidate from
+				// frame 0 so the encoder safely falls back to a full IDR.
+				let (first, last) = if buffer.len() >= 16 {
+					(
+						u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
+						u32::from_le_bytes(buffer[12..16].try_into().unwrap()),
+					)
+				} else {
+					(0, u32::MAX)
+				};
+				Ok(Self::InvalidateReferenceFrames { first, last })
+			},
 			ControlMessageType::RequestIdrFrame => Ok(Self::RequestIdrFrame),
 			ControlMessageType::StartB => Ok(Self::StartB),
 			ControlMessageType::HdrMode => Ok(Self::HdrMode),
@@ -528,8 +543,11 @@ async fn run_control_loop(
 					ControlMessage::Encrypted(_) => {
 						unreachable!("Encrypted control messages should be decrypted already.")
 					},
-					ControlMessage::RequestIdrFrame | ControlMessage::InvalidateReferenceFrames => {
+					ControlMessage::RequestIdrFrame => {
 						video_handle.request_idr_frame();
+					},
+					ControlMessage::InvalidateReferenceFrames { first, last } => {
+						video_handle.invalidate_reference_frames(first, last);
 					},
 					ControlMessage::StartB => {
 						video_handle.trigger();

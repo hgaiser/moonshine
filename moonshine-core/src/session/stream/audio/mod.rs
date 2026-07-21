@@ -185,7 +185,8 @@ pub(crate) struct AudioStartHandle {
 impl AudioStartHandle {
 	/// Signal the encoder and packet handler to begin processing.
 	pub fn trigger(&self) {
-		self.notify.notify_waiters();
+		self.notify.notify_one();
+		self.notify.notify_one();
 	}
 
 	/// Clone the start notify for external triggering (e.g. bench binary).

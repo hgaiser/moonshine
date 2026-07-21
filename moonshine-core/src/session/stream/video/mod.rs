@@ -59,8 +59,12 @@ pub struct FrameStats {
 	pub import: std::time::Duration,
 	/// Time spent on GPU color conversion.
 	pub convert: std::time::Duration,
-	/// Time spent encoding the frame.
-	pub encode: std::time::Duration,
+	/// Time spent submitting the frame to the asynchronous encoder.
+	pub submit: std::time::Duration,
+	/// Time between submit completion and the packet consumer awaiting the encode future.
+	pub consumer_queue: std::time::Duration,
+	/// Time from submit completion until the asynchronous encode/readback future has resolved.
+	pub encode_wait: std::time::Duration,
 	/// Time spent packetizing the encoded data.
 	pub packetize: std::time::Duration,
 	/// Time spent sending the packets over the channel.
@@ -179,18 +183,32 @@ pub struct VideoStreamContext {
 pub(crate) struct VideoStreamHandle {
 	notify: Arc<Notify>,
 	idr_tx: broadcast::Sender<()>,
+	/// Reference frame invalidation requests, carrying the inclusive
+	/// `[first, last]` client frame-index range the client could not decode.
+	invalidate_tx: broadcast::Sender<(u32, u32)>,
 	reset_tx: broadcast::Sender<()>,
 }
 
 impl VideoStreamHandle {
 	/// Signal the video pipeline and packet handler to begin processing.
 	pub fn trigger(&self) {
-		self.notify.notify_waiters();
+		self.notify.notify_one();
+		self.notify.notify_one();
 	}
 
 	/// Request an IDR (key) frame from the encoder.
 	pub fn request_idr_frame(&self) {
 		let _ = self.idr_tx.send(());
+	}
+
+	/// Request reference frame invalidation for the inclusive client frame-index
+	/// range `[first, last]` the client reported it could not decode.
+	///
+	/// The encoder drops the affected references and recovers by predicting from
+	/// a surviving reference where possible, falling back to an IDR only when no
+	/// reference survives — much cheaper than always re-sending a keyframe.
+	pub fn invalidate_reference_frames(&self, first: u32, last: u32) {
+		let _ = self.invalidate_tx.send((first, last));
 	}
 
 	/// Reset the stream's frame/sequence counters for a resuming client.
@@ -273,6 +291,10 @@ impl VideoStream {
 		// IDR broadcast channel.
 		let (idr_tx, _idr_rx) = broadcast::channel(1);
 
+		// Reference frame invalidation broadcast channel. Sized for a small burst
+		// of loss reports; the encode loop drains all pending each iteration.
+		let (invalidate_tx, _invalidate_rx) = broadcast::channel(16);
+
 		// Stream-reset broadcast channel (client reconnect/resume).
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
 
@@ -290,6 +312,7 @@ impl VideoStream {
 			keys_rx,
 			packet_tx,
 			idr_tx.subscribe(),
+			invalidate_tx.subscribe(),
 			reset_tx.subscribe(),
 			stop.clone(),
 			hdr_metadata_tx,
@@ -301,6 +324,7 @@ impl VideoStream {
 		Ok(VideoStreamHandle {
 			notify: start_notify,
 			idr_tx,
+			invalidate_tx,
 			reset_tx,
 		})
 	}
@@ -324,9 +348,9 @@ fn spawn_handle_video_packets(
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			tokio::select! {
-				batch = packet_rx.recv() => {
+				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Some(batch) => {
+						Ok(Some(batch)) => {
 							if let Some(client_address) = client_address {
 								for shard in batch.shards() {
 									if let Err(e) = socket.send_to(shard, client_address).await {
@@ -335,20 +359,22 @@ fn spawn_handle_video_packets(
 								}
 							}
 						},
-						None => {
+						Ok(None) => {
 							tracing::debug!("Video packet channel closed.");
 							break;
 						},
+						Err(_) => break,
 					}
 				},
 
-				message = socket.recv_from(&mut buf) => {
+				message = stop_session_manager.wrap_cancel(socket.recv_from(&mut buf)) => {
 					let (len, address) = match message {
-						Ok((len, address)) => (len, address),
-						Err(e) => {
+						Ok(Ok((len, address))) => (len, address),
+						Ok(Err(e)) => {
 							tracing::warn!("Failed to receive message: {e}");
 							break;
 						},
+						Err(_) => break,
 					};
 
 					if &buf[..len] == b"PING" {
