@@ -86,6 +86,18 @@ const ACTIVE_STATE_PROPERTY: &str = "ActiveState";
 const STOP_JOB_TIMEOUT: Duration = Duration::from_secs(2);
 const UNIT_REMOVED_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// systemd only emits JobRemoved/UnitRemoved/PropertiesChanged bus signals to
+/// connections that have called org.freedesktop.systemd1.Manager.Subscribe().
+/// Without it, waiting for those signals only works when some *other* client
+/// on the user bus happens to hold a subscription. Call this once for every
+/// new session bus connection, before waiting on any systemd signals.
+async fn subscribe_to_systemd_signals(conn: &Connection) -> Result<(), ()> {
+	conn.call_method(Some(SYSTEMD_BUS), SYSTEMD_PATH, Some(SYSTEMD_MANAGER), "Subscribe", &())
+		.await
+		.map_err(|e| tracing::error!("Failed to subscribe to systemd signals: {e}"))?;
+	Ok(())
+}
+
 #[derive(Clone)]
 pub(crate) struct LaunchOptions<'a> {
 	pub unit_name: &'a str,
@@ -138,6 +150,7 @@ impl Application {
 		let conn = Connection::session()
 			.await
 			.map_err(|e| tracing::error!("Failed to connect to session bus: {e}"))?;
+		subscribe_to_systemd_signals(&conn).await?;
 
 		// Stop any leftover unit from a previous session.
 		let _ = stop_unit(&conn, &context.unit_name).await;
@@ -353,6 +366,7 @@ async fn stop_unit_owned(unit_name: String) -> Result<(), ()> {
 	let conn = Connection::session().await.map_err(|e| {
 		tracing::error!("Failed to connect to session bus: {e}");
 	})?;
+	subscribe_to_systemd_signals(&conn).await?;
 	stop_unit(&conn, &unit_name).await
 }
 
