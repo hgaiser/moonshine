@@ -2820,7 +2820,7 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.6.0"
-source = "git+https://github.com/hgaiser/pixelforge?rev=d60ce3af5266e12a398b756f2a0585f772f01f1c#d60ce3af5266e12a398b756f2a0585f772f01f1c"
+source = "git+https://github.com/hgaiser/pixelforge?rev=fc525827f87c3539efb803bc16a5f148b54a3106#fc525827f87c3539efb803bc16a5f148b54a3106"
 dependencies = [
  "ash",
  "thiserror 1.0.69",
