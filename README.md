@@ -48,29 +48,50 @@ To run Moonshine for your user:
 
 ### Source
 
-The following dependencies are required to build:
+The following dependencies are required to build and run:
 
 ```sh
-sudo pacman -S \
+# Build dependencies
+sudo pacman -S --asdeps \
    clang \
    cmake \
+   libc++ \
+   rust
+
+# Runtime dependencies
+sudo pacman -S \
    gcc-libs \
    glibc \
-   libc++ \
    libevdev \
-   libpulse \
    libxkbcommon \
-   make \
    mesa \
    opus \
-   pkg-config \
-   rust \
-   shaderc \
-   vulkan-headers \
    wayland
 ```
 
-Then compile and run:
+Then build:
+
+```sh
+cargo build --release --workspace
+```
+
+Set up the environment:
+
+```sh
+# Install uinput/uhid kernel modules
+sudo install -Dm644 dist/moonshine-modules.conf /usr/lib/modules-load.d/moonshine.conf
+sudo modprobe uinput uhid
+
+# Install udev rules for input device access
+sudo install -Dm644 dist/60-moonshine.rules /usr/lib/udev/rules.d/60-moonshine.rules
+sudo udevadm control --reload-rules
+
+# Install the Vulkan WSI layer for game rendering
+sudo install -Dm755 target/release/libmoonshine_wsi.so /usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so
+sudo install -Dm644 dist/VkLayer_moonshine_wsi.json /usr/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
+```
+
+Then run:
 
 ```sh
 cargo run --release -- /path/to/config.toml
