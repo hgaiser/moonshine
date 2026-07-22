@@ -11,50 +11,37 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  check:
-    name: Check
-    runs-on: ubuntu-latest
-    container:
-      image: archlinux:base-devel
+  ci:
+    name: ${{ matrix.name }}
+    # Pin to ubuntu-24.04 (glibc 2.39) so CI validates the same baseline the
+    # release binaries are built against.
+    runs-on: ubuntu-24.04
 
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
-        uses: ./.github/actions/install-dependencies
-
-      - name: Run cargo check
-        run: cargo check --all-features
-
-  test:
-    name: Test Suite
-    runs-on: ubuntu-latest
-    container:
-      image: archlinux:base-devel
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
-        uses: ./.github/actions/install-dependencies
-
-      - name: Run unit tests
-        run: cargo test --all-features
-
-      # - name: Run doc tests
-      #   run: cargo test --doc --all-features
-
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    container:
-      image: archlinux:base-devel
+    strategy:
+      # Let all legs run to completion even if one fails.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Check
+            run: cargo check --all-features
+            deps: true
+          - name: Test Suite
+            run: cargo test --all-features
+            deps: true
+          - name: Clippy
+            components: clippy
+            run: cargo clippy --all-features -- -D warnings
+            deps: true
+          - name: Rustfmt
+            components: rustfmt
+            run: cargo fmt --all -- --check
+            deps: false
+          - name: Documentation
+            run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+            deps: true
+          - name: Cargo Machete
+            run: cargo install cargo-machete && cargo machete
+            deps: true
 
     steps:
       - uses: actions/checkout@v4
@@ -62,65 +49,11 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: ${{ matrix.components }}
 
       - name: Install dependencies
+        if: matrix.deps
         uses: ./.github/actions/install-dependencies
 
-      - name: Run clippy
-        run: cargo clippy --all-features -- -D warnings
-
-  fmt:
-    name: Rustfmt
-    runs-on: ubuntu-latest
-    container:
-      image: archlinux:base-devel
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-
-      - name: Check formatting
-        run: cargo fmt --all -- --check
-
-  doc:
-    name: Documentation
-    runs-on: ubuntu-latest
-    container:
-      image: archlinux:base-devel
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install dependencies
-        uses: ./.github/actions/install-dependencies
-
-      - name: Build documentation
-        run: cargo doc --no-deps --all-features
-        env:
-          RUSTDOCFLAGS: -D warnings
-
-  machete:
-    name: Cargo Machete (Unused Dependencies)
-    runs-on: ubuntu-latest
-    container:
-      image: archlinux:base-devel
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install cargo-machete
-        run: cargo install cargo-machete
-
-      - name: Check for unused dependencies
-        run: cargo machete
+      - name: ${{ matrix.name }}
+        run: ${{ matrix.run }}

@@ -5,19 +5,19 @@ runs:
   steps:
     - name: Install dependencies
       run: |
-        sudo pacman -Syyuu --noconfirm --needed \
+        sudo apt-get update
+        sudo apt-get install -y --no-install-recommends \
+          build-essential \
           clang \
           cmake \
-          gcc-libs \
-          glib2 \
-          glibc \
-          jq \
-          libc++ \
-          libevdev \
-          libpulse \
-          libxkbcommon \
-          mesa \
-          opus \
-          rust \
-          shaderc
+          libc++-dev \
+          libc++abi-dev \
+          libclang-dev \
+          libdrm-dev \
+          libevdev-dev \
+          libgbm-dev \
+          libopus-dev \
+          libwayland-dev \
+          libxkbcommon-dev \
+          pkg-config
       shell: bash

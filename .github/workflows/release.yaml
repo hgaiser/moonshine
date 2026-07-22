@@ -13,23 +13,22 @@ permissions:
 jobs:
   build:
     name: Build binary
-    runs-on: ubuntu-latest
-
-    container:
-      image: archlinux:base-devel
+    # Pin to ubuntu-24.04 (glibc 2.39) so the release binary runs on
+    # Ubuntu 24.04+, Fedora 40+, Arch, ...
+    runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
     - name: Install dependencies
       uses: ./.github/actions/install-dependencies
 
     - name: Build
-      run: |
-        source /etc/profile
-        cargo build --release
-      shell: bash
+      run: cargo build --release
 
     - name: Compress
       run: |
