@@ -224,6 +224,9 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 		format!("MOONSHINE_WAYLAND_DISPLAY={}", context.wayland_display),
 		// Activate the moonshine WSI Vulkan layer.
 		"ENABLE_MOONSHINE_WSI=1".to_string(),
+		// Force Proton to use winepulse.drv instead of winepipewire.drv,
+		// so it respects PULSE_SERVER and routes audio through Moonshine.
+		"PROTON_USE_PIPEWIRE=0".to_string(),
 	];
 
 	if context.hdr {
