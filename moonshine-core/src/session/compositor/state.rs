@@ -1457,7 +1457,9 @@ impl MoonshineCompositor {
 		let (xwayland, client) = match XWayland::spawn(
 			&self.display_handle,
 			None,
-			[("WAYLAND_DEBUG", "1")],
+			std::env::var("MOONSHINE_WAYLAND_DEBUG")
+				.ok()
+				.map(|_| ("WAYLAND_DEBUG", "1")),
 			true,
 			xwayland_log_stdout,
 			xwayland_log_stderr,
