@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 
+use libc;
+
 use smithay::reexports::wayland_server::Resource;
 
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
@@ -283,6 +285,10 @@ pub(crate) struct MoonshineCompositor {
 	pub xwayland_shell_state: XWaylandShellState,
 	pub xwm: Option<X11Wm>,
 	pub xdisplay: Option<u32>,
+	/// PID of the XWayland process, captured at startup for cleanup during shutdown.
+	/// Smithay's `-terminate` flag is unreliable when the WM parent stays alive,
+	/// so we track the PID and explicitly kill the process during session teardown.
+	pub xwayland_pid: Option<u32>,
 	/// Channel to notify the session thread of the XWayland display number
 	/// once it becomes ready.
 	pub xdisplay_tx: Option<mpsc::SyncSender<super::CompositorReady>>,
@@ -603,6 +609,7 @@ impl MoonshineCompositor {
 				xwayland_shell_state,
 				xwm: None,
 				xdisplay: None,
+				xwayland_pid: None,
 				xdisplay_tx: Some(xdisplay_tx),
 				wayland_socket_token: Some(wayland_socket_token),
 				wayland_display,
@@ -1499,6 +1506,19 @@ impl MoonshineCompositor {
 					data.xwm = Some(wm);
 					data.xdisplay = Some(display_number);
 
+					// Find and store XWayland PID for cleanup during shutdown.
+					// Smithay's `-terminate` flag is unreliable when the WM parent (moonshine)
+					// stays alive, so we track the PID and explicitly kill the process.
+					if let Some(pid) = find_xwayland_pid(display_number) {
+						data.xwayland_pid = Some(pid);
+						tracing::debug!(pid, display_number, "Captured XWayland PID");
+					} else {
+						tracing::warn!(
+							display_number,
+							"Failed to find XWayland PID in /proc — session shutdown will not be able to terminate it"
+						);
+					}
+
 					// Open an X11 connection to the XWayland display for
 					// reading root window properties (Steam focus control).
 					if data.x11_focus.is_none() {
@@ -1546,6 +1566,14 @@ impl MoonshineCompositor {
 		if self.xwm.take().is_some() {
 			tracing::debug!("Dropped X11 window manager");
 		}
+
+		// Explicitly terminate the XWayland process.
+		// The `-terminate` flag is unreliable when the WM parent (moonshine) stays alive,
+		// so we kill it ourselves to prevent orphaned XWayland processes accumulating
+		// across sessions. See smithay/smithay#1210.
+		if let Some(pid) = self.xwayland_pid.take() {
+			terminate_xwayland(pid);
+		}
 	}
 }
 
@@ -1586,4 +1614,83 @@ fn export_dmabuf(
 		color_space: surface_color_space.unwrap_or(FrameColorSpace::Srgb),
 		hdr_metadata,
 	})
+}
+
+/// Find the PID of the XWayland process for the given display number.
+///
+/// Scans `/proc` for a process whose cmdline contains "Xwayland" as the
+/// first argument and the display number (e.g. `:0`) as an exact argument.
+///
+/// This is needed because Smithay's `XWayland` wrapper does not expose the
+/// child PID — it's stored in a private `XWaylandClientData::child` field.
+/// See smithay/smithay#1210.
+fn find_xwayland_pid(display_number: u32) -> Option<u32> {
+	let display_name = format!(":{}", display_number);
+	let display_bytes = display_name.as_bytes();
+	for entry in std::fs::read_dir("/proc").ok()?.filter_map(|e| e.ok()) {
+		let name = entry.file_name();
+		let pid_str = name.to_string_lossy();
+		let Ok(pid) = pid_str.parse() else { continue };
+		let Ok(cmdline) = std::fs::read(entry.path().join("cmdline")) else {
+			continue;
+		};
+
+		// Cmdline uses null bytes as separators between arguments.
+		let args: Vec<&[u8]> = cmdline.split(|&b| b == 0).collect();
+
+		// First arg must start with "Xwayland" and one arg must exactly match the display number.
+		if args.first().map(|a| a.starts_with(b"Xwayland")) == Some(true) && args.contains(&display_bytes) {
+			return Some(pid);
+		}
+	}
+	None
+}
+
+/// Check if the process with the given PID is still an XWayland process.
+///
+/// Used to guard against PID reuse between capture at session start and
+/// termination at session end. Returns `true` if `/proc/{pid}/cmdline`
+/// starts with "Xwayland".
+fn is_xwayland_process(pid: u32) -> bool {
+	std::fs::read(format!("/proc/{}/cmdline", pid))
+		.ok()
+		.map(|cmdline| cmdline.starts_with(b"Xwayland"))
+		.unwrap_or(false)
+}
+
+/// Terminate the XWayland process with the given PID.
+///
+/// Sends SIGTERM first, waits up to 1 second polling every 100ms,
+/// then sends SIGKILL if the process is still alive.
+fn terminate_xwayland(pid: u32) {
+	// Check if process is still alive before doing anything.
+	if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+		tracing::debug!(pid, "XWayland process already exited");
+		return;
+	}
+
+	unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+	tracing::info!(pid, "Sent SIGTERM to XWayland process");
+
+	// Wait up to 1 second (10 polls at 100ms each).
+	for _ in 0..10 {
+		std::thread::sleep(std::time::Duration::from_millis(100));
+		if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+			tracing::debug!(pid, "XWayland process terminated gracefully");
+			return;
+		}
+	}
+
+	// Process still alive — verify it's still XWayland before force kill.
+	// PID reuse between session start and shutdown is extremely unlikely,
+	// but we guard against it to avoid killing an unrelated process.
+	if is_xwayland_process(pid) {
+		tracing::warn!(pid, "XWayland did not terminate gracefully, sending SIGKILL");
+		unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+	} else {
+		tracing::warn!(
+			pid,
+			"PID was reused before SIGKILL, skipping to avoid killing unrelated process"
+		);
+	}
 }
