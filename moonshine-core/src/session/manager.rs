@@ -360,14 +360,14 @@ impl SessionManager {
 					// Resume (reconnect): the streams are already running, so PLAY is a
 					// no-op — the client picks up the existing streams once it PINGs.
 					// The reconnecting client is a fresh Moonlight session that expects
-					// frame numbers to start at 1, so reset the video frame counters and
-					// force an IDR; otherwise it sees the running counter as a huge frame
-					// gap and reports a poor connection.
+					// frame numbers to start at 1, so arm a video stream reset (frame-counter
+					// reset + forced IDR); otherwise it sees the running counter as a huge
+					// frame gap and reports a poor connection. The reset fires once the packet
+					// handler re-learns the client's (usually new) address from its first PING,
+					// so the forced IDR isn't sent to the stale previous address.
 					active.reset_video_stream();
 					guard.session = Some(SessionState::Active(active));
-					tracing::info!(
-						"Resuming active session: resetting video frame counter and treating PLAY as no-op."
-					);
+					tracing::info!("Resuming active session: arming video stream reset and treating PLAY as no-op.");
 					return Ok(());
 				},
 				None => {
