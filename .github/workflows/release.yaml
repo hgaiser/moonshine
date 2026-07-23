@@ -68,7 +68,7 @@ jobs:
 
     - name: Package native formats
       run: |
-        VERSION="${{ steps.tag.outputs.version }}"
+        export VERSION="${{ steps.tag.outputs.version }}"
         for fmt in deb rpm; do
           nfpm package --config nfpm.yaml --packager "$fmt" --target .
         done
