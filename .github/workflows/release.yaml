@@ -60,7 +60,11 @@ jobs:
           -C "$RUNNER_TEMP" moonshine
 
     - name: Install nfpm
-      uses: goreleaser/nfpm-action@v2
+      run: |
+        curl -sSfL "https://github.com/goreleaser/nfpm/releases/latest/download/nfpm_2.47.0_Linux_x86_64.tar.gz" \
+          -o /tmp/nfpm.tar.gz
+        tar xzf /tmp/nfpm.tar.gz -C /usr/local/bin nfpm
+        nfpm --version
 
     - name: Package native formats
       run: |

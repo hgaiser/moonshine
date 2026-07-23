@@ -1,0 +1,96 @@
+# nfpm configuration — emits .deb, .rpm, and Arch (.pkg.tar.zst) packages from
+# the prebuilt binaries. Used by .github/workflows/release.yaml.
+#
+# VERSION is injected by the release workflow (GITHUB_REF_NAME minus the 'v').
+
+name: moonshine
+arch: amd64 # nfpm maps this per packager: amd64 (deb) / x86_64 (rpm, archlinux)
+platform: linux
+version: ${VERSION}
+release: "1"
+maintainer: "Hans Gaiser <hansg91@email.com>"
+description: |
+  Streaming server for Moonlight clients, written in Rust.
+  Each streaming session runs in its own isolated compositor.
+homepage: "https://github.com/hgaiser/moonshine"
+license: "BSD-2-Clause"
+
+contents:
+  # (&root-owned writes uname/gname into the package so namcap's ownership
+  # check passes; nfpm defaults to numeric 0/0.)
+  - src: ./target/release/moonshine
+    dst: /usr/bin/moonshine
+    file_info: &root-owned
+      owner: root
+      group: root
+  - src: ./dist/start-moonshine.sh
+    dst: /usr/bin/start-moonshine.sh
+    file_info: *root-owned
+  - src: ./target/release/libmoonshine_wsi.so
+    dst: /usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so
+    file_info: *root-owned
+  - src: ./dist/60-moonshine.rules
+    dst: /usr/lib/udev/rules.d/60-moonshine.rules
+    file_info: *root-owned
+  - src: ./dist/moonshine-modules.conf
+    dst: /usr/lib/modules-load.d/moonshine.conf
+    file_info: *root-owned
+  - src: ./dist/moonshine@.service
+    dst: /usr/lib/systemd/system/moonshine@.service
+    file_info: *root-owned
+  - src: ./dist/VkLayer_moonshine_wsi.json
+    dst: /usr/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
+    file_info: *root-owned
+  # License locations differ per distro.
+  - src: ./LICENSE
+    dst: /usr/share/licenses/moonshine/LICENSE
+    packager: archlinux
+    file_info: *root-owned
+  - src: ./LICENSE
+    dst: /usr/share/licenses/moonshine/LICENSE
+    packager: rpm
+    file_info: *root-owned
+  - src: ./LICENSE
+    dst: /usr/share/doc/moonshine/copyright
+    packager: deb
+    file_info: *root-owned
+
+scripts:
+  postinstall: ./dist/nfpm/postinstall.sh
+  postremove: ./dist/nfpm/postremove.sh
+
+# Dependency names differ per distro — the only per-format wrinkle.
+# (libwayland-client is needed by the WSI layer, which is dlopen'd into games.)
+overrides:
+  deb:
+    depends:
+      - libc6
+      - libopus0
+      - libevdev2
+      - libxkbcommon0
+      - libgbm1
+      - libstdc++6
+      - libgcc-s1
+      - libwayland-client0
+      - xwayland
+  rpm:
+    depends:
+      - glibc
+      - opus
+      - libevdev
+      - libxkbcommon
+      - mesa-libgbm
+      - libstdc++
+      - libgcc
+      - libwayland-client
+      - xorg-x11-server-Xwayland
+  archlinux:
+    depends:
+      - glibc
+      - gcc-libs
+      - libevdev
+      - libxkbcommon
+      - mesa
+      - opus
+      - wayland
+      - xorg-xwayland
