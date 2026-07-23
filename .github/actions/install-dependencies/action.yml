@@ -19,5 +19,6 @@ runs:
           libopus-dev \
           libwayland-dev \
           libxkbcommon-dev \
+          patchelf \
           pkg-config
       shell: bash

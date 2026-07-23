@@ -43,8 +43,14 @@ jobs:
     - name: Build
       run: cargo build --release --workspace
 
-    - name: Strip binaries
-      run: strip ./target/release/moonshine ./target/release/libmoonshine_wsi.so
+    - name: Strip and fixup
+      run: |
+        strip ./target/release/moonshine ./target/release/libmoonshine_wsi.so
+        # Remove libunwind — pulled in transitively via libc++ on Ubuntu but
+        # never called at runtime (no C++ exceptions in the code path).
+        # Can be removed if inputtino-sys is changed to link -lc++ statically
+        # or dropped entirely.
+        patchelf --remove-needed libunwind.so.1 ./target/release/moonshine
 
     # Portable tarball with an FHS-ish layout (bin/, lib/, share/).
     - name: Package portable tarball
