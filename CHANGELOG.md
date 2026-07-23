@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.13.0] - 23-07-2026
+
+### Added
+
+- Pass client display information (`MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT`, `MOONSHINE_CLIENT_FRAMERATE`) as environment variables to launched applications (#109, @BigDiaB).
+- Package releases as `.deb`, `.rpm`, and `.pkg.tar.zst` via nfpm (#130).
+
+### Changed
+
+- Make `WAYLAND_DEBUG` opt-in behind `MOONSHINE_WAYLAND_DEBUG` environment variable.
+- Update CI to Ubuntu 24.04.
+- Bump pixelforge dependency.
+
+### Fixed
+
+- Use limited (TV) range instead of full range in SDR mode for correct color output (#126).
+- Subscribe to systemd signals before waiting on job/unit events to prevent launch/stop timeouts on headless, linger-only hosts (#124, @scottjab).
+- Fall back to PulseAudio when PipeWire is available to fix audio compatibility.
+
 ## [v0.12.0] - 20-07-2026
 
 ### Added
