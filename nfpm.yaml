@@ -1,10 +1,10 @@
-# nfpm configuration — emits .deb, .rpm, and Arch (.pkg.tar.zst) packages from
-# the prebuilt binaries. Used by .github/workflows/release.yaml.
+# nfpm configuration — emits .deb and .rpm packages from the prebuilt
+# binaries. Used by .github/workflows/release.yaml.
 #
 # VERSION is injected by the release workflow (GITHUB_REF_NAME minus the 'v').
 
 name: moonshine
-arch: amd64 # nfpm maps this per packager: amd64 (deb) / x86_64 (rpm, archlinux)
+arch: amd64 # nfpm maps this per packager: amd64 (deb) / x86_64 (rpm)
 platform: linux
 version: ${VERSION}
 release: "1"
@@ -16,8 +16,6 @@ homepage: "https://github.com/hgaiser/moonshine"
 license: "BSD-2-Clause"
 
 contents:
-  # (&root-owned writes uname/gname into the package so namcap's ownership
-  # check passes; nfpm defaults to numeric 0/0.)
   - src: ./target/release/moonshine
     dst: /usr/bin/moonshine
   - src: ./dist/start-moonshine.sh
@@ -37,9 +35,6 @@ contents:
     dst: /usr/share/licenses/moonshine/LICENSE
     packager: rpm
   - src: ./LICENSE
-    dst: /usr/share/licenses/moonshine/LICENSE
-    packager: rpm
-  - src: ./LICENSE
     dst: /usr/share/doc/moonshine/copyright
     packager: deb
 
@@ -47,7 +42,7 @@ scripts:
   postinstall: ./dist/nfpm/postinstall.sh
   postremove: ./dist/nfpm/postremove.sh
 
-# Dependency names differ per distro — the only per-format wrinkle.
+# Dependency names differ per distro.
 # (libwayland-client is needed by the WSI layer, which is dlopen'd into games.)
 overrides:
   deb:
