@@ -12,34 +12,54 @@ permissions:
 
 jobs:
   build:
-    name: Build binary
-    runs-on: ubuntu-latest
-
-    container:
-      image: archlinux:base-devel
+    name: Build and package
+    # Pin to ubuntu-24.04 (glibc 2.39) so the release binary runs on
+    # Ubuntu 24.04+, Fedora 40+, Arch, ...
+    runs-on: ubuntu-24.04
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
     - name: Install dependencies
       uses: ./.github/actions/install-dependencies
 
     - name: Build
-      run: |
-        source /etc/profile
-        cargo build --release
-      shell: bash
+      run: cargo build --release --workspace
 
-    - name: Compress
+    - name: Strip binaries
+      run: strip ./target/release/moonshine ./target/release/libmoonshine_wsi.so
+
+    # Portable tarball with an FHS-ish layout (bin/, lib/, share/).
+    - name: Package portable tarball
       run: |
-        mkdir "$RUNNER_TEMP/$GITHUB_REF_NAME"
-        cp -r ./target/release/moonshine README.md "$RUNNER_TEMP/$GITHUB_REF_NAME"
-        cp LICENSE "$RUNNER_TEMP/$GITHUB_REF_NAME/LICENSE"
-        tar caf "./moonshine-$GITHUB_REF_NAME-linux-amd64.tar.xz" -C "$RUNNER_TEMP" "$GITHUB_REF_NAME"
+        STAGE="$RUNNER_TEMP/moonshine"
+        mkdir -p "$STAGE/bin" "$STAGE/lib/moonshine/vulkan-layers" "$STAGE/share/moonshine"
+        cp ./target/release/moonshine "$STAGE/bin/"
+        cp ./target/release/libmoonshine_wsi.so "$STAGE/lib/moonshine/vulkan-layers/"
+        cp ./dist/start-moonshine.sh ./dist/60-moonshine.rules ./dist/moonshine-modules.conf \
+           ./dist/moonshine@.service ./dist/VkLayer_moonshine_wsi.json "$STAGE/share/moonshine/"
+        cp README.md LICENSE "$STAGE/"
+        tar --zstd -cf "./moonshine-$GITHUB_REF_NAME-linux-amd64.tar.zst" -C "$RUNNER_TEMP" moonshine
+
+    - name: Install nfpm
+      uses: goreleaser/nfpm-action@v2
+
+    - name: Package native formats
+      run: |
+        export VERSION="${GITHUB_REF_NAME#v}"
+        for fmt in deb rpm; do
+          nfpm package --config nfpm.yaml --packager "$fmt" --target .
+        done
 
     - name: Release
       uses: softprops/action-gh-release@v2
       if: startsWith(github.ref, 'refs/tags/')
       with:
-        files: "./moonshine-*.tar.xz"
+        files: |
+          ./moonshine-*-linux-amd64.tar.zst
+          ./moonshine_*.deb
+          ./moonshine-*.rpm
