@@ -3,9 +3,11 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use desktop::DesktopApplicationScannerConfig;
+use lutris::LutrisApplicationScannerConfig;
 use steam::SteamApplicationScannerConfig;
 
 pub mod desktop;
+pub mod lutris;
 pub mod steam;
 
 use crate::session::application::ApplicationConfig;
@@ -19,6 +21,9 @@ pub enum ApplicationScannerConfig {
 
 	/// Scans directories containing freedesktop .desktop launchers.
 	Desktop(DesktopApplicationScannerConfig),
+
+	/// Scans the Lutris game database.
+	Lutris(LutrisApplicationScannerConfig),
 }
 
 pub fn scan_applications(application_scanners: &Vec<ApplicationScannerConfig>) -> Vec<ApplicationConfig> {
@@ -33,6 +38,10 @@ pub fn scan_applications(application_scanners: &Vec<ApplicationScannerConfig>) -
 			},
 			ApplicationScannerConfig::Desktop(config) => match desktop::scan_desktop_applications(config) {
 				Ok(desktop_applications) => desktop_applications,
+				Err(()) => continue,
+			},
+			ApplicationScannerConfig::Lutris(config) => match lutris::scan_lutris_applications(config) {
+				Ok(lutris_applications) => lutris_applications,
 				Err(()) => continue,
 			},
 		};
