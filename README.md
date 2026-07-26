@@ -25,19 +25,55 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 ### Arch
 
-The simplest method is to install through the AUR using:
+The recommended method is to install through the AUR using:
 
 ```
 yay -S moonshine
 ```
 
-To run Moonshine for your user:
+After installing, follow the distro-agnostic [Enable the service](#enable-the-service) steps below.
+
+### Debian / Ubuntu (.deb)
+
+Download the latest `.deb` from the [releases page](https://github.com/hgaiser/moonshine/releases) and install it:
+
+```sh
+sudo apt install ./moonshine_*.deb
+```
+
+After installing, follow the [Enable the service](#enable-the-service) steps below.
+
+### Fedora / RHEL (.rpm)
+
+Download the latest `.rpm` and install it:
+
+```sh
+sudo dnf install ./moonshine_*.rpm
+```
+
+The package's post-install scripts set up udev rules, kernel modules, and the `moonshine` group automatically.
+After installing, follow the [Enable the service](#enable-the-service) steps below.
+
+### Nix
+
+This repository is also a nix flake, providing a package and a NixOS module that sets up the service for you.
+See [nix/README.md](nix/README.md) for instructions, or install just the package on any distro with:
+
+```sh
+nix profile install github:hgaiser/moonshine
+```
+
+After installing, follow the [Enable the service](#enable-the-service) steps below (the NixOS module handles this for you when enabled).
+
+### Enable the service
+
+These steps apply to every installation method above (the service is a systemd unit).
 
 1. **Enable user lingering**:
    ```sh
    sudo loginctl enable-linger $USER
    ```
-   This allows Moonshine to run applications in the user's session even when the user is not logged in.
+   This allows Moonshine to run applications in the user's session even when the user is not logged in (when running headless).
 
    If your user is always logged in when you want to stream, you can skip this step.
 
@@ -45,11 +81,6 @@ To run Moonshine for your user:
    ```sh
    sudo systemctl enable --now moonshine@$USER
    ```
-
-### NixOS
-
-This repository is also a nix flake, providing a package and a NixOS module that sets up the service for you.
-See [nix/README.md](nix/README.md) for instructions.
 
 ### Source
 
