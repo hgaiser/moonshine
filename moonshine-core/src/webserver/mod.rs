@@ -26,8 +26,8 @@ use tokio::net::TcpListener;
 use crate::{
 	clients::ClientManager,
 	session::{
-		application::ApplicationConfig, compositor::CompositorConfig, manager::SessionManager, SessionContext,
-		SessionKeyData, SessionKeys, APP_LAUNCH_HTTP_TIMEOUT_SECS,
+		application::ApplicationConfig, manager::SessionManager, SessionContext, SessionKeyData, SessionKeys,
+		APP_LAUNCH_HTTP_TIMEOUT_SECS,
 	},
 	tls::TlsAcceptor,
 	ShutdownReason,
@@ -79,21 +79,6 @@ impl Default for WebserverConfig {
 const SERVERINFO_APP_VERSION: &str = "7.1.431.-1";
 const SERVERINFO_GFE_VERSION: &str = "3.23.0.74";
 
-#[repr(u32)]
-#[allow(dead_code)]
-enum ServerCodecModeSupport {
-	H264 = 0x00000001,
-	Hevc = 0x00000100,
-	HevcMain10 = 0x00000200,
-	Av1Main8 = 0x00010000,      // Sunshine extension
-	Av1Main10 = 0x00020000,     // Sunshine extension
-	H264High8444 = 0x00040000,  // Sunshine extension
-	HevcRext8444 = 0x00080000,  // Sunshine extension
-	HevcRext10444 = 0x00100000, // Sunshine extension
-	Av1High8444 = 0x00200000,   // Sunshine extension
-	Av1High10444 = 0x00400000,  // Sunshine extension
-}
-
 #[derive(Clone)]
 pub struct Webserver {
 	name: String,
@@ -104,6 +89,7 @@ pub struct Webserver {
 	client_manager: ClientManager,
 	session_manager: SessionManager,
 	server_certs: String,
+	supported_codecs: u32,
 	hdr_supported: bool,
 	shutdown: ShutdownManager<ShutdownReason>,
 }
@@ -117,7 +103,8 @@ impl Webserver {
 		rtsp_port: u16,
 		webserver_config: WebserverConfig,
 		applications: Vec<ApplicationConfig>,
-		compositor_config: CompositorConfig,
+		supported_codecs: u32,
+		hdr_supported: bool,
 		unique_id: String,
 		// Passing certificate content as string.
 		server_certs: String,
@@ -125,10 +112,6 @@ impl Webserver {
 		session_manager: SessionManager,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
-		// Gate HDR advertisement on both the config flag and a runtime
-		// GPU capability probe (10-bit or FP16 render formats).
-		let hdr_supported = compositor_config.hdr && super::session::compositor::probe_hdr_support(&compositor_config);
-
 		let server = Self {
 			name,
 			rtsp_port,
@@ -138,6 +121,7 @@ impl Webserver {
 			client_manager,
 			session_manager,
 			server_certs,
+			supported_codecs,
 			hdr_supported,
 			shutdown: shutdown.clone(),
 		};
@@ -593,16 +577,7 @@ impl Webserver {
 		response += &format!("<mac>{}</mac>", mac_address.unwrap_or("".to_string()));
 		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
 		response += &format!("<LocalIP>{}</LocalIP>", escape_xml(local_ip));
-		let server_codec_mode_support = (ServerCodecModeSupport::H264 as u32)
-			| (ServerCodecModeSupport::H264High8444 as u32)
-			| (ServerCodecModeSupport::Hevc as u32)
-			| (ServerCodecModeSupport::HevcRext8444 as u32)
-			| (ServerCodecModeSupport::HevcMain10 as u32)
-			| (ServerCodecModeSupport::HevcRext10444 as u32)
-			| (ServerCodecModeSupport::Av1Main8 as u32)
-			| (ServerCodecModeSupport::Av1High8444 as u32)
-			| (ServerCodecModeSupport::Av1Main10 as u32)
-			| (ServerCodecModeSupport::Av1High10444 as u32);
+		let server_codec_mode_support = self.supported_codecs;
 		response += &format!(
 			"<ServerCodecModeSupport>{}</ServerCodecModeSupport>",
 			server_codec_mode_support

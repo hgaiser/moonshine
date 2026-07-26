@@ -182,13 +182,18 @@ async fn get_server_cert(
 				Notification::new()
 					.appname("Moonshine")
 					.summary("Received pairing request.")
+					.body(&format!("Open {pin_url} to enter the PIN."))
 					.action("default", "default")
 					.action("open", "Enter PIN")
 					.show()
 					.map_err(|e| tracing::warn!("Failed to show PIN notification: {e}"))?
 					.wait_for_action(|action| {
 						if action != "__closed" {
-							let _ = open::that(pin_url);
+							if let Err(e) = open::that(&pin_url) {
+								tracing::warn!(
+									"Couldn't open the PIN page automatically ({e}). Open it manually: {pin_url}"
+								);
+							}
 						}
 					});
 

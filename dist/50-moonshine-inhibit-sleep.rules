@@ -1,0 +1,11 @@
+# Allow members of the 'moonshine' group to hold a block-type sleep inhibitor.
+# Moonshine runs as a system service without a logind session, so logind treats
+# its inhibit requests as unprivileged and silently rejects a block-type sleep
+# inhibitor unless polkit grants it. See TIPS.md for setup.
+polkit.addRule(function(action, subject) {
+    if ((action.id == "org.freedesktop.login1.inhibit" ||
+         action.id == "org.freedesktop.login1.inhibit-block-sleep")
+        && subject.isInGroup("moonshine")) {
+        return polkit.Result.YES;
+    }
+});
