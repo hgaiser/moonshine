@@ -38,6 +38,19 @@ pub struct Config {
 
 	/// Configuration for the compositor.
 	pub compositor: CompositorConfig,
+
+	/// Inhibit system sleep (suspend) while a session is active.
+	///
+	/// Moonshine asks logind to block sleep for the duration of a stream. This
+	/// requires the user to be in the `moonshine` group and the polkit rule
+	/// shipped with Moonshine to be installed (handled by the packages). Set to
+	/// `false` to disable.
+	#[serde(default = "default_inhibit_sleep")]
+	pub inhibit_sleep: bool,
+}
+
+fn default_inhibit_sleep() -> bool {
+	true
 }
 
 impl Config {
@@ -121,6 +134,7 @@ impl Default for Config {
 				launch_timeout_secs: 2,
 			})],
 			compositor: CompositorConfig::default(),
+			inhibit_sleep: true,
 		}
 	}
 }

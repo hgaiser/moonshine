@@ -275,6 +275,7 @@ impl Moonshine {
 			config.stream.control.clone(),
 			config.address.clone(),
 			config.stream.timeout,
+			config.inhibit_sleep,
 			shutdown.clone(),
 		)?;
 		let client_manager = ClientManager::new(cert.clone(), pkey.clone())?;

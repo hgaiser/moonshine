@@ -38,26 +38,23 @@ Note that this closes your desktop Steam session when a stream starts.
 
 ### How to
 
-Add your user to the `moonshine` group so Moonshine is allowed to hold a sleep inhibitor: `sudo usermod -aG moonshine $USER`.
-Log out and back in (or reboot) for the new group membership to take effect.
-In your application's `command`, wrap the real command with `systemd-inhibit`:
+Make sure your user is in the `moonshine` group: `sudo usermod -aG moonshine $USER`.
+Log out and back in for the new membership to take effect.
+Moonshine then blocks sleep automatically for the duration of every stream — nothing else is required.
+If you want to disable this, set `inhibit_sleep = false` at the top of your configuration:
 
 ```toml
-[[application]]
-title = "Steam"
-command = [
-    "/usr/bin/systemd-inhibit", "--what=sleep", "--mode=block", "--who=Moonshine",
-    "/usr/bin/steam", "steam://open/bigpicture",
-]
+name = "Moonshine"
+inhibit_sleep = false
 ```
-
-`systemd-inhibit` holds the block until the wrapped process exits, so no separate `post_command` is needed.
 
 ### Details
 
-When installed from a package, Moonshine sets up the `moonshine` group and a polkit rule (`/usr/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules`) for you; if you installed Moonshine manually, create the group with `sudo groupadd --system moonshine` and copy that polkit rule file into place yourself.
-`moonshine@$USER.service` runs as a system service without a logind session, so logind treats its inhibit request as unprivileged and silently rejects a block-type sleep inhibitor.
-The polkit rule grants the `moonshine` group the right to acquire that inhibitor, which is why joining the group is required.
+Moonshine asks logind (over D-Bus) to inhibit sleep when a session starts and releases it when the session ends.
+This is the same thing `systemd-inhibit` does, but handled by Moonshine itself, so you do not have to wrap each application's `command` with it.
+It requires the polkit rule shipped with Moonshine (`/usr/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules`) and membership in the `moonshine` group it is scoped to.
+When installed from a package, both are set up for you (via the sysusers.d drop-in and the package's post-install step); if you installed Moonshine manually, create the group with `sudo groupadd --system moonshine` and copy that polkit rule file into place yourself.
+If the user is not in the `moonshine` group (and has no active session), Moonshine logs a warning and streaming still works, but the host may suspend mid-stream.
 
 ## Run games in high-performance mode
 
