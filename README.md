@@ -46,6 +46,11 @@ To run Moonshine for your user:
    sudo systemctl enable --now moonshine@$USER
    ```
 
+### NixOS
+
+This repository is also a nix flake, providing a package and a NixOS module that sets up the service for you.
+See [nix/README.md](nix/README.md) for instructions.
+
 ### Source
 
 The following dependencies are required to build and run:
