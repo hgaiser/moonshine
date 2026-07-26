@@ -143,10 +143,9 @@ title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
 pre_command = [
     ["/usr/bin/systemctl", "stop", "conflicting.service"],
-    ["/usr/bin/nvidia-smi", "pstate", "50"],
 ]
 post_command = [
-    ["/usr/bin/nvidia-smi", "pstate", "performance"],
+    ["/usr/bin/systemctl", "start", "conflicting.service"],
 ]
 ```
 
@@ -175,6 +174,10 @@ directories = [
 include_terminal = false
 resolve_icons = true
 ```
+
+## Tips & Tricks
+
+See [TIPS.md](TIPS.md) for practical recipes and workarounds.
 
 ## FAQ
 

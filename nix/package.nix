@@ -138,6 +138,12 @@ rustPlatform.buildRustPackage {
     # Input-group access + active-seat ACLs for /dev/uinput and /dev/uhid,
     # picked up by services.udev.packages.
     install -Dm644 dist/60-moonshine.rules $out/lib/udev/rules.d/60-moonshine.rules
+
+    # Polkit rule that lets the 'moonshine' group hold a block-type sleep
+    # inhibitor (used by the suspend-inhibit tip in TIPS.md). The group itself
+    # is declared in the NixOS module; the rule is referenced from there.
+    install -Dm644 dist/50-moonshine-inhibit-sleep.rules \
+      $out/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
   '';
 
   postFixup = ''

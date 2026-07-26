@@ -6,6 +6,13 @@
 udevadm control --reload || true
 udevadm trigger || true
 
+# The 'moonshine' group used by the suspend-inhibit polkit rule
+# (dist/50-moonshine-inhibit-sleep.rules) is defined by the shipped sysusers.d
+# drop-in (dist/moonshine-sysusers.conf -> /usr/lib/sysusers.d/moonshine.conf).
+# Running systemd-sysusers applies that drop-in so the group exists immediately
+# instead of only after the next boot.
+systemd-sysusers 2>/dev/null || true
+
 # Load the virtual input modules now so no reboot is required
 # (dist/moonshine-modules.conf takes care of subsequent boots).
 modprobe uinput || true

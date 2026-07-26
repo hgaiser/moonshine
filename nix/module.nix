@@ -131,6 +131,16 @@ in
     # gamepad/keyboard/mouse.
     services.udev.packages = [ cfg.package ];
 
+    # Group that opt-in users join so the suspend-inhibit polkit rule
+    # (shipped in the package) lets Moonshine hold a block-type sleep
+    # inhibitor. See TIPS.md.
+    users.groups.moonshine = { };
+
+    # Allow the 'moonshine' group to acquire a block-type sleep inhibitor.
+    security.polkit.extraPolicies = [
+      "${cfg.package}/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules"
+    ];
+
     # Virtual input backends used by inputtino (upstream ships this as a
     # modules-load.d drop-in).
     boot.kernelModules = [
