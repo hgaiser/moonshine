@@ -171,6 +171,16 @@ include_terminal = false
 resolve_icons = true
 ```
 
+**Lutris scanner** — finds all installed Lutris games:
+
+```toml
+[[application_scanner]]
+type = "lutris"
+command = ["/usr/bin/lutris", "lutris:rungame/{slug}"]
+```
+
+Games are matched by their Lutris slug. Box art is automatically loaded from Lutris's `coverart/` directory when available. The default database path is `~/.local/share/lutris/pga.db`. You can override it with the `pga_db` option to point at a custom database location.
+
 ## FAQ
 
 1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**
