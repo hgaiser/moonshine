@@ -501,7 +501,16 @@ impl Webserver {
 			},
 		};
 
-		let asset = match image::open(&boxart_path) {
+		let image_bytes = match std::fs::read(&boxart_path) {
+			Ok(bytes) => bytes,
+			Err(e) => {
+				let message = format!("Failed to read boxart at '{}': {e}", boxart_path.display());
+				tracing::warn!("{message}");
+				return bad_request(message);
+			},
+		};
+
+		let asset = match image::load_from_memory(&image_bytes) {
 			Ok(asset) => asset,
 			Err(e) => {
 				let message = format!("Failed to load boxart at '{}': {e}", boxart_path.display());
