@@ -1,4 +1,4 @@
-[![CI](https://github.com/hgaiser/moonshine/workflows/Test/badge.svg)](https://github.com/hgaiser/moonshine/actions)
+[![CI](https://github.com/hgaiser/moonshine/actions/workflows/ci.yaml/badge.svg)](https://github.com/hgaiser/moonshine/actions)
 
 # Moonshine 🌙
 
