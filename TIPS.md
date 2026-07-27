@@ -9,6 +9,7 @@ See the [Configuration](../README.md#configuration) section of the README for th
 - [Close a desktop Steam before streaming Steam](#close-a-desktop-steam-before-streaming-steam)
 - [Prevent the host from suspending while streaming](#prevent-the-host-from-suspending-while-streaming)
 - [Run games in high-performance mode](#run-games-in-high-performance-mode)
+- [Run Flatpak Steam inside Moonshine's compositor](#run-flatpak-steam-inside-moonshines-compositor)
 
 ## Close a desktop Steam before streaming Steam
 
@@ -84,3 +85,41 @@ command = ["gamemoderun", "/usr/bin/steam", "-bigpicture", "steam://rungameid/{g
 GameMode consists of a daemon (`gamemoded`) and a client library; `gamemoderun` asks the daemon to enable optimizations for the process it launches.
 The daemon is normally started automatically via D-Bus the first time a game requests it, so no manual step is needed beyond installing the package — you can verify it with `gamemoded -t`.
 If the daemon is not installed or not running, `gamemoderun` simply launches the game without applying any optimizations.
+
+## Run Flatpak Steam inside Moonshine's compositor
+
+### How to
+
+Wrap the `command` with `dbus-run-session`:
+
+```toml
+[[application]]
+title = "Steam Flatpak"
+command = [
+	"dbus-run-session", "--",
+	"flatpak", "run",
+	"com.valvesoftware.Steam",
+	"steam://open/bigpicture",
+]
+```
+
+For games launched through Steam's application scanner:
+
+```toml
+[[application_scanner]]
+type = "steam"
+library = "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
+command = [
+	"dbus-run-session", "--",
+	"flatpak", "run",
+	"com.valvesoftware.Steam",
+	"steam://rungameid/{game_id}",
+]
+```
+
+### Details
+
+The root cause is in how Flatpak's portal infrastructure interacts with the desktop environment.
+Flatpak uses the host's D-Bus session bus to communicate with portal backends. When setting up the sandbox, the portal backend tells Flatpak to expose the **host's** Wayland and display sockets, overriding the `WAYLAND_DISPLAY` and `DISPLAY` environment variables that Moonshine sets. This causes Steam to render on the host's physical desktop instead of inside Moonshine's headless compositor.
+
+`dbus-run-session` spawns a fresh D-Bus daemon without the host's portal backend registered, so Flatpak cannot discover the host compositor through the portal and falls back to the environment variables inherited from Moonshine's systemd unit. Because the portal backend is responsible for both Wayland and audio setup, the `PULSE_SERVER` env var is also honored correctly without needing `--env=` overrides.
