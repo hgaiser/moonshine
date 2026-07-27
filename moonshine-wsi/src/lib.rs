@@ -20,12 +20,12 @@
 //!
 //! # Architecture
 //!
-//! - [`instance`] — per-VkInstance state, Wayland connection setup.
-//! - [`device`]   — per-VkDevice state, extension injection.
-//! - [`surface`]  — per-VkSurfaceKHR state, XWayland bypass.
-//! - [`swapchain`]— per-VkSwapchainKHR state, swapchain feedback protocol.
-//! - [`dispatch`] — raw Vulkan loader dispatch table types and helpers.
-//! - [`state`]    — global maps keyed by Vulkan handle.
+//! - `instance` — per-VkInstance state, Wayland connection setup.
+//! - `device`   — per-VkDevice state, extension injection.
+//! - `surface`  — per-VkSurfaceKHR state, XWayland bypass.
+//! - `swapchain`— per-VkSwapchainKHR state, swapchain feedback protocol.
+//! - `dispatch` — raw Vulkan loader dispatch table types and helpers.
+//! - `state`    — global maps keyed by Vulkan handle.
 
 #![allow(non_upper_case_globals)]
 #![allow(clippy::missing_transmute_annotations)]

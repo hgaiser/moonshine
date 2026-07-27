@@ -394,10 +394,7 @@ pub(crate) unsafe fn xcb_get_largest_obscuring_child(
 		Some((std::mem::transmute(qt), std::mem::transmute(qtr)))
 	});
 
-	let (query_tree, query_tree_reply) = match fns_opt {
-		Some(fns) => *fns,
-		None => return None,
-	};
+	let (query_tree, query_tree_reply) = (*fns_opt)?;
 
 	if connection.is_null() {
 		return None;
