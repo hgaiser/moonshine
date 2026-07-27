@@ -1,6 +1,7 @@
 use std::ffi::CStr;
 use std::io::Write;
 use std::os::linux::fs::MetadataExt;
+use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -165,6 +166,7 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 	check_xwayland(&mut report);
 	check_dbus(&mut report);
 	check_xdg_runtime(&mut report);
+	check_inhibit(&mut report);
 
 	// --- Ports (requires config) ---
 
@@ -662,6 +664,69 @@ fn check_xdg_runtime(report: &mut HealthReport) {
 			);
 		},
 	}
+}
+
+fn check_inhibit(report: &mut HealthReport) {
+	let start = Instant::now();
+
+	let conn = match zbus::blocking::Connection::system() {
+		Ok(conn) => conn,
+		Err(e) => {
+			report.add_warn(
+				"Sleep inhibit",
+				format!("  Cannot connect to system D-Bus: {e}\n  systemd-logind may not be running."),
+				start.elapsed().as_millis() as u64,
+			);
+			return;
+		},
+	};
+
+	let msg = match conn.call_method(
+		Some("org.freedesktop.login1"),
+		"/org/freedesktop/login1",
+		Some("org.freedesktop.login1.Manager"),
+		"Inhibit",
+		&("sleep", "Moonshine", "healthcheck", "block"),
+	) {
+		Ok(msg) => msg,
+		Err(e) => {
+			report.add_warn(
+				"Sleep inhibit",
+				format!("  Cannot acquire sleep inhibit: {e}\n  Add your user to the 'moonshine' group: `sudo usermod -aG moonshine $USER`\n  Then log out and back in."),
+				start.elapsed().as_millis() as u64,
+			);
+			return;
+		},
+	};
+
+	let raw = match msg.data().fds().first().map(|fd| fd.as_raw_fd()) {
+		Some(fd) => fd,
+		None => {
+			report.add_warn(
+				"Sleep inhibit",
+				"  logind returned no file descriptor in inhibit response.".into(),
+				start.elapsed().as_millis() as u64,
+			);
+			return;
+		},
+	};
+
+	let duped = unsafe { libc::dup(raw) };
+	if duped < 0 {
+		report.add_warn(
+			"Sleep inhibit",
+			"  Failed to duplicate inhibit file descriptor.".into(),
+			start.elapsed().as_millis() as u64,
+		);
+		return;
+	}
+	let _fd = unsafe { OwnedFd::from_raw_fd(duped) };
+
+	report.add_passed(
+		"Sleep inhibit",
+		"Can acquire logind sleep inhibit (user in moonshine group, polkit rules ok)".into(),
+		start.elapsed().as_millis() as u64,
+	);
 }
 
 // ---------------------------------------------------------------------------

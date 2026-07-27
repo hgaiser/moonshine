@@ -1,4 +1,4 @@
-use std::io::IsTerminal;
+use is_terminal::IsTerminal;
 use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
@@ -107,18 +107,25 @@ fn log_health_report(report: &HealthReport) {
 }
 
 fn print_health_report(report: &HealthReport) {
+	let tty = std::io::stdout().is_terminal();
+	let (red, green, yellow, reset) = if tty {
+		("\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[m")
+	} else {
+		("", "", "", "")
+	};
+
 	iter_checks(report, |outcome, name, msg| match outcome {
 		CheckOutcome::Passed => {
-			println!("  OK    {:>15}  {msg}", name);
+			println!("  {green}OK{reset}    {:>15}  {msg}", name);
 		},
 		CheckOutcome::Failed => {
-			println!("  FAIL  {:>15}", name);
+			println!("  {red}FAIL{reset}  {:>15}", name);
 			for line in msg.lines() {
 				println!("        {line}");
 			}
 		},
 		CheckOutcome::Warning => {
-			println!("  WARN  {:>15}", name);
+			println!("  {yellow}WARN{reset}  {:>15}", name);
 			for line in msg.lines() {
 				println!("        {line}");
 			}
@@ -130,16 +137,19 @@ fn print_health_report(report: &HealthReport) {
 	if passed {
 		if warn > 0 {
 			println!(
-				"Health checks passed in {}ms ({} warnings).",
+				"{green}Health checks passed{reset} in {}ms ({} warnings).",
 				report.duration.as_millis(),
 				warn
 			);
 		} else {
-			println!("All health checks passed in {}ms.", report.duration.as_millis());
+			println!(
+				"{green}All health checks passed{reset} in {}ms.",
+				report.duration.as_millis()
+			);
 		}
 	} else {
 		println!(
-			"Health checks FAILED in {}ms ({} errors, {} warnings).",
+			"{red}Health checks FAILED{reset} in {}ms ({} errors, {} warnings).",
 			report.duration.as_millis(),
 			fatal,
 			warn,
