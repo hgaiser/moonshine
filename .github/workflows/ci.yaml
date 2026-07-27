@@ -23,21 +23,21 @@ jobs:
       matrix:
         include:
           - name: Check
-            run: cargo check --all-features
+            run: cargo check --workspace --all-features
             deps: true
           - name: Test Suite
-            run: cargo test --all-features
+            run: cargo test --workspace --all-features
             deps: true
           - name: Clippy
             components: clippy
-            run: cargo clippy --all-features -- -D warnings
+            run: cargo clippy --workspace --all-features -- -D warnings
             deps: true
           - name: Rustfmt
             components: rustfmt
             run: cargo fmt --all -- --check
             deps: false
           - name: Documentation
-            run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features
+            run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
             deps: true
           - name: Cargo Machete
             run: cargo install cargo-machete && cargo machete
