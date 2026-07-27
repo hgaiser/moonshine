@@ -246,6 +246,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		},
 		"127.0.0.1".to_string(),
 		60,
+		false,
 		shutdown.clone(),
 	)
 	.map_err(|_| "Failed to create session manager")?;
