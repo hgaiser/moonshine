@@ -59,7 +59,8 @@ jobs:
         mkdir -p "$STAGE/bin" "$STAGE/lib/moonshine/vulkan-layers" "$STAGE/share/moonshine"
         cp ./target/release/moonshine "$STAGE/bin/"
         cp ./target/release/libmoonshine_wsi.so "$STAGE/lib/moonshine/vulkan-layers/"
-        cp ./dist/start-moonshine.sh ./dist/60-moonshine.rules ./dist/moonshine-modules.conf \
+        cp ./dist/start-moonshine.sh ./dist/60-moonshine.rules ./dist/50-moonshine-inhibit-sleep.rules \
+           ./dist/moonshine-modules.conf ./dist/moonshine-sysusers.conf \
            ./dist/moonshine@.service ./dist/VkLayer_moonshine_wsi.json "$STAGE/share/moonshine/"
         cp README.md LICENSE "$STAGE/"
         tar --zstd -cf "./moonshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst" \
