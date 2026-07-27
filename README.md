@@ -28,7 +28,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 The recommended method is to install through the AUR using:
 
 ```
-yay -S moonshine
+yay -S moonshine-bin
 ```
 
 After installing, follow the distro-agnostic [Enable the service](#enable-the-service) steps below.
