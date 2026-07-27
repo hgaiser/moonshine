@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
+use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use serde::{Deserialize, Serialize};
 use tokio::{
 	net::UdpSocket,
@@ -185,7 +186,12 @@ pub(crate) struct VideoStreamHandle {
 impl VideoStreamHandle {
 	/// Signal the video pipeline and packet handler to begin processing.
 	pub fn trigger(&self) {
-		self.notify.notify_waiters();
+		// Call notify_one() twice instead of notify_waiters() because
+		// Notify only wakes tasks already .awaiting; notify_waiters()
+		// is a no-op if no task is waiting yet.  notify_one() stores
+		// a permit so the next notified().await completes immediately.
+		self.notify.notify_one();
+		self.notify.notify_one();
 	}
 
 	/// Request an IDR (key) frame from the encoder.
@@ -267,6 +273,16 @@ impl VideoStream {
 			let _ = socket.set_tos_v4(160);
 		}
 
+		// Initialize quinn-udp state for GSO support.
+		let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
+			.map_err(|e| tracing::error!("Failed to initialize UDP socket state: {e}"))?;
+		let gso_enabled = udp_state.max_gso_segments() > 1;
+		if gso_enabled {
+			tracing::info!("GSO enabled, max segments: {}", udp_state.max_gso_segments());
+		} else {
+			tracing::info!("GSO not available, using per-shard sends");
+		}
+
 		// Gate for pipeline + packet handler.
 		let start_notify = Arc::new(Notify::new());
 
@@ -280,7 +296,7 @@ impl VideoStream {
 		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
 
 		// Spawn packet handler — gated behind start_notify.
-		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone());
+		spawn_handle_video_packets(packet_rx, socket, udp_state, start_notify.clone(), stop.clone());
 
 		// Spawn pipeline thread — gated behind start_notify.
 		VideoPipeline::new(
@@ -309,6 +325,7 @@ impl VideoStream {
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<ShardBatch>,
 	socket: UdpSocket,
+	udp_state: UdpSocketState,
 	start: Arc<Notify>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -327,11 +344,37 @@ fn spawn_handle_video_packets(
 				batch = packet_rx.recv() => {
 					match batch {
 						Some(batch) => {
-							if let Some(client_address) = client_address {
-								for shard in batch.shards() {
-									if let Err(e) = socket.send_to(shard, client_address).await {
-										tracing::warn!("Failed to send packet to client: {e}");
+							if let Some(addr) = client_address {
+								if batch.shard_count() == 0 {
+									continue;
+								}
+
+								// Try GSO first if available (check dynamically —
+								// quinn-udp may disable GSO after a send failure).
+								let use_gso = udp_state.max_gso_segments() > 1;
+								if use_gso {
+									let transmit = Transmit {
+										destination: addr,
+										ecn: None,
+										contents: batch.as_bytes(),
+										segment_size: Some(batch.shard_size()),
+										src_ip: None,
+									};
+									match udp_state.send(UdpSockRef::from(&socket), &transmit) {
+										Ok(()) => {}
+										Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+											socket.writable().await.ok();
+											if udp_state.send(UdpSockRef::from(&socket), &transmit).is_err() {
+												send_shards(&socket, &batch, addr).await;
+											}
+										}
+										Err(e) => {
+											tracing::debug!("GSO send failed ({e}), falling back to per-shard");
+											send_shards(&socket, &batch, addr).await;
+										}
 									}
+								} else {
+									send_shards(&socket, &batch, addr).await;
 								}
 							}
 						},
@@ -363,4 +406,13 @@ fn spawn_handle_video_packets(
 
 		tracing::debug!("Video packet stream stopped.");
 	});
+}
+
+/// Send all shards in a batch as individual UDP packets.
+async fn send_shards(socket: &UdpSocket, batch: &ShardBatch, addr: std::net::SocketAddr) {
+	for shard in batch.shards() {
+		if let Err(e) = socket.send_to(shard, addr).await {
+			tracing::warn!("Failed to send packet to client: {e}");
+		}
+	}
 }

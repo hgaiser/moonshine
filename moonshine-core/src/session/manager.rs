@@ -207,10 +207,16 @@ impl SessionManager {
 	pub async fn trigger_streams_start(&self) {
 		let inner = self.inner.lock().await;
 		if let Some(notify) = inner.video_start_notify.as_ref() {
-			notify.notify_waiters();
+			// Call notify_one() twice instead of notify_waiters() because
+			// Notify only wakes tasks already .awaiting; notify_waiters()
+			// is a no-op if no task is waiting yet.  notify_one() stores
+			// a permit so the next notified().await completes immediately.
+			notify.notify_one();
+			notify.notify_one();
 		}
 		if let Some(notify) = inner.audio_start_notify.as_ref() {
-			notify.notify_waiters();
+			notify.notify_one();
+			notify.notify_one();
 		}
 	}
 
