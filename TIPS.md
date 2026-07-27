@@ -22,7 +22,7 @@ Add a `pre_command` that shuts down any running desktop Steam before the stream 
 title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
 pre_command = [
-    ["/usr/bin/bash", "-c", "/usr/bin/steam -shutdown >/dev/null 2>&1 || true; for i in $(seq 1 30); do pgrep -x steam >/dev/null 2>&1 || exit 0; sleep 1; done"],
+    ["/usr/bin/bash", "-c", "if pgrep -x steam >/dev/null; then steam -shutdown &>/dev/null; for i in $(seq 1 30); do ! pgrep -x steam >/dev/null && break; sleep 1; done; fi"],
 ]
 ```
 
