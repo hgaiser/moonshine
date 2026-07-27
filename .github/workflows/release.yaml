@@ -30,7 +30,7 @@ jobs:
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
         echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v7
       with:
         ref: ${{ github.event.inputs.tag || github.ref }}
 
