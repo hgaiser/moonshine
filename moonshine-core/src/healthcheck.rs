@@ -145,7 +145,6 @@ fn iter_checks(report: &HealthReport, mut f: impl FnMut(CheckOutcome, &str, &str
 	}
 }
 
-
 /// Run the health check and log the results to the console.
 pub fn print_health_report(report: &HealthReport) {
 	let tty = std::io::stdout().is_terminal();
@@ -276,6 +275,7 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 	check_xwayland(&mut report);
 	check_xdg_runtime(&mut report);
 	check_inhibit(&mut report);
+	check_kcmp(&mut report);
 
 	// --- Ports (requires config) ---
 
@@ -817,6 +817,62 @@ fn check_inhibit(report: &mut HealthReport) {
 		"Can acquire logind sleep inhibit (user in moonshine group, polkit rules ok)".into(),
 		start.elapsed().as_millis() as u64,
 	);
+}
+
+fn check_kcmp(report: &mut HealthReport) {
+	let start = Instant::now();
+
+	/// `KCMP_FILE` — not exposed by `libc` or glibc.
+	const KCMP_FILE: libc::c_int = 0;
+
+	// SAFETY: uses /dev/null fds; syscall with scalar arguments.
+	let result = unsafe {
+		let a = std::fs::File::open("/dev/null");
+		let b = std::fs::File::open("/dev/null");
+		match (a, b) {
+			(Ok(a), Ok(b)) => libc::syscall(
+				libc::SYS_kcmp,
+				libc::getpid(),
+				libc::getpid(),
+				KCMP_FILE,
+				a.as_raw_fd() as libc::c_ulong,
+				b.as_raw_fd() as libc::c_ulong,
+			),
+			(Err(e), _) | (_, Err(e)) => {
+				report.add_failed(
+					"kcmp(2)",
+					format!("  Cannot open /dev/null for kcmp(2) probe: {e}"),
+					start.elapsed().as_millis() as u64,
+				);
+				return;
+			},
+		}
+	};
+
+	if result < 0 {
+		let error = std::io::Error::last_os_error();
+		let hint = match error.raw_os_error() {
+			Some(libc::ENOSYS) => {
+				"  Kernel was compiled without CONFIG_CHECKPOINT_RESTORE.\n  \
+				kcmp(2) is required for DMA-BUF import cache validation.\n  \
+				Rebuild your kernel with CONFIG_CHECKPOINT_RESTORE=y."
+			},
+			Some(libc::EPERM) => {
+				"  kcmp(2) is blocked by a seccomp filter (e.g. Flatpak/container).\n  \
+				kcmp(2) is required for DMA-BUF import cache validation.\n  \
+				Run outside the sandbox or adjust the seccomp profile."
+			},
+			_ => "  kcmp(2) is required for DMA-BUF import cache validation.",
+		};
+		report.add_failed(
+			"kcmp(2)",
+			format!("  kcmp(2) not available: {error}\n{hint}"),
+			start.elapsed().as_millis() as u64,
+		);
+		return;
+	}
+
+	report.add_passed("kcmp(2)", "Available".into(), start.elapsed().as_millis() as u64);
 }
 
 // ---------------------------------------------------------------------------

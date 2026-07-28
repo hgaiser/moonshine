@@ -51,7 +51,10 @@ async fn main() -> Result<(), ()> {
 	init_tracing();
 
 	// Standalone healthcheck subcommand — run checks and exit.
-	if let Some(Command::Healthcheck { config: healthcheck_config }) = args.command {
+	if let Some(Command::Healthcheck {
+		config: healthcheck_config,
+	}) = args.command
+	{
 		let config = match healthcheck_config.as_ref().map(Config::read_from_file) {
 			Some(Ok(c)) => Some(c),
 			Some(Err(())) => {
@@ -152,7 +155,6 @@ async fn main() -> Result<(), ()> {
 	tracing::debug!("Successfully waited for shutdown to complete.");
 	std::process::exit(exit_code as i32);
 }
-
 
 fn init_tracing() {
 	tracing_subscriber::registry()
