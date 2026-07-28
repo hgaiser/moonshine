@@ -22,9 +22,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: Check
-            run: cargo check --workspace --all-features
-            deps: true
           - name: Test Suite
             run: cargo test --workspace --all-features
             deps: true
