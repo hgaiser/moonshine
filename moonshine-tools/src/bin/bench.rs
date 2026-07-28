@@ -847,5 +847,5 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 }
 
 fn boxed_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
-	Box::new(std::io::Error::new(std::io::ErrorKind::Other, message.into()))
+	Box::new(std::io::Error::other(message.into()))
 }
