@@ -10,6 +10,8 @@ use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 use self::input::gamepad::GamepadConfig;
 use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
+use crate::session::SessionContext;
+use crate::session::SessionKeysReceiver;
 use crate::session::compositor::{
 	frame::{HdrMetadata, HdrModeState},
 	input::CompositorInputEvent,
@@ -17,8 +19,6 @@ use crate::session::compositor::{
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::audio::AudioStartHandle;
 use crate::session::stream::video::VideoStreamHandle;
-use crate::session::SessionContext;
-use crate::session::SessionKeysReceiver;
 
 mod feedback;
 pub(crate) mod input;
@@ -132,13 +132,18 @@ impl<'a> ControlMessage<'a> {
 		match u16::from_le_bytes(buffer[..2].try_into().unwrap()).try_into()? {
 			ControlMessageType::Encrypted => {
 				if buffer.len() < MINIMUM_ENCRYPTED_LENGTH {
-					tracing::warn!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.", buffer.len());
+					tracing::warn!(
+						"Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got buffer of {} bytes.",
+						buffer.len()
+					);
 					return Err(());
 				}
 
 				let length = u16::from_le_bytes(buffer[2..4].try_into().unwrap());
 				if (length as usize) < MINIMUM_ENCRYPTED_LENGTH {
-					tracing::warn!("Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes.");
+					tracing::warn!(
+						"Expected encrypted control message of at least {MINIMUM_ENCRYPTED_LENGTH} bytes, got reported length of {length} bytes."
+					);
 					return Err(());
 				}
 
@@ -161,7 +166,10 @@ impl<'a> ControlMessage<'a> {
 				// Length of the input event, excluding the length itself.
 				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 				if length as usize != buffer.len() - 8 {
-					tracing::warn!("Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.", buffer.len() - 8);
+					tracing::warn!(
+						"Failed to interpret input event message: expected {length} bytes, but buffer has {} bytes left.",
+						buffer.len() - 8
+					);
 					return Err(());
 				}
 
@@ -393,14 +401,13 @@ fn send_to_peer(
 	payload: &[u8],
 	label: &str,
 ) {
-	if let Ok(packet) = encode_control(key, sequence_number, payload) {
-		if let Some(peer) = host.peer_mut(peer_id) {
-			if peer.state() == PeerState::Connected {
-				let _ = peer
-					.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
-					.map_err(|e| tracing::warn!("Failed to send {label} to peer: {e}"));
-			}
-		}
+	if let Ok(packet) = encode_control(key, sequence_number, payload)
+		&& let Some(peer) = host.peer_mut(peer_id)
+		&& peer.state() == PeerState::Connected
+	{
+		let _ = peer
+			.send(0, Packet::new(packet.as_slice(), PacketMode::ReliableSequenced))
+			.map_err(|e| tracing::warn!("Failed to send {label} to peer: {e}"));
 	}
 }
 
@@ -462,14 +469,14 @@ async fn run_control_loop(
 		}
 
 		// Check for feedback messages.
-		if let Ok(command) = feedback_rx.try_recv() {
-			if let Some(peer_id) = connected_peer {
-				tracing::debug!("Sending control feedback command: {command:?}");
-				let payload = command.as_packet();
-				let key = context.keys_rx.borrow().remote_input_key.clone();
-				send_to_peer(&mut host, peer_id, &key, sequence_number, &payload, "feedback");
-				sequence_number += 1;
-			}
+		if let Ok(command) = feedback_rx.try_recv()
+			&& let Some(peer_id) = connected_peer
+		{
+			tracing::debug!("Sending control feedback command: {command:?}");
+			let payload = command.as_packet();
+			let key = context.keys_rx.borrow().remote_input_key.clone();
+			send_to_peer(&mut host, peer_id, &key, sequence_number, &payload, "feedback");
+			sequence_number += 1;
 		}
 
 		match host
@@ -568,19 +575,20 @@ async fn run_control_loop(
 		}
 
 		// Check for HDR metadata updates from the video pipeline.
-		if context.hdr && hdr_metadata_rx.has_changed().unwrap_or(false) {
-			if let Some(peer_id) = connected_peer {
-				let state = hdr_metadata_rx.borrow_and_update().clone();
-				let key = context.keys_rx.borrow().remote_input_key.clone();
-				send_hdr_state(
-					&mut host,
-					peer_id,
-					&state,
-					&key,
-					&mut sequence_number,
-					"metadata update",
-				);
-			}
+		if context.hdr
+			&& hdr_metadata_rx.has_changed().unwrap_or(false)
+			&& let Some(peer_id) = connected_peer
+		{
+			let state = hdr_metadata_rx.borrow_and_update().clone();
+			let key = context.keys_rx.borrow().remote_input_key.clone();
+			send_hdr_state(
+				&mut host,
+				peer_id,
+				&state,
+				&key,
+				&mut sequence_number,
+				"metadata update",
+			);
 		}
 	}
 

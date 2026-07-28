@@ -178,13 +178,12 @@ impl DmaBufImporter {
 		let params = ImportParams::new(width, height, format, planes);
 
 		let now = Instant::now();
-		if let Some(cached) = self.cache.get_mut(&fd) {
-			// Parameters catch reconfigurations (e.g. HDR format switch); the
-			// identity check catches recycled fd numbers.
-			if cached.params == params && cached.is_same_buffer(fd) {
-				cached.last_used = now;
-				return Ok((cached.image, false));
-			}
+		if let Some(cached) = self.cache.get_mut(&fd)
+			&& cached.params == params
+			&& cached.is_same_buffer(fd)
+		{
+			cached.last_used = now;
+			return Ok((cached.image, false));
 		}
 
 		// Cache miss: the fd now points to a different buffer or it was

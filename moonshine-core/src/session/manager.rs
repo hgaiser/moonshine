@@ -1,14 +1,9 @@
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{Mutex, broadcast, watch};
 
-use crate::session::compositor::CompositorConfig;
-use crate::session::stream::audio::AudioStreamConfig;
-use crate::session::stream::audio::AudioStreamContext;
-use crate::session::stream::control::ControlStreamConfig;
-use crate::session::stream::video::VideoStreamConfig;
-use crate::session::stream::video::VideoStreamContext;
+use crate::ShutdownReason;
 use crate::session::FrameStats;
 use crate::session::InitializedSession;
 use crate::session::SessionContext;
@@ -16,7 +11,12 @@ use crate::session::SessionKeyData;
 use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
 use crate::session::SessionState;
-use crate::ShutdownReason;
+use crate::session::compositor::CompositorConfig;
+use crate::session::stream::audio::AudioStreamConfig;
+use crate::session::stream::audio::AudioStreamContext;
+use crate::session::stream::control::ControlStreamConfig;
+use crate::session::stream::video::VideoStreamConfig;
+use crate::session::stream::video::VideoStreamContext;
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 

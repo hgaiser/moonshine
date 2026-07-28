@@ -3,9 +3,9 @@ use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
 use strum_macros::FromRepr;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
 use self::gamepad::Gamepad;
 use self::gamepad::GamepadConfig;
@@ -302,11 +302,11 @@ impl GamepadSlot {
 	}
 
 	fn check_rumble(&mut self, now: Instant) {
-		if let Some(off_at) = self.home_rumble_off_at {
-			if now >= off_at {
-				self.send_rumble(0, 0);
-				self.home_rumble_off_at = None;
-			}
+		if let Some(off_at) = self.home_rumble_off_at
+			&& now >= off_at
+		{
+			self.send_rumble(0, 0);
+			self.home_rumble_off_at = None;
 		}
 	}
 
@@ -368,14 +368,13 @@ async fn run_gamepad_handler(
 					gamepads[idx].is_none()
 				};
 
-				if needs_create {
-					if let Ok(new_slot) =
+				if needs_create
+					&& let Ok(new_slot) =
 						GamepadSlot::new(&gamepad, feedback_tx, &gamepad_config, timer_wake.clone()).await
-					{
-						let mut gamepads = gamepads.lock().await;
-						gamepads[idx] = Some(new_slot);
-						tracing::info!("Gamepad {} connected.", gamepad.index);
-					}
+				{
+					let mut gamepads = gamepads.lock().await;
+					gamepads[idx] = Some(new_slot);
+					tracing::info!("Gamepad {} connected.", gamepad.index);
 				}
 			},
 			InputEvent::GamepadTouch(gamepad_touch) => {

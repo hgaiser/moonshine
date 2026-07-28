@@ -28,8 +28,8 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::utils::Transform;
 
-use crate::session::manager::SessionShutdownReason;
 use crate::session::SessionContext;
+use crate::session::manager::SessionShutdownReason;
 
 use self::frame::ExportedFrame;
 use self::input::CompositorInputEvent;

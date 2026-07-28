@@ -2,17 +2,17 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock;
 
+use aes::Aes128;
 use aes::cipher::Array;
 use aes::cipher::BlockCipherDecrypt;
 use aes::cipher::BlockCipherEncrypt;
 use aes::cipher::KeyInit;
-use aes::Aes128;
 use aws_lc_rs::rand::SecureRandom;
 use aws_lc_rs::rand::SystemRandom;
 use aws_lc_rs::signature::KeyPair;
-use aws_lc_rs::signature::RsaKeyPair;
 use aws_lc_rs::signature::RSA_PKCS1_2048_8192_SHA256;
 use aws_lc_rs::signature::RSA_PKCS1_SHA256;
+use aws_lc_rs::signature::RsaKeyPair;
 use sha2::Digest;
 use sha2::Sha256;
 use tokio::sync::Notify;
@@ -276,7 +276,7 @@ fn verify_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> 
 	let server_challenge = match client.server_challenge {
 		Some(server_challenge) => server_challenge,
 		None => {
-			return Err("Client does not have a server challenge, possibly incorrect pairing procedure?".to_string())
+			return Err("Client does not have a server challenge, possibly incorrect pairing procedure?".to_string());
 		},
 	};
 

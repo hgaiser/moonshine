@@ -76,11 +76,7 @@ pub fn frame_limiter_override() -> u32 {
 			.and_then(|path| {
 				let c_path = std::ffi::CString::new(path.as_encoded_bytes()).ok()?;
 				let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY) };
-				if fd < 0 {
-					None
-				} else {
-					Some(fd)
-				}
+				if fd < 0 { None } else { Some(fd) }
 			})
 			.unwrap_or(-1)
 	});

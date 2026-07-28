@@ -9,7 +9,7 @@ use smithay::desktop::WindowSurfaceType;
 use smithay::input::keyboard::{FilterResult, Keycode};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
-use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraint};
+use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
 
 use crate::session::compositor::state::MoonshineCompositor;
 
@@ -257,17 +257,17 @@ fn clamp_cursor(state: &mut MoonshineCompositor) {
 
 	// Expand bounds to include the override window's geometry if active.
 	// This allows the cursor to move within the dropdown area.
-	if let Some(ref override_win) = state.override_window {
-		if let Some(geo) = state.space.element_geometry(override_win) {
-			let override_min_x = geo.loc.x as f64;
-			let override_min_y = geo.loc.y as f64;
-			let override_max_x = (geo.loc.x + geo.size.w - 1) as f64;
-			let override_max_y = (geo.loc.y + geo.size.h - 1) as f64;
-			min_x = min_x.min(override_min_x);
-			min_y = min_y.min(override_min_y);
-			max_x = max_x.max(override_max_x);
-			max_y = max_y.max(override_max_y);
-		}
+	if let Some(ref override_win) = state.override_window
+		&& let Some(geo) = state.space.element_geometry(override_win)
+	{
+		let override_min_x = geo.loc.x as f64;
+		let override_min_y = geo.loc.y as f64;
+		let override_max_x = (geo.loc.x + geo.size.w - 1) as f64;
+		let override_max_y = (geo.loc.y + geo.size.h - 1) as f64;
+		min_x = min_x.min(override_min_x);
+		min_y = min_y.min(override_min_y);
+		max_x = max_x.max(override_max_x);
+		max_y = max_y.max(override_max_y);
 	}
 
 	state.cursor_position.x = state.cursor_position.x.clamp(min_x, max_x);
@@ -295,15 +295,15 @@ fn find_surface_under(
 	// override_surface is active the renderer replaces the entire space
 	// with the bypass surface, so dropdown windows are not rendered —
 	// routing to them would make invisible windows intercept clicks.
-	if state.override_window.is_some() && !state.is_override_active() {
-		if let Some(ref override_win) = state.override_window {
-			let override_loc = state.space.element_geometry(override_win)?.loc;
-			let pos_within_override = state.cursor_position - override_loc.to_f64();
-			if let Some((surface, surface_offset)) =
-				override_win.surface_under(pos_within_override, WindowSurfaceType::ALL)
-			{
-				return Some((surface, surface_offset.to_f64() + override_loc.to_f64()));
-			}
+	if state.override_window.is_some()
+		&& !state.is_override_active()
+		&& let Some(ref override_win) = state.override_window
+	{
+		let override_loc = state.space.element_geometry(override_win)?.loc;
+		let pos_within_override = state.cursor_position - override_loc.to_f64();
+		if let Some((surface, surface_offset)) = override_win.surface_under(pos_within_override, WindowSurfaceType::ALL)
+		{
+			return Some((surface, surface_offset.to_f64() + override_loc.to_f64()));
 		}
 	}
 
@@ -312,24 +312,24 @@ fn find_surface_under(
 		if let Some(wid) = state.focused_x11_window {
 			// XWayland path: find the focused X11 window and route events there.
 			for window in state.space.elements() {
-				if let Some(x11) = window.x11_surface() {
-					if x11.window_id() == wid {
-						let window_loc = state.space.element_geometry(window)?.loc;
-						let pos_within_window = state.cursor_position - window_loc.to_f64();
-						// Try finding a sub-surface under the cursor first.
-						if let Some((surface, surface_offset)) =
-							window.surface_under(pos_within_window, WindowSurfaceType::ALL)
-						{
-							return Some((surface, surface_offset.to_f64() + window_loc.to_f64()));
-						}
-						// If the X11 window has no buffer (ICD renders to the
-						// bypass surface), use the toplevel wl_surface directly
-						// so pointer events still reach XWayland.
-						if let Some(wl_surface) = x11.wl_surface() {
-							return Some((wl_surface, window_loc.to_f64()));
-						}
-						return None;
+				if let Some(x11) = window.x11_surface()
+					&& x11.window_id() == wid
+				{
+					let window_loc = state.space.element_geometry(window)?.loc;
+					let pos_within_window = state.cursor_position - window_loc.to_f64();
+					// Try finding a sub-surface under the cursor first.
+					if let Some((surface, surface_offset)) =
+						window.surface_under(pos_within_window, WindowSurfaceType::ALL)
+					{
+						return Some((surface, surface_offset.to_f64() + window_loc.to_f64()));
 					}
+					// If the X11 window has no buffer (ICD renders to the
+					// bypass surface), use the toplevel wl_surface directly
+					// so pointer events still reach XWayland.
+					if let Some(wl_surface) = x11.wl_surface() {
+						return Some((wl_surface, window_loc.to_f64()));
+					}
+					return None;
 				}
 			}
 			return None;

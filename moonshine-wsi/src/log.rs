@@ -85,11 +85,11 @@ pub fn write_log(message: &str) {
 		format!("{h:02}:{m:02}:{s:02}.{ms:03}")
 	};
 	let line = format!("{ts} {message}");
-	if let Some(file_mutex) = log_file() {
-		if let Ok(mut file) = file_mutex.lock() {
-			let _ = writeln!(file, "{}", line);
-			return;
-		}
+	if let Some(file_mutex) = log_file()
+		&& let Ok(mut file) = file_mutex.lock()
+	{
+		let _ = writeln!(file, "{}", line);
+		return;
 	}
 	eprintln!("{}", line);
 }

@@ -7,8 +7,8 @@ use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
 use crate::session::stream::control::{
-	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
 	FeedbackCommand,
+	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
 };
 
 /// Configuration for the hold-to-Home gamepad button remap.

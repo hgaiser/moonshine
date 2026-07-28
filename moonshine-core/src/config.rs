@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+pub use crate::app_scanner::ApplicationScannerConfig;
 pub use crate::app_scanner::lutris::LutrisApplicationScannerConfig;
 pub use crate::app_scanner::steam::SteamApplicationScannerConfig;
-pub use crate::app_scanner::ApplicationScannerConfig;
 pub use crate::session::application::ApplicationConfig;
 use crate::session::compositor::CompositorConfig;
-pub use crate::session::stream::control::input::gamepad::GamepadConfig;
 use crate::session::stream::StreamConfig;
+pub use crate::session::stream::control::input::gamepad::GamepadConfig;
 use crate::webserver::WebserverConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

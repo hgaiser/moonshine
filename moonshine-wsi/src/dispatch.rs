@@ -42,8 +42,10 @@ pub type PFN_vkGetDeviceProcAddr = unsafe extern "C" fn(VkDevice, *const std::ff
 /// # Safety
 /// Each non-null pointer in `exts` must point to a valid null-terminated C string.
 pub unsafe fn has_extension(exts: &[*const std::ffi::c_char], name: &std::ffi::CStr) -> bool {
-	exts.iter()
-		.any(|&p| !p.is_null() && std::ffi::CStr::from_ptr(p) == name)
+	unsafe {
+		exts.iter()
+			.any(|&p| !p.is_null() && std::ffi::CStr::from_ptr(p) == name)
+	}
 }
 
 /// `XlibSurfaceCreateInfoKHR` is not in ash on all platforms; we declare a
@@ -238,21 +240,23 @@ unsafe fn dispatch_key_raw<T>(handle: T) -> usize
 where
 	T: ash::vk::Handle,
 {
-	let raw = handle.as_raw();
-	// The first pointer-sized word at the raw address is the dispatch table ptr.
-	*(raw as *const usize)
+	unsafe {
+		let raw = handle.as_raw();
+		// The first pointer-sized word at the raw address is the dispatch table ptr.
+		*(raw as *const usize)
+	}
 }
 
 use crate::state::{DeviceKey, InstanceKey};
 
 /// Extract the instance-level dispatch key from a VkInstance or VkPhysicalDevice.
 pub unsafe fn instance_key_of<T: ash::vk::Handle>(handle: T) -> InstanceKey {
-	InstanceKey(dispatch_key_raw(handle))
+	unsafe { InstanceKey(dispatch_key_raw(handle)) }
 }
 
 /// Extract the device-level dispatch key from a VkDevice or VkQueue.
 pub unsafe fn device_key_of<T: ash::vk::Handle>(handle: T) -> DeviceKey {
-	DeviceKey(dispatch_key_raw(handle))
+	unsafe { DeviceKey(dispatch_key_raw(handle)) }
 }
 
 /// Walk the `pNext` chain of a create-info struct looking for a
@@ -266,22 +270,24 @@ pub unsafe fn device_key_of<T: ash::vk::Handle>(handle: T) -> DeviceKey {
 /// `p_next` must be the `pNext` chain of a valid `VkInstanceCreateInfo` or
 /// `VkDeviceCreateInfo`.
 pub unsafe fn find_layer_link<T>(p_next: *const std::ffi::c_void, s_type: StructureType) -> *mut T {
-	let mut cursor = p_next;
-	while !cursor.is_null() {
-		let header = &*(cursor as *const VkBaseInStructure);
-		if header.s_type == s_type {
-			// Check if this is a VK_LAYER_LINK_INFO entry.
-			// The `function` field is at the same offset in both
-			// VkLayerInstanceCreateInfo and VkLayerDeviceCreateInfo.
-			let function_ptr = (cursor as *const u8).add(std::mem::offset_of!(VkLayerInstanceCreateInfo, function))
-				as *const VkLayerFunction;
-			if *function_ptr == VkLayerFunction::LinkInfo {
-				return cursor as *mut T;
+	unsafe {
+		let mut cursor = p_next;
+		while !cursor.is_null() {
+			let header = &*(cursor as *const VkBaseInStructure);
+			if header.s_type == s_type {
+				// Check if this is a VK_LAYER_LINK_INFO entry.
+				// The `function` field is at the same offset in both
+				// VkLayerInstanceCreateInfo and VkLayerDeviceCreateInfo.
+				let function_ptr = (cursor as *const u8).add(std::mem::offset_of!(VkLayerInstanceCreateInfo, function))
+					as *const VkLayerFunction;
+				if *function_ptr == VkLayerFunction::LinkInfo {
+					return cursor as *mut T;
+				}
 			}
+			cursor = header.p_next;
 		}
-		cursor = header.p_next;
+		std::ptr::null_mut()
 	}
-	std::ptr::null_mut()
 }
 
 /// Minimal header shared by all Vulkan structs (for chain walking).
@@ -298,15 +304,17 @@ pub struct VkBaseInStructure {
 /// `p_next` must be a valid Vulkan pNext chain (or null).  The returned
 /// pointer is only valid as long as the chain it was found in.
 pub unsafe fn find_in_chain<T>(p_next: *const std::ffi::c_void, s_type: StructureType) -> Option<*const T> {
-	let mut cursor = p_next;
-	while !cursor.is_null() {
-		let header = &*(cursor as *const VkBaseInStructure);
-		if header.s_type == s_type {
-			return Some(cursor as *const T);
+	unsafe {
+		let mut cursor = p_next;
+		while !cursor.is_null() {
+			let header = &*(cursor as *const VkBaseInStructure);
+			if header.s_type == s_type {
+				return Some(cursor as *const T);
+			}
+			cursor = header.p_next;
 		}
-		cursor = header.p_next;
+		None
 	}
-	None
 }
 
 /// `VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO` (loader-private value `47` from `vk_layer.h`).

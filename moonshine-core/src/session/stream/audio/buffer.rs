@@ -43,14 +43,14 @@ where
 
 	pub fn buffer(&self) -> &Buffer<F> {
 		match self {
-			PlaybackBuffer::Passthrough(ref buffer) => buffer,
+			PlaybackBuffer::Passthrough(buffer) => buffer,
 			PlaybackBuffer::Resampling { converter, .. } => converter.source(),
 		}
 	}
 
 	fn buffer_mut(&mut self) -> &mut Buffer<F> {
 		match self {
-			PlaybackBuffer::Passthrough(ref mut buffer) => buffer,
+			PlaybackBuffer::Passthrough(buffer) => buffer,
 			PlaybackBuffer::Resampling { converter, .. } => converter.source_mut(),
 		}
 	}
@@ -78,10 +78,7 @@ where
 	pub fn drain(&mut self, num_frames: usize) -> Option<impl dasp::Signal<Frame = F> + '_> {
 		match self {
 			PlaybackBuffer::Passthrough(buffer) => buffer.drain(num_frames).map(EitherSignal::Left),
-			PlaybackBuffer::Resampling {
-				ref mut converter,
-				output_rate,
-			} => {
+			PlaybackBuffer::Resampling { converter, output_rate } => {
 				let buffer = converter.source();
 				let needed_frames =
 					(buffer.sample_spec.sample_rate as usize * num_frames).div_ceil(*output_rate as usize);

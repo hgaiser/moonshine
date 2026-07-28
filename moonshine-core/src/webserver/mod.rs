@@ -9,14 +9,14 @@ use std::{
 use async_shutdown::ShutdownManager;
 use http_body_util::{BodyExt, Full, Limited};
 use hyper::{
+	Method, Request, Response, StatusCode,
 	body::Bytes,
 	header::{self, HeaderValue},
 	service::service_fn,
-	Method, Request, Response, StatusCode,
 };
 use hyper_util::rt::tokio::TokioIo;
-use image::imageops::FilterType;
 use image::ImageFormat;
+use image::imageops::FilterType;
 use network_interface::NetworkInterfaceConfig;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -24,13 +24,13 @@ use socket2::{Domain, Protocol, Socket, Type};
 use tokio::net::TcpListener;
 
 use crate::{
+	ShutdownReason,
 	clients::ClientManager,
 	session::{
-		application::ApplicationConfig, manager::SessionManager, SessionContext, SessionKeyData, SessionKeys,
-		APP_LAUNCH_HTTP_TIMEOUT_SECS,
+		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys, application::ApplicationConfig,
+		manager::SessionManager,
 	},
 	tls::TlsAcceptor,
-	ShutdownReason,
 };
 
 use self::pairing::handle_pair_request;

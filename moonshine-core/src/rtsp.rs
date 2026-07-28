@@ -2,27 +2,27 @@ use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
 use async_shutdown::ShutdownManager;
+use rtsp_types::Method;
 use rtsp_types::headers;
 use rtsp_types::headers::Transport;
-use rtsp_types::Method;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
+use crate::ShutdownReason;
 use crate::session::manager::SessionManager;
+use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::audio::AudioChannels;
 use crate::session::stream::audio::AudioConfig;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
-use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::control::ControlStreamConfig;
 use crate::session::stream::video::VideoChromaSampling;
 use crate::session::stream::video::VideoDynamicRange;
 use crate::session::stream::video::VideoFormat;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
-use crate::ShutdownReason;
 
 #[repr(u8)]
 enum ServerCapabilities {

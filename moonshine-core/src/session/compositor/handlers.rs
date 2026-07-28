@@ -3,10 +3,10 @@
 //! These are the minimum required delegate implementations for a working
 //! Wayland compositor with XWayland support.
 
-use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::allocator::Buffer;
-use smithay::backend::renderer::utils::on_commit_buffer_handler;
+use smithay::backend::allocator::dmabuf::Dmabuf;
 use smithay::backend::renderer::ImportDma;
+use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_dispatch2;
 use smithay::desktop::Window;
 use smithay::input::dnd::DndGrabHandler;
@@ -14,19 +14,19 @@ use smithay::input::pointer::{CursorImageStatus, MotionEvent, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgToplevelState;
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_buffer;
 use smithay::reexports::wayland_server::protocol::wl_output::WlOutput;
 use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
-use smithay::reexports::wayland_server::Resource;
 use smithay::utils::{Logical, Point, Rectangle, Serial};
 use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::compositor::{is_sync_subsurface, CompositorClientState, CompositorHandler, CompositorState};
+use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState, is_sync_subsurface};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
-use smithay::wayland::pointer_constraints::{with_pointer_constraint, PointerConstraintsHandler};
-use smithay::wayland::selection::data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler};
+use smithay::wayland::pointer_constraints::{PointerConstraintsHandler, with_pointer_constraint};
 use smithay::wayland::selection::SelectionHandler;
+use smithay::wayland::selection::data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler};
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
@@ -36,7 +36,7 @@ use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
 use smithay::wayland::seat::WaylandFocus;
 use smithay::xwayland::XWaylandClientData;
 
-use crate::session::compositor::focus::{get_window_priority_key, KeyboardFocusTarget, WindowFlags, WindowMetadata};
+use crate::session::compositor::focus::{KeyboardFocusTarget, WindowFlags, WindowMetadata, get_window_priority_key};
 use crate::session::compositor::state::{ClientState, MoonshineCompositor};
 
 // ---------------------------------------------------------------------------
@@ -260,13 +260,12 @@ fn scan_cmdline_for_app_id(cmdline: &[u8]) -> u32 {
 		if let Some(ids_str) = part.strip_prefix(b"--appids=") {
 			// Proton steamwebhelper: --appids=<N> or --appids=<N>,<N>...
 			for id_str in ids_str.split(|&b| b == b',') {
-				if let Ok(s) = std::str::from_utf8(id_str.trim_ascii()) {
-					if let Ok(id) = s.parse::<u32>() {
-						if id != 0 {
-							app_id = id;
-							break;
-						}
-					}
+				if let Ok(s) = std::str::from_utf8(id_str.trim_ascii())
+					&& let Ok(id) = s.parse::<u32>()
+					&& id != 0
+				{
+					app_id = id;
+					break;
 				}
 			}
 			if app_id != 0 {
@@ -276,30 +275,26 @@ fn scan_cmdline_for_app_id(cmdline: &[u8]) -> u32 {
 
 		if part == b"SteamLaunch" {
 			found_steam_launch = true;
-		} else if found_steam_launch && part.starts_with(b"AppId=") {
-			if let Some(id_str) = part.strip_prefix(b"AppId=") {
-				if let Ok(s) = std::str::from_utf8(id_str.trim_ascii()) {
-					if let Ok(id) = s.parse::<u32>() {
-						if id != 0 {
-							app_id = id;
-							break;
-						}
-					}
-				}
-			}
+		} else if found_steam_launch
+			&& part.starts_with(b"AppId=")
+			&& let Some(id_str) = part.strip_prefix(b"AppId=")
+			&& let Ok(s) = std::str::from_utf8(id_str.trim_ascii())
+			&& let Ok(id) = s.parse::<u32>()
+			&& id != 0
+		{
+			app_id = id;
+			break;
 		}
 		// Also detect standalone AppId=<N> without SteamLaunch prefix
 		// (some launchers may use just AppId=N directly).
-		if part.starts_with(b"AppId=") {
-			if let Some(id_str) = part.strip_prefix(b"AppId=") {
-				if let Ok(s) = std::str::from_utf8(id_str.trim_ascii()) {
-					if let Ok(id) = s.parse::<u32>() {
-						if id != 0 && app_id == 0 {
-							app_id = id;
-						}
-					}
-				}
-			}
+		if part.starts_with(b"AppId=")
+			&& let Some(id_str) = part.strip_prefix(b"AppId=")
+			&& let Ok(s) = std::str::from_utf8(id_str.trim_ascii())
+			&& let Ok(id) = s.parse::<u32>()
+			&& id != 0
+			&& app_id == 0
+		{
+			app_id = id;
 		}
 		// Note: we do NOT break on "--" because --appids= can appear
 		// after "--" in some launchers (e.g., "steamwebhelper -- --appids=12345").
@@ -387,11 +382,11 @@ impl CompositorHandler for MoonshineCompositor {
 			// Only trigger focus dirty on window MAP, not on every commit,
 			// to avoid focus jumping. We check if this window was just mapped
 			// by comparing against the focused window's damage_sequence.
-			if let Some(meta) = self.window_metadata.get_mut(&window) {
-				if meta.has_game_id() {
-					self.damage_sequence_counter += 1;
-					meta.damage_sequence = self.damage_sequence_counter;
-				}
+			if let Some(meta) = self.window_metadata.get_mut(&window)
+				&& meta.has_game_id()
+			{
+				self.damage_sequence_counter += 1;
+				meta.damage_sequence = self.damage_sequence_counter;
 			}
 		}
 
@@ -444,14 +439,13 @@ impl MoonshineCompositor {
 	/// block across `toplevel_destroyed`, `unmapped_window`, and
 	/// `destroyed_window`.
 	fn unregister_window(&mut self, window: &Window) {
-		if let Some(meta) = self.window_metadata.get(window) {
-			if let Some(parent_id) = meta.transient_for {
-				if let Some(children) = self.transient_children.get_mut(&parent_id) {
-					children.retain(|w| w != window);
-					if children.is_empty() {
-						self.transient_children.remove(&parent_id);
-					}
-				}
+		if let Some(meta) = self.window_metadata.get(window)
+			&& let Some(parent_id) = meta.transient_for
+			&& let Some(children) = self.transient_children.get_mut(&parent_id)
+		{
+			children.retain(|w| w != window);
+			if children.is_empty() {
+				self.transient_children.remove(&parent_id);
 			}
 		}
 		self.window_metadata.remove(window);
@@ -646,19 +640,19 @@ impl MoonshineCompositor {
 			// Re-read STEAM_INPUT_FOCUS for all overlay windows.
 			// Steam changes this property dynamically when the overlay is toggled.
 			for (window, meta) in self.window_metadata.iter_mut() {
-				if meta.flags.contains(WindowFlags::OVERLAY) {
-					if let Some(x11) = window.x11_surface() {
-						let new_mode = x11_focus.get_input_focus_mode(x11.window_id());
-						if new_mode != meta.input_focus_mode {
-							tracing::debug!(
-								target: "focus",
-								window_id = x11.window_id(),
-								old_mode = meta.input_focus_mode,
-								new_mode,
-								"STEAM_INPUT_FOCUS changed on overlay"
-							);
-							meta.input_focus_mode = new_mode;
-						}
+				if meta.flags.contains(WindowFlags::OVERLAY)
+					&& let Some(x11) = window.x11_surface()
+				{
+					let new_mode = x11_focus.get_input_focus_mode(x11.window_id());
+					if new_mode != meta.input_focus_mode {
+						tracing::debug!(
+							target: "focus",
+							window_id = x11.window_id(),
+							old_mode = meta.input_focus_mode,
+							new_mode,
+							"STEAM_INPUT_FOCUS changed on overlay"
+						);
+						meta.input_focus_mode = new_mode;
 					}
 				}
 			}
@@ -667,22 +661,22 @@ impl MoonshineCompositor {
 			// _NET_WM_PID may not be set at map time — Steam sets it
 			// asynchronously after the window is created.
 			for (window, meta) in self.window_metadata.iter_mut() {
-				if meta.app_id == 0 {
-					if let Some(x11) = window.x11_surface() {
-						let pid = x11_focus.get_window_pid(x11.window_id());
-						tracing::debug!(target: "focus", window_id = x11.window_id(), pid, "refresh_app_id: re-read _NET_WM_PID");
-						if pid != 0 {
-							let new_app_id = get_appid_from_pid(pid);
-							if new_app_id != 0 {
-								tracing::debug!(
-									target: "focus",
-									window_id = x11.window_id(),
-									pid,
-									app_id = new_app_id,
-									"Refreshed app_id from _NET_WM_PID"
-								);
-								meta.app_id = new_app_id;
-							}
+				if meta.app_id == 0
+					&& let Some(x11) = window.x11_surface()
+				{
+					let pid = x11_focus.get_window_pid(x11.window_id());
+					tracing::debug!(target: "focus", window_id = x11.window_id(), pid, "refresh_app_id: re-read _NET_WM_PID");
+					if pid != 0 {
+						let new_app_id = get_appid_from_pid(pid);
+						if new_app_id != 0 {
+							tracing::debug!(
+								target: "focus",
+								window_id = x11.window_id(),
+								pid,
+								app_id = new_app_id,
+								"Refreshed app_id from _NET_WM_PID"
+							);
+							meta.app_id = new_app_id;
 						}
 					}
 				}
@@ -835,28 +829,27 @@ impl MoonshineCompositor {
 			let fc = fc?;
 
 			// Step 1: Try exact window ID match.
-			if let Some(target_window) = fc.window {
-				if let Some(w) = candidates
+			if let Some(target_window) = fc.window
+				&& let Some(w) = candidates
 					.iter()
 					.find(|w| w.x11_surface().is_some_and(|x| x.window_id() == target_window))
-				{
-					if let Some(x11) = w.x11_surface() {
-						let app_id = self.window_metadata.get(w).map(|m| m.app_id);
-						tracing::debug!(
-							target: "focus",
-							steam_target_x11 = target_window,
-							candidate_x11 = x11.window_id(),
-							candidate_app_id = ?app_id,
-							"Steam focus matched X11 window"
-						);
-					}
-					return Some(w);
+			{
+				if let Some(x11) = w.x11_surface() {
+					let app_id = self.window_metadata.get(w).map(|m| m.app_id);
+					tracing::debug!(
+						target: "focus",
+						steam_target_x11 = target_window,
+						candidate_x11 = x11.window_id(),
+						candidate_app_id = ?app_id,
+						"Steam focus matched X11 window"
+					);
 				}
-				// Exact window ID not found — fall through to app-id list.
-				// The window may have been recreated or filtered out; the
-				// app-id list provides a fallback so focus doesn't jump to
-				// an unrelated candidate during window transitions.
+				return Some(w);
 			}
+			// Exact window ID not found — fall through to app-id list.
+			// The window may have been recreated or filtered out; the
+			// app-id list provides a fallback so focus doesn't jump to
+			// an unrelated candidate during window transitions.
 
 			// Step 2: Try app-id list match, selecting the highest-priority
 			// candidate among all windows matching any of the requested app IDs.
@@ -984,10 +977,11 @@ impl MoonshineCompositor {
 
 		// Activation state: call set_activated on old and new XDG toplevels.
 		// Deactivate the old window whether it was X11 or Wayland.
-		if let Some(ref old_win) = old_focused_window {
-			if old_win.toplevel().is_some() && old_win != best {
-				old_win.set_activated(false);
-			}
+		if let Some(ref old_win) = old_focused_window
+			&& old_win.toplevel().is_some()
+			&& old_win != best
+		{
+			old_win.set_activated(false);
 		}
 		if best.toplevel().is_some() {
 			best.set_activated(true);
@@ -995,10 +989,8 @@ impl MoonshineCompositor {
 
 		// Keyboard focus persistence.
 		let primary_focus_changed = old_focused_x11 != self.focused_x11_window;
-		if primary_focus_changed {
-			if let Some(x11) = keyboard_target.as_ref().and_then(|w| w.x11_surface()) {
-				self.last_keyboard_focus_window = Some(x11.window_id());
-			}
+		if primary_focus_changed && let Some(x11) = keyboard_target.as_ref().and_then(|w| w.x11_surface()) {
+			self.last_keyboard_focus_window = Some(x11.window_id());
 		}
 
 		// Set keyboard focus via Smithay seat.
@@ -1018,10 +1010,10 @@ impl MoonshineCompositor {
 		// / WM_TAKE_FOCUS windows (WmHints { input: false }, e.g. HFW under
 		// Proton) where Smithay only sends WM_TAKE_FOCUS but never calls
 		// XSetInputFocus, so the game never receives FocusIn → WM_ACTIVATE.
-		if let Some(ref x11_focus) = self.x11_focus {
-			if let Some(x11) = keyboard_target.as_ref().and_then(|w| w.x11_surface()) {
-				x11_focus.set_input_focus(x11.window_id());
-			}
+		if let Some(ref x11_focus) = self.x11_focus
+			&& let Some(x11) = keyboard_target.as_ref().and_then(|w| w.x11_surface())
+		{
+			x11_focus.set_input_focus(x11.window_id());
 		}
 
 		// Send initial pointer motion event to the pointer focus window to establish
@@ -1276,11 +1268,11 @@ impl MoonshineCompositor {
 			let best_child = children.into_iter().next().expect("children checked non-empty above");
 
 			// Check if this child is a non-dropdown.
-			if let Some(meta) = self.window_metadata.get(&best_child) {
-				if !meta.is_dropdown() {
-					// Found a non-dropdown child — promote it.
-					return best_child;
-				}
+			if let Some(meta) = self.window_metadata.get(&best_child)
+				&& !meta.is_dropdown()
+			{
+				// Found a non-dropdown child — promote it.
+				return best_child;
 			}
 			// This child is a dropdown, continue walking.
 			if let Some(x11) = best_child.x11_surface() {
@@ -1377,23 +1369,23 @@ impl XdgShellHandler for MoonshineCompositor {
 		surface.send_configure();
 		// Update fullscreen state in metadata.
 		let target = surface.wl_surface();
-		if let Some(window) = self.find_window_by_surface(target) {
-			if let Some(meta) = self.window_metadata.get_mut(&window) {
-				surface.with_committed_state(|state| {
-					let is_fullscreen = state
-						.as_ref()
-						.map(|s| s.states.contains(XdgToplevelState::Fullscreen))
-						.unwrap_or(false);
-					if is_fullscreen != meta.fullscreen {
-						meta.fullscreen = is_fullscreen;
-						if let Some(s) = state {
-							if let Some(size) = s.size {
-								meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
-							}
-						}
+		if let Some(window) = self.find_window_by_surface(target)
+			&& let Some(meta) = self.window_metadata.get_mut(&window)
+		{
+			surface.with_committed_state(|state| {
+				let is_fullscreen = state
+					.as_ref()
+					.map(|s| s.states.contains(XdgToplevelState::Fullscreen))
+					.unwrap_or(false);
+				if is_fullscreen != meta.fullscreen {
+					meta.fullscreen = is_fullscreen;
+					if let Some(s) = state
+						&& let Some(size) = s.size
+					{
+						meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
 					}
-				});
-			}
+				}
+			});
 		}
 		self.reevaluate_focus();
 	}
@@ -1401,23 +1393,23 @@ impl XdgShellHandler for MoonshineCompositor {
 	fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
 		// Update fullscreen state in metadata.
 		let target = surface.wl_surface();
-		if let Some(window) = self.find_window_by_surface(target) {
-			if let Some(meta) = self.window_metadata.get_mut(&window) {
-				surface.with_committed_state(|state| {
-					let is_fullscreen = state
-						.as_ref()
-						.map(|s| s.states.contains(XdgToplevelState::Fullscreen))
-						.unwrap_or(false);
-					if !is_fullscreen && meta.fullscreen {
-						meta.fullscreen = false;
-						if let Some(s) = state {
-							if let Some(size) = s.size {
-								meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
-							}
-						}
+		if let Some(window) = self.find_window_by_surface(target)
+			&& let Some(meta) = self.window_metadata.get_mut(&window)
+		{
+			surface.with_committed_state(|state| {
+				let is_fullscreen = state
+					.as_ref()
+					.map(|s| s.states.contains(XdgToplevelState::Fullscreen))
+					.unwrap_or(false);
+				if !is_fullscreen && meta.fullscreen {
+					meta.fullscreen = false;
+					if let Some(s) = state
+						&& let Some(size) = s.size
+					{
+						meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
 					}
-				});
-			}
+				}
+			});
 		}
 		self.reevaluate_focus();
 	}
@@ -1425,14 +1417,12 @@ impl XdgShellHandler for MoonshineCompositor {
 	fn app_id_changed(&mut self, surface: ToplevelSurface) {
 		// Update app_id when the Wayland client changes its app_id.
 		let target = surface.wl_surface();
-		if let Some(window) = self.find_window_by_surface(target) {
-			if let Some(meta) = self.window_metadata.get_mut(&window) {
-				if let Some(client) = surface.wl_surface().client() {
-					if let Ok(creds) = client.get_credentials(&self.display_handle) {
-						meta.app_id = get_appid_from_pid(creds.pid as u32);
-					}
-				}
-			}
+		if let Some(window) = self.find_window_by_surface(target)
+			&& let Some(meta) = self.window_metadata.get_mut(&window)
+			&& let Some(client) = surface.wl_surface().client()
+			&& let Ok(creds) = client.get_credentials(&self.display_handle)
+		{
+			meta.app_id = get_appid_from_pid(creds.pid as u32);
 		}
 		self.reevaluate_focus();
 	}
@@ -1500,14 +1490,14 @@ impl OutputHandler for MoonshineCompositor {
 impl PointerConstraintsHandler for MoonshineCompositor {
 	fn new_constraint(&mut self, surface: &WlSurface, pointer: &PointerHandle<Self>) {
 		// Auto-activate constraints when the surface already has pointer focus.
-		if let Some(current_focus) = pointer.current_focus() {
-			if &current_focus == surface {
-				with_pointer_constraint(surface, pointer, |constraint| {
-					if let Some(c) = constraint {
-						c.activate();
-					}
-				});
-			}
+		if let Some(current_focus) = pointer.current_focus()
+			&& &current_focus == surface
+		{
+			with_pointer_constraint(surface, pointer, |constraint| {
+				if let Some(c) = constraint {
+					c.activate();
+				}
+			});
 		}
 	}
 
@@ -1738,12 +1728,12 @@ impl XwmHandler for MoonshineCompositor {
 
 						// Update transient_children index when transient_for changes.
 						// Remove from old parent's child list.
-						if let Some(old_parent) = old_parent {
-							if let Some(children) = self.transient_children.get_mut(&old_parent) {
-								children.retain(|w| *w != elem);
-								if children.is_empty() {
-									self.transient_children.remove(&old_parent);
-								}
+						if let Some(old_parent) = old_parent
+							&& let Some(children) = self.transient_children.get_mut(&old_parent)
+						{
+							children.retain(|w| *w != elem);
+							if children.is_empty() {
+								self.transient_children.remove(&old_parent);
 							}
 						}
 						// Add to new parent's child list.
@@ -1847,10 +1837,9 @@ impl XwmHandler for MoonshineCompositor {
 					.window_metadata
 					.values()
 					.find(|m| m.x11_window_id == Some(focused_id))
+					&& meta.damage_sequence > focused_meta.damage_sequence
 				{
-					if meta.damage_sequence > focused_meta.damage_sequence {
-						self.focus_state.mark_dirty();
-					}
+					self.focus_state.mark_dirty();
 				}
 			}
 		} else {
@@ -2100,16 +2089,16 @@ impl XwmHandler for MoonshineCompositor {
 			meta.geometry = geometry;
 
 			// Only reclassify if the window has the STEAM_OVERLAY property.
-			if let Some(sov) = steam_overlay_value {
-				if sov != 0 {
-					let is_overlay = geometry.size.w > 1200;
-					if is_overlay {
-						meta.flags.remove(WindowFlags::NOTIFICATION);
-						meta.flags.insert(WindowFlags::OVERLAY);
-					} else {
-						meta.flags.remove(WindowFlags::OVERLAY);
-						meta.flags.insert(WindowFlags::NOTIFICATION);
-					}
+			if let Some(sov) = steam_overlay_value
+				&& sov != 0
+			{
+				let is_overlay = geometry.size.w > 1200;
+				if is_overlay {
+					meta.flags.remove(WindowFlags::NOTIFICATION);
+					meta.flags.insert(WindowFlags::OVERLAY);
+				} else {
+					meta.flags.remove(WindowFlags::OVERLAY);
+					meta.flags.insert(WindowFlags::NOTIFICATION);
 				}
 			}
 

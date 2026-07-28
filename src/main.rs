@@ -5,18 +5,18 @@ use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
 use clap::{Parser, Subcommand};
-use tokio::signal::unix::{signal, SignalKind};
+use tokio::signal::unix::{SignalKind, signal};
+use tracing_subscriber::EnvFilter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::EnvFilter;
 
+pub use moonshine_core::ShutdownReason;
 use moonshine_core::clients::ClientManager;
 use moonshine_core::config::Config;
 use moonshine_core::discovery::MdnsDiscovery;
 use moonshine_core::rtsp::RtspServer;
 use moonshine_core::session::manager::SessionManager;
 use moonshine_core::webserver::Webserver;
-pub use moonshine_core::ShutdownReason;
 
 #[derive(Parser, Debug)]
 #[clap(version)]

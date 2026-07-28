@@ -4,9 +4,9 @@
 //! All Smithay `delegate_*!` macros target this struct.
 
 use std::os::unix::io::AsRawFd;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 
 use smithay::reexports::wayland_server::Resource;
 
@@ -14,15 +14,15 @@ use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::gbm::GbmAllocator;
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc, Modifier};
 use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
+use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::element::{AsRenderElements, Element, Id, Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
-use smithay::backend::renderer::utils::{with_renderer_surface_state, CommitCounter, DamageSet, OpaqueRegions};
+use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions, with_renderer_surface_state};
 use smithay::backend::renderer::{Bind, BufferType, ImportDma};
 use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::utils::send_frames_surface_tree;
-use smithay::desktop::utils::{take_presentation_feedback_surface_tree, OutputPresentationFeedback};
+use smithay::desktop::utils::{OutputPresentationFeedback, take_presentation_feedback_surface_tree};
 use std::collections::HashMap;
 
 use smithay::desktop::Space;
@@ -904,39 +904,39 @@ impl MoonshineCompositor {
 		// Also send frame callbacks to the override surface if active,
 		// so the NVIDIA driver's Wayland WSI unblocks and presents the
 		// next frame.
-		if let Some((ref override_surface, _)) = self.override_surface {
-			if override_surface.alive() {
-				send_frames_surface_tree(
-					override_surface,
-					&self.output,
-					self.clock.now(),
-					Some(std::time::Duration::ZERO),
-					|_, _| Some(self.output.clone()),
-				);
+		if let Some((ref override_surface, _)) = self.override_surface
+			&& override_surface.alive()
+		{
+			send_frames_surface_tree(
+				override_surface,
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
 
-				// Drain and respond to wp_presentation_feedback callbacks
-				// so the NVIDIA driver's WaitForPresentKHR can return.
-				let mut feedback = OutputPresentationFeedback::new(&self.output);
-				take_presentation_feedback_surface_tree(
-					override_surface,
-					&mut feedback,
-					|_, _| Some(self.output.clone()),
-					|_, _| {
-						smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
-					},
-				);
-				let frame_period = self
-					.output
-					.preferred_mode()
-					.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
-					.unwrap_or(std::time::Duration::from_millis(11));
-				feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
+			// Drain and respond to wp_presentation_feedback callbacks
+			// so the NVIDIA driver's WaitForPresentKHR can return.
+			let mut feedback = OutputPresentationFeedback::new(&self.output);
+			take_presentation_feedback_surface_tree(
+				override_surface,
+				&mut feedback,
+				|_, _| Some(self.output.clone()),
+				|_, _| {
+					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+				},
+			);
+			let frame_period = self
+				.output
+				.preferred_mode()
+				.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
+				.unwrap_or(std::time::Duration::from_millis(11));
+			feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
 					self.clock.now(),
 					Refresh::Fixed(frame_period),
 					0,
 					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(),
 				);
-			}
 		}
 
 		// Flush the frame callbacks (and any other pending events) to
@@ -977,11 +977,11 @@ impl MoonshineCompositor {
 		};
 
 		// The window must be positioned at the origin to avoid an offset frame.
-		if let Some(geo) = self.space.element_geometry(window) {
-			if geo.loc != Point::from((0, 0)) {
-				tracing::trace!("Direct scanout: window not at origin ({:?})", geo.loc);
-				return false;
-			}
+		if let Some(geo) = self.space.element_geometry(window)
+			&& geo.loc != Point::from((0, 0))
+		{
+			tracing::trace!("Direct scanout: window not at origin ({:?})", geo.loc);
+			return false;
 		}
 
 		let wl_surface = toplevel.wl_surface().clone();
@@ -1306,12 +1306,11 @@ impl MoonshineCompositor {
 		// a new wl_surface) when toggling HDR mode, so the old surface's
 		// gamescope_current entry must be evicted explicitly — it won't be
 		// cleaned up by create_swapchain (which only sees the new surface).
-		if let Some(old_surface) = self.override_surface.as_ref().map(|(s, _)| s.clone()) {
-			if old_surface != surface {
-				if let Some(cm) = &mut self.color_management {
-					cm.clear_gamescope_current(&old_surface);
-				}
-			}
+		if let Some(old_surface) = self.override_surface.as_ref().map(|(s, _)| s.clone())
+			&& old_surface != surface
+			&& let Some(cm) = &mut self.color_management
+		{
+			cm.clear_gamescope_current(&old_surface);
 		}
 
 		tracing::debug!(x11_window, focus_key, "Storing override surface for X11 window");
@@ -1342,14 +1341,13 @@ impl MoonshineCompositor {
 			// are no longer rendered or receive input.
 			self.space.unmap_elem(&override_win);
 			// Clean up metadata and transient children index.
-			if let Some(meta) = self.window_metadata.get(&override_win) {
-				if let Some(parent_id) = meta.transient_for {
-					if let Some(children) = self.transient_children.get_mut(&parent_id) {
-						children.retain(|w| *w != override_win);
-						if children.is_empty() {
-							self.transient_children.remove(&parent_id);
-						}
-					}
+			if let Some(meta) = self.window_metadata.get(&override_win)
+				&& let Some(parent_id) = meta.transient_for
+				&& let Some(children) = self.transient_children.get_mut(&parent_id)
+			{
+				children.retain(|w| *w != override_win);
+				if children.is_empty() {
+					self.transient_children.remove(&parent_id);
 				}
 			}
 			self.window_metadata.remove(&override_win);
@@ -1394,27 +1392,27 @@ impl MoonshineCompositor {
 		// Send a synthetic pointer motion to establish pointer focus on the
 		// dropdown so that subsequent MouseButtonDown/Up are delivered there
 		// instead of the previously focused surface.
-		if let Some(x11) = window.x11_surface() {
-			if let Some(wl_surface) = x11.wl_surface() {
-				let window_loc = Point::from((x as f64, y as f64));
-				let pointer = self.seat.get_pointer().expect("pointer should exist");
-				let serial = smithay::utils::SERIAL_COUNTER.next_serial();
-				tracing::debug!(
-					target: "focus",
-					surface_id = ?wl_surface,
-					"notify_dropdown: sending initial pointer motion event to dropdown"
-				);
-				pointer.motion(
-					self,
-					Some((wl_surface.clone(), window_loc)),
-					&smithay::input::pointer::MotionEvent {
-						location: self.cursor_position,
-						serial,
-						time: self.clock.now().as_millis(),
-					},
-				);
-				pointer.frame(self);
-			}
+		if let Some(x11) = window.x11_surface()
+			&& let Some(wl_surface) = x11.wl_surface()
+		{
+			let window_loc = Point::from((x as f64, y as f64));
+			let pointer = self.seat.get_pointer().expect("pointer should exist");
+			let serial = smithay::utils::SERIAL_COUNTER.next_serial();
+			tracing::debug!(
+				target: "focus",
+				surface_id = ?wl_surface,
+				"notify_dropdown: sending initial pointer motion event to dropdown"
+			);
+			pointer.motion(
+				self,
+				Some((wl_surface.clone(), window_loc)),
+				&smithay::input::pointer::MotionEvent {
+					location: self.cursor_position,
+					serial,
+					time: self.clock.now().as_millis(),
+				},
+			);
+			pointer.frame(self);
 		}
 
 		tracing::debug!(

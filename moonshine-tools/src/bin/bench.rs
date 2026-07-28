@@ -2,7 +2,11 @@ use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
 use clap::Parser;
+use moonshine_core::ShutdownReason;
 use moonshine_core::config::ApplicationConfig;
+use moonshine_core::session::SessionContext;
+use moonshine_core::session::SessionKeyData;
+use moonshine_core::session::SessionKeys;
 use moonshine_core::session::compositor::CompositorConfig;
 use moonshine_core::session::manager::SessionManager;
 use moonshine_core::session::stream::audio::AudioChannels;
@@ -16,12 +20,8 @@ use moonshine_core::session::stream::video::VideoDynamicRange;
 use moonshine_core::session::stream::video::VideoFormat;
 use moonshine_core::session::stream::video::VideoStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamContext;
-use moonshine_core::session::SessionContext;
-use moonshine_core::session::SessionKeyData;
-use moonshine_core::session::SessionKeys;
-use moonshine_core::ShutdownReason;
 use tokio::signal;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(name = "moonshine-bench", about = "Benchmark Moonshine's encoding pipeline")]
