@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.14.1] - 28-07-2026
+
+### Added
+
+- Wait for D-Bus to become available on startup, preventing session launch failures when D-Bus starts asynchronously.
+
+### Changed
+
+- Use Rust edition 2024.
+
+### Fixed
+
+- Drop nonexistent `security.polkit.extraPolicies` from NixOS module that caused evaluation failures (#141, @scottjab).
+- Include polkit and sysusers rule files in the binary release package.
+
 ## [v0.14.0] - 27-07-2026
 
 ### Added
