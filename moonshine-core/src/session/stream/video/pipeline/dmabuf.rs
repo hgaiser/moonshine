@@ -7,29 +7,24 @@
 //! NVIDIA Wayland WSI creates a new `wl_buffer` wrapper each frame while the
 //! underlying DMA-BUF fd is stable.
 //!
-//! Kernel fd recycling is mitigated by a two-layer check on every cache hit:
+//! Kernel fd recycling is caught by a two-layer check on every cache hit:
 //! 1. Import parameters (format, dimensions, modifier) — catches genuine
 //!    reconfigurations (e.g. PQ → scRGB HDR switch).
-//! 2. `kcmp(2)` open-file-description comparison, with an inode fallback when
-//!    `kcmp(2)` is unavailable — catches a recycled fd number pointing at a new
-//!    buffer whose parameters happen to be identical.
+//! 2. `kcmp(2)` open-file-description comparison — catches a recycled fd number
+//!    pointing at a new buffer whose parameters happen to be identical.
 //!
-//! Each cache entry holds a `dup` of its fd to make the identity check
-//! reliable and to pin the buffer against inode recycling.
+//! Each cache entry holds a `dup` of its fd for the `kcmp(2)` comparison.
 //!
-//! Eviction: entries unused for `CACHE_TTL` (2s) are destroyed. The compositor
-//! holds client buffers alive until the encoder signals `consumed`, so the fd
-//! is valid during import and the TTL is long enough for in-flight GPU work to
-//! drain.
+//! The startup healthcheck verifies `kcmp(2)` is available; startup is refused
+//! without it.
 
 use ash::vk;
 use pixelforge::VideoContext;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::io::{BorrowedFd, IntoRawFd};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 /// TTL before a cached import is evicted. 2s covers in-flight GPU work
 /// (~16ms depth-2 at 120fps) while keeping VRAM under control.
@@ -86,30 +81,21 @@ struct CachedImport {
 	image: vk::Image,
 	memory: vk::DeviceMemory,
 	params: ImportParams,
-	/// Duplicate of the DMA-BUF fd, held for identity checks and to pin the buffer.
+	/// Duplicate of the DMA-BUF fd, held for `kcmp(2)` identity checks.
 	fd: OwnedFd,
-	/// Cached inode of the DMA-BUF, for the `kcmp(2)` fallback path.
-	inode: Option<u64>,
 	last_used: Instant,
 }
 
-/// Set when `kcmp(2)` is permanently unavailable (ENOSYS/EPERM), to avoid retrying per frame.
-static KCMP_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
-
 /// Check whether two fds refer to the same open file description via `kcmp(2)`.
-///
-/// Returns `Some(bool)` on success, `None` when `kcmp(2)` is permanently
-/// unavailable — the caller should fall back to inode comparison.
 ///
 /// All DMA-BUF fds in a session are dups of the exporter's single `struct file`,
 /// so "same open file description" means "same buffer".
-fn same_open_file(a: RawFd, b: RawFd) -> Option<bool> {
-	/// `KCMP_FILE` — not exposed by the `libc` or glibc.
+///
+/// The startup healthcheck guarantees `kcmp(2)` is available, so this never
+/// returns an error at runtime.
+pub(crate) fn same_open_file(a: RawFd, b: RawFd) -> bool {
+	/// `KCMP_FILE` — not exposed by `libc` or glibc.
 	const KCMP_FILE: libc::c_int = 0;
-
-	if KCMP_UNSUPPORTED.load(Ordering::Relaxed) {
-		return None;
-	}
 
 	// SAFETY: syscall with scalar arguments; fds are only compared, not accessed.
 	let result = unsafe {
@@ -122,52 +108,20 @@ fn same_open_file(a: RawFd, b: RawFd) -> Option<bool> {
 			b as libc::c_ulong,
 		)
 	};
-	if result >= 0 {
-		// 0 = identical, 1/2 = ordering between distinct files.
-		return Some(result == 0);
-	}
 
-	let error = std::io::Error::last_os_error();
-	match error.raw_os_error() {
-		Some(libc::ENOSYS) | Some(libc::EPERM) => {
-			warn!("kcmp(2) unavailable ({error}); falling back to DMA-BUF inode comparison");
-			KCMP_UNSUPPORTED.store(true, Ordering::Relaxed);
-			None
-		},
-		// EBADF — fd doesn't refer to the same buffer
-		_ => Some(false),
-	}
-}
+	assert!(
+		result >= 0,
+		"kcmp(2) failed unexpectedly — the startup healthcheck should have caught this"
+	);
 
-/// Get the inode of a DMA-BUF via `fstat(2)`.
-///
-/// Fallback identity check when `kcmp(2)` is unavailable. Each DMA-BUF has a
-/// distinct inode on the `dmabuf` pseudo-filesystem for its lifetime; the cache
-/// entry's `dup` fd pins the buffer, preventing its inode from being recycled.
-fn dmabuf_inode(fd: RawFd) -> Option<u64> {
-	// SAFETY: `stat` is only read after `fstat` returns success.
-	unsafe {
-		let mut st: libc::stat = std::mem::zeroed();
-		if libc::fstat(fd, &mut st) == 0 {
-			Some(st.st_ino as u64)
-		} else {
-			None
-		}
-	}
+	// 0 = identical, 1/2 = ordering between distinct files.
+	result == 0
 }
 
 impl CachedImport {
 	/// Check whether `fd` refers to the same DMA-BUF this entry was imported from.
-	///
-	/// Returns `false` (safe) when neither `kcmp(2)` nor inode comparison can answer.
 	fn is_same_buffer(&self, fd: RawFd) -> bool {
-		match same_open_file(self.fd.as_raw_fd(), fd) {
-			Some(same) => same,
-			None => match (self.inode, dmabuf_inode(fd)) {
-				(Some(cached), Some(incoming)) => cached == incoming,
-				_ => false,
-			},
-		}
+		same_open_file(self.fd.as_raw_fd(), fd)
 	}
 }
 
@@ -250,7 +204,7 @@ impl DmaBufImporter {
 			width, height, format, planes[0].stride, planes[0].modifier
 		);
 
-		// Keep a dup for identity comparison and to pin the buffer for inode stability.
+		// Keep a dup for `kcmp(2)` identity comparison.
 		let owned_fd = unsafe { BorrowedFd::borrow_raw(fd) }
 			.try_clone_to_owned()
 			.map_err(|e| format!("Failed to duplicate DMA-BUF FD for the import cache: {e}"))?;
@@ -264,7 +218,6 @@ impl DmaBufImporter {
 				memory,
 				params,
 				fd: owned_fd,
-				inode: dmabuf_inode(fd),
 				last_used: now,
 			},
 		);
@@ -476,11 +429,7 @@ mod tests {
 		// Different open file description, same inode (separate `open(2)`).
 		let other = std::fs::File::open("/dev/null").unwrap();
 
-		let Some(dup_is_same) = same_open_file(a.as_raw_fd(), dup.as_raw_fd()) else {
-			// kcmp(2) unavailable — nothing to assert
-			return;
-		};
-		assert!(dup_is_same);
-		assert_eq!(same_open_file(a.as_raw_fd(), other.as_raw_fd()), Some(false));
+		assert!(same_open_file(a.as_raw_fd(), dup.as_raw_fd()));
+		assert!(!same_open_file(a.as_raw_fd(), other.as_raw_fd()));
 	}
 }
