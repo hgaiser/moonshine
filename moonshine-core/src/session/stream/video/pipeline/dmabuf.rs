@@ -1,33 +1,26 @@
-//! DMA-BUF import support for zero-copy video encoding.
+//! Zero-copy DMA-BUF import into Vulkan images for video encoding.
 //!
-//! This module provides the ability to import Linux DMA-BUF file descriptors as
-//! Vulkan images for direct video encoding without CPU-side copies.
+//! `DmaBufImporter` caches `VkImage`/`VkDeviceMemory` per DMA-BUF file descriptor,
+//! avoiding per-frame `vkCreateImage` + `vkAllocateMemory` (~0.5–1.5ms on NVIDIA).
 //!
-//! `DmaBufImporter` caches imported Vulkan resources per DMA-BUF file descriptor
-//! so that the same underlying buffer is imported only once. Subsequent frames
-//! reusing the same DMA-BUF reuse the cached `VkImage` and `VkDeviceMemory`,
-//! eliminating per-frame `vkCreateImage` + `vkAllocateMemory(DMA-BUF import)`
-//! calls that can cost 0.5\u20131.5ms on NVIDIA drivers.
+//! The cache is keyed by raw fd rather than `wl_buffer` ObjectId because the
+//! NVIDIA Wayland WSI creates a new `wl_buffer` wrapper each frame while the
+//! underlying DMA-BUF fd is stable.
 //!
-//! Keying by FD rather than `wl_buffer` ObjectId is critical: the NVIDIA
-//! Wayland WSI creates a new `wl_buffer` wrapper each frame even though the
-//! underlying DMA-BUF fd is stable. ObjectId-keying would miss the cache
-//! every frame; FD-keying catches the reuse.
+//! Kernel fd recycling is mitigated by a two-layer check on every cache hit:
+//! 1. Import parameters (format, dimensions, modifier) — catches genuine
+//!    reconfigurations (e.g. PQ → scRGB HDR switch).
+//! 2. `kcmp(2)` open-file-description comparison, with an inode fallback when
+//!    `kcmp(2)` is unavailable — catches a recycled fd number pointing at a new
+//!    buffer whose parameters happen to be identical.
 //!
-//! The kernel also recycles fd numbers for *new* buffers: once a `wl_buffer`
-//! is released and its fd closed, the same number comes back for an unrelated
-//! buffer. A cache hit on the fd number alone may therefore be a different
-//! buffer, and the import parameters cannot tell — swapchain images share
-//! identical dimensions, format, stride and modifier. Each entry keeps its own
-//! `dup` of the fd and a hit is only trusted when `kcmp(2)` confirms that the
-//! incoming fd refers to the *same open file description*; mismatched entries
-//! are retired and freed after `CACHE_TTL`, once any in-flight GPU work using
-//! them has completed.
+//! Each cache entry holds a `dup` of its fd to make the identity check
+//! reliable and to pin the buffer against inode recycling.
 //!
-//! The cache evicts entries that have not been touched in `CACHE_TTL`. The
-//! compositor holds client buffers alive until the encoder signals `consumed`,
-//! so the fd is guaranteed valid during import. The 2s TTL ensures any
-//! in-flight GPU work completes before cached Vulkan resources are freed.
+//! Eviction: entries unused for `CACHE_TTL` (2s) are destroyed. The compositor
+//! holds client buffers alive until the encoder signals `consumed`, so the fd
+//! is valid during import and the TTL is long enough for in-flight GPU work to
+//! drain.
 
 use ash::vk;
 use pixelforge::VideoContext;
@@ -38,21 +31,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 
-/// How long a cached import stays resident after its last use before being
-/// evicted and freed. Long enough that any in-flight encoder/blitter work
-/// using the image has definitely completed (depth-2 pipeline at 120 fps is
-/// ~16 ms of in-flight latency), short enough that monotonically-growing
-/// buffer-index churn doesn't accumulate VRAM.
+/// TTL before a cached import is evicted. 2s covers in-flight GPU work
+/// (~16ms depth-2 at 120fps) while keeping VRAM under control.
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
-/// Sweep for stale cache entries every N `import_or_reuse` calls. Cheap
-/// (HashMap retain over a small map) but no point doing it every frame.
+/// Sweep for stale entries every N `import_or_reuse` calls.
 const SWEEP_INTERVAL_CALLS: u32 = 60;
 
-/// Information about a single DMA-BUF plane.
+/// A single DMA-BUF plane descriptor.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DmaBufPlane {
-	/// File descriptor for the DMA-BUF.
 	pub fd: RawFd,
 	/// Offset within the DMA-BUF to the start of this plane.
 	pub offset: u32,
@@ -98,46 +86,32 @@ struct CachedImport {
 	image: vk::Image,
 	memory: vk::DeviceMemory,
 	params: ImportParams,
-	/// Our own `dup` of the DMA-BUF this image was imported from, kept for the
-	/// life of the entry so an incoming fd can be compared against it. It also
-	/// pins the buffer, which is what makes the inode fallback below reliable.
+	/// Duplicate of the DMA-BUF fd, held for identity checks and to pin the buffer.
 	fd: OwnedFd,
-	/// Inode of that DMA-BUF, used only when `kcmp(2)` is unavailable.
+	/// Cached inode of the DMA-BUF, for the `kcmp(2)` fallback path.
 	inode: Option<u64>,
 	last_used: Instant,
 }
 
-/// Set once `kcmp(2)` has been seen to be refused outright, so the syscall is
-/// not retried every frame.
+/// Set when `kcmp(2)` is permanently unavailable (ENOSYS/EPERM), to avoid retrying per frame.
 static KCMP_UNSUPPORTED: AtomicBool = AtomicBool::new(false);
 
-/// Whether `a` and `b` refer to the same open file description, or `None` when
-/// the kernel refuses `kcmp(2)` altogether and the caller must fall back.
+/// Check whether two fds refer to the same open file description via `kcmp(2)`.
 ///
-/// This is what makes fd-keying safe. Kernel fd numbers are recycled: once a
-/// `wl_buffer` is released and its fd closed, the same number comes back for an
-/// unrelated buffer. `ImportParams` cannot detect that, because swapchain images
-/// share identical dimensions, format, stride and modifier — so without an
-/// identity check the cache hands back a `VkImage` bound to a previous buffer's
-/// memory and the encoder re-encodes a stale frame (the permanent shimmer seen
-/// on some games in HDR direct scanout).
+/// Returns `Some(bool)` on success, `None` when `kcmp(2)` is permanently
+/// unavailable — the caller should fall back to inode comparison.
 ///
-/// All fds for one dma-buf are dups of the exporter's single `struct file`
-/// (`dma_buf_fd()` installs `dmabuf->file`, and SCM_RIGHTS passes it across the
-/// socket unchanged), so "same open file description" is exactly "same buffer"
-/// here.
+/// All DMA-BUF fds in a session are dups of the exporter's single `struct file`,
+/// so "same open file description" means "same buffer".
 fn same_open_file(a: RawFd, b: RawFd) -> Option<bool> {
-	/// `KCMP_FILE` — compare a single open file description. Not exposed by the
-	/// `libc` crate on Linux, nor wrapped by glibc, so both the constant and the
-	/// syscall are spelled out here.
+	/// `KCMP_FILE` — not exposed by the `libc` or glibc.
 	const KCMP_FILE: libc::c_int = 0;
 
 	if KCMP_UNSUPPORTED.load(Ordering::Relaxed) {
 		return None;
 	}
 
-	// SAFETY: a plain syscall with scalar arguments; the fds are only compared,
-	// never read from or written to.
+	// SAFETY: syscall with scalar arguments; fds are only compared, not accessed.
 	let result = unsafe {
 		libc::syscall(
 			libc::SYS_kcmp,
@@ -149,34 +123,29 @@ fn same_open_file(a: RawFd, b: RawFd) -> Option<bool> {
 		)
 	};
 	if result >= 0 {
-		// 0 means identical; 1 and 2 are an ordering between distinct files.
+		// 0 = identical, 1/2 = ordering between distinct files.
 		return Some(result == 0);
 	}
 
 	let error = std::io::Error::last_os_error();
 	match error.raw_os_error() {
-		// No CONFIG_CHECKPOINT_RESTORE, or a seccomp policy in the way. This
-		// cannot change at runtime, so stop asking and use the inode instead.
 		Some(libc::ENOSYS) | Some(libc::EPERM) => {
 			warn!("kcmp(2) unavailable ({error}); falling back to DMA-BUF inode comparison");
 			KCMP_UNSUPPORTED.store(true, Ordering::Relaxed);
 			None
 		},
-		// EBADF and friends: whatever that descriptor is, it is not the buffer
-		// this entry was imported from.
+		// EBADF — fd doesn't refer to the same buffer
 		_ => Some(false),
 	}
 }
 
-/// Inode of a DMA-BUF, or `None` if it cannot be determined.
+/// Get the inode of a DMA-BUF via `fstat(2)`.
 ///
-/// Fallback identity for kernels that refuse `kcmp(2)`. Every dma-buf gets a
-/// distinct inode on the anonymous dmabuf filesystem and keeps it for its whole
-/// lifetime; inode numbers are only recycled once the buffer is freed, which a
-/// live cache entry prevents — it holds a `dup` of the fd, as does the
-/// `VkDeviceMemory` imported from it.
+/// Fallback identity check when `kcmp(2)` is unavailable. Each DMA-BUF has a
+/// distinct inode on the `dmabuf` pseudo-filesystem for its lifetime; the cache
+/// entry's `dup` fd pins the buffer, preventing its inode from being recycled.
 fn dmabuf_inode(fd: RawFd) -> Option<u64> {
-	// SAFETY: `stat` is only read after fstat reports success.
+	// SAFETY: `stat` is only read after `fstat` returns success.
 	unsafe {
 		let mut st: libc::stat = std::mem::zeroed();
 		if libc::fstat(fd, &mut st) == 0 {
@@ -188,10 +157,9 @@ fn dmabuf_inode(fd: RawFd) -> Option<u64> {
 }
 
 impl CachedImport {
-	/// Whether `fd` still refers to the buffer this entry was imported from.
+	/// Check whether `fd` refers to the same DMA-BUF this entry was imported from.
 	///
-	/// Refuses reuse when neither check can answer, rather than risking a
-	/// `VkImage` bound to another buffer's memory.
+	/// Returns `false` (safe) when neither `kcmp(2)` nor inode comparison can answer.
 	fn is_same_buffer(&self, fd: RawFd) -> bool {
 		match same_open_file(self.fd.as_raw_fd(), fd) {
 			Some(same) => same,
@@ -203,19 +171,16 @@ impl CachedImport {
 	}
 }
 
-/// Importer for DMA-BUF file descriptors into Vulkan images.
+/// Imports DMA-BUF fds into Vulkan images with a per-fd cache and TTL eviction.
 ///
-/// Owns a per-FD cache of `VkImage` + `VkDeviceMemory` with TTL eviction.
-/// Layout transitions are deferred to the consumer (e.g. `ColorConverter`)
-/// to avoid a separate GPU submission per first-time import.
+/// Layout transitions are deferred to the consumer (e.g. `ColorConverter`) to
+/// avoid a separate GPU submission per first-time import.
 pub(crate) struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
-	/// Per-FD cache. Keying on the fd is what makes reuse possible at all —
-	/// NVIDIA's Wayland WSI wraps a new `wl_buffer` every frame, so keying on
-	/// anything derived from the `wl_buffer` would allocate a fresh entry per
-	/// frame and defeat the cache entirely. Recycled fd numbers are caught by
-	/// `CachedImport::is_same_buffer` in `import_or_reuse`, not by the key.
+	/// Per-fd cache. Keyed by raw fd because the NVIDIA WSI creates a new
+	/// `wl_buffer` wrapper each frame. Recycled fd numbers are caught by
+	/// `CachedImport::is_same_buffer`, not by the key.
 	cache: HashMap<RawFd, CachedImport>,
 	/// Imports whose fd was recycled for a different buffer, awaiting TTL
 	/// expiry before destruction (in-flight GPU work may still reference them).
@@ -238,17 +203,10 @@ impl DmaBufImporter {
 		})
 	}
 
-	/// Import a DMA-BUF as a Vulkan image, reusing a cached import when
-	/// the same DMA-BUF fd has been seen before with the same parameters.
+	/// Import a DMA-BUF as a Vulkan image, reusing a cached import on hit.
 	///
-	/// The `format` parameter specifies the Vulkan format matching the DMA-BUF
-	/// pixel format (e.g. `B8G8R8A8_UNORM` for SDR, `A2B10G10R10_UNORM_PACK32`
-	/// for 10-bit HDR, `R16G16B16A16_SFLOAT` for FP16 HDR).
-	///
-	/// Returns `(image, needs_transition)` where `needs_transition` is `true`
-	/// for first-time imports whose image is still in `UNDEFINED` layout.
-	/// The caller is responsible for transitioning the image (e.g. by passing
-	/// the appropriate `src_layout` to `ColorConverter::convert`).
+	/// Returns `(image, needs_transition)` — `needs_transition` is `true` for
+	/// first-time imports whose image is still in `UNDEFINED` layout.
 	pub fn import_or_reuse(
 		&mut self,
 		fd: RawFd,
@@ -267,21 +225,17 @@ impl DmaBufImporter {
 
 		let now = Instant::now();
 		if let Some(cached) = self.cache.get_mut(&fd) {
-			// Both must match: the parameters catch a genuine reconfiguration,
-			// the identity check catches an fd number recycled for a different
-			// buffer — which the parameters alone cannot see, since swapchain
-			// images are identical on every field they compare.
+			// Parameters catch reconfigurations (e.g. HDR format switch); the
+			// identity check catches recycled fd numbers.
 			if cached.params == params && cached.is_same_buffer(fd) {
 				cached.last_used = now;
 				return Ok((cached.image, false));
 			}
 		}
 
-		// A leftover entry here means the fd number now refers to a different
-		// buffer, or the same buffer was reconfigured. Reusing the stale image
-		// would make the GPU read the wrong memory — silently wrong pixels at
-		// best, a device-lost fault at worst. Retire it for TTL-deferred
-		// destruction in case prior GPU work still references it.
+		// Cache miss: the fd now points to a different buffer or it was
+		// reconfigured. Retire the stale entry for TTL-deferred destruction
+		// so in-flight GPU work can drain first.
 		if let Some(mut stale) = self.cache.remove(&fd) {
 			debug!(
 				"fd {fd} now refers to a different buffer (params {:?} -> {:?}); retiring stale import",
@@ -296,8 +250,7 @@ impl DmaBufImporter {
 			width, height, format, planes[0].stride, planes[0].modifier
 		);
 
-		// Kept for the life of the entry: `is_same_buffer` compares against it,
-		// and holding it pins the buffer so its inode cannot be recycled either.
+		// Keep a dup for identity comparison and to pin the buffer for inode stability.
 		let owned_fd = unsafe { BorrowedFd::borrow_raw(fd) }
 			.try_clone_to_owned()
 			.map_err(|e| format!("Failed to duplicate DMA-BUF FD for the import cache: {e}"))?;
@@ -318,10 +271,7 @@ impl DmaBufImporter {
 		Ok((image, true))
 	}
 
-	/// Drop cached entries that haven't been touched in `CACHE_TTL` and free
-	/// their backing Vulkan resources. Stale entries are guaranteed to be out
-	/// of any encoder/blitter pipeline (TTL >> max in-flight depth at 120 fps),
-	/// so it's safe to destroy without an explicit fence wait.
+	/// Free Vulkan resources for entries that haven't been touched in `CACHE_TTL`.
 	fn evict_stale(&mut self) {
 		let cutoff = Instant::now() - CACHE_TTL;
 		let device = self.context.device();
@@ -348,10 +298,7 @@ impl DmaBufImporter {
 		}
 	}
 
-	/// Perform the raw Vulkan import of a DMA-BUF with the specified format.
-	///
-	/// Returns the `(VkImage, VkDeviceMemory)` pair. The image is in
-	/// `UNDEFINED` layout; the caller must transition it.
+	/// Raw Vulkan DMA-BUF import. Returns `(VkImage, VkDeviceMemory)` in `UNDEFINED` layout.
 	fn import_internal(
 		&self,
 		width: u32,
@@ -508,9 +455,7 @@ mod tests {
 
 	#[test]
 	fn import_params_detect_recycled_fd_after_format_switch() {
-		// PQ→scRGB swapchain recreation: the new FP16 buffer can land on the
-		// same fd number as the destroyed 10-bit buffer, with a different
-		// format and stride. The cache must not treat this as a hit.
+		// PQ → scRGB: format and stride differ, so the fd is a cache miss despite same fd number.
 		let pq = ImportParams::new(1920, 1080, vk::Format::A2B10G10R10_UNORM_PACK32, &[plane(0, 7680)]);
 		let scrgb = ImportParams::new(1920, 1080, vk::Format::R16G16B16A16_SFLOAT, &[plane(0, 15360)]);
 		assert_ne!(pq, scrgb);
@@ -526,16 +471,13 @@ mod tests {
 	#[test]
 	fn kcmp_distinguishes_open_file_descriptions() {
 		let a = std::fs::File::open("/dev/null").unwrap();
-		// A dup shares the open file description, exactly like the fd the
-		// importer keeps against the one the compositor hands it each frame.
+		// Same open file description (shared `struct file`).
 		let dup = a.try_clone().unwrap();
-		// A separate open is a different description of the same inode — the
-		// case a stat-based comparison could not tell apart.
+		// Different open file description, same inode (separate `open(2)`).
 		let other = std::fs::File::open("/dev/null").unwrap();
 
 		let Some(dup_is_same) = same_open_file(a.as_raw_fd(), dup.as_raw_fd()) else {
-			// No CONFIG_CHECKPOINT_RESTORE, or seccomp: the inode fallback
-			// applies and there is nothing to assert here.
+			// kcmp(2) unavailable — nothing to assert
 			return;
 		};
 		assert!(dup_is_same);
