@@ -1059,7 +1059,10 @@ impl VideoPipelineInner {
 						// Count this frame in flight; the consumer decrements when done.
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
-						if frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future)).is_err() {
+						if frame_ctx_tx
+							.blocking_send(ConsumerMessage::Frame(frame_context, future))
+							.is_err()
+						{
 							tracing::debug!("Packet consumer gone; stopping encoding loop.");
 							break;
 						}
