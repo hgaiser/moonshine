@@ -6,8 +6,8 @@
 mod dmabuf;
 mod hdr_sei;
 
-use std::sync::atomic::AtomicUsize;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use ash::vk;

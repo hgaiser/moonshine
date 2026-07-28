@@ -803,7 +803,9 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 		}
 	}
 
-	tracing::info!("Average pipeline breakdown (us/frame): additive stages; delta = total - accounted; queue_diag is included in enc_wait");
+	tracing::info!(
+		"Average pipeline breakdown (us/frame): additive stages; delta = total - accounted; queue_diag is included in enc_wait"
+	);
 	tracing::info!(
 		"  {:<8} {:<10} {:>6} {:<5} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>8} {:>10} {:>8} {:>8} {:>6}",
 		"label",
