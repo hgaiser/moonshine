@@ -232,6 +232,10 @@ See [TIPS.md](TIPS.md) for practical recipes and workarounds.
 
    This is currently not a supported feature and not a focus of Moonshine. If you are interested in adding support for this, feel free to open an issue or discuss on [Discord](https://discord.com/invite/moonlight-stream-352065098472488960).
 
+3. **How do I run the healthcheck?**
+
+   Run `moonshine healthcheck` to check GPU capabilities, codec support, and port availability. Pass `--config <path>` to also check configured ports and GPU preferences.
+
 ## Security
 
 Moonshine is **not designed for use on public networks**.
