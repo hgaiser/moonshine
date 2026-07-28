@@ -1,4 +1,5 @@
 use std::ffi::CStr;
+use std::io::IsTerminal;
 use std::io::Write;
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
@@ -88,6 +89,115 @@ impl HealthReport {
 	}
 }
 
+/// Return `(all_fatal_passed, fatal_count, warning_count)`.
+pub fn health_summary(report: &HealthReport) -> (bool, usize, usize) {
+	let fatal = report
+		.checks
+		.iter()
+		.filter(|c| c.outcome == CheckOutcome::Failed)
+		.count();
+	let warn = report
+		.checks
+		.iter()
+		.filter(|c| c.outcome == CheckOutcome::Warning)
+		.count();
+	(report.all_fatal_passed, fatal, warn)
+}
+
+pub fn log_health_report(report: &HealthReport) {
+	iter_checks(report, |outcome, name, msg| match outcome {
+		CheckOutcome::Passed => {
+			tracing::debug!("{:>15}  OK   {msg}", name);
+		},
+		CheckOutcome::Failed => {
+			tracing::error!("{:>15}  FAIL\n{msg}", name);
+		},
+		CheckOutcome::Warning => {
+			tracing::warn!("{:>15}  WARN\n{msg}", name);
+		},
+	});
+
+	let (passed, fatal, warn) = health_summary(report);
+	if passed {
+		if warn > 0 {
+			tracing::debug!(
+				"Health checks passed in {}ms ({} warnings).",
+				report.duration.as_millis(),
+				warn
+			);
+		} else {
+			tracing::debug!("Health checks passed in {}ms.", report.duration.as_millis());
+		}
+	} else {
+		tracing::error!(
+			"Health checks FAILED in {}ms ({} errors, {} warnings). Fix issues above or use --no-health-check.",
+			report.duration.as_millis(),
+			fatal,
+			warn,
+		);
+	}
+}
+
+/// Invoke `f` for every check with its outcome, name and message.
+fn iter_checks(report: &HealthReport, mut f: impl FnMut(CheckOutcome, &str, &str)) {
+	for check in &report.checks {
+		f(check.outcome, check.name, &check.message);
+	}
+}
+
+
+/// Run the health check and log the results to the console.
+pub fn print_health_report(report: &HealthReport) {
+	let tty = std::io::stdout().is_terminal();
+	let (red, green, yellow, reset) = if tty {
+		("\x1b[31m", "\x1b[32m", "\x1b[33m", "\x1b[m")
+	} else {
+		("", "", "", "")
+	};
+
+	iter_checks(report, |outcome, name, msg| match outcome {
+		CheckOutcome::Passed => {
+			println!("  {green}OK{reset}    {:>15}  {msg}", name);
+		},
+		CheckOutcome::Failed => {
+			println!("  {red}FAIL{reset}  {:>15}", name);
+			for line in msg.lines() {
+				println!("        {line}");
+			}
+		},
+		CheckOutcome::Warning => {
+			println!("  {yellow}WARN{reset}  {:>15}", name);
+			for line in msg.lines() {
+				println!("        {line}");
+			}
+		},
+	});
+
+	let (passed, fatal, warn) = health_summary(report);
+	println!();
+	if passed {
+		if warn > 0 {
+			println!(
+				"{green}Health checks passed{reset} in {}ms ({} warnings).",
+				report.duration.as_millis(),
+				warn
+			);
+		} else {
+			println!(
+				"{green}All health checks passed{reset} in {}ms.",
+				report.duration.as_millis()
+			);
+		}
+	} else {
+		println!(
+			"{red}Health checks FAILED{reset} in {}ms ({} errors, {} warnings).",
+			report.duration.as_millis(),
+			fatal,
+			warn,
+		);
+	}
+}
+
 /// Probe GPU capabilities and HDR support without the full health check.
 ///
 /// Runs the render-node, EGL, Vulkan, codec and DMA-BUF probes and records
@@ -164,7 +274,6 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 	// --- External dependencies ---
 
 	check_xwayland(&mut report);
-	check_dbus(&mut report);
 	check_xdg_runtime(&mut report);
 	check_inhibit(&mut report);
 
@@ -598,25 +707,6 @@ fn check_xwayland(report: &mut HealthReport) {
 			report.add_warn(
 				"Xwayland",
 				"  Xwayland not found in PATH.\n  Ubuntu: `sudo apt install xwayland`\n  Fedora: `sudo dnf install xorg-x11-server-Xwayland`\n  Arch: `sudo pacman -S xorg-x11-server`".into(),
-				start.elapsed().as_millis() as u64,
-			);
-		},
-	}
-}
-
-fn check_dbus(report: &mut HealthReport) {
-	let start = Instant::now();
-	match zbus::blocking::Connection::session() {
-		Ok(_conn) => {
-			let addr = std::env::var("DBUS_SESSION_BUS_ADDRESS").unwrap_or_else(|_| "unset".into());
-			report.add_passed("D-Bus", addr, start.elapsed().as_millis() as u64);
-		},
-		Err(e) => {
-			report.add_failed(
-				"D-Bus",
-				format!(
-					"  Cannot connect to D-Bus session bus: {e}\n  Ensure DBUS_SESSION_BUS_ADDRESS is set and a session bus is running.\n  Usually: export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus\n  For headless operation run: `sudo loginctl enable-linger $USER`"
-				),
 				start.elapsed().as_millis() as u64,
 			);
 		},

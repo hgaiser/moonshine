@@ -13,10 +13,10 @@ edition = "2021"
 [dependencies]
 async-shutdown = "0.2.2"
 clap = { version = "4.6.1", features = ["derive"] }
-is-terminal = "0.4.17"
 moonshine-core = { path = "moonshine-core" }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal", "sync", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+zbus = "5.18.0"
 
 
