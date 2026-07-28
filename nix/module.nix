@@ -133,13 +133,12 @@ in
 
     # Group that opt-in users join so the suspend-inhibit polkit rule
     # (shipped in the package) lets Moonshine hold a block-type sleep
-    # inhibitor. See TIPS.md.
+    # inhibitor. See TIPS.md. The rule itself needs no wiring here: nixpkgs
+    # builds polkit with --datadir=/run/current-system/sw/share and its module
+    # links /share/polkit-1 into the system path, so
+    # share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules is picked up
+    # from environment.systemPackages above.
     users.groups.moonshine = { };
-
-    # Allow the 'moonshine' group to acquire a block-type sleep inhibitor.
-    security.polkit.extraPolicies = [
-      "${cfg.package}/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules"
-    ];
 
     # Virtual input backends used by inputtino (upstream ships this as a
     # modules-load.d drop-in).
