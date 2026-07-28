@@ -385,7 +385,7 @@ impl Drop for DmaBufImporter {
 
 #[cfg(test)]
 mod tests {
-	use super::{same_open_file, DmaBufPlane, ImportParams};
+	use super::{DmaBufPlane, ImportParams, same_open_file};
 	use ash::vk;
 	use std::os::fd::AsRawFd;
 
