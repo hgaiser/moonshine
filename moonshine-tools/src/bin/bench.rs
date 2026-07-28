@@ -620,13 +620,7 @@ async fn run_benchmark(
 	}
 
 	tracing::info!("Triggering video and audio pipelines...");
-	// notify_waiters() only wakes tasks already parked on notified(); right after
-	// start_session() the pipeline/encoder threads and packet-handler tasks may not
-	// have parked yet. Re-trigger briefly to close that startup race.
-	for _ in 0..5 {
-		session_manager.trigger_streams_start().await;
-		tokio::time::sleep(Duration::from_millis(100)).await;
-	}
+	session_manager.trigger_streams_start().await;
 
 	// Send PING to the video socket so the packet handler learns the client
 	// address and actually transmits encoded frames over UDP (otherwise all
