@@ -173,6 +173,63 @@ pub(crate) struct ColorRepresentationSurfaceData {
 // Compositor-level color management state
 // ---------------------------------------------------------------------------
 
+/// Mastering metadata from `vkSetHdrMetadataEXT`, in raw protocol units.
+///
+/// Holds no transfer function or primaries, so it cannot imply a color space.
+/// [`HdrMetadata`] is the u16 wire form sent to the Moonlight client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MasteringMetadata {
+	max_cll: u32,
+	max_fall: u32,
+	mastering_luminance: (u32, u32),
+	mastering_primaries: [(u32, u32); 3],
+	white_point: (u32, u32),
+}
+
+impl MasteringMetadata {
+	/// Whether the values describe a real mastering display.
+	///
+	/// Gamescope: `gamescope_swapchain_set_hdr_metadata()`
+	fn is_plausible(self) -> bool {
+		self.max_cll != 0 && self.max_fall != 0 && (self.white_point.0 != 0 || self.white_point.1 != 0)
+	}
+
+	fn apply_to(self, desc: &mut ImageDescription) {
+		desc.max_cll = Some(self.max_cll);
+		desc.max_fall = Some(self.max_fall);
+		desc.mastering_luminance = Some(self.mastering_luminance);
+		desc.mastering_primaries = Some(self.mastering_primaries);
+		desc.white_point = Some(self.white_point);
+	}
+}
+
+/// Color state a surface declared through the swapchain protocol.
+///
+/// `swapchain_feedback` owns the colorspace and `vkSetHdrMetadataEXT` the
+/// metadata. They arrive in either order, and metadata alone yields no image
+/// description, so an SDR swapchain can never be read as BT.2020+PQ.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct SwapchainColor {
+	colorspace: Option<(TransferFunction, Primaries)>,
+	metadata: Option<MasteringMetadata>,
+}
+
+impl SwapchainColor {
+	fn to_image_description(self) -> Option<ImageDescription> {
+		let (transfer_function, primaries) = self.colorspace?;
+		// `srgb()` only supplies the empty metadata fields here.
+		let mut desc = ImageDescription {
+			transfer_function,
+			primaries,
+			..ImageDescription::srgb()
+		};
+		if let Some(metadata) = self.metadata {
+			metadata.apply_to(&mut desc);
+		}
+		Some(desc)
+	}
+}
+
 /// Tracks per-surface color space declarations.
 pub(crate) struct ColorManagementState {
 	/// Pending image description per surface (applied on next commit).
@@ -180,7 +237,7 @@ pub(crate) struct ColorManagementState {
 	/// Current (committed) image description per surface.
 	current: HashMap<WlSurface, ImageDescription>,
 	/// Current image description per surface from gamescope/moonshine swapchain.
-	gamescope_current: HashMap<WlSurface, ImageDescription>,
+	gamescope_current: HashMap<WlSurface, SwapchainColor>,
 	/// Whether HDR mode was negotiated with the Moonlight client.
 	pub hdr: bool,
 }
@@ -215,52 +272,27 @@ impl ColorManagementState {
 		self.pending.insert(surface.clone(), Some(desc));
 	}
 
-	/// Update only the transfer function and primaries of a surface's gamescope
-	/// color description, **preserving** any HDR mastering metadata previously
-	/// set via [`set_gamescope_hdr_metadata`] (i.e. `vkSetHdrMetadataEXT`).
-	///
-	/// `swapchain_feedback` reports the swapchain color space but carries no
-	/// mastering metadata. Replacing the whole description from that path would
-	/// reset `max_cll`/`max_fall`/mastering luminance to `None`, discarding the
-	/// values the game provided through `vkSetHdrMetadataEXT` — which can arrive
-	/// before the colorspace event. Preserving them here ensures the client
-	/// receives the game's real HDR10 metadata instead of a generic fallback.
-	///
-	/// [`set_gamescope_hdr_metadata`]: Self::set_gamescope_hdr_metadata
+	/// Gamescope: `swapchain_feedback` carries the color space only.
 	pub fn set_gamescope_colorspace(
 		&mut self,
 		surface: &WlSurface,
 		transfer_function: TransferFunction,
 		primaries: Primaries,
 	) {
-		let desc = self
-			.gamescope_current
-			.entry(surface.clone())
-			.or_insert_with(ImageDescription::srgb);
-		desc.transfer_function = transfer_function;
-		desc.primaries = primaries;
+		let entry = self.gamescope_current.entry(surface.clone()).or_default();
+		entry.colorspace = Some((transfer_function, primaries));
 		tracing::debug!(
 			surface_id = ?surface.id(),
-			color_space = ?desc.to_frame_color_space(),
-			has_metadata = desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some(),
-			"set_gamescope_colorspace (preserving metadata)"
+			color_space = ?entry.to_image_description().map(ImageDescription::to_frame_color_space),
+			has_metadata = entry.metadata.is_some(),
+			"set_gamescope_colorspace"
 		);
 	}
 
-	/// Update only the HDR mastering metadata of a surface's gamescope color
-	/// description, **preserving** the transfer function and primaries
-	/// previously set via [`set_gamescope_colorspace`].
+	/// Record a surface's HDR mastering metadata.
 	///
-	/// This is the mirror image of [`set_gamescope_colorspace`]:
-	/// `vkSetHdrMetadataEXT` carries only mastering metadata, while the
-	/// transfer function is determined by the swapchain color space. Games
-	/// like Cyberpunk 2077 set HDR metadata *after* their scRGB swapchain is
-	/// created; replacing the whole description here would mislabel the linear
-	/// scRGB buffers as PQ-encoded (over-saturating the stream). When no color
-	/// space has been declared yet, defaults to BT.2020+PQ — the DXVK HDR10
-	/// path, where the swapchain blitter outputs genuinely PQ-encoded data.
-	///
-	/// [`set_gamescope_colorspace`]: Self::set_gamescope_colorspace
+	/// `vkSetHdrMetadataEXT` carries no transfer function, so this never affects
+	/// which color space the surface is in.
 	pub fn set_gamescope_hdr_metadata(
 		&mut self,
 		surface: &WlSurface,
@@ -270,21 +302,32 @@ impl ColorManagementState {
 		mastering_primaries: [(u32, u32); 3],
 		white_point: (u32, u32),
 	) {
-		let desc = self
-			.gamescope_current
-			.entry(surface.clone())
-			.or_insert_with(ImageDescription::bt2020_pq);
-		desc.max_cll = Some(max_cll);
-		desc.max_fall = Some(max_fall);
-		desc.mastering_luminance = Some(mastering_luminance);
-		desc.mastering_primaries = Some(mastering_primaries);
-		desc.white_point = Some(white_point);
-		tracing::debug!(
-			surface_id = ?surface.id(),
-			color_space = ?desc.to_frame_color_space(),
+		let metadata = MasteringMetadata {
 			max_cll,
 			max_fall,
-			"set_gamescope_hdr_metadata (preserving colorspace)"
+			mastering_luminance,
+			mastering_primaries,
+			white_point,
+		};
+		if !metadata.is_plausible() {
+			tracing::debug!(
+				surface_id = ?surface.id(),
+				max_cll,
+				max_fall,
+				?white_point,
+				"set_gamescope_hdr_metadata: implausible metadata, discarding"
+			);
+			return;
+		}
+
+		let entry = self.gamescope_current.entry(surface.clone()).or_default();
+		entry.metadata = Some(metadata);
+		tracing::debug!(
+			surface_id = ?surface.id(),
+			color_space = ?entry.to_image_description().map(ImageDescription::to_frame_color_space),
+			max_cll,
+			max_fall,
+			"set_gamescope_hdr_metadata"
 		);
 	}
 
@@ -333,7 +376,12 @@ impl ColorManagementState {
 	/// declares an HDR color space. Gamescope swapchain declarations are checked
 	/// before wp_color_management declarations within each pass.
 	pub fn frame_color_space(&self) -> FrameColorSpace {
-		let color_spaces = || self.gamescope_current.values().chain(self.current.values());
+		let color_spaces = || {
+			self.gamescope_current
+				.values()
+				.filter_map(|c| c.to_image_description())
+				.chain(self.current.values().copied())
+		};
 
 		// First pass: prefer already-encoded BT.2020+PQ (passthrough).
 		if color_spaces().any(|desc| desc.to_frame_color_space() == FrameColorSpace::Bt2020Pq) {
@@ -362,7 +410,8 @@ impl ColorManagementState {
 		let desc = self
 			.gamescope_current
 			.values()
-			.chain(self.current.values())
+			.filter_map(|c| c.to_image_description())
+			.chain(self.current.values().copied())
 			.filter(|desc| desc.to_frame_color_space() != FrameColorSpace::Srgb)
 			.find(|desc| desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some())?;
 		// Clamp u32 protocol values to u16 range for the Moonlight HDR metadata.
@@ -953,11 +1002,95 @@ impl Dispatch<wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1
 
 #[cfg(test)]
 mod tests {
-	use super::{FrameColorSpace, ImageDescription, Primaries, TransferFunction};
+	use super::{FrameColorSpace, ImageDescription, MasteringMetadata, Primaries, SwapchainColor, TransferFunction};
+
+	fn mastering_metadata() -> MasteringMetadata {
+		MasteringMetadata {
+			max_cll: 2000,
+			max_fall: 500,
+			mastering_luminance: (0, 1200),
+			mastering_primaries: [(1, 2), (3, 4), (5, 6)],
+			white_point: (7, 8),
+		}
+	}
+
+	/// The reported bug: an SDR swapchain that sets metadata must not end up
+	/// described as BT.2020+PQ.
+	#[test]
+	fn metadata_without_a_color_space_describes_nothing() {
+		let color = SwapchainColor {
+			colorspace: None,
+			metadata: Some(mastering_metadata()),
+		};
+
+		assert_eq!(color.to_image_description(), None);
+	}
+
+	#[test]
+	fn color_space_without_metadata_describes_itself() {
+		let color = SwapchainColor {
+			colorspace: Some((TransferFunction::St2084Pq, Primaries::Bt2020)),
+			metadata: None,
+		};
+
+		let desc = color.to_image_description().expect("color space was declared");
+		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::Bt2020Pq);
+		assert_eq!(desc.max_cll, None);
+	}
+
+	/// DXVK's HDR10 path: metadata attaches to the declared space, and does not
+	/// pick one of its own.
+	#[test]
+	fn metadata_attaches_to_the_declared_color_space() {
+		let color = SwapchainColor {
+			colorspace: Some((TransferFunction::ScrgbLinear, Primaries::Srgb)),
+			metadata: Some(mastering_metadata()),
+		};
+
+		let desc = color.to_image_description().expect("color space was declared");
+		assert_eq!(desc.to_frame_color_space(), FrameColorSpace::ScrgbLinear);
+		assert_eq!(desc.max_cll, Some(2000));
+		assert_eq!(desc.max_fall, Some(500));
+		assert_eq!(desc.mastering_luminance, Some((0, 1200)));
+		assert_eq!(desc.mastering_primaries, Some([(1, 2), (3, 4), (5, 6)]));
+		assert_eq!(desc.white_point, Some((7, 8)));
+	}
 
 	#[test]
 	fn srgb_helper_maps_to_srgb_frame_color_space() {
 		assert_eq!(ImageDescription::srgb().to_frame_color_space(), FrameColorSpace::Srgb);
+	}
+
+	#[test]
+	fn implausible_mastering_metadata_is_rejected() {
+		assert!(mastering_metadata().is_plausible());
+
+		let zero_cll = MasteringMetadata {
+			max_cll: 0,
+			..mastering_metadata()
+		};
+		let zero_fall = MasteringMetadata {
+			max_fall: 0,
+			..mastering_metadata()
+		};
+		let zero_white_point = MasteringMetadata {
+			white_point: (0, 0),
+			..mastering_metadata()
+		};
+
+		assert!(!zero_cll.is_plausible());
+		assert!(!zero_fall.is_plausible());
+		assert!(!zero_white_point.is_plausible());
+	}
+
+	/// One non-zero coordinate is still a coordinate.
+	#[test]
+	fn partially_zero_white_point_is_plausible() {
+		let half = MasteringMetadata {
+			white_point: (0, 8),
+			..mastering_metadata()
+		};
+		assert!(half.is_plausible());
 	}
 
 	#[test]
