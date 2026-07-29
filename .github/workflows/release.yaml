@@ -80,6 +80,35 @@ jobs:
           nfpm package --config nfpm.yaml --packager "$fmt" --target .
         done
 
+    - name: Build sysext squashfs image
+      run: |
+        sudo apt-get install -y squashfs-tools
+        S="$RUNNER_TEMP/sysext"
+        mkdir -p "$S/usr/bin" \
+                 "$S/usr/lib/moonshine/vulkan-layers" \
+                 "$S/usr/lib/udev/rules.d" \
+                 "$S/usr/lib/modules-load.d" \
+                 "$S/usr/lib/systemd/system" \
+                 "$S/usr/lib/sysusers.d" \
+                 "$S/usr/lib/extension-release.d" \
+                 "$S/usr/share/vulkan/implicit_layer.d" \
+                 "$S/usr/share/polkit-1/rules.d" \
+                 "$S/usr/share/licenses/moonshine"
+        cp ./target/release/moonshine "$S/usr/bin/"
+        cp ./target/release/libmoonshine_wsi.so "$S/usr/lib/moonshine/vulkan-layers/"
+        cp ./dist/start-moonshine.sh "$S/usr/bin/"
+        cp ./dist/moonshine-install.sh "$S/usr/bin/"
+        cp ./dist/60-moonshine.rules "$S/usr/lib/udev/rules.d/"
+        cp ./dist/moonshine-modules.conf "$S/usr/lib/modules-load.d/"
+        cp ./dist/moonshine@.service "$S/usr/lib/systemd/system/"
+        cp ./dist/moonshine-sysusers.conf "$S/usr/lib/sysusers.d/"
+        cp ./dist/VkLayer_moonshine_wsi.json "$S/usr/share/vulkan/implicit_layer.d/"
+        cp ./dist/50-moonshine-inhibit-sleep.rules "$S/usr/share/polkit-1/rules.d/"
+        cp ./LICENSE "$S/usr/share/licenses/moonshine/"
+        echo "ID=_any" > "$S/usr/lib/extension-release.d/extension-release.moonshine"
+        mksquashfs "$S" "moonshine-${{ steps.tag.outputs.tag }}-x86_64.raw" \
+          -all-root -noappend -comp zstd
+
     - name: Release
       uses: softprops/action-gh-release@v2
       if: steps.tag.outputs.tag != ''
@@ -89,3 +118,4 @@ jobs:
           ./moonshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst
           ./moonshine_*.deb
           ./moonshine-*.rpm
+          ./moonshine-${{ steps.tag.outputs.tag }}-x86_64.raw
