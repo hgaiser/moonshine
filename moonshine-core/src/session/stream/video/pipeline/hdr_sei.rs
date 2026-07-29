@@ -138,7 +138,7 @@ fn build_av1_cll_obu(m: &HdrMetadata) -> Vec<u8> {
 	payload.extend(m.max_cll.to_be_bytes());
 	payload.extend(m.max_fall.to_be_bytes());
 
-	build_av1_obu(5, &payload) // obu_type = OBU_METADATA = 5
+	build_av1_metadata_obu(&payload)
 }
 
 /// Build AV1 OBU metadata for HDR MDCV (metadata_type = 2).
@@ -158,22 +158,24 @@ fn build_av1_mdcv_obu(m: &HdrMetadata) -> Vec<u8> {
 	payload.extend(m.max_luminance.to_be_bytes());
 	payload.extend(m.min_luminance.to_be_bytes());
 
-	build_av1_obu(5, &payload) // obu_type = OBU_METADATA = 5
+	build_av1_metadata_obu(&payload)
 }
 
-/// Build a complete AV1 OBU with header and size.
-fn build_av1_obu(obu_type: u8, payload: &[u8]) -> Vec<u8> {
-	// OBU header byte: obu_forbidden_bit (1) = 0, obu_type (4), obu_extension_flag (1) = 0,
-	// obu_has_size_field (1) = 1, obu_reserved_1bit (1) = 0.
-	let header_byte = (obu_type << 3) | 0x02; // has_size = 1
+/// Build a complete AV1 metadata OBU (type 5) with header, size and trailing
+/// bits.
+fn build_av1_metadata_obu(payload: &[u8]) -> Vec<u8> {
+	// OBU header byte: obu_forbidden_bit (1) = 0, obu_type (4) = 5 (OBU_METADATA),
+	// obu_extension_flag (1) = 0, obu_has_size_field (1) = 1, obu_reserved_1bit (1) = 0.
+	const OBU_METADATA_HEADER: u8 = (5 << 3) | 0x02;
 
+	// AV1 spec 5.3.1: a metadata OBU ends with `trailing_bits`, counted in
+	// `obu_size`. The payloads here are byte-aligned, so that is a single stop
+	// byte, the same `0x80` the H.26x SEI path appends.
 	let mut obu = Vec::new();
-	obu.push(header_byte);
-
-	// Size field (leb128-encoded payload length).
-	leb128_encode(&mut obu, payload.len() as u64);
-
+	obu.push(OBU_METADATA_HEADER);
+	leb128_encode(&mut obu, (payload.len() + 1) as u64);
 	obu.extend_from_slice(payload);
+	obu.push(0x80);
 	obu
 }
 
@@ -531,12 +533,48 @@ mod tests {
 	#[test]
 	fn test_av1_obu_structure() {
 		let m = test_metadata();
-		let cll_obu = build_av1_cll_obu(&m);
+		const METADATA_OBU_HEADER: u8 = (5 << 3) | 0x02;
 
-		// OBU header: type=5 (metadata), has_size=1.
-		assert_eq!(cll_obu[0], (5 << 3) | 0x02);
+		// header, size=6, metadata_type=1, max_cll=1000, max_fall=400, stop byte.
+		assert_eq!(
+			build_av1_cll_obu(&m),
+			vec![METADATA_OBU_HEADER, 6, 1, 0x03, 0xE8, 0x01, 0x90, 0x80]
+		);
 
 		let mdcv_obu = build_av1_mdcv_obu(&m);
-		assert_eq!(mdcv_obu[0], (5 << 3) | 0x02);
+		assert_eq!(mdcv_obu[0], METADATA_OBU_HEADER);
+		assert_eq!(mdcv_obu[2], 2, "metadata_type = METADATA_TYPE_HDR_MDCV");
+		assert_eq!(*mdcv_obu.last().unwrap(), 0x80, "trailing bits");
+	}
+
+	/// `obu_size` counts the trailing bits, so a decoder that trusts it reads
+	/// the whole OBU and no more.
+	#[test]
+	fn test_av1_obu_size_matches_payload() {
+		let m = test_metadata();
+		for obu in [build_av1_cll_obu(&m), build_av1_mdcv_obu(&m)] {
+			let (size, size_bytes) = leb128_decode(&obu[1..]);
+			assert_eq!(size as usize, obu.len() - 1 - size_bytes);
+		}
+	}
+
+	/// AV1 metadata must precede the frame it describes.
+	#[test]
+	fn test_inject_av1_inserts_before_frame_obu() {
+		let m = test_metadata();
+		// Temporal delimiter (type 2, size 0) then a frame OBU (type 6).
+		let td = [0x12u8, 0x00];
+		let frame = [0x32u8, 0x02, 0xAA, 0xBB];
+		let data: Vec<u8> = td.iter().chain(frame.iter()).copied().collect();
+
+		let out = inject_av1_metadata(&data, &m);
+		let mdcv = build_av1_mdcv_obu(&m);
+		let cll = build_av1_cll_obu(&m);
+
+		let mut expected = td.to_vec();
+		expected.extend_from_slice(&mdcv);
+		expected.extend_from_slice(&cll);
+		expected.extend_from_slice(&frame);
+		assert_eq!(out, expected);
 	}
 }
