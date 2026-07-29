@@ -465,6 +465,12 @@ struct VideoPipelineInner {
 	keys_rx: SessionKeysReceiver,
 }
 
+/// Whether a color description carries the PQ transfer function, which is what
+/// makes the stream HDR. The luma range is independent of it.
+fn is_hdr(desc: ColorDescription) -> bool {
+	desc.transfer_characteristics == ColorDescription::bt2020_pq().transfer_characteristics
+}
+
 impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run(
@@ -558,8 +564,14 @@ impl VideoPipelineInner {
 
 		// Select color description for VUI signaling.
 		let color_description = match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription::bt709(),
-			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq(),
+			VideoDynamicRange::Sdr => ColorDescription {
+				full_range: ctx.full_range,
+				..ColorDescription::bt709()
+			},
+			VideoDynamicRange::Hdr => ColorDescription {
+				full_range: ctx.full_range,
+				..ColorDescription::bt2020_pq()
+			},
 		};
 
 		// Create encode configuration.
@@ -689,8 +701,14 @@ impl VideoPipelineInner {
 		// color_desc differs, we call set_color_description() to update
 		// the SPS/sequence header.
 		let mut encoder_color_desc: Option<ColorDescription> = Some(match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription::bt709(),
-			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq(),
+			VideoDynamicRange::Sdr => ColorDescription {
+				full_range: ctx.full_range,
+				..ColorDescription::bt709()
+			},
+			VideoDynamicRange::Hdr => ColorDescription {
+				full_range: ctx.full_range,
+				..ColorDescription::bt2020_pq()
+			},
 		});
 
 		while !stop_session_manager.is_shutdown_triggered() {
@@ -780,6 +798,11 @@ impl VideoPipelineInner {
 						match encoder.encode(encoder.input_image()) {
 							Ok(future) => {
 								let submitted_at = std::time::Instant::now();
+								// Deliberately still a whole-struct comparison, unlike the
+								// control-stream check above. Correcting it newly enables
+								// AV1 metadata injection for full-range clients, and that
+								// produces streams Moonlight cannot decode. Left until the
+								// AV1 path is fixed.
 								let inject_hdr = encoder_color_desc == Some(ColorDescription::bt2020_pq());
 								let frame_context = FrameContext {
 									created_at: now,
@@ -919,8 +942,8 @@ impl VideoPipelineInner {
 					Some(conv) => conv,
 					None => {
 						let (color_space, full_range) = match ctx.dynamic_range {
-							VideoDynamicRange::Sdr => (ColorSpace::Bt709, false),
-							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, false),
+							VideoDynamicRange::Sdr => (ColorSpace::Bt709, ctx.full_range),
+							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, ctx.full_range),
 						};
 						let mut config =
 							ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
@@ -951,20 +974,29 @@ impl VideoPipelineInner {
 					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
 						FrameColorSpace::Srgb => (
 							ColorSpace::Bt709,
-							false,
-							ColorDescription::bt709(),
+							ctx.full_range,
+							ColorDescription {
+								full_range: ctx.full_range,
+								..ColorDescription::bt709()
+							},
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::Bt2020Pq => (
 							ColorSpace::Bt2020,
-							false,
-							ColorDescription::bt2020_pq(),
+							ctx.full_range,
+							ColorDescription {
+								full_range: ctx.full_range,
+								..ColorDescription::bt2020_pq()
+							},
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::ScrgbLinear => (
 							ColorSpace::Bt709LinearToBt2020Pq,
-							false,
-							ColorDescription::bt2020_pq(),
+							ctx.full_range,
+							ColorDescription {
+								full_range: ctx.full_range,
+								..ColorDescription::bt2020_pq()
+							},
 							SCRGB_REFERENCE_WHITE_NITS,
 						),
 					};
@@ -1010,7 +1042,7 @@ impl VideoPipelineInner {
 				// In HDR sessions, `enabled` reflects whether the current
 				// frame is encoded as BT.2020+PQ (true) or BT.709 (false).
 				if ctx.dynamic_range == VideoDynamicRange::Hdr {
-					let hdr_enabled = encoder_color_desc == Some(ColorDescription::bt2020_pq());
+					let hdr_enabled = encoder_color_desc.is_some_and(is_hdr);
 					let new_state = HdrModeState {
 						enabled: hdr_enabled,
 						metadata: frame.hdr_metadata,
@@ -1044,6 +1076,11 @@ impl VideoPipelineInner {
 						// Hand this frame's context plus its packet future to the
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
+						// Deliberately still a whole-struct comparison, unlike the
+						// control-stream check above. Correcting it newly enables
+						// AV1 metadata injection for full-range clients, and that
+						// produces streams Moonlight cannot decode. Left until the
+						// AV1 path is fixed.
 						let inject_hdr = encoder_color_desc == Some(ColorDescription::bt2020_pq());
 						let frame_context = FrameContext {
 							created_at: frame.created_at,
@@ -1101,9 +1138,25 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
-	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost};
+	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost, is_hdr};
 	use ash::vk;
-	use pixelforge::{InputFormat, PixelForgeError};
+	use pixelforge::{ColorDescription, InputFormat, PixelForgeError};
+
+	/// The client's requested luma range must not change whether the stream
+	/// counts as HDR.
+	#[test]
+	fn hdr_is_decided_by_the_transfer_function_not_the_range() {
+		for full_range in [false, true] {
+			assert!(is_hdr(ColorDescription {
+				full_range,
+				..ColorDescription::bt2020_pq()
+			}));
+			assert!(!is_hdr(ColorDescription {
+				full_range,
+				..ColorDescription::bt709()
+			}));
+		}
+	}
 
 	// DRM fourccs — kept in the test module to document the byte ordering
 	// explicitly and guard against accidental typos in the production match.

@@ -172,6 +172,10 @@ pub struct VideoStreamContext {
 
 	/// Whether the client has enabled video encryption.
 	pub encrypt_video: bool,
+
+	/// Whether the client asked for full-range (0-255) rather than
+	/// limited-range (16-235) luma.
+	pub full_range: bool,
 }
 
 /// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
