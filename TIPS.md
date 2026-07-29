@@ -40,7 +40,6 @@ Note that this closes your desktop Steam session when a stream starts.
 ### How to
 
 Make sure your user is in the `moonshine` group: `sudo usermod -aG moonshine $USER`.
-Log out and back in for the new membership to take effect.
 Moonshine then blocks sleep automatically for the duration of every stream — nothing else is required.
 If you want to disable this, set `inhibit_sleep = false` at the top of your configuration:
 
@@ -62,28 +61,25 @@ If the user is not in the `moonshine` group (and has no active session), Moonshi
 ### How to
 
 Install the `gamemode` package for your distribution.
-Wrap your application's `command` with `gamemoderun` so the optimizations run for the whole streaming session and are cleaned up automatically when it exits.
+Then for each Steam game you want to optimize (or globally in Steam's launch options), set the game's launch option to:
 
-```toml
-[[application]]
-title = "Steam"
-command = ["gamemoderun", "/usr/bin/steam", "steam://open/bigpicture"]
+```
+gamemoderun %command%
 ```
 
-For individual games launched via the Steam scanner you can do the same on the scanner's `command`:
-
-```toml
-[[application_scanner]]
-type = "steam"
-library = "$HOME/.local/share/Steam"
-command = ["gamemoderun", "/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
-```
+Do **not** use `gamemoderun` with Steam anywhere in Moonshine's configuration, since that launches Steam itself under `LD_PRELOAD`, which leaks into Steam's child processes and can prevent the session from launching.
 
 ### Details
 
 [GameMode](https://github.com/FeralInteractive/gamemode) applies a set of temporary system optimizations (CPU governor, I/O priority, scheduler tweaks, etc.) while a game is running, then reverts them when it exits.
 GameMode consists of a daemon (`gamemoded`) and a client library; `gamemoderun` asks the daemon to enable optimizations for the process it launches.
 The daemon is normally started automatically via D-Bus the first time a game requests it, so no manual step is needed beyond installing the package — you can verify it with `gamemoded -t`.
+
+### Requirements
+
+Make sure your user is in the `gamemode` group: `sudo usermod -aG gamemode $USER`.
+Without it, `gamemoderun` will not be able to communicate with the daemon and will silently skip applying optimizations.
+
 If the daemon is not installed or not running, `gamemoderun` simply launches the game without applying any optimizations.
 
 ## Run Flatpak Steam inside Moonshine's compositor
