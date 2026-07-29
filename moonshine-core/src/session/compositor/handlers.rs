@@ -420,6 +420,21 @@ impl MoonshineCompositor {
 			.cloned()
 	}
 
+	/// Find a `Window` by its X11 surface.
+	///
+	/// X11 counterpart to [`Self::find_window_by_surface`].
+	fn find_window_by_x11_surface(&self, window: &X11Surface) -> Option<Window> {
+		self.space
+			.elements()
+			.find(|w| w.x11_surface().map(|x| x == window).unwrap_or(false))
+			.cloned()
+	}
+
+	/// The output rectangle, which every fullscreen window is held at.
+	fn output_rect(&self) -> Rectangle<i32, Logical> {
+		Rectangle::new((0, 0).into(), (self.width as i32, self.height as i32).into())
+	}
+
 	/// Helper to read an X11 window property via `X11Focus`, returning a
 	/// default value when X11 focus infrastructure is not available.
 	///
@@ -478,6 +493,30 @@ impl MoonshineCompositor {
 			}
 		}
 		false
+	}
+
+	/// Apply a fullscreen state change requested by an X11 client.
+	///
+	/// Smithay's `XwmHandler` defaults are no-ops, so without this
+	/// `_NET_WM_STATE_FULLSCREEN` is never set and clients that wait for the
+	/// transition stall. `reevaluate_focus` then applies the geometry.
+	///
+	/// Gamescope: `handle_net_wm_state()`
+	fn set_x11_fullscreen(&mut self, window: &X11Surface, fullscreen: bool) {
+		if let Err(e) = window.set_fullscreen(fullscreen) {
+			tracing::warn!("Failed to set X11 fullscreen state: {e}");
+			return;
+		}
+
+		// `refresh_metadata` never re-reads this, so map time is otherwise the
+		// only point it is set. `skip_and_not_fullscreen()` ranks focus on it.
+		if let Some(elem) = self.find_window_by_x11_surface(window)
+			&& let Some(meta) = self.window_metadata.get_mut(&elem)
+		{
+			meta.fullscreen = fullscreen;
+		}
+
+		self.reevaluate_focus();
 	}
 
 	/// Build WindowMetadata from an X11 surface for focus priority decisions.
@@ -1100,7 +1139,8 @@ impl MoonshineCompositor {
 	/// 2. `classify_special_windows()` — overlay/notification/etc. classification
 	/// 3. `build_candidates()` — filter and collect candidate windows
 	/// 4. Steam control override + priority sort
-	/// 5. `apply_focus()` — set keyboard/pointer focus, activation
+	/// 5. `enforce_fullscreen_geometry()` — hold the winner at the output size
+	/// 6. `apply_focus()` — set keyboard/pointer focus, activation
 	pub fn reevaluate_focus(&mut self) {
 		// Mark focus as dirty before recalculating.
 		self.focus_state.mark_dirty();
@@ -1214,8 +1254,45 @@ impl MoonshineCompositor {
 		// Transient child promotion.
 		let best = self.promote_transient_child(best);
 
-		// Step 5: Apply focus (keyboard/pointer target, activation, Smithay seat).
+		// Step 5: Hold the focused fullscreen window at the output size.
+		self.enforce_fullscreen_geometry(&best);
+
+		// Step 6: Apply focus (keyboard/pointer target, activation, Smithay seat).
 		self.apply_focus(&best);
+	}
+
+	/// Resize the focused window to the output when it should be fullscreen.
+	///
+	/// Correcting geometry here rather than refusing the client's
+	/// `ConfigureRequest` fixes a wrong-sized window whatever caused it.
+	///
+	/// Gamescope: `determine_and_apply_focus()`
+	fn enforce_fullscreen_geometry(&self, window: &Window) {
+		let Some(meta) = self.window_metadata.get(window) else {
+			return;
+		};
+		if !meta.has_game_id() || !meta.is_fullscreen() {
+			return;
+		}
+
+		let Some(x11) = window.x11_surface() else {
+			return;
+		};
+		let geo = self.output_rect();
+		if x11.geometry().size == geo.size {
+			return;
+		}
+
+		tracing::debug!(
+			target: "focus",
+			window_id = x11.window_id(),
+			current = ?x11.geometry().size,
+			output = ?geo.size,
+			"Resizing focused fullscreen window to output size"
+		);
+		if let Err(e) = x11.configure(geo) {
+			tracing::warn!("Failed to resize fullscreen X11 window: {e}");
+		}
 	}
 
 	/// Walk the transient-for chain of children to find a non-dropdown
@@ -1336,7 +1413,7 @@ impl XdgShellHandler for MoonshineCompositor {
 		let meta = WindowMetadata {
 			app_id,
 			map_sequence: self.map_sequence_counter,
-			geometry: Rectangle::new((0, 0).into(), (self.width as i32, self.height as i32).into()),
+			geometry: self.output_rect(),
 			fullscreen,
 			..Default::default()
 		};
@@ -1805,7 +1882,7 @@ impl XwmHandler for MoonshineCompositor {
 		);
 
 		// Configure the X11 window to fill the output.
-		let geo = Rectangle::new((0, 0).into(), (self.width as i32, self.height as i32).into());
+		let geo = self.output_rect();
 		if let Err(e) = window.configure(geo) {
 			tracing::warn!("Failed to configure X11 window geometry: {e}");
 		}
@@ -1955,11 +2032,7 @@ impl XwmHandler for MoonshineCompositor {
 				.is_some_and(|m| m.transient_for == Some(unmapped_id))
 		});
 
-		let maybe = self
-			.space
-			.elements()
-			.find(|e| e.x11_surface().map(|x| x == &window).unwrap_or(false))
-			.cloned();
+		let maybe = self.find_window_by_x11_surface(&window);
 
 		// Check if this window is an overlay/notification/external-overlay
 		// that might be pointed to by pointer_focus_window or the special
@@ -2038,6 +2111,8 @@ impl XwmHandler for MoonshineCompositor {
 		_reorder: Option<Reorder>,
 	) {
 		// Grant geometry changes but ignore position (we control placement).
+		// `enforce_fullscreen_geometry` corrects a fullscreen window that
+		// resizes itself away from the output.
 		let mut geo = window.geometry();
 		if let Some(w) = w {
 			geo.size.w = w as i32;
@@ -2056,12 +2131,7 @@ impl XwmHandler for MoonshineCompositor {
 		_above: Option<u32>,
 	) {
 		// Update position in space and refresh geometry metadata.
-		let Some(elem) = self
-			.space
-			.elements()
-			.find(|e| e.x11_surface().map(|x| x == &window).unwrap_or(false))
-			.cloned()
-		else {
+		let Some(elem) = self.find_window_by_x11_surface(&window) else {
 			return;
 		};
 		self.space.map_element(elem.clone(), geometry.loc, false);
@@ -2107,6 +2177,26 @@ impl XwmHandler for MoonshineCompositor {
 				self.focus_state.mark_dirty();
 			}
 		}
+	}
+
+	fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+		tracing::debug!(
+			target: "focus",
+			window_id = window.window_id(),
+			title = ?window.title(),
+			"X11 fullscreen request"
+		);
+		self.set_x11_fullscreen(&window, true);
+	}
+
+	fn unfullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
+		tracing::debug!(
+			target: "focus",
+			window_id = window.window_id(),
+			title = ?window.title(),
+			"X11 unfullscreen request"
+		);
+		self.set_x11_fullscreen(&window, false);
 	}
 
 	fn resize_request(&mut self, _xwm: XwmId, _window: X11Surface, _button: u32, _resize_edge: ResizeEdge) {
