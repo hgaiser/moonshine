@@ -25,26 +25,44 @@ die()   { echo -e " ${BOLD}${RED}✗${RESET} $*" >&2; exit 1; }
 
 prompt() {
   local question="$1" var="$2" default="$3"
-  local yn
-
-  if [[ ! -t 0 ]]; then
-    eval "$var=$default"
-    return
-  fi
+  local yn prompt_str
 
   if [[ "$default" == "Y" ]]; then
-    read -r -p "  ${question} [Y/n] " yn
-    yn="${yn:-Y}"
+    prompt_str="  ${question} [Y/n] "
   else
-    read -r -p "  ${question} [y/N] " yn
-    yn="${yn:-N}"
+    prompt_str="  ${question} [y/N] "
   fi
 
-  if [[ "$yn" =~ ^[Yy] ]]; then
-    eval "$var=true"
+  if [[ -t 0 ]]; then
+    read -r -p "$prompt_str" yn
+    yn="${yn:-$default}"
+  elif (</dev/tty true) 2>/dev/null; then
+    read -r -p "$prompt_str" yn </dev/tty
+    yn="${yn:-$default}"
   else
-    eval "$var=false"
+    echo -e "${prompt_str}${DIM}→ ${default} (non-interactive)${RESET}"
+    yn="$default"
   fi
+
+  [[ "$yn" =~ ^[Yy] ]] && eval "$var=true" || eval "$var=false"
+}
+
+prompt_text() {
+  local question="$1" var="$2" default="$3"
+  local val prompt_str="  ${question} [${default}] "
+
+  if [[ -t 0 ]]; then
+    read -r -p "$prompt_str" val
+    val="${val:-$default}"
+  elif (</dev/tty true) 2>/dev/null; then
+    read -r -p "$prompt_str" val </dev/tty
+    val="${val:-$default}"
+  else
+    echo -e "${prompt_str}${DIM}→ ${default} (non-interactive)${RESET}"
+    val="$default"
+  fi
+
+  eval "$var=\$val"
 }
 
 # --- help ---
@@ -65,6 +83,7 @@ print_help() {
   echo "  --no-start       Do not start after install"
   echo "  --healthcheck    Run a health check after install (default: prompt)"
   echo "  --no-healthcheck Skip the health check"
+  echo "  --user USER      Install for this user (default: current user)"
   echo "  --help           Show this message"
   echo ""
   echo "Run as your normal user. The script will ask for sudo when needed."
@@ -105,6 +124,7 @@ ENABLE_ON_BOOT=""
 LINGER=""
 START_NOW=""
 HEALTHCHECK=""
+TARGET_USER=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -117,7 +137,9 @@ while [[ $# -gt 0 ]]; do
     --start) START_NOW=true; shift ;;
     --no-start) START_NOW=false; shift ;;
     --healthcheck) HEALTHCHECK=true; shift ;;
-    --no-healthcheck) HEALTHCHECK=false; shift ;;    *) die "unknown option: $1" ;;
+    --no-healthcheck) HEALTHCHECK=false; shift ;;
+    --user) TARGET_USER="$2"; shift 2 ;;
+    *) die "unknown option: $1" ;;
   esac
 done
 
@@ -177,6 +199,16 @@ step "Downloaded (${SIZE})"
 
 # --- prompts ---
 
+if [[ -z "$TARGET_USER" ]]; then
+  prompt_text "Install for which user?" TARGET_USER "$USER"
+fi
+USER="$TARGET_USER"
+
+USER_UID=$(id -u "$USER" 2>/dev/null || true)
+if [[ -z "${USER_UID:-}" ]]; then
+  die "user '$USER' does not exist"
+fi
+
 if loginctl show-user "$USER" -p Linger 2>/dev/null | grep -q "Linger=yes"; then
   LINGER_NEEDED=false
   step "Linger already enabled for ${USER}"
@@ -209,14 +241,19 @@ fi
 PRIV_CMDS=(
   "mkdir -p /var/lib/extensions"
   "mv '${TMPFILE}' /var/lib/extensions/moonshine.raw"
-  "systemd-sysext merge moonshine.raw"
+  "systemd-sysext refresh"
   "systemd-sysusers"
   "udevadm control --reload && udevadm trigger"
   "modprobe uinput && modprobe uhid"
+  "systemctl reload-or-restart polkit.service"
 )
 
 if $LINGER_NEEDED && [[ "$LINGER" == "true" ]]; then
   PRIV_CMDS+=("loginctl enable-linger '${USER}'")
+fi
+
+if [[ "$HEALTHCHECK" == "true" ]]; then
+  PRIV_CMDS+=("systemd-run --quiet --wait --pipe -p 'User=${USER}' -p 'Environment=HOME=/home/${USER}' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' /usr/bin/moonshine healthcheck")
 fi
 
 if [[ "$ENABLE_ON_BOOT" == "true" ]] || [[ "$START_NOW" == "true" ]]; then
@@ -228,10 +265,6 @@ if [[ "$ENABLE_ON_BOOT" == "true" ]] || [[ "$START_NOW" == "true" ]]; then
   else
     PRIV_CMDS+=("systemctl start 'moonshine@${USER}'")
   fi
-fi
-
-if [[ "$HEALTHCHECK" == "true" ]]; then
-  PRIV_CMDS+=("systemd-run --quiet --wait --pipe -p 'User=${USER}' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' /usr/bin/moonshine healthcheck")
 fi
 
 # --- display and run ---
@@ -249,18 +282,19 @@ sudo bash -c "
   set -euo pipefail
   mkdir -p /var/lib/extensions
   mv '$TMPFILE' /var/lib/extensions/moonshine.raw
-  systemd-sysext merge moonshine.raw 2>/dev/null || true
-  systemd-sysusers 2>/dev/null || true
+  systemd-sysext refresh
+  systemd-sysusers || true
   udevadm control --reload || true
   udevadm trigger || true
   modprobe uinput || true
   modprobe uhid || true
+  systemctl reload-or-restart polkit.service || true
   $($LINGER_NEEDED && [[ \"$LINGER\" == \"true\" ]] && echo "loginctl enable-linger '$USER' || true")
+  $([[ \"$HEALTHCHECK\" == \"true\" ]] && echo "systemd-run --quiet --wait --pipe -p 'User=$USER' -p 'Environment=HOME=/home/$USER' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' /usr/bin/moonshine healthcheck || true")
   $([[ \"$ENABLE_ON_BOOT\" == \"true\" ]] || [[ \"$START_NOW\" == \"true\" ]] && echo "systemctl daemon-reload")
   $([[ \"$ENABLE_ON_BOOT\" == \"true\" ]] && [[ \"$START_NOW\" == \"true\" ]] && echo "systemctl enable --now 'moonshine@${USER}'")
   $([[ \"$ENABLE_ON_BOOT\" == \"true\" ]] && [[ \"$START_NOW\" != \"true\" ]] && echo "systemctl enable 'moonshine@${USER}'")
   $([[ \"$ENABLE_ON_BOOT\" != \"true\" ]] && [[ \"$START_NOW\" == \"true\" ]] && echo "systemctl start 'moonshine@${USER}'")
-  $([[ \"$HEALTHCHECK\" == \"true\" ]] && echo "systemd-run --quiet --wait --pipe -p 'User=$USER' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' /usr/bin/moonshine healthcheck || true")
 "
 
 ok "moonshine ${VERSION} installed"

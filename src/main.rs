@@ -20,11 +20,9 @@ use moonshine_core::webserver::Webserver;
 
 #[derive(Parser, Debug)]
 #[clap(version)]
-#[command(subcommand_negates_reqs = true)]
 struct Args {
 	/// Path to the configuration file.
-	#[arg(required = true)]
-	config: PathBuf,
+	config: Option<PathBuf>,
 
 	/// Skip health checks on startup.
 	#[arg(long)]
@@ -37,11 +35,17 @@ struct Args {
 #[derive(Subcommand, Debug)]
 enum Command {
 	/// Run health checks and report results, then exit.
-	Healthcheck {
-		/// Path to configuration file (enables port availability and GPU preference checks).
-		#[arg(short, long)]
-		config: Option<PathBuf>,
-	},
+	Healthcheck,
+}
+
+fn default_config_path() -> PathBuf {
+	match std::env::var("XDG_CONFIG_HOME") {
+		Ok(dir) if !dir.is_empty() => PathBuf::from(dir).join("moonshine/config.toml"),
+		_ => {
+			let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+			PathBuf::from(home).join(".config/moonshine/config.toml")
+		},
+	}
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -50,28 +54,18 @@ async fn main() -> Result<(), ()> {
 
 	init_tracing();
 
+	let config_path = args.config.unwrap_or_else(default_config_path);
+	let mut config = Config::load_or_create(&config_path)?;
+
 	// Standalone healthcheck subcommand — run checks and exit.
-	if let Some(Command::Healthcheck {
-		config: healthcheck_config,
-	}) = args.command
-	{
-		let config = match healthcheck_config.as_ref().map(Config::read_from_file) {
-			Some(Ok(c)) => Some(c),
-			Some(Err(())) => {
-				tracing::warn!("Failed to load config, running checks without config.");
-				None
-			},
-			None => None,
-		};
-		let report = tokio::task::spawn_blocking(move || healthcheck::run_healthcheck(config.as_ref()))
+	if let Some(Command::Healthcheck) = args.command {
+		let report = tokio::task::spawn_blocking(move || healthcheck::run_healthcheck(Some(&config)))
 			.await
 			.map_err(|e| tracing::error!("Failed to run health check task: {e}"))?;
 		healthcheck::print_health_report(&report);
 		std::process::exit(if report.all_fatal_passed { 0 } else { 1 });
 	}
 
-	let config_path = &args.config;
-	let mut config = Config::load_or_create(config_path)?;
 	tracing::debug!("Using configuration:\n{:#?}", config);
 
 	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
