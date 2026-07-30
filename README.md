@@ -73,8 +73,7 @@ For immutable distros where `/usr` is read-only, use the installer script:
 curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash
 ```
 
-This deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`,
-avoiding SELinux conflicts with overlay filesystems.
+This deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`, avoiding SELinux conflicts with overlay filesystems.
 
 ### Enable the service
 
