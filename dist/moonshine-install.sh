@@ -68,9 +68,7 @@ prompt_text() {
 # --- help ---
 
 print_help() {
-  echo "moonshine-install.sh — install moonshine via systemd-sysext"
-  echo ""
-  echo "  curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash"
+  echo "moonshine-install.sh — install moonshine"
   echo ""
   echo "Options:"
   echo "  --uninstall      Remove moonshine completely"
@@ -101,14 +99,6 @@ USER="$USER"
 
 if [[ "$(uname -m)" != "x86_64" ]]; then
   die "moonshine only supports x86_64"
-fi
-
-if ! command -v systemd-sysext &>/dev/null; then
-  die "systemd-sysext not found (systemd >= 248 required)"
-fi
-
-if systemd-detect-virt --container --quiet 2>/dev/null; then
-  die "cannot run inside a container (sysext uses overlayfs)"
 fi
 
 if ! command -v sudo &>/dev/null; then
@@ -155,37 +145,20 @@ if [[ "$UNINSTALL" == "true" ]]; then
     sudo systemctl disable "moonshine@${USER}" || true
   fi
 
-  if systemd-sysext list 2>/dev/null | grep -q moonshine; then
-    step "Unmerging sysext..."
-    sudo systemd-sysext unmerge moonshine.raw || true
-  fi
-
-  if [[ -f /var/lib/extensions/moonshine.raw ]]; then
-    step "Removing extension image..."
-    sudo rm -f /var/lib/extensions/moonshine.raw
-  fi
-
-  if [[ -f /etc/systemd/system/moonshine@.service ]]; then
-    step "Removing copied service unit..."
-    sudo rm -f /etc/systemd/system/moonshine@.service
-    sudo systemctl daemon-reload || true
-  fi
-
+  step "Removing files..."
+  sudo rm -rf /opt/moonshine
+  sudo rm -f /etc/systemd/system/moonshine@.service
+  sudo rm -f /etc/udev/rules.d/60-moonshine.rules
+  sudo rm -f /etc/modules-load.d/moonshine.conf
+  sudo rm -f /etc/sysusers.d/moonshine.conf
+  sudo rm -f /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
+  sudo rm -f /etc/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
+  sudo rm -f /etc/profile.d/moonshine.sh
+  sudo systemctl daemon-reload || true
   sudo udevadm control --reload || true
 
   ok "moonshine uninstalled"
   exit 0
-fi
-
-# --- check if sysext is already enabled ---
-
-if ! systemctl is-enabled systemd-sysext.service &>/dev/null; then
-  die "systemd-sysext.service is not enabled.
-  Moonshine requires sysext to be active at boot to merge the extension.
-  Enable it first (this makes /usr read-only, breaking package managers
-  like pacman/apt/dnf while the sysext is active — understand the risk):
-    sudo systemctl enable --now systemd-sysext.service
-  Then run this installer again."
 fi
 
 # --- download ---
@@ -202,13 +175,19 @@ fi
 
 info "Installing moonshine ${VERSION}"
 
-URL="https://github.com/hgaiser/moonshine/releases/download/${VERSION}/moonshine-${VERSION}-x86_64.raw"
+URL="https://github.com/hgaiser/moonshine/releases/download/${VERSION}/moonshine-${VERSION}-linux-amd64.tar.zst"
 step "Downloading ${DIM}${URL}${RESET}"
 TMPFILE="$(mktemp)"
 curl -fsSL --retry 3 -o "$TMPFILE" "$URL"
 
 SIZE=$(du -h "$TMPFILE" | cut -f1)
 step "Downloaded (${SIZE})"
+
+step "Extracting..."
+TMPDIR="$(mktemp -d)"
+tar --zstd -xf "$TMPFILE" -C "$TMPDIR"
+S="$TMPDIR/moonshine"
+
 echo ""
 
 # --- prompts ---
@@ -251,25 +230,73 @@ if [[ -z "$HEALTHCHECK" ]]; then
 fi
 
 # --- build and run privileged commands ---
-# start-moonshine.sh and moonshine@.service are not in the sysext — they're
-# deployed directly to /etc/systemd/system/ so they persist on the real
-# filesystem regardless of the sysext overlay. This ensures the service unit
-# is available at boot before systemd-sysext merges extensions, and avoids
-# permission issues with overlayfs on distros like Bazzite.
+
+MOONSHINE_HOME="/opt/moonshine"
 
 CMDS=(
+  # Stop existing service
   "systemctl stop 'moonshine@${USER}' 2>/dev/null || true"
-  "mkdir -p /var/lib/extensions"
-  "mv '${TMPFILE}' /var/lib/extensions/moonshine.raw"
-  "systemd-sysext refresh"
-  "curl -fsSL --retry 3 -o /etc/systemd/system/start-moonshine.sh https://raw.githubusercontent.com/hgaiser/moonshine/${VERSION}/dist/start-moonshine.sh"
-  "chmod +x /etc/systemd/system/start-moonshine.sh"
-  "curl -fsSL --retry 3 https://raw.githubusercontent.com/hgaiser/moonshine/${VERSION}/dist/moonshine@.service | sed 's|/usr/bin/start-moonshine.sh|/etc/systemd/system/start-moonshine.sh|' > /etc/systemd/system/moonshine@.service"
+
+  # Create directories
+  "mkdir -p '${MOONSHINE_HOME}/bin'"
+  "mkdir -p /etc/udev/rules.d"
+  "mkdir -p /etc/modules-load.d"
+  "mkdir -p /etc/sysusers.d"
+  "mkdir -p /etc/vulkan/implicit_layer.d"
+  "mkdir -p /etc/polkit-1/rules.d"
+  # Deploy moonshine binary
+  "cp '${S}/bin/moonshine' '${MOONSHINE_HOME}/bin/moonshine'"
+  "chmod 755 '${MOONSHINE_HOME}/bin/moonshine'"
+
+  # Deploy Vulkan WSI layer
+  "mkdir -p '${MOONSHINE_HOME}/lib'"
+  "cp '${S}/lib/moonshine/vulkan-layers/libmoonshine_wsi.so' '${MOONSHINE_HOME}/lib/libmoonshine_wsi.so'"
+  "chmod 755 '${MOONSHINE_HOME}/lib/libmoonshine_wsi.so'"
+
+  # Deploy the install script itself for future upgrades/uninstall
+  "cp '${S}/bin/moonshine-install.sh' '${MOONSHINE_HOME}/bin/moonshine-install.sh'"
+  "chmod 755 '${MOONSHINE_HOME}/bin/moonshine-install.sh'"
+
+  # Deploy start script with path patched
+  "sed 's|/usr/bin/moonshine|${MOONSHINE_HOME}/bin/moonshine|g' '${S}/share/moonshine/start-moonshine.sh' > '${MOONSHINE_HOME}/start-moonshine.sh'"
+  "chmod 755 '${MOONSHINE_HOME}/start-moonshine.sh'"
+
+  # Deploy service unit with path patched
+  "sed 's|/usr/bin/start-moonshine.sh|${MOONSHINE_HOME}/start-moonshine.sh|' '${S}/share/moonshine/moonshine@.service' > /etc/systemd/system/moonshine@.service"
+
+  # Deploy udev rules
+  "cp '${S}/share/moonshine/60-moonshine.rules' /etc/udev/rules.d/60-moonshine.rules"
+
+  # Deploy modules-load config
+  "cp '${S}/share/moonshine/moonshine-modules.conf' /etc/modules-load.d/moonshine.conf"
+
+  # Deploy sysusers config
+  "cp '${S}/share/moonshine/moonshine-sysusers.conf' /etc/sysusers.d/moonshine.conf"
+
+  # Deploy Vulkan layer manifest with library_path patched
+  "sed 's|/usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so|${MOONSHINE_HOME}/lib/libmoonshine_wsi.so|' '${S}/share/moonshine/VkLayer_moonshine_wsi.json' > /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json"
+
+  # Deploy polkit sleep-inhibit rules
+  "cp '${S}/share/moonshine/50-moonshine-inhibit-sleep.rules' /etc/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules"
+
+  # Create profile.d for PATH
+  "echo 'export PATH=\"\${PATH}:${MOONSHINE_HOME}/bin\"' > /etc/profile.d/moonshine.sh"
+
+  # Reload systemd
+  "systemctl daemon-reload"
+
+  # Apply sysusers (creates moonshine group)
   "systemd-sysusers || true"
+
+  # Reload udev rules
   "udevadm control --reload || true"
   "udevadm trigger || true"
+
+  # Load kernel modules
   "modprobe uinput || true"
   "modprobe uhid || true"
+
+  # Reload polkit
   "systemctl reload-or-restart polkit.service || true"
 )
 
@@ -280,11 +307,10 @@ fi
 if [[ "$HEALTHCHECK" == "true" ]]; then
   CMDS+=("echo ''")
   CMDS+=("echo ':: Running health check'")
-  CMDS+=("systemd-run --quiet --wait --pipe -p 'User=${USER}' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' /etc/systemd/system/start-moonshine.sh healthcheck || true")
+  CMDS+=("systemd-run --quiet --wait --pipe -p 'User=${USER}' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' '${MOONSHINE_HOME}/start-moonshine.sh' healthcheck || true")
 fi
 
 if [[ "$ENABLE_ON_BOOT" == "true" ]] || [[ "$START_NOW" == "true" ]]; then
-  CMDS+=("systemctl daemon-reload")
   if [[ "$ENABLE_ON_BOOT" == "true" ]] && [[ "$START_NOW" == "true" ]]; then
     CMDS+=("systemctl enable --now 'moonshine@${USER}'")
   elif [[ "$ENABLE_ON_BOOT" == "true" ]]; then
@@ -304,6 +330,9 @@ echo ""
 
 sudo bash -c "$(printf '%s\n' "${CMDS[@]}")"
 
+# Cleanup temp files
+rm -rf "$TMPDIR" "$TMPFILE"
+
 ok "moonshine ${VERSION} installed"
 
 if [[ "$ENABLE_ON_BOOT" != "true" ]] && [[ "$START_NOW" != "true" ]]; then
@@ -319,8 +348,6 @@ fi
 echo ""
 echo -e "  ${DIM}status${RESET}  ${BOLD}systemctl status moonshine@${USER}${RESET}"
 echo -e "  ${DIM}config${RESET}  ${BOLD}/home/${USER}/.config/moonshine/config.toml${RESET}"
-echo ""
-step "This installer is at /usr/bin/moonshine-install.sh for future upgrades or uninstall"
 echo ""
 
 ok "Done"

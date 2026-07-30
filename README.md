@@ -16,7 +16,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 ## Requirements
 
-1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and systemd-sysext for Atomic distros (Bazzite, Silverblue, SteamOS). Tested on Arch Linux, but reported to work on other distributions too.
+1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and an install script for Atomic distros (Bazzite, Silverblue, SteamOS). Tested on Arch Linux, but reported to work on other distributions too.
 1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
 1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
 1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
@@ -64,6 +64,17 @@ nix profile install github:hgaiser/moonshine
 ```
 
 After installing, follow the [Enable the service](#enable-the-service) steps below (the NixOS module handles this for you when enabled).
+
+### Bazzite / Silverblue / Atomic distros
+
+For immutable distros where `/usr` is read-only, use the installer script:
+
+```sh
+curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash
+```
+
+This deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`,
+avoiding SELinux conflicts with overlay filesystems.
 
 ### Enable the service
 
