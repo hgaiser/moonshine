@@ -2,8 +2,8 @@ use aes::cipher::Array;
 use aes::cipher::BlockModeEncrypt;
 use aes::cipher::KeyIvInit;
 use aes_gcm::{
-	aead::{Aead, KeyInit},
 	Aes128Gcm, Key, Nonce,
+	aead::{Aead, KeyInit},
 };
 use inout::block_padding::Pkcs7;
 

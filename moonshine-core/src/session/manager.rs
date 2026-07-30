@@ -1,14 +1,9 @@
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
-use tokio::sync::{broadcast, watch, Mutex};
+use tokio::sync::{Mutex, broadcast, watch};
 
-use crate::session::compositor::CompositorConfig;
-use crate::session::stream::audio::AudioStreamConfig;
-use crate::session::stream::audio::AudioStreamContext;
-use crate::session::stream::control::ControlStreamConfig;
-use crate::session::stream::video::VideoStreamConfig;
-use crate::session::stream::video::VideoStreamContext;
+use crate::ShutdownReason;
 use crate::session::FrameStats;
 use crate::session::InitializedSession;
 use crate::session::SessionContext;
@@ -16,7 +11,12 @@ use crate::session::SessionKeyData;
 use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
 use crate::session::SessionState;
-use crate::ShutdownReason;
+use crate::session::compositor::CompositorConfig;
+use crate::session::stream::audio::AudioStreamConfig;
+use crate::session::stream::audio::AudioStreamContext;
+use crate::session::stream::control::ControlStreamConfig;
+use crate::session::stream::video::VideoStreamConfig;
+use crate::session::stream::video::VideoStreamContext;
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
@@ -64,6 +64,9 @@ struct SessionManagerInner {
 
 	/// Time in seconds since last ping after which the stream closes.
 	stream_timeout: u64,
+
+	/// Whether to inhibit system sleep while a session is active.
+	inhibit_sleep: bool,
 
 	/// The currently active session, if any.
 	session: Option<SessionState>,
@@ -152,6 +155,7 @@ impl SessionManager {
 		control_config: ControlStreamConfig,
 		address: String,
 		stream_timeout: u64,
+		inhibit_sleep: bool,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		let trigger_token = shutdown.trigger_shutdown_token(ShutdownReason::SessionManagerShutdown);
@@ -166,6 +170,7 @@ impl SessionManager {
 			control_config,
 			address,
 			stream_timeout,
+			inhibit_sleep,
 			session: None,
 			stop: ShutdownManager::new(),
 			keys_tx: None,
@@ -388,13 +393,17 @@ impl SessionManager {
 		let mut guard = self.inner.lock().await;
 		let video_config = guard.video_config.clone();
 		let stream_timeout = guard.stream_timeout;
-		match launched.start(
-			video_config,
-			stream_timeout,
-			video_stream_context,
-			audio_stream_context,
-			stop,
-		) {
+		match launched
+			.start(
+				video_config,
+				stream_timeout,
+				video_stream_context,
+				audio_stream_context,
+				stop,
+				guard.inhibit_sleep,
+			)
+			.await
+		{
 			Ok((active, video_notify, audio_notify)) => {
 				guard.session = Some(SessionState::Active(active));
 				guard.video_start_notify = Some(video_notify);

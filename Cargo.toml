@@ -3,12 +3,12 @@ members = [".", "moonshine-core", "moonshine-tools", "moonshine-wsi"]
 resolver = "2"
 
 [workspace.package]
-version = "0.13.5"
+version = "0.14.4"
 
 [package]
 name = "moonshine"
 version.workspace = true
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 async-shutdown = "0.2.2"
@@ -17,5 +17,4 @@ moonshine-core = { path = "moonshine-core" }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal", "sync", "macros"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
-
-
+zbus = "5.18.0"

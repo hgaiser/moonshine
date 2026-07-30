@@ -11,10 +11,10 @@
 //!
 //! Uses dlsym to load X11 at runtime — no link-time dependency.
 
-use std::ffi::{c_char, c_int, c_void, CString};
+use std::ffi::{CString, c_char, c_int, c_void};
 use std::sync::OnceLock;
 
-use libc::{c_long as libc_c_long, c_ulong as libc_c_ulong, dlopen, dlsym, pid_t, RTLD_LAZY};
+use libc::{RTLD_LAZY, c_long as libc_c_long, c_ulong as libc_c_ulong, dlopen, dlsym, pid_t};
 
 // ---------------------------------------------------------------------------
 // X11 FFI types

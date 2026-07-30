@@ -1,5 +1,5 @@
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::Duration;
@@ -453,11 +453,10 @@ async fn wait_for_unit_terminal_state(
 				if iface != UNIT_INTERFACE {
 					continue;
 				}
-				if let Some(zvariant::Value::Str(state)) = changed.get(ACTIVE_STATE_PROPERTY) {
-					if let Some(state) = terminal_state(state.as_str()) {
+				if let Some(zvariant::Value::Str(state)) = changed.get(ACTIVE_STATE_PROPERTY)
+					&& let Some(state) = terminal_state(state.as_str()) {
 						return Ok(state.to_string());
 					}
-				}
 			},
 			message = unit_removed_stream.next() => {
 				let Some(message) = message else {

@@ -300,11 +300,7 @@ fn parse_exec_command(entry: &DesktopEntry, desktop_file: &Path) -> Option<Vec<S
 		}
 	}
 
-	if command.is_empty() {
-		None
-	} else {
-		Some(command)
-	}
+	if command.is_empty() { None } else { Some(command) }
 }
 
 fn expand_exec_token(token: &str, entry: &DesktopEntry, desktop_file: &Path) -> String {
@@ -811,7 +807,7 @@ Exec=/usr/bin/duplicate --run
 
 		let _env_lock = ENV_MUTEX.lock().unwrap();
 		let previous_data_home = env::var_os("XDG_DATA_HOME");
-		env::set_var("XDG_DATA_HOME", tempdir.path().join("data"));
+		unsafe { env::set_var("XDG_DATA_HOME", tempdir.path().join("data")) };
 
 		write_file(
 			&app_dir.join("explicit.desktop"),
@@ -852,8 +848,8 @@ Icon=moonshine
 		assert_eq!(named_application.boxart.as_deref(), Some(named_icon.as_path()));
 
 		match previous_data_home {
-			Some(value) => env::set_var("XDG_DATA_HOME", value),
-			None => env::remove_var("XDG_DATA_HOME"),
+			Some(value) => unsafe { env::set_var("XDG_DATA_HOME", value) },
+			None => unsafe { env::remove_var("XDG_DATA_HOME") },
 		}
 	}
 
@@ -873,7 +869,7 @@ Icon=moonshine
 
 		let _env_lock = ENV_MUTEX.lock().unwrap();
 		let previous_path = env::var_os("PATH");
-		env::set_var("PATH", &bin_dir);
+		unsafe { env::set_var("PATH", &bin_dir) };
 
 		let app_dir = tempdir.path().join("applications");
 		write_file(
@@ -891,8 +887,8 @@ TryExec=moonshine-test
 		assert_eq!(applications.len(), 1);
 
 		match previous_path {
-			Some(value) => env::set_var("PATH", value),
-			None => env::remove_var("PATH"),
+			Some(value) => unsafe { env::set_var("PATH", value) },
+			None => unsafe { env::remove_var("PATH") },
 		}
 	}
 }

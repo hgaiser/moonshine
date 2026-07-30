@@ -10,8 +10,8 @@ use rcgen::{
 };
 use rsa::rand_core::RngCore;
 use rsa::{
-	pkcs8::{EncodePrivateKey, LineEnding},
 	RsaPrivateKey,
+	pkcs8::{EncodePrivateKey, LineEnding},
 };
 
 use crate::config::Config;
@@ -23,13 +23,13 @@ use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, Error, ServerConfig, SignatureScheme};
 use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
-use tokio_rustls::{server::TlsStream, TlsAcceptor as TlsAcceptorTokio};
+use tokio_rustls::{TlsAcceptor as TlsAcceptorTokio, server::TlsStream};
 use tracing::Level;
 use x509_parser::prelude::*;
 
 use aws_lc_rs::signature::{
-	UnparsedPublicKey, RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384, RSA_PKCS1_2048_8192_SHA512,
-	RSA_PSS_2048_8192_SHA256, RSA_PSS_2048_8192_SHA384, RSA_PSS_2048_8192_SHA512,
+	RSA_PKCS1_2048_8192_SHA256, RSA_PKCS1_2048_8192_SHA384, RSA_PKCS1_2048_8192_SHA512, RSA_PSS_2048_8192_SHA256,
+	RSA_PSS_2048_8192_SHA384, RSA_PSS_2048_8192_SHA512, UnparsedPublicKey,
 };
 
 /// A lenient client certificate verifier that mirrors Sunshine's validation behavior.

@@ -6,16 +6,16 @@
 mod dmabuf;
 mod hdr_sei;
 
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use ash::vk;
 use async_shutdown::ShutdownManager;
-use tokio::sync::{broadcast, mpsc, watch, Notify};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 
+use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
-use crate::session::SessionKeysReceiver;
 
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::shard_batch::ShardBatch;
@@ -532,15 +532,15 @@ impl VideoPipelineInner {
 				// Recreate the converter if the input format changed (e.g. GBM pool
 				// ABGR2101010 → direct scanout XBGR8888). The converter's image view
 				// format must match the source image format.
-				if let Some(ref conv) = color_converter {
-					if conv.config().input_format != frame_input_format {
-						tracing::info!(
-							"Input format changed from {:?} to {:?}, recreating color converter",
-							conv.config().input_format,
-							frame_input_format,
-						);
-						color_converter = None;
-					}
+				if let Some(ref conv) = color_converter
+					&& conv.config().input_format != frame_input_format
+				{
+					tracing::info!(
+						"Input format changed from {:?} to {:?}, recreating color converter",
+						conv.config().input_format,
+						frame_input_format,
+					);
+					color_converter = None;
 				}
 
 				// Initialize converter if needed.
@@ -874,7 +874,7 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
-	use super::{drm_fourcc_to_input, is_device_lost, BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS};
+	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost};
 	use ash::vk;
 	use pixelforge::{InputFormat, PixelForgeError};
 

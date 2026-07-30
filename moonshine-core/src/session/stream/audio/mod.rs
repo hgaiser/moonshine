@@ -6,14 +6,14 @@ use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use strum_macros::Display;
 use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 use tokio::sync::Notify;
+use tokio::sync::mpsc;
 
-use crate::session::manager::SessionShutdownReason;
 use crate::session::SessionKeysReceiver;
+use crate::session::manager::SessionShutdownReason;
 
 use self::encoder::AudioEncoder;
-use self::pulse_server::{PulseServer, CAPTURE_SAMPLE_RATE};
+use self::pulse_server::{CAPTURE_SAMPLE_RATE, PulseServer};
 
 mod buffer;
 mod encoder;
@@ -306,11 +306,10 @@ fn spawn_handle_audio_packets(
 				packet = stop.wrap_cancel(packet_rx.recv()) => {
 					match packet {
 						Ok(Some(packet)) => {
-							if let Some(client_address) = client_address {
-								if let Err(e) = socket.send_to(packet.as_slice(), client_address).await {
+							if let Some(client_address) = client_address
+								&& let Err(e) = socket.send_to(packet.as_slice(), client_address).await {
 									tracing::warn!("Failed to send packet to client: {e}");
 								}
-							}
 						},
 						_ => {
 							tracing::debug!("Audio packet channel closed.");

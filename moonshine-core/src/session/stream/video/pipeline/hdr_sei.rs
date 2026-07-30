@@ -419,7 +419,7 @@ mod tests {
 		// H.265 PREFIX_SEI NAL header.
 		assert_eq!(nal[4], 0x4E); // (39 << 1) = 78 = 0x4E
 		assert_eq!(nal[5], 0x01); // nuh_temporal_id_plus1 = 1
-							// SEI payload type = 137.
+		// SEI payload type = 137.
 		assert_eq!(nal[6], 137);
 		// SEI payload size = 24.
 		assert_eq!(nal[7], 24);

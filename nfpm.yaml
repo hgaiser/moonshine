@@ -30,6 +30,10 @@ contents:
     dst: /usr/lib/systemd/system/moonshine@.service
   - src: ./dist/VkLayer_moonshine_wsi.json
     dst: /usr/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
+  - src: ./dist/50-moonshine-inhibit-sleep.rules
+    dst: /usr/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
+  - src: ./dist/moonshine-sysusers.conf
+    dst: /usr/lib/sysusers.d/moonshine.conf
   # License locations differ per distro.
   - src: ./LICENSE
     dst: /usr/share/licenses/moonshine/LICENSE

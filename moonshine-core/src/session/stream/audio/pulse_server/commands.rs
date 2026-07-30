@@ -5,7 +5,7 @@ use pulseaudio::protocol::{self as pulse, ClientInfoList};
 
 use crate::session::stream::audio::pulse_server::dyn_buffer::DynPlaybackBuffer;
 use crate::session::stream::audio::pulse_server::{
-	pop_missing, Client, Error, PlaybackStream, ServerState, StreamState, SINK_NAME,
+	Client, Error, PlaybackStream, SINK_NAME, ServerState, StreamState, pop_missing,
 };
 
 pub(super) fn handle_command(
@@ -100,16 +100,15 @@ pub(super) fn handle_command(
 		},
 		pulse::Command::CreatePlaybackStream(params) => {
 			let mut sample_spec = params.sample_spec;
-			if sample_spec.format == pulse::SampleFormat::Invalid {
-				if let Some(format) = params.formats.iter().find_map(|f| match sample_spec_from_format(f) {
+			if sample_spec.format == pulse::SampleFormat::Invalid
+				&& let Some(format) = params.formats.iter().find_map(|f| match sample_spec_from_format(f) {
 					Ok(ss) => Some(ss),
 					Err(e) => {
 						tracing::warn!("rejecting invalid format: {:#}", e);
 						None
 					},
 				}) {
-					sample_spec = format;
-				}
+				sample_spec = format;
 			}
 
 			if !is_supported_format(sample_spec.format) {
@@ -347,24 +346,24 @@ pub(super) fn handle_command(
 			Ok(())
 		},
 		pulse::Command::TriggerPlaybackStream(channel) => {
-			if let Some(stream) = client.playback_streams.get_mut(&channel) {
-				if matches!(stream.state, StreamState::Prebuffering(_)) {
-					stream.state = StreamState::Playing;
-				}
+			if let Some(stream) = client.playback_streams.get_mut(&channel)
+				&& matches!(stream.state, StreamState::Prebuffering(_))
+			{
+				stream.state = StreamState::Playing;
 			}
 			pulse::write_ack_message(&mut client.socket, seq)?;
 			Ok(())
 		},
 		pulse::Command::PrebufPlaybackStream(channel) => {
-			if let Some(stream) = client.playback_streams.get_mut(&channel) {
-				if matches!(stream.state, StreamState::Playing) {
-					stream.state = StreamState::Prebuffering(stream.buffer_attr.pre_buffering as u64);
-					// Mirror the underflow re-entry path: seed missing so pop_missing
-					// immediately issues a seeding REQUEST on the next clock tick, and
-					// discard stale in-flight credit accumulated while Playing.
-					stream.missing = stream.buffer_attr.pre_buffering as i64;
-					stream.requested = 0;
-				}
+			if let Some(stream) = client.playback_streams.get_mut(&channel)
+				&& matches!(stream.state, StreamState::Playing)
+			{
+				stream.state = StreamState::Prebuffering(stream.buffer_attr.pre_buffering as u64);
+				// Mirror the underflow re-entry path: seed missing so pop_missing
+				// immediately issues a seeding REQUEST on the next clock tick, and
+				// discard stale in-flight credit accumulated while Playing.
+				stream.missing = stream.buffer_attr.pre_buffering as i64;
+				stream.requested = 0;
 			}
 			pulse::write_ack_message(&mut client.socket, seq)?;
 			Ok(())

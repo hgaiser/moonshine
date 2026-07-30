@@ -3,17 +3,17 @@ use std::{collections::HashMap, net::SocketAddr, sync::Arc};
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
 use hyper::{
+	Request, Response,
 	body::Bytes,
 	header::{self, HeaderValue},
-	Request, Response,
 };
 use notify_rust::Notification;
 use tokio::sync::Notify;
 
+use crate::ShutdownReason;
 use crate::clients::ClientManager;
 use crate::clients::PendingClient;
 use crate::webserver::bad_request;
-use crate::ShutdownReason;
 
 /// Extract a required query parameter, or return a 400 bad-request response.
 macro_rules! require_param {
@@ -182,13 +182,18 @@ async fn get_server_cert(
 				Notification::new()
 					.appname("Moonshine")
 					.summary("Received pairing request.")
+					.body(&format!("Open {pin_url} to enter the PIN."))
 					.action("default", "default")
 					.action("open", "Enter PIN")
 					.show()
 					.map_err(|e| tracing::warn!("Failed to show PIN notification: {e}"))?
 					.wait_for_action(|action| {
-						if action != "__closed" {
-							let _ = open::that(pin_url);
+						if action != "__closed"
+							&& let Err(e) = open::that(&pin_url)
+						{
+							tracing::warn!(
+								"Couldn't open the PIN page automatically ({e}). Open it manually: {pin_url}"
+							);
 						}
 					});
 

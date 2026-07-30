@@ -1,4 +1,4 @@
-[![CI](https://github.com/hgaiser/moonshine/workflows/Test/badge.svg)](https://github.com/hgaiser/moonshine/actions)
+[![CI](https://github.com/hgaiser/moonshine/actions/workflows/ci.yaml/badge.svg)](https://github.com/hgaiser/moonshine/actions)
 
 # Moonshine 🌙
 
@@ -16,7 +16,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 ## Requirements
 
-1. **Linux only**. Tested on Arch Linux, but it's been reported to work on other Linux distributions too.
+1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and systemd-sysext for Atomic distros (Bazzite, Silverblue, SteamOS). Tested on Arch Linux, but reported to work on other distributions too.
 1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
 1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
 1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
@@ -25,19 +25,55 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 ### Arch
 
-The simplest method is to install through the AUR using:
+The recommended method is to install through the AUR using:
 
 ```
-yay -S moonshine
+yay -S moonshine-bin
 ```
 
-To run Moonshine for your user:
+After installing, follow the distro-agnostic [Enable the service](#enable-the-service) steps below.
+
+### Debian / Ubuntu (.deb)
+
+Download the latest `.deb` from the [releases page](https://github.com/hgaiser/moonshine/releases) and install it:
+
+```sh
+sudo apt install ./moonshine_*.deb
+```
+
+After installing, follow the [Enable the service](#enable-the-service) steps below.
+
+### Fedora / RHEL (.rpm)
+
+Download the latest `.rpm` and install it:
+
+```sh
+sudo dnf install ./moonshine_*.rpm
+```
+
+The package's post-install scripts set up udev rules, kernel modules, and the `moonshine` group automatically.
+After installing, follow the [Enable the service](#enable-the-service) steps below.
+
+### Nix
+
+This repository is also a nix flake, providing a package and a NixOS module that sets up the service for you.
+See [nix/README.md](nix/README.md) for instructions, or install just the package on any distro with:
+
+```sh
+nix profile install github:hgaiser/moonshine
+```
+
+After installing, follow the [Enable the service](#enable-the-service) steps below (the NixOS module handles this for you when enabled).
+
+### Enable the service
+
+These steps apply to every installation method above (the service is a systemd unit).
 
 1. **Enable user lingering**:
    ```sh
    sudo loginctl enable-linger $USER
    ```
-   This allows Moonshine to run applications in the user's session even when the user is not logged in.
+   This allows Moonshine to run applications in the user's session even when the user is not logged in (when running headless).
 
    If your user is always logged in when you want to stream, you can skip this step.
 
@@ -138,10 +174,9 @@ title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
 pre_command = [
     ["/usr/bin/systemctl", "stop", "conflicting.service"],
-    ["/usr/bin/nvidia-smi", "pstate", "50"],
 ]
 post_command = [
-    ["/usr/bin/nvidia-smi", "pstate", "performance"],
+    ["/usr/bin/systemctl", "start", "conflicting.service"],
 ]
 ```
 
@@ -171,6 +206,23 @@ include_terminal = false
 resolve_icons = true
 ```
 
+**Lutris scanner** — finds all installed Lutris games:
+
+```toml
+[[application_scanner]]
+type = "lutris"
+command = ["/usr/bin/lutris", "lutris:rungame/{slug}"]
+```
+
+Games are matched by their Lutris slug.
+Box art is automatically loaded from Lutris's `coverart/` directory when available.
+The default database path is `~/.local/share/lutris/pga.db`.
+You can override it with the `pga_db` option to point at a custom database location.
+
+## Tips & Tricks
+
+See [TIPS.md](TIPS.md) for practical recipes and workarounds.
+
 ## FAQ
 
 1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**
@@ -179,6 +231,10 @@ resolve_icons = true
 2. **Can I use Moonshine to stream to two clients simultaneously?**
 
    This is currently not a supported feature and not a focus of Moonshine. If you are interested in adding support for this, feel free to open an issue or discuss on [Discord](https://discord.com/invite/moonlight-stream-352065098472488960).
+
+3. **How do I run the healthcheck?**
+
+   Run `moonshine healthcheck` to check GPU capabilities, codec support, and port availability. Pass `--config <path>` to also check configured ports and GPU preferences.
 
 ## Security
 

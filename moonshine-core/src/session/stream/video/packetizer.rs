@@ -1,9 +1,9 @@
 use aes_gcm::{
-	aead::{AeadInPlace, KeyInit},
 	Aes128Gcm, Key, Nonce,
+	aead::{AeadInPlace, KeyInit},
 };
 use fec_rs::ReedSolomon;
-use std::collections::{hash_map::Entry, HashMap};
+use std::collections::{HashMap, hash_map::Entry};
 use std::time::Instant;
 
 use crate::session::SessionKeysReceiver;
@@ -242,7 +242,9 @@ impl Packetizer {
 		let nr_blocks = (nr_data_shards - 1) / nr_data_shards_per_block + 1;
 		let last_block_index = (nr_blocks.min(4) as u8 - 1) << 6; // TODO: Why the bit shift? To 'force' a limit of 4 blocks?
 
-		tracing::trace!("Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block.");
+		tracing::trace!(
+			"Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block."
+		);
 		tracing::trace!("Sending {nr_blocks} blocks of video data.");
 
 		// Accumulate all blocks into a single batch.
@@ -260,7 +262,9 @@ impl Packetizer {
 			let mut end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
 
 			if block_index == 3 {
-				tracing::debug!("Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC.");
+				tracing::debug!(
+					"Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC."
+				);
 				end = nr_data_shards;
 			}
 

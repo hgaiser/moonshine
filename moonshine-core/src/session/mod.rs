@@ -19,15 +19,17 @@ use crate::session::stream::video::VideoStreamHandle;
 use self::application::Application;
 use self::application::ApplicationConfig;
 use self::application::ApplicationContext;
-use self::compositor::frame::HdrModeState;
 use self::compositor::Compositor;
 use self::compositor::LaunchedCompositor;
+use self::compositor::frame::HdrModeState;
+use self::inhibit::SleepInhibitor;
 use self::stream::audio::AudioStreamConfig;
 use self::stream::control::ControlStreamConfig;
 use self::stream::video::VideoStreamConfig;
 
 pub mod application;
 pub mod compositor;
+pub mod inhibit;
 pub mod manager;
 pub mod stream;
 
@@ -247,13 +249,14 @@ impl LaunchedSession {
 		&self.context
 	}
 
-	pub(crate) fn start(
+	pub(crate) async fn start(
 		self,
 		video_config: VideoStreamConfig,
 		stream_timeout: u64,
 		video_ctx: VideoStreamContext,
 		audio_ctx: AudioStreamContext,
 		stop: ShutdownManager<SessionShutdownReason>,
+		inhibit_sleep: bool,
 	) -> Result<(ActiveSession, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>), ()> {
 		let Self {
 			context,
@@ -302,11 +305,18 @@ impl LaunchedSession {
 			hdr_metadata_rx,
 		);
 
+		let sleep_inhibitor = if inhibit_sleep {
+			SleepInhibitor::acquire().await
+		} else {
+			None
+		};
+
 		Ok((
 			ActiveSession {
 				context,
 				_application: application,
 				video_handle: video_handle_for_resume,
+				sleep_inhibitor,
 			},
 			video_start_notify,
 			audio_start_notify,
@@ -319,6 +329,9 @@ pub(crate) struct ActiveSession {
 	context: SessionContext,
 	_application: Application,
 	video_handle: VideoStreamHandle,
+	/// Held while the session is active to keep the host awake; dropped on teardown.
+	#[allow(dead_code)]
+	sleep_inhibitor: Option<SleepInhibitor>,
 }
 
 impl ActiveSession {
