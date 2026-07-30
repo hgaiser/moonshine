@@ -177,6 +177,17 @@ if [[ "$UNINSTALL" == "true" ]]; then
   exit 0
 fi
 
+# --- check if sysext is already enabled ---
+
+if ! systemctl is-enabled systemd-sysext.service &>/dev/null; then
+  die "systemd-sysext.service is not enabled.
+  Moonshine requires sysext to be active at boot to merge the extension.
+  Enable it first (this makes /usr read-only, breaking package managers
+  like pacman/apt/dnf while the sysext is active — understand the risk):
+    sudo systemctl enable --now systemd-sysext.service
+  Then run this installer again."
+fi
+
 # --- download ---
 
 VERSION="__VERSION__"
@@ -198,6 +209,7 @@ curl -fsSL --retry 3 -o "$TMPFILE" "$URL"
 
 SIZE=$(du -h "$TMPFILE" | cut -f1)
 step "Downloaded (${SIZE})"
+echo ""
 
 # --- prompts ---
 
@@ -238,70 +250,59 @@ if [[ -z "$HEALTHCHECK" ]]; then
   prompt "Run health check?" HEALTHCHECK Y
 fi
 
-# --- build privileged commands ---
+# --- build and run privileged commands ---
+# start-moonshine.sh and moonshine@.service are not in the sysext — they're
+# deployed directly to /etc/systemd/system/ so they persist on the real
+# filesystem regardless of the sysext overlay. This ensures the service unit
+# is available at boot before systemd-sysext merges extensions, and avoids
+# permission issues with overlayfs on distros like Bazzite.
 
-PRIV_CMDS=(
+CMDS=(
+  "systemctl stop 'moonshine@${USER}' 2>/dev/null || true"
   "mkdir -p /var/lib/extensions"
   "mv '${TMPFILE}' /var/lib/extensions/moonshine.raw"
   "systemd-sysext refresh"
-  "curl -fsSL --retry 3 -o /etc/systemd/system/moonshine@.service https://raw.githubusercontent.com/hgaiser/moonshine/${VERSION}/dist/moonshine@.service"
-  "systemd-sysusers"
-  "udevadm control --reload && udevadm trigger"
-  "modprobe uinput && modprobe uhid"
-  "systemctl reload-or-restart polkit.service"
-  "systemctl enable systemd-sysext.service"
+  "curl -fsSL --retry 3 -o /etc/systemd/system/start-moonshine.sh https://raw.githubusercontent.com/hgaiser/moonshine/${VERSION}/dist/start-moonshine.sh"
+  "chmod +x /etc/systemd/system/start-moonshine.sh"
+  "curl -fsSL --retry 3 https://raw.githubusercontent.com/hgaiser/moonshine/${VERSION}/dist/moonshine@.service | sed 's|/usr/bin/start-moonshine.sh|/etc/systemd/system/start-moonshine.sh|' > /etc/systemd/system/moonshine@.service"
+  "systemd-sysusers || true"
+  "udevadm control --reload || true"
+  "udevadm trigger || true"
+  "modprobe uinput || true"
+  "modprobe uhid || true"
+  "systemctl reload-or-restart polkit.service || true"
 )
 
 if $LINGER_NEEDED && [[ "$LINGER" == "true" ]]; then
-  PRIV_CMDS+=("loginctl enable-linger '${USER}'")
+  CMDS+=("loginctl enable-linger '${USER}' || true")
 fi
 
 if [[ "$HEALTHCHECK" == "true" ]]; then
-  PRIV_CMDS+=("systemd-run --quiet --wait --pipe -p 'User=${USER}' -p 'Environment=HOME=/home/${USER}' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' /usr/bin/moonshine healthcheck")
+  CMDS+=("echo ''")
+  CMDS+=("echo ':: Running health check'")
+  CMDS+=("systemd-run --quiet --wait --pipe -p 'User=${USER}' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' /etc/systemd/system/start-moonshine.sh healthcheck || true")
 fi
 
 if [[ "$ENABLE_ON_BOOT" == "true" ]] || [[ "$START_NOW" == "true" ]]; then
-  PRIV_CMDS+=("systemctl daemon-reload")
+  CMDS+=("systemctl daemon-reload")
   if [[ "$ENABLE_ON_BOOT" == "true" ]] && [[ "$START_NOW" == "true" ]]; then
-    PRIV_CMDS+=("systemctl enable --now 'moonshine@${USER}'")
+    CMDS+=("systemctl enable --now 'moonshine@${USER}'")
   elif [[ "$ENABLE_ON_BOOT" == "true" ]]; then
-    PRIV_CMDS+=("systemctl enable 'moonshine@${USER}'")
+    CMDS+=("systemctl enable 'moonshine@${USER}'")
   else
-    PRIV_CMDS+=("systemctl start 'moonshine@${USER}'")
+    CMDS+=("systemctl start 'moonshine@${USER}'")
   fi
 fi
-
-# --- display and run ---
 
 echo ""
 echo -e "  ${DIM}The following commands will be run with sudo:${RESET}"
 echo ""
-for cmd in "${PRIV_CMDS[@]}"; do
+for cmd in "${CMDS[@]}"; do
   echo "  $cmd"
 done
 echo ""
 
-# Rebuild for execution with tolerances (|| true for non-critical steps)
-sudo bash -c "
-  set -euo pipefail
-  mkdir -p /var/lib/extensions
-  mv '$TMPFILE' /var/lib/extensions/moonshine.raw
-  systemd-sysext refresh
-  curl -fsSL --retry 3 -o /etc/systemd/system/moonshine@.service https://raw.githubusercontent.com/hgaiser/moonshine/${VERSION}/dist/moonshine@.service
-  systemd-sysusers || true
-  udevadm control --reload || true
-  udevadm trigger || true
-  modprobe uinput || true
-  modprobe uhid || true
-  systemctl reload-or-restart polkit.service || true
-  systemctl enable systemd-sysext.service || true
-  $($LINGER_NEEDED && [[ \"$LINGER\" == \"true\" ]] && echo "loginctl enable-linger '$USER' || true")
-  $([[ \"$HEALTHCHECK\" == \"true\" ]] && echo "systemd-run --quiet --wait --pipe -p 'User=$USER' -p 'Environment=HOME=/home/$USER' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' /usr/bin/moonshine healthcheck || true")
-  $([[ \"$ENABLE_ON_BOOT\" == \"true\" ]] || [[ \"$START_NOW\" == \"true\" ]] && echo "systemctl daemon-reload")
-  $([[ \"$ENABLE_ON_BOOT\" == \"true\" ]] && [[ \"$START_NOW\" == \"true\" ]] && echo "systemctl enable --now 'moonshine@${USER}'")
-  $([[ \"$ENABLE_ON_BOOT\" == \"true\" ]] && [[ \"$START_NOW\" != \"true\" ]] && echo "systemctl enable 'moonshine@${USER}'")
-  $([[ \"$ENABLE_ON_BOOT\" != \"true\" ]] && [[ \"$START_NOW\" == \"true\" ]] && echo "systemctl start 'moonshine@${USER}'")
-"
+sudo bash -c "$(printf '%s\n' "${CMDS[@]}")"
 
 ok "moonshine ${VERSION} installed"
 

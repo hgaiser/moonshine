@@ -96,7 +96,6 @@ jobs:
                  "$S/usr/share/licenses/moonshine"
         cp ./target/release/moonshine "$S/usr/bin/"
         cp ./target/release/libmoonshine_wsi.so "$S/usr/lib/moonshine/vulkan-layers/"
-        cp ./dist/start-moonshine.sh "$S/usr/bin/"
         cp ./dist/moonshine-install.sh "$S/usr/bin/"
         cp ./dist/60-moonshine.rules "$S/usr/lib/udev/rules.d/"
         cp ./dist/moonshine-modules.conf "$S/usr/lib/modules-load.d/"
