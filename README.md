@@ -16,7 +16,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 ## Requirements
 
-1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and an install script for Atomic distros (Bazzite, Silverblue, SteamOS). Tested on Arch Linux, but reported to work on other distributions too.
+1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and an install script for SteamOS. Tested on Arch Linux, but reported to work on other distributions too.
 1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
 1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
 1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
@@ -45,10 +45,10 @@ After installing, follow the [Enable the service](#enable-the-service) steps bel
 
 ### Fedora / RHEL (.rpm)
 
-Download the latest `.rpm` and install it:
+Download the latest `.rpm` from the [releases page](https://github.com/hgaiser/moonshine/releases) and install it:
 
 ```sh
-sudo dnf install ./moonshine_*.rpm
+sudo dnf install ./moonshine-*.rpm
 ```
 
 The package's post-install scripts set up udev rules, kernel modules, and the `moonshine` group automatically.
@@ -67,13 +67,24 @@ After installing, follow the [Enable the service](#enable-the-service) steps bel
 
 ### Bazzite / Silverblue / Atomic distros
 
-For immutable distros where `/usr` is read-only, use the installer script:
+On Fedora Atomic distros, download the `.rpm` from the [releases page](https://github.com/hgaiser/moonshine/releases) and layer it:
+
+```sh
+sudo rpm-ostree install ./moonshine-*.rpm
+sudo systemctl reboot
+```
+
+After reboot, follow the [Enable the service](#enable-the-service) steps below.
+
+### SteamOS
+
+Use the installer script:
 
 ```sh
 curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash
 ```
 
-This deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`, avoiding SELinux conflicts with overlay filesystems.
+This deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`.
 
 ### Enable the service
 
