@@ -70,10 +70,9 @@ prompt_text() {
 print_help() {
   echo "moonshine-install.sh — install moonshine via systemd-sysext"
   echo ""
-  echo "  curl -fsSL https://raw.githubusercontent.com/hgaiser/moonshine/main/dist/moonshine-install.sh | bash"
+  echo "  curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash"
   echo ""
   echo "Options:"
-  echo "  --version VER    Install a specific version (e.g. v0.13.0)"
   echo "  --uninstall      Remove moonshine completely"
   echo "  --enable         Enable the service on boot (default: prompt)"
   echo "  --no-enable      Do not enable on boot"
@@ -119,7 +118,6 @@ fi
 # --- parse args ---
 
 UNINSTALL=false
-REQUESTED_VERSION=""
 ENABLE_ON_BOOT=""
 LINGER=""
 START_NOW=""
@@ -129,7 +127,6 @@ TARGET_USER=""
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --uninstall) UNINSTALL=true; shift ;;
-    --version) REQUESTED_VERSION="$2"; shift 2 ;;
     --enable) ENABLE_ON_BOOT=true; shift ;;
     --no-enable) ENABLE_ON_BOOT=false; shift ;;
     --linger) LINGER=true; shift ;;
@@ -168,6 +165,12 @@ if [[ "$UNINSTALL" == "true" ]]; then
     sudo rm -f /var/lib/extensions/moonshine.raw
   fi
 
+  if [[ -f /etc/systemd/system/moonshine@.service ]]; then
+    step "Removing copied service unit..."
+    sudo rm -f /etc/systemd/system/moonshine@.service
+    sudo systemctl daemon-reload || true
+  fi
+
   sudo udevadm control --reload || true
 
   ok "moonshine uninstalled"
@@ -176,9 +179,8 @@ fi
 
 # --- download ---
 
-if [[ -n "$REQUESTED_VERSION" ]]; then
-  VERSION="$REQUESTED_VERSION"
-else
+VERSION="__VERSION__"
+if [[ "$VERSION" == "__VERSION__" ]]; then
   info "Resolving latest release"
   VERSION=$(curl -fsSL "https://api.github.com/repos/hgaiser/moonshine/releases/latest" \
     | grep -oP '"tag_name":\s*"\K[^"]+')
@@ -242,10 +244,12 @@ PRIV_CMDS=(
   "mkdir -p /var/lib/extensions"
   "mv '${TMPFILE}' /var/lib/extensions/moonshine.raw"
   "systemd-sysext refresh"
+  "curl -fsSL --retry 3 -o /etc/systemd/system/moonshine@.service https://raw.githubusercontent.com/hgaiser/moonshine/${VERSION}/dist/moonshine@.service"
   "systemd-sysusers"
   "udevadm control --reload && udevadm trigger"
   "modprobe uinput && modprobe uhid"
   "systemctl reload-or-restart polkit.service"
+  "systemctl enable systemd-sysext.service"
 )
 
 if $LINGER_NEEDED && [[ "$LINGER" == "true" ]]; then
@@ -283,12 +287,14 @@ sudo bash -c "
   mkdir -p /var/lib/extensions
   mv '$TMPFILE' /var/lib/extensions/moonshine.raw
   systemd-sysext refresh
+  curl -fsSL --retry 3 -o /etc/systemd/system/moonshine@.service https://raw.githubusercontent.com/hgaiser/moonshine/${VERSION}/dist/moonshine@.service
   systemd-sysusers || true
   udevadm control --reload || true
   udevadm trigger || true
   modprobe uinput || true
   modprobe uhid || true
   systemctl reload-or-restart polkit.service || true
+  systemctl enable systemd-sysext.service || true
   $($LINGER_NEEDED && [[ \"$LINGER\" == \"true\" ]] && echo "loginctl enable-linger '$USER' || true")
   $([[ \"$HEALTHCHECK\" == \"true\" ]] && echo "systemd-run --quiet --wait --pipe -p 'User=$USER' -p 'Environment=HOME=/home/$USER' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' /usr/bin/moonshine healthcheck || true")
   $([[ \"$ENABLE_ON_BOOT\" == \"true\" ]] || [[ \"$START_NOW\" == \"true\" ]] && echo "systemctl daemon-reload")

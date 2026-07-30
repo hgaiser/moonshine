@@ -68,7 +68,7 @@ After installing, follow the [Enable the service](#enable-the-service) steps bel
 ### Bazzite / Silverblue / Atomic distros (systemd-sysext)
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/hgaiser/moonshine/main/dist/moonshine-install.sh | bash
+curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash
 ```
 
 The script downloads the latest release, merges the system extension, and prompts for setup.

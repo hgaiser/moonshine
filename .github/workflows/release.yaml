@@ -100,7 +100,6 @@ jobs:
         cp ./dist/moonshine-install.sh "$S/usr/bin/"
         cp ./dist/60-moonshine.rules "$S/usr/lib/udev/rules.d/"
         cp ./dist/moonshine-modules.conf "$S/usr/lib/modules-load.d/"
-        cp ./dist/moonshine@.service "$S/usr/lib/systemd/system/"
         cp ./dist/moonshine-sysusers.conf "$S/usr/lib/sysusers.d/"
         cp ./dist/VkLayer_moonshine_wsi.json "$S/usr/share/vulkan/implicit_layer.d/"
         cp ./dist/50-moonshine-inhibit-sleep.rules "$S/usr/share/polkit-1/rules.d/"
@@ -108,6 +107,10 @@ jobs:
         echo "ID=_any" > "$S/usr/lib/extension-release.d/extension-release.moonshine"
         mksquashfs "$S" "moonshine-${{ steps.tag.outputs.tag }}-x86_64.raw" \
           -all-root -noappend -comp zstd
+
+    - name: Bake version into install script
+      run: |
+        sed -i 's/VERSION="__VERSION__"/VERSION="${{ steps.tag.outputs.tag }}"/' ./dist/moonshine-install.sh
 
     - name: Release
       uses: softprops/action-gh-release@v2
@@ -119,3 +122,4 @@ jobs:
           ./moonshine_*.deb
           ./moonshine-*.rpm
           ./moonshine-${{ steps.tag.outputs.tag }}-x86_64.raw
+          ./dist/moonshine-install.sh
