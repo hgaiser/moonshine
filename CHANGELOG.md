@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.14.5] - 30-07-2026
+
+### Changed
+
+- Dropped systemd-sysext extension in favor of deploying to `/opt/moonshine/` and `/etc/` drop-in directories. Avoids SELinux boot failures on Fedora Atomic / Bazzite caused by unlabeled overlayfs files.
+
+### Fixed
+
+- WSI layer detection in healthcheck now queries the Vulkan loader directly instead of checking hardcoded file paths, making it work regardless of where the layer files are installed.
+
 ## [v0.14.4] - 30-07-2026
 
 ### Fixed

@@ -52,6 +52,10 @@ jobs:
         # or dropped entirely.
         patchelf --remove-needed libunwind.so.1 ./target/release/moonshine
 
+    - name: Bake version into install script
+      run: |
+        sed -i 's/VERSION="__VERSION__"/VERSION="${{ steps.tag.outputs.tag }}"/' ./dist/moonshine-install.sh
+
     # Portable tarball with an FHS-ish layout (bin/, lib/, share/).
     - name: Package portable tarball
       run: |
@@ -62,6 +66,7 @@ jobs:
         cp ./dist/start-moonshine.sh ./dist/60-moonshine.rules ./dist/50-moonshine-inhibit-sleep.rules \
            ./dist/moonshine-modules.conf ./dist/moonshine-sysusers.conf \
            ./dist/moonshine@.service ./dist/VkLayer_moonshine_wsi.json "$STAGE/share/moonshine/"
+        cp ./dist/moonshine-install.sh "$STAGE/bin/"
         cp README.md LICENSE "$STAGE/"
         tar --zstd -cf "./moonshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst" \
           -C "$RUNNER_TEMP" moonshine
@@ -80,37 +85,6 @@ jobs:
           nfpm package --config nfpm.yaml --packager "$fmt" --target .
         done
 
-    - name: Build sysext squashfs image
-      run: |
-        sudo apt-get install -y squashfs-tools
-        S="$RUNNER_TEMP/sysext"
-        mkdir -p "$S/usr/bin" \
-                 "$S/usr/lib/moonshine/vulkan-layers" \
-                 "$S/usr/lib/udev/rules.d" \
-                 "$S/usr/lib/modules-load.d" \
-                 "$S/usr/lib/systemd/system" \
-                 "$S/usr/lib/sysusers.d" \
-                 "$S/usr/lib/extension-release.d" \
-                 "$S/usr/share/vulkan/implicit_layer.d" \
-                 "$S/usr/share/polkit-1/rules.d" \
-                 "$S/usr/share/licenses/moonshine"
-        cp ./target/release/moonshine "$S/usr/bin/"
-        cp ./target/release/libmoonshine_wsi.so "$S/usr/lib/moonshine/vulkan-layers/"
-        cp ./dist/moonshine-install.sh "$S/usr/bin/"
-        cp ./dist/60-moonshine.rules "$S/usr/lib/udev/rules.d/"
-        cp ./dist/moonshine-modules.conf "$S/usr/lib/modules-load.d/"
-        cp ./dist/moonshine-sysusers.conf "$S/usr/lib/sysusers.d/"
-        cp ./dist/VkLayer_moonshine_wsi.json "$S/usr/share/vulkan/implicit_layer.d/"
-        cp ./dist/50-moonshine-inhibit-sleep.rules "$S/usr/share/polkit-1/rules.d/"
-        cp ./LICENSE "$S/usr/share/licenses/moonshine/"
-        echo "ID=_any" > "$S/usr/lib/extension-release.d/extension-release.moonshine"
-        mksquashfs "$S" "moonshine-${{ steps.tag.outputs.tag }}-x86_64.raw" \
-          -all-root -noappend -comp zstd
-
-    - name: Bake version into install script
-      run: |
-        sed -i 's/VERSION="__VERSION__"/VERSION="${{ steps.tag.outputs.tag }}"/' ./dist/moonshine-install.sh
-
     - name: Release
       uses: softprops/action-gh-release@v2
       if: steps.tag.outputs.tag != ''
@@ -120,5 +94,4 @@ jobs:
           ./moonshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst
           ./moonshine_*.deb
           ./moonshine-*.rpm
-          ./moonshine-${{ steps.tag.outputs.tag }}-x86_64.raw
           ./dist/moonshine-install.sh

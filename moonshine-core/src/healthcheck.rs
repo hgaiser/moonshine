@@ -235,6 +235,7 @@ fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
 	let vk_context = check_vulkan(report);
 	check_codecs(report, vk_context.as_ref());
 	report.dma_buf_supported = check_dmabuf(report, vk_context.as_ref());
+	check_wsi_layer(report);
 
 	if let Some(ref ctx) = vk_context {
 		let props = ctx.device_properties();
@@ -283,11 +284,8 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 		check_ports(&mut report, config);
 	}
 
-	// --- Warning checks ---
-
 	check_uinput(&mut report);
 	check_uhid(&mut report);
-	check_wsi_layer(&mut report);
 
 	if let Some(config) = config {
 		check_dirs(&mut report, config);
@@ -961,28 +959,42 @@ fn check_uhid(report: &mut HealthReport) {
 
 fn check_wsi_layer(report: &mut HealthReport) {
 	let start = Instant::now();
-	let manifest = Path::new("/usr/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json");
-	let lib_path = Path::new("/usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so");
 
-	if !manifest.exists() {
-		report.add_warn(
-			"WSI layer",
-			"  WSI layer manifest not found.\n  Games will render through XWayland (higher latency, no direct scanout).\n  Build and install from the moonshine-wsi crate.".into(),
-			start.elapsed().as_millis() as u64,
-		);
-	} else if !lib_path.exists() {
-		report.add_warn(
-			"WSI layer",
-			format!(
-				"  WSI layer library not found: {}\n  Reinstall from the moonshine-wsi crate.",
-				lib_path.display()
-			),
-			start.elapsed().as_millis() as u64,
-		);
+	let entry = match unsafe { ash::Entry::load() } {
+		Ok(e) => e,
+		Err(_) => {
+			report.add_failed(
+				"WSI layer",
+				"  Skipped (Vulkan check failed).".into(),
+				start.elapsed().as_millis() as u64,
+			);
+			return;
+		},
+	};
+
+	let layers = match unsafe { entry.enumerate_instance_layer_properties() } {
+		Ok(l) => l,
+		Err(_) => {
+			report.add_warn(
+				"WSI layer",
+				"  Could not enumerate Vulkan instance layers.".into(),
+				start.elapsed().as_millis() as u64,
+			);
+			return;
+		},
+	};
+
+	let found = layers.iter().any(|l| {
+		l.layer_name_as_c_str()
+			.is_ok_and(|name| name.to_bytes() == b"VK_LAYER_MOONSHINE_wsi")
+	});
+
+	if found {
+		report.add_passed("WSI layer", String::new(), start.elapsed().as_millis() as u64);
 	} else {
-		report.add_passed(
+		report.add_warn(
 			"WSI layer",
-			lib_path.display().to_string(),
+			"  Not found in Vulkan instance layers.\n  Install the moonshine-wsi Vulkan layer.\n  Games will render through XWayland (higher latency, no direct scanout).".into(),
 			start.elapsed().as_millis() as u64,
 		);
 	}
