@@ -240,6 +240,32 @@ Box art is automatically loaded from Lutris's `coverart/` directory when availab
 The default database path is `~/.local/share/lutris/pga.db`.
 You can override it with the `pga_db` option to point at a custom database location.
 
+**Heroic scanner** — finds all installed [Heroic Games Launcher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) games (Epic, GOG, Amazon and manually added games):
+
+```toml
+[[application_scanner]]
+type = "heroic"
+command = ["heroic", "--no-gui", "heroic://launch?appName={app_name}&runner={runner}"]
+```
+
+If you installed Heroic from Flathub, launch it through Flatpak instead:
+
+```toml
+[[application_scanner]]
+type = "heroic"
+command = [
+  "flatpak", "run", "com.heroicgameslauncher.hgl",
+  "--no-gui", "heroic://launch?appName={app_name}&runner={runner}",
+]
+```
+
+`{app_name}` is Heroic's internal game id and `{runner}` is the store it came from (`legendary` for Epic, `gog` for GOG, `nile` for Amazon, `sideload` for manually added games).
+Commands are looked up in `PATH`, so a bare `heroic` works regardless of where your distribution installs it; use an absolute path if you run Heroic from an AppImage.
+Box art is automatically loaded from Heroic's `images-cache/` directory for any art Heroic has already downloaded.
+
+The default configuration directory is `~/.config/heroic`, falling back to `~/.var/app/com.heroicgameslauncher.hgl/config/heroic` when only the Flatpak is installed.
+You can override it with the `config_dir` option.
+
 ## Tips & Tricks
 
 See [TIPS.md](TIPS.md) for practical recipes and workarounds.
