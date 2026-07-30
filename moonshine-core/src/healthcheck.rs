@@ -318,7 +318,7 @@ fn check_render_nodes(report: &mut HealthReport, _gpu_config: &Option<String>) -
 	if !dri.exists() {
 		report.add_failed(
 			"Render nodes",
-			"  No /dev/dri directory found.\n  Ensure the GPU kernel DRM driver is loaded and /dev/dri exists.\n  Ubuntu: `sudo ubuntu-drivers autoinstall` (or install matching kernel/firmware)\n  Fedora: `sudo dnf install mesa-dri-drivers`".into(),
+			"  No /dev/dri directory found.\n  Ensure the GPU kernel DRM driver is loaded and /dev/dri exists.\n  Ubuntu: `sudo ubuntu-drivers autoinstall` (or install matching kernel/firmware)\n  Fedora: `sudo dnf install mesa-dri-drivers`\n  Arch: `sudo pacman -S mesa`".into(),
 			start.elapsed().as_millis() as u64,
 		);
 		return None;
@@ -349,7 +349,7 @@ fn check_render_nodes(report: &mut HealthReport, _gpu_config: &Option<String>) -
 	if entries.is_empty() {
 		report.add_failed(
 			"Render nodes",
-			"  No render nodes found in /dev/dri.\n  Install GPU drivers with render node support.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install mesa-dri-drivers`".into(),
+			"  No render nodes found in /dev/dri.\n  Install GPU drivers with render node support.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install mesa-dri-drivers`\n  Arch: `sudo pacman -S mesa`".into(),
 			start.elapsed().as_millis() as u64,
 		);
 		return None;
@@ -458,7 +458,7 @@ fn check_egl(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(Strin
 			report.add_failed(
 				"EGL/GLES",
 				format!(
-					"  Failed to create GBM device: {e}\n  libgbm is required for GPU rendering.\n  Ubuntu: `sudo apt install libgbm1`\n  Fedora: `sudo dnf install mesa-libgbm`"
+					"  Failed to create GBM device: {e}\n  libgbm is required for GPU rendering.\n  Ubuntu: `sudo apt install libgbm1`\n  Fedora: `sudo dnf install mesa-libgbm`\n  Arch: `sudo pacman -S mesa`"
 				),
 				start.elapsed().as_millis() as u64,
 			);
@@ -472,7 +472,7 @@ fn check_egl(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(Strin
 			report.add_failed(
 				"EGL/GLES",
 				format!(
-					"  Failed to create EGL display: {e}\n  GPU drivers may be missing or incomplete.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install mesa-libEGL`"
+					"  Failed to create EGL display: {e}\n  GPU drivers may be missing or incomplete.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install mesa-libEGL`\n  Arch: `sudo pacman -S mesa`"
 				),
 				start.elapsed().as_millis() as u64,
 			);
@@ -551,7 +551,7 @@ fn check_vulkan(report: &mut HealthReport) -> Option<VideoContext> {
 		},
 		Err(e) => {
 			let msg = format!(
-				"  Failed to initialize Vulkan: {e}\n  Ensure Vulkan drivers with video encode support are installed.\n  Requires NVIDIA RTX 20xx+, AMD RDNA2+, or Intel Arc.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install vulkan-loader mesa-vulkan-drivers`"
+				"  Failed to initialize Vulkan: {e}\n  Ensure Vulkan drivers with video encode support are installed.\n  Requires NVIDIA RTX 20xx+, AMD RDNA2+, or Intel Arc.\n  Ubuntu: `sudo ubuntu-drivers autoinstall`\n  Fedora: `sudo dnf install vulkan-loader mesa-vulkan-drivers`\n  Arch: `sudo pacman -S vulkan-icd-loader vulkan-mesa-layer`"
 			);
 			report.add_failed("Vulkan", msg, start.elapsed().as_millis() as u64);
 			None
