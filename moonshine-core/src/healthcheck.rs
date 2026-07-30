@@ -969,7 +969,7 @@ fn check_wsi_layer(report: &mut HealthReport) {
 				start.elapsed().as_millis() as u64,
 			);
 			return;
-		}
+		},
 	};
 
 	let layers = match unsafe { entry.enumerate_instance_layer_properties() } {
