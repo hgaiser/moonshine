@@ -496,12 +496,7 @@ impl Gamepad {
 
 	pub fn set_motion(&self, motion: &GamepadMotion) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
-			gamepad.set_motion(
-				motion.motion_type,
-				motion.x.to_radians(),
-				motion.y.to_radians(),
-				motion.z.to_radians(),
-			);
+			gamepad.set_motion(motion.motion_type, motion.x, motion.y, motion.z);
 		}
 	}
 
