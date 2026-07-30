@@ -65,16 +65,6 @@ nix profile install github:hgaiser/moonshine
 
 After installing, follow the [Enable the service](#enable-the-service) steps below (the NixOS module handles this for you when enabled).
 
-### Bazzite / Silverblue / Atomic distros (systemd-sysext)
-
-```sh
-curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash
-```
-
-The script downloads the latest release, merges the system extension, and prompts for setup.
-It's also installed to `/usr/bin/moonshine-install.sh` so you can upgrade or uninstall later without downloading it again.
-Use `--help` for flags.
-
 ### Enable the service
 
 These steps apply to every installation method above (the service is a systemd unit).
