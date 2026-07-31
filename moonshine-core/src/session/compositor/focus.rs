@@ -357,18 +357,18 @@ mod tests {
 		m
 	}
 
-	// ---- Priority key tests (T2) ----
-
 	#[test]
-	fn steam_fills_the_output_without_the_fullscreen_state() {
+	fn test_steam_fills_the_output_without_the_fullscreen_state() {
 		assert!(make_meta(&[("app_id", "769")]).is_fullscreen());
 	}
 
 	#[test]
-	fn a_game_fills_the_output_only_once_it_declares_fullscreen() {
+	fn test_a_game_fills_the_output_only_once_it_declares_fullscreen() {
 		assert!(!make_meta(&[("app_id", "12345")]).is_fullscreen());
 		assert!(make_meta(&[("app_id", "12345"), ("fullscreen", "true")]).is_fullscreen());
 	}
+
+	// ---- Priority key tests (T2) ----
 
 	#[test]
 	fn test_game_wins_over_non_game() {
