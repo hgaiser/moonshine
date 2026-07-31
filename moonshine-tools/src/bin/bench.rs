@@ -597,8 +597,8 @@ async fn run_benchmark(
 		},
 		chroma_sampling_type: VideoChromaSampling::Yuv420,
 		max_reference_frames: 1,
-		encrypt_video: false,
 		full_range: false,
+		encrypt_video: false,
 	};
 
 	let audio_ctx = AudioStreamContext {
