@@ -65,7 +65,8 @@ jobs:
         cp ./target/release/libmoonshine_wsi.so "$STAGE/lib/moonshine/vulkan-layers/"
         cp ./dist/start-moonshine.sh ./dist/60-moonshine.rules ./dist/50-moonshine-inhibit-sleep.rules \
            ./dist/moonshine-modules.conf ./dist/moonshine-sysusers.conf \
-           ./dist/moonshine@.service ./dist/VkLayer_moonshine_wsi.json "$STAGE/share/moonshine/"
+           ./dist/moonshine@.service ./dist/VkLayer_moonshine_wsi.json \
+           ./dist/moonshine-atomic-update.conf "$STAGE/share/moonshine/"
         cp ./dist/moonshine-install.sh "$STAGE/bin/"
         cp README.md LICENSE "$STAGE/"
         tar --zstd -cf "./moonshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst" \
