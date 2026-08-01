@@ -84,7 +84,7 @@ Use the installer script:
 curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash
 ```
 
-This deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`.
+This deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`. The installer registers these files with SteamOS so they persist across atomic updates.
 
 ### Enable the service
 

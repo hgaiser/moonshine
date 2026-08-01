@@ -154,6 +154,7 @@ if [[ "$UNINSTALL" == "true" ]]; then
   sudo rm -f /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
   sudo rm -f /etc/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
   sudo rm -f /etc/profile.d/moonshine.sh
+  sudo rm -f /etc/atomic-update.conf.d/moonshine.conf
   sudo systemctl daemon-reload || true
   sudo udevadm control --reload || true
 
@@ -281,6 +282,9 @@ CMDS=(
 
   # Create profile.d for PATH
   "echo 'export PATH=\"\${PATH}:${MOONSHINE_HOME}/bin\"' > /etc/profile.d/moonshine.sh"
+
+  # Preserve /etc integration across SteamOS atomic updates
+  "if [[ -d /etc/atomic-update.conf.d ]]; then cp '${S}/share/moonshine/moonshine-atomic-update.conf' /etc/atomic-update.conf.d/moonshine.conf; fi"
 
   # Reload systemd
   "systemctl daemon-reload"
