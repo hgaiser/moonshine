@@ -199,6 +199,13 @@ impl WindowMetadata {
 		self.app_id == 769
 	}
 
+	/// Returns `true` if the window should fill the output. Steam counts even
+	/// without the fullscreen state set.
+	/// Gamescope: `window_is_fullscreen()`
+	pub fn is_fullscreen(&self) -> bool {
+		self.fullscreen || self.is_steam_big_picture()
+	}
+
 	/// Returns `true` if the window has skipTaskbar AND skipPager but is not fullscreen.
 	/// Gamescope: `win_skip_and_not_fullscreen()`
 	pub fn skip_and_not_fullscreen(&self) -> bool {
@@ -348,6 +355,17 @@ mod tests {
 			}
 		}
 		m
+	}
+
+	#[test]
+	fn test_steam_fills_the_output_without_the_fullscreen_state() {
+		assert!(make_meta(&[("app_id", "769")]).is_fullscreen());
+	}
+
+	#[test]
+	fn test_a_game_fills_the_output_only_once_it_declares_fullscreen() {
+		assert!(!make_meta(&[("app_id", "12345")]).is_fullscreen());
+		assert!(make_meta(&[("app_id", "12345"), ("fullscreen", "true")]).is_fullscreen());
 	}
 
 	// ---- Priority key tests (T2) ----
