@@ -141,22 +141,44 @@ fn build_av1_cll_obu(m: &HdrMetadata) -> Vec<u8> {
 	build_av1_metadata_obu(&payload)
 }
 
-/// Build AV1 OBU metadata for HDR MDCV (metadata_type = 2).
+/// Convert a chromaticity coordinate from the 0.00002 steps of H.26x MDCV SEI
+/// (the `HdrMetadata` scale) to AV1's 0.16 fixed-point scale.
+fn av1_chromaticity(value: u16) -> u16 {
+	// value / 50000 * 65536, rounded; 50000 (chromaticity 1.0) does not fit
+	// 16 bits and saturates.
+	((u64::from(value) * 65536 + 25000) / 50000).min(u64::from(u16::MAX)) as u16
+}
+
+/// Convert a luminance from 0.0001 cd/m² units (the `HdrMetadata` scale) to
+/// AV1's 24.8 fixed-point `luminance_max`. The scale shrinks by 10000/256, so
+/// unlike [`av1_luminance_min`] no input can overflow the field.
+fn av1_luminance_max(value: u32) -> u32 {
+	((u64::from(value) * 256 + 5000) / 10000) as u32
+}
+
+/// Convert a luminance from 0.0001 cd/m² units (the `HdrMetadata` scale) to
+/// AV1's 18.14 fixed-point `luminance_min`.
+fn av1_luminance_min(value: u32) -> u32 {
+	((u64::from(value) * 16384 + 5000) / 10000).min(u64::from(u32::MAX)) as u32
+}
+
+/// Build AV1 OBU metadata for HDR MDCV (metadata_type = 2), converting the
+/// values into AV1's units (spec 6.7.4).
 fn build_av1_mdcv_obu(m: &HdrMetadata) -> Vec<u8> {
 	let mut payload = Vec::new();
 	// metadata_type = 2 (METADATA_TYPE_HDR_MDCV), leb128 encoded.
 	payload.push(2);
 	// Display primaries (RGB order, u16 BE each).
 	for &(x, y) in &m.display_primaries {
-		payload.extend(x.to_be_bytes());
-		payload.extend(y.to_be_bytes());
+		payload.extend(av1_chromaticity(x).to_be_bytes());
+		payload.extend(av1_chromaticity(y).to_be_bytes());
 	}
 	// White point.
-	payload.extend(m.white_point.0.to_be_bytes());
-	payload.extend(m.white_point.1.to_be_bytes());
+	payload.extend(av1_chromaticity(m.white_point.0).to_be_bytes());
+	payload.extend(av1_chromaticity(m.white_point.1).to_be_bytes());
 	// Luminance (u32 BE).
-	payload.extend(m.max_luminance.to_be_bytes());
-	payload.extend(m.min_luminance.to_be_bytes());
+	payload.extend(av1_luminance_max(m.max_luminance).to_be_bytes());
+	payload.extend(av1_luminance_min(m.min_luminance).to_be_bytes());
 
 	build_av1_metadata_obu(&payload)
 }
@@ -543,8 +565,26 @@ mod tests {
 
 		let mdcv_obu = build_av1_mdcv_obu(&m);
 		assert_eq!(mdcv_obu[0], METADATA_OBU_HEADER);
+		assert_eq!(mdcv_obu[1], 26, "1 type + 24 payload + 1 trailing byte");
 		assert_eq!(mdcv_obu[2], 2, "metadata_type = METADATA_TYPE_HDR_MDCV");
 		assert_eq!(*mdcv_obu.last().unwrap(), 0x80, "trailing bits");
+	}
+
+	/// Anchors are derived independently: D65 is x=0.3127, y=0.3290, and
+	/// 0.3127 * 65536 = 20493.1.
+	#[test]
+	fn test_av1_mdcv_units_are_av1_fixed_point() {
+		assert_eq!(av1_chromaticity(15635), 20493); // D65 x
+		assert_eq!(av1_chromaticity(16450), 21561); // D65 y
+		assert_eq!(av1_chromaticity(0), 0);
+		// Chromaticity 1.0 needs 65536 and saturates at the field maximum.
+		assert_eq!(av1_chromaticity(50000), u16::MAX);
+
+		// 1000 nits: 1000 * 256 in 24.8.
+		assert_eq!(av1_luminance_max(10_000_000), 256_000);
+		// 0.05 nits: 0.05 * 16384 = 819.2 in 18.14.
+		assert_eq!(av1_luminance_min(500), 819);
+		assert_eq!(av1_luminance_min(u32::MAX), u32::MAX, "saturates");
 	}
 
 	/// `obu_size` counts the trailing bits, so a decoder that trusts it reads
@@ -575,6 +615,30 @@ mod tests {
 		expected.extend_from_slice(&mdcv);
 		expected.extend_from_slice(&cll);
 		expected.extend_from_slice(&frame);
+		assert_eq!(out, expected);
+	}
+
+	/// An encoder may emit padding OBUs (type 15) after the sequence header;
+	/// metadata still goes in front of the frame, not the padding.
+	#[test]
+	fn test_inject_av1_skips_leading_non_frame_obus() {
+		let m = test_metadata();
+		let mut data = Vec::new();
+		data.extend_from_slice(&[0x12, 0x00]); // temporal delimiter
+		data.extend_from_slice(&[0x0A, 0x02, 0xC0, 0xDE]); // sequence header, size 2
+		data.extend_from_slice(&[0x7A, 0x03, 0xAA, 0xAA, 0xAA]); // padding, size 3
+		let frame_pos = data.len();
+		data.extend_from_slice(&[0x32, 0x02, 0xAA, 0xBB]); // frame, size 2
+
+		assert_eq!(find_first_frame_obu(&data), frame_pos);
+
+		// The metadata lands after the padding and before the frame, so the
+		// leading OBUs reach the decoder unchanged.
+		let out = inject_av1_metadata(&data, &m);
+		let mut expected = data[..frame_pos].to_vec();
+		expected.extend_from_slice(&build_av1_mdcv_obu(&m));
+		expected.extend_from_slice(&build_av1_cll_obu(&m));
+		expected.extend_from_slice(&data[frame_pos..]);
 		assert_eq!(out, expected);
 	}
 }
