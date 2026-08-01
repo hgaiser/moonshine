@@ -129,10 +129,10 @@ fn handle_set_hdr_metadata(
 	// preserving a colorspace already established by `swapchain_feedback` —
 	// e.g. Cyberpunk sets HDR metadata *after* its scRGB swapchain is created,
 	// and overwriting the description here would mislabel the linear scRGB
-	// buffers as PQ-encoded. When no colorspace was declared yet this defaults
-	// to BT.2020+PQ: the WSI layer remaps HDR→sRGB for the ICD, but DXVK
-	// doesn't see the remap and performs sRGB→PQ conversion in its swapchain
-	// blitter, so the pixel data arriving at the compositor is PQ-encoded.
+	// buffers as PQ-encoded. When no colorspace was declared yet the metadata
+	// is parked until `swapchain_feedback` declares one: SDR games call
+	// `vkSetHdrMetadataEXT` too (DXVK forwards it without looking at the
+	// swapchain color space), so metadata alone must not imply BT.2020+PQ.
 	if let Some(cm) = &mut state.color_management {
 		cm.set_gamescope_hdr_metadata(
 			surface,
