@@ -117,7 +117,10 @@ impl AudioEncoderInner {
 			.enable_all()
 			.build()
 			.expect("Failed to build tokio runtime for audio encoder");
-		rt.block_on(start_notify.notified());
+		if rt.block_on(stop.wrap_cancel(start_notify.notified())).is_err() {
+			tracing::debug!("Audio encoder stopped before start signal.");
+			return;
+		}
 
 		let mut sequence_number = 0u16;
 		let stream_start_time = std::time::Instant::now();

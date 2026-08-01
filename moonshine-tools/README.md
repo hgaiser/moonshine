@@ -26,6 +26,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 
 | Option | Default | Description |
 |--------|---------|-------------|
+| `--matrix` | off | Run the built-in 4K, 1440p, and 1080p matrix across 60/120/360 FPS and `hevc`, `h264`, and `av1` |
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
 | `--fps <N>` | `60` | Target frame rate |
 | `--bitrate <N>` | `20000000` | Target bitrate in bits per second |
@@ -47,6 +48,12 @@ Compare AV1 encoding at 4K:
 
 ```bash
 moonshine-bench --resolution 3840x2160 --codec av1 --bitrate 50000000 --duration 60 /usr/bin/vkcube
+```
+
+Run the full 4K/1440p/1080p x 60/120/360 FPS x HEVC/H.264/AV1 matrix:
+
+```bash
+cargo run --release -p moonshine-tools --bin moonshine-bench -- --matrix --duration 30 --warmup 4 /usr/bin/vkcube
 ```
 
 Run indefinitely until you press Ctrl+C:
@@ -73,12 +80,15 @@ Every 5 seconds, a summary is printed with:
 
 - **Frame count & FPS** — actual encoded frames per second
 - **Bitrate** — average encoded bitrate in Mbps
-- **Total latency** — avg/min/max time for the full pipeline per frame
-- **Encode latency** — avg/min/max time spent in the encoder
-- **Breakdown** — avg time per stage: channel wait, DMA-BUF import, color conversion, packetization, send
+- **Total latency** — avg/min/max and p50/p95/p99 time for the full pipeline per frame
+- **Submit latency** — avg/min/max and p50/p95/p99 CPU time spent submitting a frame to the asynchronous encoder
+- **Encode wait latency** — avg/min/max and p50/p95/p99 time waiting for the asynchronous encode/readback future
+- **Breakdown** — avg time per stage: channel wait, DMA-BUF import, color conversion, submit, encode wait, packetization, send; consumer queue is reported as a diagnostic included inside encode wait
 - **Key frames** — number of keyframes emitted
 
 At the end of the run, a final summary covers the entire session (excluding the warmup period).
+
+With `--matrix`, each combination prints the same per-run summaries and the command finishes with a consolidated latency distribution table plus an average pipeline breakdown table. Matrix mode uses fixed target FPS values of 60, 120, and 360. If `--duration` is left at `0`, matrix mode defaults to 8 seconds per combination so the matrix completes.
 
 ### How It Works
 
