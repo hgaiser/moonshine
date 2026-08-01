@@ -29,6 +29,21 @@ impl ShardBatch {
 		}
 	}
 
+	/// Raw contiguous buffer for GSO sends.
+	pub fn as_bytes(&self) -> &[u8] {
+		&self.data
+	}
+
+	/// Size of each individual shard.
+	pub fn shard_size(&self) -> usize {
+		self.shard_size
+	}
+
+	/// Number of shards in this batch.
+	pub fn shard_count(&self) -> usize {
+		self.data.len().checked_div(self.shard_size).unwrap_or(0)
+	}
+
 	/// Append all shards from `other` into this batch.
 	///
 	/// Both batches must have the same shard_size (or `self` must be empty).

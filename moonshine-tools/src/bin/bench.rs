@@ -1,3 +1,4 @@
+use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
@@ -325,6 +326,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 	tracing::info!("Triggering video and audio pipelines...");
 	session_manager.trigger_streams_start().await;
+
+	// Send PING to the video socket so the packet handler learns the client
+	// address and actually transmits encoded frames over UDP (otherwise all
+	// packets are silently dropped waiting for a Moonlight client to connect).
+	let ping_addr: std::net::SocketAddr = "127.0.0.1:47998".parse().unwrap();
+	if let Ok(ping_sock) = UdpSocket::bind("127.0.0.1:0") {
+		let _ = ping_sock.send_to(b"PING", ping_addr);
+		tracing::debug!("Sent PING to video socket at {ping_addr}");
+	}
 
 	tracing::info!("Session active. Collecting stats...");
 

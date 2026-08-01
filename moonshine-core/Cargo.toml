@@ -59,6 +59,7 @@ smithay = { git = "https://github.com/hgaiser/smithay", branch = "master-moonshi
     "xwayland",
     "x11rb_event_source",
 ] }
+quinn-udp = "0.6.1"
 socket2 = "0.6.4"
 steamlocate = "2.1.0"
 strum_macros = "0.28.0"
