@@ -465,12 +465,6 @@ struct VideoPipelineInner {
 	keys_rx: SessionKeysReceiver,
 }
 
-/// Whether a color description carries the PQ transfer function, which is what
-/// makes the stream HDR. The luma range is independent of it.
-fn is_hdr(desc: ColorDescription) -> bool {
-	desc.transfer_characteristics == ColorDescription::bt2020_pq().transfer_characteristics
-}
-
 impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run(
@@ -564,14 +558,8 @@ impl VideoPipelineInner {
 
 		// Select color description for VUI signaling.
 		let color_description = match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription {
-				full_range: ctx.full_range,
-				..ColorDescription::bt709()
-			},
-			VideoDynamicRange::Hdr => ColorDescription {
-				full_range: ctx.full_range,
-				..ColorDescription::bt2020_pq()
-			},
+			VideoDynamicRange::Sdr => ColorDescription::bt709().with_full_range(ctx.full_range),
+			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
 		};
 
 		// Create encode configuration.
@@ -701,14 +689,8 @@ impl VideoPipelineInner {
 		// color_desc differs, we call set_color_description() to update
 		// the SPS/sequence header.
 		let mut encoder_color_desc: Option<ColorDescription> = Some(match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription {
-				full_range: ctx.full_range,
-				..ColorDescription::bt709()
-			},
-			VideoDynamicRange::Hdr => ColorDescription {
-				full_range: ctx.full_range,
-				..ColorDescription::bt2020_pq()
-			},
+			VideoDynamicRange::Sdr => ColorDescription::bt709().with_full_range(ctx.full_range),
+			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
 		});
 
 		while !stop_session_manager.is_shutdown_triggered() {
@@ -975,28 +957,19 @@ impl VideoPipelineInner {
 						FrameColorSpace::Srgb => (
 							ColorSpace::Bt709,
 							ctx.full_range,
-							ColorDescription {
-								full_range: ctx.full_range,
-								..ColorDescription::bt709()
-							},
+							ColorDescription::bt709().with_full_range(ctx.full_range),
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::Bt2020Pq => (
 							ColorSpace::Bt2020,
 							ctx.full_range,
-							ColorDescription {
-								full_range: ctx.full_range,
-								..ColorDescription::bt2020_pq()
-							},
+							ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::ScrgbLinear => (
 							ColorSpace::Bt709LinearToBt2020Pq,
 							ctx.full_range,
-							ColorDescription {
-								full_range: ctx.full_range,
-								..ColorDescription::bt2020_pq()
-							},
+							ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
 							SCRGB_REFERENCE_WHITE_NITS,
 						),
 					};
@@ -1042,7 +1015,7 @@ impl VideoPipelineInner {
 				// In HDR sessions, `enabled` reflects whether the current
 				// frame is encoded as BT.2020+PQ (true) or BT.709 (false).
 				if ctx.dynamic_range == VideoDynamicRange::Hdr {
-					let hdr_enabled = encoder_color_desc.is_some_and(is_hdr);
+					let hdr_enabled = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 					let new_state = HdrModeState {
 						enabled: hdr_enabled,
 						metadata: frame.hdr_metadata,
@@ -1138,25 +1111,9 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
-	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost, is_hdr};
+	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost};
 	use ash::vk;
-	use pixelforge::{ColorDescription, InputFormat, PixelForgeError};
-
-	/// The client's requested luma range must not change whether the stream
-	/// counts as HDR.
-	#[test]
-	fn hdr_is_decided_by_the_transfer_function_not_the_range() {
-		for full_range in [false, true] {
-			assert!(is_hdr(ColorDescription {
-				full_range,
-				..ColorDescription::bt2020_pq()
-			}));
-			assert!(!is_hdr(ColorDescription {
-				full_range,
-				..ColorDescription::bt709()
-			}));
-		}
-	}
+	use pixelforge::{InputFormat, PixelForgeError};
 
 	// DRM fourccs — kept in the test module to document the byte ordering
 	// explicitly and guard against accidental typos in the production match.
