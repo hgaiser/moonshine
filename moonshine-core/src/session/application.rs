@@ -504,6 +504,31 @@ fn terminal_state(state: &str) -> Option<&'static str> {
 	}
 }
 
+/// Split a systemd `StandardOutput`/`StandardError` setting into the enum value
+/// and, for path-based settings, the companion path property.
+///
+/// Unit files accept `StandardOutput=file:/path`, but over D-Bus
+/// (StartTransientUnit) the path must go in a separate property:
+/// `StandardOutput=file` + `StandardOutputFile=/path`. Sending the combined
+/// `file:/path` string is rejected with "Invalid StandardOutput setting".
+/// Mirrors systemd's `bus_append_standard_inputs()` in bus-unit-util.c.
+fn split_standard_io(value: &Option<String>) -> (String, Option<(&'static str, String)>) {
+	let Some(v) = value.as_deref() else {
+		return ("null".to_string(), None);
+	};
+	for (prefix, prop) in [
+		("file:", "File"),
+		("append:", "FileToAppend"),
+		("truncate:", "FileToTruncate"),
+		("fd:", "FileDescriptorName"),
+	] {
+		if let Some(path) = v.strip_prefix(prefix) {
+			return (v[..prefix.len() - 1].to_string(), Some((prop, path.to_string())));
+		}
+	}
+	(v.to_string(), None)
+}
+
 /// Launch the application as a transient systemd service unit via D-Bus.
 async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>) -> Result<OwnedObjectPath, ()> {
 	// Resolve exec entries in a blocking task — `which::which` does filesystem lookups.
@@ -528,40 +553,53 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 
 	tracing::debug!(?pre_entries, ?main_entry, ?post_entries, "Building transient service");
 
+	// Split StandardOutput/StandardError into the enum value plus an optional
+	// companion path property. Unit-file syntax (`StandardOutput=file:/path`) is
+	// not accepted over D-Bus; the path must be a separate property
+	// (`StandardOutput=file` + `StandardOutputFile=/path`).
+	let (stdout_setting, stdout_path) = split_standard_io(options.stdout_value);
+	let (stderr_setting, stderr_path) = split_standard_io(options.stderr_value);
+
 	// Properties: a(sv) — array of (property_name: s, value: v)
-	// zvariant::Value has D-Bus type 'v' (variant), so Vec<(&str, Value)> serialises as a(sv).
+	// zvariant::Value has D-Bus type 'v' (variant), so Vec<(String, Value)> serialises as a(sv).
 	//
 	// IMPORTANT: do NOT use zvariant::Array::from(Vec<Value>) — it always produces `av`
 	// (array of variant). Build typed arrays with Array::new(signature) + append() instead.
-	let mut properties: Vec<(&str, zvariant::Value<'_>)> = vec![
-		("Type", zvariant::Value::Str("exec".into())),
-		("Slice", zvariant::Value::Str("moonshine.slice".into())),
+	let mut properties: Vec<(String, zvariant::Value<'_>)> = vec![
+		("Type".to_string(), zvariant::Value::Str("exec".into())),
+		("Slice".to_string(), zvariant::Value::Str("moonshine.slice".into())),
 		// Environment: as
-		("Environment", zvariant::Value::from(options.envs.to_vec())),
+		("Environment".to_string(), zvariant::Value::from(options.envs.to_vec())),
 		// ExecStart: a(sasb)
-		("ExecStart", build_exec_array(&[main_entry])?),
-		("TimeoutStopUSec", zvariant::Value::U64(5_000_000)),
-		("CollectMode", zvariant::Value::Str("inactive-or-failed".into())),
-		// StandardOutput/StandardError: systemd expects `s` (string)
-		// Valid values: inherit, null, tty, journal, kmsg, journal+console,
-		// file:path, append:path, truncate:path, socket, fd:name
+		("ExecStart".to_string(), build_exec_array(&[main_entry])?),
+		("TimeoutStopUSec".to_string(), zvariant::Value::U64(5_000_000)),
 		(
-			"StandardOutput",
-			zvariant::Value::Str(options.stdout_value.as_deref().unwrap_or("null").into()),
+			"CollectMode".to_string(),
+			zvariant::Value::Str("inactive-or-failed".into()),
 		),
+		// StandardOutput/StandardError: bare enum value
 		(
-			"StandardError",
-			zvariant::Value::Str(options.stderr_value.as_deref().unwrap_or("null").into()),
+			"StandardOutput".to_string(),
+			zvariant::Value::Str(stdout_setting.into()),
 		),
+		("StandardError".to_string(), zvariant::Value::Str(stderr_setting.into())),
 	];
+
+	// Path-based outputs carry their path in a companion property.
+	if let Some((prop, path)) = stdout_path {
+		properties.push((format!("StandardOutput{prop}"), zvariant::Value::Str(path.into())));
+	}
+	if let Some((prop, path)) = stderr_path {
+		properties.push((format!("StandardError{prop}"), zvariant::Value::Str(path.into())));
+	}
 
 	// Only include ExecStartPre/ExecStopPost when non-empty: an empty a(sasb) array still
 	// needs a valid element signature, and omitting absent properties is cleaner.
 	if !pre_entries.is_empty() {
-		properties.push(("ExecStartPre", build_exec_array(&pre_entries)?));
+		properties.push(("ExecStartPre".to_string(), build_exec_array(&pre_entries)?));
 	}
 	if !post_entries.is_empty() {
-		properties.push(("ExecStopPost", build_exec_array(&post_entries)?));
+		properties.push(("ExecStopPost".to_string(), build_exec_array(&post_entries)?));
 	}
 
 	// Aux units: empty a(sa(sv))
@@ -716,4 +754,64 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 			.map_err(|e| tracing::error!("Failed to append exec entry: {e}"))?;
 	}
 	Ok(zvariant::Value::Array(arr))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::split_standard_io;
+
+	#[test]
+	fn test_standard_io_defaults_to_null() {
+		assert_eq!(split_standard_io(&None), ("null".to_string(), None));
+	}
+
+	#[test]
+	fn test_standard_io_passes_bare_enums_through() {
+		assert_eq!(
+			split_standard_io(&Some("journal".to_string())),
+			("journal".to_string(), None)
+		);
+		assert_eq!(
+			split_standard_io(&Some("inherit".to_string())),
+			("inherit".to_string(), None)
+		);
+		assert_eq!(
+			split_standard_io(&Some("kmsg+console".to_string())),
+			("kmsg+console".to_string(), None)
+		);
+	}
+
+	#[test]
+	fn test_standard_io_splits_file_paths() {
+		assert_eq!(
+			split_standard_io(&Some("file:/var/log/app.log".to_string())),
+			("file".to_string(), Some(("File", "/var/log/app.log".to_string())))
+		);
+	}
+
+	#[test]
+	fn test_standard_io_splits_append_and_truncate() {
+		assert_eq!(
+			split_standard_io(&Some("append:/var/log/app.log".to_string())),
+			(
+				"append".to_string(),
+				Some(("FileToAppend", "/var/log/app.log".to_string()))
+			)
+		);
+		assert_eq!(
+			split_standard_io(&Some("truncate:/var/log/app.log".to_string())),
+			(
+				"truncate".to_string(),
+				Some(("FileToTruncate", "/var/log/app.log".to_string()))
+			)
+		);
+	}
+
+	#[test]
+	fn test_standard_io_splits_fd_names() {
+		assert_eq!(
+			split_standard_io(&Some("fd:stdout".to_string())),
+			("fd".to_string(), Some(("FileDescriptorName", "stdout".to_string())))
+		);
+	}
 }
