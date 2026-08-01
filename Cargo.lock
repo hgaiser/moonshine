@@ -2470,12 +2470,9 @@ dependencies = [
  "async-shutdown",
  "clap",
  "moonshine-core",
- "rand 0.9.4",
  "tokio",
  "tracing",
  "tracing-subscriber",
- "wayland-client",
- "wayland-protocols",
 ]
 
 [[package]]
@@ -2849,8 +2846,8 @@ dependencies = [
 
 [[package]]
 name = "pixelforge"
-version = "0.7.1"
-source = "git+https://github.com/hgaiser/pixelforge?tag=v0.7.1#85c8654d383e194b984e27b319de96e4335e2b4f"
+version = "0.7.2"
+source = "git+https://github.com/hgaiser/pixelforge?tag=v0.7.2#061d5ac05cb8d8257af4842228fc38b14bcb55a8"
 dependencies = [
  "ash",
  "futures-channel",
@@ -3082,7 +3079,7 @@ checksum = "76150b617afc75e6e21ac5f39bc196e80b65415ae48d62dbef8e2519d040ce42"
 dependencies = [
  "cfg_aliases",
  "libc",
- "socket2 0.6.4",
+ "socket2",
  "tracing",
  "windows-sys 0.61.2",
 ]
@@ -4358,7 +4355,6 @@ checksum = "23d0c813de3daa2ed6520af85a3bd49b0e722a3078506899aa9686fea58dc4b6"
 dependencies = [
  "bitflags",
  "wayland-backend",
- "wayland-client",
  "wayland-scanner",
  "wayland-server",
 ]
