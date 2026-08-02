@@ -1,20 +1,18 @@
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
-use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use serde::{Deserialize, Serialize};
-use tokio::{
-	net::UdpSocket,
-	sync::{Notify, broadcast, mpsc, watch},
-};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
+mod gso_socket;
 mod packetizer;
 mod pipeline;
 mod shard_batch;
+use gso_socket::UdpGsoSocket;
 use pipeline::VideoPipeline;
 use shard_batch::ShardBatch;
 
@@ -234,7 +232,7 @@ impl VideoStreamHandle {
 }
 
 pub(crate) struct VideoStream {
-	socket: UdpSocket,
+	socket: UdpGsoSocket,
 	frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -251,9 +249,7 @@ impl VideoStream {
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 
-		let socket = UdpSocket::bind((address.as_str(), config.port))
-			.await
-			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
+		let socket = UdpGsoSocket::new(&address, config.port).await?;
 
 		tracing::debug!(
 			"Listening for video messages on {}",
@@ -290,16 +286,6 @@ impl VideoStream {
 			let _ = socket.set_tos_v4(160);
 		}
 
-		// Initialize quinn-udp state for GSO support.
-		let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
-			.map_err(|e| tracing::error!("Failed to initialize UDP socket state: {e}"))?;
-		let gso_enabled = udp_state.max_gso_segments() > 1;
-		if gso_enabled {
-			tracing::info!("GSO enabled, max segments: {}", udp_state.max_gso_segments());
-		} else {
-			tracing::info!("GSO not available, using per-shard sends");
-		}
-
 		// Gate for pipeline + packet handler.
 		let start_notify = Arc::new(Notify::new());
 
@@ -317,7 +303,7 @@ impl VideoStream {
 		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
 
 		// Spawn packet handler — gated behind start_notify.
-		spawn_handle_video_packets(packet_rx, socket, udp_state, start_notify.clone(), stop.clone());
+		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone());
 
 		// Spawn pipeline thread — gated behind start_notify.
 		VideoPipeline::new(
@@ -347,8 +333,7 @@ impl VideoStream {
 
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<ShardBatch>,
-	socket: UdpSocket,
-	udp_state: UdpSocketState,
+	socket: UdpGsoSocket,
 	start: Arc<Notify>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -374,35 +359,24 @@ fn spawn_handle_video_packets(
 									continue;
 								}
 
-								// Try GSO first if available (check dynamically —
-								// quinn-udp may disable GSO after a send failure).
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
-								let use_gso = udp_state.max_gso_segments() > 1;
-								if use_gso {
-									match stop_session_manager
-										.wrap_cancel(send_batch_gso(&socket, &udp_state, &batch, addr))
-										.await
-									{
-										Ok(failed_chunks) => {
-											if failed_chunks > 0
-												&& last_send_warn
-													.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
-											{
-												tracing::warn!(
-													"GSO send failed for {failed_chunks} chunk(s), sent per-shard instead"
-												);
-												last_send_warn = Some(std::time::Instant::now());
-											}
-										},
-										Err(_) => break,
-									}
-								} else if stop_session_manager
-									.wrap_cancel(send_shards(&socket, &batch, addr))
+								match stop_session_manager
+									.wrap_cancel(socket.send_batch(&batch, addr))
 									.await
-									.is_err()
 								{
-									break;
+									Ok(failed_chunks) => {
+										if failed_chunks > 0
+											&& last_send_warn
+												.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
+										{
+											tracing::warn!(
+												"GSO send failed for {failed_chunks} chunk(s), sent per-shard instead"
+											);
+											last_send_warn = Some(std::time::Instant::now());
+										}
+									},
+									Err(_) => break,
 								}
 							}
 						},
@@ -436,122 +410,4 @@ fn spawn_handle_video_packets(
 
 		tracing::debug!("Video packet stream stopped.");
 	});
-}
-
-/// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
-/// A GSO batch is still one datagram: the kernel rejects anything larger
-/// with EMSGSIZE before segmenting. IPv6 allows 20 more bytes; the IPv4
-/// value is safe for both.
-const MAX_UDP_PAYLOAD: usize = 65507;
-
-/// Number of shards per GSO send: the kernel's segment-count cap or the
-/// datagram-size cap, whichever binds first. Never zero, even for a shard
-/// larger than a datagram (such a chunk fails at send time and falls back
-/// to per-shard sends, which fail visibly instead of silently).
-fn gso_segments_per_send(max_gso_segments: usize, shard_size: usize) -> usize {
-	max_gso_segments
-		.min(MAX_UDP_PAYLOAD.checked_div(shard_size).unwrap_or(0))
-		.max(1)
-}
-
-/// Send a batch as GSO chunks sized to the kernel's segment and datagram
-/// caps; a frame's batch routinely exceeds both. Uses `try_send` because
-/// `send` masks every error except `WouldBlock` as success, silently
-/// discarding the batch. Returns the number of chunks that fell back to
-/// per-shard sends, so the caller can rate-limit the warning.
-async fn send_batch_gso(
-	socket: &UdpSocket,
-	udp_state: &UdpSocketState,
-	batch: &ShardBatch,
-	addr: std::net::SocketAddr,
-) -> u32 {
-	let shard_size = batch.shard_size();
-	if shard_size == 0 {
-		return 0;
-	}
-	let segments_per_send = gso_segments_per_send(udp_state.max_gso_segments(), shard_size);
-
-	let mut failed_chunks = 0u32;
-	for chunk in batch.as_bytes().chunks(segments_per_send * shard_size) {
-		let transmit = Transmit {
-			destination: addr,
-			ecn: None,
-			contents: chunk,
-			segment_size: Some(shard_size),
-			src_ip: None,
-		};
-		let result = loop {
-			match udp_state.try_send(UdpSockRef::from(socket), &transmit) {
-				// A frame burst can outrun the socket buffer; wait for it to
-				// drain and resend the same chunk instead of degrading.
-				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-					socket.writable().await.ok();
-				},
-				other => break other,
-			}
-		};
-		if let Err(e) = result {
-			failed_chunks += 1;
-			tracing::debug!("GSO send failed ({e}), falling back to per-shard sends for this chunk");
-			send_shard_bytes(socket, chunk, shard_size, addr).await;
-		}
-	}
-	failed_chunks
-}
-
-/// Send all shards in a batch as individual UDP packets.
-async fn send_shards(socket: &UdpSocket, batch: &ShardBatch, addr: std::net::SocketAddr) {
-	send_shard_bytes(socket, batch.as_bytes(), batch.shard_size(), addr).await;
-}
-
-/// Send a contiguous buffer of equal-sized shards as individual UDP packets.
-async fn send_shard_bytes(socket: &UdpSocket, bytes: &[u8], shard_size: usize, addr: std::net::SocketAddr) {
-	if shard_size == 0 {
-		return;
-	}
-	for shard in bytes.chunks(shard_size) {
-		if let Err(e) = socket.send_to(shard, addr).await {
-			tracing::warn!("Failed to send packet to client: {e}");
-		}
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn gso_segment_count_cap_binds() {
-		// Payload cap (65507 / 100 = 655) is looser than the segment cap.
-		assert_eq!(gso_segments_per_send(8, 100), 8);
-	}
-
-	#[test]
-	fn gso_payload_cap_binds() {
-		// 65507 / 2000 = 32, tighter than the kernel's 64-segment cap.
-		assert_eq!(gso_segments_per_send(64, 2000), 32);
-	}
-
-	#[test]
-	fn gso_boundary_shard_sizes() {
-		assert_eq!(gso_segments_per_send(64, MAX_UDP_PAYLOAD), 1);
-		assert_eq!(gso_segments_per_send(64, MAX_UDP_PAYLOAD - 1), 1);
-		// A shard that cannot fit a datagram at all still yields 1, not 0.
-		assert_eq!(gso_segments_per_send(64, MAX_UDP_PAYLOAD + 1), 1);
-		assert_eq!(gso_segments_per_send(64, 0), 1);
-	}
-
-	#[test]
-	fn gso_chunks_respect_kernel_limits() {
-		// Shard counts chosen to force a partial final chunk.
-		for (shard_count, shard_size) in [(250usize, 1404usize), (47, 1404), (100, 733)] {
-			let segments = gso_segments_per_send(64, shard_size);
-			let data = vec![0u8; shard_count * shard_size];
-			for chunk in data.chunks(segments * shard_size) {
-				assert_eq!(chunk.len() % shard_size, 0, "chunk must hold whole shards");
-				assert!(chunk.len() <= MAX_UDP_PAYLOAD, "chunk must fit one datagram");
-				assert!(chunk.len() / shard_size <= 64, "chunk must respect segment cap");
-			}
-		}
-	}
 }
