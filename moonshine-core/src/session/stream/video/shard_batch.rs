@@ -19,16 +19,6 @@ impl ShardBatch {
 		}
 	}
 
-	/// Iterate over all shards as byte slices for sending.
-	pub fn shards(&self) -> impl Iterator<Item = &[u8]> {
-		let size = self.shard_size;
-		if size == 0 {
-			[].chunks_exact(1) // yields an empty iterator
-		} else {
-			self.data.chunks_exact(size)
-		}
-	}
-
 	/// Raw contiguous buffer for GSO sends.
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.data
