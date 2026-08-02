@@ -75,10 +75,8 @@ fn default_config_dir() -> PathBuf {
 /// the array lives under, so both spellings are accepted.
 #[derive(Debug, Deserialize)]
 struct HeroicLibrary {
-	/// Left untyped so a single malformed game can be dropped without losing
-	/// the whole library.
 	#[serde(alias = "games", default)]
-	library: Vec<serde_json::Value>,
+	library: Vec<HeroicGame>,
 }
 
 /// A single entry of a Heroic library cache.
@@ -126,7 +124,10 @@ pub(crate) fn scan_heroic_applications(config: &HeroicApplicationScannerConfig) 
 	let config_dir = PathBuf::from(expanded.as_ref());
 
 	if !config_dir.exists() {
-		tracing::debug!("Heroic configuration directory not found at {:?}.", config_dir);
+		tracing::warn!(
+			"Heroic configuration directory not found at {:?}, no Heroic games will be scanned.",
+			config_dir
+		);
 		return Ok(Vec::new());
 	}
 
@@ -198,17 +199,7 @@ fn read_library(path: &Path) -> Result<Vec<HeroicGame>, ()> {
 	let library: HeroicLibrary = serde_json::from_str(&contents)
 		.map_err(|e| tracing::warn!("Failed to parse Heroic library {:?}: {e}", path))?;
 
-	Ok(library
-		.library
-		.into_iter()
-		.filter_map(|game| match serde_json::from_value::<HeroicGame>(game) {
-			Ok(game) => Some(game),
-			Err(e) => {
-				tracing::debug!("Skipping unparseable entry in Heroic library {:?}: {e}", path);
-				None
-			},
-		})
-		.collect())
+	Ok(library.library)
 }
 
 /// Heroic requests Epic art through a resizing CDN and caches it under whichever
@@ -457,26 +448,6 @@ mod tests {
 		);
 
 		assert_eq!(scan_one_boxart(config_dir), None);
-	}
-
-	#[test]
-	fn skips_malformed_entries_without_dropping_the_library() {
-		let tempdir = tempdir().unwrap();
-		let config_dir = tempdir.path();
-
-		write_library(
-			config_dir,
-			"store_cache/legendary_library.json",
-			r#"{"library": [
-				{"title": "Missing App Name", "runner": "legendary", "is_installed": true},
-				{"app_name": "epic-id", "title": "Epic Game", "runner": "legendary", "is_installed": true}
-			]}"#,
-		);
-
-		let applications = scan_heroic_applications(&scanner_config(config_dir.to_path_buf())).unwrap();
-
-		assert_eq!(applications.len(), 1);
-		assert_eq!(applications[0].title, "Epic Game");
 	}
 
 	#[test]
