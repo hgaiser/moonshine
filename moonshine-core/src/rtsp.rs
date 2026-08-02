@@ -360,6 +360,32 @@ impl RtspServer {
 		let max_reference_frames: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
 
+		// Bit 0 selects full-range luma, the remaining bits an SDR colorspace.
+		// Sunshine: `colorspace_from_client_config()`
+		const CSC_COLORSPACE_REC601: u32 = 0;
+		const CSC_COLORSPACE_REC709: u32 = 1;
+		let encoder_csc_mode: Option<u32> = get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].encoderCscMode");
+		let full_range = encoder_csc_mode.unwrap_or_default() & 0x1 != 0;
+
+		// Only Rec.709 is encoded. Rec.601 doubles as the protocol default for
+		// clients that never chose a colorspace, so it stays quiet; higher
+		// values are explicit requests worth a warning.
+		match encoder_csc_mode.map(|mode| mode >> 1) {
+			Some(CSC_COLORSPACE_REC601) => {
+				tracing::debug!("Client sent SDR colorspace Rec.601 (the protocol default), encoding Rec.709.");
+			},
+			Some(colorspace) if colorspace != CSC_COLORSPACE_REC709 => {
+				tracing::warn!(
+					"Client requested SDR colorspace {colorspace} via encoderCscMode, encoding Rec.709 instead."
+				);
+			},
+			_ => {},
+		}
+		tracing::info!(
+			"Client requested {} range video.",
+			if full_range { "full" } else { "limited" }
+		);
+
 		// Parse the client's encryption flags from the ANNOUNCE SDP.
 		let client_encryption_flags: u8 =
 			get_optional_sdp_attribute(&sdp_session, "x-ss-general.encryptionEnabled").unwrap_or(0);
@@ -376,6 +402,7 @@ impl RtspServer {
 			dynamic_range,
 			chroma_sampling_type,
 			max_reference_frames,
+			full_range,
 			encrypt_video: self.video_config.encrypt && (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
 		};
 

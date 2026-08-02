@@ -597,6 +597,7 @@ async fn run_benchmark(
 		},
 		chroma_sampling_type: VideoChromaSampling::Yuv420,
 		max_reference_frames: 1,
+		full_range: false,
 		encrypt_video: false,
 	};
 
