@@ -57,7 +57,10 @@ pub(crate) fn scan_lutris_applications(config: &LutrisApplicationScannerConfig) 
 	let db_path = PathBuf::from(expanded.as_ref());
 
 	if !db_path.exists() {
-		tracing::debug!("Lutris database not found at {:?}.", db_path);
+		tracing::warn!(
+			"Lutris database not found at {:?}, no Lutris games will be scanned.",
+			db_path
+		);
 		return Ok(Vec::new());
 	}
 

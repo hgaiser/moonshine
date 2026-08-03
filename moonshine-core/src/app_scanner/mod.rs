@@ -3,10 +3,12 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use desktop::DesktopApplicationScannerConfig;
+use heroic::HeroicApplicationScannerConfig;
 use lutris::LutrisApplicationScannerConfig;
 use steam::SteamApplicationScannerConfig;
 
 pub mod desktop;
+pub mod heroic;
 pub mod lutris;
 pub mod steam;
 
@@ -24,6 +26,9 @@ pub enum ApplicationScannerConfig {
 
 	/// Scans the Lutris game database.
 	Lutris(LutrisApplicationScannerConfig),
+
+	/// Scans the Heroic Games Launcher library caches.
+	Heroic(HeroicApplicationScannerConfig),
 }
 
 pub fn scan_applications(application_scanners: &Vec<ApplicationScannerConfig>) -> Vec<ApplicationConfig> {
@@ -42,6 +47,10 @@ pub fn scan_applications(application_scanners: &Vec<ApplicationScannerConfig>) -
 			},
 			ApplicationScannerConfig::Lutris(config) => match lutris::scan_lutris_applications(config) {
 				Ok(lutris_applications) => lutris_applications,
+				Err(()) => continue,
+			},
+			ApplicationScannerConfig::Heroic(config) => match heroic::scan_heroic_applications(config) {
+				Ok(heroic_applications) => heroic_applications,
 				Err(()) => continue,
 			},
 		};
