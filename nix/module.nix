@@ -28,6 +28,18 @@ let
   configFile = settingsFormat.generate "moonshine-config.toml" cfg.settings;
 
   runtimeDir = "/run/user/${toString cfg.uid}";
+
+  # The Vulkan implicit-layer manifest on its own, for the driver path below.
+  # Everything in hardware.graphics.extraPackages is merged into
+  # /run/opengl-driver, and programs.steam puts that lib/ on Steam's FHS
+  # library path, so the whole package has no business being in there. The
+  # manifest names the layer library by absolute store path, so it is all that
+  # needs to go.
+  wsiLayer = pkgs.runCommand "moonshine-wsi-layer" { } ''
+    install -Dm644 \
+      ${cfg.package}/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json \
+      $out/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
+  '';
 in
 {
   options.services.moonshine = {
@@ -120,11 +132,34 @@ in
       }
     ];
 
-    # Besides the binary, the package carries the Vulkan implicit-layer
-    # manifest (share/vulkan/implicit_layer.d) that the loader must be able
-    # to find; it only engages for apps moonshine launches
-    # (ENABLE_MOONSHINE_WSI=1), so it is inert for everything else.
+    # Puts `moonshine` on PATH for the healthcheck and pairing subcommands, and
+    # is how the polkit rule below gets picked up.
     environment.systemPackages = [ cfg.package ];
+
+    # The moonshine-wsi Vulkan layer routes a game's swapchain frames into
+    # moonshine's compositor. It is an *implicit* layer, so the loader has to
+    # find its manifest by scanning, and a store path is only scanned when it
+    # is listed in XDG_DATA_DIRS. Nothing here has that: a systemd system
+    # service gets no XDG_DATA_DIRS, and neither does the user instance that
+    # launches the games when it was started by lingering rather than by a
+    # graphical login. Without it everything silently falls back to rendering
+    # through XWayland.
+    #
+    # nixpkgs builds the loader with SYSCONFDIR=/run/opengl-driver/share, which
+    # it always scans, environment or not. So install the layer there: the
+    # NixOS counterpart of the /etc/vulkan/implicit_layer.d drop that upstream's
+    # install script does on atomic distributions. Only the 64-bit driver path,
+    # because the layer is built for the host architecture and there is no
+    # 32-bit build to put in extraPackages32. Nothing is lost: where the
+    # manifest sits in an arch-agnostic directory (/usr/share on deb/rpm), a
+    # 32-bit loader finds it and skips it over the ELF class anyway.
+    hardware.graphics = {
+      # Needed regardless of the layer: this option is what creates
+      # /run/opengl-driver, which is where the package resolves its Vulkan
+      # loader and the NVIDIA userspace driver from.
+      enable = true;
+      extraPackages = [ wsiLayer ];
+    };
 
     # Grants the `input` group + active-seat ACLs on /dev/uinput and
     # /dev/uhid, which inputtino uses to create the virtual

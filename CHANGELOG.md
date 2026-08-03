@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Heroic Games Launcher application scanner, discovering installed Epic, GOG, Amazon and sideloaded games with box art.
 
+### Fixed
+
+- NixOS module installs the moonshine-wsi Vulkan layer into the driver path (`/run/opengl-driver`) instead of leaving it in a store path the Vulkan loader never scans. Games were falling back to XWayland rendering and the healthcheck reported the layer as missing.
+
 ## [v0.14.5] - 30-07-2026
 
 ### Changed
