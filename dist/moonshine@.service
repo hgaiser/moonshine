@@ -4,7 +4,7 @@ Description=Streaming server using the NVIDIA GameStream / Moonlight protocol.
 [Service]
 User=%i
 Group=%i
-SupplementaryGroups=input moonshine
+SupplementaryGroups=moonshine
 ExecStart=/usr/bin/start-moonshine.sh /home/%i/.config/moonshine/config.toml
 Environment=MOONSHINE_LOG=moonshine=info
 Restart=always

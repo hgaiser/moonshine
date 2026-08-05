@@ -172,11 +172,12 @@ in
       };
       serviceConfig = {
         User = cfg.user;
-        # /dev/uinput and /dev/uhid are input-group 0660 via the package's
-        # udev rules (a system unit can grant supplementary groups directly,
-        # so no extraGroups on the user).
+        # /dev/dri render nodes are video-group on NixOS. The `input` group is
+        # deliberately NOT granted here: it only helps moonshine's own access
+        # to /dev/uinput, not the streamed games, which moonshine launches via
+        # the user's systemd manager and which get only the user's real groups.
+        # Headless users who want gamepads must add the user to `input`.
         SupplementaryGroups = [
-          "input"
           "video"
         ];
         ExecStart = "${lib.getExe cfg.package} ${configFile}";

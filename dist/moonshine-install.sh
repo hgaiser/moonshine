@@ -311,7 +311,7 @@ fi
 if [[ "$HEALTHCHECK" == "true" ]]; then
   CMDS+=("echo ''")
   CMDS+=("echo ':: Running health check'")
-  CMDS+=("systemd-run --quiet --wait --pipe -p 'User=${USER}' -p 'SupplementaryGroups=input' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' '${MOONSHINE_HOME}/start-moonshine.sh' healthcheck || true")
+  CMDS+=("systemd-run --quiet --wait --pipe -p 'User=${USER}' -p 'SupplementaryGroups=moonshine' -p 'DeviceAllow=/dev/uinput rw' -p 'DeviceAllow=/dev/uhid rw' -p 'DeviceAllow=char-drm rw' -p 'DeviceAllow=char-nvidia rw' -p 'DeviceAllow=char-nvidia-uvm rw' '${MOONSHINE_HOME}/start-moonshine.sh' healthcheck || true")
 fi
 
 if [[ "$ENABLE_ON_BOOT" == "true" ]] || [[ "$START_NOW" == "true" ]]; then

@@ -1,4 +1,4 @@
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 use std::io::IsTerminal;
 use std::io::Write;
 use std::os::linux::fs::MetadataExt;
@@ -286,6 +286,7 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 
 	check_uinput(&mut report);
 	check_uhid(&mut report);
+	check_input_group(&mut report);
 
 	if let Some(config) = config {
 		check_dirs(&mut report, config);
@@ -310,6 +311,37 @@ fn group_name_of(path: &Path) -> String {
 	} else {
 		unsafe { CStr::from_ptr((*grp).gr_name) }.to_string_lossy().into_owned()
 	}
+}
+
+/// GID of a group by name, or `None` if it doesn't exist.
+fn group_gid(name: &str) -> Option<libc::gid_t> {
+	let cname = CString::new(name).ok()?;
+	let grp = unsafe { libc::getgrnam(cname.as_ptr()) };
+	if grp.is_null() {
+		None
+	} else {
+		Some(unsafe { (*grp).gr_gid })
+	}
+}
+
+/// Whether the current process is a member of the given group (primary or supplementary).
+fn is_member_of_group(name: &str) -> bool {
+	let Some(gid) = group_gid(name) else {
+		return false;
+	};
+	if unsafe { libc::getgid() } == gid {
+		return true;
+	}
+	let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+	if n <= 0 {
+		return false;
+	}
+	let mut groups = vec![0 as libc::gid_t; n as usize];
+	let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
+	if n < 0 {
+		return false;
+	}
+	groups.iter().take(n as usize).any(|&g| g == gid)
 }
 
 fn check_render_nodes(report: &mut HealthReport, _gpu_config: &Option<String>) -> Option<PathBuf> {
@@ -921,6 +953,11 @@ fn check_ports(report: &mut HealthReport, config: &Config) {
 // Warning checks
 // ---------------------------------------------------------------------------
 
+/// Whether a kernel module is loaded (also true for modules built into the kernel).
+fn kernel_module_loaded(name: &str) -> bool {
+	Path::new("/sys/module").join(name).exists()
+}
+
 fn check_uinput(report: &mut HealthReport) {
 	let start = Instant::now();
 	match std::fs::OpenOptions::new().write(true).open("/dev/uinput") {
@@ -928,13 +965,24 @@ fn check_uinput(report: &mut HealthReport) {
 			report.add_passed("uinput", "Writable".into(), start.elapsed().as_millis() as u64);
 		},
 		Err(e) => {
-			report.add_warn(
-				"uinput",
+			let msg = if kernel_module_loaded("uinput") {
 				format!(
-					"  Cannot access /dev/uinput: {e}\n  Gamepad emulation will not work.\n  Load the module: `sudo modprobe uinput`\n  Persistent: `echo uinput | sudo tee /etc/modules-load.d/moonshine.conf`\n  Check udev rules are installed: /usr/lib/udev/rules.d/60-moonshine.rules"
-				),
-				start.elapsed().as_millis() as u64,
-			);
+					"  Cannot access /dev/uinput: {e}\n  \
+					 The uinput module is loaded, so this is a permissions problem.\n  \
+					 Ensure the udev rules are installed: /usr/lib/udev/rules.d/60-moonshine.rules\n  \
+					 And that your user is in the 'input' group: `sudo usermod -aG input $USER`\n  \
+					 Then log out and back in (or reboot)."
+				)
+			} else {
+				format!(
+					"  Cannot access /dev/uinput: {e}\n  \
+					 The uinput kernel module is not loaded.\n  \
+					 Load it now: `sudo modprobe uinput`\n  \
+					 Persistent: the moonshine package ships a modules-load.d drop-in\n  \
+					 (moonshine.conf) that loads it at boot."
+				)
+			};
+			report.add_warn("uinput", msg, start.elapsed().as_millis() as u64);
 		},
 	}
 }
@@ -946,14 +994,49 @@ fn check_uhid(report: &mut HealthReport) {
 			report.add_passed("uhid", "Writable".into(), start.elapsed().as_millis() as u64);
 		},
 		Err(e) => {
-			report.add_warn(
-				"uhid",
+			let msg = if kernel_module_loaded("uhid") {
 				format!(
-					"  Cannot access /dev/uhid: {e}\n  Gamepad emulation may not work.\n  Load the module: `sudo modprobe uhid`\n  Persistent: `echo uhid | sudo tee /etc/modules-load.d/moonshine.conf`"
-				),
-				start.elapsed().as_millis() as u64,
-			);
+					"  Cannot access /dev/uhid: {e}\n  \
+					 The uhid module is loaded, so this is a permissions problem.\n  \
+					 Ensure the udev rules are installed: /usr/lib/udev/rules.d/60-moonshine.rules\n  \
+					 And that your user is in the 'input' group: `sudo usermod -aG input $USER`\n  \
+					 Then log out and back in (or reboot)."
+				)
+			} else {
+				format!(
+					"  Cannot access /dev/uhid: {e}\n  \
+					 The uhid kernel module is not loaded.\n  \
+					 Load it now: `sudo modprobe uhid`\n  \
+					 Persistent: the moonshine package ships a modules-load.d drop-in\n  \
+					 (moonshine.conf) that loads it at boot."
+				)
+			};
+			report.add_warn("uhid", msg, start.elapsed().as_millis() as u64);
 		},
+	}
+}
+
+fn check_input_group(report: &mut HealthReport) {
+	let start = Instant::now();
+	if is_member_of_group("input") {
+		report.add_passed(
+			"input group",
+			"User is in the 'input' group; streamed games can read virtual gamepads when headless.".into(),
+			start.elapsed().as_millis() as u64,
+		);
+	} else {
+		report.add_warn(
+			"input group",
+			"  The user is not a member of the 'input' group.\n  \
+			 When streaming headless (no active desktop session), streamed games need this group\n  \
+			 to read the virtual gamepads that moonshine creates.\n  \
+			 Add yourself to the group and log out and back in (or reboot):\n  \
+			 `sudo usermod -aG input $USER`\n  \
+			 If you always stream while a desktop session is active, this is not required: the\n  \
+			 active seat user is granted access to input devices via ACLs (uaccess)."
+				.into(),
+			start.elapsed().as_millis() as u64,
+		);
 	}
 }
 

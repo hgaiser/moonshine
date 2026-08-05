@@ -103,6 +103,12 @@ These steps apply to every installation method above (the service is a systemd u
    sudo systemctl enable --now moonshine@$USER
    ```
 
+3. **Gamepad support when streaming headless** (no active desktop session): add your user to the `input` group, then log out and back in (or reboot) for it to take effect:
+   ```sh
+   sudo usermod -aG input $USER
+   ```
+   Moonshine creates a virtual gamepad per streamed controller, and the streamed game must be able to read it. When streaming while a desktop session is active, your user is already granted access to input devices as the active seat, so this step is not needed there. Run `moonshine healthcheck` to verify — it reports an `input group` warning if the group is missing.
+
 ### Source
 
 The following dependencies are required to build and run:

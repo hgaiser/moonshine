@@ -62,6 +62,14 @@ Then import the module and enable the service in your configuration:
 
 After `nixos-rebuild switch` the service is running. There is no `systemctl enable` step, and user lingering is enabled automatically. Pair with a Moonlight client as usual via http://localhost:47989/pin .
 
+If you stream headless (no active desktop session) and want gamepad support, the streaming user must be a member of the `input` group so streamed games can read the virtual gamepads moonshine creates. The service does not grant it. Add it to the user's `extraGroups`:
+
+```nix
+users.users.alice.extraGroups = [ "input" ];
+```
+
+When streaming while a desktop session is active this is not required — the active seat user is granted access to input devices via ACLs.
+
 Settings you leave out fall back to Moonshine's defaults. Note that the default application list points at `/usr/bin/steam`, which doesn't exist on NixOS, so you will want to set `application` as shown above.
 
 ## Development
