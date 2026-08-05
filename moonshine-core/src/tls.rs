@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::File;
-use std::io::{BufReader, Write};
+use std::io::{BufReader, ErrorKind, Write};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -291,12 +291,17 @@ impl TlsAcceptor {
 	}
 
 	pub(crate) async fn accept(&self, connection: TcpStream) -> Result<TlsStream<TcpStream>, ()> {
-		let stream = self
-			.acceptor
-			.accept(connection)
-			.await
-			.map_err(|e| tracing::warn!("TLS handshake failed: {}", e))?;
-		Ok(stream)
+		match self.acceptor.accept(connection).await {
+			Ok(stream) => Ok(stream),
+			Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+				tracing::debug!("TLS handshake aborted by peer: {}", e);
+				Err(())
+			},
+			Err(e) => {
+				tracing::warn!("TLS handshake failed: {}", e);
+				Err(())
+			},
+		}
 	}
 }
 
