@@ -10,6 +10,7 @@ See the [Configuration](../README.md#configuration) section of the README for th
 - [Prevent the host from suspending while streaming](#prevent-the-host-from-suspending-while-streaming)
 - [Run games in high-performance mode](#run-games-in-high-performance-mode)
 - [Run Flatpak Steam inside Moonshine's compositor](#run-flatpak-steam-inside-moonshines-compositor)
+- [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 
 ## Close a desktop Steam before streaming Steam
 
@@ -119,3 +120,19 @@ The root cause is in how Flatpak's portal infrastructure interacts with the desk
 Flatpak uses the host's D-Bus session bus to communicate with portal backends. When setting up the sandbox, the portal backend tells Flatpak to expose the **host's** Wayland and display sockets, overriding the `WAYLAND_DISPLAY` and `DISPLAY` environment variables that Moonshine sets. This causes Steam to render on the host's physical desktop instead of inside Moonshine's headless compositor.
 
 `dbus-run-session` spawns a fresh D-Bus daemon without the host's portal backend registered, so Flatpak cannot discover the host compositor through the portal and falls back to the environment variables inherited from Moonshine's systemd unit. Because the portal backend is responsible for both Wayland and audio setup, the `PULSE_SERVER` env var is also honored correctly without needing `--env=` overrides.
+
+## Run a desktop environment for a full remote desktop
+
+### How to
+
+Add the desktop environment as a regular application. For example, to stream a full COSMIC desktop instead of a single game:
+
+```toml
+[[application]]
+title = "COSMIC Desktop"
+command = ["/usr/bin/start-cosmic"]
+```
+
+### Details
+
+Launching a desktop environment as an application turns the stream into a full remote desktop: the compositor boots inside Moonshine's headless compositor, and you use the desktop's own keybindings to launch programs. Other compositors work the same way, e.g. `["/usr/bin/sway"]`.
