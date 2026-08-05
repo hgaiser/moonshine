@@ -9,6 +9,7 @@ See the [Configuration](../README.md#configuration) section of the README for th
 - [Close a desktop Steam before streaming Steam](#close-a-desktop-steam-before-streaming-steam)
 - [Prevent the host from suspending while streaming](#prevent-the-host-from-suspending-while-streaming)
 - [Run games in high-performance mode](#run-games-in-high-performance-mode)
+- [Use Gamescope with the client's resolution](#use-gamescope-with-the-clients-resolution)
 - [Run Flatpak Steam inside Moonshine's compositor](#run-flatpak-steam-inside-moonshines-compositor)
 - [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 
@@ -82,6 +83,34 @@ Make sure your user is in the `gamemode` group: `sudo usermod -aG gamemode $USER
 Without it, `gamemoderun` will not be able to communicate with the daemon and will silently skip applying optimizations.
 
 If the daemon is not installed or not running, `gamemoderun` simply launches the game without applying any optimizations.
+
+## Use Gamescope with the client's resolution
+
+### How to
+
+Set the game's Steam launch option (or the app's `command`) to wrap the game in Gamescope, using the client's resolution from the environment:
+
+```
+/usr/bin/gamescope -f -W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w "$MOONSHINE_CLIENT_WIDTH" -h "$MOONSHINE_CLIENT_HEIGHT" -r "$MOONSHINE_CLIENT_FRAMERATE" -- %command%
+```
+
+For supersampling, render above the output resolution — here 1.5x the client resolution:
+
+```
+/usr/bin/gamescope -f -W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w $((MOONSHINE_CLIENT_WIDTH * 3 / 2)) -h $((MOONSHINE_CLIENT_HEIGHT * 3 / 2)) -r "$MOONSHINE_CLIENT_FRAMERATE" -- %command%
+```
+
+Moonshine sets `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and `MOONSHINE_CLIENT_FRAMERATE` on the environment of the launched application, so they are inherited by Gamescope, Steam and `%command%`.
+
+### Details
+
+- `-W`/`-H` set the output resolution; set them to the client's resolution so the stream is filled.
+- `-w`/`-h` set the resolution the game actually renders at. Rendering below the output resolution upscales (bilinear or FSR); rendering above it downsamples for supersampling. You can play with the values to trade quality against performance — when they match the client resolution you get a 1:1 image.
+- `-r` sets the refresh rate, e.g. from `MOONSHINE_CLIENT_FRAMERATE`.
+
+Wrapping the game in Gamescope can also work around focus or rendering issues: Gamescope provides its own Wayland/X11 surfaces and input handling, so games that misbehave under Moonshine's compositor directly (unfocused windows, scaling artifacts, etc.) often behave correctly when run inside it.
+
+Note that these environment variables are only set when the app is launched by Moonshine, so fall back to defaults (e.g. `${MOONSHINE_CLIENT_WIDTH:-2560}`) if you also run the same command outside a stream.
 
 ## Run Flatpak Steam inside Moonshine's compositor
 
