@@ -443,7 +443,7 @@ fn send_hdr_state(
 	let payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
 	send_to_peer(host, peer_id, key, *sequence_number, &payload, label);
 	*sequence_number += 1;
-	tracing::info!("Sent HDR mode ({label}): enabled={}", state.enabled);
+	tracing::debug!("Sent HDR mode ({label}) to client: enabled={}", state.enabled);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -588,6 +588,7 @@ async fn run_control_loop(
 			if let Some(peer_id) = connected_peer {
 				let state = hdr_metadata_rx.borrow_and_update().clone();
 				let key = context.keys_rx.borrow().remote_input_key.clone();
+				tracing::info!("Informing client: HDR session");
 				send_hdr_state(&mut host, peer_id, &state, &key, &mut sequence_number, "initial");
 			}
 		}

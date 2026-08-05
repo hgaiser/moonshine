@@ -300,7 +300,7 @@ fn run_compositor(
 		})
 		.ok_or_else(|| "No supported DMA-BUF render formats found".to_string())?;
 
-	tracing::info!(
+	tracing::debug!(
 		"Selected render format: {:?} with {} modifier(s)",
 		render_fourcc,
 		render_modifiers.len()

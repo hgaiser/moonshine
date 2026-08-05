@@ -978,7 +978,7 @@ impl VideoPipelineInner {
 					// the encoder switch succeeds, so that the converter's
 					// color space stays in sync with the encoder's VUI.
 					if encoder_color_desc != Some(color_desc) {
-						tracing::info!(
+						tracing::debug!(
 							"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
 						);
 						match encoder.set_color_description(color_desc) {
@@ -1021,15 +1021,18 @@ impl VideoPipelineInner {
 						metadata: frame.hdr_metadata,
 					};
 					if new_state != last_hdr_state {
-						tracing::info!(
-							"HDR mode state changed: enabled={}, metadata={}",
-							new_state.enabled,
-							if new_state.metadata.is_some() {
-								"present"
-							} else {
-								"none"
+						if new_state.enabled {
+							match new_state.metadata {
+								Some(m) => tracing::info!(
+									"Content switched to HDR (BT.2020/PQ): maxCLL {} nits, maxFALL {} nits",
+									m.max_cll,
+									m.max_fall
+								),
+								None => tracing::info!("Content switched to HDR (BT.2020/PQ)"),
 							}
-						);
+						} else {
+							tracing::info!("Content switched to SDR (BT.709)");
+						}
 						last_hdr_state = new_state.clone();
 						let _ = hdr_metadata_tx.send(new_state);
 					}

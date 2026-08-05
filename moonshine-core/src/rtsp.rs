@@ -381,7 +381,7 @@ impl RtspServer {
 			},
 			_ => {},
 		}
-		tracing::info!(
+		tracing::debug!(
 			"Client requested {} range video.",
 			if full_range { "full" } else { "limited" }
 		);
@@ -443,7 +443,7 @@ impl RtspServer {
 		let high_quality = audio_quality != 0;
 		let audio_config = AudioConfig::from_channels(channels, channel_mask, high_quality);
 
-		tracing::info!(
+		tracing::debug!(
 			"Audio config: {} channels, mask=0x{:x}, high_quality={}, config={:?}",
 			audio_config.channels,
 			audio_config.channel_mask,

@@ -40,9 +40,9 @@ impl UdpGsoSocket {
 		let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
 			.map_err(|e| tracing::error!("Failed to initialize UDP socket state: {e}"))?;
 		if udp_state.max_gso_segments() > 1 {
-			tracing::info!("GSO enabled, max segments: {}", udp_state.max_gso_segments());
+			tracing::debug!("GSO enabled, max segments: {}", udp_state.max_gso_segments());
 		} else {
-			tracing::info!("GSO not available, using per-shard sends");
+			tracing::debug!("GSO not available, using per-shard sends");
 		}
 		Ok(Self { socket, udp_state })
 	}

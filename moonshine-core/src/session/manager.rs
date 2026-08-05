@@ -414,7 +414,6 @@ impl SessionManager {
 				guard.session = Some(SessionState::Active(active));
 				guard.video_start_notify = Some(video_notify);
 				guard.audio_start_notify = Some(audio_notify);
-				tracing::info!("Session streams started successfully.");
 				Ok(())
 			},
 			Err(()) => {
