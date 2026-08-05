@@ -780,12 +780,7 @@ impl VideoPipelineInner {
 						match encoder.encode(encoder.input_image()) {
 							Ok(future) => {
 								let submitted_at = std::time::Instant::now();
-								// Deliberately still a whole-struct comparison, unlike the
-								// control-stream check above. Correcting it newly enables
-								// AV1 metadata injection for full-range clients, and that
-								// produces streams Moonlight cannot decode. Left until the
-								// AV1 path is fixed.
-								let inject_hdr = encoder_color_desc == Some(ColorDescription::bt2020_pq());
+								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 								let frame_context = FrameContext {
 									created_at: now,
 									channel_wait: std::time::Duration::ZERO,
@@ -1052,12 +1047,7 @@ impl VideoPipelineInner {
 						// Hand this frame's context plus its packet future to the
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
-						// Deliberately still a whole-struct comparison, unlike the
-						// control-stream check above. Correcting it newly enables
-						// AV1 metadata injection for full-range clients, and that
-						// produces streams Moonlight cannot decode. Left until the
-						// AV1 path is fixed.
-						let inject_hdr = encoder_color_desc == Some(ColorDescription::bt2020_pq());
+						let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 						let frame_context = FrameContext {
 							created_at: frame.created_at,
 							channel_wait: t1_received.duration_since(frame.created_at),
