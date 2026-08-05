@@ -303,7 +303,7 @@ impl ControlStream {
 		let host_config = HostConfig {
 			address: Some(socket_address),
 			peer_count: 128,
-			channel_limit: 1,
+			channel_limit: 0x30,
 			..Default::default()
 		};
 
