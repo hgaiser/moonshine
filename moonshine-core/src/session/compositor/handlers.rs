@@ -1395,6 +1395,7 @@ impl XdgShellHandler for MoonshineCompositor {
 		// size.
 		surface.with_pending_state(|state| {
 			state.size = Some((self.width as i32, self.height as i32).into());
+			state.states.set(XdgToplevelState::Maximized);
 		});
 		surface.send_configure();
 
@@ -1455,50 +1456,37 @@ impl XdgShellHandler for MoonshineCompositor {
 	}
 
 	fn fullscreen_request(&mut self, surface: ToplevelSurface, _output: Option<WlOutput>) {
+		surface.with_pending_state(|state| {
+			state.states.set(XdgToplevelState::Fullscreen);
+		});
 		surface.send_configure();
+
 		// Update fullscreen state in metadata.
 		let target = surface.wl_surface();
+		let geometry = self.output_rect();
 		if let Some(window) = self.find_window_by_surface(target)
 			&& let Some(meta) = self.window_metadata.get_mut(&window)
 		{
-			surface.with_committed_state(|state| {
-				let is_fullscreen = state
-					.as_ref()
-					.map(|s| s.states.contains(XdgToplevelState::Fullscreen))
-					.unwrap_or(false);
-				if is_fullscreen != meta.fullscreen {
-					meta.fullscreen = is_fullscreen;
-					if let Some(s) = state
-						&& let Some(size) = s.size
-					{
-						meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
-					}
-				}
-			});
+			meta.fullscreen = true;
+			meta.geometry = geometry;
 		}
 		self.reevaluate_focus();
 	}
 
 	fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+		surface.with_pending_state(|state| {
+			state.states.unset(XdgToplevelState::Fullscreen);
+		});
+		surface.send_configure();
+
 		// Update fullscreen state in metadata.
 		let target = surface.wl_surface();
+		let geometry = self.output_rect();
 		if let Some(window) = self.find_window_by_surface(target)
 			&& let Some(meta) = self.window_metadata.get_mut(&window)
 		{
-			surface.with_committed_state(|state| {
-				let is_fullscreen = state
-					.as_ref()
-					.map(|s| s.states.contains(XdgToplevelState::Fullscreen))
-					.unwrap_or(false);
-				if !is_fullscreen && meta.fullscreen {
-					meta.fullscreen = false;
-					if let Some(s) = state
-						&& let Some(size) = s.size
-					{
-						meta.geometry = Rectangle::new((0, 0).into(), (size.w, size.h).into());
-					}
-				}
-			});
+			meta.fullscreen = false;
+			meta.geometry = geometry;
 		}
 		self.reevaluate_focus();
 	}
