@@ -377,6 +377,18 @@ impl CompositorHandler for MoonshineCompositor {
 		{
 			window.on_commit();
 
+			// wlroots' wayland backend drops the size from the initial
+			// configure (output not enabled yet); re-send it on each
+			// mismatched commit so nested compositors adopt the session size.
+			if let Some(toplevel) = window.toplevel()
+				&& window.geometry().size != (self.width as i32, self.height as i32).into()
+			{
+				toplevel.with_pending_state(|state| {
+					state.size = Some((self.width as i32, self.height as i32).into());
+				});
+				toplevel.send_configure();
+			}
+
 			// Damage sequence tracking (Task 2.1):
 			// Increment damage_sequence for game windows (app_id != 0).
 			// Only trigger focus dirty on window MAP, not on every commit,
