@@ -435,7 +435,7 @@ impl MoonshineCompositor {
 		hdr: bool,
 		keyboard_config: KeyboardConfig,
 	) -> (Self, Display<Self>) {
-		let compositor_state = CompositorState::new::<Self>(&display_handle);
+		let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
 		let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
 		let xdg_shell_state = XdgShellState::new::<Self>(&display_handle);
 		let mut seat_state = SeatState::new();
