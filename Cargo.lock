@@ -2381,7 +2381,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine"
-version = "0.14.5"
+version = "0.15.0"
 dependencies = [
  "async-shutdown",
  "clap",
@@ -2394,7 +2394,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine-core"
-version = "0.14.5"
+version = "0.15.0"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm",
@@ -2466,7 +2466,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine-tools"
-version = "0.14.5"
+version = "0.15.0"
 dependencies = [
  "async-shutdown",
  "clap",
@@ -2478,7 +2478,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine-wsi"
-version = "0.14.5"
+version = "0.15.0"
 dependencies = [
  "ash",
  "libc",

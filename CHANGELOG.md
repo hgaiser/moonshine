@@ -5,15 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v0.15.0] - 05-08-2026
 
 ### Added
 
-- Heroic Games Launcher application scanner, discovering installed Epic, GOG, Amazon and sideloaded games with box art.
+- Heroic Games Launcher application scanner, discovering installed Epic, GOG, Amazon and sideloaded games with box art. (#152, @scottjab)
+- Pipeline video encoding with pixelforge, honoring reference frame invalidation requests instead of forcing IDR frames and dropping frames to catch up under load. (#116, @urwrstkn8mare)
+- Use Generic Segmentation Offload (GSO) for video stream sends.
+- Expose `wl_compositor` v6.
+- Healthcheck now verifies the host user is in the input group and recommends Arch Linux packages when checks fail.
 
 ### Fixed
 
-- NixOS module installs the moonshine-wsi Vulkan layer into the driver path (`/run/opengl-driver`) instead of leaving it in a store path the Vulkan loader never scans. Games were falling back to XWayland rendering and the healthcheck reported the layer as missing.
+- Honor the client's requested color range in the color converter and encoder VUI, so full-range sessions no longer stream limited-range data, and detect HDR status from the transfer function rather than the whole color description. (#146, @lutyjj)
+- Inject AV1 mastering-display metadata for full-range clients now that the metadata OBUs are spec-valid. (#166, @lutyjj)
+- Terminate AV1 metadata OBUs with trailing bits and convert MDCV values to AV1's units, so decoders no longer reject the HDR metadata. (#154, @lutyjj)
+- Keep mastering-display metadata from promoting SDR surfaces to BT.2020+PQ. (#148, @lutyjj)
+- Split oversized GSO video sends to fit the kernel's UDP limits, fixing streams that froze at high bitrates. (#157, @lutyjj)
+- Implement X11 fullscreen requests and acknowledge XDG shell fullscreen requests, fixing fullscreen games that stalled at partial size. (#147, @lutyjj; #158, @rosslovas)
+- Raise the ENet channel limit to match moonlight-common-c, enabling a reliable gyro data stream for the PS5 DualSense controller. (#151, @maugsburger)
+- Send a configure on every commit whose size mismatches.
+- Write app stdout and stderr to files instead of losing them.
+- Reduce info log noise and silence benign TLS warnings.
+- Warn when the Lutris database or Heroic config directory is missing. (#152, @scottjab)
+- Preserve SteamOS configuration across updates. (#153, @tdejager)
+- NixOS module installs the moonshine-wsi Vulkan layer into the driver path (`/run/opengl-driver`) instead of leaving it in a store path the Vulkan loader never scans. Games were falling back to XWayland rendering and the healthcheck reported the layer as missing. (#162, @scottjab)
 
 ## [v0.14.5] - 30-07-2026
 
