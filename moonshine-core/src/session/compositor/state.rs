@@ -45,6 +45,7 @@ use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
@@ -251,6 +252,9 @@ pub(crate) struct MoonshineCompositor {
 	/// Monotonically increasing render counter.
 	pub render_count: usize,
 
+	// -- Single-pixel buffer --
+	pub single_pixel_buffer_state: SinglePixelBufferState,
+
 	// -- Static screen detection --
 	/// Set to `true` whenever visible content changes (surface commit, cursor
 	/// move). Cleared after a frame is sent. When false and a frame was sent
@@ -445,6 +449,7 @@ impl MoonshineCompositor {
 		RelativePointerManagerState::new::<Self>(&display_handle);
 		PointerConstraintsState::new::<Self>(&display_handle);
 		let viewporter_state = smithay::wayland::viewporter::ViewporterState::new::<Self>(&display_handle);
+		let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
 		smithay::wayland::presentation::PresentationState::new::<Self>(&display_handle, 1);
 		let clock = Clock::new();
 
@@ -598,6 +603,7 @@ impl MoonshineCompositor {
 				last_frame_sent_at: std::time::Instant::now(),
 				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
 				viewporter_state,
+				single_pixel_buffer_state,
 				color_management,
 				deferred_info_done: Vec::new(),
 				xwayland_shell_state,
