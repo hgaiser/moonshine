@@ -468,7 +468,7 @@ struct VideoPipelineInner {
 impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run(
-		self,
+		mut self,
 		runtime: tokio::runtime::Handle,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		packet_tx: mpsc::Sender<ShardBatch>,
@@ -501,13 +501,18 @@ impl VideoPipelineInner {
 		}
 
 		// Create the encoder.
-		let (context, encoder) = match self.create_encoder() {
+		let (context, encoder, chroma_sampling) = match self.create_encoder() {
 			Ok(result) => result,
 			Err(e) => {
 				tracing::error!("Failed to create video encoder: {e}");
 				return;
 			},
 		};
+
+		// Adopt the sampling the encoder was actually created with, so the color
+		// converter below (and the packet consumer's copy of the context) agree
+		// with the encoder's input format after a fallback.
+		self.context.chroma_sampling_type = chroma_sampling;
 
 		// Start the capture and encoding loop.
 		if let Err(e) = self.run_encoding_loop(
@@ -529,7 +534,14 @@ impl VideoPipelineInner {
 		tracing::debug!("Video pipeline stopped.");
 	}
 
-	fn create_encoder(&self) -> Result<(VideoContext, Encoder), String> {
+	/// Create the video encoder, returning it alongside the chroma sampling it
+	/// was actually created with.
+	///
+	/// The returned sampling may differ from the client's request — see the
+	/// fallback below — and callers must use it in place of
+	/// `context.chroma_sampling_type` so the color converter's output format
+	/// stays in sync with the encoder's input format.
+	fn create_encoder(&self) -> Result<(VideoContext, Encoder, VideoChromaSampling), String> {
 		let ctx = &self.context;
 
 		// Create Vulkan video context.
@@ -544,12 +556,6 @@ impl VideoPipelineInner {
 			VideoFormat::Av1 => Codec::AV1,
 		};
 
-		// Convert pixel format.
-		let pixel_format = match ctx.chroma_sampling_type {
-			VideoChromaSampling::Yuv420 => PixelFormat::Yuv420,
-			VideoChromaSampling::Yuv444 => PixelFormat::Yuv444,
-		};
-
 		// Convert bit depth based on dynamic range.
 		let bit_depth = match ctx.dynamic_range {
 			VideoDynamicRange::Sdr => pixelforge::EncodeBitDepth::Eight,
@@ -562,27 +568,77 @@ impl VideoPipelineInner {
 			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
 		};
 
-		// Create encode configuration.
-		let config = match codec {
-			Codec::H264 => EncodeConfig::h264(ctx.width, ctx.height),
-			Codec::H265 => EncodeConfig::h265(ctx.width, ctx.height),
-			Codec::AV1 => EncodeConfig::av1(ctx.width, ctx.height),
+		// Chroma sampling comes straight from the client's SDP, but not every
+		// encoder implements every profile: AMD's VCN exposes 4:2:0 profiles
+		// only, so a client with "YUV 4:4:4" enabled would fail session setup
+		// with a bare ERROR_VIDEO_PROFILE_CODEC_NOT_SUPPORTED_KHR. 4:2:0 is
+		// supported by every Vulkan Video encoder, so try the requested sampling
+		// first and fall back to it rather than dropping the session. The client
+		// reads the actual sampling from the bitstream's sequence header, so a
+		// downgrade needs no renegotiation.
+		let mut samplings = vec![ctx.chroma_sampling_type];
+		if ctx.chroma_sampling_type != VideoChromaSampling::Yuv420 {
+			samplings.push(VideoChromaSampling::Yuv420);
 		}
-		.with_pixel_format(pixel_format)
-		.with_bit_depth(bit_depth)
-		.with_color_description(color_description)
-		.with_rate_control(RateControlMode::Cbr)
-		.with_target_bitrate(ctx.bitrate as u32)
-		.with_frame_rate(ctx.fps, 1)
-		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
-		.with_b_frames(0) // No B-frames for low latency
-		.with_max_reference_frames(ctx.max_reference_frames)
-		.with_virtual_buffer_size_ms(1000 / ctx.fps)
-		.with_initial_virtual_buffer_size_ms(0);
 
-		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
+		let mut last_error = None;
+		for chroma_sampling in samplings {
+			let pixel_format = match chroma_sampling {
+				VideoChromaSampling::Yuv420 => PixelFormat::Yuv420,
+				VideoChromaSampling::Yuv444 => PixelFormat::Yuv444,
+			};
 
-		Ok((context, encoder))
+			// Create encode configuration.
+			let config = match codec {
+				Codec::H264 => EncodeConfig::h264(ctx.width, ctx.height),
+				Codec::H265 => EncodeConfig::h265(ctx.width, ctx.height),
+				Codec::AV1 => EncodeConfig::av1(ctx.width, ctx.height),
+			}
+			.with_pixel_format(pixel_format)
+			.with_bit_depth(bit_depth)
+			.with_color_description(color_description)
+			.with_rate_control(RateControlMode::Cbr)
+			.with_target_bitrate(ctx.bitrate as u32)
+			.with_frame_rate(ctx.fps, 1)
+			.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
+			.with_b_frames(0) // No B-frames for low latency
+			.with_max_reference_frames(ctx.max_reference_frames)
+			.with_virtual_buffer_size_ms(1000 / ctx.fps)
+			.with_initial_virtual_buffer_size_ms(0);
+
+			match Encoder::new(context.clone(), config) {
+				Ok(encoder) => {
+					if chroma_sampling != ctx.chroma_sampling_type {
+						tracing::warn!(
+							"This GPU cannot encode {:?} at {:?}, falling back to {:?}. \
+							 Disable 4:4:4 in the client to silence this.",
+							codec,
+							ctx.chroma_sampling_type,
+							chroma_sampling,
+						);
+					}
+					return Ok((context, encoder, chroma_sampling));
+				},
+				Err(e) => last_error = Some(e),
+			}
+		}
+
+		// Every candidate failed, so the unsupported part of the profile is
+		// something we cannot substitute (most often 10-bit for an HDR session
+		// on a codec that has no 10-bit profile, such as H.264). Spell out the
+		// full profile — the underlying Vulkan error names none of it.
+		let detail = last_error.map(|e| format!(" Encoder error: {e}")).unwrap_or_default();
+		Err(format!(
+			"Failed to create encoder for {codec:?} {:?} {bit_depth:?} ({}): \
+			 this GPU does not support that combination. \
+			 HDR requires a codec with a 10-bit profile (HEVC or AV1).{detail}",
+			ctx.chroma_sampling_type,
+			if ctx.dynamic_range == VideoDynamicRange::Hdr {
+				"HDR"
+			} else {
+				"SDR"
+			},
+		))
 	}
 
 	#[allow(clippy::too_many_arguments)]
