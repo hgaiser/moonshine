@@ -65,7 +65,7 @@ fn find_libraries(config_dir: &Path) -> Vec<PathBuf> {
 			})
 			.collect(),
 		Err(e) => {
-			tracing::debug!("Failed to read Heroic store cache {:?}: {e}", store_cache);
+			tracing::warn!("Failed to read Heroic store cache {:?}: {e}", store_cache);
 			Vec::new()
 		},
 	};
