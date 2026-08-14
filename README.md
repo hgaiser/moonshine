@@ -11,7 +11,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 - **No monitor required**: Works on headless servers — no HDMI dummy plug needed.
 - **Hardware video encoding**: H.264, H.265, and AV1 encoding using the GPU.
 - **HDR support**: True 10-bit HDR streaming for supported games.
-- **Full input support**: Mouse, keyboard, and gamepad (including motion, touchpad, and haptics).
+- **Full input support**: Mouse, keyboard, touchscreen, pen/stylus, and gamepad (including motion, touchpad, and haptics).
 - **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
 
 ## Requirements

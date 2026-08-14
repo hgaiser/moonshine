@@ -46,6 +46,7 @@ use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
 use smithay::wayland::socket::ListeningSocketSource;
+use smithay::wayland::tablet_manager::{TabletDescriptor, TabletManagerState, TabletSeatTrait};
 use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
@@ -226,6 +227,9 @@ pub(crate) struct MoonshineCompositor {
 	pub cursor_status: CursorImageStatus,
 	pub pointer_element: PointerElement,
 	pub last_pointer_activity: Option<std::time::Instant>,
+	pub pen_tablet_descriptor: TabletDescriptor,
+	pub active_pen_tool_kind: Option<u8>,
+	pub pen_buttons: u8,
 
 	// -- Desktop --
 	pub space: Space<smithay::desktop::Window>,
@@ -444,6 +448,7 @@ impl MoonshineCompositor {
 		let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
 		RelativePointerManagerState::new::<Self>(&display_handle);
 		PointerConstraintsState::new::<Self>(&display_handle);
+		TabletManagerState::new::<Self>(&display_handle);
 		let viewporter_state = smithay::wayland::viewporter::ViewporterState::new::<Self>(&display_handle);
 		smithay::wayland::presentation::PresentationState::new::<Self>(&display_handle, 1);
 		let clock = Clock::new();
@@ -468,11 +473,19 @@ impl MoonshineCompositor {
 
 		let mut space = Space::default();
 
-		// Create seat with keyboard and pointer.
+		// Create the input devices exposed to streamed applications.
 		let mut seat = seat_state.new_wl_seat(&display_handle, "moonshine");
 		seat.add_keyboard(xkb_config, 200, 25)
 			.expect("Failed to add keyboard to seat");
 		seat.add_pointer();
+		seat.add_touch();
+		let pen_tablet_descriptor = TabletDescriptor {
+			name: "Moonlight Pen".to_owned(),
+			usb_id: None,
+			syspath: None,
+		};
+		seat.tablet_seat()
+			.add_tablet::<Self>(&display_handle, &pen_tablet_descriptor);
 
 		// Create the Wayland socket for clients to connect.
 		let socket_source = ListeningSocketSource::new_auto().expect("Failed to create Wayland listening socket");
@@ -583,6 +596,9 @@ impl MoonshineCompositor {
 				cursor_status: CursorImageStatus::default_named(),
 				pointer_element,
 				last_pointer_activity: None,
+				pen_tablet_descriptor,
+				active_pen_tool_kind: None,
+				pen_buttons: 0,
 				space,
 				clock,
 				handle,
