@@ -12,6 +12,7 @@ See the [Configuration](../README.md#configuration) section of the README for th
 - [Use Gamescope with the client's resolution](#use-gamescope-with-the-clients-resolution)
 - [Run Flatpak Steam inside Moonshine's compositor](#run-flatpak-steam-inside-moonshines-compositor)
 - [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
+- [Debug a failing application](#debug-a-failing-application)
 
 ## Close a desktop Steam before streaming Steam
 
@@ -165,3 +166,31 @@ command = ["/usr/bin/start-cosmic"]
 ### Details
 
 Launching a desktop environment as an application turns the stream into a full remote desktop: the compositor boots inside Moonshine's headless compositor, and you use the desktop's own keybindings to launch programs. Other compositors work the same way, e.g. `["/usr/bin/sway"]`.
+
+## Debug a failing application
+
+### How to
+
+Set the application's `stdout` and `stderr` to `"journal"` so its output is captured by systemd's journal instead of being discarded (the default is `null`):
+
+```toml
+[[application]]
+title = "Steam"
+command = ["/usr/bin/steam", "steam://open/bigpicture"]
+stdout = "journal"
+stderr = "journal"
+```
+
+After a failed run, inspect the logs for the session's unit:
+
+```
+journalctl --user -u moonshine-session.service
+```
+
+You can also add `-e` to jump to the end of the log and `-f` to follow it live while retrying the launch.
+
+### Details
+
+By default Moonshine launches applications with `StandardOutput=null` and `StandardError=null`, so an application that fails to start produces no diagnostic output at all. Redirecting to the journal makes its stderr (where most crash output and backtraces land) visible, which is usually the fastest way to find out why the session failed to launch.
+
+These fields are also available on `[[application_scanner]]` configs for games launched through Steam/Lutris/Heroic. Instead of the journal you can also redirect to a file, e.g. `stdout = "file:/path/to/log.txt"`; any systemd `StandardOutput`/`StandardError` value (`journal`, `file:/path`, `append:/path`, `inherit`, ...) is accepted.
