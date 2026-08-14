@@ -328,21 +328,9 @@ fn is_valid_app_name(app_name: &str) -> bool {
 /// has displayed. Portrait art is preferred over the landscape banner, which
 /// only gets used when there is nothing better.
 fn find_boxart(config_dir: &Path, game: &HeroicGame) -> Option<PathBuf> {
-	// Full resolution portrait art, saved when Heroic downloads a game icon.
-	//
-	// Heroic always writes that art as a JPG. It only writes a PNG when it has
-	// substituted a store's own icon for the art, to keep the transparency, and
-	// that icon is a small square logo rather than cover art. Matching on the
-	// extension alone keeps any store Heroic does that for out of the box art.
-	if is_valid_app_name(&game.app_name) {
-		let icon = config_dir.join("icons").join(format!("{}.jpg", game.app_name));
-		if icon.exists() {
-			return Some(icon);
-		}
-	}
-
-	// Otherwise fall back to Heroic's image cache, which keys files by the
-	// SHA256 of their source URL and stores them without an extension.
+	// Heroic's image cache, which keys files by the SHA256 of their source URL
+	// and stores them without an extension. Everything its UI draws lands here,
+	// so it is the broadest source of genuine cover art.
 	let images_cache = config_dir.join("images-cache");
 	[game.art_square.as_deref(), game.art_cover.as_deref()]
 		.into_iter()
@@ -351,6 +339,21 @@ fn find_boxart(config_dir: &Path, game: &HeroicGame) -> Option<PathBuf> {
 		.flat_map(|url| ART_URL_VARIANTS.map(|variant| format!("{url}{variant}")))
 		.map(|url| images_cache.join(hex::encode(Sha256::digest(url.as_bytes()))))
 		.find(|path| path.exists())
+		.or_else(|| {
+			// Failing that, the icon Heroic saves when a game is given a desktop
+			// shortcut or added to Steam. Usually the same portrait art at full
+			// resolution, though for GOG it can be a small square store logo, so
+			// it only gets used when the cache had nothing.
+			if !is_valid_app_name(&game.app_name) {
+				return None;
+			}
+
+			let icons = config_dir.join("icons");
+			["jpg", "png"]
+				.into_iter()
+				.map(|extension| icons.join(format!("{}.{extension}", game.app_name)))
+				.find(|path| path.exists())
+		})
 }
 
 #[cfg(test)]
@@ -607,14 +610,27 @@ mod tests {
 	}
 
 	#[test]
-	fn prefers_the_full_resolution_icon_over_the_image_cache() {
+	fn prefers_cached_cover_art_over_a_shortcut_icon() {
 		let tempdir = tempdir().unwrap();
 		let config_dir = tempdir.path();
 
 		write_art_library(config_dir);
 		cache_art(config_dir, COVER_URL);
-		cache_art(config_dir, &format!("{SQUARE_URL}?h=400&resize=1&w=300"));
+		let square_path = cache_art(config_dir, &format!("{SQUARE_URL}?h=400&resize=1&w=300"));
 
+		// Heroic only writes this once a game is given a shortcut, and by then it
+		// has already cached the art the shortcut icon was downloaded from.
+		write_icon(config_dir, "epic-id.jpg");
+
+		assert_eq!(scan_one_boxart(config_dir), Some(square_path));
+	}
+
+	#[test]
+	fn falls_back_to_a_shortcut_icon_when_nothing_is_cached() {
+		let tempdir = tempdir().unwrap();
+		let config_dir = tempdir.path();
+
+		write_art_library(config_dir);
 		let icon = write_icon(config_dir, "epic-id.jpg");
 
 		assert_eq!(scan_one_boxart(config_dir), Some(icon));
@@ -660,23 +676,23 @@ mod tests {
 		// Heroic requests GOG art without the resizing parameters it adds for Epic.
 		let square_path = cache_art(config_dir, SQUARE_URL);
 
-		// A PNG under icons/ is the store's own logo, not cover art.
+		// For GOG, Heroic swaps the store's own logo in for the shortcut icon and
+		// writes it as a PNG to keep the transparency. It is a small square logo
+		// rather than cover art, so the cached art has to win.
 		write_icon(config_dir, "gog-id.png");
 
 		assert_eq!(scan_one_boxart(config_dir), Some(square_path));
 	}
 
 	#[test]
-	fn still_uses_the_icons_entry_of_a_store_that_substitutes_icons() {
+	fn falls_back_to_a_substituted_store_icon_when_nothing_is_cached() {
 		let tempdir = tempdir().unwrap();
 		let config_dir = tempdir.path();
 
 		write_gog_art_library(config_dir);
-		cache_art(config_dir, SQUARE_URL);
 
-		// Heroic only writes a JPG here when it had no icon to substitute, in
-		// which case it is the portrait art at full resolution.
-		let icon = write_icon(config_dir, "gog-id.jpg");
+		// A square store logo is poor box art, but it beats none at all.
+		let icon = write_icon(config_dir, "gog-id.png");
 
 		assert_eq!(scan_one_boxart(config_dir), Some(icon));
 	}

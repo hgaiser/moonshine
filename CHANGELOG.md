@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Read GOG install state from Heroic's `gog_store/installed.json`, which Heroic strips out of the library cache, so the Heroic scanner no longer skips every installed GOG game. (#169, @scottjab)
+- Prefer Heroic's cached cover art over its shortcut icons, so GOG games no longer show a small square store logo as their box art. (#169, @scottjab)
 
 
 ## [v0.15.0] - 05-08-2026
