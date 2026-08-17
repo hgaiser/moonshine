@@ -10,6 +10,7 @@ use tokio::sync::mpsc;
 use self::gamepad::Gamepad;
 use self::gamepad::GamepadConfig;
 use self::remap::{HoldToHome, HoldTransition};
+use self::touch::{Pen, PointerEventKind, Touch};
 use crate::session::compositor::input::CompositorInputEvent;
 use crate::session::manager::SessionShutdownReason;
 
@@ -25,6 +26,7 @@ pub(crate) mod gamepad;
 mod keyboard;
 mod mouse;
 mod remap;
+mod touch;
 
 #[derive(FromRepr)]
 #[repr(u32)]
@@ -37,6 +39,8 @@ enum InputEventType {
 	MouseButtonUp = 0x00000009,
 	MouseScrollVertical = 0x0000000A,
 	MouseScrollHorizontal = 0x55000001,
+	Touch = 0x55000002,
+	Pen = 0x55000003,
 	GamepadInfo = 0x55000004, // Called ControllerArrival in Moonlight.
 	GamepadTouch = 0x55000005,
 	GamepadMotion = 0x55000006,
@@ -56,6 +60,8 @@ enum InputEvent {
 	MouseButtonUp(MouseButton),
 	MouseScrollVertical(MouseScrollVertical),
 	MouseScrollHorizontal(MouseScrollHorizontal),
+	Touch(Touch),
+	Pen(Pen),
 	GamepadInfo(GamepadInfo),
 	GamepadTouch(GamepadTouch),
 	GamepadMotion(GamepadMotion),
@@ -96,6 +102,8 @@ impl InputEvent {
 			Some(InputEventType::MouseScrollHorizontal) => Ok(InputEvent::MouseScrollHorizontal(
 				MouseScrollHorizontal::from_bytes(&buffer[4..])?,
 			)),
+			Some(InputEventType::Touch) => Ok(InputEvent::Touch(Touch::from_bytes(&buffer[4..])?)),
+			Some(InputEventType::Pen) => Ok(InputEvent::Pen(Pen::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadInfo) => Ok(InputEvent::GamepadInfo(GamepadInfo::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadTouch) => Ok(InputEvent::GamepadTouch(GamepadTouch::from_bytes(&buffer[4..])?)),
 			Some(InputEventType::GamepadMotion) => {
@@ -203,6 +211,42 @@ impl InputHandler {
 				let _ = self
 					.input_tx
 					.send(CompositorInputEvent::ScrollHorizontal { amount: event.amount });
+			},
+			InputEvent::Touch(event) => {
+				tracing::trace!("Touch input: {event:?}");
+				let compositor_event = match event.event_kind {
+					PointerEventKind::Down => Some(CompositorInputEvent::TouchDown {
+						slot: event.pointer_id,
+						x: event.x,
+						y: event.y,
+					}),
+					PointerEventKind::Move => Some(CompositorInputEvent::TouchMove {
+						slot: event.pointer_id,
+						x: event.x,
+						y: event.y,
+					}),
+					PointerEventKind::Up | PointerEventKind::Cancel => {
+						Some(CompositorInputEvent::TouchUp { slot: event.pointer_id })
+					},
+					PointerEventKind::CancelAll => Some(CompositorInputEvent::TouchCancelAll),
+					PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => None,
+				};
+				if let Some(event) = compositor_event {
+					let _ = self.input_tx.send(event);
+				}
+			},
+			InputEvent::Pen(event) => {
+				tracing::trace!("Pen input: {event:?}");
+				let _ = self.input_tx.send(CompositorInputEvent::Pen {
+					event_kind: event.event_kind as u8,
+					tool_kind: event.tool_kind as u8,
+					buttons: event.buttons,
+					x: event.x,
+					y: event.y,
+					pressure_or_distance: event.pressure_or_distance,
+					rotation: event.rotation,
+					tilt: event.tilt,
+				});
 			},
 			// Gamepad events: forward to gamepad handler thread.
 			gamepad_event => {

@@ -150,7 +150,21 @@ impl Key {
 			return Err(());
 		}
 
-		Key::from_repr(buffer[1]).ok_or_else(|| tracing::warn!("Unknown keycode: {}", buffer[5]))
+		let wire_keycode = u16::from_le_bytes(buffer[1..3].try_into().unwrap());
+		let keycode = (wire_keycode & 0x00FF) as u8;
+
+		// Some clients emit null or unmapped keyboard packets while handling
+		// touch input. They do not represent a key and must not flood the logs.
+		if matches!(keycode, 0x00 | 0xFF) {
+			return Err(());
+		}
+
+		Key::from_repr(keycode).ok_or_else(|| {
+			tracing::warn!(
+				wire_keycode = format_args!("0x{wire_keycode:04X}"),
+				"Unsupported keyboard keycode"
+			)
+		})
 	}
 
 	/// Convert a Windows virtual key code to a Linux evdev keycode.
@@ -263,5 +277,28 @@ impl Key {
 			Key::NonUsBackslash => Some(86),
 			_ => None,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::Key;
+
+	#[test]
+	fn parses_normalized_keyboard_keycode() {
+		let payload = [0x00, Key::A as u8, 0x80, 0x00, 0x00, 0x00];
+		assert_eq!(Key::from_bytes(&payload), Ok(Key::A));
+	}
+
+	#[test]
+	fn ignores_null_keyboard_keycode() {
+		let payload = [0x00, 0x00, 0x80, 0x00, 0x00, 0x00];
+		assert_eq!(Key::from_bytes(&payload), Err(()));
+	}
+
+	#[test]
+	fn ignores_unmapped_keyboard_keycode() {
+		let payload = [0x00, 0xFF, 0x00, 0x00, 0x00, 0x00];
+		assert_eq!(Key::from_bytes(&payload), Err(()));
 	}
 }

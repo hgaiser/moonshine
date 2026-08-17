@@ -26,7 +26,7 @@ use crate::session::stream::video::VideoStreamContext;
 
 #[repr(u8)]
 enum ServerCapabilities {
-	_TouchEvents = 0x01,
+	PenTouchEvents = 0x01,
 	ControllerTouchEvents = 0x02,
 }
 
@@ -114,7 +114,7 @@ impl RtspServer {
 	}
 
 	fn capabilities(&self) -> u8 {
-		ServerCapabilities::ControllerTouchEvents as u8
+		ServerCapabilities::PenTouchEvents as u8 | ServerCapabilities::ControllerTouchEvents as u8
 	}
 
 	fn encryption_flags_supported(&self) -> u8 {

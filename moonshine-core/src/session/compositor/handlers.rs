@@ -5,6 +5,7 @@
 
 use smithay::backend::allocator::Buffer;
 use smithay::backend::allocator::dmabuf::Dmabuf;
+use smithay::backend::input::TabletToolDescriptor;
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_dispatch2;
@@ -29,6 +30,7 @@ use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler};
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
+use smithay::wayland::tablet_manager::TabletSeatHandler;
 use smithay::wayland::xwayland_shell::{XWaylandShellHandler, XWaylandShellState};
 use smithay::xwayland::xwm::{Reorder, ResizeEdge, XwmId};
 use smithay::xwayland::{X11Surface, X11Wm, XwmHandler};
@@ -1539,6 +1541,12 @@ impl SeatHandler for MoonshineCompositor {
 	}
 
 	fn led_state_changed(&mut self, _seat: &Seat<Self>, _led_state: smithay::input::keyboard::LedState) {}
+}
+
+impl TabletSeatHandler for MoonshineCompositor {
+	fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
+		self.cursor_status = image;
+	}
 }
 
 // -- Selection / Data Device Handlers --
