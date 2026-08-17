@@ -210,7 +210,7 @@ impl PulseServer {
 			server_version: Some(std::ffi::CString::new(env!("CARGO_PKG_VERSION")).unwrap()),
 			host_name: Some(std::ffi::CString::new("moonshine").unwrap()),
 			default_sink_name: Some(sink_name.clone()),
-			default_source_name: Some(sink_name),
+			default_source_name: None,
 			sample_spec: capture_spec,
 			channel_map,
 			..Default::default()
