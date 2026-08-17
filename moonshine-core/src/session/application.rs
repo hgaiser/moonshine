@@ -86,6 +86,9 @@ const ACTIVE_STATE_PROPERTY: &str = "ActiveState";
 const STOP_JOB_TIMEOUT: Duration = Duration::from_secs(2);
 const UNIT_REMOVED_TIMEOUT: Duration = Duration::from_secs(2);
 
+/// Start-job wait (includes `ExecStartPre`), decoupled from `launch_timeout_secs` so a `pre_command` isn't cut off.
+const START_JOB_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// systemd only emits JobRemoved/UnitRemoved/PropertiesChanged bus signals to
 /// connections that have called org.freedesktop.systemd1.Manager.Subscribe().
 /// Without it, waiting for those signals only works when some *other* client
@@ -632,7 +635,7 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 		.map_err(|e| tracing::warn!("Failed to deserialize StartTransientUnit reply: {e}"))?;
 
 	// Wait for the launch job to complete.
-	wait_for_job_signal(&mut job_stream, &job_path, options.timeout, "Application launch").await?;
+	wait_for_job_signal(&mut job_stream, &job_path, START_JOB_TIMEOUT, "Application launch").await?;
 
 	// Get the unit object path — now that the job is done, the unit should exist.
 	let unit_path = conn
