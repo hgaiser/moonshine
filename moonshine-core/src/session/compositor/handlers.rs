@@ -994,6 +994,34 @@ impl MoonshineCompositor {
 			self.clear_dropdowns();
 		}
 
+		// Raise the focused window to the top of the stack.
+		//
+		// Stacking order is otherwise fixed at map time and never revisited,
+		// so focus and z-order can disagree indefinitely: a window mapped
+		// earlier keeps covering the focused one. Launching a game from Steam
+		// Big Picture hits this — Big Picture stays mapped and on top, and
+		// blanks its own surface while the game starts, so the composited
+		// output is black even though the game renders correctly underneath.
+		//
+		// `activate: false` reorders the stack without touching activation
+		// state, preserving the `_NET_WM_STATE_FOCUSED` handling that Wine
+		// depends on for input delivery (see `mapped_override_redirect_window`).
+		self.space.raise_element(best, false);
+
+		// Overlays and dropdowns belong above the focused window — gamescope
+		// layers base < overlay < external overlay. Re-raise them so the line
+		// above cannot bury the Steam overlay behind the game.
+		for layer in [
+			self.overlay_window.clone(),
+			self.external_overlay_window.clone(),
+			self.override_window.clone(),
+		]
+		.into_iter()
+		.flatten()
+		{
+			self.space.raise_element(&layer, false);
+		}
+
 		// Find the overlay window with input_focus_mode != 0.
 		// Gamescope: looks for overlayWindow with inputFocusMode set.
 		let overlay_with_input_focus: Option<Window> = self.overlay_window.as_ref().and_then(|w| {

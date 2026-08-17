@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
@@ -189,7 +190,9 @@ pub(crate) struct VideoStreamHandle {
 	/// Reference frame invalidation requests, carrying the inclusive
 	/// `[first, last]` client frame-index range the client could not decode.
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
-	reset_tx: broadcast::Sender<()>,
+	/// Set on resume to arm a stream reset; the packet handler fires it once it has
+	/// re-learned the reconnecting client's address (see `request_reset`).
+	resume_pending: Arc<AtomicBool>,
 }
 
 impl VideoStreamHandle {
@@ -218,15 +221,23 @@ impl VideoStreamHandle {
 		let _ = self.invalidate_tx.send((first, last));
 	}
 
-	/// Reset the stream's frame/sequence counters for a resuming client.
+	/// Arm a stream reset for a resuming client.
 	///
 	/// Called when a client reconnects to an already-running session. The pipeline
 	/// keeps incrementing `frame_number` for the lifetime of the session, but a fresh
 	/// Moonlight session expects frame numbers to start at 1; without a reset it counts
-	/// the jump as massive frame loss and reports a poor connection. This also forces an
-	/// IDR so the resumed client has a decodable starting frame.
+	/// the jump as massive frame loss and reports a poor connection. The reset also forces
+	/// an IDR so the resumed client has a decodable starting frame.
+	///
+	/// The reset is not fired immediately: the packet handler still holds the previous
+	/// connection's address, and a reconnecting client almost always arrives on a new UDP
+	/// source port. Firing now would spend the forced IDR on the stale address, the client
+	/// would receive no decodable frame, and it would abort with a connection error
+	/// (typically recovering only on a retry). Instead we arm a flag that the packet handler
+	/// consumes once it has re-learned the client's address from its first PING, so the IDR
+	/// lands where the client is actually listening.
 	pub fn request_reset(&self) {
-		let _ = self.reset_tx.send(());
+		self.resume_pending.store(true, Ordering::Relaxed);
 	}
 
 	/// Clone the start notify for external triggering (e.g. bench binary).
@@ -300,14 +311,23 @@ impl VideoStream {
 		// of loss reports; the encode loop drains all pending each iteration.
 		let (invalidate_tx, _invalidate_rx) = broadcast::channel(16);
 
-		// Stream-reset broadcast channel (client reconnect/resume).
+		// Stream-reset broadcast channel (client reconnect/resume). The packet handler
+		// fires it once it has re-learned the reconnecting client's address.
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
+		let resume_pending = Arc::new(AtomicBool::new(false));
 
 		// Packet channel.
 		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
 
 		// Spawn packet handler — gated behind start_notify.
-		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone());
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			start_notify.clone(),
+			reset_tx.clone(),
+			resume_pending.clone(),
+			stop.clone(),
+		);
 
 		// Spawn pipeline thread — gated behind start_notify.
 		VideoPipeline::new(
@@ -330,7 +350,7 @@ impl VideoStream {
 			notify: start_notify,
 			idr_tx,
 			invalidate_tx,
-			reset_tx,
+			resume_pending,
 		})
 	}
 }
@@ -339,6 +359,8 @@ fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<ShardBatch>,
 	socket: UdpGsoSocket,
 	start: Arc<Notify>,
+	reset_tx: broadcast::Sender<()>,
+	resume_pending: Arc<AtomicBool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
 	tokio::spawn(async move {
@@ -405,6 +427,14 @@ fn spawn_handle_video_packets(
 					if &buf[..len] == b"PING" {
 						tracing::trace!("Received video stream PING message from {address}.");
 						client_address = Some(address);
+
+						// A resume armed a stream reset (frame-counter reset + forced IDR). Fire it
+						// now that we know where the reconnecting client is listening, so the forced
+						// IDR is sent to the current address instead of the previous connection's.
+						if resume_pending.swap(false, Ordering::Relaxed) {
+							tracing::info!("Re-learned client address after resume; firing armed stream reset.");
+							let _ = reset_tx.send(());
+						}
 					} else {
 						tracing::warn!("Received unknown message on video stream of length {len}.");
 					}
