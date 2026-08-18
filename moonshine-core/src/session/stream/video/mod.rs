@@ -316,6 +316,7 @@ impl VideoStream {
 			context,
 			keys_rx,
 			packet_tx,
+			idr_tx.clone(),
 			idr_tx.subscribe(),
 			invalidate_tx.subscribe(),
 			reset_tx.subscribe(),

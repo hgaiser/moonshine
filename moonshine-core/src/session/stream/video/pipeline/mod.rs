@@ -247,11 +247,13 @@ impl Drop for InFlightGuard {
 /// `in_flight` counts frames submitted but not yet finished here; each fully
 /// processed (or dropped) frame decrements it via [`InFlightGuard`], which is the
 /// signal the encoding thread's drop-to-catch-up gate reads.
+#[allow(clippy::too_many_arguments)]
 async fn run_packet_consumer(
 	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
 	packet_tx: mpsc::Sender<ShardBatch>,
 	stats_tx: broadcast::Sender<FrameStats>,
 	in_flight: Arc<AtomicUsize>,
+	idr_tx: broadcast::Sender<()>,
 	mut packetizer: Packetizer,
 	ctx: VideoStreamContext,
 	config: VideoStreamConfig,
@@ -283,7 +285,19 @@ async fn run_packet_consumer(
 		let mut packet = match future.await {
 			Ok(packet) => packet,
 			Err(e) => {
-				tracing::warn!("Failed to read back encoded frame: {e}");
+				// A frame whose bitstream overflowed its destination buffer was
+				// truncated and is not sent. Request an IDR so the next frame is a
+				// keyframe, keeping the client's reference chain decodable.
+				if let PixelForgeError::BufferOverflow { written, capacity } = &e {
+					tracing::warn!(
+						written,
+						capacity,
+						"Encoded frame overflowed bitstream buffer; requesting IDR"
+					);
+					let _ = idr_tx.send(());
+				} else {
+					tracing::warn!("Failed to read back encoded frame: {e}");
+				}
 				continue;
 			},
 		};
@@ -417,6 +431,7 @@ impl VideoPipeline {
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
 		packet_tx: mpsc::Sender<ShardBatch>,
+		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
 		reset_request_rx: broadcast::Receiver<()>,
@@ -445,6 +460,7 @@ impl VideoPipeline {
 					runtime,
 					frame_rx,
 					packet_tx,
+					idr_tx,
 					idr_frame_request_rx,
 					invalidate_request_rx,
 					reset_request_rx,
@@ -473,6 +489,7 @@ impl VideoPipelineInner {
 		runtime: tokio::runtime::Handle,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		packet_tx: mpsc::Sender<ShardBatch>,
+		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
 		reset_request_rx: broadcast::Receiver<()>,
@@ -517,6 +534,7 @@ impl VideoPipelineInner {
 			context,
 			encoder,
 			packet_tx,
+			idr_tx,
 			idr_frame_request_rx,
 			invalidate_request_rx,
 			reset_request_rx,
@@ -595,6 +613,7 @@ impl VideoPipelineInner {
 		context: VideoContext,
 		mut encoder: Encoder,
 		packet_tx: mpsc::Sender<ShardBatch>,
+		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
 		mut reset_request_rx: broadcast::Receiver<()>,
@@ -636,6 +655,7 @@ impl VideoPipelineInner {
 				packet_tx,
 				stats_tx,
 				in_flight,
+				idr_tx.clone(),
 				packetizer,
 				ctx,
 				config,
