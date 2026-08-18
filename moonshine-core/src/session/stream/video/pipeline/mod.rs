@@ -28,7 +28,8 @@ use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
-	InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext, VideoContextBuilder,
+	EncoderTuningMode, InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext,
+	VideoContextBuilder,
 };
 
 /// Maximum number of frames in flight (submitted to the encoder but not yet
@@ -568,6 +569,7 @@ impl VideoPipelineInner {
 			Codec::H265 => EncodeConfig::h265(ctx.width, ctx.height),
 			Codec::AV1 => EncodeConfig::av1(ctx.width, ctx.height),
 		}
+		.with_encoder_tuning_mode(EncoderTuningMode::LowLatency)
 		.with_pixel_format(pixel_format)
 		.with_bit_depth(bit_depth)
 		.with_color_description(color_description)
