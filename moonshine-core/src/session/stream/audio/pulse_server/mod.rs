@@ -2,13 +2,13 @@ mod commands;
 mod dyn_buffer;
 
 use std::collections::BTreeMap;
-use std::io::{Cursor, Read};
+use std::io::{Cursor, Read, Write};
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
 use std::time;
 
 use async_shutdown::ShutdownManager;
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use mio::net::UnixListener;
 use pulseaudio::protocol::{self as pulse};
 
@@ -20,6 +20,11 @@ type Error = Box<dyn std::error::Error + Send + Sync>;
 
 const LISTENER: mio::Token = mio::Token(0);
 const CLOCK: mio::Token = mio::Token(1);
+
+/// Cap on per-client pending outgoing data. A buffer exceeding this means the
+/// client has stopped reading; the stuck client is dropped rather than letting
+/// the buffer grow unboundedly, and the session survives.
+const MAX_OUTGOING_BUFFER: usize = 64 * 1024 * 1024;
 
 /// The server emits samples at this rate to the encoder.
 pub(crate) const CAPTURE_SAMPLE_RATE: u32 = 48000;
@@ -78,7 +83,55 @@ struct Client {
 	protocol_version: u16,
 	props: Option<pulse::Props>,
 	incoming: BytesMut,
+	outgoing: BytesMut,
+	writable_registered: bool,
 	playback_streams: BTreeMap<u32, PlaybackStream>,
+}
+
+/// Outcome of attempting to flush a client's outgoing buffer.
+enum FlushResult {
+	/// Buffer fully drained; socket is idle.
+	Done,
+	/// Socket send buffer is full; retry when the socket becomes writable.
+	Blocked,
+	/// Socket write failed (peer gone, etc.); the client should be dropped.
+	Dead,
+}
+
+impl Client {
+	/// Write as much of the outgoing buffer to the socket as possible.
+	///
+	/// `WouldBlock` is not an error: the remainder stays buffered and the
+	/// caller arms `WRITABLE` interest. A real write error only ever kills the
+	/// offending client, never the server.
+	fn flush(&mut self) -> FlushResult {
+		loop {
+			if self.outgoing.is_empty() {
+				return FlushResult::Done;
+			}
+			match self.socket.write(&self.outgoing) {
+				Ok(0) => return FlushResult::Dead,
+				Ok(n) => self.outgoing.advance(n),
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return FlushResult::Blocked,
+				Err(_) => return FlushResult::Dead,
+			}
+		}
+	}
+}
+
+/// Adapter that lets the `pulseaudio` protocol writers append directly into a
+/// client's outgoing buffer instead of hitting a nonblocking socket.
+struct ClientWriter<'a>(&'a mut BytesMut);
+
+impl std::io::Write for ClientWriter<'_> {
+	fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+		self.0.extend_from_slice(buf);
+		Ok(buf.len())
+	}
+
+	fn flush(&mut self) -> std::io::Result<()> {
+		Ok(())
+	}
 }
 
 struct ServerState {
@@ -342,6 +395,8 @@ impl PulseServer {
 								protocol_version: pulse::MAX_VERSION,
 								props: None,
 								incoming: BytesMut::new(),
+								outgoing: BytesMut::new(),
+								writable_registered: false,
 								playback_streams: BTreeMap::new(),
 							},
 						);
@@ -360,6 +415,9 @@ impl PulseServer {
 							}
 						}
 					},
+					client_token if event.is_writable() => {
+						self.flush_client(client_token);
+					},
 					_ => (),
 				}
 			}
@@ -367,67 +425,135 @@ impl PulseServer {
 	}
 
 	fn recv(&mut self, client_token: mio::Token) -> Result<(), Error> {
-		let client = self.clients.get_mut(&client_token).unwrap();
+		let result = (|| -> Result<(), Error> {
+			let client = self.clients.get_mut(&client_token).unwrap();
 
-		let mut read_size = 8192;
+			let mut read_size = 8192;
 
-		'read: loop {
-			let off = client.incoming.len();
-			client.incoming.resize(off + read_size, 0);
-			let n = match client.socket.read(&mut client.incoming[off..]) {
-				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-					client.incoming.truncate(off);
-					return Ok(());
-				},
-				v => v.map_err(|e| -> Error { format!("recv error: {e}").into() })?,
-			};
+			'read: loop {
+				let off = client.incoming.len();
+				client.incoming.resize(off + read_size, 0);
+				let n = match client.socket.read(&mut client.incoming[off..]) {
+					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+						client.incoming.truncate(off);
+						return Ok(());
+					},
+					v => v.map_err(|e| -> Error { format!("recv error: {e}").into() })?,
+				};
 
-			client.incoming.truncate(off + n);
+				client.incoming.truncate(off + n);
 
-			loop {
-				if client.incoming.len() < pulse::DESCRIPTOR_SIZE {
-					read_size = 8192;
-					continue 'read;
-				}
-
-				let desc = pulse::read_descriptor(&mut Cursor::new(&client.incoming[..pulse::DESCRIPTOR_SIZE]))?;
-
-				// Guard against excessively large payloads (max 4 MiB).
-				const MAX_PAYLOAD_SIZE: u32 = 4 * 1024 * 1024;
-				if desc.length > MAX_PAYLOAD_SIZE {
-					return Err(format!("payload too large: {} bytes", desc.length).into());
-				}
-
-				if client.incoming.len() < (desc.length as usize + pulse::DESCRIPTOR_SIZE) {
-					read_size = desc.length as usize + pulse::DESCRIPTOR_SIZE - client.incoming.len();
-					continue 'read;
-				}
-
-				let _desc_bytes = client.incoming.split_to(pulse::DESCRIPTOR_SIZE);
-				let payload = client.incoming.split_to(desc.length as usize).freeze();
-
-				if desc.channel == u32::MAX {
-					let (seq, cmd) =
-						match pulse::Command::read_tag_prefixed(&mut Cursor::new(payload), client.protocol_version) {
-							Err(pulse::ProtocolError::Unimplemented(seq, cmd)) => {
-								tracing::warn!("Unimplemented PA command: {:?}", cmd);
-								pulse::write_error(&mut client.socket, seq, &pulse::PulseError::NotImplemented)?;
-								continue;
-							},
-							v => v.map_err(|e| -> Error { format!("decoding command: {e}").into() })?,
-						};
-
-					match commands::handle_command(client, &mut self.server_state, seq, cmd) {
-						Ok(()) => (),
-						Err(e) => {
-							let _ = pulse::write_error(&mut client.socket, seq, &pulse::PulseError::Internal);
-							return Err(e);
-						},
+				loop {
+					if client.incoming.len() < pulse::DESCRIPTOR_SIZE {
+						read_size = 8192;
+						continue 'read;
 					}
-				} else {
-					commands::handle_stream_write(client, desc, &payload)?;
+
+					let desc = pulse::read_descriptor(&mut Cursor::new(&client.incoming[..pulse::DESCRIPTOR_SIZE]))?;
+
+					// Guard against excessively large payloads (max 4 MiB).
+					const MAX_PAYLOAD_SIZE: u32 = 4 * 1024 * 1024;
+					if desc.length > MAX_PAYLOAD_SIZE {
+						return Err(format!("payload too large: {} bytes", desc.length).into());
+					}
+
+					if client.incoming.len() < (desc.length as usize + pulse::DESCRIPTOR_SIZE) {
+						read_size = desc.length as usize + pulse::DESCRIPTOR_SIZE - client.incoming.len();
+						continue 'read;
+					}
+
+					let _desc_bytes = client.incoming.split_to(pulse::DESCRIPTOR_SIZE);
+					let payload = client.incoming.split_to(desc.length as usize).freeze();
+
+					if desc.channel == u32::MAX {
+						let (seq, cmd) =
+							match pulse::Command::read_tag_prefixed(&mut Cursor::new(payload), client.protocol_version)
+							{
+								Err(pulse::ProtocolError::Unimplemented(seq, cmd)) => {
+									tracing::warn!("Unimplemented PA command: {:?}", cmd);
+									pulse::write_error(
+										&mut ClientWriter(&mut client.outgoing),
+										seq,
+										&pulse::PulseError::NotImplemented,
+									)?;
+									continue;
+								},
+								v => v.map_err(|e| -> Error { format!("decoding command: {e}").into() })?,
+							};
+
+						match commands::handle_command(client, &mut self.server_state, seq, cmd) {
+							Ok(()) => (),
+							Err(e) => {
+								let _ = pulse::write_error(
+									&mut ClientWriter(&mut client.outgoing),
+									seq,
+									&pulse::PulseError::Internal,
+								);
+								return Err(e);
+							},
+						}
+					} else {
+						commands::handle_stream_write(client, desc, &payload)?;
+					}
 				}
 			}
+		})();
+
+		if result.is_ok() {
+			self.flush_client(client_token);
+		}
+
+		result
+	}
+
+	/// Flush a client's pending outgoing data, managing `WRITABLE` interest and
+	/// dropping clients that are stuck or whose socket has failed.
+	fn flush_client(&mut self, client_token: mio::Token) {
+		let remove = {
+			let client = match self.clients.get_mut(&client_token) {
+				Some(client) => client,
+				None => return,
+			};
+
+			if client.outgoing.len() > MAX_OUTGOING_BUFFER {
+				tracing::warn!(
+					"PulseAudio client {} is stuck (outgoing buffer {} B exceeds cap), dropping",
+					client.id,
+					MAX_OUTGOING_BUFFER,
+				);
+				true
+			} else {
+				match client.flush() {
+					FlushResult::Done => {
+						if client.writable_registered {
+							client.writable_registered = false;
+							let _ = self.poll.registry().reregister(
+								&mut client.socket,
+								client_token,
+								mio::Interest::READABLE,
+							);
+						}
+						false
+					},
+					FlushResult::Blocked => {
+						if !client.writable_registered {
+							client.writable_registered = true;
+							let _ = self.poll.registry().reregister(
+								&mut client.socket,
+								client_token,
+								mio::Interest::READABLE | mio::Interest::WRITABLE,
+							);
+						}
+						false
+					},
+					FlushResult::Dead => true,
+				}
+			}
+		};
+
+		if remove && let Some(mut client) = self.clients.remove(&client_token) {
+			tracing::debug!("PulseAudio client disconnected (id={})", client.id);
+			let _ = self.poll.registry().deregister(&mut client.socket);
 		}
 	}
 
@@ -487,7 +613,7 @@ impl PulseServer {
 						// Buffer underrun: notify client and (re-)enter prebuffering.
 						tracing::warn!("Buffer underrun for stream {}", id);
 						pulse::write_command_message(
-							&mut client.socket,
+							&mut ClientWriter(&mut client.outgoing),
 							u32::MAX,
 							&pulse::Command::Underflow(pulse::Underflow {
 								channel: *id,
@@ -531,7 +657,7 @@ impl PulseServer {
 					let req = pop_missing(&mut stream.missing, &mut stream.requested, min_req, in_prebuf);
 					if req > 0 {
 						pulse::write_command_message(
-							&mut client.socket,
+							&mut ClientWriter(&mut client.outgoing),
 							u32::MAX,
 							&pulse::Command::Request(pulse::Request {
 								channel: *id,
@@ -546,9 +672,17 @@ impl PulseServer {
 			for id in done_draining.iter() {
 				let stream = client.playback_streams.remove(id).unwrap();
 				if let StreamState::Draining(drain_seq) = stream.state {
-					pulse::write_ack_message(&mut client.socket, drain_seq)?;
+					pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), drain_seq)?;
 				}
 			}
+		}
+
+		// Flush pending output for all clients. WouldBlock is handled gracefully
+		// (buffered + WRITABLE interest); a stuck client is dropped, never the
+		// whole server.
+		let tokens: Vec<mio::Token> = self.clients.keys().copied().collect();
+		for token in tokens {
+			self.flush_client(token);
 		}
 
 		// Apply sink-level volume.
