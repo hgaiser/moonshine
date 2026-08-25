@@ -368,8 +368,13 @@ impl PulseServer {
 			for event in events.iter() {
 				match event.token() {
 					CLOCK => {
-						self.clock.read()?;
-						self.clock_tick()?;
+						// A wakeup can race its own drain and find no expirations
+						// left to read (EAGAIN); skip the tick, don't kill the session.
+						match self.clock.read() {
+							Ok(_) => self.clock_tick()?,
+							Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => (),
+							Err(e) => return Err(e.into()),
+						}
 					},
 					LISTENER => loop {
 						let (mut socket, _) = match self.listener.accept() {
