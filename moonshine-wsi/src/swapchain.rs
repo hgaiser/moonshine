@@ -60,15 +60,14 @@ pub unsafe extern "C" fn create_swapchain(
 		// Determine whether XWayland bypass is allowed for this surface.
 		let bypass_allowed = can_bypass_xwayland(surface_key);
 
-		let p_create_info_for_icd;
 		let mut patched_create_info;
-		if need_remap {
+		let p_create_info_for_icd = if need_remap {
 			patched_create_info = *create_info;
 			patched_create_info.image_color_space = ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
-			p_create_info_for_icd = &patched_create_info as *const VkSwapchainCreateInfoKHR;
+			&patched_create_info as *const VkSwapchainCreateInfoKHR
 		} else {
-			p_create_info_for_icd = p_create_info;
-		}
+			p_create_info
+		};
 
 		// Call the next layer/ICD first.
 		let result = with_device(device_key, |data| data.dispatch.create_swapchain)
