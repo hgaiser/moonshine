@@ -34,6 +34,21 @@ pub struct VideoStreamConfig {
 	/// packetize than the frame budget.
 	#[serde(default)]
 	pub log_frame_spikes: bool,
+
+	/// Target on-wire rate used to pace video UDP shards. Zero disables pacing
+	/// and retains UDP GSO. This is a burst-rate ceiling, not the codec bitrate.
+	#[serde(default)]
+	pub pacing_wire_rate_mbps: u32,
+
+	/// Maximum fraction of one frame interval that a paced batch may consume.
+	/// Larger batches are accelerated to meet this deadline rather than building
+	/// latency in the sender queue.
+	#[serde(default = "default_pacing_frame_budget_percent")]
+	pub pacing_frame_budget_percent: u8,
+}
+
+const fn default_pacing_frame_budget_percent() -> u8 {
+	80
 }
 
 impl Default for VideoStreamConfig {
@@ -43,6 +58,8 @@ impl Default for VideoStreamConfig {
 			fec_percentage: 20,
 			encrypt: false,
 			log_frame_spikes: false,
+			pacing_wire_rate_mbps: 0,
+			pacing_frame_budget_percent: default_pacing_frame_budget_percent(),
 		}
 	}
 }
@@ -279,11 +296,17 @@ impl VideoStream {
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<VideoStreamHandle, ()> {
 		let Self {
-			socket,
+			mut socket,
 			frame_rx,
 			hdr_metadata_tx,
 			stats_tx,
 		} = self;
+
+		socket.configure_adaptive_pacing(
+			config.pacing_wire_rate_mbps,
+			context.fps,
+			config.pacing_frame_budget_percent,
+		);
 
 		// Apply QoS to UDP socket.
 		if context.qos {
@@ -349,6 +372,17 @@ fn spawn_handle_video_packets(
 		let mut client_address = None;
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
+		let mut sender_stats_started = std::time::Instant::now();
+		let mut sent_batches = 0u64;
+		let mut sent_shards = 0u64;
+		let mut deadline_clamped_batches = 0u64;
+		let mut pacing_budget_missed_batches = 0u64;
+		let mut frame_deadline_missed_batches = 0u64;
+		let mut failed_gso_chunks = 0u64;
+		let mut send_errors = 0u64;
+		let mut max_queue_age = std::time::Duration::ZERO;
+		let mut max_send_elapsed = std::time::Duration::ZERO;
+		let mut max_pacing_interval = std::time::Duration::ZERO;
 
 		// Trigger session shutdown if we exit unexpectedly.
 		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
@@ -363,6 +397,7 @@ fn spawn_handle_video_packets(
 								if batch.shard_count() == 0 {
 									continue;
 								}
+								let queue_age = batch.queue_age();
 
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
@@ -370,15 +405,54 @@ fn spawn_handle_video_packets(
 									.wrap_cancel(socket.send_batch(&batch, addr))
 									.await
 								{
-									Ok(failed_chunks) => {
-										if failed_chunks > 0
+									Ok(result) => {
+										sent_batches += 1;
+										sent_shards += result.shard_count as u64;
+										deadline_clamped_batches += u64::from(result.deadline_clamped);
+										pacing_budget_missed_batches += u64::from(result.pacing_budget_missed);
+										frame_deadline_missed_batches += u64::from(result.frame_deadline_missed);
+										failed_gso_chunks += u64::from(result.failed_gso_chunks);
+										send_errors += u64::from(result.send_errors);
+										max_queue_age = max_queue_age.max(queue_age);
+										max_send_elapsed = max_send_elapsed.max(result.elapsed);
+										max_pacing_interval = max_pacing_interval.max(result.pacing_interval.unwrap_or_default());
+
+										if result.failed_gso_chunks > 0
 											&& last_send_warn
 												.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
 										{
 											tracing::warn!(
-												"GSO send failed for {failed_chunks} chunk(s), sent per-shard instead"
+												"GSO send failed for {} chunk(s), sent per-shard instead",
+												result.failed_gso_chunks
 											);
 											last_send_warn = Some(std::time::Instant::now());
+										}
+
+										if sender_stats_started.elapsed() >= std::time::Duration::from_secs(5) {
+											tracing::info!(
+												batches = sent_batches,
+												shards = sent_shards,
+												deadline_clamped_batches,
+												pacing_budget_missed_batches,
+												frame_deadline_missed_batches,
+												failed_gso_chunks,
+												send_errors,
+												max_queue_age_us = max_queue_age.as_micros() as u64,
+												max_send_us = max_send_elapsed.as_micros() as u64,
+												max_pacing_interval_us = max_pacing_interval.as_micros() as u64,
+												"Video sender stats"
+											);
+											sender_stats_started = std::time::Instant::now();
+											sent_batches = 0;
+											sent_shards = 0;
+											deadline_clamped_batches = 0;
+											pacing_budget_missed_batches = 0;
+											frame_deadline_missed_batches = 0;
+											failed_gso_chunks = 0;
+											send_errors = 0;
+											max_queue_age = std::time::Duration::ZERO;
+											max_send_elapsed = std::time::Duration::ZERO;
+											max_pacing_interval = std::time::Duration::ZERO;
 										}
 									},
 									Err(_) => break,
