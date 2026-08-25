@@ -870,16 +870,26 @@ impl MoonshineCompositor {
 		self.buffer_last_rendered_at[idx] = Some(self.render_count);
 		self.render_count += 1;
 
-		match render_result {
-			Ok(_) | Err(smithay::backend::renderer::damage::Error::OutputNoMode(_)) => {},
+		let sync = match &render_result {
+			Ok(r) => r.sync.clone(),
+			Err(smithay::backend::renderer::damage::Error::OutputNoMode(_)) => {
+				smithay::backend::renderer::sync::SyncPoint::signaled()
+			},
 			Err(e) => {
 				tracing::error!("Failed to render output: {e}");
 				return;
 			},
-		}
+		};
 
 		// Drop framebuffer before sending, to release the mutable borrow on dmabuf.
 		drop(framebuffer);
+
+		// Block until the render has actually completed. `finish()` only flushes
+		// the GL blit, so without waiting the encoder can read a stale buffer
+		// from the round-robin pool (frames arrive out of order).
+		if let Err(e) = sync.wait() {
+			tracing::warn!("Failed to wait for render fence: {e}");
+		}
 
 		// Update created_at to reflect the actual render completion time.
 		// The ExportedFrame was built before renderer.bind() (borrow workaround),
