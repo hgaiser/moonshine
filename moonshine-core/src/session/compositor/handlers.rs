@@ -1285,7 +1285,7 @@ impl MoonshineCompositor {
 		let Some(meta) = self.window_metadata.get(window) else {
 			return;
 		};
-		if !meta.has_game_id() || !meta.is_fullscreen() {
+		if !meta.is_fullscreen() {
 			return;
 		}
 
@@ -1884,16 +1884,11 @@ impl XwmHandler for MoonshineCompositor {
 			target: "focus",
 			title = ?window.title(),
 			class = ?window.class(),
+			geometry = ?window.geometry(),
 			override_redirect = window.is_override_redirect(),
 			wl_surface = ?window.wl_surface(),
 			"X11 window map request"
 		);
-
-		// Configure the X11 window to fill the output.
-		let geo = self.output_rect();
-		if let Err(e) = window.configure(geo) {
-			tracing::warn!("Failed to configure X11 window geometry: {e}");
-		}
 
 		// Grant the map request.
 		if let Err(e) = window.set_mapped(true) {
