@@ -452,15 +452,21 @@ impl SessionManager {
 	pub(crate) async fn update_keys(&self, keys: SessionKeyData) -> Result<(), ()> {
 		let guard = self.inner.lock().await;
 
-		if guard.session.is_none() {
-			tracing::warn!("No active session to update keys for.");
+		if guard.stop.is_shutdown_triggered() {
+			tracing::warn!("Session is shutting down; rejecting resume key update.");
+			return Err(());
+		}
+
+		if !matches!(guard.session.as_ref(), Some(SessionState::Active(_))) {
+			tracing::warn!("No active streaming session to update keys for.");
 			return Err(());
 		}
 
 		if let Some(keys_tx) = &guard.keys_tx {
 			keys_tx.send_replace(keys);
 		} else {
-			tracing::warn!("No active session to update keys for.");
+			tracing::warn!("Active streaming session has no key sender; rejecting resume.");
+			return Err(());
 		}
 
 		Ok(())
