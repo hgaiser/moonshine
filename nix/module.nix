@@ -120,6 +120,8 @@ in
     };
   };
 
+  disabledModules = [ "services/networking/moonshine.nix" ];
+
   config = lib.mkIf cfg.enable {
     assertions = [
       {
@@ -135,8 +137,6 @@ in
     # Puts `moonshine` on PATH for the healthcheck and pairing subcommands, and
     # is how the polkit rule below gets picked up.
     environment.systemPackages = [ cfg.package ];
-
-    disabledModules = [ "services/networking/moonshine.nix" ];
 
     # The moonshine-wsi Vulkan layer routes a game's swapchain frames into
     # moonshine's compositor. It is an *implicit* layer, so the loader has to
