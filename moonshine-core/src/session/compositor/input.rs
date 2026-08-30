@@ -8,7 +8,7 @@ use smithay::backend::input::{
 	Axis, ButtonState, KeyState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType, TouchSlot,
 };
 use smithay::desktop::WindowSurfaceType;
-use smithay::input::keyboard::{FilterResult, Keycode};
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode, xkb};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
 use smithay::input::touch::{DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, UpEvent as TouchUpEvent};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
@@ -87,6 +87,12 @@ pub(crate) enum CompositorInputEvent {
 		rotation: u16,
 		tilt: u8,
 	},
+	/// Type text received from the Moonlight clipboard ("type clipboard text").
+	/// Each character is resolved against the current keyboard layout and
+	/// injected as key events.
+	TypeText {
+		text: String,
+	},
 }
 
 /// Process an input event received from the Moonlight control stream.
@@ -102,6 +108,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 	match event {
 		CompositorInputEvent::KeyDown { .. }
 		| CompositorInputEvent::KeyUp { .. }
+		| CompositorInputEvent::TypeText { .. }
 		| CompositorInputEvent::TouchDown { .. }
 		| CompositorInputEvent::TouchMove { .. }
 		| CompositorInputEvent::TouchUp { .. }
@@ -138,6 +145,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				);
 			}
 		},
+		CompositorInputEvent::TypeText { text } => type_text(state, &text, time),
 		CompositorInputEvent::MouseMoveAbsolute {
 			x,
 			y,
@@ -359,6 +367,129 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			time,
 		),
 	}
+}
+
+/// A keycode plus the modifier keycodes that must be held to reach it.
+type ResolvedKey = (Keycode, Vec<Keycode>);
+
+/// Type text by injecting per-character key events, resolved against the
+/// current keyboard layout.
+///
+/// The Moonlight "type clipboard text" feature sends one UTF-8 code point
+/// per event, so a pasted string arrives as a sequence of `TypeText` events.
+/// Characters that the current layout cannot produce (e.g. Cyrillic on a US
+/// layout) are skipped with a warning.
+fn type_text(state: &mut MoonshineCompositor, text: &str, time: u32) {
+	let Some(keyboard) = state.seat.get_keyboard() else {
+		return;
+	};
+
+	// Resolve all keystrokes up front. `with_xkb_state` holds the keyboard
+	// lock, so we cannot inject while inside the closure.
+	let keystrokes: Vec<(char, Option<ResolvedKey>)> = keyboard.with_xkb_state(state, |ctx| {
+		let xkb = ctx.xkb().lock().unwrap();
+		let keymap = unsafe { xkb.keymap() };
+		text.chars().map(|c| (c, resolve_char(keymap, c))).collect()
+	});
+
+	for (c, resolved) in keystrokes {
+		let Some((keycode, modifier_keycodes)) = resolved else {
+			tracing::warn!("Unable to type character {:?} with the current keyboard layout", c);
+			continue;
+		};
+
+		for &modifier in &modifier_keycodes {
+			inject_key(state, &keyboard, modifier, KeyState::Pressed, time);
+		}
+		inject_key(state, &keyboard, keycode, KeyState::Pressed, time);
+		inject_key(state, &keyboard, keycode, KeyState::Released, time);
+		for &modifier in modifier_keycodes.iter().rev() {
+			inject_key(state, &keyboard, modifier, KeyState::Released, time);
+		}
+	}
+}
+
+fn inject_key(
+	state: &mut MoonshineCompositor,
+	keyboard: &KeyboardHandle<MoonshineCompositor>,
+	keycode: Keycode,
+	key_state: KeyState,
+	time: u32,
+) {
+	keyboard.input::<(), _>(
+		state,
+		keycode,
+		key_state,
+		SERIAL_COUNTER.next_serial(),
+		time,
+		|_, _, _| FilterResult::Forward,
+	);
+}
+
+/// Find the keycode (and any modifier keycodes needed to reach it) that
+/// produces the given character in the keymap. Prefers the lowest shift level
+/// so plain characters are typed without modifiers where possible.
+fn resolve_char(keymap: &xkb::Keymap, c: char) -> Option<ResolvedKey> {
+	// The Return key produces '\r', so match newlines against that too.
+	let needle = if c == '\n' { '\r' } else { c };
+
+	for level in 0..4 {
+		let mut keycode = keymap.min_keycode();
+		let max = keymap.max_keycode();
+		while keycode <= max {
+			for layout in 0..keymap.num_layouts() {
+				if level < keymap.num_levels_for_key(keycode, layout)
+					&& keymap
+						.key_get_syms_by_level(keycode, layout, level)
+						.iter()
+						.any(|&sym| keysym_produces(sym, needle))
+				{
+					let modifier_keycodes = resolve_modifiers(keymap, layout, keycode, level);
+					return Some((keycode, modifier_keycodes));
+				}
+			}
+			keycode = Keycode::new(keycode.raw() + 1);
+		}
+	}
+	None
+}
+
+fn keysym_produces(sym: xkb::Keysym, c: char) -> bool {
+	xkb::keysym_to_utf8(sym).starts_with(c)
+}
+
+/// Determine which modifier keycodes must be held to reach `level` of the
+/// given key, by resolving every modifier bit to a key that activates it.
+fn resolve_modifiers(keymap: &xkb::Keymap, layout: u32, keycode: Keycode, level: u32) -> Vec<Keycode> {
+	let mut masks = [0; 4];
+	let count = keymap.key_get_mods_for_level(keycode, layout, level, &mut masks);
+	let combined = masks[..count].iter().fold(0u32, |acc, mask| acc | mask);
+
+	let mut result = Vec::new();
+	for mod_index in 0..keymap.num_mods().min(32) {
+		if combined & (1 << mod_index) != 0
+			&& let Some(modifier) = find_modifier_keycode(keymap, layout, mod_index)
+		{
+			result.push(modifier);
+		}
+	}
+	result
+}
+
+/// Find a key that activates the given modifier when pressed unmodified
+/// (e.g. Shift_L for the Shift modifier).
+fn find_modifier_keycode(keymap: &xkb::Keymap, layout: u32, mod_index: u32) -> Option<Keycode> {
+	let mut keycode = keymap.min_keycode();
+	let max = keymap.max_keycode();
+	while keycode <= max {
+		let mut masks = [0];
+		let count = keymap.key_get_mods_for_level(keycode, layout, 0, &mut masks);
+		if count > 0 && masks[0] & (1 << mod_index) != 0 {
+			return Some(keycode);
+		}
+		keycode = Keycode::new(keycode.raw() + 1);
+	}
+	None
 }
 
 #[derive(Debug, Clone, Copy)]

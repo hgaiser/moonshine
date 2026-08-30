@@ -47,6 +47,7 @@ enum InputEventType {
 	GamepadBattery = 0x55000007,
 	GamepadUpdate = 0x0000000C,
 	GamepadEnableHaptics = 0x0000000D,
+	Utf8Text = 0x00000017,
 }
 
 #[derive(Debug)]
@@ -68,6 +69,7 @@ enum InputEvent {
 	GamepadBattery(GamepadBattery),
 	GamepadUpdate(GamepadUpdate),
 	GamepadEnableHaptics,
+	Utf8Text(String),
 }
 
 impl InputEvent {
@@ -116,6 +118,15 @@ impl InputEvent {
 				Ok(InputEvent::GamepadUpdate(GamepadUpdate::from_bytes(&buffer[4..])?))
 			},
 			Some(InputEventType::GamepadEnableHaptics) => Ok(InputEvent::GamepadEnableHaptics),
+			Some(InputEventType::Utf8Text) => {
+				let text = String::from_utf8(buffer[4..].to_vec())
+					.map_err(|e| tracing::warn!("Invalid UTF-8 in text event: {e}"))?;
+				if text.is_empty() {
+					tracing::warn!("Received empty text event");
+					return Err(());
+				}
+				Ok(InputEvent::Utf8Text(text))
+			},
 			None => {
 				tracing::warn!("Received unknown event type: {event_type}");
 				Err(())
@@ -247,6 +258,10 @@ impl InputHandler {
 					rotation: event.rotation,
 					tilt: event.tilt,
 				});
+			},
+			InputEvent::Utf8Text(text) => {
+				tracing::trace!("Typing text: {text:?}");
+				let _ = self.input_tx.send(CompositorInputEvent::TypeText { text });
 			},
 			// Gamepad events: forward to gamepad handler thread.
 			gamepad_event => {
@@ -584,5 +599,25 @@ async fn run_timer_task(gamepads: Arc<Mutex<[Option<GamepadSlot>; 16]>>, wake: A
 				slot.advance(now);
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::InputEvent;
+
+	#[test]
+	fn parses_utf8_text_event() {
+		let payload = [0x17, 0x00, 0x00, 0x00, b'h', b'e', b'y'];
+		assert!(matches!(
+			InputEvent::from_bytes(&payload),
+			Ok(InputEvent::Utf8Text(text)) if text == "hey"
+		));
+	}
+
+	#[test]
+	fn rejects_empty_utf8_text_event() {
+		let payload = [0x17, 0x00, 0x00, 0x00];
+		assert!(InputEvent::from_bytes(&payload).is_err());
 	}
 }
