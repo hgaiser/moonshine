@@ -1,6 +1,7 @@
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use tokio::net::UdpSocket;
 
+use super::pacer::Pacer;
 use super::shard_batch::ShardBatch;
 
 /// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
@@ -8,21 +9,6 @@ use super::shard_batch::ShardBatch;
 /// with EMSGSIZE before segmenting. IPv6 allows 20 more bytes; the IPv4
 /// value is safe for both.
 const MAX_UDP_PAYLOAD: usize = 65507;
-
-/// Approximate bytes added to each UDP payload on a VLAN Ethernet path:
-/// IPv4 + UDP + Ethernet/VLAN/FCS + preamble/SFD + inter-packet gap.
-const WIRE_OVERHEAD_BYTES: usize = 70;
-
-#[derive(Clone, Copy, Debug)]
-enum PacingMode {
-	Disabled,
-	Fixed(std::time::Duration),
-	Adaptive {
-		wire_rate_bps: u64,
-		frame_interval: std::time::Duration,
-		frame_budget_percent: u8,
-	},
-}
 
 #[derive(Debug, Default)]
 pub(crate) struct SendBatchResult {
@@ -36,30 +22,6 @@ pub(crate) struct SendBatchResult {
 	pub frame_deadline_missed: bool,
 }
 
-fn adaptive_pacing_interval(
-	shard_size: usize,
-	shard_count: usize,
-	wire_rate_bps: u64,
-	frame_interval: std::time::Duration,
-	frame_budget_percent: u8,
-) -> (std::time::Duration, bool) {
-	if shard_size == 0 || shard_count <= 1 || wire_rate_bps == 0 {
-		return (std::time::Duration::ZERO, false);
-	}
-
-	let wire_bits = (shard_size.saturating_add(WIRE_OVERHEAD_BYTES) as u128) * 8;
-	let rate_interval_ns = wire_bits.saturating_mul(1_000_000_000).div_ceil(wire_rate_bps as u128);
-	let gaps = (shard_count - 1) as u128;
-	let budget_ns = frame_interval
-		.as_nanos()
-		.saturating_mul(frame_budget_percent.clamp(1, 100) as u128)
-		/ 100;
-	let deadline_interval_ns = budget_ns / gaps;
-	let clamped = rate_interval_ns > deadline_interval_ns;
-	let interval_ns = rate_interval_ns.min(deadline_interval_ns).min(u64::MAX as u128) as u64;
-	(std::time::Duration::from_nanos(interval_ns), clamped)
-}
-
 /// Number of shards per GSO send: the kernel's segment-count cap or the
 /// datagram-size cap, whichever binds first. Never zero, even for a shard
 /// larger than a datagram (such a chunk fails at send time and falls back
@@ -71,34 +33,14 @@ fn gso_segments_per_send(max_gso_segments: usize, shard_size: usize) -> usize {
 }
 
 /// UDP socket for the video stream, with Generic Segmentation Offload.
-///
-/// Wraps a `tokio::net::UdpSocket` and quinn-udp's `UdpSocketState` so shard
-/// batches can be sent as GSO super-packets sized to the kernel's segment-count
-/// and datagram-size caps. Batches exceeding a cap are split into chunks; chunks
-/// the kernel rejects fall back to per-shard sends. Without GSO support, the
-/// socket sends everything per-shard.
 pub(crate) struct UdpGsoSocket {
 	socket: UdpSocket,
 	udp_state: UdpSocketState,
 	disable_gso: bool,
-	pacing: PacingMode,
+	pacer: Option<Pacer>,
 }
 
 impl UdpGsoSocket {
-	fn pacing_deadlines(&self) -> Option<(std::time::Duration, std::time::Duration)> {
-		match self.pacing {
-			PacingMode::Adaptive {
-				frame_interval,
-				frame_budget_percent,
-				..
-			} => Some((
-				frame_interval.mul_f64(f64::from(frame_budget_percent) / 100.0),
-				frame_interval,
-			)),
-			PacingMode::Disabled | PacingMode::Fixed(_) => None,
-		}
-	}
-
 	/// Bind a socket to `address:port` and initialize its GSO state.
 	pub async fn new(address: &str, port: u16) -> Result<Self, ()> {
 		let socket = UdpSocket::bind((address, port))
@@ -106,19 +48,8 @@ impl UdpGsoSocket {
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 		let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
 			.map_err(|e| tracing::error!("Failed to initialize UDP socket state: {e}"))?;
-		let fixed_pacing = std::env::var("MOONSHINE_SHARD_PACING_US")
-			.ok()
-			.and_then(|value| value.parse::<u64>().ok())
-			.filter(|value| *value > 0)
-			.map(std::time::Duration::from_micros);
-		let disable_gso = std::env::var_os("MOONSHINE_DISABLE_GSO").is_some() || fixed_pacing.is_some();
-		let pacing = fixed_pacing.map_or(PacingMode::Disabled, PacingMode::Fixed);
-		if let Some(interval) = fixed_pacing {
-			tracing::info!(
-				pacing_us = interval.as_micros() as u64,
-				"GSO disabled; pacing video shards"
-			);
-		} else if disable_gso {
+		let disable_gso = std::env::var_os("MOONSHINE_DISABLE_GSO").is_some();
+		if disable_gso {
 			tracing::info!("GSO disabled by MOONSHINE_DISABLE_GSO");
 		} else if udp_state.max_gso_segments() > 1 {
 			tracing::debug!("GSO enabled, max segments: {}", udp_state.max_gso_segments());
@@ -129,29 +60,36 @@ impl UdpGsoSocket {
 			socket,
 			udp_state,
 			disable_gso,
-			pacing,
+			pacer: None,
 		})
 	}
 
-	/// Configure adaptive per-shard pacing for the negotiated stream. Environment
-	/// test controls take precedence so fixed-delay A/B runs remain reproducible.
-	pub fn configure_adaptive_pacing(&mut self, wire_rate_mbps: u32, fps: u32, frame_budget_percent: u8) {
-		if !matches!(self.pacing, PacingMode::Disabled) || wire_rate_mbps == 0 || fps == 0 {
+	/// Configure pacing from the bitrate and frame rate negotiated with the
+	/// client. A zero headroom percentage leaves pacing disabled.
+	pub fn configure_pacing(
+		&mut self,
+		client_bitrate_bps: usize,
+		fps: u32,
+		headroom_percent: u16,
+		frame_budget_percent: u8,
+	) {
+		if client_bitrate_bps == 0 || fps == 0 || headroom_percent == 0 {
+			tracing::info!("Video packet pacing disabled");
 			return;
 		}
 
-		self.disable_gso = true;
-		self.pacing = PacingMode::Adaptive {
-			wire_rate_bps: u64::from(wire_rate_mbps) * 1_000_000,
-			frame_interval: std::time::Duration::from_secs_f64(1.0 / f64::from(fps)),
-			frame_budget_percent: frame_budget_percent.clamp(1, 100),
-		};
-		tracing::info!(
-			wire_rate_mbps,
-			fps,
-			frame_budget_percent = frame_budget_percent.clamp(1, 100),
-			"GSO disabled; adaptive video shard pacing enabled"
-		);
+		match Pacer::new(client_bitrate_bps, fps, headroom_percent, frame_budget_percent) {
+			Ok(pacer) => {
+				self.pacer = Some(pacer);
+				tracing::info!(
+					client_bitrate_mbps = client_bitrate_bps / 1_000_000,
+					headroom_percent,
+					frame_budget_percent = frame_budget_percent.clamp(1, 100),
+					"Adaptive video packet pacing enabled"
+				);
+			},
+			Err(e) => tracing::warn!("Failed to initialize high-resolution video pacer: {e}"),
+		}
 	}
 
 	/// Local address the socket is bound to.
@@ -171,120 +109,112 @@ impl UdpGsoSocket {
 
 	/// Send a shard batch to `addr`.
 	///
-	/// Returns the number of chunks that fell back to per-shard sends because
-	/// the kernel rejected the GSO send (0 on success).
-	///
 	/// GSO availability is re-checked on every call: quinn-udp disables it at
 	/// runtime if the kernel or NIC rejects a segmented send.
-	pub async fn send_batch(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> SendBatchResult {
-		let started = tokio::time::Instant::now();
+	pub async fn send_batch(&mut self, batch: &ShardBatch, addr: std::net::SocketAddr) -> SendBatchResult {
+		let started = std::time::Instant::now();
+		let shard_size = batch.shard_size();
+		let shard_count = batch.shard_count();
 		let mut result = SendBatchResult {
-			shard_count: batch.shard_count(),
+			shard_count,
 			..SendBatchResult::default()
 		};
-		if !self.disable_gso && self.udp_state.max_gso_segments() > 1 {
-			let (failed_gso_chunks, send_errors) = self.send_batch_gso(batch, addr).await;
-			result.failed_gso_chunks = failed_gso_chunks;
-			result.send_errors = send_errors;
+		if shard_size == 0 || shard_count == 0 {
+			return result;
+		}
+
+		let max_gso_segments = if self.disable_gso {
+			1
 		} else {
-			let (send_errors, pacing_interval, deadline_clamped) =
-				self.send_shards(batch.as_bytes(), batch.shard_size(), addr).await;
-			result.send_errors = send_errors;
-			result.pacing_interval = pacing_interval;
-			result.deadline_clamped = deadline_clamped;
+			self.udp_state.max_gso_segments()
+		};
+		let max_segments_per_send = gso_segments_per_send(max_gso_segments, shard_size);
+		let pacing_deadlines = self
+			.pacer
+			.as_ref()
+			.map(|pacer| (pacer.frame_budget(), pacer.frame_interval()));
+		let mut schedule = self
+			.pacer
+			.as_ref()
+			.map(|pacer| pacer.schedule_batch(shard_size, shard_count, max_segments_per_send));
+		let segments_per_send = schedule
+			.as_ref()
+			.map_or(max_segments_per_send, |schedule| schedule.segments_per_send);
+		if let Some(schedule) = &schedule {
+			result.pacing_interval = Some(schedule.pacing_interval);
+			result.deadline_clamped = schedule.deadline_clamped;
+		}
+
+		let mut pacing_failed = false;
+		for chunk in batch.as_bytes().chunks(segments_per_send * shard_size) {
+			if !pacing_failed && let (Some(pacer), Some(schedule)) = (&mut self.pacer, &mut schedule) {
+				if let Err(e) = pacer.wait(schedule).await {
+					tracing::warn!("High-resolution video pacer failed; disabling pacing: {e}");
+					pacing_failed = true;
+				}
+				schedule.advance(chunk.len().div_ceil(shard_size));
+			}
+
+			let (failed_gso, send_errors) =
+				send_gso_chunk(&self.socket, &self.udp_state, chunk, shard_size, addr).await;
+			result.failed_gso_chunks += u32::from(failed_gso);
+			result.send_errors += send_errors;
+		}
+
+		if pacing_failed {
+			self.pacer = None;
 		}
 		result.elapsed = started.elapsed();
-		if let Some((pacing_budget, frame_deadline)) = self.pacing_deadlines() {
+		if let Some((pacing_budget, frame_deadline)) = pacing_deadlines {
 			result.pacing_budget_missed = result.elapsed > pacing_budget;
 			result.frame_deadline_missed = result.elapsed > frame_deadline;
 		}
 		result
 	}
+}
 
-	/// Send a batch as GSO chunks sized to the kernel's segment and datagram
-	/// caps; a frame's batch routinely exceeds both. Uses `try_send` because
-	/// `send` masks every error except `WouldBlock` as success, silently
-	/// discarding the batch.
-	async fn send_batch_gso(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> (u32, u32) {
-		let shard_size = batch.shard_size();
-		if shard_size == 0 {
-			return (0, 0);
-		}
-		let segments_per_send = gso_segments_per_send(self.udp_state.max_gso_segments(), shard_size);
-
-		let mut failed_chunks = 0u32;
-		let mut send_errors = 0u32;
-		for chunk in batch.as_bytes().chunks(segments_per_send * shard_size) {
-			let transmit = Transmit {
-				destination: addr,
-				ecn: None,
-				contents: chunk,
-				segment_size: Some(shard_size),
-				src_ip: None,
-			};
-			let result = loop {
-				match self.udp_state.try_send(UdpSockRef::from(&self.socket), &transmit) {
-					// A frame burst can outrun the socket buffer; wait for it to
-					// drain and resend the same chunk instead of degrading.
-					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-						self.socket.writable().await.ok();
-					},
-					other => break other,
-				}
-			};
-			if let Err(e) = result {
-				failed_chunks += 1;
-				tracing::debug!("GSO send failed ({e}), falling back to per-shard sends for this chunk");
-				let (errors, _, _) = self.send_shards(chunk, shard_size, addr).await;
-				send_errors += errors;
-			}
-		}
-		(failed_chunks, send_errors)
-	}
-
-	/// Send a contiguous buffer of equal-sized shards as individual UDP packets.
-	async fn send_shards(
-		&self,
-		bytes: &[u8],
-		shard_size: usize,
-		addr: std::net::SocketAddr,
-	) -> (u32, Option<std::time::Duration>, bool) {
-		if shard_size == 0 {
-			return (0, None, false);
-		}
-		let shard_count = bytes.len().div_ceil(shard_size);
-		let (pacing_interval, deadline_clamped) = match self.pacing {
-			PacingMode::Disabled => (None, false),
-			PacingMode::Fixed(interval) => (Some(interval), false),
-			PacingMode::Adaptive {
-				wire_rate_bps,
-				frame_interval,
-				frame_budget_percent,
-			} => {
-				let (interval, clamped) = adaptive_pacing_interval(
-					shard_size,
-					shard_count,
-					wire_rate_bps,
-					frame_interval,
-					frame_budget_percent,
-				);
-				(Some(interval), clamped)
+/// Send one GSO chunk. If the kernel rejects segmentation, retry each shard so
+/// the frame is not silently discarded.
+async fn send_gso_chunk(
+	socket: &UdpSocket,
+	udp_state: &UdpSocketState,
+	chunk: &[u8],
+	shard_size: usize,
+	addr: std::net::SocketAddr,
+) -> (bool, u32) {
+	let transmit = Transmit {
+		destination: addr,
+		ecn: None,
+		contents: chunk,
+		segment_size: Some(shard_size),
+		src_ip: None,
+	};
+	let send_result = loop {
+		match udp_state.try_send(UdpSockRef::from(socket), &transmit) {
+			Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+				socket.writable().await.ok();
 			},
-		};
-		let mut next_send = tokio::time::Instant::now();
-		let mut send_errors = 0u32;
-		for (index, shard) in bytes.chunks(shard_size).enumerate() {
-			if let Err(e) = self.socket.send_to(shard, addr).await {
-				tracing::warn!("Failed to send packet to client: {e}");
-				send_errors += 1;
-			}
-			if let Some(interval) = pacing_interval.filter(|_| index + 1 < shard_count) {
-				next_send += interval;
-				tokio::time::sleep_until(next_send).await;
-			}
+			other => break other,
 		}
-		(send_errors, pacing_interval, deadline_clamped)
+	};
+	match send_result {
+		Ok(()) => (false, 0),
+		Err(e) => {
+			tracing::debug!("GSO send failed ({e}), falling back to per-shard sends for this chunk");
+			(true, send_shards(socket, chunk, shard_size, addr).await)
+		},
 	}
+}
+
+async fn send_shards(socket: &UdpSocket, bytes: &[u8], shard_size: usize, addr: std::net::SocketAddr) -> u32 {
+	let mut send_errors = 0u32;
+	for shard in bytes.chunks(shard_size) {
+		if let Err(e) = socket.send_to(shard, addr).await {
+			tracing::warn!("Failed to send packet to client: {e}");
+			send_errors += 1;
+		}
+	}
+	send_errors
 }
 
 #[cfg(test)]
@@ -324,39 +254,5 @@ mod tests {
 				assert!(chunk.len() / shard_size <= 64, "chunk must respect segment cap");
 			}
 		}
-	}
-
-	#[test]
-	fn adaptive_pacing_targets_configured_wire_rate() {
-		let (interval, clamped) = adaptive_pacing_interval(
-			1392,
-			100,
-			120_000_000,
-			std::time::Duration::from_secs_f64(1.0 / 60.0),
-			80,
-		);
-		assert_eq!(interval, std::time::Duration::from_nanos(97_467));
-		assert!(!clamped);
-	}
-
-	#[test]
-	fn adaptive_pacing_honors_frame_deadline() {
-		let frame_interval = std::time::Duration::from_millis(10);
-		let (interval, clamped) = adaptive_pacing_interval(1392, 101, 1_000_000, frame_interval, 80);
-		assert_eq!(interval, std::time::Duration::from_micros(80));
-		assert!(clamped);
-	}
-
-	#[test]
-	fn adaptive_pacing_handles_degenerate_batches() {
-		let frame_interval = std::time::Duration::from_millis(16);
-		assert_eq!(
-			adaptive_pacing_interval(1392, 1, 120_000_000, frame_interval, 80),
-			(std::time::Duration::ZERO, false)
-		);
-		assert_eq!(
-			adaptive_pacing_interval(1392, 10, 0, frame_interval, 80),
-			(std::time::Duration::ZERO, false)
-		);
 	}
 }

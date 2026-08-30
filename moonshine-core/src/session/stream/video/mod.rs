@@ -9,6 +9,7 @@ use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
 mod gso_socket;
+mod pacer;
 mod packetizer;
 mod pipeline;
 mod shard_batch;
@@ -35,10 +36,11 @@ pub struct VideoStreamConfig {
 	#[serde(default)]
 	pub log_frame_spikes: bool,
 
-	/// Target on-wire rate used to pace video UDP shards. Zero disables pacing
-	/// and retains UDP GSO. This is a burst-rate ceiling, not the codec bitrate.
-	#[serde(default)]
-	pub pacing_wire_rate_mbps: u32,
+	/// Percentage of the client-requested bitrate available to the video packet
+	/// pacer. Zero disables pacing. Values above 100 provide headroom for FEC,
+	/// frame-size variation, and protocol overhead.
+	#[serde(default = "default_pacing_bitrate_headroom_percent")]
+	pub pacing_bitrate_headroom_percent: u16,
 
 	/// Maximum fraction of one frame interval that a paced batch may consume.
 	/// Larger batches are accelerated to meet this deadline rather than building
@@ -51,6 +53,10 @@ const fn default_pacing_frame_budget_percent() -> u8 {
 	80
 }
 
+const fn default_pacing_bitrate_headroom_percent() -> u16 {
+	200
+}
+
 impl Default for VideoStreamConfig {
 	fn default() -> Self {
 		Self {
@@ -58,7 +64,7 @@ impl Default for VideoStreamConfig {
 			fec_percentage: 20,
 			encrypt: false,
 			log_frame_spikes: false,
-			pacing_wire_rate_mbps: 0,
+			pacing_bitrate_headroom_percent: default_pacing_bitrate_headroom_percent(),
 			pacing_frame_budget_percent: default_pacing_frame_budget_percent(),
 		}
 	}
@@ -302,9 +308,10 @@ impl VideoStream {
 			stats_tx,
 		} = self;
 
-		socket.configure_adaptive_pacing(
-			config.pacing_wire_rate_mbps,
+		socket.configure_pacing(
+			context.bitrate,
 			context.fps,
+			config.pacing_bitrate_headroom_percent,
 			config.pacing_frame_budget_percent,
 		);
 
@@ -361,7 +368,7 @@ impl VideoStream {
 
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<ShardBatch>,
-	socket: UdpGsoSocket,
+	mut socket: UdpGsoSocket,
 	start: Arc<Notify>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
