@@ -68,7 +68,7 @@ impl ApplicationConfig {
 	pub fn id(&self) -> i32 {
 		let mut hasher = DefaultHasher::new();
 		self.title.hash(&mut hasher);
-		hasher.finish() as i32
+		((hasher.finish() as u32) & 0x7FFF_FFFF) as i32
 	}
 }
 
