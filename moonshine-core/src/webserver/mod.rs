@@ -573,7 +573,7 @@ impl Webserver {
 		response += &format!("<GfeVersion>{}</GfeVersion>", SERVERINFO_GFE_VERSION);
 		response += &format!("<uniqueid>{}</uniqueid>", self.unique_id);
 		response += &format!("<HttpsPort>{}</HttpsPort>", self.webserver_config.port_https);
-		response += "<ExternalPort></ExternalPort>";
+		response += &format!("<ExternalPort>{}</ExternalPort>", self.webserver_config.port);
 		response += &format!("<mac>{}</mac>", mac_address.unwrap_or("".to_string()));
 		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
 		response += &format!("<LocalIP>{}</LocalIP>", escape_xml(local_ip));
