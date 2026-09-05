@@ -328,7 +328,7 @@ async fn run_packet_consumer(
 		let processing_latency = t_start.duration_since(frame_context.created_at);
 		let latency_100us = (processing_latency.as_micros() / 100).min(u16::MAX as u128) as u16;
 
-		let shards = match packetizer.packetize(
+		let mut shards = match packetizer.packetize(
 			&packet.data,
 			is_key_frame,
 			ctx.packet_size,
@@ -350,6 +350,7 @@ async fn run_packet_consumer(
 		};
 
 		let t_packetized = std::time::Instant::now();
+		shards.mark_enqueued();
 
 		// A closed packet channel means the network sender is gone, i.e. the
 		// session is already tearing down. Stop the consumer; the encoding thread
