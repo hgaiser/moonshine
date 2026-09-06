@@ -15,8 +15,7 @@ use smithay::backend::allocator::gbm::GbmAllocator;
 use smithay::backend::allocator::{Allocator, Buffer, Fourcc, Modifier};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
-use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
-use smithay::backend::renderer::element::{AsRenderElements, Element, Id, Kind, RenderElement};
+use smithay::backend::renderer::element::{AsRenderElements, Element, Id, RenderElement, RenderElementStates};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions, with_renderer_surface_state};
 use smithay::backend::renderer::{Bind, BufferType, ImportDma};
@@ -58,6 +57,10 @@ use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColor
 /// always have a free buffer: at most two frames are queued in the
 /// `sync_channel(2)` and one is being processed by the encoder.
 const BUFFER_POOL_SIZE: usize = 3;
+
+#[cfg(test)]
+#[path = "test_state.rs"]
+mod test_state;
 
 /// A pre-allocated GBM buffer slot in the compositor's buffer pool.
 pub(crate) struct GbmBufferSlot {
@@ -209,8 +212,8 @@ pub(crate) struct MoonshineCompositor {
 	// -- Rendering --
 	pub output: Output,
 	pub damage_tracker: OutputDamageTracker,
-	pub allocator: GbmAllocator<std::fs::File>,
-	pub renderer: GlesRenderer,
+	/// Absent only in protocol tests, which exercise the real handlers with SHM buffers.
+	pub renderer: Option<GlesRenderer>,
 
 	// -- DMA-BUF --
 	pub dmabuf_state: DmabufState,
@@ -233,6 +236,10 @@ pub(crate) struct MoonshineCompositor {
 
 	// -- Desktop --
 	pub space: Space<smithay::desktop::Window>,
+	pub popups: smithay::desktop::PopupManager,
+	pub(super) popup_grab: Option<smithay::desktop::PopupGrab<Self>>,
+	pub(super) popup_pointer_target: Option<(WlSurface, Point<f64, Logical>)>,
+	pub(super) input_serials: super::input_serials::InputSerials<smithay::reexports::wayland_server::backend::ClientId>,
 	pub clock: Clock<Monotonic>,
 
 	// -- Lifecycle --
@@ -586,8 +593,7 @@ impl MoonshineCompositor {
 				data_device_state,
 				output,
 				damage_tracker,
-				allocator,
-				renderer,
+				renderer: Some(renderer),
 				dmabuf_state,
 				dmabuf_global,
 				frame_tx,
@@ -600,6 +606,10 @@ impl MoonshineCompositor {
 				active_pen_tool_kind: None,
 				pen_buttons: 0,
 				space,
+				popups: smithay::desktop::PopupManager::default(),
+				popup_grab: None,
+				popup_pointer_target: None,
+				input_serials: Default::default(),
 				clock,
 				handle,
 				width,
@@ -686,13 +696,9 @@ impl MoonshineCompositor {
 		// space toplevel as before.
 		//
 		// Direct scanout bypasses the GLES compositor entirely, so the
-		// cursor cannot be blended onto the frame.  Skip direct scanout
-		// when the cursor is visible so that the GLES path composites the
-		// cursor on top.
-		let cursor_visible = self
-			.last_pointer_activity
-			.is_some_and(|t| t.elapsed() <= std::time::Duration::from_secs(3));
-		if !cursor_visible {
+		// cursor and native popup menus cannot be blended onto the frame.
+		// Keep compositing while a menu is mapped, even after the cursor fades.
+		if self.can_direct_scanout_scene() {
 			if self.is_override_active() {
 				if self.try_direct_scanout_override() {
 					tracing::trace!("Frame via direct scanout (override path)");
@@ -744,10 +750,19 @@ impl MoonshineCompositor {
 
 		// Check before bind() to avoid borrow conflict with self.renderer.
 		let override_active = self.is_override_active();
+		let override_popups = if override_active {
+			self.popup_surfaces_for_render()
+		} else {
+			Vec::new()
+		};
 
 		// Bind the pre-allocated Dmabuf as a render target.
-		let bind_result = self.renderer.bind(&mut self.buffer_pool[idx].dmabuf);
-		let mut framebuffer = match bind_result {
+		let mut framebuffer = match self
+			.renderer
+			.as_mut()
+			.expect("rendering requires a GPU")
+			.bind(&mut self.buffer_pool[idx].dmabuf)
+		{
 			Ok(fb) => fb,
 			Err(e) => {
 				tracing::error!("Failed to bind Dmabuf for rendering: {e}");
@@ -759,7 +774,12 @@ impl MoonshineCompositor {
 		// Collect render elements from the space.
 		let num_space_elements = self.space.elements().count();
 		let space_elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
-			match smithay::desktop::space::space_render_elements(&mut self.renderer, [&self.space], &self.output, 1.0) {
+			match smithay::desktop::space::space_render_elements(
+				self.renderer.as_mut().expect("rendering requires a GPU"),
+				[&self.space],
+				&self.output,
+				1.0,
+			) {
 				Ok(elements) => elements,
 				Err(e) => {
 					tracing::error!("Failed to collect render elements: {e}");
@@ -805,7 +825,7 @@ impl MoonshineCompositor {
 		let scale = smithay::utils::Scale::from(1.0);
 		let cursor_pos = self.cursor_position;
 		let cursor_elements: Vec<OutputRenderElements> = self.pointer_element.render_elements(
-			&mut self.renderer,
+			self.renderer.as_mut().expect("rendering requires a GPU"),
 			(cursor_pos - cursor_hotspot.to_f64()).to_physical(scale).to_i32_round(),
 			scale,
 			1.0,
@@ -815,28 +835,27 @@ impl MoonshineCompositor {
 		let mut elements: Vec<OutputRenderElements> = Vec::with_capacity(cursor_elements.len() + space_elements.len());
 		elements.extend(cursor_elements);
 
-		// If the WSI layer created an override surface (via
-		// override_window_content), render it instead of the XWayland
-		// space elements — but only when the override's X11 window matches
-		// the currently focused window (or is 0 with no X11 focus).
+		// The WSI replacement supplies the game's base content. Its native
+		// popup trees remain above that content in the same order and positions
+		// as normal composition, below the cursor.
 		if override_active {
 			let Some((override_surface, _)) = self.override_surface.as_ref() else {
 				tracing::warn!("override_active but override_surface is None");
 				return;
 			};
-			let override_elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
-				render_elements_from_surface_tree(
-					&mut self.renderer,
-					override_surface,
-					(0, 0),
-					1.0,
-					1.0,
-					Kind::Unspecified,
-				);
+			let override_elements = super::render_scene::override_render_elements(
+				self.renderer.as_mut().expect("rendering requires a GPU"),
+				override_surface,
+				&override_popups,
+			);
 			if override_elements.is_empty() {
 				tracing::debug!("override active but surface has no committed buffer — rendering black");
 			}
-			elements.extend(override_elements.into_iter().map(OutputRenderElements::Space));
+			elements.extend(
+				override_elements
+					.into_iter()
+					.map(|element| OutputRenderElements::Space(SpaceRenderElements::Surface(element))),
+			);
 		} else {
 			if self.override_surface.as_ref().is_some_and(|(s, _)| !s.alive()) {
 				tracing::debug!("Override surface is dead, clearing.");
@@ -859,7 +878,7 @@ impl MoonshineCompositor {
 			.unwrap_or(0);
 
 		let render_result = self.damage_tracker.render_output(
-			&mut self.renderer,
+			self.renderer.as_mut().expect("rendering requires a GPU"),
 			&mut framebuffer,
 			buffer_age,
 			&elements,
@@ -870,11 +889,12 @@ impl MoonshineCompositor {
 		self.buffer_last_rendered_at[idx] = Some(self.render_count);
 		self.render_count += 1;
 
-		let sync = match &render_result {
-			Ok(r) => r.sync.clone(),
-			Err(smithay::backend::renderer::damage::Error::OutputNoMode(_)) => {
-				smithay::backend::renderer::sync::SyncPoint::signaled()
-			},
+		let (sync, render_states) = match render_result {
+			Ok(r) => (r.sync, r.states),
+			Err(smithay::backend::renderer::damage::Error::OutputNoMode(_)) => (
+				smithay::backend::renderer::sync::SyncPoint::signaled(),
+				RenderElementStates::default(),
+			),
 			Err(e) => {
 				tracing::error!("Failed to render output: {e}");
 				return;
@@ -916,54 +936,9 @@ impl MoonshineCompositor {
 			},
 		}
 
-		// Send frame callbacks to clients so they know to submit the
-		// next buffer.
-		self.space.elements().for_each(|window| {
-			window.send_frame(
-				&self.output,
-				self.clock.now(),
-				Some(std::time::Duration::ZERO),
-				|_, _| Some(self.output.clone()),
-			);
-		});
-
-		// Also send frame callbacks to the override surface if active,
-		// so the NVIDIA driver's Wayland WSI unblocks and presents the
-		// next frame.
-		if let Some((ref override_surface, _)) = self.override_surface
-			&& override_surface.alive()
-		{
-			send_frames_surface_tree(
-				override_surface,
-				&self.output,
-				self.clock.now(),
-				Some(std::time::Duration::ZERO),
-				|_, _| Some(self.output.clone()),
-			);
-
-			// Drain and respond to wp_presentation_feedback callbacks
-			// so the NVIDIA driver's WaitForPresentKHR can return.
-			let mut feedback = OutputPresentationFeedback::new(&self.output);
-			take_presentation_feedback_surface_tree(
-				override_surface,
-				&mut feedback,
-				|_, _| Some(self.output.clone()),
-				|_, _| {
-					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
-				},
-			);
-			let frame_period = self
-				.output
-				.preferred_mode()
-				.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
-				.unwrap_or(std::time::Duration::from_millis(11));
-			feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
-					self.clock.now(),
-					Refresh::Fixed(frame_period),
-					0,
-					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(),
-				);
-		}
+		// Complete callbacks for the composition, including popup animations
+		// and the WSI present wait while a menu temporarily prevents scanout.
+		self.send_composited_frame_callbacks(&render_states);
 
 		// Flush the frame callbacks (and any other pending events) to
 		// clients immediately. Without this, the wl_callback.done events

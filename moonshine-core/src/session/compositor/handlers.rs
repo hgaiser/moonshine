@@ -9,7 +9,7 @@ use smithay::backend::input::TabletToolDescriptor;
 use smithay::backend::renderer::ImportDma;
 use smithay::backend::renderer::utils::on_commit_buffer_handler;
 use smithay::delegate_dispatch2;
-use smithay::desktop::Window;
+use smithay::desktop::{PopupKind, Window};
 use smithay::input::dnd::DndGrabHandler;
 use smithay::input::pointer::{CursorImageStatus, MotionEvent, PointerHandle};
 use smithay::input::{Seat, SeatHandler, SeatState};
@@ -45,6 +45,7 @@ use crate::session::compositor::state::{ClientState, MoonshineCompositor};
 // Process-tree app_id detection (mirrors gamescope's get_appid_from_pid)
 // ---------------------------------------------------------------------------
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 use std::time::Instant;
@@ -52,6 +53,14 @@ use std::time::Instant;
 type AppIdCacheKey = (u32, u64);
 type AppIdCacheValue = (u32, Instant);
 type AppIdCache = RwLock<HashMap<AppIdCacheKey, AppIdCacheValue>>;
+
+/// Keep a retained toplevel role out of focus selection while its buffer is
+/// unmapped, without losing the Window needed to handle a later remap.
+#[derive(Default)]
+struct NativeWindowMapping {
+	mapped: Cell<bool>,
+	ever_mapped: Cell<bool>,
+}
 
 /// PID → app_id cache keyed on `(pid, starttime)` to avoid stale hits after
 /// PID reuse. Processes in a Steam game tree (Steam → reaper → proton → game)
@@ -371,13 +380,24 @@ impl CompositorHandler for MoonshineCompositor {
 		}
 
 		// If the surface is a toplevel, refresh the space.
-		if let Some(window) = self
+		let committed_window = self
 			.space
 			.elements()
 			.find(|w| w.toplevel().map(|t| t.wl_surface() == surface).unwrap_or(false))
-			.cloned()
-		{
+			.cloned();
+		if let Some(window) = committed_window {
 			window.on_commit();
+			let mapped = smithay::backend::renderer::utils::with_renderer_surface_state(surface, |state| {
+				state.buffer().is_some()
+			})
+			.unwrap_or(false);
+			window.user_data().insert_if_missing(NativeWindowMapping::default);
+			let mapping = window.user_data().get::<NativeWindowMapping>().unwrap();
+			let mapping_changed = mapping.mapped.replace(mapped) != mapped;
+			mapping.ever_mapped.set(mapping.ever_mapped.get() || mapped);
+			if mapping_changed && !mapped {
+				self.dismiss_popups_for_window(Some(&window));
+			}
 
 			// wlroots' wayland backend drops the size from the initial
 			// configure (output not enabled yet); re-send it on each
@@ -402,6 +422,9 @@ impl CompositorHandler for MoonshineCompositor {
 				self.damage_sequence_counter += 1;
 				meta.damage_sequence = self.damage_sequence_counter;
 			}
+			if mapping_changed {
+				self.reevaluate_focus();
+			}
 		}
 
 		// Handle popup commits.
@@ -417,8 +440,15 @@ impl CompositorHandler for MoonshineCompositor {
 }
 
 impl MoonshineCompositor {
-	fn popups_commit(&mut self, _surface: &WlSurface) {
-		// Popup handling can be added later.
+	fn popups_commit(&mut self, surface: &WlSurface) {
+		self.popups.commit(surface);
+		if let Some(PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
+			&& popup.get_parent_surface().is_some()
+			&& !popup.is_initial_configure_sent()
+			&& let Err(error) = popup.send_configure()
+		{
+			tracing::warn!(?error, "Failed to send initial popup configuration");
+		}
 	}
 
 	/// Find a `Window` by its Wayland surface.
@@ -789,6 +819,13 @@ impl MoonshineCompositor {
 	fn build_candidates(&self, windows: &[Window]) -> Vec<Window> {
 		let mut candidates = Vec::new();
 		for window in windows {
+			if window
+				.user_data()
+				.get::<NativeWindowMapping>()
+				.is_some_and(|state| state.ever_mapped.get() && !state.mapped.get())
+			{
+				continue;
+			}
 			if let Some(meta) = self.window_metadata.get(window) {
 				// Skip overlays, notifications, external overlays, system tray,
 				// VR overlay targets, and streaming clients — all packed into
@@ -993,6 +1030,8 @@ impl MoonshineCompositor {
 		let focus_changed = old_focused_x11 != self.focused_x11_window
 			|| old_focused_window.as_ref().and_then(|w| w.wl_surface()) != best.wl_surface();
 		if focus_changed {
+			self.input_serials.clear();
+			self.dismiss_popups_for_window(old_focused_window.as_ref());
 			self.clear_dropdowns();
 		}
 
@@ -1212,6 +1251,9 @@ impl MoonshineCompositor {
 
 		// Handle no candidates — clear old focus.
 		if candidates.is_empty() {
+			self.input_serials.clear();
+			let old_window = self.focused_window.take();
+			self.dismiss_popups_for_window(old_window.as_ref());
 			if self.focused_x11_window.is_some() {
 				self.focused_x11_window = None;
 			}
@@ -1448,6 +1490,7 @@ impl XdgShellHandler for MoonshineCompositor {
 			.cloned();
 
 		if let Some(window) = window {
+			self.dismiss_popups_for_window(Some(&window));
 			self.unregister_window(&window);
 			self.space.unmap_elem(&window);
 		}
@@ -1506,16 +1549,32 @@ impl XdgShellHandler for MoonshineCompositor {
 		self.reevaluate_focus();
 	}
 
-	fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
-		// Popup handling can be added later.
+	fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+		surface.with_pending_state(|state| {
+			state.geometry = positioner.get_geometry();
+			state.positioner = positioner;
+		});
+		self.unconstrain_popup(&surface);
+		if let Err(error) = self.popups.track_popup(PopupKind::Xdg(surface)) {
+			tracing::warn!(?error, "Failed to track popup");
+		}
 	}
 
-	fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
-		// Popup grabs can be added later.
+	fn grab(&mut self, surface: PopupSurface, seat: WlSeat, serial: Serial) {
+		self.grab_popup(surface, seat, serial);
 	}
 
-	fn reposition_request(&mut self, _surface: PopupSurface, _positioner: PositionerState, _token: u32) {
-		// Repositioning can be added later.
+	fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+		surface.with_pending_state(|state| {
+			state.geometry = positioner.get_geometry();
+			state.positioner = positioner;
+		});
+		self.unconstrain_popup(&surface);
+		surface.send_repositioned(token);
+	}
+
+	fn popup_destroyed(&mut self, _surface: PopupSurface) {
+		self.screen_dirty = true;
 	}
 }
 
@@ -1524,7 +1583,7 @@ impl XdgShellHandler for MoonshineCompositor {
 impl SeatHandler for MoonshineCompositor {
 	type KeyboardFocus = KeyboardFocusTarget;
 	type PointerFocus = WlSurface;
-	type TouchFocus = WlSurface;
+	type TouchFocus = super::popup_touch_focus::TouchFocusTarget;
 
 	fn seat_state(&mut self) -> &mut SeatState<Self> {
 		&mut self.seat_state
@@ -1536,7 +1595,9 @@ impl SeatHandler for MoonshineCompositor {
 	}
 
 	fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
-		let window_id = focused.map(|f| f.window().x11_surface().map(|x| x.window_id()));
+		let window_id = focused
+			.and_then(|f| f.window())
+			.and_then(|w| w.x11_surface().map(|x| x.window_id()));
 		tracing::debug!(target: "focus", window_id = ?window_id, "Keyboard focus changed");
 	}
 
@@ -1630,7 +1691,11 @@ impl DmabufHandler for MoonshineCompositor {
 			render_fourcc = format!("0x{:08X} ({:?})", self.render_fourcc as u32, self.render_fourcc),
 			"Client DMA-BUF import"
 		);
-		if self.renderer.import_dmabuf(&dmabuf, None).is_ok() {
+		if self
+			.renderer
+			.as_mut()
+			.is_some_and(|renderer| renderer.import_dmabuf(&dmabuf, None).is_ok())
+		{
 			tracing::debug!("DMA-BUF import successful");
 			let _ = notifier.successful::<MoonshineCompositor>();
 		} else {

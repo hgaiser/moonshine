@@ -2,7 +2,7 @@
 //!
 //! Two concerns are handled here:
 //!
-//! 1. **KeyboardFocusTarget** — A wrapper around `Window` that implements
+//! 1. **KeyboardFocusTarget** — A window or grabbed native popup that implements
 //!    Smithay's `KeyboardTarget`, `IsAlive`, and `WaylandFocus` traits.
 //!    This is the type used by Smithay's seat keyboard focus system.
 //!
@@ -14,7 +14,7 @@ use std::borrow::Cow;
 
 use bitflags::bitflags;
 use smithay::backend::input::KeyState;
-use smithay::desktop::{Window, WindowSurface};
+use smithay::desktop::{PopupKind, Window, WindowSurface};
 use smithay::input::Seat;
 use smithay::input::keyboard::{KeyboardTarget, KeysymHandle, ModifiersState};
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -27,43 +27,61 @@ use crate::session::compositor::state::MoonshineCompositor;
 // KeyboardFocusTarget — Smithay keyboard focus wrapper
 // ============================================================================
 
-/// Focus target for keyboard input. Wraps a `Window` and delegates keyboard
-/// events to the underlying Wayland or X11 surface.
-///
-/// This was simplified from an enum (with `X11`, `Wayland`, and `ProxiedX11`
-/// variants) to a newtype wrapper. The `ProxiedX11` variant was removed when
-/// the proxy surface mechanism was eliminated — proxy surfaces were used to
-/// route keyboard events through an intermediary X11 window, but the current
-/// architecture routes keyboard input directly via `Window::underlying_surface()`
-/// dispatch, making the proxy indirection unnecessary.
+/// Keyboard focus may belong to a window or its explicitly grabbed popup.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct KeyboardFocusTarget(Window);
+pub(crate) enum KeyboardFocusTarget {
+	Window(Window),
+	Popup(Box<PopupKind>),
+}
 
 impl KeyboardFocusTarget {
 	/// Get a reference to the inner Window.
-	pub fn window(&self) -> &Window {
-		&self.0
+	pub fn window(&self) -> Option<&Window> {
+		match self {
+			Self::Window(window) => Some(window),
+			Self::Popup(_) => None,
+		}
 	}
 }
 
 impl IsAlive for KeyboardFocusTarget {
 	#[inline]
 	fn alive(&self) -> bool {
-		self.0.alive()
+		match self {
+			Self::Window(window) => window.alive(),
+			Self::Popup(popup) => popup.alive(),
+		}
 	}
 }
 
 impl WaylandFocus for KeyboardFocusTarget {
 	#[inline]
 	fn wl_surface(&self) -> Option<Cow<'_, WlSurface>> {
-		self.0.wl_surface()
+		match self {
+			Self::Window(window) => window.wl_surface(),
+			Self::Popup(popup) => Some(Cow::Borrowed(popup.wl_surface())),
+		}
 	}
 }
 
 impl From<Window> for KeyboardFocusTarget {
 	#[inline]
 	fn from(w: Window) -> Self {
-		KeyboardFocusTarget(w)
+		Self::Window(w)
+	}
+}
+
+impl From<PopupKind> for KeyboardFocusTarget {
+	fn from(popup: PopupKind) -> Self {
+		Self::Popup(Box::new(popup))
+	}
+}
+
+impl From<KeyboardFocusTarget> for WlSurface {
+	fn from(focus: KeyboardFocusTarget) -> Self {
+		// PopupManager converts the checked native Wayland root or a popup,
+		// never an unassociated X11 window, into a pointer focus target.
+		focus.wl_surface().expect("popup grab has a Wayland root").into_owned()
 	}
 }
 
@@ -74,9 +92,12 @@ impl From<Window> for KeyboardFocusTarget {
 macro_rules! delegate_keyboard {
 	($method:ident($($param:ident : $ty:ty),*) -> $ret:ty) => {
 		fn $method(&self, $($param: $ty),*) -> $ret {
-			match self.0.underlying_surface() {
-				WindowSurface::Wayland(w) => KeyboardTarget::$method(w.wl_surface(), $($param),*),
-				WindowSurface::X11(s) => KeyboardTarget::$method(s, $($param),*),
+			match self {
+				Self::Window(window) => match window.underlying_surface() {
+					WindowSurface::Wayland(w) => KeyboardTarget::$method(w.wl_surface(), $($param),*),
+					WindowSurface::X11(s) => KeyboardTarget::$method(s, $($param),*),
+				},
+				Self::Popup(popup) => KeyboardTarget::$method(popup.wl_surface(), $($param),*),
 			}
 		}
 	};
@@ -85,7 +106,28 @@ macro_rules! delegate_keyboard {
 impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 	delegate_keyboard!(enter(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, keys: Vec<KeysymHandle<'_>>, serial: Serial) -> ());
 	delegate_keyboard!(leave(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, serial: Serial) -> ());
-	delegate_keyboard!(key(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, key: KeysymHandle<'_>, state: KeyState, serial: Serial, time: u32) -> ());
+	fn key(
+		&self,
+		seat: &Seat<MoonshineCompositor>,
+		data: &mut MoonshineCompositor,
+		key: KeysymHandle<'_>,
+		state: KeyState,
+		serial: Serial,
+		time: u32,
+	) {
+		// Record at delivery, not injection: a different grab may consume an
+		// injected key, and clipboard typing injects its own action serials.
+		if state == KeyState::Pressed {
+			data.record_input_serial(serial, self.wl_surface().map(|s| s.into_owned()));
+		}
+		match self {
+			Self::Window(window) => match window.underlying_surface() {
+				WindowSurface::Wayland(w) => KeyboardTarget::key(w.wl_surface(), seat, data, key, state, serial, time),
+				WindowSurface::X11(s) => KeyboardTarget::key(s, seat, data, key, state, serial, time),
+			},
+			Self::Popup(popup) => KeyboardTarget::key(popup.wl_surface(), seat, data, key, state, serial, time),
+		}
+	}
 	delegate_keyboard!(modifiers(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, modifiers: ModifiersState, serial: Serial) -> ());
 }
 

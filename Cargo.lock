@@ -2456,6 +2456,8 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
+ "wayland-client",
+ "wayland-protocols",
  "wayland-scanner",
  "which 8.0.5",
  "x509-parser",
@@ -4369,6 +4371,7 @@ checksum = "23d0c813de3daa2ed6520af85a3bd49b0e722a3078506899aa9686fea58dc4b6"
 dependencies = [
  "bitflags",
  "wayland-backend",
+ "wayland-client",
  "wayland-scanner",
  "wayland-server",
 ]

@@ -11,9 +11,17 @@ pub(crate) mod frame;
 mod gamescope_swapchain;
 mod handlers;
 pub(crate) mod input;
+mod input_serials;
+mod popup_touch;
+mod popup_touch_focus;
+mod popups;
 mod protocols;
+mod render_scene;
 mod state;
 mod x11_focus;
+
+#[cfg(test)]
+pub(super) mod tests;
 
 use std::sync::mpsc;
 
@@ -395,6 +403,7 @@ fn run_compositor(
 					if let Err(e) = display.dispatch_clients(state) {
 						tracing::error!("Failed to dispatch Wayland clients: {e}");
 					}
+					state.refresh_popups();
 
 					// Send deferred wp_image_description_info_v1 destructor events.
 					for info in state.deferred_info_done.drain(..) {
