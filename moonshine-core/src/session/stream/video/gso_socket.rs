@@ -1,6 +1,7 @@
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use tokio::net::UdpSocket;
 
+use super::pacer::Pacer;
 use super::shard_batch::ShardBatch;
 
 /// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
@@ -8,6 +9,18 @@ use super::shard_batch::ShardBatch;
 /// with EMSGSIZE before segmenting. IPv6 allows 20 more bytes; the IPv4
 /// value is safe for both.
 const MAX_UDP_PAYLOAD: usize = 65507;
+
+#[derive(Debug, Default)]
+pub(crate) struct SendBatchResult {
+	pub failed_gso_chunks: u32,
+	pub send_errors: u32,
+	pub shard_count: usize,
+	pub elapsed: std::time::Duration,
+	pub pacing_interval: Option<std::time::Duration>,
+	pub deadline_clamped: bool,
+	pub pacing_budget_missed: bool,
+	pub frame_deadline_missed: bool,
+}
 
 /// Number of shards per GSO send: the kernel's segment-count cap or the
 /// datagram-size cap, whichever binds first. Never zero, even for a shard
@@ -20,15 +33,11 @@ fn gso_segments_per_send(max_gso_segments: usize, shard_size: usize) -> usize {
 }
 
 /// UDP socket for the video stream, with Generic Segmentation Offload.
-///
-/// Wraps a `tokio::net::UdpSocket` and quinn-udp's `UdpSocketState` so shard
-/// batches can be sent as GSO super-packets sized to the kernel's segment-count
-/// and datagram-size caps. Batches exceeding a cap are split into chunks; chunks
-/// the kernel rejects fall back to per-shard sends. Without GSO support, the
-/// socket sends everything per-shard.
 pub(crate) struct UdpGsoSocket {
 	socket: UdpSocket,
 	udp_state: UdpSocketState,
+	disable_gso: bool,
+	pacer: Option<Pacer>,
 }
 
 impl UdpGsoSocket {
@@ -39,12 +48,48 @@ impl UdpGsoSocket {
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 		let udp_state = UdpSocketState::new(UdpSockRef::from(&socket))
 			.map_err(|e| tracing::error!("Failed to initialize UDP socket state: {e}"))?;
-		if udp_state.max_gso_segments() > 1 {
+		let disable_gso = std::env::var_os("MOONSHINE_DISABLE_GSO").is_some();
+		if disable_gso {
+			tracing::info!("GSO disabled by MOONSHINE_DISABLE_GSO");
+		} else if udp_state.max_gso_segments() > 1 {
 			tracing::debug!("GSO enabled, max segments: {}", udp_state.max_gso_segments());
 		} else {
 			tracing::debug!("GSO not available, using per-shard sends");
 		}
-		Ok(Self { socket, udp_state })
+		Ok(Self {
+			socket,
+			udp_state,
+			disable_gso,
+			pacer: None,
+		})
+	}
+
+	/// Configure pacing from the bitrate and frame rate negotiated with the
+	/// client. A zero headroom percentage leaves pacing disabled.
+	pub fn configure_pacing(
+		&mut self,
+		client_bitrate_bps: usize,
+		fps: u32,
+		headroom_percent: u16,
+		frame_budget_percent: u8,
+	) {
+		if client_bitrate_bps == 0 || fps == 0 || headroom_percent == 0 {
+			tracing::info!("Video packet pacing disabled");
+			return;
+		}
+
+		match Pacer::new(client_bitrate_bps, fps, headroom_percent, frame_budget_percent) {
+			Ok(pacer) => {
+				self.pacer = Some(pacer);
+				tracing::info!(
+					client_bitrate_mbps = client_bitrate_bps / 1_000_000,
+					headroom_percent,
+					frame_budget_percent = frame_budget_percent.clamp(1, 100),
+					"Adaptive video packet pacing enabled"
+				);
+			},
+			Err(e) => tracing::warn!("Failed to initialize high-resolution video pacer: {e}"),
+		}
 	}
 
 	/// Local address the socket is bound to.
@@ -64,70 +109,112 @@ impl UdpGsoSocket {
 
 	/// Send a shard batch to `addr`.
 	///
-	/// Returns the number of chunks that fell back to per-shard sends because
-	/// the kernel rejected the GSO send (0 on success).
-	///
 	/// GSO availability is re-checked on every call: quinn-udp disables it at
 	/// runtime if the kernel or NIC rejects a segmented send.
-	pub async fn send_batch(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
-		if self.udp_state.max_gso_segments() > 1 {
-			self.send_batch_gso(batch, addr).await
-		} else {
-			self.send_shards(batch.as_bytes(), batch.shard_size(), addr).await;
-			0
-		}
-	}
-
-	/// Send a batch as GSO chunks sized to the kernel's segment and datagram
-	/// caps; a frame's batch routinely exceeds both. Uses `try_send` because
-	/// `send` masks every error except `WouldBlock` as success, silently
-	/// discarding the batch.
-	async fn send_batch_gso(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
+	pub async fn send_batch(&mut self, batch: &ShardBatch, addr: std::net::SocketAddr) -> SendBatchResult {
+		let started = std::time::Instant::now();
 		let shard_size = batch.shard_size();
-		if shard_size == 0 {
-			return 0;
+		let shard_count = batch.shard_count();
+		let mut result = SendBatchResult {
+			shard_count,
+			..SendBatchResult::default()
+		};
+		if shard_size == 0 || shard_count == 0 {
+			return result;
 		}
-		let segments_per_send = gso_segments_per_send(self.udp_state.max_gso_segments(), shard_size);
 
-		let mut failed_chunks = 0u32;
+		let max_gso_segments = if self.disable_gso {
+			1
+		} else {
+			self.udp_state.max_gso_segments()
+		};
+		let max_segments_per_send = gso_segments_per_send(max_gso_segments, shard_size);
+		let pacing_deadlines = self
+			.pacer
+			.as_ref()
+			.map(|pacer| (pacer.frame_budget(), pacer.frame_interval()));
+		let mut schedule = self
+			.pacer
+			.as_ref()
+			.map(|pacer| pacer.schedule_batch(shard_size, shard_count, max_segments_per_send));
+		let segments_per_send = schedule
+			.as_ref()
+			.map_or(max_segments_per_send, |schedule| schedule.segments_per_send);
+		if let Some(schedule) = &schedule {
+			result.pacing_interval = Some(schedule.pacing_interval);
+			result.deadline_clamped = schedule.deadline_clamped;
+		}
+
+		let mut pacing_failed = false;
 		for chunk in batch.as_bytes().chunks(segments_per_send * shard_size) {
-			let transmit = Transmit {
-				destination: addr,
-				ecn: None,
-				contents: chunk,
-				segment_size: Some(shard_size),
-				src_ip: None,
-			};
-			let result = loop {
-				match self.udp_state.try_send(UdpSockRef::from(&self.socket), &transmit) {
-					// A frame burst can outrun the socket buffer; wait for it to
-					// drain and resend the same chunk instead of degrading.
-					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-						self.socket.writable().await.ok();
-					},
-					other => break other,
+			if !pacing_failed && let (Some(pacer), Some(schedule)) = (&mut self.pacer, &mut schedule) {
+				if let Err(e) = pacer.wait(schedule).await {
+					tracing::warn!("High-resolution video pacer failed; disabling pacing: {e}");
+					pacing_failed = true;
 				}
-			};
-			if let Err(e) = result {
-				failed_chunks += 1;
-				tracing::debug!("GSO send failed ({e}), falling back to per-shard sends for this chunk");
-				self.send_shards(chunk, shard_size, addr).await;
+				schedule.advance(chunk.len().div_ceil(shard_size));
 			}
-		}
-		failed_chunks
-	}
 
-	/// Send a contiguous buffer of equal-sized shards as individual UDP packets.
-	async fn send_shards(&self, bytes: &[u8], shard_size: usize, addr: std::net::SocketAddr) {
-		if shard_size == 0 {
-			return;
+			let (failed_gso, send_errors) =
+				send_gso_chunk(&self.socket, &self.udp_state, chunk, shard_size, addr).await;
+			result.failed_gso_chunks += u32::from(failed_gso);
+			result.send_errors += send_errors;
 		}
-		for shard in bytes.chunks(shard_size) {
-			if let Err(e) = self.socket.send_to(shard, addr).await {
-				tracing::warn!("Failed to send packet to client: {e}");
-			}
+
+		if pacing_failed {
+			self.pacer = None;
+		}
+		result.elapsed = started.elapsed();
+		if let Some((pacing_budget, frame_deadline)) = pacing_deadlines {
+			result.pacing_budget_missed = result.elapsed > pacing_budget;
+			result.frame_deadline_missed = result.elapsed > frame_deadline;
+		}
+		result
+	}
+}
+
+/// Send one GSO chunk. If the kernel rejects segmentation, retry each shard so
+/// the frame is not silently discarded.
+async fn send_gso_chunk(
+	socket: &UdpSocket,
+	udp_state: &UdpSocketState,
+	chunk: &[u8],
+	shard_size: usize,
+	addr: std::net::SocketAddr,
+) -> (bool, u32) {
+	let transmit = Transmit {
+		destination: addr,
+		ecn: None,
+		contents: chunk,
+		segment_size: Some(shard_size),
+		src_ip: None,
+	};
+	let send_result = loop {
+		match udp_state.try_send(UdpSockRef::from(socket), &transmit) {
+			Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+				socket.writable().await.ok();
+			},
+			other => break other,
+		}
+	};
+	match send_result {
+		Ok(()) => (false, 0),
+		Err(e) => {
+			tracing::debug!("GSO send failed ({e}), falling back to per-shard sends for this chunk");
+			(true, send_shards(socket, chunk, shard_size, addr).await)
+		},
+	}
+}
+
+async fn send_shards(socket: &UdpSocket, bytes: &[u8], shard_size: usize, addr: std::net::SocketAddr) -> u32 {
+	let mut send_errors = 0u32;
+	for shard in bytes.chunks(shard_size) {
+		if let Err(e) = socket.send_to(shard, addr).await {
+			tracing::warn!("Failed to send packet to client: {e}");
+			send_errors += 1;
 		}
 	}
+	send_errors
 }
 
 #[cfg(test)]

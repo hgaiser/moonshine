@@ -8,6 +8,8 @@ pub(crate) struct ShardBatch {
 	data: Vec<u8>,
 	/// Size of each shard in bytes.
 	shard_size: usize,
+	/// Time this completed frame batch entered the network sender queue.
+	queued_at: Option<std::time::Instant>,
 }
 
 impl ShardBatch {
@@ -16,6 +18,7 @@ impl ShardBatch {
 		Self {
 			data: Vec::new(),
 			shard_size: 0,
+			queued_at: None,
 		}
 	}
 
@@ -32,6 +35,15 @@ impl ShardBatch {
 	/// Number of shards in this batch.
 	pub fn shard_count(&self) -> usize {
 		self.data.len().checked_div(self.shard_size).unwrap_or(0)
+	}
+
+	pub fn mark_enqueued(&mut self) {
+		self.queued_at = Some(std::time::Instant::now());
+	}
+
+	pub fn queue_age(&self) -> std::time::Duration {
+		self.queued_at
+			.map_or(std::time::Duration::ZERO, |queued_at| queued_at.elapsed())
 	}
 
 	/// Append all shards from `other` into this batch.
@@ -122,6 +134,7 @@ impl ShardBuf {
 		ShardBatch {
 			data: self.data,
 			shard_size: self.stride,
+			queued_at: None,
 		}
 	}
 }
