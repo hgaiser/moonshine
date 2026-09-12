@@ -50,7 +50,7 @@ serde_json = "1.0.149"
 sha2 = "0.11.0"
 shellexpand = "3.1.2"
 shlex = "2.0.1"
-smithay = { git = "https://github.com/hgaiser/smithay", branch = "master-moonshine", default-features = false, features = [
+smithay = { git = "https://github.com/Smithay/smithay", rev = "0ff00983b6007257a7a161a4fe8b14a778e2ac8f", default-features = false, features = [
     "backend_drm",
     "backend_gbm",
     "backend_egl",

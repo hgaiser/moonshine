@@ -459,18 +459,58 @@ fn is_executable(path: &Path) -> bool {
 	}
 }
 
+#[derive(Clone)]
+struct IconCandidate {
+	path: PathBuf,
+	extension: Option<String>,
+	score: i32,
+}
+
 pub(super) struct IconResolver {
 	enabled: bool,
 	cache: HashMap<String, Option<PathBuf>>,
-	search_roots: Vec<PathBuf>,
+	index: HashMap<String, Vec<IconCandidate>>,
 }
 
 impl IconResolver {
 	pub(super) fn new(enabled: bool) -> Self {
+		let mut index: HashMap<String, Vec<IconCandidate>> = HashMap::new();
+		if enabled {
+			for root in icon_search_roots() {
+				if !root.exists() {
+					continue;
+				}
+
+				for entry in WalkDir::new(root)
+					.follow_links(true)
+					.into_iter()
+					.filter_map(|entry| entry.ok())
+					.filter(|entry| entry.file_type().is_file())
+				{
+					let path = entry.into_path();
+					if !is_supported_image(&path) {
+						continue;
+					}
+
+					let Some(file_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+						continue;
+					};
+
+					let extension = path.extension().and_then(|ext| ext.to_str()).map(|s| s.to_string());
+					let score = score_icon_path(&path);
+
+					index
+						.entry(file_stem.to_ascii_lowercase())
+						.or_default()
+						.push(IconCandidate { path, extension, score });
+				}
+			}
+		}
+
 		Self {
 			enabled,
 			cache: HashMap::new(),
-			search_roots: icon_search_roots(),
+			index,
 		}
 	}
 
@@ -515,49 +555,27 @@ impl IconResolver {
 		let icon_stem = Path::new(icon)
 			.file_stem()
 			.and_then(|stem| stem.to_str())
-			.unwrap_or(icon);
+			.unwrap_or(icon)
+			.to_ascii_lowercase();
 		let icon_ext = Path::new(icon).extension().and_then(|extension| extension.to_str());
+
+		let candidates = self.index.get(&icon_stem)?;
 		let mut best_match = None;
 		let mut best_score = i32::MIN;
 
-		for root in &self.search_roots {
-			if !root.exists() {
-				continue;
-			}
-
-			for entry in WalkDir::new(root)
-				.follow_links(true)
-				.into_iter()
-				.filter_map(|entry| entry.ok())
-				.filter(|entry| entry.file_type().is_file())
-			{
-				let path = entry.path();
-				if !is_supported_image(path) {
-					continue;
-				}
-
-				let Some(file_stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+		for candidate in candidates {
+			if let Some(icon_ext) = icon_ext {
+				let Some(candidate_ext) = &candidate.extension else {
 					continue;
 				};
-
-				if file_stem != icon_stem {
+				if !candidate_ext.eq_ignore_ascii_case(icon_ext) {
 					continue;
 				}
+			}
 
-				if let Some(icon_ext) = icon_ext {
-					let Some(candidate_ext) = path.extension().and_then(|extension| extension.to_str()) else {
-						continue;
-					};
-					if !candidate_ext.eq_ignore_ascii_case(icon_ext) {
-						continue;
-					}
-				}
-
-				let score = score_icon_path(path);
-				if score > best_score {
-					best_score = score;
-					best_match = Some(path.to_path_buf());
-				}
+			if candidate.score > best_score {
+				best_score = candidate.score;
+				best_match = Some(candidate.path.clone());
 			}
 		}
 

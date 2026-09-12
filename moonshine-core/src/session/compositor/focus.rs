@@ -13,10 +13,11 @@
 use std::borrow::Cow;
 
 use bitflags::bitflags;
-use smithay::backend::input::KeyState;
+use smithay::backend::input::{InputTime, KeyState};
 use smithay::desktop::{Window, WindowSurface};
 use smithay::input::Seat;
 use smithay::input::keyboard::{KeyboardTarget, KeysymHandle, ModifiersState};
+use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{IsAlive, Serial};
 use smithay::wayland::seat::WaylandFocus;
@@ -85,7 +86,7 @@ macro_rules! delegate_keyboard {
 impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
 	delegate_keyboard!(enter(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, keys: Vec<KeysymHandle<'_>>, serial: Serial) -> ());
 	delegate_keyboard!(leave(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, serial: Serial) -> ());
-	delegate_keyboard!(key(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, key: KeysymHandle<'_>, state: KeyState, serial: Serial, time: u32) -> ());
+	delegate_keyboard!(key(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, key: KeysymHandle<'_>, state: KeyState, serial: Serial, time: InputTime) -> ());
 	delegate_keyboard!(modifiers(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, modifiers: ModifiersState, serial: Serial) -> ());
 }
 
@@ -196,14 +197,23 @@ impl WindowMetadata {
 	/// Returns `true` if this is a Steam Big Picture window.
 	/// Gamescope: detects STEAM_LEGACY_BIG_PICTURE property.
 	pub fn is_steam_big_picture(&self) -> bool {
-		self.app_id == 769
+		self.app_id == crate::session::compositor::x11_focus::STEAM_BIG_PICTURE_APPID
 	}
 
-	/// Returns `true` if the window should fill the output. Steam counts even
-	/// without the fullscreen state set.
-	/// Gamescope: `window_is_fullscreen()`
-	pub fn is_fullscreen(&self) -> bool {
-		self.fullscreen || self.is_steam_big_picture()
+	/// Returns `true` if the window should be held at the output size.
+	///
+	/// Gamescope holds the focus window at the output size regardless of the
+	/// fullscreen hint, so a game running below the stream resolution is
+	/// scaled up to fill the whole output. Only the main window qualifies —
+	/// dialogs, dropdowns, and Steam overlay/notification windows keep their
+	/// own size.
+	pub fn should_fill_output(&self) -> bool {
+		self.has_game_id()
+			&& self.transient_for.is_none()
+			&& !self.is_dropdown()
+			&& !self
+				.flags
+				.intersects(WindowFlags::OVERLAY | WindowFlags::NOTIFICATION | WindowFlags::EXTERNAL_OVERLAY)
 	}
 
 	/// Returns `true` if the window has skipTaskbar AND skipPager but is not fullscreen.
@@ -287,6 +297,8 @@ pub(crate) struct FocusState {
 	/// X11 window ID that most recently sent `_NET_ACTIVE_WINDOW`.
 	/// Cleared after being consumed by `pick_best_candidate`.
 	requested_focus_window: Option<u32>,
+	/// Wayland surface that requested activation via `xdg-activation`.
+	requested_focus_surface: Option<WlSurface>,
 }
 
 impl FocusState {
@@ -328,6 +340,24 @@ impl FocusState {
 	pub fn clear_requested_focus(&mut self) {
 		self.requested_focus_window = None;
 	}
+
+	/// Store an explicit focus request from an `xdg-activation` request.
+	/// Replaces any previously pending surface request.
+	pub fn set_requested_focus_surface(&mut self, surface: WlSurface) {
+		tracing::debug!(target: "focus", surface_id = ?surface.id(), "xdg-activation: storing explicit focus request");
+		self.requested_focus_surface = Some(surface);
+		self.mark_dirty();
+	}
+
+	/// Peek at the pending `xdg-activation` focus request without consuming it.
+	pub fn peek_requested_focus_surface(&self) -> Option<&WlSurface> {
+		self.requested_focus_surface.as_ref()
+	}
+
+	/// Clear the pending `xdg-activation` focus request.
+	pub fn clear_requested_focus_surface(&mut self) {
+		self.requested_focus_surface = None;
+	}
 }
 
 #[cfg(test)]
@@ -358,14 +388,25 @@ mod tests {
 	}
 
 	#[test]
-	fn test_steam_fills_the_output_without_the_fullscreen_state() {
-		assert!(make_meta(&[("app_id", "769")]).is_fullscreen());
+	fn test_game_is_held_at_output_size_without_the_fullscreen_state() {
+		assert!(make_meta(&[("app_id", "769")]).should_fill_output());
+		assert!(make_meta(&[("app_id", "12345")]).should_fill_output());
 	}
 
 	#[test]
-	fn test_a_game_fills_the_output_only_once_it_declares_fullscreen() {
-		assert!(!make_meta(&[("app_id", "12345")]).is_fullscreen());
-		assert!(make_meta(&[("app_id", "12345"), ("fullscreen", "true")]).is_fullscreen());
+	fn test_dialog_and_dropdown_are_not_held_at_output_size() {
+		assert!(
+			!make_meta(&[
+				("app_id", "12345"),
+				("override_redirect", "true"),
+				("width", "100"),
+				("height", "100"),
+			])
+			.should_fill_output()
+		);
+		let mut m = make_meta(&[("app_id", "12345")]);
+		m.transient_for = Some(12345);
+		assert!(!m.should_fill_output());
 	}
 
 	// ---- Priority key tests (T2) ----

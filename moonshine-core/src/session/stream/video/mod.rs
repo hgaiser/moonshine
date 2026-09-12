@@ -34,6 +34,45 @@ pub struct VideoStreamConfig {
 	/// packetize than the frame budget.
 	#[serde(default)]
 	pub log_frame_spikes: bool,
+
+	/// Upper bound for the client-requested video packet size, in bytes.
+	///
+	/// Moonlight's default packet size (1392 bytes) can exceed the path MTU
+	/// over VPNs and tunnels, causing fragmented, dropped video. When non-zero,
+	/// the client's `x-nv-video[0].packetSize` is clamped to this value; a
+	/// smaller client request is honored. `0` disables the cap.
+	///
+	/// This is the stream's packet size, not a raw interface MTU: the on-wire
+	/// UDP payload is `max_packet_size + 16` bytes. For example, to fit a
+	/// 1420-byte WireGuard MTU over IPv4, use 1376 (1420 minus the 20-byte IP
+	/// and 8-byte UDP headers and the 16-byte stream overhead).
+	#[serde(default)]
+	pub max_packet_size: usize,
+}
+
+/// Smallest accepted packet size cap. Lower values would leave almost no room
+/// for payload after the 16-byte NV video header, so they are ignored.
+const MIN_PACKET_SIZE: usize = 200;
+
+impl VideoStreamConfig {
+	/// Clamp a client-requested video packet size to `max_packet_size`.
+	///
+	/// A client only asks for what it believes it can receive, so a request
+	/// smaller than the cap is honored; the cap only lowers oversized requests.
+	/// A cap of `0` disables the limit.
+	pub(crate) fn clamp_packet_size(&self, requested: usize) -> usize {
+		if self.max_packet_size == 0 {
+			return requested;
+		}
+		if self.max_packet_size < MIN_PACKET_SIZE {
+			tracing::warn!(
+				"max_packet_size {} is below the minimum of {MIN_PACKET_SIZE}, ignoring the cap.",
+				self.max_packet_size
+			);
+			return requested;
+		}
+		requested.min(self.max_packet_size)
+	}
 }
 
 impl Default for VideoStreamConfig {
@@ -43,6 +82,7 @@ impl Default for VideoStreamConfig {
 			fec_percentage: 20,
 			encrypt: false,
 			log_frame_spikes: false,
+			max_packet_size: 0,
 		}
 	}
 }
@@ -415,4 +455,36 @@ fn spawn_handle_video_packets(
 
 		tracing::debug!("Video packet stream stopped.");
 	});
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn config(max_packet_size: usize) -> VideoStreamConfig {
+		VideoStreamConfig {
+			max_packet_size,
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn no_cap_honors_requested() {
+		assert_eq!(config(0).clamp_packet_size(1392), 1392);
+	}
+
+	#[test]
+	fn smaller_client_request_is_honored() {
+		assert_eq!(config(1200).clamp_packet_size(1024), 1024);
+	}
+
+	#[test]
+	fn larger_client_request_is_capped() {
+		assert_eq!(config(1200).clamp_packet_size(1392), 1200);
+	}
+
+	#[test]
+	fn undersized_cap_is_ignored() {
+		assert_eq!(config(50).clamp_packet_size(1392), 1392);
+	}
 }

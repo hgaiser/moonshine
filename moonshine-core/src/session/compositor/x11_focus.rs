@@ -107,6 +107,9 @@ struct XResClientIdValue {
 /// XRes client ID mask constants.
 const XRES_CLIENT_ID_PID_MASK: u32 = 0x2; // 1 << XRES_CLIENT_ID_PID
 
+/// Steam's own app id (its BPM/overlay/steamwebhelper windows).
+pub const STEAM_BIG_PICTURE_APPID: u32 = 769;
+
 /// XLib Success status.
 const XLIB_SUCCESS: c_int = 0;
 
@@ -345,6 +348,8 @@ pub(crate) struct X11Focus {
 	dpy: *mut XDisplay,
 	/// Root window of the default screen — obtained once via XDefaultRootWindow.
 	root: Window,
+	/// Display name (`:N`) — written to GAMESCOPE_FOCUS_DISPLAY etc.
+	display_name: String,
 	/// Pre-interned atom IDs — cached once at construction time to avoid
 	/// repeated `XInternAtom` calls on every property read.
 	atoms: CachedAtoms,
@@ -371,6 +376,12 @@ struct CachedAtoms {
 	gamescope_focusable_apps: Atom,
 	gamescope_focusable_windows: Atom,
 	gamescope_xwayland_server_id: Atom,
+	gamescope_focused_app_gfx: Atom,
+	gamescope_focused_window: Atom,
+	gamescope_focus_display: Atom,
+	gamescope_mouse_focus_display: Atom,
+	gamescope_keyboard_focus_display: Atom,
+	utf8_string: Atom,
 }
 
 impl CachedAtoms {
@@ -402,6 +413,12 @@ impl CachedAtoms {
 					gamescope_focusable_apps: intern_one(b"GAMESCOPE_FOCUSABLE_APPS")?,
 					gamescope_focusable_windows: intern_one(b"GAMESCOPE_FOCUSABLE_WINDOWS")?,
 					gamescope_xwayland_server_id: intern_one(b"GAMESCOPE_XWAYLAND_SERVER_ID")?,
+					gamescope_focused_app_gfx: intern_one(b"GAMESCOPE_FOCUSED_APP_GFX")?,
+					gamescope_focused_window: intern_one(b"GAMESCOPE_FOCUSED_WINDOW")?,
+					gamescope_focus_display: intern_one(b"GAMESCOPE_FOCUS_DISPLAY")?,
+					gamescope_mouse_focus_display: intern_one(b"GAMESCOPE_MOUSE_FOCUS_DISPLAY")?,
+					gamescope_keyboard_focus_display: intern_one(b"GAMESCOPE_KEYBOARD_FOCUS_DISPLAY")?,
+					utf8_string: intern_one(b"UTF8_STRING")?,
 				})
 			}
 		})
@@ -428,10 +445,17 @@ impl X11Focus {
 			return None;
 		}
 
+		let x11_focus = Self {
+			dpy,
+			root,
+			atoms,
+			display_name: format!(":{}", display_number),
+		};
+
 		// Initialize GAMESCOPE_XWAYLAND_SERVER_ID on the root window so that
 		// compatible WSI clients can discover this compositor's XWayland server
 		// and succeed the override_window_content handshake.
-		if atoms.gamescope_xwayland_server_id != 0 {
+		if x11_focus.atoms.gamescope_xwayland_server_id != 0 {
 			let server_id = display_id_to_server_id(display_number);
 			with_xlib(|loaded| {
 				let seterr = loaded.xseterrorhandler?;
@@ -444,9 +468,9 @@ impl X11Focus {
 					// reading garbage past the value.
 					let server_id_long = server_id as libc_c_long;
 					change(
-						dpy,
-						root,
-						atoms.gamescope_xwayland_server_id,
+						x11_focus.dpy,
+						x11_focus.root,
+						x11_focus.atoms.gamescope_xwayland_server_id,
 						XA_CARDINAL,
 						32,
 						1,
@@ -460,7 +484,7 @@ impl X11Focus {
 		}
 
 		tracing::debug!(target: "focus", "Opened X11 connection to :{}", display_number);
-		Some(Self { dpy, root, atoms })
+		Some(x11_focus)
 	}
 
 	/// Read a single CARDINAL (format-32) window property by pre-interned atom.
@@ -695,6 +719,11 @@ impl X11Focus {
 		self.read_cardinal_prop_by_atom(window_id as Window, self.atoms.steam_overlay, 0)
 	}
 
+	/// The interned `STEAM_OVERLAY` atom id, for matching property-notify events.
+	pub fn steam_overlay_atom(&self) -> Atom {
+		self.atoms.steam_overlay
+	}
+
 	/// Read the _NET_WM_WINDOW_OPACITY property from an X11 window.
 	/// Returns a value 0-255 where 255 is fully opaque.
 	///
@@ -826,7 +855,7 @@ impl X11Focus {
 			let change = loaded.xchangeproperty?;
 			unsafe {
 				let prev = seterr(Some(silent_x11_error));
-				// Replace = 1; Format = 32; type = CARDINAL; data = value
+				// PropModeReplace = 0; Format = 32; type = CARDINAL; data = value
 				// XChangeProperty with format=32 expects native C `long`
 				// elements.  On LP64 (64-bit) `long` is 8 bytes but `u32`
 				// is 4 bytes, so we must convert to native `long` to avoid
@@ -838,9 +867,36 @@ impl X11Focus {
 					atom,
 					XA_CARDINAL,
 					32,
-					1,
+					0,
 					&value_long as *const libc_c_long as *const c_void,
 					1,
+				);
+				seterr(prev);
+			}
+			Some(())
+		});
+	}
+
+	/// Write a UTF-8 string property to a window (format 8).
+	fn write_utf8_prop(&self, window_id: Window, atom: Atom, value: &str) {
+		if self.dpy.is_null() {
+			return;
+		}
+		with_xlib(|loaded| {
+			let seterr = loaded.xseterrorhandler?;
+			let change = loaded.xchangeproperty?;
+			unsafe {
+				let prev = seterr(Some(silent_x11_error));
+				// PropModeReplace = 0; Format = 8; type = UTF8_STRING
+				change(
+					self.dpy,
+					window_id,
+					atom,
+					self.atoms.utf8_string,
+					8,
+					0,
+					value.as_ptr() as *const c_void,
+					value.len() as c_int,
 				);
 				seterr(prev);
 			}
@@ -858,7 +914,7 @@ impl X11Focus {
 			let change = loaded.xchangeproperty?;
 			unsafe {
 				let prev = seterr(Some(silent_x11_error));
-				// Replace = 1; Format = 32; type = CARDINAL
+				// PropModeReplace = 0; Format = 32; type = CARDINAL
 				// XChangeProperty with format=32 expects native C `long`
 				// elements.  On LP64 (64-bit) `long` is 8 bytes but `u32`
 				// is 4 bytes, so we must convert to native `long` to avoid
@@ -870,7 +926,7 @@ impl X11Focus {
 					atom,
 					XA_CARDINAL,
 					32,
-					1,
+					0,
 					longs.as_ptr() as *const c_void,
 					values.len() as c_int,
 				);
@@ -897,23 +953,54 @@ impl X11Focus {
 		});
 	}
 
-	/// Write the focused app ID to GAMESCOPE_FOCUSED_APP on the root window.
-	///
-	/// Gamescope: `set_focused_app()` — tells Steam which app ID is currently
-	/// focused so it can route controller input appropriately.
-	pub fn set_focused_app(&self, app_id: u32) {
-		if self.atoms.gamescope_focused_app == 0 {
-			return;
-		}
-		self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app, app_id);
-	}
-
 	/// Clear GAMESCOPE_FOCUSED_APP from the root window.
 	pub fn clear_focused_app(&self) {
 		if self.atoms.gamescope_focused_app == 0 {
 			return;
 		}
 		self.delete_property(self.root, self.atoms.gamescope_focused_app);
+		self.delete_property(self.root, self.atoms.gamescope_focused_app_gfx);
+		self.delete_property(self.root, self.atoms.gamescope_focused_window);
+	}
+
+	/// Write the gamescope focus contract (FOCUSED_APP/GFX/WINDOW + displays)
+	/// so Steam's controller routing targets the focused window.
+	pub fn set_focused_window_contract(&self, app_id: u32, window_id: u32) {
+		if app_id != 0 {
+			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app, app_id);
+			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app_gfx, app_id);
+		} else {
+			self.delete_property(self.root, self.atoms.gamescope_focused_app);
+			self.delete_property(self.root, self.atoms.gamescope_focused_app_gfx);
+		}
+		if window_id != 0 {
+			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_window, window_id);
+		} else {
+			self.delete_property(self.root, self.atoms.gamescope_focused_window);
+		}
+		self.write_utf8_prop(self.root, self.atoms.gamescope_focus_display, &self.display_name);
+		self.write_utf8_prop(self.root, self.atoms.gamescope_mouse_focus_display, &self.display_name);
+		self.write_utf8_prop(
+			self.root,
+			self.atoms.gamescope_keyboard_focus_display,
+			&self.display_name,
+		);
+	}
+
+	/// Write GAMESCOPE_FOCUSED_APP and FOCUSED_APP_GFX with potentially
+	/// different values (used when the overlay is raised: input goes to
+	/// the overlay, rendering stays on the game).
+	pub fn set_focused_app_split(&self, input_app_id: u32, gfx_app_id: u32) {
+		if input_app_id != 0 {
+			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app, input_app_id);
+		} else {
+			self.delete_property(self.root, self.atoms.gamescope_focused_app);
+		}
+		if gfx_app_id != 0 {
+			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app_gfx, gfx_app_id);
+		} else {
+			self.delete_property(self.root, self.atoms.gamescope_focused_app_gfx);
+		}
 	}
 
 	/// Write the list of focusable app IDs to GAMESCOPE_FOCUSABLE_APPS on the root window.

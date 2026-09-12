@@ -260,7 +260,7 @@ impl InputHandler {
 				});
 			},
 			InputEvent::Utf8Text(text) => {
-				tracing::trace!("Typing text: {text:?}");
+				tracing::debug!("Typing clipboard text.");
 				let _ = self.input_tx.send(CompositorInputEvent::TypeText { text });
 			},
 			// Gamepad events: forward to gamepad handler thread.

@@ -305,13 +305,17 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
-		let packet_size = match get_sdp_attribute(&sdp_session, "x-nv-video[0].packetSize") {
+		let requested_packet_size: usize = match get_sdp_attribute(&sdp_session, "x-nv-video[0].packetSize") {
 			Ok(packet_size) => packet_size,
 			Err(()) => {
 				tracing::warn!("Failed to parse x-nv-video[0].packetSize in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
+		let packet_size = self.video_config.clamp_packet_size(requested_packet_size);
+		if packet_size != requested_packet_size {
+			tracing::info!("Clamping client video packet size from {requested_packet_size} to {packet_size} bytes.");
+		}
 		let mut bitrate = match get_sdp_attribute(&sdp_session, "x-ml-video.configuredBitrateKbps") {
 			Ok(bitrate) => bitrate,
 			Err(()) => {

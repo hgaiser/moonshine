@@ -5,15 +5,19 @@
 //! Smithay `Seat` — no libei or EIS socket needed.
 
 use smithay::backend::input::{
-	Axis, ButtonState, KeyState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType, TouchSlot,
+	Axis, ButtonState, InputTime, KeyState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType, TouchSlot,
 };
 use smithay::desktop::WindowSurfaceType;
-use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode, xkb};
+use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode};
 use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
+use smithay::input::tablet::TabletSeatTrait;
+use smithay::input::tablet::tool::{
+	AxisFrame as TabletAxisFrame, ButtonEvent as TabletButtonEvent, DownEvent as TabletDownEvent,
+	MotionEvent as TabletMotionEvent, ProximityInEvent, ProximityOutEvent, TabletToolHandle, UpEvent as TabletUpEvent,
+};
 use smithay::input::touch::{DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, UpEvent as TouchUpEvent};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
-use smithay::wayland::tablet_manager::{TabletSeatTrait, TabletToolHandle};
 
 use crate::session::compositor::state::MoonshineCompositor;
 
@@ -87,9 +91,8 @@ pub(crate) enum CompositorInputEvent {
 		rotation: u16,
 		tilt: u8,
 	},
-	/// Type text received from the Moonlight clipboard ("type clipboard text").
-	/// Each character is resolved against the current keyboard layout and
-	/// injected as key events.
+	/// Text received from the Moonlight clipboard ("type clipboard text").
+	/// Committed to the focused client via the text-input protocol.
 	TypeText {
 		text: String,
 	},
@@ -102,7 +105,7 @@ pub(crate) enum CompositorInputEvent {
 /// since we *are* the compositor.
 pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCompositor) {
 	let serial = SERIAL_COUNTER.next_serial();
-	let time = state.clock.now().as_millis();
+	let time = InputTime::from_millis(state.clock.now().as_millis());
 
 	// specific pointer events (non-keyboard) should reset the cursor inactivity timer
 	match event {
@@ -145,7 +148,14 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				);
 			}
 		},
-		CompositorInputEvent::TypeText { text } => type_text(state, &text, time),
+		CompositorInputEvent::TypeText { text } => {
+			if state.pending_text.len() < MAX_PENDING_TEXT {
+				state.pending_text.push_str(&text);
+				if state.pending_text.len() >= MAX_PENDING_TEXT {
+					tracing::warn!("Clipboard text exceeds {MAX_PENDING_TEXT} bytes, ignoring the rest.");
+				}
+			}
+		},
 		CompositorInputEvent::MouseMoveAbsolute {
 			x,
 			y,
@@ -214,7 +224,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				&RelativeMotionEvent {
 					delta,
 					delta_unaccel: delta,
-					utime: time as u64,
+					time,
 				},
 			);
 
@@ -369,44 +379,120 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 	}
 }
 
-/// A keycode plus the modifier keycodes that must be held to reach it.
-type ResolvedKey = (Keycode, Vec<Keycode>);
+/// Modifier keys used to type a code point through the "Ctrl+Shift+U" Unicode
+/// input method. These are xkb keycodes (evdev keycode + 8) for standard keys.
+const KEY_LEFTCTRL: u32 = 37; // evdev 29
+const KEY_LEFTSHIFT: u32 = 50; // evdev 42
+const KEY_U: u32 = 30; // evdev 22
+const KEY_ENTER: u32 = 36; // evdev 28
 
-/// Type text by injecting per-character key events, resolved against the
-/// current keyboard layout.
+/// Upper bound on queued clipboard text, to bound memory on a huge payload.
+const MAX_PENDING_TEXT: usize = 64 * 1024;
+
+/// Number of characters typed per frame tick.
+const CHARS_PER_TICK: usize = 8;
+
+/// Type a bounded batch of the queued clipboard text.
 ///
-/// The Moonlight "type clipboard text" feature sends one UTF-8 code point
-/// per event, so a pasted string arrives as a sequence of `TypeText` events.
-/// Characters that the current layout cannot produce (e.g. Cyrillic on a US
-/// layout) are skipped with a warning.
-fn type_text(state: &mut MoonshineCompositor, text: &str, time: u32) {
+/// A paste arrives as one `TypeText` event per code point. Injecting each in
+/// its own compositor callback (and flushing after every one) backpressures
+/// the single calloop thread and starves the frame timer, stalling the stream.
+/// Instead the text is queued and typed in bounded batches on successive frame
+/// ticks, so the compositor always returns to render between batches.
+pub(crate) fn drain_pending_text(state: &mut MoonshineCompositor) {
+	if state.pending_text.is_empty() {
+		return;
+	}
+
+	// Split off at most `CHARS_PER_TICK` characters, on a char boundary, so a
+	// Ctrl+Shift+U sequence is never split mid-character.
+	let end = state
+		.pending_text
+		.char_indices()
+		.nth(CHARS_PER_TICK)
+		.map(|(i, _)| i)
+		.unwrap_or(state.pending_text.len());
+	let remainder = state.pending_text.split_off(end);
+	let batch = std::mem::replace(&mut state.pending_text, remainder);
+
+	tracing::debug!(target: "input", "Typing queued clipboard text.");
+	let time = InputTime::from_millis(state.clock.now().as_millis());
+	type_text(state, &batch, time);
+	let _ = state.display_handle.flush_clients();
+}
+
+/// Type `text` by synthesizing the "Ctrl+Shift+U <hex> Enter" Unicode input
+/// sequence for each code point.
+///
+/// This is layout-independent in that it relies on the application's input
+/// method (GTK/Qt/IBus) rather than the keyboard layout. It only works in apps
+/// that implement that input method; games and bare X11 apps receive the
+/// keystrokes literally.
+fn type_text(state: &mut MoonshineCompositor, text: &str, time: InputTime) {
 	let Some(keyboard) = state.seat.get_keyboard() else {
 		return;
 	};
 
-	// Resolve all keystrokes up front. `with_xkb_state` holds the keyboard
-	// lock, so we cannot inject while inside the closure.
-	let keystrokes: Vec<(char, Option<ResolvedKey>)> = keyboard.with_xkb_state(state, |ctx| {
-		let xkb = ctx.xkb().lock().unwrap();
-		let keymap = unsafe { xkb.keymap() };
-		text.chars().map(|c| (c, resolve_char(keymap, c))).collect()
-	});
-
-	for (c, resolved) in keystrokes {
-		let Some((keycode, modifier_keycodes)) = resolved else {
-			tracing::warn!("Unable to type character {:?} with the current keyboard layout", c);
-			continue;
-		};
-
-		for &modifier in &modifier_keycodes {
-			inject_key(state, &keyboard, modifier, KeyState::Pressed, time);
-		}
-		inject_key(state, &keyboard, keycode, KeyState::Pressed, time);
-		inject_key(state, &keyboard, keycode, KeyState::Released, time);
-		for &modifier in modifier_keycodes.iter().rev() {
-			inject_key(state, &keyboard, modifier, KeyState::Released, time);
-		}
+	for codepoint in text.chars() {
+		type_codepoint(state, &keyboard, codepoint, time);
 	}
+}
+
+/// Type a single code point via Ctrl+Shift+U.
+fn type_codepoint(
+	state: &mut MoonshineCompositor,
+	keyboard: &KeyboardHandle<MoonshineCompositor>,
+	codepoint: char,
+	time: InputTime,
+) {
+	// Ctrl+Shift+U opens the Unicode input method. The modifiers are released
+	// before the hex digits, which are typed unmodified.
+	inject_key(state, keyboard, Keycode::new(KEY_LEFTCTRL), KeyState::Pressed, time);
+	inject_key(state, keyboard, Keycode::new(KEY_LEFTSHIFT), KeyState::Pressed, time);
+	tap_key(state, keyboard, Keycode::new(KEY_U), time);
+	inject_key(state, keyboard, Keycode::new(KEY_LEFTSHIFT), KeyState::Released, time);
+	inject_key(state, keyboard, Keycode::new(KEY_LEFTCTRL), KeyState::Released, time);
+
+	for digit in format!("{:X}", codepoint as u32).chars() {
+		tap_key(state, keyboard, hex_keycode(digit), time);
+	}
+
+	// Enter commits the code point.
+	tap_key(state, keyboard, Keycode::new(KEY_ENTER), time);
+}
+
+/// Map an uppercase hex digit to the xkb keycode of its standard key.
+fn hex_keycode(digit: char) -> Keycode {
+	let evdev = match digit {
+		'0' => 11,
+		'1' => 2,
+		'2' => 3,
+		'3' => 4,
+		'4' => 5,
+		'5' => 6,
+		'6' => 7,
+		'7' => 8,
+		'8' => 9,
+		'9' => 10,
+		'A' => 30,
+		'B' => 48,
+		'C' => 46,
+		'D' => 32,
+		'E' => 18,
+		'F' => 33,
+		_ => unreachable!("not a hex digit: {digit}"),
+	};
+	Keycode::new(evdev + 8)
+}
+
+fn tap_key(
+	state: &mut MoonshineCompositor,
+	keyboard: &KeyboardHandle<MoonshineCompositor>,
+	keycode: Keycode,
+	time: InputTime,
+) {
+	inject_key(state, keyboard, keycode, KeyState::Pressed, time);
+	inject_key(state, keyboard, keycode, KeyState::Released, time);
 }
 
 fn inject_key(
@@ -414,7 +500,7 @@ fn inject_key(
 	keyboard: &KeyboardHandle<MoonshineCompositor>,
 	keycode: Keycode,
 	key_state: KeyState,
-	time: u32,
+	time: InputTime,
 ) {
 	keyboard.input::<(), _>(
 		state,
@@ -424,72 +510,6 @@ fn inject_key(
 		time,
 		|_, _, _| FilterResult::Forward,
 	);
-}
-
-/// Find the keycode (and any modifier keycodes needed to reach it) that
-/// produces the given character in the keymap. Prefers the lowest shift level
-/// so plain characters are typed without modifiers where possible.
-fn resolve_char(keymap: &xkb::Keymap, c: char) -> Option<ResolvedKey> {
-	// The Return key produces '\r', so match newlines against that too.
-	let needle = if c == '\n' { '\r' } else { c };
-
-	for level in 0..4 {
-		let mut keycode = keymap.min_keycode();
-		let max = keymap.max_keycode();
-		while keycode <= max {
-			for layout in 0..keymap.num_layouts() {
-				if level < keymap.num_levels_for_key(keycode, layout)
-					&& keymap
-						.key_get_syms_by_level(keycode, layout, level)
-						.iter()
-						.any(|&sym| keysym_produces(sym, needle))
-				{
-					let modifier_keycodes = resolve_modifiers(keymap, layout, keycode, level);
-					return Some((keycode, modifier_keycodes));
-				}
-			}
-			keycode = Keycode::new(keycode.raw() + 1);
-		}
-	}
-	None
-}
-
-fn keysym_produces(sym: xkb::Keysym, c: char) -> bool {
-	xkb::keysym_to_utf8(sym).starts_with(c)
-}
-
-/// Determine which modifier keycodes must be held to reach `level` of the
-/// given key, by resolving every modifier bit to a key that activates it.
-fn resolve_modifiers(keymap: &xkb::Keymap, layout: u32, keycode: Keycode, level: u32) -> Vec<Keycode> {
-	let mut masks = [0; 4];
-	let count = keymap.key_get_mods_for_level(keycode, layout, level, &mut masks);
-	let combined = masks[..count].iter().fold(0u32, |acc, mask| acc | mask);
-
-	let mut result = Vec::new();
-	for mod_index in 0..keymap.num_mods().min(32) {
-		if combined & (1 << mod_index) != 0
-			&& let Some(modifier) = find_modifier_keycode(keymap, layout, mod_index)
-		{
-			result.push(modifier);
-		}
-	}
-	result
-}
-
-/// Find a key that activates the given modifier when pressed unmodified
-/// (e.g. Shift_L for the Shift modifier).
-fn find_modifier_keycode(keymap: &xkb::Keymap, layout: u32, mod_index: u32) -> Option<Keycode> {
-	let mut keycode = keymap.min_keycode();
-	let max = keymap.max_keycode();
-	while keycode <= max {
-		let mut masks = [0];
-		let count = keymap.key_get_mods_for_level(keycode, layout, 0, &mut masks);
-		if count > 0 && masks[0] & (1 << mod_index) != 0 {
-			return Some(keycode);
-		}
-		keycode = Keycode::new(keycode.raw() + 1);
-	}
-	None
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -533,32 +553,42 @@ fn pen_tool_descriptor(tool_kind: u8) -> TabletToolDescriptor {
 	}
 }
 
-fn get_pen_tool(state: &mut MoonshineCompositor, tool_kind: u8) -> TabletToolHandle {
+fn get_pen_tool(state: &mut MoonshineCompositor, tool_kind: u8) -> TabletToolHandle<MoonshineCompositor> {
 	let tablet_seat = state.seat.tablet_seat();
 	let descriptor = pen_tool_descriptor(tool_kind);
 	if let Some(tool) = tablet_seat.get_tool(&descriptor) {
 		return tool;
 	}
 
-	let display_handle = state.display_handle.clone();
-	tablet_seat.add_tool::<MoonshineCompositor>(state, &display_handle, &descriptor)
+	tablet_seat.add_tool(&descriptor)
 }
 
-fn release_pen(state: &mut MoonshineCompositor, time: u32) {
+fn release_pen(state: &mut MoonshineCompositor, time: InputTime) {
 	let Some(tool_kind) = state.active_pen_tool_kind.take() else {
 		state.pen_buttons = 0;
 		return;
 	};
 
 	if let Some(tool) = state.seat.tablet_seat().get_tool(&pen_tool_descriptor(tool_kind)) {
-		tool.tip_up(time);
-		sync_pen_buttons(&tool, state.pen_buttons, 0, time);
-		tool.proximity_out(time);
+		// `proximity_out` internally releases any pressed buttons and lifts the tip.
+		tool.proximity_out(
+			state,
+			&ProximityOutEvent {
+				serial: SERIAL_COUNTER.next_serial(),
+				time,
+			},
+		);
 	}
 	state.pen_buttons = 0;
 }
 
-fn sync_pen_buttons(tool: &TabletToolHandle, old_buttons: u8, new_buttons: u8, time: u32) {
+fn sync_pen_buttons(
+	state: &mut MoonshineCompositor,
+	tool: &TabletToolHandle<MoonshineCompositor>,
+	old_buttons: u8,
+	new_buttons: u8,
+	time: InputTime,
+) {
 	const BUTTONS: [(u8, u32); 3] = [
 		(0x01, 0x14B), // BTN_STYLUS
 		(0x02, 0x14C), // BTN_STYLUS2
@@ -567,17 +597,30 @@ fn sync_pen_buttons(tool: &TabletToolHandle, old_buttons: u8, new_buttons: u8, t
 
 	for (mask, button) in BUTTONS {
 		if old_buttons & mask != new_buttons & mask {
-			let state = if new_buttons & mask != 0 {
+			let button_state = if new_buttons & mask != 0 {
 				ButtonState::Pressed
 			} else {
 				ButtonState::Released
 			};
-			tool.button(button, state, SERIAL_COUNTER.next_serial(), time);
+			tool.button(
+				state,
+				&TabletButtonEvent {
+					serial: SERIAL_COUNTER.next_serial(),
+					button,
+					state: button_state,
+					time,
+				},
+			);
 		}
 	}
 }
 
-fn process_pen_input(state: &mut MoonshineCompositor, event: PenInput, serial: smithay::utils::Serial, time: u32) {
+fn process_pen_input(
+	state: &mut MoonshineCompositor,
+	event: PenInput,
+	serial: smithay::utils::Serial,
+	time: InputTime,
+) {
 	if matches!(
 		event.event_kind,
 		POINTER_EVENT_CANCEL | POINTER_EVENT_HOVER_LEAVE | POINTER_EVENT_CANCEL_ALL
@@ -589,7 +632,7 @@ fn process_pen_input(state: &mut MoonshineCompositor, event: PenInput, serial: s
 	if event.event_kind == POINTER_EVENT_BUTTON_ONLY {
 		if let Some(tool_kind) = state.active_pen_tool_kind {
 			let tool = get_pen_tool(state, tool_kind);
-			sync_pen_buttons(&tool, state.pen_buttons, event.buttons, time);
+			sync_pen_buttons(state, &tool, state.pen_buttons, event.buttons, time);
 			state.pen_buttons = event.buttons;
 		}
 		return;
@@ -603,8 +646,7 @@ fn process_pen_input(state: &mut MoonshineCompositor, event: PenInput, serial: s
 	}
 
 	let tool = get_pen_tool(state, event.tool_kind);
-	let tablet_seat = state.seat.tablet_seat();
-	let Some(tablet) = tablet_seat.get_tablet(&state.pen_tablet_descriptor) else {
+	let Some(tablet) = state.seat.tablet_seat().get_tablet(&state.pen_tablet_descriptor) else {
 		return;
 	};
 	let location = normalized_pointer_location(state, event.x, event.y);
@@ -612,39 +654,65 @@ fn process_pen_input(state: &mut MoonshineCompositor, event: PenInput, serial: s
 	state.cursor_position = location;
 
 	if state.active_pen_tool_kind.is_none() {
-		let Some(focus) = focus.clone() else {
+		if focus.is_none() {
 			return;
-		};
-		tool.proximity_in(location, focus, &tablet, serial, time);
+		}
+		tool.proximity_in(
+			state,
+			focus.clone(),
+			tablet,
+			&ProximityInEvent {
+				location,
+				axis: None,
+				serial,
+				time,
+			},
+		);
 		state.active_pen_tool_kind = Some(event.tool_kind);
 	}
 
 	let value = event.pressure_or_distance.clamp(0.0, 1.0) as f64;
+	let mut axis = TabletAxisFrame::new();
 	if event.event_kind == POINTER_EVENT_HOVER {
-		tool.distance(value);
+		axis = axis.distance(value);
 	} else {
-		tool.pressure(value);
+		axis = axis.pressure(value);
 	}
 
 	if event.rotation != ROTATION_UNKNOWN && event.tilt != TILT_UNKNOWN {
 		let angle = (event.rotation as f64).to_radians();
 		let magnitude = f64::from(event.tilt.min(90));
-		tool.tilt((magnitude * angle.sin(), -magnitude * angle.cos()));
+		axis = axis.tilt(magnitude * angle.sin(), -magnitude * angle.cos());
 	}
+	tool.axis(state, axis);
 
-	tool.motion(location, focus, &tablet, serial, time);
-	sync_pen_buttons(&tool, state.pen_buttons, event.buttons, time);
+	tool.motion(state, focus, &TabletMotionEvent { location, serial, time });
+	sync_pen_buttons(state, &tool, state.pen_buttons, event.buttons, time);
 	state.pen_buttons = event.buttons;
 
 	match event.event_kind {
 		POINTER_EVENT_DOWN | POINTER_EVENT_MOVE => {
-			tool.tip_down(SERIAL_COUNTER.next_serial(), time);
+			tool.down(
+				state,
+				&TabletDownEvent {
+					serial: SERIAL_COUNTER.next_serial(),
+					time,
+				},
+			);
 		},
 		POINTER_EVENT_UP => {
-			tool.tip_up(time);
+			tool.up(
+				state,
+				&TabletUpEvent {
+					serial: SERIAL_COUNTER.next_serial(),
+					time,
+				},
+			);
 		},
 		_ => {},
 	}
+
+	tool.frame(state, time);
 }
 
 fn normalized_pointer_location(state: &MoonshineCompositor, x: f32, y: f32) -> Point<f64, Logical> {
@@ -769,7 +837,7 @@ fn find_surface_at(
 			// Native Wayland path (x11_win == 0): the override surface is a
 			// fullscreen bypass surface at the output origin.  Route pointer
 			// events directly to it so the application receives input.
-			if let Some((ref override_surface, _)) = state.override_surface {
+			if let Some((ref override_surface, _, _)) = state.override_surface {
 				return Some((override_surface.clone(), Point::from((0.0, 0.0))));
 			}
 		}

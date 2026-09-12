@@ -24,7 +24,7 @@ use crate::session::stream::video::{
 	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
 };
 
-use dmabuf::{DmaBufImporter, DmaBufPlane};
+use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
@@ -673,8 +673,9 @@ impl VideoPipelineInner {
 			(VideoChromaSampling::Yuv444, VideoDynamicRange::Hdr) => OutputFormat::YUV444P10,
 		};
 
-		// Color converter will be initialized on first frame.
-		let mut color_converter: Option<ColorConverter> = None;
+		// Converter per input format, plus the source import whose view it caches.
+		let mut color_converters: std::collections::HashMap<u32, (ColorConverter, Option<Arc<CachedImport>>)> =
+			std::collections::HashMap::new();
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
@@ -901,7 +902,8 @@ impl VideoPipelineInner {
 				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
 
 				// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
-				let (source_image, needs_transition) =
+				// The `Arc` pins the image while the converter caches a view of it.
+				let (source_import, needs_transition) =
 					match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
 						Ok(result) => result,
 						Err(e) => {
@@ -910,6 +912,7 @@ impl VideoPipelineInner {
 							continue;
 						},
 					};
+				let source_image = source_import.image();
 
 				// First-time imports are in UNDEFINED layout; the converter
 				// will handle the transition inside its command buffer.
@@ -922,24 +925,11 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
-				// Recreate the converter if the input format changed (e.g. GBM pool
-				// ABGR2101010 → direct scanout XBGR8888). The converter's image view
-				// format must match the source image format.
-				if let Some(ref conv) = color_converter
-					&& conv.config().input_format != frame_input_format
-				{
-					tracing::info!(
-						"Input format changed from {:?} to {:?}, recreating color converter",
-						conv.config().input_format,
-						frame_input_format,
-					);
-					color_converter = None;
-				}
-
-				// Initialize converter if needed.
-				let converter = match &mut color_converter {
-					Some(conv) => conv,
-					None => {
+				// Get (or build) a converter for this input format. Cached per
+				// format so switching render paths doesn't rebuild one each frame.
+				let (converter, cached_source) = match color_converters.entry(frame.format) {
+					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+					std::collections::hash_map::Entry::Vacant(e) => {
 						let (color_space, full_range) = match ctx.dynamic_range {
 							VideoDynamicRange::Sdr => (ColorSpace::Bt709, ctx.full_range),
 							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, ctx.full_range),
@@ -950,8 +940,8 @@ impl VideoPipelineInner {
 						config.full_range = full_range;
 						match ColorConverter::new(context.clone(), config) {
 							Ok(conv) => {
-								color_converter = Some(conv);
-								color_converter.as_mut().unwrap()
+								tracing::debug!("Created color converter for input format {frame_input_format:?}");
+								e.insert((conv, None))
 							},
 							Err(e) => {
 								tracing::warn!("Failed to create color converter: {e}");
@@ -1013,6 +1003,9 @@ impl VideoPipelineInner {
 						converter.set_sdr_reference_white_nits(sdr_white_nits);
 					}
 				}
+
+				// Retain the source image; the converter caches a view of it.
+				*cached_source = Some(Arc::clone(&source_import));
 
 				// Convert to YUV.
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {

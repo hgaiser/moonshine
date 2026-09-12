@@ -5,12 +5,41 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [v0.16.0] - 11-09-2026
+
+### Added
+
+- Implement clipboard paste from Moonlight clients, including Unicode text.
+- Add native touch and pen input. (#175, @antomanc)
+- Use low-latency mode for Vulkan video encoding. (#180, @KarlVogel)
+- Expose the external port in the server info response. (#196, @BigDiaB)
+
+### Changed
+
+- Index icon directories once when resolving box art, removing a full recursive filesystem scan per application that froze startup. (#205, @mozvip)
 
 ### Fixed
 
+- Cache color converters per input format, so switching render paths no longer rebuilds them every frame.
+- Treat a client-hidden cursor as hidden when choosing direct scanout, so hiding the cursor no longer forces the GLES compositing path.
+- Impersonate gamescope when launching Steam games so Steam uses its external-overlay mode, fixing the Steam overlay.
+- Honor `xdg-activation` focus requests so Wayland-native games (e.g. Proton with `PROTON_ENABLE_WAYLAND=1`) get keyboard focus instead of the Steam UI keeping it.
+- Hold the focused game window at the output size regardless of its fullscreen hint, so games running below the stream resolution are scaled up to fill the output; dialogs and overlay windows keep their own size.
+- Request an IDR frame when an encoded frame overflows its bitstream buffer, so the next frame is a keyframe and the client's reference chain stays decodable.
+- Wait for the render fence before handing a frame to the encoder, so the encoder no longer reads a stale buffer from the round-robin pool and frames arrive out of order.
+- Bump pixelforge to v0.9.1, fixing AV1 encoding.
+- Give the systemd start job a fixed 90-second timeout decoupled from `launch_timeout_secs`, so a configured `pre_command` isn't cut off.
+- Reject resume requests for stale sessions so Moonlight no longer waits for a reconnect that cannot produce frames. (#185, @brongan)
+- Tolerate audio clock timerfd wakeups with no expirations instead of tearing down the session. (#167, @lutyjj)
+- Drop a PulseAudio client that stops reading instead of letting its outgoing buffer grow without bound and crashing the session. (#184)
+- Don't advertise a default PulseAudio source name, which crashed some native Linux games. (#173, @KarlVogel)
+- Return an empty string instead of null for the PulseAudio source, fixing a crash in Factorio. (#198, @KarlVogel)
+- Make application IDs positive so they are accepted by the Moonlight web client. (#197, @BigDiaB)
+- Ignore the null and unmapped keyboard packets some clients send for touch input, which previously flooded the logs. (#175, @antomanc)
+- Disable nixpkgs' bundled `services/networking/moonshine.nix` from the NixOS module so it can be enabled without conflicting with the upstream module. (#187, #190, @amateurattentionseeker)
 - Read GOG install state from Heroic's `gog_store/installed.json`, which Heroic strips out of the library cache, so the Heroic scanner no longer skips every installed GOG game. (#169, @scottjab)
 - Prefer Heroic's cached cover art over its shortcut icons, so GOG games no longer show a small square store logo as their box art. (#169, @scottjab)
+- Warn when the Heroic store cache cannot be read. (#169, @scottjab)
 
 
 ## [v0.15.0] - 05-08-2026

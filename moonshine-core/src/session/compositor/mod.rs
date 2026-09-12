@@ -440,6 +440,8 @@ fn run_compositor(
 	event_loop
 		.handle()
 		.insert_source(timer, move |_event, _metadata, state: &mut MoonshineCompositor| {
+			// Type a bounded batch of any clipboard text queued since the last tick.
+			input::drain_pending_text(state);
 			state.render_and_export();
 			// Schedule the next frame relative to the ideal wall-clock
 			// target, not relative to "now". This absorbs render-time

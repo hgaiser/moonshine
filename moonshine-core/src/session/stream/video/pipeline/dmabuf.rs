@@ -15,6 +15,9 @@
 //!
 //! Each cache entry holds a `dup` of its fd for the `kcmp(2)` comparison.
 //!
+//! Entries are refcounted: consumers (e.g. `ColorConverter`) hold an `Arc` so
+//! an image is never destroyed while they cache a view of it.
+//!
 //! The startup healthcheck verifies `kcmp(2)` is available; startup is refused
 //! without it.
 
@@ -23,6 +26,7 @@ use pixelforge::VideoContext;
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::io::{BorrowedFd, IntoRawFd};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 
@@ -77,13 +81,16 @@ impl ImportParams {
 }
 
 /// Cached Vulkan resources for a single compositor buffer slot.
-struct CachedImport {
+pub(crate) struct CachedImport {
 	image: vk::Image,
 	memory: vk::DeviceMemory,
 	params: ImportParams,
 	/// Duplicate of the DMA-BUF fd, held for `kcmp(2)` identity checks.
 	fd: OwnedFd,
-	last_used: Instant,
+	/// TTL timestamp; `Mutex` lets a cache hit refresh it through a shared `Arc`.
+	last_used: Mutex<Instant>,
+	/// Own context clone so `Drop` can free resources after the importer is gone.
+	context: VideoContext,
 }
 
 /// Check whether two fds refer to the same open file description via `kcmp(2)`.
@@ -119,9 +126,35 @@ pub(crate) fn same_open_file(a: RawFd, b: RawFd) -> bool {
 }
 
 impl CachedImport {
+	/// The imported Vulkan image.
+	pub(crate) fn image(&self) -> vk::Image {
+		self.image
+	}
+
 	/// Check whether `fd` refers to the same DMA-BUF this entry was imported from.
 	fn is_same_buffer(&self, fd: RawFd) -> bool {
 		same_open_file(self.fd.as_raw_fd(), fd)
+	}
+
+	/// Refresh the TTL timestamp.
+	fn touch(&self, now: Instant) {
+		*self.last_used.lock().expect("CachedImport last_used mutex poisoned") = now;
+	}
+
+	/// Current TTL timestamp.
+	fn last_used(&self) -> Instant {
+		*self.last_used.lock().expect("CachedImport last_used mutex poisoned")
+	}
+}
+
+impl Drop for CachedImport {
+	fn drop(&mut self) {
+		// SAFETY: runs when the last `Arc` drops, so nothing references the image.
+		unsafe {
+			let device = self.context.device();
+			device.destroy_image(self.image, None);
+			device.free_memory(self.memory, None);
+		}
 	}
 }
 
@@ -132,13 +165,11 @@ impl CachedImport {
 pub(crate) struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
-	/// Per-fd cache. Keyed by raw fd because the NVIDIA WSI creates a new
-	/// `wl_buffer` wrapper each frame. Recycled fd numbers are caught by
-	/// `CachedImport::is_same_buffer`, not by the key.
-	cache: HashMap<RawFd, CachedImport>,
-	/// Imports whose fd was recycled for a different buffer, awaiting TTL
-	/// expiry before destruction (in-flight GPU work may still reference them).
-	retired: Vec<CachedImport>,
+	/// Per-fd cache; `is_same_buffer` catches recycled fds. `Arc`s are shared
+	/// with consumers that keep the image alive while caching a view of it.
+	cache: HashMap<RawFd, Arc<CachedImport>>,
+	/// Stale imports awaiting TTL expiry before the importer drops its `Arc`.
+	retired: Vec<Arc<CachedImport>>,
 	/// Calls since the last stale-entry sweep.
 	calls_since_sweep: u32,
 }
@@ -157,10 +188,8 @@ impl DmaBufImporter {
 		})
 	}
 
-	/// Import a DMA-BUF as a Vulkan image, reusing a cached import on hit.
-	///
-	/// Returns `(image, needs_transition)` — `needs_transition` is `true` for
-	/// first-time imports whose image is still in `UNDEFINED` layout.
+	/// Import a DMA-BUF, reusing a cached import on hit. Returns
+	/// `(import, needs_transition)`; the `Arc` pins the image to the caller.
 	pub fn import_or_reuse(
 		&mut self,
 		fd: RawFd,
@@ -168,7 +197,7 @@ impl DmaBufImporter {
 		height: u32,
 		format: vk::Format,
 		planes: &[DmaBufPlane],
-	) -> Result<(vk::Image, bool), String> {
+	) -> Result<(Arc<CachedImport>, bool), String> {
 		self.calls_since_sweep += 1;
 		if self.calls_since_sweep >= SWEEP_INTERVAL_CALLS {
 			self.calls_since_sweep = 0;
@@ -178,23 +207,21 @@ impl DmaBufImporter {
 		let params = ImportParams::new(width, height, format, planes);
 
 		let now = Instant::now();
-		if let Some(cached) = self.cache.get_mut(&fd)
+		if let Some(cached) = self.cache.get(&fd)
 			&& cached.params == params
 			&& cached.is_same_buffer(fd)
 		{
-			cached.last_used = now;
-			return Ok((cached.image, false));
+			cached.touch(now);
+			return Ok((Arc::clone(cached), false));
 		}
 
-		// Cache miss: the fd now points to a different buffer or it was
-		// reconfigured. Retire the stale entry for TTL-deferred destruction
-		// so in-flight GPU work can drain first.
-		if let Some(mut stale) = self.cache.remove(&fd) {
+		// Miss: retire the stale entry for TTL-deferred release.
+		if let Some(stale) = self.cache.remove(&fd) {
 			debug!(
 				"fd {fd} now refers to a different buffer (params {:?} -> {:?}); retiring stale import",
 				stale.params, params
 			);
-			stale.last_used = now;
+			stale.touch(now);
 			self.retired.push(stale);
 		}
 
@@ -210,41 +237,45 @@ impl DmaBufImporter {
 
 		let (image, memory) = self.import_internal(width, height, format, planes)?;
 
-		self.cache.insert(
-			fd,
-			CachedImport {
-				image,
-				memory,
-				params,
-				fd: owned_fd,
-				last_used: now,
-			},
-		);
-		Ok((image, true))
+		let cached = Arc::new(CachedImport {
+			image,
+			memory,
+			params,
+			fd: owned_fd,
+			last_used: Mutex::new(now),
+			context: self.context.clone(),
+		});
+		self.cache.insert(fd, Arc::clone(&cached));
+		Ok((cached, true))
 	}
 
-	/// Free Vulkan resources for entries that haven't been touched in `CACHE_TTL`.
+	/// Move TTL-expired entries to `retired` for one more `CACHE_TTL` before
+	/// releasing the importer's `Arc` (consumers may still pin the image).
 	fn evict_stale(&mut self) {
-		let cutoff = Instant::now() - CACHE_TTL;
-		let device = self.context.device();
-		let destroy_if_expired = |v: &CachedImport| {
-			if v.last_used < cutoff {
-				unsafe {
-					device.destroy_image(v.image, None);
-					device.free_memory(v.memory, None);
-				}
+		let now = Instant::now();
+		let cutoff = now - CACHE_TTL;
+
+		let mut moved = 0usize;
+		let mut expired = Vec::new();
+		self.cache.retain(|_, v| {
+			if v.last_used() < cutoff {
+				v.touch(now);
+				expired.push(Arc::clone(v));
+				moved += 1;
 				false
 			} else {
 				true
 			}
-		};
-		let before = self.cache.len() + self.retired.len();
-		self.cache.retain(|_, v| destroy_if_expired(v));
-		self.retired.retain(destroy_if_expired);
-		let evicted = before - self.cache.len() - self.retired.len();
-		if evicted > 0 {
+		});
+		self.retired.extend(expired);
+
+		let before = self.retired.len();
+		self.retired.retain(|v| v.last_used() >= cutoff);
+		let dropped = before - self.retired.len();
+
+		if moved > 0 || dropped > 0 {
 			trace!(
-				"DmaBufImporter: evicted {evicted} stale cache entries, {} live",
+				"DmaBufImporter: retired {moved} stale cache entries, dropped {dropped} from retired, {} live",
 				self.cache.len()
 			);
 		}
@@ -373,13 +404,9 @@ impl DmaBufImporter {
 
 impl Drop for DmaBufImporter {
 	fn drop(&mut self) {
-		let device = self.context.device();
-		unsafe {
-			for cached in self.cache.drain().map(|(_, v)| v).chain(self.retired.drain(..)) {
-				device.destroy_image(cached.image, None);
-				device.free_memory(cached.memory, None);
-			}
-		}
+		// Releases only the importer's refs; `CachedImport::drop` frees the rest.
+		self.cache.clear();
+		self.retired.clear();
 	}
 }
 
