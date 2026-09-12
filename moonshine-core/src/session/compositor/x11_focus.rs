@@ -42,6 +42,7 @@ pub(crate) struct AppId(pub u32);
 // Predefined X11 atom constants (from X11/Xatom.h).
 // These are built-in atoms with fixed numeric IDs — they do not need interning.
 const XA_CARDINAL: Atom = 6;
+const XA_WINDOW: Atom = 33;
 
 // ---------------------------------------------------------------------------
 // X11 function pointer types
@@ -81,6 +82,14 @@ type FnXChangeProperty = unsafe extern "C" fn(
 	c_int,
 ) -> c_int;
 type FnXDeleteProperty = unsafe extern "C" fn(*mut XDisplay, Window, Atom) -> c_int;
+type FnXQueryTree = unsafe extern "C" fn(
+	*mut XDisplay,
+	Window,           // w
+	*mut Window,      // root_return
+	*mut Window,      // parent_return
+	*mut *mut Window, // children_return
+	*mut u32,         // nchildren_return
+) -> c_int;
 
 // ---------------------------------------------------------------------------
 // XRes FFI types (libXRes.so.1)
@@ -150,6 +159,7 @@ struct LoadedXlib {
 	xdefaultrootwindow: Option<FnXDefaultRootWindow>,
 	xchangeproperty: Option<FnXChangeProperty>,
 	xdeleteproperty: Option<FnXDeleteProperty>,
+	xquerytree: Option<FnXQueryTree>,
 }
 
 static LOADED_XLIB: OnceLock<LoadedXlib> = OnceLock::new();
@@ -279,6 +289,7 @@ fn load_xlib() {
 				xdefaultrootwindow: None,
 				xchangeproperty: None,
 				xdeleteproperty: None,
+				xquerytree: None,
 			};
 		}
 
@@ -304,6 +315,8 @@ fn load_xlib() {
 		let xchangeproperty_ptr = dlsym(lib_ptr, c"XChangeProperty".as_ptr());
 		libc::dlerror();
 		let xdeleteproperty_ptr = dlsym(lib_ptr, c"XDeleteProperty".as_ptr());
+		libc::dlerror();
+		let xquerytree_ptr = dlsym(lib_ptr, c"XQueryTree".as_ptr());
 
 		LoadedXlib {
 			lib: lib_ptr as isize,
@@ -318,6 +331,7 @@ fn load_xlib() {
 			xdefaultrootwindow: sym!(xdefaultrootwindow_ptr, FnXDefaultRootWindow),
 			xchangeproperty: sym!(xchangeproperty_ptr, FnXChangeProperty),
 			xdeleteproperty: sym!(xdeleteproperty_ptr, FnXDeleteProperty),
+			xquerytree: sym!(xquerytree_ptr, FnXQueryTree),
 		}
 	});
 }
@@ -367,11 +381,17 @@ struct CachedAtoms {
 	steam_streaming_client: Atom,
 	steam_streaming_client_video: Atom,
 	steam_legacy_big_picture: Atom,
+	steam_game: Atom,
 	steam_gamescope_vroverlay_target: Atom,
 	gamescope_external_overlay: Atom,
 	gamescopectrl_baselayer_window: Atom,
 	gamescopectrl_baselayer_appid: Atom,
+	gamescope_upscale_scaler: Atom,
+	gamescope_scaling_filter: Atom,
+	steam_screen_scale: Atom,
+	steam_screen_magnification: Atom,
 	wine_hwnd_style: Atom,
+	wine_hwnd_style_ex: Atom,
 	gamescope_focused_app: Atom,
 	gamescope_focusable_apps: Atom,
 	gamescope_focusable_windows: Atom,
@@ -381,6 +401,8 @@ struct CachedAtoms {
 	gamescope_focus_display: Atom,
 	gamescope_mouse_focus_display: Atom,
 	gamescope_keyboard_focus_display: Atom,
+	net_active_window: Atom,
+	wm_state: Atom,
 	utf8_string: Atom,
 }
 
@@ -403,12 +425,18 @@ impl CachedAtoms {
 					steam_overlay: intern_one(b"STEAM_OVERLAY")?,
 					steam_streaming_client: intern_one(b"STEAM_STREAMING_CLIENT")?,
 					steam_streaming_client_video: intern_one(b"STEAM_STREAMING_CLIENT_VIDEO")?,
-					steam_legacy_big_picture: intern_one(b"STEAM_LEGACY_BIG_PICTURE")?,
+					steam_legacy_big_picture: intern_one(b"STEAM_BIGPICTURE")?,
+					steam_game: intern_one(b"STEAM_GAME")?,
 					steam_gamescope_vroverlay_target: intern_one(b"STEAM_GAMESCOPE_VROVERLAY_TARGET")?,
 					gamescope_external_overlay: intern_one(b"GAMESCOPE_EXTERNAL_OVERLAY")?,
 					gamescopectrl_baselayer_window: intern_one(b"GAMESCOPECTRL_BASELAYER_WINDOW")?,
 					gamescopectrl_baselayer_appid: intern_one(b"GAMESCOPECTRL_BASELAYER_APPID")?,
-					wine_hwnd_style: intern_one(b"WINE_HWND_STYLE")?,
+					gamescope_upscale_scaler: intern_one(b"GAMESCOPE_UPSCALE_SCALER")?,
+					gamescope_scaling_filter: intern_one(b"GAMESCOPE_SCALING_FILTER")?,
+					steam_screen_scale: intern_one(b"STEAM_SCREEN_SCALE")?,
+					steam_screen_magnification: intern_one(b"STEAM_SCREEN_MAGNIFICATION")?,
+					wine_hwnd_style: intern_one(b"_WINE_HWND_STYLE")?,
+					wine_hwnd_style_ex: intern_one(b"_WINE_HWND_EXSTYLE")?,
 					gamescope_focused_app: intern_one(b"GAMESCOPE_FOCUSED_APP")?,
 					gamescope_focusable_apps: intern_one(b"GAMESCOPE_FOCUSABLE_APPS")?,
 					gamescope_focusable_windows: intern_one(b"GAMESCOPE_FOCUSABLE_WINDOWS")?,
@@ -418,6 +446,8 @@ impl CachedAtoms {
 					gamescope_focus_display: intern_one(b"GAMESCOPE_FOCUS_DISPLAY")?,
 					gamescope_mouse_focus_display: intern_one(b"GAMESCOPE_MOUSE_FOCUS_DISPLAY")?,
 					gamescope_keyboard_focus_display: intern_one(b"GAMESCOPE_KEYBOARD_FOCUS_DISPLAY")?,
+					net_active_window: intern_one(b"_NET_ACTIVE_WINDOW")?,
+					wm_state: intern_one(b"WM_STATE")?,
 					utf8_string: intern_one(b"UTF8_STRING")?,
 				})
 			}
@@ -598,6 +628,13 @@ impl X11Focus {
 	/// Proton) where Smithay only sends WM_TAKE_FOCUS but never calls
 	/// XSetInputFocus, so the game never receives FocusIn → WM_ACTIVATE.
 	pub fn set_input_focus(&self, window_id: u32) {
+		self.set_input_focus_revert(window_id, 1);
+	}
+
+	/// `XSetInputFocus` with an explicit revert mode. Gamescope uses
+	/// `RevertToNone` for toplevel targets so a focused subwindow reverts to
+	/// its parent rather than stranding focus.
+	pub fn set_input_focus_revert(&self, window_id: u32, revert_mode: i32) {
 		if self.dpy.is_null() {
 			return;
 		}
@@ -610,14 +647,55 @@ impl X11Focus {
 				// A destroyed window will cause BadWindow/BadMatch; without
 				// a handler that terminates the process via the default handler.
 				let prev = seterr(Some(silent_x11_error));
-				// RevertToPointerRoot = 1; CurrentTime = 0
-				set_focus(self.dpy, window_id as Window, 1, 0);
+				set_focus(self.dpy, window_id as Window, revert_mode, 0);
 				flush(self.dpy);
 				seterr(prev);
 			}
-			tracing::debug!(target: "focus", window_id, "set_input_focus: XSetInputFocus called");
+			tracing::debug!(target: "focus", window_id, revert_mode, "set_input_focus: XSetInputFocus called");
 			Some(())
 		});
+	}
+
+	/// Write a format-32 property of the given type with native `long` values.
+	fn write_atom_prop(&self, window_id: Window, atom: Atom, type_atom: Atom, values: &[libc_c_long]) {
+		if self.dpy.is_null() {
+			return;
+		}
+		with_xlib(|loaded| {
+			let seterr = loaded.xseterrorhandler?;
+			let change = loaded.xchangeproperty?;
+			unsafe {
+				let prev = seterr(Some(silent_x11_error));
+				change(
+					self.dpy,
+					window_id,
+					atom,
+					type_atom,
+					32,
+					0,
+					values.as_ptr() as *const c_void,
+					values.len() as c_int,
+				);
+				seterr(prev);
+			}
+			Some(())
+		});
+	}
+
+	/// Publish `_NET_ACTIVE_WINDOW` on the root window. Wine >= 10 treats it as
+	/// the foreground window, so it must track real keyboard focus.
+	pub fn set_net_active_window(&self, window_id: u32) {
+		self.write_atom_prop(
+			self.root,
+			self.atoms.net_active_window,
+			XA_WINDOW,
+			&[window_id as libc_c_long],
+		);
+	}
+
+	/// Set `WM_STATE` to `ICCCM_NORMAL_STATE` (1). Gamescope: `set_wm_state()`.
+	pub fn set_wm_state_normal(&self, window_id: u32) {
+		self.write_atom_prop(window_id as Window, self.atoms.wm_state, self.atoms.wm_state, &[1, 0]);
 	}
 
 	/// Read all focus control data at once.
@@ -636,6 +714,93 @@ impl X11Focus {
 		let app_ids = self.read_cardinal_array_prop(self.root, self.atoms.gamescopectrl_baselayer_appid, 1024);
 		let app_ids: Vec<AppId> = app_ids.into_iter().map(AppId).collect();
 		Some(FocusControl { window, app_ids })
+	}
+
+	/// Return `window_id` followed by its X11 ancestors, stopping at (and
+	/// excluding) the root window.
+	///
+	/// Smithay's XWM reparents clients into frame windows, so the root's child
+	/// is a frame the compositor does not render. Walking the chain lets the
+	/// caller pick the ancestor it actually manages.
+	pub fn get_ancestor_chain(&self, window_id: u32) -> Vec<u32> {
+		let mut chain = Vec::new();
+		if self.dpy.is_null() || window_id == 0 {
+			return chain;
+		}
+		with_xlib(|loaded| {
+			let query_tree = loaded.xquerytree?;
+			let free = loaded.xfree?;
+			let seterr = loaded.xseterrorhandler?;
+			unsafe {
+				// A window can be destroyed between steps (or before the walk),
+				// which makes XQueryTree raise BadWindow. Suppress it like the
+				// property readers do, otherwise Xlib's default handler aborts.
+				let prev = seterr(Some(silent_x11_error));
+				let mut current = window_id as Window;
+				loop {
+					let mut root: Window = 0;
+					let mut parent: Window = 0;
+					let mut children: *mut Window = std::ptr::null_mut();
+					let mut nchildren: u32 = 0;
+					if query_tree(self.dpy, current, &mut root, &mut parent, &mut children, &mut nchildren) == 0 {
+						if !children.is_null() {
+							free(children as *mut c_void);
+						}
+						break;
+					}
+					if !children.is_null() {
+						free(children as *mut c_void);
+					}
+					chain.push(current as u32);
+					if parent == root || parent == 0 {
+						break;
+					}
+					current = parent;
+				}
+				seterr(prev);
+			}
+			Some(())
+		});
+		chain
+	}
+
+	/// Read the `GAMESCOPE_UPSCALE_SCALER` atom from the root window.
+	///
+	/// Returns `None` when the property is not set.
+	pub fn get_upscale_scaler(&self) -> Option<u32> {
+		if self.dpy.is_null() {
+			return None;
+		}
+		let value = self.read_cardinal_prop_by_atom(self.root, self.atoms.gamescope_upscale_scaler, u32::MAX);
+		if value == u32::MAX { None } else { Some(value) }
+	}
+
+	/// Read the `GAMESCOPE_SCALING_FILTER` atom from the root window.
+	///
+	/// Returns `None` when the property is not set.
+	pub fn get_scaling_filter(&self) -> Option<u32> {
+		if self.dpy.is_null() {
+			return None;
+		}
+		let value = self.read_cardinal_prop_by_atom(self.root, self.atoms.gamescope_scaling_filter, u32::MAX);
+		if value == u32::MAX { None } else { Some(value) }
+	}
+
+	/// The overscan × magnification scale, normally 1.0.
+	///
+	/// `STEAM_SCREEN_SCALE` and `STEAM_SCREEN_MAGNIFICATION` are full-scale at
+	/// `0xFFFFFFFF` and `0xFFFF` respectively.
+	pub fn get_global_scale(&self) -> f64 {
+		if self.dpy.is_null() {
+			return 1.0;
+		}
+		const FULL_SCALE: u32 = u32::MAX;
+		const FULL_ZOOM: u32 = 0xFFFF;
+		let overscan = self.read_cardinal_prop_by_atom(self.root, self.atoms.steam_screen_scale, FULL_SCALE) as f64
+			/ FULL_SCALE as f64;
+		let zoom = self.read_cardinal_prop_by_atom(self.root, self.atoms.steam_screen_magnification, FULL_ZOOM) as f64
+			/ FULL_ZOOM as f64;
+		overscan * zoom
 	}
 
 	/// Read the PID for the client owning an X11 window.
@@ -823,22 +988,33 @@ impl X11Focus {
 		.unwrap_or(0)
 	}
 
-	/// Read the STEAM_LEGACY_BIG_PICTURE window property.
+	/// Read the `STEAM_BIGPICTURE` window property.
 	/// Returns true if the window is a Steam Big Picture Mode window.
 	///
-	/// Gamescope: reads `steamLegacyBigPictureAtom` property.
+	/// Gamescope: reads `steamAtom` (`STEAM_BIGPICTURE`).
 	/// Steam Big Picture windows get app_id = 769.
 	pub fn is_steam_big_picture(&self, window_id: u32) -> bool {
 		self.read_cardinal_prop_by_atom(window_id as Window, self.atoms.steam_legacy_big_picture, 0) != 0
 	}
 
-	/// Read the WINE_HWND_STYLE window property.
+	/// Read the `STEAM_GAME` window property: the Steam app id the window
+	/// belongs to (0 when unset). Gamescope: `steamAppID`.
+	pub fn get_steam_app_id(&self, window_id: u32) -> u32 {
+		self.read_cardinal_prop_by_atom(window_id as Window, self.atoms.steam_game, 0)
+	}
+
+	/// Read the `_WINE_HWND_STYLE` window property.
 	/// Returns the window style bits if set, 0 otherwise.
 	///
-	/// Gamescope: reads `wineHwndStyleAtom` property.
-	/// WS_DISABLED = 0x80000000 bit indicates a disabled window.
+	/// `WS_DISABLED` (0x80000000) indicates a disabled window.
 	pub fn get_window_style(&self, window_id: u32) -> u32 {
 		self.read_cardinal_prop_by_atom(window_id as Window, self.atoms.wine_hwnd_style, 0)
+	}
+
+	/// Read the `_WINE_HWND_EXSTYLE` window property.
+	/// Returns the extended style bits if set, 0 otherwise.
+	pub fn get_window_style_ex(&self, window_id: u32) -> u32 {
+		self.read_cardinal_prop_by_atom(window_id as Window, self.atoms.wine_hwnd_style_ex, 0)
 	}
 
 	/// Write a single CARDINAL (format-32) value to a window property.

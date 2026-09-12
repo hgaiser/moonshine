@@ -180,7 +180,8 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 				y as f64
 			};
 
-			state.cursor_position = Point::from((new_x, new_y));
+			// Input is in output coordinates; the scene may be scaled.
+			state.cursor_position = state.output_to_scene(Point::from((new_x, new_y)));
 			clamp_cursor(state);
 
 			let under = find_surface_under(state);
@@ -199,7 +200,8 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 		CompositorInputEvent::MouseMoveRelative { dx, dy } => {
 			tracing::trace!(target: "input", "Mouse relative: ({dx}, {dy})");
 
-			let delta = Point::from((dx as f64, dy as f64));
+			let (rx, ry) = state.scene_input_ratio();
+			let delta = Point::from((dx as f64 * rx, dy as f64 * ry));
 			let pointer = state.seat.get_pointer().expect("pointer should exist");
 
 			// Check for pointer constraints (lock/confine).
@@ -837,7 +839,7 @@ fn find_surface_at(
 			// Native Wayland path (x11_win == 0): the override surface is a
 			// fullscreen bypass surface at the output origin.  Route pointer
 			// events directly to it so the application receives input.
-			if let Some((ref override_surface, _, _)) = state.override_surface {
+			if let Some((ref override_surface, _)) = state.override_surface {
 				return Some((override_surface.clone(), Point::from((0.0, 0.0))));
 			}
 		}

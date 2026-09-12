@@ -103,8 +103,38 @@ pub(crate) struct WindowMetadata {
 	/// for "SteamLaunch AppId=N" in the parent process chain.
 	pub app_id: u32,
 
+	/// `STEAM_GAME` property: the app id the window belongs to (0 when unset).
+	/// Mirrors `steamcompmgr_win_t::steamAppID`.
+	pub steam_app_id: u32,
+
+	/// `STEAM_LEGACY_BIG_PICTURE` property set. Mirrors
+	/// `steamcompmgr_win_t::isSteamLegacyBigPicture`.
+	pub steam_legacy_big_picture: bool,
+
+	/// Raw `STEAM_OVERLAY` property: the window is a Steam overlay/notification
+	/// before the interactive/notification split. Mirrors `steamcompmgr_win_t::isOverlay`.
+	pub is_overlay: bool,
+
+	/// `_WINE_HWND_STYLE`/`_WINE_HWND_EXSTYLE` were present.
+	pub has_hwnd_style: bool,
+	pub has_hwnd_style_ex: bool,
+
+	/// X11 map_state == IsViewable.
+	pub map_state_viewable: bool,
+
+	/// X11 window c_class == InputOutput (false for InputOnly).
+	pub class_input_output: bool,
+
+	/// Set when the window was picked while it had no committed buffer, so the
+	/// real presenting focus can lag until it draws. Gamescope:
+	/// `steamcompmgr_win_t::outdatedInteractiveFocus`.
+	pub outdated_interactive_focus: bool,
+
 	/// X11 window ID of this window (None for Wayland-only windows).
 	pub x11_window_id: Option<u32>,
+
+	/// Owning client PID (0 when unknown).
+	pub pid: u32,
 
 	/// X11 window ID of the transient-for parent (None = no parent).
 	pub transient_for: Option<u32>,
@@ -121,8 +151,15 @@ pub(crate) struct WindowMetadata {
 	/// Window identified as a dropdown candidate (popup menu, etc.).
 	pub maybe_a_dropdown: bool,
 
-	/// Window is disabled (WS_DISABLED style).
-	pub disabled: bool,
+	/// Fixed requested size from min==max size hints (0 when unset).
+	pub requested_width: u32,
+	pub requested_height: u32,
+
+	/// `_WINE_HWND_STYLE` bits (0 when unset).
+	pub hwnd_style: u32,
+
+	/// `_WINE_HWND_EXSTYLE` bits (0 when unset).
+	pub hwnd_style_ex: u32,
 
 	/// Monotonically increasing sequence number assigned at window map time.
 	/// Used as a tiebreaker for game windows.
@@ -171,27 +208,64 @@ impl WindowMetadata {
 	}
 
 	/// Returns `true` if the window is override-redirect.
-	/// Gamescope: `win_is_override_redirect()`
+	/// Gamescope: `win_is_override_redirect()` — ignores 1x1 "useless" windows.
 	pub fn is_override_redirect(&self) -> bool {
-		self.override_redirect
+		self.override_redirect && !self.is_useless()
 	}
 
-	/// Returns `true` if the window is 1x1 ("useless").
-	/// Gamescope: `win_is_useless()`
+	/// Returns `true` if the window is a system tray icon or 1x1 ("useless").
 	pub fn is_useless(&self) -> bool {
-		self.geometry.size.w == 1 && self.geometry.size.h == 1
+		self.flags.contains(WindowFlags::SYS_TRAY_ICON) || (self.geometry.size.w == 1 && self.geometry.size.h == 1)
 	}
 
 	/// Returns `true` if the window is a dropdown candidate.
-	/// Gamescope: `win_maybe_a_dropdown()`
 	pub fn is_dropdown(&self) -> bool {
-		self.maybe_a_dropdown || (self.is_override_redirect() && !self.is_useless())
+		// Warframe (230410): positioned transient popups with skip flags.
+		if self.app_id == 230410
+			&& self.maybe_a_dropdown
+			&& self.transient_for.is_some()
+			&& (self.skip_pager || self.skip_taskbar)
+		{
+			return !self.is_useless();
+		}
+		// Antichamber (219890) splash screen.
+		if self.app_id == 219890 {
+			return false;
+		}
+
+		// WS_EX_CONTROLPARENT | WS_EX_LAYERED, excluding WS_EX_APPWINDOW.
+		const WS_EX_CONTROLPARENT: u32 = 0x0001_0000;
+		const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+		const WS_EX_LAYERED: u32 = 0x0008_0000;
+		if self.has_hwnd_style_ex
+			&& (self.hwnd_style_ex & (WS_EX_CONTROLPARENT | WS_EX_LAYERED)) == (WS_EX_CONTROLPARENT | WS_EX_LAYERED)
+			&& self.hwnd_style_ex & WS_EX_APPWINDOW == 0
+		{
+			return true;
+		}
+
+		// Forza Horizon 4/5 background window.
+		if (self.app_id == 1293830 || self.app_id == 1551360)
+			&& self.maybe_a_dropdown
+			&& self.requested_width == 0
+			&& self.requested_height == 0
+		{
+			return false;
+		}
+
+		let valid_maybe_a_dropdown = self.maybe_a_dropdown
+			&& ((!self.is_dialog || (self.transient_for.is_none() && self.skip_and_not_fullscreen()))
+				&& (self.skip_pager || self.skip_taskbar));
+
+		(valid_maybe_a_dropdown || self.is_override_redirect()) && !self.is_useless()
 	}
 
-	/// Returns `true` if the window is disabled.
-	/// Gamescope: `win_is_disabled()`
+	/// Returns `true` if the window is disabled (`WS_DISABLED`, 0x80000000).
 	pub fn is_disabled(&self) -> bool {
-		self.disabled
+		if !self.has_hwnd_style {
+			return false;
+		}
+		self.hwnd_style & 0x8000_0000 != 0
 	}
 
 	/// Returns `true` if this is a Steam Big Picture window.
@@ -200,15 +274,22 @@ impl WindowMetadata {
 		self.app_id == crate::session::compositor::x11_focus::STEAM_BIG_PICTURE_APPID
 	}
 
+	/// Returns `true` if the window is Steam's own UI.
+	/// Gamescope: `window_is_steam()` — legacy BPM flag or app id 769.
+	pub fn is_steam(&self) -> bool {
+		self.steam_legacy_big_picture || self.app_id == crate::session::compositor::x11_focus::STEAM_BIG_PICTURE_APPID
+	}
+
 	/// Returns `true` if the window should be held at the output size.
 	///
-	/// Gamescope holds the focus window at the output size regardless of the
-	/// fullscreen hint, so a game running below the stream resolution is
-	/// scaled up to fill the whole output. Only the main window qualifies —
-	/// dialogs, dropdowns, and Steam overlay/notification windows keep their
-	/// own size.
+	/// Only a window that actually went fullscreen is held at the output size;
+	/// a windowed launcher (e.g. Rockstar Games Launcher at 1280x600) keeps its
+	/// own size and is scaled by the compositor instead. Steam Big Picture
+	/// counts even without the fullscreen state set. Dialogs, dropdowns, and
+	/// overlay/notification windows keep their own size.
 	pub fn should_fill_output(&self) -> bool {
-		self.has_game_id()
+		(self.fullscreen || self.is_steam_big_picture())
+			&& self.has_game_id()
 			&& self.transient_for.is_none()
 			&& !self.is_dropdown()
 			&& !self
@@ -289,14 +370,88 @@ pub(crate) fn get_window_priority_key(
 	)
 }
 
+/// Returns `true` if the window is treated as its own "connector" under the
+/// given strategy, in which case transient links are not followed for focus.
+/// Gamescope: `win_treat_as_per_window()`.
+pub(crate) fn win_treat_as_per_window(
+	meta: &WindowMetadata,
+	strategy: crate::session::compositor::VirtualConnectorStrategy,
+) -> bool {
+	use crate::session::compositor::VirtualConnectorStrategy;
+	match strategy {
+		VirtualConnectorStrategy::PerWindow => true,
+		VirtualConnectorStrategy::PerAppId => meta.app_id == 0,
+		VirtualConnectorStrategy::SingleApplication | VirtualConnectorStrategy::SteamControlled => false,
+	}
+}
+
+/// Reserved bit marking a non-Steam window key. Gamescope:
+/// `k_ulNonSteamWindowBit`.
+const NON_STEAM_WINDOW_BIT: u64 = 1 << 63;
+/// Reserved bit used by the Steam bootstrapper key. Gamescope: `k_ulReservedBit`.
+const RESERVED_BIT: u64 = 1 << 62;
+
+/// The virtual connector key for a window under the given strategy.
+/// Gamescope: `steamcompmgr_win_t::GetVirtualConnectorKey()`.
+pub(crate) fn virtual_connector_key(
+	meta: &WindowMetadata,
+	strategy: crate::session::compositor::VirtualConnectorStrategy,
+) -> u64 {
+	use crate::session::compositor::VirtualConnectorStrategy;
+	match strategy {
+		VirtualConnectorStrategy::SingleApplication | VirtualConnectorStrategy::SteamControlled => 0,
+		VirtualConnectorStrategy::PerAppId => {
+			if meta.steam_legacy_big_picture {
+				1 | RESERVED_BIT
+			} else if meta.app_id != 0 {
+				meta.app_id as u64
+			} else {
+				NON_STEAM_WINDOW_BIT | meta.map_sequence
+			}
+		},
+		VirtualConnectorStrategy::PerWindow => meta.map_sequence,
+	}
+}
+
+/// Returns `true` if two windows belong to the same app (by app id or Steam
+/// game id).
+pub(crate) fn windows_share_app(a: &WindowMetadata, b: &WindowMetadata) -> bool {
+	(a.app_id != 0 && a.app_id == b.app_id) || (a.steam_app_id != 0 && a.steam_app_id == b.steam_app_id)
+}
+
+/// Same-app override-redirect windows from another process are decorations
+/// (e.g. a highlight overlay), not dropdowns.
+pub(crate) fn is_same_app_override_decoration(candidate: &WindowMetadata, focus: &WindowMetadata) -> bool {
+	if candidate.pid == focus.pid || !windows_share_app(candidate, focus) {
+		return false;
+	}
+	// WS_EX_LAYERED | WS_EX_TRANSPARENT
+	const WS_EX_LAYERED: u32 = 0x0008_0000;
+	const WS_EX_TRANSPARENT: u32 = 0x0000_0020;
+	candidate.is_override_redirect()
+		&& candidate.has_hwnd_style_ex
+		&& (candidate.hwnd_style_ex & (WS_EX_LAYERED | WS_EX_TRANSPARENT)) == (WS_EX_LAYERED | WS_EX_TRANSPARENT)
+}
+
+/// Returns `true` if `override` is a valid override slot for `focus`.
+pub(crate) fn is_good_override_candidate(override_meta: &WindowMetadata, focus: &WindowMetadata) -> bool {
+	let rect = override_meta.geometry;
+	if is_same_app_override_decoration(override_meta, focus) {
+		return false;
+	}
+	if override_meta.pid != focus.pid && !windows_share_app(override_meta, focus) {
+		return false;
+	}
+	override_meta.x11_window_id != focus.x11_window_id
+		&& (rect.loc.x + rect.size.w) > 0
+		&& (rect.loc.y + rect.size.h) > 0
+}
+
 /// Focus state for the compositor. Tracks whether focus needs reevaluation.
 #[derive(Debug, Default)]
 pub(crate) struct FocusState {
 	/// Whether focus needs to be recalculated.
 	dirty: bool,
-	/// X11 window ID that most recently sent `_NET_ACTIVE_WINDOW`.
-	/// Cleared after being consumed by `pick_best_candidate`.
-	requested_focus_window: Option<u32>,
 	/// Wayland surface that requested activation via `xdg-activation`.
 	requested_focus_surface: Option<WlSurface>,
 }
@@ -313,32 +468,6 @@ impl FocusState {
 	pub fn apply(&mut self) {
 		tracing::trace!(target: "focus", "FocusState applied (cleaned)");
 		self.dirty = false;
-	}
-
-	/// Store an explicit focus request from a `_NET_ACTIVE_WINDOW` client message.
-	/// Replaces any previously pending request.
-	/// Marks focus dirty so the request is honoured on the next evaluation cycle.
-	pub fn set_requested_focus(&mut self, window_id: u32) {
-		tracing::debug!(target: "focus", window_id, "_NET_ACTIVE_WINDOW: storing explicit focus request");
-		self.requested_focus_window = Some(window_id);
-		self.mark_dirty();
-	}
-
-	// /// Consume and return the pending `_NET_ACTIVE_WINDOW` focus request, if any.
-	// /// Returns `None` if no explicit request is pending.
-	// pub fn take_requested_focus(&mut self) -> Option<u32> {
-	// 	self.requested_focus_window.take()
-	// }
-
-	/// Peek at the pending `_NET_ACTIVE_WINDOW` focus request without consuming it.
-	/// Returns `None` if no explicit request is pending.
-	pub fn peek_requested_focus(&self) -> Option<u32> {
-		self.requested_focus_window
-	}
-
-	/// Clear the pending `_NET_ACTIVE_WINDOW` focus request.
-	pub fn clear_requested_focus(&mut self) {
-		self.requested_focus_window = None;
 	}
 
 	/// Store an explicit focus request from an `xdg-activation` request.
@@ -369,9 +498,14 @@ mod tests {
 		for &(key, val) in fields {
 			match key {
 				"app_id" => m.app_id = val.parse().unwrap(),
+				"steam_app_id" => m.steam_app_id = val.parse().unwrap(),
+				"steam_legacy_big_picture" => m.steam_legacy_big_picture = val.parse().unwrap(),
 				"override_redirect" => m.override_redirect = val.parse().unwrap(),
 				"maybe_a_dropdown" => m.maybe_a_dropdown = val.parse().unwrap(),
-				"disabled" => m.disabled = val.parse().unwrap(),
+				"disabled" => {
+					m.has_hwnd_style = true;
+					m.hwnd_style = if val.parse().unwrap() { 0x8000_0000 } else { 0 };
+				},
 				"is_dialog" => m.is_dialog = val.parse().unwrap(),
 				"is_x11" => m.is_x11 = val.parse().unwrap(),
 				"skip_taskbar" => m.skip_taskbar = val.parse().unwrap(),
@@ -388,9 +522,14 @@ mod tests {
 	}
 
 	#[test]
-	fn test_game_is_held_at_output_size_without_the_fullscreen_state() {
+	fn test_steam_big_picture_is_held_at_output_size_without_the_fullscreen_state() {
 		assert!(make_meta(&[("app_id", "769")]).should_fill_output());
-		assert!(make_meta(&[("app_id", "12345")]).should_fill_output());
+	}
+
+	#[test]
+	fn test_a_windowed_game_keeps_its_own_size_until_fullscreen() {
+		assert!(!make_meta(&[("app_id", "12345")]).should_fill_output());
+		assert!(make_meta(&[("app_id", "12345"), ("fullscreen", "true")]).should_fill_output());
 	}
 
 	#[test]
@@ -595,5 +734,54 @@ mod tests {
 			("height", "100"),
 		]);
 		assert!(get_window_priority_key(&non_dialog) > get_window_priority_key(&dialog));
+	}
+
+	#[test]
+	fn test_windows_share_app_by_steam_game_id() {
+		let a = make_meta(&[("app_id", "0"), ("steam_app_id", "12345")]);
+		let b = make_meta(&[("app_id", "0"), ("steam_app_id", "12345")]);
+		let c = make_meta(&[("app_id", "0"), ("steam_app_id", "999")]);
+		assert!(windows_share_app(&a, &b));
+		assert!(!windows_share_app(&a, &c));
+	}
+
+	#[test]
+	fn test_legacy_big_picture_is_steam() {
+		assert!(make_meta(&[("app_id", "0"), ("steam_legacy_big_picture", "true")]).is_steam());
+		assert!(make_meta(&[("app_id", "769")]).is_steam());
+		assert!(!make_meta(&[("app_id", "12345")]).is_steam());
+	}
+
+	#[test]
+	fn test_one_by_one_override_is_not_override_redirect() {
+		let one_by_one = make_meta(&[("override_redirect", "true"), ("width", "1"), ("height", "1")]);
+		assert!(!one_by_one.is_override_redirect());
+		let normal = make_meta(&[("override_redirect", "true"), ("width", "100"), ("height", "100")]);
+		assert!(normal.is_override_redirect());
+	}
+
+	#[test]
+	fn test_disabled_requires_the_wine_style_property() {
+		// `hwnd_style` set without `has_hwnd_style` must not count as disabled.
+		let m = WindowMetadata {
+			hwnd_style: 0x8000_0000,
+			..Default::default()
+		};
+		assert!(!m.is_disabled());
+	}
+
+	#[test]
+	fn test_per_window_strategy_treats_every_window_as_its_own_connector() {
+		use crate::session::compositor::VirtualConnectorStrategy;
+		let m = make_meta(&[("app_id", "12345"), ("map_sequence", "7")]);
+		assert!(win_treat_as_per_window(&m, VirtualConnectorStrategy::PerWindow));
+		assert!(!win_treat_as_per_window(&m, VirtualConnectorStrategy::SteamControlled));
+		assert!(!win_treat_as_per_window(
+			&m,
+			VirtualConnectorStrategy::SingleApplication
+		));
+		assert_eq!(virtual_connector_key(&m, VirtualConnectorStrategy::PerWindow), 7);
+		assert_eq!(virtual_connector_key(&m, VirtualConnectorStrategy::SteamControlled), 0);
+		assert_eq!(virtual_connector_key(&m, VirtualConnectorStrategy::PerAppId), 12345);
 	}
 }

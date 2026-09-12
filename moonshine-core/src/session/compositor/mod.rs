@@ -12,6 +12,7 @@ mod gamescope_swapchain;
 mod handlers;
 pub(crate) mod input;
 mod protocols;
+mod scaling;
 mod state;
 mod x11_focus;
 
@@ -56,6 +57,29 @@ impl Default for KeyboardConfig {
 	}
 }
 
+/// How focus is split between windows. Mirrors gamescope's
+/// `VirtualConnectorStrategy` (`backend_virtual_connector_strategy`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VirtualConnectorStrategy {
+	/// One focus across the whole output; the highest-priority window wins.
+	#[default]
+	SingleApplication,
+	/// Steam names the focus window/app-id list.
+	SteamControlled,
+	/// One focus per app id.
+	PerAppId,
+	/// One focus per window.
+	PerWindow,
+}
+
+impl VirtualConnectorStrategy {
+	/// Strategies that only ever drive a single output/connector.
+	pub fn is_single_output(self) -> bool {
+		matches!(self, Self::SingleApplication | Self::SteamControlled)
+	}
+}
+
 /// Configuration for the embedded headless compositor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -66,6 +90,16 @@ pub struct CompositorConfig {
 	/// Whether to enable HDR mode in the compositor if the client supports it.
 	pub hdr: bool,
 
+	/// Steam integration mode, equivalent to gamescope's `-e`. Promotes the
+	/// connector strategy to [`VirtualConnectorStrategy::SteamControlled`] and
+	/// enables Steam's window filtering.
+	pub steam_mode: bool,
+
+	/// Focus split strategy, equivalent to gamescope's
+	/// `backend_virtual_connector_strategy`. Only meaningful without
+	/// `steam_mode`/multiple outputs.
+	pub virtual_connector_strategy: VirtualConnectorStrategy,
+
 	/// Keyboard configuration for the compositor's XKB state.
 	pub keyboard: KeyboardConfig,
 }
@@ -75,6 +109,8 @@ impl Default for CompositorConfig {
 		Self {
 			gpu: None,
 			hdr: true,
+			steam_mode: true,
+			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
 			keyboard: KeyboardConfig::default(),
 		}
 	}
@@ -377,6 +413,8 @@ fn run_compositor(
 		ready_tx,
 		&render_node,
 		hdr,
+		config.steam_mode,
+		config.virtual_connector_strategy,
 		config.keyboard.clone(),
 	);
 

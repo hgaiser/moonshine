@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 
 use smithay::reexports::wayland_server::Resource;
+use smithay::wayland::seat::WaylandFocus;
 
 use smithay::backend::allocator::dmabuf::{AsDmabuf, Dmabuf};
 use smithay::backend::allocator::gbm::GbmAllocator;
@@ -16,10 +17,11 @@ use smithay::backend::allocator::{Allocator, Buffer, Fourcc, Modifier};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
+use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement, RescaleRenderElement};
 use smithay::backend::renderer::element::{AsRenderElements, Element, Id, Kind, RenderElement};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions, with_renderer_surface_state};
-use smithay::backend::renderer::{Bind, BufferType, ImportDma};
+use smithay::backend::renderer::{Bind, BufferType, ImportDma, Renderer};
 use smithay::desktop::space::SpaceRenderElements;
 use smithay::desktop::utils::send_frames_surface_tree;
 use smithay::desktop::utils::{OutputPresentationFeedback, take_presentation_feedback_surface_tree};
@@ -193,6 +195,9 @@ impl From<PointerRenderElement<GlesRenderer>> for OutputRenderElements {
 	}
 }
 
+/// A composed element with an output scaling and centering transform applied.
+type ScaledOutputElement = RelocateRenderElement<RescaleRenderElement<OutputRenderElements>>;
+
 /// Central compositor state for Moonshine's headless compositor.
 ///
 /// Runs on a dedicated calloop thread. All Smithay delegate_*! macros
@@ -316,13 +321,24 @@ pub(crate) struct MoonshineCompositor {
 	/// Whether HDR mode is active for this session.
 	pub hdr: bool,
 
+	/// Steam integration mode (gamescope's `-e`). Promotes the connector
+	/// strategy to `SteamControlled` and enables Steam window filtering.
+	pub steam_mode: bool,
+
+	/// Focus split strategy (gamescope's `backend_virtual_connector_strategy`).
+	pub virtual_connector_strategy: super::VirtualConnectorStrategy,
+
 	// -- WSI layer --
-	/// Override surface from gamescope_swapchain.
-	/// When set, this surface is rendered instead of the original X11 window.
-	/// The u32 is the associated X11 window ID (0 for native Wayland).
-	/// WSI override surface `(surface, focus_key, render_window)` — focus_key may
-	/// be the Steam UI while render_window is the game that actually presents.
-	pub override_surface: Option<(WlSurface, u32, u32)>,
+	/// WSI override surface `(surface, render_window)`, where `render_window` is
+	/// the resolved X11 toplevel of the window the swapchain was created on
+	/// (0 for native Wayland).  When set, this surface is rendered instead of
+	/// that window's X11 content.
+	pub override_surface: Option<(WlSurface, u32)>,
+
+	/// X11 window the WSI layer reported for the current override surface (the
+	/// swapchain window, often a child of the rendered toplevel). Kept so the
+	/// target can be re-resolved when its window maps later.
+	pub override_reported_window: u32,
 
 	/// X11 window ID of the currently focused window (from Smithay's keyboard focus).
 	/// Used by the WSI layer to match override surfaces to focused windows.
@@ -333,12 +349,27 @@ pub(crate) struct MoonshineCompositor {
 	/// especially for Wayland→Wayland transitions where focused_x11_window
 	/// would be None for both old and new.
 	pub focused_window: Option<smithay::desktop::Window>,
+	/// Scaling mode used to fit the focused window to the output.
+	pub upscale_scaler: super::scaling::UpscaleScaler,
+	/// Texture filter used when scaling.
+	pub upscale_filter: smithay::backend::renderer::TextureFilter,
+	/// Overscan × magnification scale (`STEAM_SCREEN_SCALE` ×
+	/// `STEAM_SCREEN_MAGNIFICATION`), normally 1.0.
+	pub global_scale: f64,
 
 	/// Currently active override window (dropdown, menu, tooltip).
 	/// Override windows are visually raised and may receive keyboard input
 	/// while the primary focus remains on the main game window.
 	/// Gamescope: `steamcompmgr_win_t::overrideWindow`
 	pub override_window: Option<smithay::desktop::Window>,
+
+	/// Previous override kept painted under a nested popup so it does not blink
+	/// out. Gamescope: `focus_t::overrideUnderlayWindow`.
+	pub override_underlay_window: Option<smithay::desktop::Window>,
+
+	/// Same-app decoration windows painted above the focus window.
+	/// Gamescope: `focus_t::decorationWindows`.
+	pub decoration_windows: Vec<smithay::desktop::Window>,
 
 	/// Currently active Steam overlay window (width > 1200 + STEAM_OVERLAY).
 	/// Gamescope: `focus_t::overlayWindow` — the main Steam overlay window.
@@ -356,6 +387,17 @@ pub(crate) struct MoonshineCompositor {
 	/// Separate from keyboard focus when an overlay has `inputFocusMode != 0`.
 	/// Gamescope: `focus_t::inputFocusWindow` — where pointer/mouse events go.
 	pub pointer_focus_window: Option<smithay::desktop::Window>,
+
+	/// Window that currently receives X input focus (gamescope's
+	/// `focus_t::inputFocusWindow`), separate from the presented focus.
+	pub input_focus_window: Option<smithay::desktop::Window>,
+
+	/// X11 window ID last focused by the X server (gamescope's
+	/// `currentKeyboardFocusWindow`).
+	pub current_keyboard_focus_window: Option<u32>,
+
+	/// `STEAM_INPUT_FOCUS` of the input focus window last applied.
+	pub input_focus_mode: u32,
 
 	/// Monotonically increasing damage sequence counter. Incremented on each
 	/// surface commit for game windows (app_id != 0). Used to detect when
@@ -381,6 +423,11 @@ pub(crate) struct MoonshineCompositor {
 	/// the last time it was applied, avoiding unnecessary recalculation.
 	/// Gamescope: `focus_t::ulCurrentFocusSerial` + `MakeFocusDirty()`.
 	pub focus_state: super::focus::FocusState,
+
+	/// Last-seen Steam focus control `(window, app_ids)` from the root window.
+	/// Polled once per frame; a change re-evaluates focus. Gamescope receives a
+	/// root PropertyNotify instead.
+	pub last_focus_control: Option<(Option<u32>, Vec<u32>)>,
 
 	/// Metadata for each window, used for focus priority decisions.
 	/// Mirrors the fields from `steamcompmgr_win_t` in gamescope.
@@ -452,6 +499,8 @@ impl MoonshineCompositor {
 		xdisplay_tx: mpsc::SyncSender<super::CompositorReady>,
 		render_node: &std::path::Path,
 		hdr: bool,
+		steam_mode: bool,
+		virtual_connector_strategy: super::VirtualConnectorStrategy,
 		keyboard_config: KeyboardConfig,
 	) -> (Self, Display<Self>) {
 		let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
@@ -643,19 +692,31 @@ impl MoonshineCompositor {
 				wayland_socket_token: Some(wayland_socket_token),
 				wayland_display,
 				hdr: hdr_active,
+				steam_mode,
+				virtual_connector_strategy,
 				override_surface: None,
+				override_reported_window: 0,
 				focused_x11_window: None,
 				focused_window: None,
+				upscale_scaler: super::scaling::UpscaleScaler::from_env(),
+				upscale_filter: smithay::backend::renderer::TextureFilter::Linear,
+				global_scale: 1.0,
 				override_window: None,
+				override_underlay_window: None,
+				decoration_windows: Vec::new(),
 				overlay_window: None,
 				notification_window: None,
 				external_overlay_window: None,
 				pointer_focus_window: None,
+				input_focus_window: None,
+				current_keyboard_focus_window: None,
+				input_focus_mode: 0,
 				damage_sequence_counter: 0,
 				map_sequence_counter: 0,
 				last_keyboard_focus_window: None,
 				x11_focus: None,
 				focus_state: super::focus::FocusState::default(),
+				last_focus_control: None,
 				window_metadata: HashMap::new(),
 				transient_children: std::collections::HashMap::new(),
 				held_scanout_buffers: Vec::new(),
@@ -667,14 +728,19 @@ impl MoonshineCompositor {
 		)
 	}
 
-	/// Space render elements, excluding the window with X11 ID `exclude_x11`
-	/// (the game presents via the WSI override surface, so its stale X11
-	/// window would occlude the fresh override).
-	fn space_render_elements_excluding(
+	/// Space render elements, substituting the WSI override surface for the
+	/// content of the window with X11 ID `override.1`.
+	///
+	/// Mirrors gamescope's `steamcompmgr_win_t::current_surface()`: a window
+	/// presents the override surface whenever one is set, in place of its X11
+	/// content, at the window's own geometry.
+	fn space_render_elements_with_override(
 		renderer: &mut GlesRenderer,
 		space: &Space<smithay::desktop::Window>,
 		output: &Output,
-		exclude_x11: Option<u32>,
+		override_surface: Option<(&WlSurface, u32)>,
+		decoration_windows: &[smithay::desktop::Window],
+		override_underlay_window: Option<&smithay::desktop::Window>,
 	) -> Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
 		let output_scale = output.current_scale().fractional_scale();
 		let scale = smithay::utils::Scale::from(output_scale);
@@ -682,23 +748,197 @@ impl MoonshineCompositor {
 			return Vec::new();
 		};
 
+		let mut render_window =
+			|elements: &mut Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>,
+			 window: &smithay::desktop::Window| {
+				let location = (window.geometry().loc - output_geo.loc).to_physical_precise_round(scale);
+
+				let overridden = override_surface.and_then(|(surface, xid)| {
+					window
+						.x11_surface()
+						.is_some_and(|x| x.window_id() == xid)
+						.then_some(surface)
+				});
+
+				if let Some(surface) = overridden {
+					elements.extend(render_elements_from_surface_tree(
+						renderer,
+						surface,
+						location,
+						scale,
+						1.0,
+						Kind::Unspecified,
+					));
+				} else {
+					elements.extend(
+						window
+							.render_elements::<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>(
+								renderer, location, scale, 1.0,
+							),
+					);
+				}
+			};
+
 		let mut elements = Vec::new();
 		for window in space.elements() {
-			if let Some(xid) = exclude_x11
-				&& window.x11_surface().is_some_and(|x| x.window_id() == xid)
-			{
+			// Decorations and the carried override underlay are painted on top.
+			if decoration_windows.contains(window) || override_underlay_window == Some(window) {
 				continue;
 			}
-			// Windows are mapped at their geometry origin in this single-output
-			// compositor.
-			let location = (window.geometry().loc - output_geo.loc).to_physical_precise_round(scale);
-			elements.extend(
-				window.render_elements::<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>(
-					renderer, location, scale, 1.0,
-				),
-			);
+			render_window(&mut elements, window);
 		}
+
+		// Same-app decorations ride above the focus window; the underlay sits
+		// between them and the override.
+		for window in decoration_windows
+			.iter()
+			.chain(override_underlay_window.iter().copied())
+		{
+			if !space.elements().any(|e| e == window) {
+				continue;
+			}
+			render_window(&mut elements, window);
+		}
+
 		elements
+	}
+
+	/// Compute the scaling transform that fits the main window to the output.
+	/// Returns the scale, the centering offset and the origin (the window's
+	/// top-left in physical output coordinates).
+	///
+	/// `None` when no scaling is needed: no window to anchor to, or the window
+	/// already fills the output.
+	fn compute_output_scale(
+		&self,
+	) -> Option<(
+		super::scaling::OutputScale,
+		smithay::utils::Point<i32, smithay::utils::Physical>,
+	)> {
+		// The scaling base is the focus window.
+		let window = self.focused_window.as_ref()?;
+		if self.window_metadata.get(window).is_none_or(|m| m.is_useless()) {
+			return None;
+		}
+		let out = self.output_rect();
+		let geo = window.geometry();
+
+		// The scaling source is the committed buffer size when available rather
+		// than the window geometry: a window can present a swapchain larger than
+		// itself (e.g. borderless fullscreen at another resolution).
+		let (mut source_w, mut source_h) = self.window_source_size(window).unwrap_or((geo.size.w, geo.size.h));
+
+		// Grow the source to include the override/dropdown window, so it stays
+		// on-screen without pushing the scale below 1.
+		if let Some(fit) = self.override_window.as_ref() {
+			let fit_geo = fit.geometry();
+			let fit_right = fit_geo.loc.x - geo.loc.x + fit_geo.size.w;
+			let fit_bottom = fit_geo.loc.y - geo.loc.y + fit_geo.size.h;
+			source_w = source_w.max(fit_right.clamp(0, out.size.w));
+			source_h = source_h.max(fit_bottom.clamp(0, out.size.h));
+		}
+
+		let scale = super::scaling::OutputScale::for_source(
+			self.upscale_scaler,
+			out.size.w as f64,
+			out.size.h as f64,
+			source_w as f64,
+			source_h as f64,
+			f64::MAX,
+			self.global_scale,
+		);
+		if scale.is_identity() {
+			return None;
+		}
+
+		let origin = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
+			geo.loc.x - out.loc.x,
+			geo.loc.y - out.loc.y,
+		));
+		tracing::debug!(
+			target: "focus",
+			base_x11 = ?window.x11_surface().map(|x| x.window_id()),
+			base_size = ?(geo.size.w, geo.size.h),
+			base_loc = ?(geo.loc.x, geo.loc.y),
+			output = ?(out.size.w, out.size.h),
+			scale_x = scale.scale_x,
+			scale_y = scale.scale_y,
+			offset_x = scale.offset_x,
+			offset_y = scale.offset_y,
+			"applying output scale"
+		);
+		Some((scale, origin))
+	}
+
+	/// Map an output-space point into the compositor's scene space, inverting
+	/// the output scaling transform.
+	///
+	/// Absolute pointer input arrives in output coordinates; the scene is what
+	/// windows (and hit-testing) live in, so it must be un-transformed.
+	pub fn output_to_scene(
+		&self,
+		point: smithay::utils::Point<f64, smithay::utils::Logical>,
+	) -> smithay::utils::Point<f64, smithay::utils::Logical> {
+		let Some((scale, origin)) = self.compute_output_scale() else {
+			return point;
+		};
+		smithay::utils::Point::from((
+			(point.x - scale.offset_x) / scale.scale_x + origin.x as f64,
+			(point.y - scale.offset_y) / scale.scale_y + origin.y as f64,
+		))
+	}
+
+	/// Scene-space per output-pixel ratio for relative input, inverting the
+	/// output scaling (`1.0` per axis when no scaling is active).
+	pub fn scene_input_ratio(&self) -> (f64, f64) {
+		match self.compute_output_scale() {
+			Some((scale, _)) => (1.0 / scale.scale_x, 1.0 / scale.scale_y),
+			None => (1.0, 1.0),
+		}
+	}
+
+	/// Committed buffer size of the window's content, if any.
+	///
+	/// A window whose content is overridden by the WSI presents the override
+	/// surface, so its buffer is the override's.
+	fn window_source_size(&self, window: &smithay::desktop::Window) -> Option<(i32, i32)> {
+		if let Some(x11_id) = window.x11_surface().map(|x| x.window_id())
+			&& let Some((surface, render_window)) = self.override_surface.as_ref()
+			&& *render_window == x11_id
+			&& surface.alive()
+			&& let Some(size) = Self::surface_buffer_size(surface)
+		{
+			return Some(size);
+		}
+		window.wl_surface().as_deref().and_then(Self::surface_buffer_size)
+	}
+
+	/// The committed buffer size of a `wl_surface`, in buffer pixels.
+	fn surface_buffer_size(surface: &WlSurface) -> Option<(i32, i32)> {
+		with_renderer_surface_state(surface, |st| st.buffer_size().map(|s| (s.w, s.h))).flatten()
+	}
+
+	/// Re-evaluate focus when Steam changes the root focus-control properties.
+	///
+	/// Gamescope receives a PropertyNotify on the root; moonshine has no X event
+	/// source for it, so poll the two cheap local reads once per frame and only
+	/// re-focus when they change.
+	fn poll_focus_control(&mut self) {
+		let Some(fc) = self.x11_focus.as_ref().and_then(|xf| xf.read_focus_control()) else {
+			return;
+		};
+		let current = (fc.window, fc.app_ids.iter().map(|a| a.0).collect::<Vec<_>>());
+		if self.last_focus_control.as_ref() == Some(&current) {
+			return;
+		}
+		tracing::debug!(
+			target: "focus",
+			window = ?current.0,
+			app_ids = ?current.1,
+			"Steam focus control changed; re-evaluating focus"
+		);
+		self.last_focus_control = Some(current);
+		self.reevaluate_focus();
 	}
 
 	/// Raise/lower the Steam overlay above/below the game when `STEAM_OVERLAY`
@@ -815,6 +1055,11 @@ impl MoonshineCompositor {
 		// is detected as soon as the overlay window commits a frame.
 		self.update_overlay_z_order();
 
+		// Steam changes `GAMESCOPECTRL_BASELAYER_WINDOW`/`APPID` on the root to
+		// move focus; gamescope gets a PropertyNotify, moonshine has no X event
+		// source for that, so poll the two properties and re-focus on change.
+		self.poll_focus_control();
+
 		// Detect cursor-only movement as a screen change.
 		if self.cursor_position != self.last_cursor_position {
 			self.screen_dirty = true;
@@ -910,8 +1155,18 @@ impl MoonshineCompositor {
 			},
 		};
 
-		// Check before bind() to avoid borrow conflict with self.renderer.
-		let override_active = self.is_override_active();
+		// Compute the output scaling before binding the framebuffer, which
+		// borrows `self` mutably.
+		let output_scale = self.compute_output_scale();
+
+		// Select the sampler filter for this frame (linear by default).
+		let filter = self.upscale_filter;
+		if let Err(e) = self.renderer.upscale_filter(filter) {
+			tracing::debug!("Failed to set upscale filter: {e}");
+		}
+		if let Err(e) = self.renderer.downscale_filter(filter) {
+			tracing::debug!("Failed to set downscale filter: {e}");
+		}
 
 		// Bind the pre-allocated Dmabuf as a render target.
 		let bind_result = self.renderer.bind(&mut self.buffer_pool[idx].dmabuf);
@@ -924,16 +1179,7 @@ impl MoonshineCompositor {
 			},
 		};
 
-		// Collect render elements from the space.
 		let num_space_elements = self.space.elements().count();
-		let space_elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
-			match smithay::desktop::space::space_render_elements(&mut self.renderer, [&self.space], &self.output, 1.0) {
-				Ok(elements) => elements,
-				Err(e) => {
-					tracing::error!("Failed to collect render elements: {e}");
-					return;
-				},
-			};
 
 		// Build cursor render elements.
 		// Reset to the default named cursor if the client cursor surface is dead.
@@ -980,55 +1226,33 @@ impl MoonshineCompositor {
 		);
 
 		// Combine elements in front-to-back order: cursor first (on top), then space.
-		let mut elements: Vec<OutputRenderElements> = Vec::with_capacity(cursor_elements.len() + space_elements.len());
+		let mut elements: Vec<OutputRenderElements> = Vec::new();
 		elements.extend(cursor_elements);
 
-		// If the WSI layer created an override surface (via
-		// override_window_content), render it instead of the XWayland
-		// space elements — but only when the override's X11 window matches
-		// the currently focused window (or is 0 with no X11 focus).
-		if override_active {
-			let (override_surface, override_xid) = match self.override_surface.as_ref() {
-				Some(v) => (v.0.clone(), v.2),
-				None => {
-					tracing::warn!("override_active but override_surface is None");
-					return;
-				},
-			};
-			let override_elements: Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> =
-				render_elements_from_surface_tree(
-					&mut self.renderer,
-					&override_surface,
-					(0, 0),
-					1.0,
-					1.0,
-					Kind::Unspecified,
-				);
-			if override_elements.is_empty() {
-				tracing::debug!("override active but surface has no committed buffer — rendering black");
-			}
-
-			if self.overlay_raised {
-				// Blend the Steam overlay (and any other UI windows) on top of
-				// the game's override surface. Exclude the game window — its
-				// content is the override surface and would otherwise occlude it.
-				let overlay_elements = Self::space_render_elements_excluding(
-					&mut self.renderer,
-					&self.space,
-					&self.output,
-					Some(override_xid),
-				);
-				elements.extend(overlay_elements.into_iter().map(OutputRenderElements::Space));
-			}
-
-			elements.extend(override_elements.into_iter().map(OutputRenderElements::Space));
-		} else {
-			if self.override_surface.as_ref().is_some_and(|(s, _, _)| !s.alive()) {
-				tracing::debug!("Override surface is dead, clearing.");
-				self.override_surface = None;
-			}
-			elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+		// Drop a dead override surface.
+		if self.override_surface.as_ref().is_some_and(|(s, _)| !s.alive()) {
+			tracing::debug!("Override surface is dead, clearing.");
+			self.override_surface = None;
+			self.override_reported_window = 0;
 		}
+
+		// A window whose content is overridden by the WSI presents the override
+		// surface in place of its X11 content (gamescope `current_surface()`).
+		let override_target = self
+			.override_surface
+			.as_ref()
+			.filter(|(s, _)| s.alive())
+			.map(|(s, w)| (s.clone(), *w));
+
+		let space_elements = Self::space_render_elements_with_override(
+			&mut self.renderer,
+			&self.space,
+			&self.output,
+			override_target.as_ref().map(|(s, w)| (s, *w)),
+			&self.decoration_windows,
+			self.override_underlay_window.as_ref(),
+		);
+		elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
 
 		tracing::trace!(
 			num_space_elements,
@@ -1043,13 +1267,36 @@ impl MoonshineCompositor {
 			.map(|last| self.render_count - last)
 			.unwrap_or(0);
 
-		let render_result = self.damage_tracker.render_output(
-			&mut self.renderer,
-			&mut framebuffer,
-			buffer_age,
-			&elements,
-			[0.0, 0.0, 0.0, 1.0], // black clear color
-		);
+		let render_result = if let Some((scale, origin)) = output_scale {
+			let center = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
+				scale.offset_x.round() as i32,
+				scale.offset_y.round() as i32,
+			));
+			let scaled: Vec<ScaledOutputElement> = elements
+				.into_iter()
+				.map(|e| {
+					let rescaled = RescaleRenderElement::from_element(e, origin, (scale.scale_x, scale.scale_y));
+					RelocateRenderElement::from_element(rescaled, center - origin, Relocate::Relative)
+				})
+				.collect();
+			// The relocation wrapper does not offset damage regions, so redraw
+			// the whole output while a scale/offset transform is active.
+			self.damage_tracker.render_output(
+				&mut self.renderer,
+				&mut framebuffer,
+				0,
+				&scaled,
+				[0.0, 0.0, 0.0, 1.0], // black clear color
+			)
+		} else {
+			self.damage_tracker.render_output(
+				&mut self.renderer,
+				&mut framebuffer,
+				buffer_age,
+				&elements,
+				[0.0, 0.0, 0.0, 1.0], // black clear color
+			)
+		};
 
 		// Update the buffer's render count for future age calculations.
 		self.buffer_last_rendered_at[idx] = Some(self.render_count);
@@ -1115,7 +1362,7 @@ impl MoonshineCompositor {
 		// Also send frame callbacks to the override surface if active,
 		// so the NVIDIA driver's Wayland WSI unblocks and presents the
 		// next frame.
-		if let Some((ref override_surface, _, _)) = self.override_surface
+		if let Some((ref override_surface, _)) = self.override_surface
 			&& override_surface.alive()
 		{
 			send_frames_surface_tree(
@@ -1342,7 +1589,7 @@ impl MoonshineCompositor {
 	/// the WSI layer's `vkQueuePresentKHR` can unblock for the next frame.
 	fn try_direct_scanout_override(&mut self) -> bool {
 		let override_surface = match self.override_surface.as_ref() {
-			Some((s, _, _)) if s.alive() => s.clone(),
+			Some((s, _)) if s.alive() => s.clone(),
 			_ => return false,
 		};
 
@@ -1500,46 +1747,99 @@ impl MoonshineCompositor {
 	/// Stores the override surface so it gets rendered instead of the
 	/// original X11 window.
 	pub fn override_window_surface(&mut self, x11_window: u32, surface: WlSurface) {
-		// Key the override against the currently focused X11 window rather than
-		// the rendering child window reported by the WSI layer.  Wine/DXVK
-		// renders via a child window whose XID differs from the WM-visible
-		// top-level window tracked in `focused_x11_window`.  Using the child
-		// window XID as the key would cause `is_override_active()` to never
-		// match, leaving the override permanently inactive.
-		//
-		// When `focused_x11_window` is set, use it as the match key.
-		// Fall back to the provided `x11_window` if there is no X11 focus
-		// (e.g. for native Wayland apps using a temporary X11 sub-window).
-		let focus_key = self.focused_x11_window.unwrap_or(x11_window);
-
 		// Clear stale HDR state from the previous override surface when the
 		// surface changes.  DXVK sometimes creates a new X11 window (and thus
 		// a new wl_surface) when toggling HDR mode, so the old surface's
 		// gamescope_current entry must be evicted explicitly — it won't be
 		// cleaned up by create_swapchain (which only sees the new surface).
-		if let Some(old_surface) = self.override_surface.as_ref().map(|(s, _, _)| s.clone())
+		if let Some(old_surface) = self.override_surface.as_ref().map(|(s, _)| s.clone())
 			&& old_surface != surface
 			&& let Some(cm) = &mut self.color_management
 		{
 			cm.clear_gamescope_current(&old_surface);
 		}
 
-		tracing::debug!(x11_window, focus_key, "Storing override surface for X11 window");
-		self.override_surface = Some((surface, focus_key, x11_window));
+		self.override_reported_window = x11_window;
+		self.override_surface = Some((surface, x11_window));
+		self.resolve_override_window();
 	}
 
-	/// Returns `true` when the WSI layer has an active override surface
-	/// for the currently focused window.
-	pub fn is_override_active(&self) -> bool {
-		self.override_surface
+	/// Resolve the override surface's target window from the WSI-reported xid.
+	///
+	/// The WSI reports the window its Vulkan swapchain is created on, which for
+	/// Wine/DXVK is a child of the WM-visible toplevel. Key the override by the
+	/// ancestor the compositor actually renders, independent of the current
+	/// focus (which can change after the override is stored).
+	///
+	/// Smithay's XWM reparents clients into frame windows, so the root's child
+	/// is a frame that is never rendered; the managed client window is the
+	/// first ancestor present in the space. Re-run on window map because the
+	/// swapchain can be created before its window is mapped.
+	pub fn resolve_override_window(&mut self) {
+		let Some(alive) = self.override_surface.as_ref().map(|(s, _)| s.alive()) else {
+			return;
+		};
+		// A dead swapchain surface has no live window to resolve against; the
+		// render path clears it.
+		if !alive {
+			return;
+		}
+		let reported = self.override_reported_window;
+		if reported == 0 {
+			// Native Wayland surface: not tied to an X11 window.
+			if let Some((_, render)) = self.override_surface.as_mut() {
+				*render = 0;
+			}
+			return;
+		}
+
+		// Keep the current mapping if it already points at a rendered window.
+		let current = self.override_surface.as_ref().map(|(_, r)| *r);
+		if current.is_some_and(|c| {
+			self.space
+				.elements()
+				.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == c))
+		}) {
+			return;
+		}
+
+		let chain = self
+			.x11_focus
 			.as_ref()
-			.is_some_and(|(s, focus_key, render_window)| {
-				s.alive()
-					&& [*focus_key, *render_window].iter().any(|key| match *key {
-						0 => self.focused_x11_window.is_none(),
-						id => self.focused_x11_window == Some(id),
-					})
+			.map(|xf| xf.get_ancestor_chain(reported))
+			.unwrap_or_default();
+		let resolved = chain
+			.iter()
+			.copied()
+			.find(|id| {
+				self.space
+					.elements()
+					.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == *id))
 			})
+			.unwrap_or(reported);
+		if let Some((_, render)) = self.override_surface.as_mut() {
+			*render = resolved;
+		}
+		tracing::debug!(
+			reported,
+			resolved,
+			chain = ?chain,
+			"Resolved override surface window"
+		);
+	}
+
+	/// Returns `true` when a live WSI override surface exists for a window in
+	/// the scene.  The override *is* that window's content, so it applies
+	/// whenever the window is shown, not only while it is focused.
+	pub fn is_override_active(&self) -> bool {
+		self.override_surface.as_ref().is_some_and(|(s, render_window)| {
+			s.alive()
+				&& (*render_window == 0
+					|| self
+						.space
+						.elements()
+						.any(|w| w.x11_surface().is_some_and(|x| x.window_id() == *render_window)))
+		})
 	}
 
 	/// Clear all dropdown/override windows.
@@ -1671,7 +1971,10 @@ impl MoonshineCompositor {
 			std::env::var("MOONSHINE_WAYLAND_DEBUG")
 				.ok()
 				.map(|_| ("WAYLAND_DEBUG", "1")),
-			std::iter::empty::<&str>(),
+			// Emulate RandR so games can change resolution: without it Xwayland
+			// accepts the request but the mode never changes, leaving games
+			// stuck. Games launched through wlroots/gamescope get this flag.
+			std::iter::once("-force-xrandr-emulation"),
 			true,
 			xwayland_log_stdout,
 			xwayland_log_stderr,
