@@ -15,6 +15,9 @@ mod protocols;
 mod state;
 mod x11_focus;
 
+#[cfg(test)]
+mod x11_geometry_tests;
+
 use std::sync::mpsc;
 
 use async_shutdown::ShutdownManager;

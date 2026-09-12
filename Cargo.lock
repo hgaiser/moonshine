@@ -2451,6 +2451,7 @@ dependencies = [
  "walkdir",
  "wayland-scanner",
  "which 8.0.5",
+ "x11rb",
  "x509-parser",
  "xcursor",
  "zbus",

@@ -202,13 +202,10 @@ impl WindowMetadata {
 
 	/// Returns `true` if the window should be held at the output size.
 	///
-	/// Gamescope holds the focus window at the output size regardless of the
-	/// fullscreen hint, so a game running below the stream resolution is
-	/// scaled up to fill the whole output. Only the main window qualifies —
-	/// dialogs, dropdowns, and Steam overlay/notification windows keep their
-	/// own size.
+	/// Fullscreen can arrive before app-id classification. Steam Big Picture
+	/// also fills the output without setting the fullscreen hint.
 	pub fn should_fill_output(&self) -> bool {
-		self.has_game_id()
+		(self.fullscreen || self.is_steam_big_picture())
 			&& self.transient_for.is_none()
 			&& !self.is_dropdown()
 			&& !self
@@ -388,9 +385,35 @@ mod tests {
 	}
 
 	#[test]
-	fn test_game_is_held_at_output_size_without_the_fullscreen_state() {
+	fn test_only_fullscreen_or_steam_windows_fill_output() {
 		assert!(make_meta(&[("app_id", "769")]).should_fill_output());
-		assert!(make_meta(&[("app_id", "12345")]).should_fill_output());
+		assert!(!make_meta(&[("app_id", "12345")]).should_fill_output());
+		assert!(!make_meta(&[]).should_fill_output());
+		assert!(make_meta(&[("fullscreen", "true")]).should_fill_output());
+		assert!(make_meta(&[("app_id", "12345"), ("fullscreen", "true")]).should_fill_output());
+	}
+
+	#[test]
+	fn test_fullscreen_geometry_does_not_depend_on_classification_order() {
+		let mut m = make_meta(&[("fullscreen", "true")]);
+		assert!(m.should_fill_output());
+		m.app_id = 12345;
+		assert!(m.should_fill_output());
+		m.fullscreen = false;
+		assert!(!m.should_fill_output());
+	}
+
+	#[test]
+	fn test_fullscreen_overlays_keep_their_geometry() {
+		for flag in [
+			WindowFlags::OVERLAY,
+			WindowFlags::NOTIFICATION,
+			WindowFlags::EXTERNAL_OVERLAY,
+		] {
+			let mut m = make_meta(&[("fullscreen", "true")]);
+			m.flags = flag;
+			assert!(!m.should_fill_output());
+		}
 	}
 
 	#[test]
@@ -398,13 +421,14 @@ mod tests {
 		assert!(
 			!make_meta(&[
 				("app_id", "12345"),
+				("fullscreen", "true"),
 				("override_redirect", "true"),
 				("width", "100"),
 				("height", "100"),
 			])
 			.should_fill_output()
 		);
-		let mut m = make_meta(&[("app_id", "12345")]);
+		let mut m = make_meta(&[("app_id", "12345"), ("fullscreen", "true")]);
 		m.transient_for = Some(12345);
 		assert!(!m.should_fill_output());
 	}

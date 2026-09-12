@@ -1273,7 +1273,7 @@ impl MoonshineCompositor {
 	/// 2. `classify_special_windows()` — overlay/notification/etc. classification
 	/// 3. `build_candidates()` — filter and collect candidate windows
 	/// 4. Steam control override + priority sort
-	/// 5. `enforce_fullscreen_geometry()` — hold the winner at the output size
+	/// 5. `enforce_output_geometry()` — apply the winner's fullscreen geometry
 	/// 6. `apply_focus()` — set keyboard/pointer focus, activation
 	pub fn reevaluate_focus(&mut self) {
 		// Mark focus as dirty before recalculating.
@@ -1396,25 +1396,14 @@ impl MoonshineCompositor {
 		// Transient child promotion.
 		let best = self.promote_transient_child(best);
 
-		// Step 5: Hold the focused game window at the output size.
+		// Step 5: Apply the focused window's fullscreen geometry.
 		self.enforce_output_geometry(&best);
 
 		// Step 6: Apply focus (keyboard/pointer target, activation, Smithay seat).
 		self.apply_focus(&best);
 	}
 
-	/// Resize the focused game window to the output.
-	///
-	/// Gamescope holds the focus window at the output size regardless of the
-	/// fullscreen hint, so a game running below the stream resolution is
-	/// scaled up to fill the whole output. Only the main window is held —
-	/// dialogs, dropdowns, and Steam overlay/notification windows keep their
-	/// own size.
-	///
-	/// Correcting geometry here rather than refusing the client's
-	/// `ConfigureRequest` fixes a wrong-sized window whatever caused it.
-	///
-	/// Gamescope: `determine_and_apply_focus()`
+	/// Apply the same fullscreen policy used for client configure requests.
 	fn enforce_output_geometry(&self, window: &Window) {
 		let Some(meta) = self.window_metadata.get(window) else {
 			return;
@@ -1436,10 +1425,10 @@ impl MoonshineCompositor {
 			window_id = x11.window_id(),
 			current = ?x11.geometry().size,
 			output = ?geo.size,
-			"Resizing game window to output size"
+			"Resizing fullscreen window to output size"
 		);
 		if let Err(e) = x11.configure(geo) {
-			tracing::warn!("Failed to resize game window to output size: {e}");
+			tracing::warn!("Failed to resize fullscreen window to output size: {e}");
 		}
 	}
 
@@ -2072,18 +2061,14 @@ impl XwmHandler for MoonshineCompositor {
 			target: "focus",
 			title = ?window.title(),
 			class = ?window.class(),
+			geometry = ?window.geometry(),
 			override_redirect = window.is_override_redirect(),
 			wl_surface = ?window.wl_surface(),
 			"X11 window map request"
 		);
 
-		// Configure the X11 window to fill the output.
-		let geo = self.output_rect();
-		if let Err(e) = window.configure(geo) {
-			tracing::warn!("Failed to configure X11 window geometry: {e}");
-		}
-
-		// Grant the map request.
+		// Preserve client geometry while decorations and rendering children
+		// are being established; mapping does not imply fullscreen.
 		if let Err(e) = window.set_mapped(true) {
 			tracing::error!("Failed to set X11 window mapped: {e}");
 			return;
@@ -2304,22 +2289,16 @@ impl XwmHandler for MoonshineCompositor {
 		h: Option<u32>,
 		_reorder: Option<Reorder>,
 	) {
-		// Gamescope holds the game window at the output size, so a game
-		// running below the stream resolution is scaled up to fill the whole
-		// output. This also anchors the WSI swapchain extent (read from the
-		// X11 window) to the output before the game creates it.
 		let elem = self.find_window_by_x11_surface(&window);
-		let is_game = elem
+		let should_fill_output = elem
 			.as_ref()
 			.is_some_and(|e| self.window_metadata.get(e).is_some_and(|m| m.should_fill_output()));
-		if is_game {
+		if should_fill_output {
 			let _ = window.configure(self.output_rect());
 			return;
 		}
 
-		// Grant geometry changes but ignore position (we control placement).
-		// `enforce_output_geometry` corrects a game window that resizes itself
-		// away from the output.
+		// Windowed clients own their size; the compositor controls placement.
 		let mut geo = window.geometry();
 		if let Some(w) = w {
 			geo.size.w = w as i32;
