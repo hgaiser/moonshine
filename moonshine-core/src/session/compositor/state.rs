@@ -315,6 +315,9 @@ pub(crate) struct MoonshineCompositor {
 	pub xdisplay_tx: Option<mpsc::SyncSender<super::CompositorReady>>,
 	/// Registration token for the compositor's Wayland listening socket.
 	pub wayland_socket_token: Option<RegistrationToken>,
+	/// Registration token for the root-window `PropertyNotify` source that
+	/// watches Steam's focus control properties.
+	pub x11_focus_token: Option<RegistrationToken>,
 	/// Name of the compositor's Wayland socket in XDG_RUNTIME_DIR.
 	pub wayland_display: String,
 
@@ -715,6 +718,7 @@ impl MoonshineCompositor {
 				map_sequence_counter: 0,
 				last_keyboard_focus_window: None,
 				x11_focus: None,
+				x11_focus_token: None,
 				focus_state: super::focus::FocusState::default(),
 				last_focus_control: None,
 				window_metadata: HashMap::new(),
@@ -2051,6 +2055,7 @@ impl MoonshineCompositor {
 					// reading root window properties (Steam focus control).
 					if data.x11_focus.is_none() {
 						data.x11_focus = super::x11_focus::X11Focus::open(display_number);
+						data.watch_steam_focus_control();
 					}
 
 					// Notify the session thread that XWayland is ready.
@@ -2072,6 +2077,53 @@ impl MoonshineCompositor {
 		}
 	}
 
+	/// Watch the root window for Steam focus-control changes.
+	///
+	/// Steam signals "the game is up, focus it" by reordering
+	/// `GAMESCOPECTRL_BASELAYER_APPID` on the root window. Nothing else in the
+	/// compositor wakes on that: `XwmHandler::property_notify` only fires for
+	/// windows the XWM manages, and once a game is running and steady no window
+	/// event triggers a re-evaluation. Without this source the handoff is read
+	/// exactly once — while the Steam UI is still legitimately in front — and
+	/// focus never moves to the game.
+	fn watch_steam_focus_control(&mut self) {
+		let Some(x11_focus) = self.x11_focus.as_ref() else {
+			return;
+		};
+		if !x11_focus.watch_focus_control() {
+			tracing::warn!(target: "focus", "Failed to select root PropertyNotify; Steam focus handoff will be missed");
+			return;
+		}
+		let Some(fd) = x11_focus.connection_fd() else {
+			tracing::warn!(target: "focus", "No X11 connection fd; Steam focus handoff will be missed");
+			return;
+		};
+
+		// Safety: the fd belongs to `self.x11_focus`, which outlives this
+		// source — `shutdown_session_processes` removes the source before
+		// dropping `X11Focus` and closing the display.
+		let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) };
+		let source = calloop::generic::Generic::new(borrowed, calloop::Interest::READ, calloop::Mode::Level);
+		match self.handle.insert_source(source, |_, _, state: &mut Self| {
+			if state
+				.x11_focus
+				.as_ref()
+				.is_some_and(|x11_focus| x11_focus.drain_focus_control_change())
+			{
+				state.reevaluate_focus();
+			}
+			Ok(calloop::PostAction::Continue)
+		}) {
+			Ok(token) => {
+				self.x11_focus_token = Some(token);
+				tracing::debug!(target: "focus", fd, "Watching root window for Steam focus control changes");
+			},
+			Err(e) => {
+				tracing::error!("Failed to insert X11 focus control source: {e}");
+			},
+		}
+	}
+
 	/// Shut down XWayland server connections.
 	///
 	/// Drops the X11 window manager connection so Xwayland sees no remaining
@@ -2081,6 +2133,14 @@ impl MoonshineCompositor {
 		if let Some(token) = self.wayland_socket_token.take() {
 			self.handle.remove(token);
 			tracing::debug!(wayland_display = %self.wayland_display, "Removed Wayland listening socket source");
+		}
+
+		// Remove the root-window PropertyNotify source before the connection
+		// goes away: its fd is borrowed from `x11_focus`, so closing the
+		// display first would leave a stale fd registered with the event loop.
+		if let Some(token) = self.x11_focus_token.take() {
+			self.handle.remove(token);
+			tracing::debug!(target: "focus", "Removed X11 focus control source");
 		}
 
 		// Clear the X11 focus control connection so reevaluate_focus

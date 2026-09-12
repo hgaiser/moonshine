@@ -44,6 +44,35 @@ pub(crate) struct AppId(pub u32);
 const XA_CARDINAL: Atom = 6;
 const XA_WINDOW: Atom = 33;
 
+/// `PropertyChangeMask` from `X11/X.h` — `1L << 22`.
+const PROPERTY_CHANGE_MASK: libc_c_long = 1 << 22;
+
+/// `PropertyNotify` event type from `X11/X.h`.
+const PROPERTY_NOTIFY: c_int = 28;
+
+/// `XEvent` is a union over every event struct; Xlib guarantees it is at most
+/// 24 native `long`s. Only the `XPropertyEvent` member is ever read, but the
+/// buffer handed to `XNextEvent` must be the full union size or the server
+/// will write past it.
+const X_EVENT_LONGS: usize = 24;
+
+/// `XPropertyEvent` from `X11/Xlib.h`.
+///
+/// Only `window` and `atom` are read; the remaining fields exist so `repr(C)`
+/// reproduces the C layout and those two land at the right offsets.
+#[repr(C)]
+#[allow(dead_code)]
+struct XPropertyEvent {
+	type_: c_int,
+	serial: libc_c_ulong,
+	send_event: c_int,
+	display: *mut XDisplay,
+	window: Window,
+	atom: Atom,
+	time: libc_c_ulong,
+	state: c_int,
+}
+
 // ---------------------------------------------------------------------------
 // X11 function pointer types
 // ---------------------------------------------------------------------------
@@ -90,6 +119,10 @@ type FnXQueryTree = unsafe extern "C" fn(
 	*mut *mut Window, // children_return
 	*mut u32,         // nchildren_return
 ) -> c_int;
+type FnXSelectInput = unsafe extern "C" fn(*mut XDisplay, Window, libc_c_long) -> c_int;
+type FnXPending = unsafe extern "C" fn(*mut XDisplay) -> c_int;
+type FnXNextEvent = unsafe extern "C" fn(*mut XDisplay, *mut c_void) -> c_int;
+type FnXConnectionNumber = unsafe extern "C" fn(*mut XDisplay) -> c_int;
 
 // ---------------------------------------------------------------------------
 // XRes FFI types (libXRes.so.1)
@@ -160,6 +193,10 @@ struct LoadedXlib {
 	xchangeproperty: Option<FnXChangeProperty>,
 	xdeleteproperty: Option<FnXDeleteProperty>,
 	xquerytree: Option<FnXQueryTree>,
+	xselectinput: Option<FnXSelectInput>,
+	xpending: Option<FnXPending>,
+	xnextevent: Option<FnXNextEvent>,
+	xconnectionnumber: Option<FnXConnectionNumber>,
 }
 
 static LOADED_XLIB: OnceLock<LoadedXlib> = OnceLock::new();
@@ -290,6 +327,10 @@ fn load_xlib() {
 				xchangeproperty: None,
 				xdeleteproperty: None,
 				xquerytree: None,
+				xselectinput: None,
+				xpending: None,
+				xnextevent: None,
+				xconnectionnumber: None,
 			};
 		}
 
@@ -317,6 +358,13 @@ fn load_xlib() {
 		let xdeleteproperty_ptr = dlsym(lib_ptr, c"XDeleteProperty".as_ptr());
 		libc::dlerror();
 		let xquerytree_ptr = dlsym(lib_ptr, c"XQueryTree".as_ptr());
+		let xselectinput_ptr = dlsym(lib_ptr, c"XSelectInput".as_ptr());
+		libc::dlerror();
+		let xpending_ptr = dlsym(lib_ptr, c"XPending".as_ptr());
+		libc::dlerror();
+		let xnextevent_ptr = dlsym(lib_ptr, c"XNextEvent".as_ptr());
+		libc::dlerror();
+		let xconnectionnumber_ptr = dlsym(lib_ptr, c"XConnectionNumber".as_ptr());
 
 		LoadedXlib {
 			lib: lib_ptr as isize,
@@ -332,6 +380,10 @@ fn load_xlib() {
 			xchangeproperty: sym!(xchangeproperty_ptr, FnXChangeProperty),
 			xdeleteproperty: sym!(xdeleteproperty_ptr, FnXDeleteProperty),
 			xquerytree: sym!(xquerytree_ptr, FnXQueryTree),
+			xselectinput: sym!(xselectinput_ptr, FnXSelectInput),
+			xpending: sym!(xpending_ptr, FnXPending),
+			xnextevent: sym!(xnextevent_ptr, FnXNextEvent),
+			xconnectionnumber: sym!(xconnectionnumber_ptr, FnXConnectionNumber),
 		}
 	});
 }
@@ -515,6 +567,87 @@ impl X11Focus {
 
 		tracing::debug!(target: "focus", "Opened X11 connection to :{}", display_number);
 		Some(x11_focus)
+	}
+
+	/// File descriptor of this X11 connection, for event-loop registration.
+	pub fn connection_fd(&self) -> Option<std::os::fd::RawFd> {
+		if self.dpy.is_null() {
+			return None;
+		}
+		let fd = with_xlib(|loaded| loaded.xconnectionnumber.map(|f| unsafe { f(self.dpy) }))?;
+		(fd >= 0).then_some(fd)
+	}
+
+	/// Ask the server to deliver `PropertyNotify` events for the root window.
+	///
+	/// Steam hands focus to a launched game by rewriting
+	/// `GAMESCOPECTRL_BASELAYER_APPID` on the root window, moving the game's app
+	/// ID ahead of its own 769 once the game is running. That property lives on
+	/// the root, which is not a window Smithay's XWM manages, so its changes
+	/// never reach `XwmHandler::property_notify`. Without this subscription
+	/// nothing re-runs focus selection in steady state, and focus stays on the
+	/// Steam UI for the rest of the session: the game renders, but Steam keeps
+	/// the gamepad.
+	///
+	/// `PropertyChangeMask` is not an exclusive mask (unlike
+	/// `SubstructureRedirectMask`), so selecting it here does not disturb the
+	/// XWM's own connection to the same server.
+	pub fn watch_focus_control(&self) -> bool {
+		if self.dpy.is_null() {
+			return false;
+		}
+		with_xlib(|loaded| {
+			let select = loaded.xselectinput?;
+			let flush = loaded.xflush?;
+			unsafe {
+				select(self.dpy, self.root, PROPERTY_CHANGE_MASK);
+				flush(self.dpy);
+			}
+			Some(())
+		})
+		.is_some()
+	}
+
+	/// Drain queued X11 events, reporting whether Steam's focus control changed.
+	///
+	/// Returns `true` when a `PropertyNotify` for
+	/// `GAMESCOPECTRL_BASELAYER_APPID` or `GAMESCOPECTRL_BASELAYER_WINDOW`
+	/// arrived, meaning the caller should re-run focus selection. The queue is
+	/// always drained fully, even once a match is found, so nothing is left
+	/// behind to wake the event loop again.
+	pub fn drain_focus_control_change(&self) -> bool {
+		if self.dpy.is_null() {
+			return false;
+		}
+		with_xlib(|loaded| {
+			let pending = loaded.xpending?;
+			let next = loaded.xnextevent?;
+			let mut changed = false;
+			let mut event = [0 as libc_c_long; X_EVENT_LONGS];
+			unsafe {
+				while pending(self.dpy) > 0 {
+					next(self.dpy, event.as_mut_ptr() as *mut c_void);
+					// Every XEvent variant starts with the event type.
+					if *(event.as_ptr() as *const c_int) != PROPERTY_NOTIFY {
+						continue;
+					}
+					let property = &*(event.as_ptr() as *const XPropertyEvent);
+					if property.window == self.root
+						&& (property.atom == self.atoms.gamescopectrl_baselayer_appid
+							|| property.atom == self.atoms.gamescopectrl_baselayer_window)
+					{
+						tracing::debug!(
+							target: "focus",
+							atom = property.atom,
+							"Steam focus control changed on root window"
+						);
+						changed = true;
+					}
+				}
+			}
+			Some(changed)
+		})
+		.unwrap_or(false)
 	}
 
 	/// Read a single CARDINAL (format-32) window property by pre-interned atom.
