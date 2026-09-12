@@ -11,12 +11,15 @@
 use std::ffi::{CStr, CString};
 use std::sync::{Arc, Mutex};
 
+use wayland_client::backend::ObjectId;
+use wayland_client::protocol::wl_surface::WlSurface;
 use wayland_client::{Connection, Proxy, globals::registry_queue_init, protocol::wl_compositor::WlCompositor};
 
 use crate::dispatch::*;
 use crate::proto::moonshine_swapchain_factory_v2::MoonshineSwapchainFactoryV2;
 use crate::state::{
-	CompositorCaps, InstanceData, LayerStatus, WaylandConnection, WaylandState, insert_instance, remove_instance,
+	CompositorCaps, InstanceData, LayerStatus, NativeWaylandSurface, WaylandConnection, WaylandState, insert_instance,
+	remove_instance,
 };
 
 /// Returns the value of `MOONSHINE_WAYLAND_DISPLAY`, or `None` if unset.
@@ -300,4 +303,52 @@ fn connect_to_compositor(display_name: &CStr) -> Option<Arc<Mutex<WaylandConnect
 		qh,
 		dead: false,
 	})))
+}
+
+/// Connect to the compositor through the application's own `wl_display`.
+///
+/// Used for native Wayland surfaces: the `moonshine_swapchain_factory_v2` and
+/// the swapchain must be bound on the same connection as the app's
+/// `wl_surface`.  The display is owned by the application and is never
+/// disconnected here (`Backend::from_foreign_display` does not take ownership).
+pub(crate) unsafe fn connect_to_foreign_display(
+	display_ptr: *mut std::ffi::c_void,
+	surface_ptr: *mut std::ffi::c_void,
+	hdr_supported: bool,
+) -> Option<NativeWaylandSurface> {
+	unsafe {
+		if display_ptr.is_null() || surface_ptr.is_null() {
+			return None;
+		}
+
+		let backend = wayland_backend::sys::client::Backend::from_foreign_display(display_ptr as *mut _);
+		let connection = Connection::from_backend(backend);
+
+		let event_queue = connection.new_event_queue::<WaylandState>();
+		let qh = event_queue.handle();
+
+		let (globals, _registry_queue) = registry_queue_init::<WaylandState>(&connection).ok()?;
+		let compositor: WlCompositor = globals.bind(&qh, 4..=5, ()).ok()?;
+		let factory: MoonshineSwapchainFactoryV2 = globals.bind(&qh, 1..=1, ()).ok()?;
+
+		let object_id = ObjectId::from_ptr(WlSurface::interface(), surface_ptr as *mut _).ok()?;
+		let wl_surface = WlSurface::from_id(&connection, object_id).ok()?;
+
+		Some(NativeWaylandSurface {
+			connection: Arc::new(Mutex::new(WaylandConnection {
+				connection,
+				compositor,
+				swapchain_factory: factory,
+				caps: CompositorCaps {
+					_compositor_version: 0,
+					_factory_version: 0,
+					hdr_supported,
+				},
+				event_queue,
+				qh,
+				dead: false,
+			})),
+			wl_surface,
+		})
+	}
 }

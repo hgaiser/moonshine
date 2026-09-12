@@ -17,13 +17,30 @@ use std::marker::PhantomData;
 
 use ash::vk::Handle as _;
 use wayland_client::Proxy;
+use wayland_client::protocol::wl_surface::WlSurface;
 
 use crate::dispatch::*;
+use crate::instance::connect_to_foreign_display;
 use crate::state::{
 	InstanceKey, MutexExt, SurfaceData, SurfaceKey, get_wayland_connection, insert_surface, is_layer_active,
 	remove_surface, with_instance, with_surface,
 };
+use crate::swapchain::can_bypass_xwayland;
 use crate::xcb::{xcb_get_window_extent, xlib_to_xcb_connection};
+
+/// Whether to bind the moonshine swapchain on the application's own Wayland
+/// display for native Wayland surfaces.  Opt-in until validated, since it
+/// takes over presentation for native Wayland clients.
+fn native_wayland_enabled() -> bool {
+	use std::sync::OnceLock;
+	static ENABLED: OnceLock<bool> = OnceLock::new();
+	*ENABLED.get_or_init(|| {
+		std::env::var("MOONSHINE_WSI_NATIVE_WAYLAND")
+			.ok()
+			.map(|v| v.trim() == "1")
+			.unwrap_or(false)
+	})
+}
 
 unsafe extern "C" {
 	/// Move a Wayland proxy to a different event queue.
@@ -68,6 +85,7 @@ pub unsafe extern "C" fn create_wayland_surface(
 ) -> VkResult {
 	unsafe {
 		let instance_key = instance_key_of(instance);
+		let create_info = &*p_create_info;
 
 		// Call the next layer.
 		let result = with_instance(instance_key, |data| {
@@ -83,13 +101,28 @@ pub unsafe extern "C" fn create_wayland_surface(
 			return result;
 		}
 
-		// NOTE: We intentionally do NOT record the app's wl_surface here.
-		// The surface in VkWaylandSurfaceCreateInfoKHR is a raw C wl_surface*
-		// on the application's Wayland connection, which is different from the
-		// layer's private connection to the compositor.  We cannot use it with
-		// the layer's moonshine_swapchain_factory.  The swapchain code handles
-		// the missing surface gracefully (ms_swapchain = None).
-		// TODO: use the app's wl_display to bind the protocol on the same connection.
+		// The app's wl_surface lives on its own Wayland connection, so bind the
+		// swapchain factory there.  We can then create a moonshine_swapchain for
+		// the app's surface.  If any step fails the surface is left unrecorded
+		// and the app presents through the ICD.
+		if native_wayland_enabled()
+			&& is_layer_active(instance_key)
+			&& !(*p_surface).is_null()
+			&& let Some(hdr_supported) = get_wayland_connection(instance_key).map(|a| a.force_lock().caps.hdr_supported)
+			&& let Some(native) = connect_to_foreign_display(create_info.display, create_info.surface, hdr_supported)
+		{
+			crate::log_info!("vkCreateWaylandSurfaceKHR: native Wayland surface recorded");
+			insert_surface(
+				SurfaceKey::from_raw((*p_surface).as_raw()),
+				SurfaceData {
+					wl_surface: native.wl_surface.clone(),
+					xcb_window: None,
+					xcb_connection: std::ptr::null_mut(),
+					fallback_surface: VkSurface::null(),
+					native: Some(native),
+				},
+			);
+		}
 
 		VK_SUCCESS
 	}
@@ -127,16 +160,25 @@ pub unsafe extern "C" fn create_xcb_surface(
 		}
 
 		// Try XWayland bypass: create a wl_surface on the Moonshine compositor.
-		let bypass_result = try_xwayland_bypass(
-			instance,
-			instance_key,
-			create_info.connection,
-			create_info.window,
-			p_allocator,
-			p_surface,
-		);
+		if let Some(wl_surface) =
+			try_xwayland_bypass(instance, instance_key, create_info.window, p_allocator, p_surface)
+		{
+			// Also create the plain XCB surface, so presentation can fall back
+			// to XWayland when the bypass safety checks refuse this window
+			// (launchers, Wine offscreen/GDI-blit windows, child windows, ...).
+			let fallback_surface = create_plain_xcb_surface(instance_key, instance, p_create_info, p_allocator);
 
-		if bypass_result == VK_SUCCESS {
+			insert_surface(
+				SurfaceKey::from_raw((*p_surface).as_raw()),
+				SurfaceData {
+					wl_surface,
+					xcb_window: Some(create_info.window),
+					xcb_connection: create_info.connection,
+					fallback_surface,
+					native: None,
+				},
+			);
+
 			crate::log_info!(
 				"vkCreateXcbSurfaceKHR: XWayland bypass active (window={})",
 				create_info.window
@@ -154,6 +196,52 @@ pub unsafe extern "C" fn create_xcb_surface(
 			}
 		})
 		.unwrap_or(VK_ERROR_INITIALIZATION_FAILED)
+	}
+}
+
+/// Create a plain XCB surface for the window via the next layer/ICD.
+///
+/// Returns a null handle if the ICD does not expose `vkCreateXcbSurfaceKHR`
+/// or rejects the request.
+unsafe fn create_plain_xcb_surface(
+	instance_key: InstanceKey,
+	instance: VkInstance,
+	p_create_info: *const VkXcbSurfaceCreateInfoKHR,
+	p_allocator: *const VkAllocationCallbacks,
+) -> VkSurface {
+	unsafe {
+		let mut surface = VkSurface::null();
+		let result = with_instance(instance_key, |data| {
+			if let Some(next) = data.dispatch.create_xcb_surface {
+				next(instance, p_create_info, p_allocator, &mut surface)
+			} else {
+				VK_ERROR_FEATURE_NOT_PRESENT
+			}
+		})
+		.unwrap_or(VK_ERROR_INITIALIZATION_FAILED);
+
+		if result == VK_SUCCESS {
+			surface
+		} else {
+			VkSurface::null()
+		}
+	}
+}
+
+/// Returns the XCB fallback surface to present through when XWayland bypass is
+/// not safe for `surface`, or `None` to use `surface` as-is.
+///
+/// A `None` result also means the surface is not layer-managed (e.g. a native
+/// Wayland surface), in which case the app's own surface is used.
+pub(crate) unsafe fn icd_fallback_surface(surface: VkSurface) -> Option<VkSurface> {
+	unsafe {
+		let key = SurfaceKey::from_raw(surface.as_raw());
+		let fallback = with_surface(key, |sd| sd.fallback_surface)?;
+		if fallback.is_null() || can_bypass_xwayland(key) {
+			None
+		} else {
+			Some(fallback)
+		}
 	}
 }
 
@@ -193,11 +281,19 @@ pub unsafe extern "C" fn destroy_surface(
 ) {
 	unsafe {
 		let instance_key = instance_key_of(instance);
+		let surface_key = SurfaceKey::from_raw(surface.as_raw());
 
-		remove_surface(SurfaceKey::from_raw(surface.as_raw()));
+		// Also destroy the XCB fallback surface created for this window.
+		let fallback_surface = with_surface(surface_key, |sd| sd.fallback_surface);
+		remove_surface(surface_key);
 
 		with_instance(instance_key, |data| {
 			if let Some(next) = data.dispatch.destroy_surface {
+				if let Some(fallback) = fallback_surface
+					&& !fallback.is_null()
+				{
+					next(instance, fallback, p_allocator);
+				}
 				next(instance, surface, p_allocator);
 			}
 		});
@@ -244,9 +340,12 @@ pub unsafe extern "C" fn get_physical_device_surface_capabilities(
 	unsafe {
 		let instance_key = instance_key_of(physical_device);
 
+		let fallback = icd_fallback_surface(surface);
+		let icd_surface = fallback.unwrap_or(surface);
+
 		let result = with_instance(instance_key, |data| {
 			if let Some(next) = data.dispatch.get_physical_device_surface_capabilities {
-				next(physical_device, surface, p_surface_capabilities)
+				next(physical_device, icd_surface, p_surface_capabilities)
 			} else {
 				VK_ERROR_FEATURE_NOT_PRESENT
 			}
@@ -259,7 +358,11 @@ pub unsafe extern "C" fn get_physical_device_surface_capabilities(
 
 		let caps = &mut *p_surface_capabilities;
 		caps.min_image_count = caps.min_image_count.max(min_image_count());
-		override_extent_from_xcb(SurfaceKey::from_raw(surface.as_raw()), caps);
+		// The ICD reports the real extent for the XCB fallback surface; only the
+		// bypass surface (which has no role yet) needs the window size substituted.
+		if fallback.is_none() {
+			override_extent_from_xcb(SurfaceKey::from_raw(surface.as_raw()), caps);
+		}
 
 		VK_SUCCESS
 	}
@@ -273,9 +376,15 @@ pub unsafe extern "C" fn get_physical_device_surface_capabilities2(
 	unsafe {
 		let instance_key = instance_key_of(physical_device);
 
+		let fallback = icd_fallback_surface((*p_surface_info).surface);
+		let mut icd_surface_info = *p_surface_info;
+		if let Some(fb) = fallback {
+			icd_surface_info.surface = fb;
+		}
+
 		let result = with_instance(instance_key, |data| {
 			if let Some(next) = data.dispatch.get_physical_device_surface_capabilities2 {
-				next(physical_device, p_surface_info, p_surface_capabilities)
+				next(physical_device, &icd_surface_info, p_surface_capabilities)
 			} else {
 				VK_ERROR_FEATURE_NOT_PRESENT
 			}
@@ -288,7 +397,9 @@ pub unsafe extern "C" fn get_physical_device_surface_capabilities2(
 
 		let caps = &mut (*p_surface_capabilities).surface_capabilities;
 		caps.min_image_count = caps.min_image_count.max(min_image_count());
-		override_extent_from_xcb(SurfaceKey::from_raw((*p_surface_info).surface.as_raw()), caps);
+		if fallback.is_none() {
+			override_extent_from_xcb(SurfaceKey::from_raw((*p_surface_info).surface.as_raw()), caps);
+		}
 
 		VK_SUCCESS
 	}
@@ -323,9 +434,11 @@ pub unsafe extern "C" fn get_physical_device_surface_present_modes(
 			return VK_SUCCESS;
 		}
 
+		let icd_surface = icd_fallback_surface(surface).unwrap_or(surface);
+
 		with_instance(instance_key, |data| {
 			if let Some(next) = data.dispatch.get_physical_device_surface_present_modes {
-				next(physical_device, surface, p_present_mode_count, p_present_modes)
+				next(physical_device, icd_surface, p_present_mode_count, p_present_modes)
 			} else {
 				VK_ERROR_FEATURE_NOT_PRESENT
 			}
@@ -527,10 +640,13 @@ pub unsafe extern "C" fn get_physical_device_surface_formats(
 			.map(|arc| arc.force_lock().caps.hdr_supported)
 			.unwrap_or(false);
 
+		let fallback = icd_fallback_surface(surface);
+		let icd_surface = fallback.unwrap_or(surface);
+
 		let call_icd = |count, buf| {
 			with_instance(instance_key, |data| {
 				if let Some(next) = data.dispatch.get_physical_device_surface_formats {
-					next(physical_device, surface, count, buf)
+					next(physical_device, icd_surface, count, buf)
 				} else {
 					VK_ERROR_FEATURE_NOT_PRESENT
 				}
@@ -538,7 +654,9 @@ pub unsafe extern "C" fn get_physical_device_surface_formats(
 			.unwrap_or(VK_ERROR_INITIALIZATION_FAILED)
 		};
 
-		if !hdr_supported {
+		// HDR formats only apply on the bypass path; the XCB fallback goes
+		// through XWayland's Glamor compositing, which cannot carry HDR.
+		if !hdr_supported || fallback.is_some() {
 			return call_icd(p_surface_format_count, p_surface_formats);
 		}
 
@@ -569,10 +687,16 @@ pub unsafe extern "C" fn get_physical_device_surface_formats2(
 			.map(|arc| arc.force_lock().caps.hdr_supported)
 			.unwrap_or(false);
 
+		let fallback = icd_fallback_surface((*p_surface_info).surface);
+		let mut icd_surface_info = *p_surface_info;
+		if let Some(fb) = fallback {
+			icd_surface_info.surface = fb;
+		}
+
 		let call_icd = |count, buf| {
 			with_instance(instance_key, |data| {
 				if let Some(next) = data.dispatch.get_physical_device_surface_formats2 {
-					next(physical_device, p_surface_info, count, buf)
+					next(physical_device, &icd_surface_info, count, buf)
 				} else {
 					VK_ERROR_FEATURE_NOT_PRESENT
 				}
@@ -580,7 +704,7 @@ pub unsafe extern "C" fn get_physical_device_surface_formats2(
 			.unwrap_or(VK_ERROR_INITIALIZATION_FAILED)
 		};
 
-		if !hdr_supported {
+		if !hdr_supported || fallback.is_some() {
 			return call_icd(p_surface_format_count, p_surface_formats);
 		}
 
@@ -665,26 +789,22 @@ unsafe fn append_hdr_formats<T>(
 unsafe fn try_xwayland_bypass(
 	instance: VkInstance,
 	instance_key: InstanceKey,
-	xcb_connection: *mut libc::c_void,
 	xcb_window: u32,
 	p_allocator: *const VkAllocationCallbacks,
 	p_surface: *mut VkSurface,
-) -> VkResult {
+) -> Option<WlSurface> {
 	unsafe {
 		// Early exit if layer is degraded (no compositor connection).
 		if !is_layer_active(instance_key) {
-			return VK_ERROR_FEATURE_NOT_PRESENT;
+			return None;
 		}
 
 		// Get the layer's Wayland connection to the Moonshine compositor.
-		let wl_arc = match get_wayland_connection(instance_key) {
-			Some(arc) => arc,
-			None => return VK_ERROR_FEATURE_NOT_PRESENT,
-		};
+		let wl_arc = get_wayland_connection(instance_key)?;
 
 		let wl = wl_arc.force_lock();
 		if wl.dead {
-			return VK_ERROR_FEATURE_NOT_PRESENT;
+			return None;
 		}
 
 		// Create a fresh wl_surface on the compositor.
@@ -722,23 +842,11 @@ unsafe fn try_xwayland_bypass(
 		.unwrap_or(VK_ERROR_INITIALIZATION_FAILED);
 
 		if result != VK_SUCCESS {
-			return result;
+			return None;
 		}
 
-		// Record the Wayland VkSurface.  The ICD renders to the wl_surface
-		// directly; the xcb_window is kept for override_window_content mapping
-		// and extent queries.
 		crate::log_debug!("try_xwayland_bypass: created wl_surface for xcb_window={}", xcb_window);
-		insert_surface(
-			SurfaceKey::from_raw((*p_surface).as_raw()),
-			SurfaceData {
-				wl_surface,
-				xcb_window: Some(xcb_window),
-				xcb_connection,
-			},
-		);
-
-		VK_SUCCESS
+		Some(wl_surface)
 	}
 }
 

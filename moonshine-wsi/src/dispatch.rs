@@ -28,6 +28,7 @@ pub const VK_ERROR_EXTENSION_NOT_PRESENT: ash::vk::Result = ash::vk::Result::ERR
 pub const VK_ERROR_FEATURE_NOT_PRESENT: ash::vk::Result = ash::vk::Result::ERROR_FEATURE_NOT_PRESENT;
 pub const VK_ERROR_DEVICE_LOST: ash::vk::Result = ash::vk::Result::ERROR_DEVICE_LOST;
 pub const VK_ERROR_OUT_OF_DATE_KHR: ash::vk::Result = ash::vk::Result::ERROR_OUT_OF_DATE_KHR;
+pub const VK_SUBOPTIMAL_KHR: ash::vk::Result = ash::vk::Result::SUBOPTIMAL_KHR;
 
 /// Current loader-layer interface version we support.
 pub const CURRENT_LOADER_LAYER_INTERFACE_VERSION: u32 = 2;

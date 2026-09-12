@@ -465,9 +465,187 @@ pub(crate) unsafe fn xcb_get_largest_obscuring_child(
 	}
 }
 
+// ---------------------------------------------------------------------------
+// XCB property helpers (libxcb)
+// ---------------------------------------------------------------------------
+
+/// Predefined `XCB_ATOM_CARDINAL`.
+const XCB_ATOM_CARDINAL: u32 = 6;
+/// Predefined `XCB_ATOM_WM_CLASS`.
+pub(crate) const XCB_ATOM_WM_CLASS: u32 = 67;
+/// `XCB_GET_PROPERTY_TYPE_ANY`: match a property regardless of its type.
+const XCB_GET_PROPERTY_TYPE_ANY: u32 = 0;
+
+#[repr(C)]
+struct XcbCookie {
+	sequence: u32,
+}
+
+#[repr(C)]
+struct XcbInternAtomReply {
+	response_type: u8,
+	pad0: u8,
+	sequence: u16,
+	length: u32,
+	atom: u32,
+}
+
+#[repr(C)]
+struct XcbGetPropertyReply {
+	response_type: u8,
+	format: u8,
+	sequence: u16,
+	length: u32,
+	type_: u32,
+	bytes_after: u32,
+	value_len: u32,
+	pad0: [u8; 12],
+}
+
+type FnXcbInternAtom = unsafe extern "C" fn(*mut libc::c_void, u8, u16, *const std::ffi::c_char) -> XcbCookie;
+type FnXcbInternAtomReply =
+	unsafe extern "C" fn(*mut libc::c_void, XcbCookie, *mut *mut libc::c_void) -> *mut XcbInternAtomReply;
+type FnXcbGetProperty = unsafe extern "C" fn(*mut libc::c_void, u8, u32, u32, u32, u32, u32) -> XcbCookie;
+type FnXcbGetPropertyReply =
+	unsafe extern "C" fn(*mut libc::c_void, XcbCookie, *mut *mut libc::c_void) -> *mut XcbGetPropertyReply;
+
+type XcbPropertyFns = (
+	FnXcbInternAtom,
+	FnXcbInternAtomReply,
+	FnXcbGetProperty,
+	FnXcbGetPropertyReply,
+);
+
+fn load_xcb_property_fns() -> Option<XcbPropertyFns> {
+	use std::sync::OnceLock;
+	static FNS: OnceLock<Option<XcbPropertyFns>> = OnceLock::new();
+
+	unsafe {
+		*FNS.get_or_init(|| {
+			libc::dlerror();
+			let lib = libc::dlopen(c"libxcb.so.1".as_ptr(), libc::RTLD_LAZY | libc::RTLD_GLOBAL);
+			if lib.is_null() {
+				return None;
+			}
+
+			libc::dlerror();
+			let intern = libc::dlsym(lib, c"xcb_intern_atom".as_ptr());
+			libc::dlerror();
+			let intern_reply = libc::dlsym(lib, c"xcb_intern_atom_reply".as_ptr());
+			libc::dlerror();
+			let get_prop = libc::dlsym(lib, c"xcb_get_property".as_ptr());
+			libc::dlerror();
+			let get_prop_reply = libc::dlsym(lib, c"xcb_get_property_reply".as_ptr());
+
+			if intern.is_null() || intern_reply.is_null() || get_prop.is_null() || get_prop_reply.is_null() {
+				let err_ptr = libc::dlerror();
+				if !err_ptr.is_null() {
+					let err = std::ffi::CStr::from_ptr(err_ptr);
+					crate::log_error!("dlsym(xcb property fns) failed: {}", err.to_string_lossy());
+				}
+				return None;
+			}
+
+			Some((
+				std::mem::transmute(intern),
+				std::mem::transmute(intern_reply),
+				std::mem::transmute(get_prop),
+				std::mem::transmute(get_prop_reply),
+			))
+		})
+	}
+}
+
+/// Intern an X11 atom by name.
+unsafe fn xcb_intern_atom(connection: *mut libc::c_void, name: &str) -> Option<u32> {
+	unsafe {
+		let (intern, intern_reply, _, _) = load_xcb_property_fns()?;
+		if connection.is_null() {
+			return None;
+		}
+
+		let cookie = intern(
+			connection,
+			0,
+			name.len() as u16,
+			name.as_ptr() as *const std::ffi::c_char,
+		);
+		let reply = intern_reply(connection, cookie, std::ptr::null_mut());
+		if reply.is_null() {
+			return None;
+		}
+
+		let atom = (*reply).atom;
+		libc::free(reply as *mut libc::c_void);
+		Some(atom)
+	}
+}
+
+/// Read a `CARDINAL` (u32) property from a window by name.
+///
+/// Returns `None` when the property is absent or has an unexpected type, which
+/// is the expected case for non-Wine windows.
+pub(crate) unsafe fn xcb_get_window_property_u32(
+	connection: *mut libc::c_void,
+	window: u32,
+	name: &str,
+) -> Option<u32> {
+	unsafe {
+		let atom = xcb_intern_atom(connection, name)?;
+		let (_, _, get_prop, get_prop_reply) = load_xcb_property_fns()?;
+
+		let cookie = get_prop(connection, 0, window, atom, XCB_ATOM_CARDINAL, 0, 1);
+		let reply = get_prop_reply(connection, cookie, std::ptr::null_mut());
+		if reply.is_null() {
+			return None;
+		}
+
+		let value = if (*reply).type_ == XCB_ATOM_CARDINAL && (*reply).format == 32 && (*reply).value_len >= 1 {
+			let data = (reply as *const u8).add(std::mem::size_of::<XcbGetPropertyReply>()) as *const u32;
+			Some(*data)
+		} else {
+			None
+		};
+
+		libc::free(reply as *mut libc::c_void);
+		value
+	}
+}
+
+/// Returns `true` if the window has a property with the given (predefined) atom.
+pub(crate) unsafe fn xcb_window_has_property(connection: *mut libc::c_void, window: u32, atom: u32) -> bool {
+	unsafe {
+		let (_, _, get_prop, get_prop_reply) = match load_xcb_property_fns() {
+			Some(fns) => fns,
+			None => return false,
+		};
+		if connection.is_null() {
+			return false;
+		}
+
+		let cookie = get_prop(connection, 0, window, atom, XCB_GET_PROPERTY_TYPE_ANY, 0, 0);
+		let reply = get_prop_reply(connection, cookie, std::ptr::null_mut());
+		if reply.is_null() {
+			return false;
+		}
+
+		// XCB_NONE (0) means the property does not exist.
+		let has_property = (*reply).type_ != 0;
+		libc::free(reply as *mut libc::c_void);
+		has_property
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn get_property_reply_layout_matches_xcb() {
+		assert_eq!(std::mem::size_of::<XcbGetPropertyReply>(), 32);
+		assert_eq!(std::mem::offset_of!(XcbGetPropertyReply, type_), 8);
+		assert_eq!(std::mem::offset_of!(XcbGetPropertyReply, value_len), 16);
+	}
 
 	#[test]
 	fn get_window_attributes_reply_layout_matches_xcb() {

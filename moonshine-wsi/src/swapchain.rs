@@ -21,7 +21,11 @@ use crate::state::{
 	MutexExt, SurfaceKey, SwapchainData, SwapchainKey, get_wayland_connection, insert_swapchain, is_forcing_fifo,
 	is_frame_limiter_aware, remove_swapchain, with_device, with_surface, with_swapchain, with_swapchain_mut,
 };
-use crate::xcb::{xcb_get_largest_obscuring_child, xcb_get_toplevel_window, xcb_get_window_rect};
+use crate::surface::icd_fallback_surface;
+use crate::xcb::{
+	XCB_ATOM_WM_CLASS, xcb_get_largest_obscuring_child, xcb_get_toplevel_window, xcb_get_window_attributes,
+	xcb_get_window_property_u32, xcb_get_window_rect, xcb_query_tree_window, xcb_window_has_property,
+};
 
 pub unsafe extern "C" fn create_swapchain(
 	device: VkDevice,
@@ -57,13 +61,23 @@ pub unsafe extern "C" fn create_swapchain(
 		// Compute surface_key early for bypass checks.
 		let surface_key = SurfaceKey::from_raw(create_info.surface.as_raw());
 
-		// Determine whether XWayland bypass is allowed for this surface.
-		let bypass_allowed = can_bypass_xwayland(surface_key);
+		// Determine whether XWayland bypass is allowed for this surface.  When it
+		// is not, present through the plain XCB fallback surface rather than the
+		// un-mapped Wayland bypass surface.
+		let fallback_surface = icd_fallback_surface(create_info.surface);
+		let bypass_allowed = fallback_surface.is_none() && can_bypass_xwayland(surface_key);
+		let icd_surface = fallback_surface.unwrap_or(create_info.surface);
+		let need_surface_patch = icd_surface.as_raw() != create_info.surface.as_raw();
 
 		let mut patched_create_info;
-		let p_create_info_for_icd = if need_remap {
+		let p_create_info_for_icd = if need_remap || need_surface_patch {
 			patched_create_info = *create_info;
-			patched_create_info.image_color_space = ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
+			if need_surface_patch {
+				patched_create_info.surface = icd_surface;
+			}
+			if need_remap {
+				patched_create_info.image_color_space = ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
+			}
 			&patched_create_info as *const VkSwapchainCreateInfoKHR
 		} else {
 			p_create_info
@@ -121,46 +135,75 @@ pub unsafe extern "C" fn create_swapchain(
 		};
 
 		// Get the Wayland connection (without holding any map lock).
-		let ms_swapchain = get_wayland_connection(instance_key).and_then(|arc| {
-			// Retrieve the wl_surface and xcb_window for this VkSurface.
-			let (wl_surface, xcb_window) = with_surface(surface_key, |s| (s.wl_surface.clone(), s.xcb_window))?;
+		// Native Wayland surfaces are bound on the app's own connection, XCB
+		// bypass surfaces use the layer's private connection.  Only bind a
+		// compositor swapchain when presenting through the bypass surface; the
+		// XCB fallback is presented by the ICD/XWayland directly.
+		let native = with_surface(surface_key, |s| s.native.clone()).flatten();
+		let ms_swapchain = if !bypass_allowed {
+			None
+		} else if let Some(native) = native {
+			let mut wl = native.connection.force_lock();
+			if wl.dead {
+				None
+			} else {
+				let ms = wl
+					.swapchain_factory
+					.create_swapchain(&native.wl_surface, &wl.qh, swapchain_key.raw());
 
-			let mut wl = arc.force_lock();
-			// Create the protocol object; UserData = swapchain raw handle for
-			// event dispatch back into SWAPCHAIN_MAP.
-			let ms = wl
-				.swapchain_factory
-				.create_swapchain(&wl_surface, &wl.qh, swapchain_key.raw());
-
-			// Send initial swapchain feedback with the APP's original
-			// color space.  The layer remaps HDR→sRGB for the ICD, but
-			// DXVK doesn't see that remap and converts sRGB→PQ in its
-			// swapchain blitter.  The pixel data arriving at the
-			// compositor is PQ-encoded, matching the app's requested
-			// color space.
-			ms.swapchain_feedback(
-				min_image_count,
-				create_info.image_format.as_raw() as u32,
-				app_color_space.as_raw() as u32,
-				create_info.composite_alpha.as_raw(),
-				create_info.pre_transform.as_raw(),
-				create_info.clipped,
-			);
-
-			// Tell the compositor the present mode.
-			ms.set_present_mode(create_info.present_mode.as_raw() as u32);
-
-			// Map the bypass wl_surface to the X11 window so the
-			// compositor renders it in place of the XWayland surface.
-			// Only do this when bypass safety checks pass.
-			if bypass_allowed && let Some(xid) = xcb_window {
-				crate::log_debug!("vkCreateSwapchainKHR: override_window_content x11_window={}", xid);
-				ms.override_window_content(0, xid);
+				ms.swapchain_feedback(
+					min_image_count,
+					create_info.image_format.as_raw() as u32,
+					app_color_space.as_raw() as u32,
+					create_info.composite_alpha.as_raw(),
+					create_info.pre_transform.as_raw(),
+					create_info.clipped,
+				);
+				ms.set_present_mode(create_info.present_mode.as_raw() as u32);
+				wl.flush();
+				Some(ms)
 			}
+		} else {
+			get_wayland_connection(instance_key).and_then(|arc| {
+				// Retrieve the wl_surface and xcb_window for this VkSurface.
+				let (wl_surface, xcb_window) = with_surface(surface_key, |s| (s.wl_surface.clone(), s.xcb_window))?;
 
-			wl.flush();
-			Some(ms)
-		});
+				let mut wl = arc.force_lock();
+				// Create the protocol object; UserData = swapchain raw handle for
+				// event dispatch back into SWAPCHAIN_MAP.
+				let ms = wl
+					.swapchain_factory
+					.create_swapchain(&wl_surface, &wl.qh, swapchain_key.raw());
+
+				// Send initial swapchain feedback with the APP's original
+				// color space.  The layer remaps HDR→sRGB for the ICD, but
+				// DXVK doesn't see that remap and converts sRGB→PQ in its
+				// swapchain blitter.  The pixel data arriving at the
+				// compositor is PQ-encoded, matching the app's requested
+				// color space.
+				ms.swapchain_feedback(
+					min_image_count,
+					create_info.image_format.as_raw() as u32,
+					app_color_space.as_raw() as u32,
+					create_info.composite_alpha.as_raw(),
+					create_info.pre_transform.as_raw(),
+					create_info.clipped,
+				);
+
+				// Tell the compositor the present mode.
+				ms.set_present_mode(create_info.present_mode.as_raw() as u32);
+
+				// Map the bypass wl_surface to the X11 window so the
+				// compositor renders it in place of the XWayland surface.
+				if let Some(xid) = xcb_window {
+					crate::log_debug!("vkCreateSwapchainKHR: override_window_content x11_window={}", xid);
+					ms.override_window_content(0, xid);
+				}
+
+				wl.flush();
+				Some(ms)
+			})
+		};
 
 		insert_swapchain(
 			swapchain_key,
@@ -288,6 +331,20 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 			}
 		}
 
+		// Native Wayland swapchains live on the app's own connection; dispatch
+		// their pending events too.  This never reads the socket (the app does),
+		// so it cannot block or race the application's event loop.
+		for sw in swapchains {
+			let native = with_swapchain(SwapchainKey::from_raw(sw.as_raw()), |sd| sd._surface)
+				.and_then(|surf| with_surface(SurfaceKey::from_raw(surf.as_raw()), |s| s.native.clone()).flatten());
+			if let Some(native) = native {
+				let mut wl = native.connection.force_lock();
+				if !wl.dead {
+					wl.dispatch_pending();
+				}
+			}
+		}
+
 		// Build per-present mode info if maintenance1 is available.
 		let has_maintenance1 = with_device(queue_key, |d| d.has_maintenance1).unwrap_or(false);
 		let mut present_mode_info;
@@ -353,32 +410,39 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 			}
 		}
 
-		// Re-evaluate XWayland bypass safety for each swapchain.  If bypass is
-		// no longer allowed, force the app to recreate the swapchain.
+		// Re-evaluate XWayland bypass safety for each swapchain.  When it
+		// changes, nudge the app to recreate the swapchain: OUT_OF_DATE when
+		// bypass is no longer safe, SUBOPTIMAL when it becomes safe again.
 		for (i, sw) in swapchains.iter().enumerate() {
 			let sw_key = SwapchainKey::from_raw(sw.as_raw());
 			let was_bypassing = with_swapchain(sw_key, |sd| sd.is_bypassing_xwayland).unwrap_or(false);
 
-			if was_bypassing {
-				let surface = with_swapchain(sw_key, |sd| sd._surface);
-				if let Some(surf) = surface {
-					let surf_key = SurfaceKey::from_raw(surf.as_raw());
-					let still_allowed = can_bypass_xwayland(surf_key);
-					if !still_allowed {
-						with_swapchain_mut(sw_key, |sd| sd.is_bypassing_xwayland = false);
-						if !present_info.p_results.is_null() {
-							let results = std::slice::from_raw_parts_mut(
-								present_info.p_results,
-								present_info.swapchain_count as usize,
-							);
-							if results[i] >= ash::vk::Result::SUCCESS {
-								results[i] = VK_ERROR_OUT_OF_DATE_KHR;
-							}
-						}
-						return VK_ERROR_OUT_OF_DATE_KHR;
-					}
+			let Some(surface) = with_swapchain(sw_key, |sd| sd._surface) else {
+				continue;
+			};
+
+			let now_allowed = can_bypass_xwayland(SurfaceKey::from_raw(surface.as_raw()));
+			if now_allowed == was_bypassing {
+				continue;
+			}
+
+			with_swapchain_mut(sw_key, |sd| sd.is_bypassing_xwayland = now_allowed);
+			if !present_info.p_results.is_null() {
+				let results =
+					std::slice::from_raw_parts_mut(present_info.p_results, present_info.swapchain_count as usize);
+				if results[i] >= ash::vk::Result::SUCCESS {
+					results[i] = if now_allowed {
+						VK_SUBOPTIMAL_KHR
+					} else {
+						VK_ERROR_OUT_OF_DATE_KHR
+					};
 				}
 			}
+			return if now_allowed {
+				VK_SUBOPTIMAL_KHR
+			} else {
+				VK_ERROR_OUT_OF_DATE_KHR
+			};
 		}
 
 		result
@@ -393,8 +457,13 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 ///
 /// Returns `true` only when the X11 child window is the toplevel, its geometry
 /// matches the toplevel, and no obscuring child covers the window.
-unsafe fn can_bypass_xwayland(surface_key: SurfaceKey) -> bool {
+pub(crate) unsafe fn can_bypass_xwayland(surface_key: SurfaceKey) -> bool {
 	unsafe {
+		// Native Wayland surfaces always present through the compositor.
+		if with_surface(surface_key, |s| s.native.is_some()).unwrap_or(false) {
+			return true;
+		}
+
 		let (xcb_connection, xcb_window) = match with_surface(surface_key, |s| (s.xcb_connection, s.xcb_window)) {
 			Some(v) => v,
 			None => return false,
@@ -441,6 +510,29 @@ unsafe fn can_bypass_xwayland(surface_key: SurfaceKey) -> bool {
 			&& ow > 1 && oh > 1
 		{
 			return false;
+		}
+
+		// Never bypass windows Wine presents offscreen to GDI-blit onto the
+		// real toplevel: marked with `_WINE_ALLOW_FLIP=0`, or parked under
+		// Wine's unnamed 1×1 override-redirect dummy window.  Those blits can
+		// only carry SDR, and the bypass `wl_surface` is never mapped, so the
+		// window would stay blank.
+		if let Some(allow_flip) = xcb_get_window_property_u32(xcb_connection, xcb_window, "_WINE_ALLOW_FLIP") {
+			if allow_flip == 0 {
+				return false;
+			}
+		} else if let Some((root, parent, _children)) = xcb_query_tree_window(xcb_connection, xcb_window)
+			&& parent != root
+		{
+			let parent_rect = xcb_get_window_rect(xcb_connection, parent);
+			let parent_attrs = xcb_get_window_attributes(xcb_connection, parent);
+			if let (Some((_, _, pw, ph)), Some((_, override_redirect))) = (parent_rect, parent_attrs)
+				&& pw == 1 && ph == 1
+				&& override_redirect
+				&& !xcb_window_has_property(xcb_connection, parent, XCB_ATOM_WM_CLASS)
+			{
+				return false;
+			}
 		}
 
 		true

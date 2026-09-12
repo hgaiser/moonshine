@@ -350,6 +350,17 @@ pub struct DeviceData {
 // Per-surface state
 // ---------------------------------------------------------------------------
 
+/// Protocol objects bound on the application's own `wl_display` for a native
+/// Wayland surface (as opposed to the layer's private connection, which is
+/// used for the XWayland bypass).
+#[derive(Clone)]
+pub struct NativeWaylandSurface {
+	/// Layer state wrapping the application's `wl_display`.
+	pub connection: Arc<Mutex<WaylandConnection>>,
+	/// The application's `wl_surface`, wrapped on `connection`'s queue.
+	pub wl_surface: WlSurface,
+}
+
 pub struct SurfaceData {
 	/// The `wl_surface` on the Moonshine compositor associated with this
 	/// tracked Vulkan surface.
@@ -362,6 +373,12 @@ pub struct SurfaceData {
 	/// For XWayland bypass: the opaque XCB connection pointer for live
 	/// geometry queries in the capabilities hook.
 	pub xcb_connection: *mut libc::c_void,
+	/// Plain XCB surface for the same window, used when the bypass safety
+	/// checks refuse (e.g. Wine windows presented offscreen to GDI-blit).
+	pub fallback_surface: VkSurface,
+	/// Set for native Wayland surfaces (bound on the app's own display);
+	/// `None` for XCB/XWayland surfaces.
+	pub native: Option<NativeWaylandSurface>,
 }
 
 // SAFETY: The raw xcb_connection pointer is process-global and thread-safe
