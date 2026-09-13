@@ -348,7 +348,8 @@ pub(crate) struct Gamepad {
 
 impl Gamepad {
 	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
-		let id = format!("00:11:22:33:{:02x}", info.index);
+		// inputtino parses this as a 6-octet MAC address (PS5 pairing info, SDL device linking).
+		let id = format!("00:11:22:33:00:{:02x}", info.index);
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
