@@ -384,14 +384,21 @@ impl Gamepad {
 				let mut gamepad =
 					PS5Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
 
+				// These callbacks run on inputtino's uhid thread, which also answers the kernel's
+				// report requests: never block it, and skip values the client already has.
 				gamepad.set_on_led({
 					let feedback_tx = feedback_tx.clone();
 					let index = info.index;
+					let mut last_rgb = None;
 					move |r, g, b| {
-						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
-							id: index as u16,
-							rgb: (r as u8, g as u8, b as u8),
-						}));
+						let rgb = (r as u8, g as u8, b as u8);
+						if last_rgb != Some(rgb)
+							&& feedback_tx
+								.try_send(FeedbackCommand::SetLed(SetLedCommand { id: index as u16, rgb }))
+								.is_ok()
+						{
+							last_rgb = Some(rgb);
+						}
 					}
 				});
 
@@ -415,7 +422,7 @@ impl Gamepad {
 
 						// tracing::info!("Trigger effect: {:?} {:?} {:?} {:?}", type_left, type_right, left, right);
 
-						let _ = feedback_tx.blocking_send(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
+						let _ = feedback_tx.try_send(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
 							id: index as u16,
 							trigger_event_flags,
 							type_left,
@@ -452,12 +459,20 @@ impl Gamepad {
 		let feedback_tx_for_rumble = feedback_tx.clone();
 		gamepad.set_on_rumble({
 			let index = info.index;
+			let mut last_rumble = None;
 			move |low_frequency, high_frequency| {
-				let _ = feedback_tx_for_rumble.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
-					id: index as u16,
-					low_frequency: low_frequency as u16,
-					high_frequency: high_frequency as u16,
-				}));
+				let rumble = (low_frequency as u16, high_frequency as u16);
+				if last_rumble != Some(rumble)
+					&& feedback_tx_for_rumble
+						.try_send(FeedbackCommand::Rumble(RumbleCommand {
+							id: index as u16,
+							low_frequency: rumble.0,
+							high_frequency: rumble.1,
+						}))
+						.is_ok()
+				{
+					last_rumble = Some(rumble);
+				}
 			}
 		});
 

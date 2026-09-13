@@ -464,7 +464,8 @@ async fn run_control_loop(
 	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 
 	// Create a channel over which we can receive feedback messages to send to the connected client.
-	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
+	// Gamepad callbacks drop commands when this is full, so leave room for bursts.
+	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(64);
 
 	// Sequence number of feedback messages.
 	let mut sequence_number = 0u32;
@@ -483,10 +484,11 @@ async fn run_control_loop(
 			break;
 		}
 
-		// Check for feedback messages.
-		if let Ok(command) = feedback_rx.try_recv()
-			&& let Some(peer_id) = connected_peer
-		{
+		// Send all queued feedback messages; games can queue several per loop iteration.
+		while let Ok(command) = feedback_rx.try_recv() {
+			let Some(peer_id) = connected_peer else {
+				continue;
+			};
 			tracing::debug!("Sending control feedback command: {command:?}");
 			let payload = command.as_packet();
 			let key = context.keys_rx.borrow().remote_input_key.clone();
