@@ -739,6 +739,8 @@ impl MoonshineCompositor {
 		space: &Space<smithay::desktop::Window>,
 		output: &Output,
 		override_surface: Option<(&WlSurface, u32)>,
+		decoration_windows: &[smithay::desktop::Window],
+		override_underlay_window: Option<&smithay::desktop::Window>,
 	) -> Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
 		let output_scale = output.current_scale().fractional_scale();
 		let scale = smithay::utils::Scale::from(output_scale);
@@ -777,11 +779,25 @@ impl MoonshineCompositor {
 				}
 			};
 
-		// The render element list is front-to-back (first is topmost): Smithay's
-		// damage tracker draws it in reverse. `space.elements()` runs bottom to
-		// top, so reverse it to keep the compositor's stacking order.
+		// Paint order, back to front. `Space::elements()` is back to front.
+		let mut paint_order: Vec<&smithay::desktop::Window> = space
+			.elements()
+			// Decorations and the carried override underlay are painted on top.
+			.filter(|window| !decoration_windows.contains(window) && override_underlay_window != Some(*window))
+			.collect();
+
+		// Same-app decorations ride above the focus window; the underlay sits
+		// between them and the override.
+		paint_order.extend(
+			decoration_windows
+				.iter()
+				.chain(override_underlay_window.iter().copied())
+				.filter(|window| space.elements().any(|e| e == *window)),
+		);
+
+		// Render elements are front to back (the topmost comes first).
 		let mut elements = Vec::new();
-		for window in space.elements().rev() {
+		for window in paint_order.into_iter().rev() {
 			render_window(&mut elements, window);
 		}
 
@@ -1234,6 +1250,8 @@ impl MoonshineCompositor {
 			&self.space,
 			&self.output,
 			override_target.as_ref().map(|(s, w)| (s, *w)),
+			&self.decoration_windows,
+			self.override_underlay_window.as_ref(),
 		);
 		elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
 
