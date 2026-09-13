@@ -163,6 +163,14 @@ impl<'a> ControlMessage<'a> {
 			ControlMessageType::LossStats => Ok(Self::LossStats),
 			ControlMessageType::FrameStats => Ok(Self::FrameStats),
 			ControlMessageType::InputData => {
+				if buffer.len() < 8 {
+					tracing::warn!(
+						"Expected input data message of at least 8 bytes, got {} bytes.",
+						buffer.len()
+					);
+					return Err(());
+				}
+
 				// Length of the input event, excluding the length itself.
 				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 				if length as usize != buffer.len() - 8 {
@@ -484,8 +492,9 @@ async fn run_control_loop(
 			break;
 		}
 
-		// Send all queued feedback messages; games can queue several per loop iteration.
-		while let Ok(command) = feedback_rx.try_recv() {
+		// Send queued feedback messages; games can queue several per loop iteration.
+		// Bounded so a steady stream of feedback can't starve ENet servicing.
+		for command in std::iter::from_fn(|| feedback_rx.try_recv().ok()).take(64) {
 			let Some(peer_id) = connected_peer else {
 				continue;
 			};
