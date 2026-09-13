@@ -350,7 +350,7 @@ impl VideoStream {
 		let resume_pending = Arc::new(AtomicBool::new(false));
 
 		// Packet channel.
-		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
+		let (packet_tx, packet_rx) = mpsc::channel::<(u32, ShardBatch)>(128);
 
 		// Spawn packet handler — gated behind start_notify.
 		spawn_handle_video_packets(
@@ -390,10 +390,10 @@ impl VideoStream {
 }
 
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<ShardBatch>,
+	mut packet_rx: mpsc::Receiver<(u32, ShardBatch)>,
 	socket: UdpGsoSocket,
 	start: Arc<Notify>,
-	reset_tx: broadcast::Sender<()>,
+	reset_tx: broadcast::Sender<u32>,
 	resume_pending: Arc<AtomicBool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -402,6 +402,8 @@ fn spawn_handle_video_packets(
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
+		// Epoch of the last reset fired; batches packetized before it carry old counters.
+		let mut reset_epoch = 0u32;
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
 
@@ -413,9 +415,11 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Ok(Some(batch)) => {
+						Ok(Some((epoch, batch))) => {
 							if let Some(addr) = client_address {
-								if batch.shard_count() == 0 {
+								// Frames from before a resume's reset would reach the new client
+								// with old frame numbers, making it drop the reset frames as stale.
+								if epoch < reset_epoch || batch.shard_count() == 0 {
 									continue;
 								}
 
@@ -465,7 +469,8 @@ fn spawn_handle_video_packets(
 						// Fire a resume's reset now that frames reach the client's current address.
 						if resume_pending.swap(false, Ordering::Relaxed) {
 							tracing::info!("Resumed client address is {address}, resetting video stream.");
-							let _ = reset_tx.send(());
+							reset_epoch += 1;
+							let _ = reset_tx.send(reset_epoch);
 						}
 					} else {
 						tracing::warn!("Received unknown message on video stream of length {len}.");
