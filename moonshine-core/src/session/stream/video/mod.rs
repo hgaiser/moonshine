@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
@@ -229,7 +230,8 @@ pub(crate) struct VideoStreamHandle {
 	/// Reference frame invalidation requests, carrying the inclusive
 	/// `[first, last]` client frame-index range the client could not decode.
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
-	reset_tx: broadcast::Sender<()>,
+	/// Set by a resume; the packet handler fires the reset on the client's next PING.
+	resume_pending: Arc<AtomicBool>,
 }
 
 impl VideoStreamHandle {
@@ -265,8 +267,11 @@ impl VideoStreamHandle {
 	/// Moonlight session expects frame numbers to start at 1; without a reset it counts
 	/// the jump as massive frame loss and reports a poor connection. This also forces an
 	/// IDR so the resumed client has a decodable starting frame.
+	///
+	/// The reset waits for the client's next PING: a reconnecting client usually arrives
+	/// from a new UDP port, and firing immediately would send the IDR to the old address.
 	pub fn request_reset(&self) {
-		let _ = self.reset_tx.send(());
+		self.resume_pending.store(true, Ordering::Relaxed);
 	}
 
 	/// Clone the start notify for external triggering (e.g. bench binary).
@@ -342,12 +347,20 @@ impl VideoStream {
 
 		// Stream-reset broadcast channel (client reconnect/resume).
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
+		let resume_pending = Arc::new(AtomicBool::new(false));
 
 		// Packet channel.
-		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
+		let (packet_tx, packet_rx) = mpsc::channel::<(u32, ShardBatch)>(128);
 
 		// Spawn packet handler — gated behind start_notify.
-		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone());
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			start_notify.clone(),
+			reset_tx.clone(),
+			resume_pending.clone(),
+			stop.clone(),
+		);
 
 		// Spawn pipeline thread — gated behind start_notify.
 		VideoPipeline::new(
@@ -371,15 +384,17 @@ impl VideoStream {
 			notify: start_notify,
 			idr_tx,
 			invalidate_tx,
-			reset_tx,
+			resume_pending,
 		})
 	}
 }
 
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<ShardBatch>,
+	mut packet_rx: mpsc::Receiver<(u32, ShardBatch)>,
 	socket: UdpGsoSocket,
 	start: Arc<Notify>,
+	reset_tx: broadcast::Sender<u32>,
+	resume_pending: Arc<AtomicBool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
 	tokio::spawn(async move {
@@ -387,6 +402,8 @@ fn spawn_handle_video_packets(
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
+		// Epoch of the last reset fired; batches packetized before it carry old counters.
+		let mut reset_epoch = 0u32;
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
 
@@ -398,9 +415,11 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Ok(Some(batch)) => {
+						Ok(Some((epoch, batch))) => {
 							if let Some(addr) = client_address {
-								if batch.shard_count() == 0 {
+								// Frames from before a resume's reset would reach the new client
+								// with old frame numbers, making it drop the reset frames as stale.
+								if epoch < reset_epoch || batch.shard_count() == 0 {
 									continue;
 								}
 
@@ -446,6 +465,13 @@ fn spawn_handle_video_packets(
 					if &buf[..len] == b"PING" {
 						tracing::trace!("Received video stream PING message from {address}.");
 						client_address = Some(address);
+
+						// Fire a resume's reset now that frames reach the client's current address.
+						if resume_pending.swap(false, Ordering::Relaxed) {
+							tracing::info!("Resumed client address is {address}, resetting video stream.");
+							reset_epoch += 1;
+							let _ = reset_tx.send(reset_epoch);
+						}
 					} else {
 						tracing::warn!("Received unknown message on video stream of length {len}.");
 					}

@@ -373,7 +373,8 @@ impl SessionManager {
 					// The reconnecting client is a fresh Moonlight session that expects
 					// frame numbers to start at 1, so reset the video frame counters and
 					// force an IDR; otherwise it sees the running counter as a huge frame
-					// gap and reports a poor connection.
+					// gap and reports a poor connection. The reset fires on the client's
+					// first video PING, once its new address is known.
 					active.reset_video_stream();
 					guard.session = Some(SessionState::Active(active));
 					tracing::info!(

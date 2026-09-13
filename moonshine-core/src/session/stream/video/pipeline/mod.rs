@@ -219,8 +219,9 @@ enum ConsumerMessage {
 	Frame(FrameContext, EncodeFuture),
 	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
 	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
-	/// effect before any frame submitted after the reset.
-	ResetCounters,
+	/// effect before any frame submitted after the reset. Carries the reset's
+	/// epoch, which tags later packet batches so stale ones can be dropped.
+	ResetCounters(u32),
 }
 
 /// Decrements the in-flight frame counter when dropped, on every exit path of a
@@ -250,7 +251,7 @@ impl Drop for InFlightGuard {
 #[allow(clippy::too_many_arguments)]
 async fn run_packet_consumer(
 	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
-	packet_tx: mpsc::Sender<ShardBatch>,
+	packet_tx: mpsc::Sender<(u32, ShardBatch)>,
 	stats_tx: broadcast::Sender<FrameStats>,
 	in_flight: Arc<AtomicUsize>,
 	idr_tx: broadcast::Sender<()>,
@@ -260,6 +261,7 @@ async fn run_packet_consumer(
 ) {
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
+	let mut reset_epoch = 0u32;
 	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
 	let mut last_summary_time = std::time::Instant::now();
 	let frame_interval_us = 1_000_000 / ctx.fps as u128;
@@ -268,9 +270,10 @@ async fn run_packet_consumer(
 	// encoding thread drops its sender, this loop ends after the last frame.
 	while let Some(msg) = ctx_rx.recv().await {
 		let (frame_context, future) = match msg {
-			ConsumerMessage::ResetCounters => {
+			ConsumerMessage::ResetCounters(epoch) => {
 				frame_number = 0;
 				sequence_number = 0;
+				reset_epoch = epoch;
 				continue;
 			},
 			ConsumerMessage::Frame(frame_context, future) => (frame_context, future),
@@ -355,7 +358,7 @@ async fn run_packet_consumer(
 		// session is already tearing down. Stop the consumer; the encoding thread
 		// then sees its `frame_ctx_tx` fail and exits too, which drops the
 		// video-pipeline shutdown token and tears the session down.
-		if packet_tx.send(shards).await.is_err() {
+		if packet_tx.send((reset_epoch, shards)).await.is_err() {
 			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
 			break;
 		}
@@ -430,11 +433,11 @@ impl VideoPipeline {
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: broadcast::Receiver<()>,
+		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
@@ -488,11 +491,11 @@ impl VideoPipelineInner {
 		self,
 		runtime: tokio::runtime::Handle,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: broadcast::Receiver<()>,
+		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
@@ -600,7 +603,18 @@ impl VideoPipelineInner {
 		.with_virtual_buffer_size_ms(1000 / ctx.fps)
 		.with_initial_virtual_buffer_size_ms(0);
 
-		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
+		// 4:4:4 is advertised for every supported codec, but some encoders (e.g. AMD VCN) only have 4:2:0 profiles.
+		let encoder = Encoder::new(context.clone(), config).map_err(|e| {
+			let hint = if ctx.chroma_sampling_type == VideoChromaSampling::Yuv444 {
+				" (this GPU may not support 4:4:4 encoding, try disabling YUV 4:4:4 in the client)"
+			} else {
+				""
+			};
+			format!(
+				"Failed to create {codec:?} encoder ({:?}, {:?}): {e}{hint}",
+				ctx.chroma_sampling_type, ctx.dynamic_range
+			)
+		})?;
 
 		Ok((context, encoder))
 	}
@@ -612,11 +626,11 @@ impl VideoPipelineInner {
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		mut reset_request_rx: broadcast::Receiver<()>,
+		mut reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -729,18 +743,19 @@ impl VideoPipelineInner {
 			// ("Your network connection isn't performing well"). Reset the frame and RTP
 			// sequence counters and force an IDR so the resumed client sees a clean stream
 			// starting from frame 1.
-			let mut pending_reset = false;
+			let mut pending_reset = None;
 			loop {
 				match reset_request_rx.try_recv() {
-					Ok(()) => pending_reset = true,
-					Err(broadcast::error::TryRecvError::Lagged(_)) => pending_reset = true,
+					Ok(epoch) => pending_reset = Some(epoch),
+					// The newest epoch is still queued; the next try_recv returns it.
+					Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
 			}
-			if pending_reset {
+			if let Some(epoch) = pending_reset {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
 				// Counters live on the consumer task; reset them in order.
-				let _ = frame_ctx_tx.blocking_send(ConsumerMessage::ResetCounters);
+				let _ = frame_ctx_tx.blocking_send(ConsumerMessage::ResetCounters(epoch));
 				// The next submitted frame becomes the consumer's frame 1 of the
 				// new epoch; anchor the invalidation index mapping to it.
 				frame_number_base = submitted_count;

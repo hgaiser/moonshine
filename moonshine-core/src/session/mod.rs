@@ -339,7 +339,8 @@ impl ActiveSession {
 		&self.context
 	}
 
-	/// Reset the video stream's frame counters and force an IDR for a resuming client.
+	/// Arm a video stream reset (frame counters + forced IDR) for a resuming client.
+	/// It fires once the client's first video PING arrives.
 	pub(crate) fn reset_video_stream(&self) {
 		self.video_handle.request_reset();
 	}
