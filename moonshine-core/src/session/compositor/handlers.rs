@@ -1808,10 +1808,10 @@ impl XdgShellHandler for MoonshineCompositor {
 		// Tell the client the desired surface size so Vulkan WSI can
 		// create a swapchain. Without an initial configure the client
 		// blocks indefinitely waiting for the compositor to propose a
-		// size.
+		// size. Don't claim Maximized: Wine then treats the window as a
+		// maximized, decorated Win32 window and draws its own frame.
 		surface.with_pending_state(|state| {
 			state.size = Some((self.width as i32, self.height as i32).into());
-			state.states.set(XdgToplevelState::Maximized);
 		});
 		surface.send_configure();
 
@@ -1896,8 +1896,11 @@ impl XdgShellHandler for MoonshineCompositor {
 	}
 
 	fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+		// Keep filling the output after leaving fullscreen; toplevels are no
+		// longer marked Maximized, which used to guarantee this.
 		surface.with_pending_state(|state| {
 			state.states.unset(XdgToplevelState::Fullscreen);
+			state.size = Some((self.width as i32, self.height as i32).into());
 		});
 		surface.send_configure();
 
