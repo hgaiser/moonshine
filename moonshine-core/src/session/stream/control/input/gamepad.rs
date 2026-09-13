@@ -68,8 +68,8 @@ pub struct GamepadConfig {
 pub enum PlayStationConnection {
 	#[default]
 	Bluetooth,
-	/// Proton rewrites Bluetooth DualSense input into short reports, which
-	/// breaks games and mods that read the full report; USB avoids that.
+	/// Some games and mods misread Bluetooth DualSense input under Proton
+	/// (e.g. the Dying Light DualSense mod); USB avoids that.
 	Usb,
 }
 
