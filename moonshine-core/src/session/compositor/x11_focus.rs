@@ -884,9 +884,13 @@ impl X11Focus {
 		self.read_cardinal_prop_by_atom(window_id as Window, self.atoms.steam_overlay, 0)
 	}
 
-	/// The interned `STEAM_OVERLAY` atom id, for matching property-notify events.
-	pub fn steam_overlay_atom(&self) -> Atom {
-		self.atoms.steam_overlay
+	pub fn is_overlay_property(&self, atom: u32) -> bool {
+		[
+			self.atoms.steam_overlay,
+			self.atoms.steam_input_focus,
+			self.atoms.net_wm_window_opacity,
+		]
+		.contains(&(atom as Atom))
 	}
 
 	/// Read the _NET_WM_WINDOW_OPACITY property from an X11 window.
