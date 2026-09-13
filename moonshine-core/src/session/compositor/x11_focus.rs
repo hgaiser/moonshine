@@ -1129,6 +1129,19 @@ impl X11Focus {
 		});
 	}
 
+	/// Send buffered property writes. Native Wayland focus never calls
+	/// `XSetInputFocus`, so without this Steam can miss focus-contract updates.
+	pub fn flush(&self) {
+		if self.dpy.is_null() {
+			return;
+		}
+		with_xlib(|loaded| {
+			let flush = loaded.xflush?;
+			unsafe { flush(self.dpy) };
+			Some(())
+		});
+	}
+
 	/// Clear GAMESCOPE_FOCUSED_APP from the root window.
 	pub fn clear_focused_app(&self) {
 		if self.atoms.gamescope_focused_app == 0 {

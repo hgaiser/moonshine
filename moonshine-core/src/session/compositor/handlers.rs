@@ -1574,6 +1574,14 @@ impl MoonshineCompositor {
 	/// 5. `enforce_fullscreen_geometry()` — hold the winner at the output size
 	/// 6. `apply_focus()` — set keyboard/pointer focus, activation
 	pub fn reevaluate_focus(&mut self) {
+		self.reevaluate_focus_inner();
+		// The focus-contract setters only buffer; send them together.
+		if let Some(xf) = &self.x11_focus {
+			xf.flush();
+		}
+	}
+
+	fn reevaluate_focus_inner(&mut self) {
 		// Mark focus as dirty before recalculating.
 		self.focus_state.mark_dirty();
 
