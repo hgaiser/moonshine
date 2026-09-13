@@ -427,11 +427,6 @@ pub(crate) struct MoonshineCompositor {
 	/// Gamescope: `focus_t::ulCurrentFocusSerial` + `MakeFocusDirty()`.
 	pub focus_state: super::focus::FocusState,
 
-	/// Last-seen Steam focus control `(window, app_ids)` from the root window.
-	/// Polled once per frame; a change re-evaluates focus. Gamescope receives a
-	/// root PropertyNotify instead.
-	pub last_focus_control: Option<(Option<u32>, Vec<u32>)>,
-
 	/// Metadata for each window, used for focus priority decisions.
 	/// Mirrors the fields from `steamcompmgr_win_t` in gamescope.
 	pub window_metadata: std::collections::HashMap<smithay::desktop::Window, super::focus::WindowMetadata>,
@@ -720,7 +715,6 @@ impl MoonshineCompositor {
 				x11_focus: None,
 				x11_focus_token: None,
 				focus_state: super::focus::FocusState::default(),
-				last_focus_control: None,
 				window_metadata: HashMap::new(),
 				transient_children: std::collections::HashMap::new(),
 				held_scanout_buffers: Vec::new(),
@@ -923,29 +917,6 @@ impl MoonshineCompositor {
 		with_renderer_surface_state(surface, |st| st.buffer_size().map(|s| (s.w, s.h))).flatten()
 	}
 
-	/// Re-evaluate focus when Steam changes the root focus-control properties.
-	///
-	/// Gamescope receives a PropertyNotify on the root; moonshine has no X event
-	/// source for it, so poll the two cheap local reads once per frame and only
-	/// re-focus when they change.
-	fn poll_focus_control(&mut self) {
-		let Some(fc) = self.x11_focus.as_ref().and_then(|xf| xf.read_focus_control()) else {
-			return;
-		};
-		let current = (fc.window, fc.app_ids.iter().map(|a| a.0).collect::<Vec<_>>());
-		if self.last_focus_control.as_ref() == Some(&current) {
-			return;
-		}
-		tracing::debug!(
-			target: "focus",
-			window = ?current.0,
-			app_ids = ?current.1,
-			"Steam focus control changed; re-evaluating focus"
-		);
-		self.last_focus_control = Some(current);
-		self.reevaluate_focus();
-	}
-
 	/// Raise/lower the Steam overlay above/below the game when `STEAM_OVERLAY`
 	/// changes.
 	///
@@ -1071,11 +1042,6 @@ impl MoonshineCompositor {
 		// Must run before the static-screen early return so the raise/lower
 		// is detected as soon as the overlay window commits a frame.
 		self.update_overlay_z_order();
-
-		// Steam changes `GAMESCOPECTRL_BASELAYER_WINDOW`/`APPID` on the root to
-		// move focus; gamescope gets a PropertyNotify, moonshine has no X event
-		// source for that, so poll the two properties and re-focus on change.
-		self.poll_focus_control();
 
 		// Detect cursor-only movement as a screen change.
 		if self.cursor_position != self.last_cursor_position {
