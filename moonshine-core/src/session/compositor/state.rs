@@ -1372,6 +1372,26 @@ impl MoonshineCompositor {
 			);
 		});
 
+		// Native Wayland clients can wait for presentation feedback before
+		// submitting again, even when their buffers are composited rather than scanned out.
+		let mut feedback = OutputPresentationFeedback::new(&self.output);
+		if let Ok(result) = &render_result {
+			for window in self.space.elements() {
+				window.take_presentation_feedback(
+					&mut feedback,
+					|surface, _| {
+						result
+							.states
+							.element_was_presented(surface)
+							.then(|| self.output.clone())
+					},
+					|_, _| {
+						smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+					},
+				);
+			}
+		}
+
 		// Also send frame callbacks to the override surface if active,
 		// so the NVIDIA driver's Wayland WSI unblocks and presents the
 		// next frame.
@@ -1388,7 +1408,6 @@ impl MoonshineCompositor {
 
 			// Drain and respond to wp_presentation_feedback callbacks
 			// so the NVIDIA driver's WaitForPresentKHR can return.
-			let mut feedback = OutputPresentationFeedback::new(&self.output);
 			take_presentation_feedback_surface_tree(
 				override_surface,
 				&mut feedback,
@@ -1397,18 +1416,19 @@ impl MoonshineCompositor {
 					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
 				},
 			);
-			let frame_period = self
-				.output
-				.preferred_mode()
-				.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
-				.unwrap_or(std::time::Duration::from_millis(11));
-			feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
-					self.clock.now(),
-					Refresh::Fixed(frame_period),
-					0,
-					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(),
-				);
 		}
+		let frame_period = self
+			.output
+			.preferred_mode()
+			.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
+			.unwrap_or(std::time::Duration::from_millis(11));
+		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
+			self.clock.now(),
+			Refresh::Fixed(frame_period),
+			0,
+			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
+			),
+		);
 
 		// Flush the frame callbacks (and any other pending events) to
 		// clients immediately. Without this, the wl_callback.done events
