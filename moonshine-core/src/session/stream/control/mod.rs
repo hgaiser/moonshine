@@ -512,7 +512,8 @@ async fn run_control_loop(
 			Ok(Some(Event::Receive { ref packet, .. })) => {
 				let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 					Ok(control_message) => control_message,
-					Err(()) => break,
+					// Skip messages we can't parse (e.g. types from newer clients) instead of ending the session.
+					Err(()) => continue,
 				};
 				tracing::trace!("Received control message: {control_message:?}");
 
