@@ -583,7 +583,7 @@ impl MoonshineCompositor {
 		// with it. Without this, no render elements are produced.
 		space.map_output(&output, (0, 0));
 
-		// Advertise wp_linux_dmabuf_v1 (version 5 with device feedback) so
+		// Advertise wp_linux_dmabuf_v1 (version 6 with device feedback) so
 		// Vulkan WSI and other GPU clients can create DMA-BUF-backed
 		// wl_buffer objects. NVIDIA's Vulkan WSI requires the feedback
 		// protocol to know which device to allocate on.
@@ -739,6 +739,8 @@ impl MoonshineCompositor {
 		space: &Space<smithay::desktop::Window>,
 		output: &Output,
 		override_surface: Option<(&WlSurface, u32)>,
+		decoration_windows: &[smithay::desktop::Window],
+		override_underlay_window: Option<&smithay::desktop::Window>,
 	) -> Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
 		let output_scale = output.current_scale().fractional_scale();
 		let scale = smithay::utils::Scale::from(output_scale);
@@ -777,11 +779,25 @@ impl MoonshineCompositor {
 				}
 			};
 
-		// The render element list is front-to-back (first is topmost): Smithay's
-		// damage tracker draws it in reverse. `space.elements()` runs bottom to
-		// top, so reverse it to keep the compositor's stacking order.
+		// Paint order, back to front. `Space::elements()` is back to front.
+		let mut paint_order: Vec<&smithay::desktop::Window> = space
+			.elements()
+			// Decorations and the carried override underlay are painted on top.
+			.filter(|window| !decoration_windows.contains(window) && override_underlay_window != Some(*window))
+			.collect();
+
+		// Same-app decorations ride above the focus window; the underlay sits
+		// between them and the override.
+		paint_order.extend(
+			decoration_windows
+				.iter()
+				.chain(override_underlay_window.iter().copied())
+				.filter(|window| space.elements().any(|e| e == *window)),
+		);
+
+		// Render elements are front to back (the topmost comes first).
 		let mut elements = Vec::new();
-		for window in space.elements().rev() {
+		for window in paint_order.into_iter().rev() {
 			render_window(&mut elements, window);
 		}
 
@@ -968,14 +984,22 @@ impl MoonshineCompositor {
 					.space
 					.elements()
 					.filter(|w| w.x11_surface().is_none_or(|x| Some(x.window_id()) != raised_xid))
-					.find(|w| self.window_metadata.get(w).is_some_and(|m| m.app_id != 0))
+					.find(|w| {
+						self.window_metadata
+							.get(w)
+							.is_some_and(|m| m.app_id != 0 && m.app_id != super::x11_focus::STEAM_BIG_PICTURE_APPID)
+					})
 					.cloned();
 				if let Some(game) = game {
 					self.space.raise_element(&game, false);
 					// Restore the focus contract to the game.
 					if let Some(xf) = self.x11_focus.as_ref() {
 						let app_id = self.window_metadata.get(&game).map(|m| m.app_id).unwrap_or(0);
-						let window_id = game.x11_surface().map(|x| x.window_id()).unwrap_or(0);
+						let window_id = self
+							.window_metadata
+							.get(&game)
+							.map(|m| m.steam_window_id())
+							.unwrap_or(0);
 						xf.set_focused_window_contract(app_id, window_id);
 					}
 					// Reverse the activation handoff: deactivate the overlay,
@@ -1008,8 +1032,12 @@ impl MoonshineCompositor {
 			let game = self
 				.space
 				.elements()
-				.filter(|w| w.x11_surface().is_some_and(|x| x.window_id() != xid))
-				.find(|w| self.window_metadata.get(w).is_some_and(|m| m.app_id != 0))
+				.filter(|w| w.x11_surface().is_none_or(|x| x.window_id() != xid))
+				.find(|w| {
+					self.window_metadata
+						.get(w)
+						.is_some_and(|m| m.app_id != 0 && m.app_id != super::x11_focus::STEAM_BIG_PICTURE_APPID)
+				})
 				.cloned();
 			let game_app_id = game
 				.as_ref()
@@ -1234,6 +1262,8 @@ impl MoonshineCompositor {
 			&self.space,
 			&self.output,
 			override_target.as_ref().map(|(s, w)| (s, *w)),
+			&self.decoration_windows,
+			self.override_underlay_window.as_ref(),
 		);
 		elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
 
@@ -1342,6 +1372,26 @@ impl MoonshineCompositor {
 			);
 		});
 
+		// Native Wayland clients can wait for presentation feedback before
+		// submitting again, even when their buffers are composited rather than scanned out.
+		let mut feedback = OutputPresentationFeedback::new(&self.output);
+		if let Ok(result) = &render_result {
+			for window in self.space.elements() {
+				window.take_presentation_feedback(
+					&mut feedback,
+					|surface, _| {
+						result
+							.states
+							.element_was_presented(surface)
+							.then(|| self.output.clone())
+					},
+					|_, _| {
+						smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+					},
+				);
+			}
+		}
+
 		// Also send frame callbacks to the override surface if active,
 		// so the NVIDIA driver's Wayland WSI unblocks and presents the
 		// next frame.
@@ -1358,7 +1408,6 @@ impl MoonshineCompositor {
 
 			// Drain and respond to wp_presentation_feedback callbacks
 			// so the NVIDIA driver's WaitForPresentKHR can return.
-			let mut feedback = OutputPresentationFeedback::new(&self.output);
 			take_presentation_feedback_surface_tree(
 				override_surface,
 				&mut feedback,
@@ -1367,18 +1416,19 @@ impl MoonshineCompositor {
 					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
 				},
 			);
-			let frame_period = self
-				.output
-				.preferred_mode()
-				.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
-				.unwrap_or(std::time::Duration::from_millis(11));
-			feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
-					self.clock.now(),
-					Refresh::Fixed(frame_period),
-					0,
-					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(),
-				);
 		}
+		let frame_period = self
+			.output
+			.preferred_mode()
+			.map(|m| std::time::Duration::from_nanos(1_000_000_000_000u64 / m.refresh.max(1) as u64))
+			.unwrap_or(std::time::Duration::from_millis(11));
+		feedback.presented::<smithay::utils::Time<Monotonic>, Monotonic>(
+			self.clock.now(),
+			Refresh::Fixed(frame_period),
+			0,
+			smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty(
+			),
+		);
 
 		// Flush the frame callbacks (and any other pending events) to
 		// clients immediately. Without this, the wl_callback.done events

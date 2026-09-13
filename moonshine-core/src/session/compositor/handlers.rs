@@ -1021,10 +1021,11 @@ impl MoonshineCompositor {
 		if focus.is_none() && controlled_focus {
 			if strategy == VirtualConnectorStrategy::SteamControlled {
 				if let Some(target) = focus_control_window
-					&& let Some(w) = candidates
-						.iter()
-						.find(|w| w.x11_surface().is_some_and(|x| x.window_id() == target))
-				{
+					&& let Some(w) = candidates.iter().find(|w| {
+						self.window_metadata
+							.get(w)
+							.is_some_and(|m| m.steam_window_id() == target)
+					}) {
 					focus = Some(w.clone());
 					local_game_focused = true;
 				}
@@ -1364,7 +1365,7 @@ impl MoonshineCompositor {
 		// Write the gamescope focus contract (FOCUSED_APP/GFX/WINDOW + displays).
 		if let Some(ref x11_focus) = self.x11_focus {
 			let focused_app_id = self.window_metadata.get(best).map(|m| m.app_id).unwrap_or(0);
-			let focused_window_id = best.x11_surface().map(|x| x.window_id()).unwrap_or(0);
+			let focused_window_id = self.window_metadata.get(best).map(|m| m.steam_window_id()).unwrap_or(0);
 			x11_focus.set_focused_window_contract(focused_app_id, focused_window_id);
 			// When the overlay is raised, input routes to the overlay while
 			// rendering stays on the game (matches gamescope's
@@ -1574,6 +1575,14 @@ impl MoonshineCompositor {
 	/// 5. `enforce_fullscreen_geometry()` — hold the winner at the output size
 	/// 6. `apply_focus()` — set keyboard/pointer focus, activation
 	pub fn reevaluate_focus(&mut self) {
+		self.reevaluate_focus_inner();
+		// The focus-contract setters only buffer; send them together.
+		if let Some(xf) = &self.x11_focus {
+			xf.flush();
+		}
+	}
+
+	fn reevaluate_focus_inner(&mut self) {
 		// Mark focus as dirty before recalculating.
 		self.focus_state.mark_dirty();
 
@@ -1611,9 +1620,8 @@ impl MoonshineCompositor {
 			let focusable_triplets: Vec<[u32; 3]> = candidates
 				.iter()
 				.filter_map(|w| {
-					let x11 = w.x11_surface()?;
-					let window_id = x11.window_id();
 					let meta = self.window_metadata.get(w)?;
+					let window_id = meta.steam_window_id();
 					let app_id = meta.app_id;
 					if !is_focusable(app_id) {
 						return None;
@@ -1624,6 +1632,13 @@ impl MoonshineCompositor {
 						.map(|_| {
 							// We don't have PID stored in metadata; read it from X11.
 							x11_focus.get_window_pid(window_id)
+						})
+						.or_else(|| {
+							w.wl_surface()?
+								.client()?
+								.get_credentials(&self.display_handle)
+								.ok()
+								.map(|c| c.pid as u32)
 						})
 						.unwrap_or(0);
 					Some([window_id, app_id, pid])
@@ -1793,10 +1808,10 @@ impl XdgShellHandler for MoonshineCompositor {
 		// Tell the client the desired surface size so Vulkan WSI can
 		// create a swapchain. Without an initial configure the client
 		// blocks indefinitely waiting for the compositor to propose a
-		// size.
+		// size. Don't claim Maximized: Wine then treats the window as a
+		// maximized, decorated Win32 window and draws its own frame.
 		surface.with_pending_state(|state| {
 			state.size = Some((self.width as i32, self.height as i32).into());
-			state.states.set(XdgToplevelState::Maximized);
 		});
 		surface.send_configure();
 
@@ -1881,8 +1896,11 @@ impl XdgShellHandler for MoonshineCompositor {
 	}
 
 	fn unfullscreen_request(&mut self, surface: ToplevelSurface) {
+		// Keep filling the output after leaving fullscreen; toplevels are no
+		// longer marked Maximized, which used to guarantee this.
 		surface.with_pending_state(|state| {
 			state.states.unset(XdgToplevelState::Fullscreen);
+			state.size = Some((self.width as i32, self.height as i32).into());
 		});
 		surface.send_configure();
 
@@ -2207,33 +2225,30 @@ impl XwmHandler for MoonshineCompositor {
 		// STEAM_OVERLAY (forwarded as Other) drives overlay z-order: mark it
 		// dirty so update_overlay_z_order runs this frame instead of polling.
 		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property
-			&& self
-				.x11_focus
-				.as_ref()
-				.is_some_and(|xf| xf.steam_overlay_atom() as u32 == atom)
+			&& self.x11_focus.as_ref().is_some_and(|xf| xf.is_overlay_property(atom))
 		{
-			self.overlay_dirty = true;
-			self.screen_dirty = true;
-
-			// STEAM_OVERLAY is commonly set after the window is mapped, so the
-			// map-time classification is stale. Refresh it here so the window is
-			// treated as an overlay (candidate filtering and input focus).
-			// Gamescope: re-reads isOverlay on this PropertyNotify.
-			let is_overlay = self.with_x11_focus(|xf| xf.get_steam_overlay_value(window.window_id())) != 0;
-			let root_width = self.width as i32;
-			if let Some(elem) = self.find_window_by_x11_surface(&window)
-				&& let Some(meta) = self.window_metadata.get_mut(&elem)
-			{
-				meta.is_overlay = is_overlay;
-				meta.flags.remove(WindowFlags::OVERLAY | WindowFlags::NOTIFICATION);
-				if is_overlay {
-					if meta.geometry.size.w >= root_width || meta.input_focus_mode != 0 {
-						meta.flags.insert(WindowFlags::OVERLAY);
-					} else {
-						meta.flags.insert(WindowFlags::NOTIFICATION);
-					}
+			// Steam sets these after map; refresh just this window so focus
+			// doesn't have to re-read every window.
+			if let Some(elem) = self.find_window_by_x11_surface(&window) {
+				let window_id = window.window_id();
+				let (is_overlay, opacity, input_focus_mode) = self.with_x11_focus(|xf| {
+					(
+						xf.get_steam_overlay_value(window_id) != 0,
+						xf.get_window_opacity(window_id),
+						xf.get_input_focus_mode(window_id),
+					)
+				});
+				let interactive = window.geometry().size.w >= self.width as i32 || input_focus_mode != 0;
+				if let Some(meta) = self.window_metadata.get_mut(&elem) {
+					meta.is_overlay = is_overlay;
+					meta.opacity = opacity;
+					meta.input_focus_mode = input_focus_mode;
+					meta.flags.set(WindowFlags::OVERLAY, is_overlay && interactive);
+					meta.flags.set(WindowFlags::NOTIFICATION, is_overlay && !interactive);
 				}
 			}
+			self.overlay_dirty = true;
+			self.screen_dirty = true;
 			self.reevaluate_focus();
 			return;
 		}

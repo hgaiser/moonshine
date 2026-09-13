@@ -245,9 +245,9 @@ pub(crate) struct ColorManagementState {
 impl ColorManagementState {
 	/// Create a new state and register the protocol globals.
 	pub fn new(display: &DisplayHandle, hdr: bool) -> Self {
-		// Advertise wp_color_manager_v1 (protocol version 1).
-		display.create_global::<MoonshineCompositor, wp_color_manager_v1::WpColorManagerV1, _>(1, ());
-		// Advertise wp_color_representation_manager_v1 (protocol version 1).
+		// Advertise wp_color_manager_v1 (interface version 3).
+		display.create_global::<MoonshineCompositor, wp_color_manager_v1::WpColorManagerV1, _>(3, ());
+		// Advertise wp_color_representation_manager_v1 (interface version 1).
 		display
 			.create_global::<MoonshineCompositor, wp_color_representation_manager_v1::WpColorRepresentationManagerV1, _>(
 				1,
@@ -488,6 +488,9 @@ impl GlobalDispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineComp
 		resource.supported_feature(wp_color_manager_v1::Feature::ExtendedTargetVolume);
 		resource.supported_feature(wp_color_manager_v1::Feature::SetLuminances);
 		resource.supported_feature(wp_color_manager_v1::Feature::WindowsScrgb);
+		if resource.version() >= 3 {
+			resource.supported_feature(wp_color_manager_v1::Feature::WindowsBt2100);
+		}
 		resource.supported_tf_named(wp_color_manager_v1::TransferFunction::Srgb);
 		resource.supported_tf_named(wp_color_manager_v1::TransferFunction::Gamma22);
 		resource.supported_tf_named(wp_color_manager_v1::TransferFunction::St2084Pq);
@@ -534,6 +537,13 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor
 
 			wp_color_manager_v1::Request::CreateIccCreator { obj } => {
 				data_init.init(obj, IccCreatorData);
+			},
+
+			wp_color_manager_v1::Request::CreateWindowsBt2100 { image_description } => {
+				// Predefined BT.2020/PQ space (HDR10) from the Windows-compatibility requests.
+				let desc = ImageDescription::bt2020_pq();
+				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
+				resource.ready(0);
 			},
 
 			wp_color_manager_v1::Request::CreateWindowsScrgb { image_description } => {
