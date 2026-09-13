@@ -316,7 +316,7 @@ impl GamepadSlot {
 		config: &GamepadConfig,
 		timer_wake: Arc<Notify>,
 	) -> Result<Self, ()> {
-		let gamepad = Gamepad::new(info, feedback_tx.clone()).await?;
+		let gamepad = Gamepad::new(info, feedback_tx.clone(), config).await?;
 		Ok(Self {
 			gamepad,
 			remap: HoldToHome::new(config),

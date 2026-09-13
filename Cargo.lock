@@ -1998,7 +1998,7 @@ dependencies = [
 [[package]]
 name = "inputtino"
 version = "0.1.0"
-source = "git+https://github.com/games-on-whales/inputtino#d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8"
+source = "git+https://github.com/urwrstkn8mare/inputtino?branch=ps5-usb-mode#b4657bfa5b61c1ec55012e7a9077b5ffe3c68fad"
 dependencies = [
  "inputtino-sys",
 ]
@@ -2006,7 +2006,7 @@ dependencies = [
 [[package]]
 name = "inputtino-sys"
 version = "0.1.0"
-source = "git+https://github.com/games-on-whales/inputtino#d28ec79eb63324e68d73a7de22bcb5ff0a6f6bf8"
+source = "git+https://github.com/urwrstkn8mare/inputtino?branch=ps5-usb-mode#b4657bfa5b61c1ec55012e7a9077b5ffe3c68fad"
 dependencies = [
  "bindgen",
  "cmake",

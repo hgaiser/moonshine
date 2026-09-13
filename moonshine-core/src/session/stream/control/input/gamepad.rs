@@ -1,6 +1,6 @@
 use inputtino::{
-	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
-	SwitchJoypad, XboxOneJoypad,
+	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition,
+	PS5Connection, PS5Joypad, SwitchJoypad, XboxOneJoypad,
 };
 use serde::{Deserialize, Serialize};
 use strum_macros::FromRepr;
@@ -56,6 +56,20 @@ impl Default for HomeButtonConfig {
 pub struct GamepadConfig {
 	/// Configuration for the hold-to-Home button remap.
 	pub home_button: HomeButtonConfig,
+
+	/// How virtual PlayStation (DualSense) pads are presented to games.
+	pub playstation_connection: PlayStationConnection,
+}
+
+/// Bus a virtual DualSense is presented on.
+#[derive(Default, Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlayStationConnection {
+	#[default]
+	Bluetooth,
+	/// Proton rewrites Bluetooth DualSense input into short reports, which
+	/// breaks games and mods that read the full report; USB avoids that.
+	Usb,
 }
 
 #[derive(Debug, FromRepr)]
@@ -347,7 +361,11 @@ pub(crate) struct Gamepad {
 }
 
 impl Gamepad {
-	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
+	pub async fn new(
+		info: &GamepadInfo,
+		feedback_tx: mpsc::Sender<FeedbackCommand>,
+		config: &GamepadConfig,
+	) -> Result<Self, ()> {
 		// inputtino parses this as a 6-octet MAC address (PS5 pairing info, SDL device linking).
 		let id = format!("00:11:22:33:00:{:02x}", info.index);
 		let definition = match info.kind {
@@ -382,8 +400,12 @@ impl Gamepad {
 				XboxOneJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
 			),
 			GamepadKind::PlayStation => {
-				let mut gamepad =
-					PS5Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
+				let connection = match config.playstation_connection {
+					PlayStationConnection::Bluetooth => PS5Connection::PS5_CONNECTION_BLUETOOTH,
+					PlayStationConnection::Usb => PS5Connection::PS5_CONNECTION_USB,
+				};
+				let mut gamepad = PS5Joypad::new_with_connection(&definition, connection)
+					.map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
 
 				// These callbacks run on inputtino's uhid thread, which also answers the kernel's
 				// report requests: never block it, and skip values the client already has.
