@@ -1021,10 +1021,11 @@ impl MoonshineCompositor {
 		if focus.is_none() && controlled_focus {
 			if strategy == VirtualConnectorStrategy::SteamControlled {
 				if let Some(target) = focus_control_window
-					&& let Some(w) = candidates
-						.iter()
-						.find(|w| w.x11_surface().is_some_and(|x| x.window_id() == target))
-				{
+					&& let Some(w) = candidates.iter().find(|w| {
+						self.window_metadata
+							.get(w)
+							.is_some_and(|m| m.steam_window_id() == target)
+					}) {
 					focus = Some(w.clone());
 					local_game_focused = true;
 				}
@@ -1364,7 +1365,7 @@ impl MoonshineCompositor {
 		// Write the gamescope focus contract (FOCUSED_APP/GFX/WINDOW + displays).
 		if let Some(ref x11_focus) = self.x11_focus {
 			let focused_app_id = self.window_metadata.get(best).map(|m| m.app_id).unwrap_or(0);
-			let focused_window_id = best.x11_surface().map(|x| x.window_id()).unwrap_or(0);
+			let focused_window_id = self.window_metadata.get(best).map(|m| m.steam_window_id()).unwrap_or(0);
 			x11_focus.set_focused_window_contract(focused_app_id, focused_window_id);
 			// When the overlay is raised, input routes to the overlay while
 			// rendering stays on the game (matches gamescope's
@@ -1619,9 +1620,8 @@ impl MoonshineCompositor {
 			let focusable_triplets: Vec<[u32; 3]> = candidates
 				.iter()
 				.filter_map(|w| {
-					let x11 = w.x11_surface()?;
-					let window_id = x11.window_id();
 					let meta = self.window_metadata.get(w)?;
+					let window_id = meta.steam_window_id();
 					let app_id = meta.app_id;
 					if !is_focusable(app_id) {
 						return None;
@@ -1632,6 +1632,13 @@ impl MoonshineCompositor {
 						.map(|_| {
 							// We don't have PID stored in metadata; read it from X11.
 							x11_focus.get_window_pid(window_id)
+						})
+						.or_else(|| {
+							w.wl_surface()?
+								.client()?
+								.get_credentials(&self.display_handle)
+								.ok()
+								.map(|c| c.pid as u32)
 						})
 						.unwrap_or(0);
 					Some([window_id, app_id, pid])

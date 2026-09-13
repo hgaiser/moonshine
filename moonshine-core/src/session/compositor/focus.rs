@@ -201,6 +201,12 @@ pub(crate) struct WindowMetadata {
 }
 
 impl WindowMetadata {
+	/// An opaque Steam focus identifier, not necessarily an X11 resource.
+	pub fn steam_window_id(&self) -> u32 {
+		self.x11_window_id
+			.unwrap_or(0x8000_0000 | (self.map_sequence as u32 & 0x7fff_ffff))
+	}
+
 	/// Returns `true` if this window has a game ID (non-zero appID).
 	/// Gamescope: `win_has_game_id()`
 	pub fn has_game_id(&self) -> bool {

@@ -984,14 +984,22 @@ impl MoonshineCompositor {
 					.space
 					.elements()
 					.filter(|w| w.x11_surface().is_none_or(|x| Some(x.window_id()) != raised_xid))
-					.find(|w| self.window_metadata.get(w).is_some_and(|m| m.app_id != 0))
+					.find(|w| {
+						self.window_metadata
+							.get(w)
+							.is_some_and(|m| m.app_id != 0 && m.app_id != super::x11_focus::STEAM_BIG_PICTURE_APPID)
+					})
 					.cloned();
 				if let Some(game) = game {
 					self.space.raise_element(&game, false);
 					// Restore the focus contract to the game.
 					if let Some(xf) = self.x11_focus.as_ref() {
 						let app_id = self.window_metadata.get(&game).map(|m| m.app_id).unwrap_or(0);
-						let window_id = game.x11_surface().map(|x| x.window_id()).unwrap_or(0);
+						let window_id = self
+							.window_metadata
+							.get(&game)
+							.map(|m| m.steam_window_id())
+							.unwrap_or(0);
 						xf.set_focused_window_contract(app_id, window_id);
 					}
 					// Reverse the activation handoff: deactivate the overlay,
@@ -1024,8 +1032,12 @@ impl MoonshineCompositor {
 			let game = self
 				.space
 				.elements()
-				.filter(|w| w.x11_surface().is_some_and(|x| x.window_id() != xid))
-				.find(|w| self.window_metadata.get(w).is_some_and(|m| m.app_id != 0))
+				.filter(|w| w.x11_surface().is_none_or(|x| x.window_id() != xid))
+				.find(|w| {
+					self.window_metadata
+						.get(w)
+						.is_some_and(|m| m.app_id != 0 && m.app_id != super::x11_focus::STEAM_BIG_PICTURE_APPID)
+				})
 				.cloned();
 			let game_app_id = game
 				.as_ref()
