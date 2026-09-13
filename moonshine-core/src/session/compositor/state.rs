@@ -583,7 +583,7 @@ impl MoonshineCompositor {
 		// with it. Without this, no render elements are produced.
 		space.map_output(&output, (0, 0));
 
-		// Advertise wp_linux_dmabuf_v1 (version 5 with device feedback) so
+		// Advertise wp_linux_dmabuf_v1 (version 6 with device feedback) so
 		// Vulkan WSI and other GPU clients can create DMA-BUF-backed
 		// wl_buffer objects. NVIDIA's Vulkan WSI requires the feedback
 		// protocol to know which device to allocate on.

@@ -247,7 +247,7 @@ impl ColorManagementState {
 	pub fn new(display: &DisplayHandle, hdr: bool) -> Self {
 		// Advertise wp_color_manager_v1 (interface version 3).
 		display.create_global::<MoonshineCompositor, wp_color_manager_v1::WpColorManagerV1, _>(3, ());
-		// Advertise wp_color_representation_manager_v1 (protocol version 1).
+		// Advertise wp_color_representation_manager_v1 (interface version 1).
 		display
 			.create_global::<MoonshineCompositor, wp_color_representation_manager_v1::WpColorRepresentationManagerV1, _>(
 				1,
@@ -540,7 +540,7 @@ impl Dispatch<wp_color_manager_v1::WpColorManagerV1, ()> for MoonshineCompositor
 			},
 
 			wp_color_manager_v1::Request::CreateWindowsBt2100 { image_description } => {
-				// Wine uses this predefined BT.2020/PQ space for native Wayland HDR10.
+				// Predefined BT.2020/PQ space (HDR10) from the Windows-compatibility requests.
 				let desc = ImageDescription::bt2020_pq();
 				let resource = data_init.init(image_description, ImageDescriptionUserData { desc });
 				resource.ready(0);
