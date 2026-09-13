@@ -1400,21 +1400,21 @@ impl MoonshineCompositor {
 		let pointer_target: Option<Window> = Some(input_focus.clone());
 		self.pointer_focus_window = pointer_target.clone();
 
-		// Raise the input focus window, so a window regaining focus comes back
-		// above a previously raised Steam overlay. Gamescope: `inputFocus->Raise()`
-		// in `DetermineAndApplyFocus`. While a STEAM_OVERLAY is raised,
-		// `update_overlay_z_order` owns the stacking instead.
-		if !self.overlay_raised {
-			let on_top = self.space.elements().last() == Some(&input_focus);
-			if !on_top && self.space.elements().any(|w| w == &input_focus) {
-				self.space.raise_element(&input_focus, false);
-				self.screen_dirty = true;
-				tracing::debug!(
-					target: "focus",
-					x11_id = ?input_focus.x11_surface().map(|x| x.window_id()),
-					"Raised input focus window"
-				);
-			}
+		// Raise the input focus window. Gamescope does this on every focus pass
+		// (`inputFocus->Raise()`): a window regaining focus comes back above a
+		// previously raised window, and while the Steam overlay is up the input
+		// focus *is* the overlay, so it is kept above the game. Smithay's
+		// `map_element` always raises, so a game `configure_notify` would
+		// otherwise put the game back on top.
+		let on_top = self.space.elements().last() == Some(&input_focus);
+		if !on_top && self.space.elements().any(|w| w == &input_focus) {
+			self.space.raise_element(&input_focus, false);
+			self.screen_dirty = true;
+			tracing::debug!(
+				target: "focus",
+				x11_id = ?input_focus.x11_surface().map(|x| x.window_id()),
+				"Raised input focus window"
+			);
 		}
 
 		// Activation state: call set_activated on old and new XDG toplevels.
@@ -2214,6 +2214,27 @@ impl XwmHandler for MoonshineCompositor {
 		{
 			self.overlay_dirty = true;
 			self.screen_dirty = true;
+
+			// STEAM_OVERLAY is commonly set after the window is mapped, so the
+			// map-time classification is stale. Refresh it here so the window is
+			// treated as an overlay (candidate filtering and input focus).
+			// Gamescope: re-reads isOverlay on this PropertyNotify.
+			let is_overlay = self.with_x11_focus(|xf| xf.get_steam_overlay_value(window.window_id())) != 0;
+			let root_width = self.width as i32;
+			if let Some(elem) = self.find_window_by_x11_surface(&window)
+				&& let Some(meta) = self.window_metadata.get_mut(&elem)
+			{
+				meta.is_overlay = is_overlay;
+				meta.flags.remove(WindowFlags::OVERLAY | WindowFlags::NOTIFICATION);
+				if is_overlay {
+					if meta.geometry.size.w >= root_width || meta.input_focus_mode != 0 {
+						meta.flags.insert(WindowFlags::OVERLAY);
+					} else {
+						meta.flags.insert(WindowFlags::NOTIFICATION);
+					}
+				}
+			}
+			self.reevaluate_focus();
 			return;
 		}
 
