@@ -600,7 +600,18 @@ impl VideoPipelineInner {
 		.with_virtual_buffer_size_ms(1000 / ctx.fps)
 		.with_initial_virtual_buffer_size_ms(0);
 
-		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
+		// 4:4:4 is advertised for every supported codec, but some encoders (e.g. AMD VCN) only have 4:2:0 profiles.
+		let encoder = Encoder::new(context.clone(), config).map_err(|e| {
+			let hint = if ctx.chroma_sampling_type == VideoChromaSampling::Yuv444 {
+				" This GPU may not support 4:4:4 encoding, try disabling YUV 4:4:4 in the client."
+			} else {
+				""
+			};
+			format!(
+				"Failed to create {codec:?} encoder ({:?}, {:?}): {e}.{hint}",
+				ctx.chroma_sampling_type, ctx.dynamic_range
+			)
+		})?;
 
 		Ok((context, encoder))
 	}
