@@ -245,7 +245,7 @@ pub(crate) struct ColorManagementState {
 impl ColorManagementState {
 	/// Create a new state and register the protocol globals.
 	pub fn new(display: &DisplayHandle, hdr: bool) -> Self {
-		// Advertise wp_color_manager_v1 (protocol version 1).
+		// Advertise wp_color_manager_v1 (interface version 3).
 		display.create_global::<MoonshineCompositor, wp_color_manager_v1::WpColorManagerV1, _>(3, ());
 		// Advertise wp_color_representation_manager_v1 (protocol version 1).
 		display
