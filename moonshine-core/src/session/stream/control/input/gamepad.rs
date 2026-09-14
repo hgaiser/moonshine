@@ -1,11 +1,12 @@
 use inputtino::{
-	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
-	SwitchJoypad, XboxOneJoypad,
+	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition,
+	PS5Connection, PS5Joypad, SwitchJoypad, XboxOneJoypad,
 };
 use serde::{Deserialize, Serialize};
 use strum_macros::FromRepr;
 use tokio::sync::mpsc;
 
+use super::touch::PointerEventKind;
 use crate::session::stream::control::{
 	FeedbackCommand,
 	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
@@ -56,6 +57,20 @@ impl Default for HomeButtonConfig {
 pub struct GamepadConfig {
 	/// Configuration for the hold-to-Home button remap.
 	pub home_button: HomeButtonConfig,
+
+	/// How virtual PlayStation (DualSense) pads are presented to games.
+	pub playstation_connection: PlayStationConnection,
+}
+
+/// Bus a virtual DualSense is presented on.
+#[derive(Default, Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlayStationConnection {
+	#[default]
+	Bluetooth,
+	/// Some games and mods misread Bluetooth DualSense input under Proton
+	/// (e.g. the Dying Light DualSense mod); USB avoids that.
+	Usb,
 }
 
 #[derive(Debug, FromRepr)]
@@ -147,12 +162,12 @@ impl GamepadInfo {
 #[derive(Debug)]
 pub(crate) struct GamepadTouch {
 	pub index: u8,
-	_event_type: u8,
+	event_kind: PointerEventKind,
 	// zero: [u8; 2], // Alignment/reserved
 	pointer_id: u32,
 	pub x: f32,
 	pub y: f32,
-	pub pressure: f32,
+	// pressure: f32, // Unused, the DualSense touchpad has no pressure sensor.
 }
 
 impl GamepadTouch {
@@ -175,14 +190,16 @@ impl GamepadTouch {
 			return Err(());
 		}
 
+		let event_kind = PointerEventKind::from_repr(buffer[1])
+			.ok_or_else(|| tracing::warn!(event_type = buffer[1], "Unknown gamepad touch event type"))?;
+
 		Ok(Self {
 			index: buffer[0],
-			_event_type: buffer[1],
+			event_kind,
 			// zero: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			pointer_id: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 			x: f32::from_le_bytes(buffer[8..12].try_into().unwrap()).clamp(0.0, 1.0),
 			y: f32::from_le_bytes(buffer[12..16].try_into().unwrap()).clamp(0.0, 1.0),
-			pressure: f32::from_le_bytes(buffer[16..20].try_into().unwrap()).clamp(0.0, 1.0),
 		})
 	}
 }
@@ -344,11 +361,19 @@ pub(crate) struct Gamepad {
 	/// The underlying inputtino joypad, used to inject button presses, stick
 	/// positions, triggers, touchpad events, and motion data.
 	gamepad: inputtino::Joypad,
+
+	/// Fingers currently on the touchpad, so CancelAll can lift them.
+	touch_points: Vec<u32>,
 }
 
 impl Gamepad {
-	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
-		let id = format!("00:11:22:33:{:02x}", info.index);
+	pub async fn new(
+		info: &GamepadInfo,
+		feedback_tx: mpsc::Sender<FeedbackCommand>,
+		config: &GamepadConfig,
+	) -> Result<Self, ()> {
+		// inputtino parses this as a 6-octet MAC address (PS5 pairing info, SDL device linking).
+		let id = format!("00:11:22:33:00:{:02x}", info.index);
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
@@ -381,17 +406,28 @@ impl Gamepad {
 				XboxOneJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
 			),
 			GamepadKind::PlayStation => {
-				let mut gamepad =
-					PS5Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
+				let connection = match config.playstation_connection {
+					PlayStationConnection::Bluetooth => PS5Connection::PS5_CONNECTION_BLUETOOTH,
+					PlayStationConnection::Usb => PS5Connection::PS5_CONNECTION_USB,
+				};
+				let mut gamepad = PS5Joypad::new_with_connection(&definition, connection)
+					.map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
 
+				// These callbacks run on inputtino's uhid thread, which also answers the kernel's
+				// report requests: never block it, and skip values the client already has.
 				gamepad.set_on_led({
 					let feedback_tx = feedback_tx.clone();
 					let index = info.index;
+					let mut last_rgb = None;
 					move |r, g, b| {
-						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
-							id: index as u16,
-							rgb: (r as u8, g as u8, b as u8),
-						}));
+						let rgb = (r as u8, g as u8, b as u8);
+						if last_rgb != Some(rgb)
+							&& feedback_tx
+								.try_send(FeedbackCommand::SetLed(SetLedCommand { id: index as u16, rgb }))
+								.is_ok()
+						{
+							last_rgb = Some(rgb);
+						}
 					}
 				});
 
@@ -415,7 +451,7 @@ impl Gamepad {
 
 						// tracing::info!("Trigger effect: {:?} {:?} {:?} {:?}", type_left, type_right, left, right);
 
-						let _ = feedback_tx.blocking_send(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
+						let _ = feedback_tx.try_send(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
 							id: index as u16,
 							trigger_event_flags,
 							type_left,
@@ -452,16 +488,27 @@ impl Gamepad {
 		let feedback_tx_for_rumble = feedback_tx.clone();
 		gamepad.set_on_rumble({
 			let index = info.index;
+			let mut last_rumble = None;
 			move |low_frequency, high_frequency| {
-				let _ = feedback_tx_for_rumble.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
-					id: index as u16,
-					low_frequency: low_frequency as u16,
-					high_frequency: high_frequency as u16,
-				}));
+				let rumble = (low_frequency as u16, high_frequency as u16);
+				if last_rumble != Some(rumble)
+					&& feedback_tx_for_rumble
+						.try_send(FeedbackCommand::Rumble(RumbleCommand {
+							id: index as u16,
+							low_frequency: rumble.0,
+							high_frequency: rumble.1,
+						}))
+						.is_ok()
+				{
+					last_rumble = Some(rumble);
+				}
 			}
 		});
 
-		Ok(Self { gamepad })
+		Ok(Self {
+			gamepad,
+			touch_points: Vec::new(),
+		})
 	}
 
 	/// Apply button flags to the gamepad.
@@ -482,14 +529,28 @@ impl Gamepad {
 
 	pub fn touch(&mut self, touch: &GamepadTouch) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
-			if touch.pressure > 0.5 {
-				gamepad.place_finger(
-					touch.pointer_id,
-					(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
-					(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
-				);
-			} else {
-				gamepad.release_finger(touch.pointer_id);
+			// Follow the touch lifecycle rather than pressure, which clients don't reliably fill in.
+			match touch.event_kind {
+				PointerEventKind::Down | PointerEventKind::Move => {
+					gamepad.place_finger(
+						touch.pointer_id,
+						(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
+						(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
+					);
+					if !self.touch_points.contains(&touch.pointer_id) {
+						self.touch_points.push(touch.pointer_id);
+					}
+				},
+				PointerEventKind::Up | PointerEventKind::Cancel => {
+					gamepad.release_finger(touch.pointer_id);
+					self.touch_points.retain(|id| *id != touch.pointer_id);
+				},
+				PointerEventKind::CancelAll => {
+					for pointer_id in self.touch_points.drain(..) {
+						gamepad.release_finger(pointer_id);
+					}
+				},
+				PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => {},
 			}
 		}
 	}

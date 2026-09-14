@@ -146,7 +146,8 @@ impl InputHandler {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		gamepad_config: GamepadConfig,
 	) -> Result<Self, ()> {
-		let (gamepad_tx, gamepad_rx) = mpsc::channel(10);
+		// The control loop awaits sends into this channel, so a full channel stalls all input and ENet servicing.
+		let (gamepad_tx, gamepad_rx) = mpsc::channel(64);
 
 		std::thread::spawn(move || {
 			let rt = tokio::runtime::Builder::new_current_thread()
@@ -316,7 +317,7 @@ impl GamepadSlot {
 		config: &GamepadConfig,
 		timer_wake: Arc<Notify>,
 	) -> Result<Self, ()> {
-		let gamepad = Gamepad::new(info, feedback_tx.clone()).await?;
+		let gamepad = Gamepad::new(info, feedback_tx.clone(), config).await?;
 		Ok(Self {
 			gamepad,
 			remap: HoldToHome::new(config),
