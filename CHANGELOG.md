@@ -5,6 +5,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [v0.16.1] - 13-09-2026
+
+### Added
+
+- Add `stream.video.max_packet_size` to clamp the client's video packet size, avoiding fragmentation over VPNs and tunnels.
+- Support Windows BT.2100 image descriptions. (#214, @urwrstkn8mare)
+
+### Fixed
+
+- Port gamescope's focus selection and output scaling, fixing focus handling and Steam overlay input for native Wayland windows, X11 clients and override windows, flushing gamescope focus properties and refreshing overlay state on property changes. (#212, #214, @urwrstkn8mare, @baberabb)
+- Correct window stacking order. (#214, @urwrstkn8mare)
+- Stop marking xdg toplevels as maximized. (#214, @urwrstkn8mare)
+- Send presentation feedback to composited Wayland clients. (#214, @urwrstkn8mare)
+- Fall back to an XCB surface when the Vulkan WSI bypass is unsafe.
+- Fix a crash related to color converter caching.
+
 ## [v0.16.0] - 11-09-2026
 
 ### Added
