@@ -11,6 +11,7 @@ See the [Configuration](../README.md#configuration) section of the README for th
 - [Run games in high-performance mode](#run-games-in-high-performance-mode)
 - [Use Gamescope with the client's resolution](#use-gamescope-with-the-clients-resolution)
 - [Run Flatpak Steam inside Moonshine's compositor](#run-flatpak-steam-inside-moonshines-compositor)
+- [Run Flatpak Bottles inside Moonshine's compositor](#run-flatpak-bottles-inside-moonshines-compositor)
 - [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 - [Debug a failing application](#debug-a-failing-application)
 
@@ -150,6 +151,31 @@ The root cause is in how Flatpak's portal infrastructure interacts with the desk
 Flatpak uses the host's D-Bus session bus to communicate with portal backends. When setting up the sandbox, the portal backend tells Flatpak to expose the **host's** Wayland and display sockets, overriding the `WAYLAND_DISPLAY` and `DISPLAY` environment variables that Moonshine sets. This causes Steam to render on the host's physical desktop instead of inside Moonshine's headless compositor.
 
 `dbus-run-session` spawns a fresh D-Bus daemon without the host's portal backend registered, so Flatpak cannot discover the host compositor through the portal and falls back to the environment variables inherited from Moonshine's systemd unit. Because the portal backend is responsible for both Wayland and audio setup, the `PULSE_SERVER` env var is also honored correctly without needing `--env=` overrides.
+
+## Run Flatpak Bottles inside Moonshine's compositor
+
+### How to
+
+Launch `bottles-cli` through Flatpak, wrapped with `dbus-run-session`:
+
+```toml
+[[application_scanner]]
+type = "bottles"
+command = [
+	"dbus-run-session", "--",
+	"flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+	"run", "-b", "{bottle}", "--program-id", "{program_id}",
+]
+umu_command = [
+	"dbus-run-session", "--",
+	"flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+	"umu", "run", "--game", "{umu_game}",
+]
+```
+
+### Details
+
+The root cause is the same as for Flatpak Steam above: the portal backend overrides the `WAYLAND_DISPLAY`/`DISPLAY` variables Moonshine sets, so the game renders on the host's desktop. `dbus-run-session` hides the portal, and Flatpak falls back to Moonshine's environment.
 
 ## Run a desktop environment for a full remote desktop
 

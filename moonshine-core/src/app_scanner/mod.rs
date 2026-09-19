@@ -2,11 +2,13 @@ use std::collections::HashSet;
 
 use serde::{Deserialize, Serialize};
 
+use bottles::BottlesApplicationScannerConfig;
 use desktop::DesktopApplicationScannerConfig;
 use heroic::HeroicApplicationScannerConfig;
 use lutris::LutrisApplicationScannerConfig;
 use steam::SteamApplicationScannerConfig;
 
+pub mod bottles;
 pub mod desktop;
 pub mod heroic;
 pub mod lutris;
@@ -29,6 +31,9 @@ pub enum ApplicationScannerConfig {
 
 	/// Scans the Heroic Games Launcher library caches.
 	Heroic(HeroicApplicationScannerConfig),
+
+	/// Scans the Bottles library.
+	Bottles(BottlesApplicationScannerConfig),
 }
 
 pub fn scan_applications(application_scanners: &Vec<ApplicationScannerConfig>) -> Vec<ApplicationConfig> {
@@ -51,6 +56,10 @@ pub fn scan_applications(application_scanners: &Vec<ApplicationScannerConfig>) -
 			},
 			ApplicationScannerConfig::Heroic(config) => match heroic::scan_heroic_applications(config) {
 				Ok(heroic_applications) => heroic_applications,
+				Err(()) => continue,
+			},
+			ApplicationScannerConfig::Bottles(config) => match bottles::scan_bottles_applications(config) {
+				Ok(bottles_applications) => bottles_applications,
 				Err(()) => continue,
 			},
 		};
