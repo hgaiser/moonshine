@@ -47,6 +47,14 @@ pub struct ApplicationConfig {
 	/// Seconds to wait for the application to reach an active state after launch.
 	#[serde(default = "default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Steam integration, equivalent to gamescope's `-e`: Steam chooses which
+	/// window is shown. Turn it on for Steam itself (Big Picture), so its
+	/// overlay and focus contract work; leave it off (the default) for anything
+	/// not launched through Steam, as with it on only Steam and Steam game
+	/// windows can take focus. Games from the Steam scanner have it on.
+	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
+	pub steam_integration: bool,
 }
 
 impl Default for ApplicationConfig {
@@ -60,6 +68,7 @@ impl Default for ApplicationConfig {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: default_launch_timeout(),
+			steam_integration: false,
 		}
 	}
 }
@@ -125,8 +134,9 @@ pub(crate) struct ApplicationContext {
 	pub xdisplay: u32,
 	/// Wayland socket name reported by the compositor.
 	pub wayland_display: String,
-	/// Effective HDR mode — `true` only when the compositor confirmed an HDR-capable DMA-BUF format is in use.
-	pub hdr: bool,
+	/// The compositor's environment for the application (see
+	/// `CompositorReady::env`).
+	pub compositor_env: Vec<(String, String)>,
 	/// Environment variables to pass on.
 	pub extra_env: HashMap<String, String>,
 }
@@ -225,36 +235,16 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 		),
 		format!("DISPLAY=:{}", context.xdisplay),
 		format!("WAYLAND_DISPLAY={}", context.wayland_display),
-		format!("MOONSHINE_WAYLAND_DISPLAY={}", context.wayland_display),
-		// Activate the moonshine WSI Vulkan layer.
-		"ENABLE_MOONSHINE_WSI=1".to_string(),
 		// Force Proton to use winepulse.drv instead of winepipewire.drv,
 		// so it respects PULSE_SERVER and routes audio through Moonshine.
 		"PROTON_USE_PIPEWIRE=0".to_string(),
 	];
 
-	// Impersonate gamescope so Steam uses its external-overlay mode.
-	envs.push("XDG_CURRENT_DESKTOP=gamescope".to_string());
-	envs.push(format!("GAMESCOPE_WAYLAND_DISPLAY={}", context.wayland_display));
-	envs.push(format!("STEAM_GAME_DISPLAY_0=:{}", context.xdisplay));
-	// Steam keys gamescope features (HDR, VRR, scaling, FPS limit) off these.
-	envs.push("STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER=1".to_string());
-	envs.push("STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1".to_string());
-	envs.push("STEAM_GAMESCOPE_NIS_SUPPORTED=1".to_string());
-	envs.push("STEAM_GAMESCOPE_VRR_SUPPORTED=1".to_string());
-	if context.hdr {
-		envs.push("STEAM_GAMESCOPE_HDR_SUPPORTED=1".to_string());
-	}
-
-	if context.hdr {
-		// DXVK's dxgi.dll gates HDR color space exposure on this env var.
-		// Without it, both DX11 (DXVK) and DX12 (vkd3d-proton via DXVK dxgi)
-		// games will not see HDR as available.
-		envs.push("DXVK_HDR=1".to_string());
-		// Signal HDR mode to the moonshine-wsi layer so it can advertise HDR
-		// surface formats correctly (the factory global is always present for
-		// SDR sessions too, so we need an explicit capability signal).
-		envs.push("MOONSHINE_HDR=1".to_string());
+	// ferriscope's environment: the gamescope identity Steam uses for its
+	// external-overlay mode, the ferriscope-wsi layer, and the HDR and
+	// capability variables it actually backs.
+	for (key, value) in &context.compositor_env {
+		envs.push(format!("{key}={value}"));
 	}
 
 	for (key, value) in &context.extra_env {
@@ -775,7 +765,16 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
-	use super::split_standard_io;
+	use super::{ApplicationConfig, split_standard_io};
+
+	#[test]
+	fn test_steam_integration_defaults_to_off() {
+		let unset: ApplicationConfig = toml::from_str("title = \"Game\"\ncommand = [\"g\"]").unwrap();
+		assert!(!unset.steam_integration);
+		let off: ApplicationConfig =
+			toml::from_str("title = \"Desktop\"\ncommand = [\"d\"]\nsteam_integration = false").unwrap();
+		assert!(!off.steam_integration);
+	}
 
 	#[test]
 	fn test_standard_io_defaults_to_null() {
