@@ -160,13 +160,13 @@ impl InitializedSession {
 		let video_stream = VideoStream::new(
 			video_config.clone(),
 			address.clone(),
-			handles.frame_rx,
+			handles.frames,
 			hdr_metadata_tx,
 			stop.clone(),
 			stats_tx,
 		)
 		.await?;
-		let control_stream = ControlStream::new(control_config, address, handles.input_tx, stop.clone())?;
+		let control_stream = ControlStream::new(control_config, address, handles.input, stop.clone())?;
 
 		Ok(Self {
 			context,
@@ -206,7 +206,7 @@ impl InitializedSession {
 				pulse_socket_path,
 				xdisplay: ready.xdisplay,
 				wayland_display: ready.wayland_display.clone(),
-				hdr: ready.hdr,
+				compositor_env: ready.env.clone(),
 				// Populate extra_env with width, height and refreshrate values of the client for e.g. scripting
 				extra_env: HashMap::from([
 					("MOONSHINE_CLIENT_WIDTH".to_string(), context.resolution.0.to_string()),

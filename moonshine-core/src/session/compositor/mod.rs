@@ -1,42 +1,39 @@
-//! Embedded headless Smithay compositor for Moonshine.
+//! Embedded headless compositor for Moonshine, backed by `ferriscope-core`.
 //!
-//! This module replaces the external Gamescope compositor and PipeWire capture
-//! with an in-process Smithay compositor. Frames are rendered to GBM-backed
-//! DMA-BUFs and exported directly to the video encoder.
+//! ferriscope runs the Wayland/Xwayland server, the render loop and the DMA-BUF
+//! pool. This module turns Moonshine's configuration and the client's session
+//! into ferriscope's, launches it, and hands its frame receiver to the video
+//! pipeline and its input sender to the control stream.
+//!
+//! The streams are created before the compositor is launched, so they get
+//! `CompositorHandles` whose endpoints are filled in by `Compositor::launch`.
 
-mod color_management;
-mod cursor;
-mod focus;
 pub(crate) mod frame;
-mod gamescope_swapchain;
-mod handlers;
 pub(crate) mod input;
-mod protocols;
-mod scaling;
-mod state;
-mod x11_focus;
 
-use std::sync::mpsc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
+use ferriscope_core::{Compositor as FerriscopeCompositor, FrameReceiver};
 use serde::{Deserialize, Serialize};
-use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
-use smithay::backend::allocator::{Fourcc, Modifier};
-use smithay::backend::egl::{EGLContext, EGLDisplay};
-use smithay::backend::renderer::damage::OutputDamageTracker;
-use smithay::backend::renderer::gles::{Capability, GlesRenderer};
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
-use smithay::reexports::calloop::EventLoop;
-use smithay::utils::Transform;
 
 use crate::session::SessionContext;
 use crate::session::manager::SessionShutdownReason;
 
-use self::frame::ExportedFrame;
-use self::input::CompositorInputEvent;
-use self::state::MoonshineCompositor;
+use self::input::CompositorInput;
+
+/// How long [`Compositor::launch`] waits for ferriscope's readiness handshake.
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How often the supervisor checks for a session shutdown or a compositor
+/// that stopped on its own.
+const SUPERVISOR_POLL: Duration = Duration::from_millis(200);
 
 /// Keyboard configuration for the compositor's XKB state.
+///
+/// Passed to ferriscope as the seat keymap; Steam's `GAMESCOPE_KEYBOARD_LAYOUT`
+/// overrides the layout and variant at runtime, as in gamescope.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(default)]
 pub struct KeyboardConfig {
@@ -57,26 +54,15 @@ impl Default for KeyboardConfig {
 	}
 }
 
-/// How focus is split between windows. Mirrors gamescope's
-/// `VirtualConnectorStrategy` (`backend_virtual_connector_strategy`).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum VirtualConnectorStrategy {
-	/// One focus across the whole output; the highest-priority window wins.
-	#[default]
-	SingleApplication,
-	/// Steam names the focus window/app-id list.
-	SteamControlled,
-	/// One focus per app id.
-	PerAppId,
-	/// One focus per window.
-	PerWindow,
-}
-
-impl VirtualConnectorStrategy {
-	/// Strategies that only ever drive a single output/connector.
-	pub fn is_single_output(self) -> bool {
-		matches!(self, Self::SingleApplication | Self::SteamControlled)
+impl From<&KeyboardConfig> for ferriscope_core::KeyboardConfig {
+	fn from(config: &KeyboardConfig) -> Self {
+		Self {
+			rules: String::new(),
+			model: config.model.clone(),
+			layout: config.layout.clone(),
+			variant: config.variant.clone(),
+			options: config.options.clone().unwrap_or_default(),
+		}
 	}
 }
 
@@ -90,18 +76,20 @@ pub struct CompositorConfig {
 	/// Whether to enable HDR mode in the compositor if the client supports it.
 	pub hdr: bool,
 
-	/// Steam integration mode, equivalent to gamescope's `-e`. Promotes the
-	/// connector strategy to [`VirtualConnectorStrategy::SteamControlled`] and
-	/// enables Steam's window filtering.
-	pub steam_mode: bool,
-
-	/// Focus split strategy, equivalent to gamescope's
-	/// `backend_virtual_connector_strategy`. Only meaningful without
-	/// `steam_mode`/multiple outputs.
-	pub virtual_connector_strategy: VirtualConnectorStrategy,
-
 	/// Keyboard configuration for the compositor's XKB state.
 	pub keyboard: KeyboardConfig,
+
+	/// DMA-BUF frames the consumer (the encoder) may hold at once; ferriscope
+	/// renders only into a free slot, so this bounds how far the hosted
+	/// application may run ahead of the encoder.
+	///
+	/// One frame ties the application's throughput to a single
+	/// encoder/network round-trip, so with a real Moonlight client the app is
+	/// held to `1 / latency`. The legacy `moonshine-main` compositor decoupled
+	/// the app from the encoder with three buffers, so three is the parity
+	/// value. Each extra frame allows up to one extra frame of end-to-end
+	/// latency.
+	pub pool_size: usize,
 }
 
 impl Default for CompositorConfig {
@@ -109,9 +97,8 @@ impl Default for CompositorConfig {
 		Self {
 			gpu: None,
 			hdr: true,
-			steam_mode: true,
-			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
 			keyboard: KeyboardConfig::default(),
+			pool_size: 3,
 		}
 	}
 }
@@ -122,6 +109,8 @@ pub(crate) struct CompositorContext {
 	pub height: u32,
 	pub refresh_rate: u32,
 	pub hdr: bool,
+	/// The application's Steam integration (gamescope's `-e`).
+	pub steam_integration: bool,
 }
 
 /// Information sent from the compositor thread once XWayland is ready.
@@ -132,26 +121,37 @@ pub(crate) struct CompositorReady {
 	pub wayland_display: String,
 	/// Whether HDR mode is active for this session.
 	pub hdr: bool,
+	/// Environment the hosted application needs (ferriscope's `Ready::env`):
+	/// the gamescope identity Steam keys on, the ferriscope-wsi layer switch,
+	/// and the HDR and capability variables for this session.
+	pub env: Vec<(String, String)>,
 }
+
+/// The composited frames, available once the compositor has launched.
+///
+/// Dropping a received frame returns its buffer to the compositor.
+pub(crate) type CompositorFrames = Arc<OnceLock<FrameReceiver>>;
 
 /// Handles returned by `Compositor::new()` for wiring into streams.
 pub(crate) struct CompositorHandles {
-	pub frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
-	pub input_tx: calloop::channel::Sender<CompositorInputEvent>,
+	pub frames: CompositorFrames,
+	pub input: CompositorInput,
 }
 
-/// Unlaunched compositor — holds channel endpoints, can only be launched.
+/// Unlaunched compositor — holds the handles' endpoints, can only be launched.
 pub(crate) struct Compositor {
 	config: CompositorConfig,
 	context: CompositorContext,
 	stop: ShutdownManager<SessionShutdownReason>,
-	frame_tx: std::sync::mpsc::SyncSender<ExportedFrame>,
-	input_rx: calloop::channel::Channel<CompositorInputEvent>,
-	ready_tx: std::sync::mpsc::SyncSender<CompositorReady>,
-	ready_rx: std::sync::mpsc::Receiver<CompositorReady>,
+	handles: CompositorHandles,
 }
 
 /// Launched compositor — can be queried, cannot be launched again.
+///
+/// This is a short-lived "ready" handle: Moonshine drops it once the display
+/// names have been read, so it deliberately does not own the compositor. The
+/// ferriscope compositor is owned by a supervisor thread that stops it when the
+/// session shuts down.
 pub(crate) struct LaunchedCompositor {
 	ready: CompositorReady,
 }
@@ -163,7 +163,49 @@ impl From<&SessionContext> for CompositorContext {
 			height: ctx.resolution.1,
 			refresh_rate: ctx.refresh_rate,
 			hdr: ctx.hdr,
+			steam_integration: ctx.application.steam_integration,
 		}
+	}
+}
+
+/// Build the `ferriscope-core` config for one session.
+///
+/// Moonshine spawns the hosted application itself (`Application::spawn`) once
+/// the display is ready, so ferriscope must not spawn one (`command: None`).
+/// `steam` follows the application's `steam_integration`, which also selects the Steam-controlled focus strategy, as
+/// gamescope's `-e` does (`main.cpp:787`); without it Steam sizes Big Picture to
+/// a default 1280x800 and never marks its overlay, so ferriscope would
+/// composite it as a plain window at the origin.
+fn build_ferriscope_config(
+	config: &CompositorConfig,
+	context: &CompositorContext,
+	render_node: std::path::PathBuf,
+) -> ferriscope_core::CompositorConfig {
+	let steam = context.steam_integration;
+	ferriscope_core::CompositorConfig {
+		width: context.width,
+		height: context.height,
+		rate: context.refresh_rate as f64,
+		render_node,
+		xwayland: true,
+		command: None,
+		steam,
+		focus_strategy: if steam {
+			ferriscope_core::FocusStrategy::SteamControlled
+		} else {
+			ferriscope_core::FocusStrategy::SingleApplication
+		},
+		// HDR output needs both the host configuration and a client that can
+		// display it.
+		hdr: config.hdr && context.hdr,
+		seat: ferriscope_core::SeatConfig {
+			keyboard: (&config.keyboard).into(),
+			..ferriscope_core::SeatConfig::default()
+		},
+		output: ferriscope_core::FrameOutput::Channel(ferriscope_core::ChannelOutput {
+			pool_size: config.pool_size.max(1),
+		}),
+		..ferriscope_core::CompositorConfig::default()
 	}
 }
 
@@ -173,21 +215,22 @@ impl Compositor {
 		context: CompositorContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> (Self, CompositorHandles) {
-		let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(2);
-		let (input_tx, input_rx) = calloop::channel::channel();
-		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
-
+		let handles = CompositorHandles {
+			frames: CompositorFrames::default(),
+			input: CompositorInput::new(context.width, context.height),
+		};
+		let ours = CompositorHandles {
+			frames: Arc::clone(&handles.frames),
+			input: handles.input.clone(),
+		};
 		(
 			Self {
 				config,
 				context,
 				stop,
-				frame_tx,
-				input_rx,
-				ready_tx,
-				ready_rx,
+				handles: ours,
 			},
-			CompositorHandles { frame_rx, input_tx },
+			handles,
 		)
 	}
 
@@ -196,26 +239,84 @@ impl Compositor {
 			config,
 			context,
 			stop,
-			frame_tx,
-			input_rx,
-			ready_tx,
-			ready_rx,
+			handles,
 		} = self;
 
+		// Resolve the render node before starting ferriscope so a missing GPU is
+		// reported as a clean launch failure.
+		let render_node = crate::healthcheck::find_render_node(&config.gpu).map_err(|e| {
+			tracing::error!("Failed to find render node: {e}");
+		})?;
+
+		let ferriscope_config = build_ferriscope_config(&config, &context, render_node);
+		tracing::info!(
+			steam = ferriscope_config.steam,
+			width = ferriscope_config.width,
+			height = ferriscope_config.height,
+			"launching ferriscope compositor for session"
+		);
+
+		let (compositor, ferriscope_handles) = FerriscopeCompositor::launch(ferriscope_config).map_err(|e| {
+			tracing::error!("Failed to launch ferriscope compositor: {e}");
+		})?;
+
+		let ferriscope_ready = match ferriscope_handles.ready.recv_timeout(READY_TIMEOUT) {
+			Ok(ready) => ready,
+			Err(e) => {
+				tracing::warn!("Timed out waiting for compositor ready: {e}");
+				let _ = compositor.stop();
+				return Err(());
+			},
+		};
+
+		// A dropped frame returns its buffer through its own release guard, so
+		// the explicit release channel is not needed.
+		if handles.frames.set(ferriscope_handles.frames).is_err() {
+			tracing::error!("Compositor was launched twice");
+			let _ = compositor.stop();
+			return Err(());
+		}
+		handles.input.connect(ferriscope_handles.input);
+
+		// `LaunchedCompositor` is a short-lived "ready" handle in Moonshine: it
+		// is dropped once the display names have been read, so it must not own
+		// the compositor. Hand ferriscope to a supervisor that lives until the
+		// session shuts down, then stops it, and that ends the session if
+		// ferriscope stops on its own.
+		//
+		// The supervisor holds a delay token until ferriscope has fully stopped,
+		// so the session's shutdown (and `stop_session`) waits for it. Without
+		// it Moonshine could exit while ferriscope's thread was still tearing
+		// down its GL renderer, and NVIDIA's EGL exit handler crashed it.
+		let delay = stop.delay_shutdown_token().map_err(|e| {
+			tracing::error!("Failed to hold the session open for the compositor: {e:?}");
+		})?;
 		std::thread::Builder::new()
-			.name("compositor".to_string())
+			.name("compositor-supervisor".to_string())
 			.spawn(move || {
-				if let Err(e) = run_compositor(config, context, frame_tx, input_rx, ready_tx, stop) {
-					tracing::error!("Compositor failed: {e}");
+				while !stop.is_shutdown_triggered() {
+					if compositor.is_finished() {
+						tracing::info!("Compositor stopped");
+						let _ = stop.trigger_shutdown(SessionShutdownReason::CompositorStopped);
+						break;
+					}
+					std::thread::sleep(SUPERVISOR_POLL);
 				}
+				if let Err(e) = compositor.stop() {
+					tracing::warn!("compositor shutdown: {e}");
+				}
+				drop(delay);
 			})
 			.map_err(|e| {
-				tracing::error!("Failed to spawn compositor thread: {e}");
+				tracing::error!("Failed to spawn compositor supervisor: {e}");
 			})?;
 
-		let ready = ready_rx.recv_timeout(std::time::Duration::from_secs(5)).map_err(|e| {
-			tracing::warn!("Timed out waiting for compositor ready: {e}");
-		})?;
+		let ready = CompositorReady {
+			xdisplay: ferriscope_ready.xdisplay.unwrap_or(0),
+			wayland_display: ferriscope_ready.wayland_display,
+			hdr: ferriscope_ready.hdr,
+			env: ferriscope_ready.env,
+		};
 
 		Ok(LaunchedCompositor { ready })
 	}
@@ -230,309 +331,85 @@ impl LaunchedCompositor {
 	}
 }
 
-/// Main compositor loop running on a dedicated thread.
-fn run_compositor(
-	config: CompositorConfig,
-	context: CompositorContext,
-	frame_tx: mpsc::SyncSender<ExportedFrame>,
-	input_rx: calloop::channel::Channel<CompositorInputEvent>,
-	ready_tx: mpsc::SyncSender<CompositorReady>,
-	stop: ShutdownManager<SessionShutdownReason>,
-) -> Result<(), String> {
-	// Trigger session shutdown if the compositor exits unexpectedly.
-	let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::CompositorStopped);
-	let _delay_stop = stop.delay_shutdown_token();
+#[cfg(test)]
+mod tests {
+	use super::*;
 
-	// Open a render node (no DRM master required for headless operation).
-	let render_node = find_render_node(&config.gpu)?;
-	tracing::debug!("Using render node: {}", render_node.display());
+	fn context() -> CompositorContext {
+		CompositorContext {
+			width: 2424,
+			height: 1080,
+			refresh_rate: 60,
+			hdr: false,
+			steam_integration: false,
+		}
+	}
 
-	// Open the render node.
-	// Must use read-write access: DRM render nodes require O_RDWR for
-	// GPU buffer mapping (amdgpu_bo_cpu_map fails with EACCES otherwise).
-	let render_fd_alloc = std::fs::OpenOptions::new()
-		.read(true)
-		.write(true)
-		.open(&render_node)
-		.map_err(|e| format!("Failed to open render node {}: {e}", render_node.display()))?;
+	/// Regression: the Steam overlay rendered in the left letterbox under
+	/// Moonshine+ferriscope because the adapter left ferriscope's Steam
+	/// integration off. Steam then never tagged its Big Picture window
+	/// `STEAM_OVERLAY` and kept a 1280x800 default, so ferriscope composited it
+	/// as an unscaled window at the origin. Steam integration must follow the
+	/// application's `steam_integration`, and select Steam-controlled focus.
+	///
+	/// A nested desktop, in turn, gets no keyboard with Steam integration on:
+	/// only Steam and Steam game windows may take focus.
+	#[test]
+	fn the_application_decides_steam_integration() {
+		let config = CompositorConfig::default();
+		let render_node = std::path::PathBuf::from("/dev/dri/renderD128");
 
-	// Clone the file handle for the EGL display's GBM device.
-	// GbmDevice takes ownership of the file, so we need a separate handle.
-	let render_fd_egl = render_fd_alloc
-		.try_clone()
-		.map_err(|e| format!("Failed to clone render node handle: {e}"))?;
+		let forwarded = build_ferriscope_config(&config, &context(), render_node.clone());
+		assert!(!forwarded.steam, "Steam integration is off by default");
+		assert_eq!(
+			forwarded.focus_strategy,
+			ferriscope_core::FocusStrategy::SingleApplication
+		);
 
-	// Initialize GBM.
-	let gbm_device_alloc =
-		GbmDevice::new(render_fd_alloc).map_err(|e| format!("Failed to create GBM device for allocator: {e}"))?;
-	let gbm_allocator = GbmAllocator::new(gbm_device_alloc, GbmBufferFlags::RENDERING);
-
-	// Initialize EGL + GLES renderer.
-	let gbm_device_egl =
-		GbmDevice::new(render_fd_egl).map_err(|e| format!("Failed to create GBM device for EGL: {e}"))?;
-	let egl_display =
-		unsafe { EGLDisplay::new(gbm_device_egl) }.map_err(|e| format!("Failed to create EGL display: {e}"))?;
-	let egl_context = EGLContext::new(&egl_display).map_err(|e| format!("Failed to create EGL context: {e}"))?;
-
-	// Use all supported capabilities except per-texture Fencing.
-	// Moonshine renders with a single non-shared EGL context and the
-	// frame-level EGLFence (ExportFence) already ensures all GPU work is
-	// complete before the DMA-BUF is handed to Vulkan.  Per-texture read
-	// fences are redundant here and DMA-BUF implicit sync protects client
-	// buffer reuse.  Removing them saves ~3% compositor-thread CPU
-	// (TextureSync::update_read overhead).
-	let capabilities = unsafe { GlesRenderer::supported_capabilities(&egl_context) }
-		.map_err(|e| format!("Failed to query renderer capabilities: {e}"))?;
-	let capabilities = capabilities.into_iter().filter(|c| *c != Capability::Fencing);
-	let renderer = unsafe { GlesRenderer::with_capabilities(egl_context, capabilities) }
-		.map_err(|e| format!("Failed to create GLES renderer: {e}"))?;
-
-	// Query the EGL display for formats that can be used as render targets.
-	let render_formats = renderer.egl_context().dmabuf_render_formats();
-	tracing::debug!("Supported DMA-BUF render formats: {}", render_formats.iter().count());
-
-	// Select preferred render format based on HDR mode.
-	// HDR: prefer FP16 > 10-bit > 8-bit ABGR. FP16 is required for scRGB
-	// (EXTENDED_SRGB_LINEAR) content whose HDR highlights carry values > 1.0 that a
-	// 10-bit UNORM render buffer would clamp at composite time; it also holds
-	// BT.2020+PQ content (values in [0,1]) losslessly for the passthrough path.
-	// SDR: prefer 8-bit ABGR/XBGR to match Vulkan WSI and avoid GL R↔B channel swaps.
-	// Vulkan WSI on Wayland defaults to XBGR/ABGR formats, so using ARGB causes
-	// GL to incorrectly swap red/blue channels during blit operations.
-	let preferred_fourccs: Vec<Fourcc> = if config.hdr && context.hdr {
-		vec![
-			Fourcc::Abgr16161616f,
-			Fourcc::Abgr2101010,
-			Fourcc::Abgr8888,
-			Fourcc::Xbgr8888,
-		]
-	} else {
-		vec![Fourcc::Abgr8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888]
-	};
-	let (render_fourcc, render_modifiers) = preferred_fourccs
-		.iter()
-		.find_map(|&fourcc| {
-			let modifiers: Vec<Modifier> = render_formats
-				.iter()
-				.filter(|f| f.code == fourcc)
-				.map(|f| f.modifier)
-				.collect();
-			if modifiers.is_empty() {
-				None
-			} else {
-				Some((fourcc, modifiers))
-			}
-		})
-		.or_else(|| {
-			// Fall back to first available format, collecting all its modifiers.
-			let first = render_formats.iter().next()?;
-			let fourcc = first.code;
-			let modifiers: Vec<Modifier> = render_formats
-				.iter()
-				.filter(|f| f.code == fourcc)
-				.map(|f| f.modifier)
-				.collect();
-			Some((fourcc, modifiers))
-		})
-		.ok_or_else(|| "No supported DMA-BUF render formats found".to_string())?;
-
-	tracing::debug!(
-		"Selected render format: {:?} with {} modifier(s)",
-		render_fourcc,
-		render_modifiers.len()
-	);
-
-	// Derive effective HDR: only if an HDR-capable format was actually selected.
-	let hdr = config.hdr && context.hdr && matches!(render_fourcc, Fourcc::Abgr16161616f | Fourcc::Abgr2101010);
-	if config.hdr && context.hdr && !hdr {
-		tracing::warn!(
-			"HDR requested but no HDR-capable format available (using {:?}), falling back to SDR",
-			render_fourcc
+		let on = CompositorContext {
+			steam_integration: true,
+			..context()
+		};
+		let forwarded = build_ferriscope_config(&config, &on, render_node);
+		assert!(forwarded.steam);
+		assert_eq!(
+			forwarded.focus_strategy,
+			ferriscope_core::FocusStrategy::SteamControlled
 		);
 	}
 
-	// Create the calloop event loop.
-	let mut event_loop: EventLoop<MoonshineCompositor> =
-		EventLoop::try_new().map_err(|e| format!("Failed to create event loop: {e}"))?;
-
-	// Create the Wayland display.
-	let display = smithay::reexports::wayland_server::Display::<MoonshineCompositor>::new()
-		.map_err(|e| format!("Failed to create Wayland display: {e}"))?;
-	let display_handle = display.handle();
-
-	// Create a virtual output.
-	let mode = Mode {
-		size: (context.width as i32, context.height as i32).into(),
-		refresh: (context.refresh_rate * 1000) as i32,
-	};
-
-	// Synthesize plausible physical dimensions so games that check the
-	// display's physical size (e.g. Ghost of Tsushima) see a valid monitor
-	// instead of a 0x0mm virtual output. Approximate a 27" display at
-	// the configured resolution's aspect ratio, but fall back to 16:9 if
-	// the configured dimensions are invalid.
-	let diag_mm = 686.0_f64; // 27 inches in mm
-	let aspect = if context.width == 0 || context.height == 0 {
-		16.0_f64 / 9.0_f64
-	} else {
-		context.width as f64 / context.height as f64
-	};
-	let h_mm = ((diag_mm / (1.0 + aspect * aspect).sqrt()) as i32).max(1);
-	let w_mm = ((h_mm as f64 * aspect) as i32).max(1);
-
-	let output = Output::new(
-		"moonshine-virtual".to_string(),
-		PhysicalProperties {
-			size: (w_mm, h_mm).into(),
-			subpixel: Subpixel::Unknown,
-			make: "Moonshine".into(),
-			model: "Virtual Output".into(),
-			serial_number: "".into(),
-		},
-	);
-	output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
-	output.set_preferred(mode);
-
-	// Create the damage tracker for this output.
-	let damage_tracker = OutputDamageTracker::from_output(&output);
-
-	// Build the compositor state.
-	let (state, display) = MoonshineCompositor::new(
-		display,
-		display_handle.clone(),
-		event_loop.handle(),
-		output,
-		damage_tracker,
-		gbm_allocator,
-		renderer,
-		frame_tx,
-		context.width,
-		context.height,
-		render_fourcc,
-		render_modifiers,
-		ready_tx,
-		&render_node,
-		hdr,
-		config.steam_mode,
-		config.virtual_connector_strategy,
-		config.keyboard.clone(),
-	);
-
-	// Insert the Wayland display as a calloop event source so client
-	// messages (including XWayland's protocol handshake) are dispatched
-	// whenever data arrives on the Wayland socket, not only after the
-	// frame timer fires.
-	event_loop
-		.handle()
-		.insert_source(
-			calloop::generic::Generic::new(display, calloop::Interest::READ, calloop::Mode::Level),
-			|_, display, state: &mut MoonshineCompositor| {
-				// Safety: we never drop the display while the event loop runs.
-				unsafe {
-					let display = display.get_mut();
-					if let Err(e) = display.dispatch_clients(state) {
-						tracing::error!("Failed to dispatch Wayland clients: {e}");
-					}
-
-					// Send deferred wp_image_description_info_v1 destructor events.
-					for info in state.deferred_info_done.drain(..) {
-						info.done();
-					}
-
-					// Flush pending events back to clients. Without this,
-					// responses (e.g. wl_registry.global, wl_callback.done)
-					// remain buffered and are never sent, causing XWayland's
-					// initial roundtrip to block indefinitely.
-					if let Err(e) = display.flush_clients() {
-						tracing::error!("Failed to flush Wayland clients: {e}");
-					}
-				}
-				Ok(calloop::PostAction::Continue)
-			},
-		)
-		.map_err(|e| format!("Failed to insert Wayland display source: {e}"))?;
-
-	// Register the input channel from the control stream.
-	event_loop
-		.handle()
-		.insert_source(input_rx, |event, _, state: &mut MoonshineCompositor| {
-			if let calloop::channel::Event::Msg(input_event) = event {
-				input::process_input(input_event, state);
-				// Flush queued Wayland events (pointer enter/motion/button, keyboard
-				// key, etc.) to the client immediately. Without this the events sit
-				// in the outgoing buffer until the next Display dispatch cycle.
-				let _ = state.display_handle.flush_clients();
-			}
-		})
-		.map_err(|e| format!("Failed to insert input channel: {e}"))?;
-
-	// Set up the frame timer.
-	// Use Instant-based absolute scheduling so that render time inside
-	// the callback doesn't drift the cadence. `ToDuration` would add the
-	// interval *after* the callback returns, progressively skewing the
-	// actual period and producing ~58 Hz instead of 60 Hz.
-	let frame_nanos: u64 = 1_000_000_000u64 / context.refresh_rate as u64;
-	let frame_interval = std::time::Duration::from_nanos(frame_nanos);
-	let mut next_frame = std::time::Instant::now() + frame_interval;
-	let timer = smithay::reexports::calloop::timer::Timer::from_duration(frame_interval);
-	event_loop
-		.handle()
-		.insert_source(timer, move |_event, _metadata, state: &mut MoonshineCompositor| {
-			// Type a bounded batch of any clipboard text queued since the last tick.
-			input::drain_pending_text(state);
-			state.render_and_export();
-			// Schedule the next frame relative to the ideal wall-clock
-			// target, not relative to "now". This absorbs render-time
-			// jitter and keeps a steady cadence.
-			next_frame += frame_interval;
-			let now = std::time::Instant::now();
-			if next_frame <= now {
-				// We fell behind — snap forward instead of bursting.
-				next_frame = now + frame_interval;
-			}
-			smithay::reexports::calloop::timer::TimeoutAction::ToInstant(next_frame)
-		})
-		.map_err(|e| format!("Failed to insert frame timer: {e}"))?;
-
-	tracing::info!(
-		"Compositor started: {}x{} @ {}Hz",
-		context.width,
-		context.height,
-		context.refresh_rate
-	);
-
-	// Run the event loop.
-	// Use `None` as timeout so dispatch blocks until the next calloop
-	// source fires (frame timer, input channel, or Wayland client event).
-	// A hard timeout like 16ms would compete with the frame timer cadence.
-	let mut state = state;
-	state.start_xwayland();
-
-	tracing::debug!(
-		shutdown_triggered = stop.is_shutdown_triggered(),
-		"Entering compositor event loop"
-	);
-
-	while !stop.is_shutdown_triggered() {
-		event_loop
-			.dispatch(None, &mut state)
-			.map_err(|e| format!("Event loop dispatch error: {e}"))?;
+	#[test]
+	fn the_ferriscope_config_matches_the_session() {
+		let config = CompositorConfig::default();
+		let forwarded = build_ferriscope_config(&config, &context(), std::path::PathBuf::from("/dev/dri/renderD128"));
+		assert_eq!(forwarded.width, 2424);
+		assert_eq!(forwarded.height, 1080);
+		assert_eq!(forwarded.rate, 60.0);
+		assert!(forwarded.xwayland);
+		assert!(matches!(
+			&forwarded.output,
+			ferriscope_core::FrameOutput::Channel(c) if c.pool_size == 3
+		));
+		assert!(forwarded.command.is_none(), "Moonshine spawns the app, not ferriscope");
 	}
 
-	// Stop the application first so X11 clients disconnect from
-	// Xwayland, then tear down the X11 window manager. When the event
-	// loop is dropped afterwards, Smithay's XWayland::Drop disconnects
-	// the Wayland client, and the `-terminate` flag causes Xwayland to
-	// exit.
-	state.shutdown_session_processes();
-
-	tracing::info!("Compositor stopped.");
-	Ok(())
-}
-
-/// Find the appropriate DRM render node.
-///
-/// Delegates to the shared implementation in the healthcheck module.
-fn find_render_node(gpu_config: &Option<String>) -> Result<std::path::PathBuf, String> {
-	crate::healthcheck::find_render_node(gpu_config)
+	/// Regression: the adapter must not leave ferriscope at a one-frame pool,
+	/// which caps the hosted app at `1 / consumer_latency`. Three matches the
+	/// legacy compositor's three-buffer decoupling.
+	#[test]
+	fn the_pool_defaults_to_three_frames_and_holds_at_least_one() {
+		let pool =
+			|config: &CompositorConfig| match build_ferriscope_config(config, &context(), "/dev/dri/renderD128".into())
+				.output
+			{
+				ferriscope_core::FrameOutput::Channel(channel) => channel.pool_size,
+				output => panic!("unexpected output {output:?}"),
+			};
+		assert_eq!(pool(&CompositorConfig::default()), 3);
+		let empty = CompositorConfig {
+			pool_size: 0,
+			..CompositorConfig::default()
+		};
+		assert_eq!(pool(&empty), 1);
+	}
 }

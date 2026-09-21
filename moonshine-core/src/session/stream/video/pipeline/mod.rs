@@ -4,18 +4,22 @@
 //! and packetization for network transmission.
 
 mod dmabuf;
+mod fence;
 mod hdr_sei;
 
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use ash::vk;
 use async_shutdown::ShutdownManager;
+use smithay::backend::allocator::Buffer;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetadata, HdrModeState};
+use crate::session::compositor::CompositorFrames;
+use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeState, color_space, hdr_metadata};
 use crate::session::manager::SessionShutdownReason;
 
 use crate::session::stream::video::packetizer::Packetizer;
@@ -192,6 +196,9 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 struct FrameContext {
 	/// When the source frame was captured (for end-to-end latency).
 	created_at: std::time::Instant,
+	/// The compositor's sequence number for the source frame; `None` for the
+	/// IDR re-encode path, which has no captured frame.
+	sequence: Option<u64>,
 	/// Pre-encode latency breakdown measured on the encoding thread.
 	channel_wait: std::time::Duration,
 	import: std::time::Duration,
@@ -205,9 +212,6 @@ struct FrameContext {
 	inject_hdr: bool,
 	/// HDR mastering metadata to inject, if any.
 	hdr_metadata: Option<HdrMetadata>,
-	/// Source GBM buffer index (for spike diagnostics); `usize::MAX` for the
-	/// IDR re-encode path, which has no captured frame.
-	buffer_index: usize,
 }
 
 /// Message from the encoding thread to the packet consumer thread, in
@@ -380,7 +384,7 @@ async fn run_packet_consumer(
 				send_us = send_dur.as_micros() as u64,
 				encoded_bytes,
 				is_key_frame,
-				buffer_index = frame_context.buffer_index,
+				sequence = frame_context.sequence,
 				"SPIKE: frame latency exceeds {}us",
 				frame_interval_us
 			);
@@ -426,7 +430,7 @@ async fn run_packet_consumer(
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		frames: CompositorFrames,
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
@@ -458,7 +462,7 @@ impl VideoPipeline {
 			.spawn(move || {
 				inner.run(
 					runtime,
-					frame_rx,
+					frames,
 					packet_tx,
 					idr_tx,
 					idr_frame_request_rx,
@@ -487,7 +491,7 @@ impl VideoPipelineInner {
 	fn run(
 		self,
 		runtime: tokio::runtime::Handle,
-		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		frames: CompositorFrames,
 		packet_tx: mpsc::Sender<ShardBatch>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
@@ -530,7 +534,7 @@ impl VideoPipelineInner {
 		// Start the capture and encoding loop.
 		if let Err(e) = self.run_encoding_loop(
 			runtime,
-			frame_rx,
+			frames,
 			context,
 			encoder,
 			packet_tx,
@@ -609,7 +613,7 @@ impl VideoPipelineInner {
 	fn run_encoding_loop(
 		&self,
 		runtime: tokio::runtime::Handle,
-		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		frames: CompositorFrames,
 		context: VideoContext,
 		mut encoder: Encoder,
 		packet_tx: mpsc::Sender<ShardBatch>,
@@ -622,6 +626,11 @@ impl VideoPipelineInner {
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) -> Result<(), String> {
 		let ctx = &self.context;
+
+		// The compositor is launched before the streams start.
+		let Some(frames) = frames.get() else {
+			return Err("The compositor was not launched".to_string());
+		};
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
 		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
@@ -789,9 +798,9 @@ impl VideoPipelineInner {
 			}
 
 			// Try to receive a frame from compositor (with timeout).
-			let received_frame = match frame_rx.recv_timeout(frame_interval) {
+			let received_frame = match frames.recv_timeout(frame_interval) {
 				Ok(frame) => Some(frame),
-				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+				Err(ferriscope_core::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
 					// If we have a pending IDR request and have encoded before,
 					// re-encode the encoder's input image (still contains
@@ -806,6 +815,7 @@ impl VideoPipelineInner {
 								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 								let frame_context = FrameContext {
 									created_at: now,
+									sequence: None,
 									channel_wait: std::time::Duration::ZERO,
 									import: std::time::Duration::ZERO,
 									convert: std::time::Duration::ZERO,
@@ -813,7 +823,6 @@ impl VideoPipelineInner {
 									submitted_at,
 									inject_hdr,
 									hdr_metadata: last_hdr_state.metadata,
-									buffer_index: usize::MAX,
 								};
 								// Count this frame in flight; the consumer decrements when done.
 								in_flight.fetch_add(1, Ordering::Relaxed);
@@ -829,8 +838,9 @@ impl VideoPipelineInner {
 					}
 					None
 				},
-				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+				Err(ferriscope_core::RecvTimeoutError::Disconnected) => {
 					tracing::debug!("Frame channel disconnected - compositor stopped");
+					let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::CompositorStopped);
 					break;
 				},
 			};
@@ -850,19 +860,25 @@ impl VideoPipelineInner {
 						);
 						last_drop_warn = Some(std::time::Instant::now());
 					}
-					frame.consumed.store(true, Ordering::Release);
 					continue;
 				}
 
 				let t1_received = std::time::Instant::now();
 
+				let ferriscope_core::FrameData::DmaBuf(dmabuf_frame) = &frame.data else {
+					tracing::warn!("The compositor delivered a frame that is not a DMA-BUF; dropping it");
+					continue;
+				};
+				let dmabuf = &dmabuf_frame.dmabuf;
+				let fourcc = dmabuf.format().code as u32;
+				let modifier = u64::from(dmabuf.format().modifier);
+				let (width, height) = (dmabuf.width(), dmabuf.height());
+				let captured_at = frame.info.captured_at;
+				let sequence = frame.info.sequence;
+
 				tracing::trace!(
-					"Received frame: format=0x{:08X}, modifier={:#x}, {}x{}, planes={}",
-					frame.format,
-					frame.modifier,
-					frame.width,
-					frame.height,
-					frame.planes.len()
+					"Received frame: format=0x{fourcc:08X}, modifier={modifier:#x}, {width}x{height}, planes={}",
+					dmabuf.num_planes()
 				);
 
 				let importer = match &mut dmabuf_importer {
@@ -874,41 +890,50 @@ impl VideoPipelineInner {
 						},
 						Err(e) => {
 							tracing::warn!("Failed to create DMA-BUF importer: {e}");
-							frame.consumed.store(true, Ordering::Release);
 							continue;
 						},
 					},
 				};
 
-				// Build DmaBufPlane array from ExportedFrame planes.
+				// Wait for the compositor's render to finish before reading the
+				// buffer. `None` means it already had.
+				if let Some(fence) = &dmabuf_frame.acquire_fence
+					&& let Err(e) = fence::wait_sync_file(fence.as_raw_fd(), fence::FENCE_TIMEOUT)
+				{
+					tracing::warn!("Dropping frame: {e}");
+					continue;
+				}
+
+				// The planes borrow the frame's fds, which stay open until the
+				// frame is dropped.
 				let mut planes_buf = [DmaBufPlane {
 					fd: 0,
 					offset: 0,
 					stride: 0,
 					modifier: 0,
 				}; 4];
-				let plane_count = frame.planes.len().min(4);
-				for (i, p) in frame.planes.iter().take(4).enumerate() {
-					planes_buf[i] = DmaBufPlane {
-						fd: p.fd,
-						offset: p.offset,
-						stride: p.stride,
-						modifier: frame.modifier,
+				let mut plane_count = 0;
+				for ((fd, offset), stride) in dmabuf.handles().zip(dmabuf.offsets()).zip(dmabuf.strides()).take(4) {
+					planes_buf[plane_count] = DmaBufPlane {
+						fd: fd.as_raw_fd(),
+						offset,
+						stride,
+						modifier,
 					};
+					plane_count += 1;
 				}
 				let planes = &planes_buf[..plane_count];
 
 				// Determine Vulkan format and input format from the frame's DRM fourcc.
-				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
+				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(fourcc);
 
 				// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
 				// The `Arc` pins the image while the converter caches a view of it.
 				let (source_import, needs_transition) =
-					match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
+					match importer.import_or_reuse(planes[0].fd, width, height, import_vk_format, planes) {
 						Ok(result) => result,
 						Err(e) => {
 							tracing::warn!("Failed to import DMA-BUF: {e}");
-							frame.consumed.store(true, Ordering::Release);
 							continue;
 						},
 					};
@@ -927,7 +952,7 @@ impl VideoPipelineInner {
 
 				// Get (or build) a converter for this input format. Cached per
 				// format so switching render paths doesn't rebuild one each frame.
-				let (converter, cached_source) = match color_converters.entry(frame.format) {
+				let (converter, cached_source) = match color_converters.entry(fourcc) {
 					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
 					std::collections::hash_map::Entry::Vacant(e) => {
 						let (color_space, full_range) = match ctx.dynamic_range {
@@ -945,7 +970,6 @@ impl VideoPipelineInner {
 							},
 							Err(e) => {
 								tracing::warn!("Failed to create color converter: {e}");
-								frame.consumed.store(true, Ordering::Release);
 								continue;
 							},
 						}
@@ -957,7 +981,7 @@ impl VideoPipelineInner {
 				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
 				// dynamic VUI switching in the encoder.
 				if ctx.dynamic_range == VideoDynamicRange::Hdr {
-					let frame_cs = frame.color_space;
+					let frame_cs = color_space(&frame.info.colour);
 					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
 					// scRGB 1.0 == 80 cd/m². The other paths ignore it.
 					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
@@ -1009,7 +1033,6 @@ impl VideoPipelineInner {
 
 				// Convert to YUV.
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					frame.consumed.store(true, Ordering::Release);
 					if is_device_lost(&e) {
 						return Err(format!("GPU color conversion failed: {e}"));
 					}
@@ -1018,8 +1041,9 @@ impl VideoPipelineInner {
 				}
 
 				// The DMA-BUF content has been read into the encoder's input
-				// image — signal the compositor that this GBM buffer is free.
-				frame.consumed.store(true, Ordering::Release);
+				// image: dropping the frame returns its buffer to the compositor.
+				let frame_hdr_metadata = hdr_metadata(&frame.info.colour);
+				drop(frame);
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
@@ -1028,7 +1052,7 @@ impl VideoPipelineInner {
 					let hdr_enabled = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 					let new_state = HdrModeState {
 						enabled: hdr_enabled,
-						metadata: frame.hdr_metadata,
+						metadata: frame_hdr_metadata,
 					};
 					if new_state != last_hdr_state {
 						if new_state.enabled {
@@ -1064,15 +1088,15 @@ impl VideoPipelineInner {
 						// needed, packetizes and sends it, and records stats.
 						let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 						let frame_context = FrameContext {
-							created_at: frame.created_at,
-							channel_wait: t1_received.duration_since(frame.created_at),
+							created_at: captured_at,
+							sequence: Some(sequence),
+							channel_wait: t1_received.duration_since(captured_at),
 							import: t2_imported.duration_since(t1_received),
 							convert: t3_converted.duration_since(t2_imported),
 							submit: t4_encoded.duration_since(t3_converted),
 							submitted_at: t4_encoded,
 							inject_hdr,
 							hdr_metadata: last_hdr_state.metadata,
-							buffer_index: frame.buffer_index,
 						};
 						// Count this frame in flight; the consumer decrements when done.
 						in_flight.fetch_add(1, Ordering::Relaxed);

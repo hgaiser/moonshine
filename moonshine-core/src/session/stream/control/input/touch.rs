@@ -66,7 +66,9 @@ impl Touch {
 	}
 }
 
+/// Parsed in full, but only logged until the compositor has a pen route.
 #[derive(Debug, Clone, Copy)]
+#[allow(dead_code)]
 pub(crate) struct Pen {
 	pub event_kind: PointerEventKind,
 	pub tool_kind: PenToolKind,

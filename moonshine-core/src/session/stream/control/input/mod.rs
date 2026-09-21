@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
+use ferriscope_core::InputEvent as SeatEvent;
 use strum_macros::FromRepr;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -11,7 +12,7 @@ use self::gamepad::Gamepad;
 use self::gamepad::GamepadConfig;
 use self::remap::{HoldToHome, HoldTransition};
 use self::touch::{Pen, PointerEventKind, Touch};
-use crate::session::compositor::input::CompositorInputEvent;
+use crate::session::compositor::input::{CompositorInput, scroll};
 use crate::session::manager::SessionShutdownReason;
 
 use self::{
@@ -136,13 +137,13 @@ impl InputEvent {
 }
 
 pub(crate) struct InputHandler {
-	input_tx: calloop::channel::Sender<CompositorInputEvent>,
+	compositor: CompositorInput,
 	gamepad_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
 }
 
 impl InputHandler {
 	pub fn new(
-		input_tx: calloop::channel::Sender<CompositorInputEvent>,
+		compositor: CompositorInput,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		gamepad_config: GamepadConfig,
 	) -> Result<Self, ()> {
@@ -164,104 +165,81 @@ impl InputHandler {
 			});
 		});
 
-		Ok(Self { input_tx, gamepad_tx })
+		Ok(Self { compositor, gamepad_tx })
 	}
 
 	async fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
 		match event {
 			InputEvent::KeyDown(key) => {
-				if let Some(keycode) = key.to_linux_keycode() {
-					tracing::trace!("Pressing key: {key:?} (keycode: {keycode})");
-					let _ = self.input_tx.send(CompositorInputEvent::KeyDown { keycode });
+				if let Some(code) = key.to_linux_keycode() {
+					tracing::trace!("Pressing key: {key:?} (keycode: {code})");
+					self.compositor.send(SeatEvent::Key { code, pressed: true });
 				}
 			},
 			InputEvent::KeyUp(key) => {
-				if let Some(keycode) = key.to_linux_keycode() {
-					tracing::trace!("Releasing key: {key:?} (keycode: {keycode})");
-					let _ = self.input_tx.send(CompositorInputEvent::KeyUp { keycode });
+				if let Some(code) = key.to_linux_keycode() {
+					tracing::trace!("Releasing key: {key:?} (keycode: {code})");
+					self.compositor.send(SeatEvent::Key { code, pressed: false });
 				}
 			},
 			InputEvent::MouseMoveAbsolute(event) => {
 				tracing::trace!("Absolute mouse movement: {event:?}");
-				let _ = self.input_tx.send(CompositorInputEvent::MouseMoveAbsolute {
-					x: event.x,
-					y: event.y,
-					screen_width: event.screen_width,
-					screen_height: event.screen_height,
-				});
+				self.compositor.send(self.compositor.pointer_motion(
+					event.x,
+					event.y,
+					event.screen_width,
+					event.screen_height,
+				));
 			},
 			InputEvent::MouseMoveRelative(event) => {
 				tracing::trace!("Moving mouse relative: {event:?}");
-				let _ = self.input_tx.send(CompositorInputEvent::MouseMoveRelative {
-					dx: event.x,
-					dy: event.y,
+				self.compositor.send(SeatEvent::PointerMotionDelta {
+					dx: f64::from(event.x),
+					dy: f64::from(event.y),
 				});
 			},
 			InputEvent::MouseButtonDown(button) => {
 				tracing::trace!("Pressing mouse button: {button:?}");
-				let button_code: u32 = button.into();
-				let _ = self
-					.input_tx
-					.send(CompositorInputEvent::MouseButtonDown { button: button_code });
+				let code: u32 = button.into();
+				self.compositor.send(SeatEvent::PointerButton { code, pressed: true });
 			},
 			InputEvent::MouseButtonUp(button) => {
 				tracing::trace!("Releasing mouse button: {button:?}");
-				let button_code: u32 = button.into();
-				let _ = self
-					.input_tx
-					.send(CompositorInputEvent::MouseButtonUp { button: button_code });
+				let code: u32 = button.into();
+				self.compositor.send(SeatEvent::PointerButton { code, pressed: false });
 			},
 			InputEvent::MouseScrollVertical(event) => {
 				tracing::trace!("Scrolling vertically: {event:?}");
-				let _ = self
-					.input_tx
-					.send(CompositorInputEvent::ScrollVertical { amount: event.amount });
+				self.compositor.send(scroll(event.amount, false));
 			},
 			InputEvent::MouseScrollHorizontal(event) => {
 				tracing::trace!("Scrolling horizontally: {event:?}");
-				let _ = self
-					.input_tx
-					.send(CompositorInputEvent::ScrollHorizontal { amount: event.amount });
+				self.compositor.send(scroll(event.amount, true));
 			},
 			InputEvent::Touch(event) => {
 				tracing::trace!("Touch input: {event:?}");
-				let compositor_event = match event.event_kind {
-					PointerEventKind::Down => Some(CompositorInputEvent::TouchDown {
-						slot: event.pointer_id,
-						x: event.x,
-						y: event.y,
-					}),
-					PointerEventKind::Move => Some(CompositorInputEvent::TouchMove {
-						slot: event.pointer_id,
-						x: event.x,
-						y: event.y,
-					}),
-					PointerEventKind::Up | PointerEventKind::Cancel => {
-						Some(CompositorInputEvent::TouchUp { slot: event.pointer_id })
-					},
-					PointerEventKind::CancelAll => Some(CompositorInputEvent::TouchCancelAll),
+				let slot = event.pointer_id;
+				let (x, y) = self.compositor.touch_point(event.x, event.y);
+				let seat_event = match event.event_kind {
+					PointerEventKind::Down => Some(SeatEvent::TouchDown { slot, x, y }),
+					PointerEventKind::Move => Some(SeatEvent::TouchMotion { slot, x, y }),
+					PointerEventKind::Up | PointerEventKind::Cancel => Some(SeatEvent::TouchUp { slot }),
+					PointerEventKind::CancelAll => Some(SeatEvent::TouchCancel),
 					PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => None,
 				};
-				if let Some(event) = compositor_event {
-					let _ = self.input_tx.send(event);
+				if let Some(seat_event) = seat_event {
+					self.compositor.send_touch(seat_event);
 				}
 			},
+			// TODO(input): ferriscope's seat has no pen or text-input route yet.
 			InputEvent::Pen(event) => {
-				tracing::trace!("Pen input: {event:?}");
-				let _ = self.input_tx.send(CompositorInputEvent::Pen {
-					event_kind: event.event_kind as u8,
-					tool_kind: event.tool_kind as u8,
-					buttons: event.buttons,
-					x: event.x,
-					y: event.y,
-					pressure_or_distance: event.pressure_or_distance,
-					rotation: event.rotation,
-					tilt: event.tilt,
-				});
+				tracing::trace!("Ignoring pen input, which the compositor does not support: {event:?}");
 			},
 			InputEvent::Utf8Text(text) => {
-				tracing::debug!("Typing clipboard text.");
-				let _ = self.input_tx.send(CompositorInputEvent::TypeText { text });
+				tracing::debug!(
+					characters = text.chars().count(),
+					"Ignoring clipboard text, which the compositor does not support."
+				);
 			},
 			// Gamepad events: forward to gamepad handler thread.
 			gamepad_event => {
