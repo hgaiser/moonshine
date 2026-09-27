@@ -3,10 +3,11 @@ use std::time;
 
 use pulseaudio::protocol::{self as pulse, ClientInfoList};
 
-use crate::session::stream::audio::pulse_server::dyn_buffer::DynPlaybackBuffer;
+use crate::session::stream::audio::buffer::PlaybackBuffer;
 use crate::session::stream::audio::pulse_server::{
 	Client, ClientWriter, Error, PlaybackStream, SINK_NAME, ServerState, StreamState, pop_missing,
 };
+use crate::session::stream::audio::{AudioChannels, log};
 
 pub(super) fn handle_command(
 	client: &mut Client,
@@ -107,8 +108,8 @@ pub(super) fn handle_command(
 			Ok(())
 		},
 		pulse::Command::CreatePlaybackStream(params) => {
-			let mut sample_spec = params.sample_spec;
-			if sample_spec.format == pulse::SampleFormat::Invalid
+			let mut stream_spec = params.sample_spec;
+			if stream_spec.format == pulse::SampleFormat::Invalid
 				&& let Some(format) = params.formats.iter().find_map(|f| match sample_spec_from_format(f) {
 					Ok(ss) => Some(ss),
 					Err(e) => {
@@ -116,11 +117,11 @@ pub(super) fn handle_command(
 						None
 					},
 				}) {
-				sample_spec = format;
+				stream_spec = format;
 			}
 
-			if !is_supported_format(sample_spec.format) {
-				tracing::warn!("rejecting unsupported sample format {:?}", sample_spec.format);
+			if !is_supported_format(stream_spec.format) {
+				tracing::warn!("rejecting unsupported sample format {:?}", stream_spec.format);
 				pulse::write_error(
 					&mut ClientWriter(&mut client.outgoing),
 					seq,
@@ -132,12 +133,11 @@ pub(super) fn handle_command(
 			// When fix_channels is set, the client expects the stream to be fixed
 			// to the sink's channel configuration (used by winepulse for probing).
 			let (stream_spec, stream_channel_map) = if params.flags.fix_channels {
-				let mut fixed_spec = sample_spec;
-				fixed_spec.channels = server.capture_spec.channels;
-				let fixed_map = server.sinks[0].channel_map;
-				(fixed_spec, fixed_map)
+				let mut fixed_spec = stream_spec;
+				fixed_spec.channels = server.sink_spec.channels as u8;
+				(fixed_spec, server.sink_spec.channels.map())
 			} else {
-				(sample_spec, params.channel_map)
+				(stream_spec, params.channel_map)
 			};
 
 			let mut buffer_attr = params.buffer_attr;
@@ -149,14 +149,19 @@ pub(super) fn handle_command(
 			let cvolume = params
 				.cvolume
 				.unwrap_or_else(|| pulse::ChannelVolume::norm(stream_spec.channels));
-			let volume = cvolume_to_linear(&cvolume, server.capture_channels);
+			let volume = cvolume_to_linear(&cvolume, server.sink_spec.channels);
 			let muted = params.flags.start_muted == Some(true);
 
+			let buffer = if server.sink_spec.sample_rate as u32 == stream_spec.sample_rate {
+				PlaybackBuffer::passthrough(stream_spec, stream_channel_map, server.sink_spec)
+			} else {
+				PlaybackBuffer::resample(stream_spec, stream_channel_map, server.sink_spec, server.clock_rate_hz)
+			};
 			let mut stream = PlaybackStream {
 				stream_index: server.next_stream_index,
 				state: StreamState::Prebuffering(buffer_attr.pre_buffering as u64),
 				buffer_attr,
-				buffer: DynPlaybackBuffer::new(stream_spec, stream_channel_map, server.capture_spec),
+				buffer,
 				volume,
 				muted,
 				// Mirrors pa_memblockq_set_tlength: seed missing = tlength so the first
@@ -166,6 +171,7 @@ pub(super) fn handle_command(
 				played_bytes: 0,
 				write_offset: 0,
 				read_offset: 0,
+				opened_at: time::Instant::now(),
 			};
 
 			if buffer_attr.pre_buffering == 0 || flags.start_corked {
@@ -174,6 +180,15 @@ pub(super) fn handle_command(
 
 			let channel = server.next_playback_channel_index;
 			server.next_playback_channel_index += 1;
+
+			log::pulse_create_stream_cmd(
+				client.stream_owner(channel),
+				&params.props,
+				stream_spec,
+				server.sink_spec,
+				flags,
+				buffer_attr,
+			);
 
 			let stream_index = server.next_stream_index;
 			server.next_stream_index += 1;
@@ -321,7 +336,7 @@ pub(super) fn handle_command(
 		pulse::Command::SetSinkInputVolume(params) => {
 			for stream in client.playback_streams.values_mut() {
 				if stream.stream_index == params.index {
-					stream.volume = cvolume_to_linear(&params.volume, server.capture_channels);
+					stream.volume = cvolume_to_linear(&params.volume, server.sink_spec.channels);
 				}
 			}
 			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
@@ -337,7 +352,7 @@ pub(super) fn handle_command(
 			Ok(())
 		},
 		pulse::Command::SetSinkVolume(params) => {
-			server.sink_volume = cvolume_to_linear(&params.volume, server.capture_channels);
+			server.sink_volume = cvolume_to_linear(&params.volume, server.sink_spec.channels);
 			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
 			Ok(())
 		},
@@ -347,7 +362,9 @@ pub(super) fn handle_command(
 			Ok(())
 		},
 		pulse::Command::DeletePlaybackStream(channel) => {
-			client.playback_streams.remove(&channel);
+			if let Some(stream) = client.playback_streams.remove(&channel) {
+				client.log_stream_closed(channel, &stream, "deleted by client");
+			}
 			pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), seq)?;
 			Ok(())
 		},
@@ -421,7 +438,7 @@ pub(super) fn handle_command(
 		pulse::Command::SetPlaybackStreamBufferAttr(params) => {
 			if let Some(stream) = client.playback_streams.get_mut(&params.index) {
 				stream.buffer_attr = params.buffer_attr;
-				let sample_spec = stream.buffer.sample_spec();
+				let sample_spec = stream.buffer.stream_spec();
 				configure_buffer(&mut stream.buffer_attr, &sample_spec);
 
 				// Re-seed missing based on the new target so the next pop_missing()
@@ -644,7 +661,7 @@ fn write_reply<T: pulse::CommandReply + std::fmt::Debug>(
 /// Convert a PulseAudio `ChannelVolume` to N linear gain values.
 /// If the volume has fewer channels than `out_channels`, the last
 /// volume value is repeated. If more, only the first `out_channels` are taken.
-fn cvolume_to_linear(cv: &pulse::ChannelVolume, out_channels: u8) -> Vec<f32> {
+fn cvolume_to_linear(cv: &pulse::ChannelVolume, out_channels: AudioChannels) -> Vec<f32> {
 	let vols = cv.channels();
 	let n = out_channels as usize;
 	(0..n)
@@ -669,7 +686,7 @@ fn linear_to_cvolume(vol: &[f32]) -> pulse::ChannelVolume {
 }
 
 fn sink_input_info_from_stream(stream: &PlaybackStream, client_id: u32) -> pulse::SinkInputInfo {
-	let sample_spec = stream.buffer.sample_spec();
+	let sample_spec = stream.buffer.stream_spec();
 	pulse::SinkInputInfo {
 		index: stream.stream_index,
 		name: CString::new(format!("stream-{}", stream.stream_index)).unwrap(),
