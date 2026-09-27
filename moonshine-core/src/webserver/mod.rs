@@ -786,7 +786,11 @@ impl Webserver {
 			.remove("surroundAudioInfo")
 			.and_then(|s| s.parse().ok())
 			.unwrap_or(196610); // Default: stereo (0x30002)
-		let audio_channels = AudioChannels::from((surround_audio_info & 0xFFFF) as u8);
+		let audio_channels = AudioChannels::try_from((surround_audio_info & 0xFFFF) as u8)
+			.inspect_err(|err| {
+				tracing::warn!("{err}, falling back to stereo");
+			})
+			.unwrap_or(AudioChannels::Stereo);
 		let audio_channel_mask = surround_audio_info >> 16;
 
 		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);

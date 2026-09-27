@@ -1,5 +1,4 @@
 mod commands;
-mod dyn_buffer;
 
 use std::collections::BTreeMap;
 use std::io::{Cursor, Read, Write};
@@ -12,8 +11,8 @@ use bytes::{Buf, BytesMut};
 use mio::net::UnixListener;
 use pulseaudio::protocol::{self as pulse};
 
-use dyn_buffer::DynPlaybackBuffer;
-
+use super::buffer::PlaybackBuffer;
+use super::{AudioChannels, SinkSpec, log};
 use crate::session::manager::SessionShutdownReason;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -27,11 +26,11 @@ const CLOCK: mio::Token = mio::Token(1);
 const MAX_OUTGOING_BUFFER: usize = 64 * 1024 * 1024;
 
 /// The server emits samples at this rate to the encoder.
-pub(crate) const CAPTURE_SAMPLE_RATE: u32 = 48000;
+pub(crate) const OUTPUT_SAMPLE_RATE: u32 = 48000;
 
 /// Clock tick rate. Determines audio frame size sent to the encoder.
 /// For 5ms frames: 200 Hz; for 10ms frames: 100 Hz.
-const DEFAULT_CLOCK_RATE_HZ: u32 = 200;
+pub(crate) const DEFAULT_CLOCK_RATE_HZ: u32 = 200;
 
 const SINK_NAME: &str = "moonshine";
 
@@ -59,7 +58,7 @@ struct PlaybackStream {
 	stream_index: u32,
 	state: StreamState,
 	buffer_attr: pulse::stream::BufferAttr,
-	buffer: DynPlaybackBuffer,
+	buffer: PlaybackBuffer,
 	volume: Vec<f32>,
 	muted: bool,
 	/// Bytes consumed by the audio clock since the last REQUEST was sent.
@@ -75,6 +74,7 @@ struct PlaybackStream {
 	played_bytes: u64,
 	write_offset: u64,
 	read_offset: u64,
+	opened_at: time::Instant,
 }
 
 struct Client {
@@ -99,6 +99,24 @@ enum FlushResult {
 }
 
 impl Client {
+	fn stream_owner(&self, channel: u32) -> log::StreamOwner<'_> {
+		log::StreamOwner {
+			client_id: self.id,
+			client_props: self.props.as_ref(),
+			channel,
+		}
+	}
+
+	fn log_stream_closed(&self, channel: u32, stream: &PlaybackStream, reason: &str) {
+		log::pulse_stream_closed(
+			self.stream_owner(channel),
+			reason,
+			stream.buffer.stream_spec(),
+			stream.opened_at.elapsed(),
+			stream.played_bytes,
+		);
+	}
+
 	/// Write as much of the outgoing buffer to the socket as possible.
 	///
 	/// `WouldBlock` is not an error: the remainder stays buffered and the
@@ -136,21 +154,20 @@ impl std::io::Write for ClientWriter<'_> {
 
 struct ServerState {
 	server_info: pulse::ServerInfo,
+	clock_rate_hz: u32,
 	sinks: Vec<pulse::SinkInfo>,
 	default_format_info: pulse::FormatInfo,
 	next_playback_channel_index: u32,
 	next_stream_index: u32,
 	sink_volume: Vec<f32>,
 	sink_muted: bool,
-	capture_channels: u8,
-	capture_spec: pulse::SampleSpec,
+	sink_spec: SinkSpec,
 }
 
 pub(crate) struct PulseServer {
 	listener: UnixListener,
 	poll: mio::Poll,
 	clock: mio_timerfd::TimerFd,
-	clock_rate_hz: u32,
 
 	frame_tx: crossbeam_channel::Sender<AudioFrame>,
 	frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
@@ -188,7 +205,7 @@ impl PulseServer {
 	pub fn spawn(
 		listener: std::os::unix::net::UnixListener,
 		_socket_path: PathBuf,
-		channels: u8,
+		sink_channels: AudioChannels,
 		packet_duration_ms: u32,
 		frame_tx: crossbeam_channel::Sender<AudioFrame>,
 		frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
@@ -217,46 +234,15 @@ impl PulseServer {
 
 		let sink_name = std::ffi::CString::new(SINK_NAME).unwrap();
 
-		let capture_spec = pulse::SampleSpec {
-			format: pulse::SampleFormat::Float32Le,
-			channels,
-			sample_rate: CAPTURE_SAMPLE_RATE,
-		};
-
-		let channel_map = match channels {
-			6 => pulse::ChannelMap::new([
-				pulse::ChannelPosition::FrontLeft,
-				pulse::ChannelPosition::FrontRight,
-				pulse::ChannelPosition::FrontCenter,
-				pulse::ChannelPosition::Lfe,
-				pulse::ChannelPosition::RearLeft,
-				pulse::ChannelPosition::RearRight,
-			]),
-			8 => pulse::ChannelMap::new([
-				pulse::ChannelPosition::FrontLeft,
-				pulse::ChannelPosition::FrontRight,
-				pulse::ChannelPosition::FrontCenter,
-				pulse::ChannelPosition::Lfe,
-				pulse::ChannelPosition::RearLeft,
-				pulse::ChannelPosition::RearRight,
-				pulse::ChannelPosition::SideLeft,
-				pulse::ChannelPosition::SideRight,
-			]),
-			_ => pulse::ChannelMap::stereo(),
-		};
-
-		let port_name = match channels {
-			6 => "Surround 5.1 Output",
-			8 => "Surround 7.1 Output",
-			_ => "Stereo Output",
-		};
+		let sink_spec = SinkSpec::new(sink_channels);
 
 		let mut dummy_sink = pulse::SinkInfo::new_dummy(1);
 		dummy_sink.name = sink_name.clone();
 		dummy_sink.description = Some(std::ffi::CString::new("Moonshine virtual output").unwrap());
-		dummy_sink.sample_spec = capture_spec;
-		dummy_sink.channel_map = channel_map;
-		dummy_sink.cvolume = pulse::ChannelVolume::norm(channels);
+		dummy_sink.sample_spec = sink_spec.as_pulse_spec();
+		dummy_sink.channel_map = sink_channels.map();
+		dummy_sink.base_volume = pulse::Volume::NORM;
+		dummy_sink.cvolume = pulse::ChannelVolume::norm(sink_channels as u8);
 
 		let server_info = pulse::ServerInfo {
 			server_name: Some(std::ffi::CString::new("Moonshine").unwrap()),
@@ -264,37 +250,22 @@ impl PulseServer {
 			host_name: Some(std::ffi::CString::new("moonshine").unwrap()),
 			default_sink_name: Some(sink_name.clone()),
 			default_source_name: Some(std::ffi::CString::new("").unwrap()),
-			sample_spec: capture_spec,
-			channel_map,
+			sample_spec: sink_spec.as_pulse_spec(),
+			channel_map: sink_channels.map(),
 			..Default::default()
 		};
 
-		dummy_sink.ports[0].name = std::ffi::CString::new(port_name).unwrap();
+		dummy_sink.ports[0].name = sink_channels.port_as_cstr().into();
 		dummy_sink.ports[0].port_type = pulse::port_info::PortType::Network;
 		dummy_sink.ports[0].description = Some(std::ffi::CString::new("virtual output").unwrap());
 
-		let channel_map_str = match channels {
-			6 => "front-left,front-right,front-center,lfe,rear-left,rear-right",
-			8 => "front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right",
-			_ => "front-left,front-right",
-		};
-
 		let mut format_props = pulse::Props::new();
-		format_props.set(
-			pulse::Prop::FormatChannels,
-			std::ffi::CString::new(channels.to_string()).unwrap(),
-		);
-		format_props.set(
-			pulse::Prop::FormatChannelMap,
-			std::ffi::CString::new(channel_map_str).unwrap(),
-		);
-		format_props.set(
-			pulse::Prop::FormatSampleFormat,
-			std::ffi::CString::new("float32le").unwrap(),
-		);
+		format_props.set(pulse::Prop::FormatChannels, sink_channels.count_as_cstr());
+		format_props.set(pulse::Prop::FormatChannelMap, sink_channels.map_cstr());
+		format_props.set(pulse::Prop::FormatSampleFormat, c"float32le");
 		format_props.set(
 			pulse::Prop::FormatRate,
-			std::ffi::CString::new(CAPTURE_SAMPLE_RATE.to_string()).unwrap(),
+			std::ffi::CString::new(OUTPUT_SAMPLE_RATE.to_string()).unwrap(),
 		);
 
 		let default_format_info = pulse::FormatInfo {
@@ -308,21 +279,20 @@ impl PulseServer {
 			listener,
 			poll,
 			clock,
-			clock_rate_hz,
 			frame_tx,
 			frame_recycle_rx,
 			spare_frame: None,
 			clients: BTreeMap::new(),
 			server_state: ServerState {
 				server_info,
+				clock_rate_hz,
 				sinks: vec![dummy_sink],
 				default_format_info,
 				next_playback_channel_index: 0,
 				next_stream_index: 0,
-				sink_volume: vec![1.0; channels as usize],
+				sink_volume: vec![1.0; sink_channels as usize],
 				sink_muted: false,
-				capture_channels: channels,
-				capture_spec,
+				sink_spec,
 			},
 			epoch: time::Instant::now(),
 		};
@@ -407,17 +377,12 @@ impl PulseServer {
 						);
 					},
 					client_token if event.is_read_closed() => {
-						if let Some(mut client) = self.clients.remove(&client_token) {
-							tracing::debug!("PulseAudio client disconnected (id={})", client.id);
-							let _ = self.poll.registry().deregister(&mut client.socket);
-						}
+						self.remove_client(client_token);
 					},
 					client_token if event.is_readable() && self.clients.contains_key(&client_token) => {
 						if let Err(e) = self.recv(client_token) {
 							tracing::error!("PulseAudio client error: {:#}", e);
-							if let Some(mut client) = self.clients.remove(&client_token) {
-								let _ = self.poll.registry().deregister(&mut client.socket);
-							}
+							self.remove_client(client_token);
 						}
 					},
 					client_token if event.is_writable() => {
@@ -556,8 +521,17 @@ impl PulseServer {
 			}
 		};
 
-		if remove && let Some(mut client) = self.clients.remove(&client_token) {
+		if remove {
+			self.remove_client(client_token);
+		}
+	}
+
+	fn remove_client(&mut self, client_token: mio::Token) {
+		if let Some(mut client) = self.clients.remove(&client_token) {
 			tracing::debug!("PulseAudio client disconnected (id={})", client.id);
+			for (channel, stream) in &client.playback_streams {
+				client.log_stream_closed(*channel, stream, "client disconnected");
+			}
 			let _ = self.poll.registry().deregister(&mut client.socket);
 		}
 	}
@@ -566,9 +540,8 @@ impl PulseServer {
 		let mut done_draining = Vec::new();
 
 		let capture_ts = self.epoch.elapsed().as_millis() as u64;
-		let channels = self.server_state.capture_channels as u32;
-		let num_frames = CAPTURE_SAMPLE_RATE / self.clock_rate_hz;
-		let encode_len = num_frames * channels;
+		let num_frames = self.server_state.sink_spec.sample_rate as u32 / self.server_state.clock_rate_hz;
+		let encode_len = num_frames * self.server_state.sink_spec.channels as u32;
 
 		let mut frame = match self.frame_recycle_rx.try_recv() {
 			Ok(mut frame) => {
@@ -676,6 +649,7 @@ impl PulseServer {
 
 			for id in done_draining.iter() {
 				let stream = client.playback_streams.remove(id).unwrap();
+				client.log_stream_closed(*id, &stream, "drained");
 				if let StreamState::Draining(drain_seq) = stream.state {
 					pulse::write_ack_message(&mut ClientWriter(&mut client.outgoing), drain_seq)?;
 				}
