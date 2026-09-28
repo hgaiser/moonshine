@@ -13,6 +13,8 @@
   vulkan-loader,
   wayland,
   libglvnd,
+  callPackage,
+  pyrowave ? callPackage ./pyrowave.nix { },
 }:
 
 let
@@ -116,6 +118,7 @@ rustPlatform.buildRustPackage {
     libopus
     vulkan-loader
     wayland
+    pyrowave
   ];
 
   # The tests exercise the compositor/encoder paths and expect devices
@@ -157,6 +160,7 @@ rustPlatform.buildRustPackage {
       lib.makeLibraryPath [
         vulkan-loader
         libglvnd
+        pyrowave
       ]
     } $out/bin/moonshine
     addDriverRunpath $out/bin/moonshine

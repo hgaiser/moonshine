@@ -6,9 +6,11 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use pixelforge::{Codec, VideoContext, VideoContextBuilder};
+use pixelforge::{Codec, EncodeBitDepth, EncodeConfig, Encoder, PixelFormat, VideoContext, VideoContextBuilder};
 
 use crate::config::Config;
+use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
+use crate::session::stream::video::{BitDepth, ChromaFormat, NegotiatedVideoFormat, VideoCodec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -62,6 +64,41 @@ pub const CODEC_HEVC_REXT_8444: u32 = 0x00080000;
 pub const CODEC_HEVC_REXT_10444: u32 = 0x00100000;
 pub const CODEC_AV1_HIGH_8444: u32 = 0x00200000;
 pub const CODEC_AV1_HIGH_10444: u32 = 0x00400000;
+/// Moonshine extension bits. Stock Moonlight ignores unknown bits; a
+/// PyroWave-capable client treats these as four independent profiles.
+pub const CODEC_PYROWAVE_420_8: u32 = 0x00800000;
+pub const CODEC_PYROWAVE_420_10: u32 = 0x01000000;
+pub const CODEC_PYROWAVE_444_8: u32 = 0x02000000;
+pub const CODEC_PYROWAVE_444_10: u32 = 0x04000000;
+pub const CODEC_PYROWAVE: u32 = CODEC_PYROWAVE_420_8;
+
+/// Test a negotiated mode against the exact combinations successfully probed
+/// at startup.  This intentionally has no codec-name-only shortcut.
+pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -> bool {
+	let bit = match (format.codec, format.chroma, format.bit_depth) {
+		(VideoCodec::H264, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_H264,
+		(VideoCodec::H264, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_H264_HIGH_8444,
+		(VideoCodec::Hevc, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_HEVC,
+		(VideoCodec::Hevc, ChromaFormat::Yuv420, BitDepth::Ten) => CODEC_HEVC_MAIN10,
+		(VideoCodec::Hevc, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_HEVC_REXT_8444,
+		(VideoCodec::Hevc, ChromaFormat::Yuv444, BitDepth::Ten) => CODEC_HEVC_REXT_10444,
+		(VideoCodec::Av1, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_AV1_MAIN8,
+		(VideoCodec::Av1, ChromaFormat::Yuv420, BitDepth::Ten) => CODEC_AV1_MAIN10,
+		(VideoCodec::Av1, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_AV1_HIGH_8444,
+		(VideoCodec::Av1, ChromaFormat::Yuv444, BitDepth::Ten) => CODEC_AV1_HIGH_10444,
+		// The fork's scaled RGB path emits full-range YCbCr. Refuse to advertise
+		// limited range rather than putting incorrect range metadata on the wire.
+		(VideoCodec::PyroWave, _, _) if format.range != crate::session::stream::video::ColorRange::Full => {
+			return false;
+		},
+		(VideoCodec::PyroWave, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_PYROWAVE_420_8,
+		(VideoCodec::PyroWave, ChromaFormat::Yuv420, BitDepth::Ten) => CODEC_PYROWAVE_420_10,
+		(VideoCodec::PyroWave, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_PYROWAVE_444_8,
+		(VideoCodec::PyroWave, ChromaFormat::Yuv444, BitDepth::Ten) => CODEC_PYROWAVE_444_10,
+		_ => return false,
+	};
+	capabilities & bit != 0
+}
 
 impl HealthReport {
 	fn add(&mut self, name: &'static str, outcome: CheckOutcome, message: String, duration_ms: u64) {
@@ -274,6 +311,14 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 	// --- External dependencies ---
 
 	check_xwayland(&mut report);
+	if config.is_some_and(|config| {
+		config
+			.applications
+			.iter()
+			.any(|app| app.kind == crate::session::application::ApplicationKind::Desktop)
+	}) {
+		check_plasma(&mut report);
+	}
 	check_xdg_runtime(&mut report);
 	check_inhibit(&mut report);
 	check_kcmp(&mut report);
@@ -608,24 +653,154 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 	let mut supported = 0u32;
 	let mut names = Vec::new();
 
-	if ctx.supports_encode(Codec::H264) {
-		supported |= CODEC_H264;
-		supported |= CODEC_H264_HIGH_8444;
-		names.push("H.264");
+	let candidates = [
+		(
+			Codec::H264,
+			PixelFormat::Yuv420,
+			EncodeBitDepth::Eight,
+			CODEC_H264,
+			"H.264 4:2:0 8-bit",
+		),
+		(
+			Codec::H264,
+			PixelFormat::Yuv444,
+			EncodeBitDepth::Eight,
+			CODEC_H264_HIGH_8444,
+			"H.264 4:4:4 8-bit",
+		),
+		(
+			Codec::H265,
+			PixelFormat::Yuv420,
+			EncodeBitDepth::Eight,
+			CODEC_HEVC,
+			"HEVC 4:2:0 8-bit",
+		),
+		(
+			Codec::H265,
+			PixelFormat::Yuv420,
+			EncodeBitDepth::Ten,
+			CODEC_HEVC_MAIN10,
+			"HEVC 4:2:0 10-bit",
+		),
+		(
+			Codec::H265,
+			PixelFormat::Yuv444,
+			EncodeBitDepth::Eight,
+			CODEC_HEVC_REXT_8444,
+			"HEVC 4:4:4 8-bit",
+		),
+		(
+			Codec::H265,
+			PixelFormat::Yuv444,
+			EncodeBitDepth::Ten,
+			CODEC_HEVC_REXT_10444,
+			"HEVC 4:4:4 10-bit",
+		),
+		(
+			Codec::AV1,
+			PixelFormat::Yuv420,
+			EncodeBitDepth::Eight,
+			CODEC_AV1_MAIN8,
+			"AV1 4:2:0 8-bit",
+		),
+		(
+			Codec::AV1,
+			PixelFormat::Yuv420,
+			EncodeBitDepth::Ten,
+			CODEC_AV1_MAIN10,
+			"AV1 4:2:0 10-bit",
+		),
+		(
+			Codec::AV1,
+			PixelFormat::Yuv444,
+			EncodeBitDepth::Eight,
+			CODEC_AV1_HIGH_8444,
+			"AV1 4:4:4 8-bit",
+		),
+		(
+			Codec::AV1,
+			PixelFormat::Yuv444,
+			EncodeBitDepth::Ten,
+			CODEC_AV1_HIGH_10444,
+			"AV1 4:4:4 10-bit",
+		),
+	];
+
+	for (codec, chroma, depth, bit, label) in candidates {
+		if !ctx.supports_encode(codec) {
+			continue;
+		}
+		let base = match codec {
+			Codec::H264 => EncodeConfig::h264(128, 128),
+			Codec::H265 => EncodeConfig::h265(128, 128),
+			Codec::AV1 => EncodeConfig::av1(128, 128),
+		};
+		match Encoder::new(ctx.clone(), base.with_pixel_format(chroma).with_bit_depth(depth)) {
+			Ok(encoder) => {
+				drop(encoder);
+				supported |= bit;
+				names.push(label);
+			},
+			Err(error) => tracing::debug!(label, %error, "Video profile is not supported"),
+		}
 	}
-	if ctx.supports_encode(Codec::H265) {
-		supported |= CODEC_HEVC;
-		supported |= CODEC_HEVC_MAIN10;
-		supported |= CODEC_HEVC_REXT_8444;
-		supported |= CODEC_HEVC_REXT_10444;
-		names.push("HEVC");
+
+	// PyroWave is compute-based, not a Vulkan Video profile. Probe its exact
+	// library ABI, same-adapter creation, external-memory interop, and both
+	// chroma encoder configurations independently.
+	let mut pyrowave_errors = Vec::new();
+	for (chroma, depth, bit, label) in [
+		(
+			ChromaFormat::Yuv420,
+			BitDepth::Eight,
+			CODEC_PYROWAVE_420_8,
+			"PyroWave 4:2:0 8-bit",
+		),
+		(
+			ChromaFormat::Yuv420,
+			BitDepth::Ten,
+			CODEC_PYROWAVE_420_10,
+			"PyroWave 4:2:0 10-bit",
+		),
+		(
+			ChromaFormat::Yuv444,
+			BitDepth::Eight,
+			CODEC_PYROWAVE_444_8,
+			"PyroWave 4:4:4 8-bit",
+		),
+		(
+			ChromaFormat::Yuv444,
+			BitDepth::Ten,
+			CODEC_PYROWAVE_444_10,
+			"PyroWave 4:4:4 10-bit",
+		),
+	] {
+		match PyroWaveEncoder::is_available(ctx, chroma, depth) {
+			Ok(()) => {
+				supported |= bit;
+				names.push(label);
+			},
+			Err(error) => {
+				tracing::debug!(%error, %chroma, bit_depth = depth.bits(), "PyroWave profile is unavailable");
+				pyrowave_errors.push(format!("{chroma} {}-bit: {error}", depth.bits()));
+			},
+		}
 	}
-	if ctx.supports_encode(Codec::AV1) {
-		supported |= CODEC_AV1_MAIN8;
-		supported |= CODEC_AV1_MAIN10;
-		supported |= CODEC_AV1_HIGH_8444;
-		supported |= CODEC_AV1_HIGH_10444;
-		names.push("AV1");
+	if pyrowave_errors.is_empty() {
+		report.add_passed(
+			"PyroWave",
+			format!("{SOURCE_URL} @ {SOURCE_REVISION}"),
+			start.elapsed().as_millis() as u64,
+		);
+	} else {
+		report.add_warn(
+			"PyroWave",
+			format!(
+				"  Optional codec unavailable from {SOURCE_URL} @ {SOURCE_REVISION}:\n  {}",
+				pyrowave_errors.join("\n  ")
+			),
+			start.elapsed().as_millis() as u64,
+		);
 	}
 
 	report.supported_codecs = supported;
@@ -633,7 +808,7 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 	if names.is_empty() {
 		report.add_failed(
 			"Codecs",
-			"  No video encode codec supported (H.264, HEVC, AV1).\n  GPU driver may be outdated or missing Vulkan Video extensions.\n  Update to the latest GPU driver.".into(),
+				"  No usable video encode profile detected (H.264, HEVC, AV1).\n  GPU driver may be outdated or missing Vulkan Video extensions.\n  Update to the latest GPU driver.".into(),
 			start.elapsed().as_millis() as u64,
 		);
 	} else {
@@ -740,6 +915,50 @@ fn check_xwayland(report: &mut HealthReport) {
 				start.elapsed().as_millis() as u64,
 			);
 		},
+	}
+}
+
+fn check_plasma(report: &mut HealthReport) {
+	let start = Instant::now();
+	let required = [
+		"dbus-run-session",
+		"kwin_wayland_wrapper",
+		"startplasma-wayland",
+		"plasma_session",
+		"plasmashell",
+	];
+	let missing: Vec<_> = required
+		.iter()
+		.copied()
+		.filter(|program| which::which(program).is_err())
+		.collect();
+	if !missing.is_empty() {
+		report.add_warn(
+			"Plasma 6",
+			format!(
+				"  Missing required desktop components: {}.\n  Install KDE Plasma 6, KWin, dbus, and Xwayland.",
+				missing.join(", ")
+			),
+			start.elapsed().as_millis() as u64,
+		);
+		return;
+	}
+
+	let version = std::process::Command::new("kwin_wayland")
+		.arg("--version")
+		.output()
+		.ok()
+		.filter(|output| output.status.success())
+		.map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+		.unwrap_or_else(|| "KWin version unknown".to_string());
+	if !version.contains('6') {
+		report.add_warn(
+			"Plasma 6",
+			format!("  Expected KWin/Plasma 6, detected: {version}"),
+			start.elapsed().as_millis() as u64,
+		);
+	} else {
+		report.add_passed("Plasma 6", version, start.elapsed().as_millis() as u64);
 	}
 }
 
@@ -1237,4 +1456,65 @@ pub(crate) fn find_render_node(gpu_config: &Option<String>) -> Result<PathBuf, S
 	}
 
 	Ok(best_node.unwrap_or_else(|| entries[0].path()))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::session::stream::video::ColorRange;
+
+	#[test]
+	fn profile_capabilities_are_not_codec_wide() {
+		let caps = CODEC_HEVC | CODEC_HEVC_REXT_10444;
+		assert!(supports_video_format(
+			caps,
+			NegotiatedVideoFormat::sdr(
+				VideoCodec::Hevc,
+				ChromaFormat::Yuv420,
+				BitDepth::Eight,
+				ColorRange::Limited,
+			)
+		));
+		assert!(supports_video_format(
+			caps,
+			NegotiatedVideoFormat::sdr(
+				VideoCodec::Hevc,
+				ChromaFormat::Yuv444,
+				BitDepth::Ten,
+				ColorRange::Limited,
+			)
+		));
+		assert!(!supports_video_format(
+			caps,
+			NegotiatedVideoFormat::sdr(
+				VideoCodec::Hevc,
+				ChromaFormat::Yuv444,
+				BitDepth::Eight,
+				ColorRange::Limited,
+			)
+		));
+	}
+
+	#[test]
+	fn pyrowave_profiles_require_their_bit_and_full_range() {
+		let caps = CODEC_PYROWAVE_444_10;
+		assert!(supports_video_format(
+			caps,
+			NegotiatedVideoFormat::sdr(
+				VideoCodec::PyroWave,
+				ChromaFormat::Yuv444,
+				BitDepth::Ten,
+				ColorRange::Full,
+			)
+		));
+		assert!(!supports_video_format(
+			caps,
+			NegotiatedVideoFormat::sdr(
+				VideoCodec::PyroWave,
+				ChromaFormat::Yuv444,
+				BitDepth::Ten,
+				ColorRange::Limited,
+			)
+		));
+	}
 }

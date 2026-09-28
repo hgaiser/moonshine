@@ -253,13 +253,15 @@ CMDS=(
   "mkdir -p '${MOONSHINE_HOME}/lib'"
   "cp '${S}/lib/moonshine/vulkan-layers/libmoonshine_wsi.so' '${MOONSHINE_HOME}/lib/libmoonshine_wsi.so'"
   "chmod 755 '${MOONSHINE_HOME}/lib/libmoonshine_wsi.so'"
+  "cp '${S}/lib/libpyrowave-shared.so.0' '${MOONSHINE_HOME}/lib/libpyrowave-shared.so.0'"
+  "chmod 755 '${MOONSHINE_HOME}/lib/libpyrowave-shared.so.0'"
 
   # Deploy the install script itself for future upgrades/uninstall
   "cp '${S}/bin/moonshine-install.sh' '${MOONSHINE_HOME}/bin/moonshine-install.sh'"
   "chmod 755 '${MOONSHINE_HOME}/bin/moonshine-install.sh'"
 
   # Deploy start script with path patched
-  "sed 's|/usr/bin/moonshine|${MOONSHINE_HOME}/bin/moonshine|g' '${S}/share/moonshine/start-moonshine.sh' > '${MOONSHINE_HOME}/start-moonshine.sh'"
+  "sed -e 's|/usr/bin/moonshine|${MOONSHINE_HOME}/bin/moonshine|g' -e '/set -e/a export LD_LIBRARY_PATH=\"${MOONSHINE_HOME}/lib:\${LD_LIBRARY_PATH:-}\"' '${S}/share/moonshine/start-moonshine.sh' > '${MOONSHINE_HOME}/start-moonshine.sh'"
   "chmod 755 '${MOONSHINE_HOME}/start-moonshine.sh'"
 
   # Deploy service unit with path patched

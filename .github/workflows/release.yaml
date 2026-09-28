@@ -40,6 +40,13 @@ jobs:
     - name: Install dependencies
       uses: ./.github/actions/install-dependencies
 
+    - name: Build pinned PyroWave
+      run: |
+        ./scripts/build-pyrowave.sh "$RUNNER_TEMP/pyrowave" "$RUNNER_TEMP/pyrowave-install"
+        mkdir -p ./target/release
+        cp -L "$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.0" \
+          ./target/release/libpyrowave-shared.so.0
+
     - name: Build
       run: cargo build --release --workspace
 
@@ -62,6 +69,7 @@ jobs:
         STAGE="$RUNNER_TEMP/moonshine"
         mkdir -p "$STAGE/bin" "$STAGE/lib/moonshine/vulkan-layers" "$STAGE/share/moonshine"
         cp ./target/release/moonshine "$STAGE/bin/"
+        cp ./target/release/libpyrowave-shared.so.0 "$STAGE/lib/"
         cp ./target/release/libmoonshine_wsi.so "$STAGE/lib/moonshine/vulkan-layers/"
         cp ./dist/start-moonshine.sh ./dist/60-moonshine.rules ./dist/50-moonshine-inhibit-sleep.rules \
            ./dist/moonshine-modules.conf ./dist/moonshine-sysusers.conf \

@@ -9,8 +9,9 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 - **Isolated streaming sessions**: Each stream runs in its own compositor, completely separate from your desktop environment. Your host PC can still be used for other things while you stream.
 - **No monitor required**: Works on headless servers — no HDMI dummy plug needed.
-- **Hardware video encoding**: H.264, H.265, and AV1 encoding using the GPU.
+- **GPU video encoding**: H.264, H.265, AV1, and optional PyroWave, with independently negotiated 4:2:0/4:4:4 and bit depth.
 - **HDR support**: True 10-bit HDR streaming for supported games.
+- **Headless Plasma 6 desktop**: Managed support for an isolated nested KWin/Plasma session sized for the client.
 - **Full input support**: Mouse, keyboard, touchscreen, pen/stylus, and gamepad (including motion, touchpad, and haptics).
 - **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
 
@@ -206,6 +207,16 @@ post_command = [
     ["/usr/bin/systemctl", "start", "conflicting.service"],
 ]
 ```
+
+For a complete isolated KDE Plasma 6 desktop, use `type = "desktop"`; Moonshine
+manages KWin, Plasma, its private D-Bus, display mode, input, audio, and
+lifecycle. See [docs/PLASMA.md](docs/PLASMA.md) for configuration, dependencies,
+architecture, and the runtime validation checklist.
+
+PyroWave-aware clients can negotiate the codec explicitly without affecting
+stock Moonlight clients. The authoritative fork pin, capability bits, SDP
+extension, packet framing, zero-copy Vulkan path, and limitations are specified
+in [docs/PYROWAVE.md](docs/PYROWAVE.md).
 
 ### Application scanners
 

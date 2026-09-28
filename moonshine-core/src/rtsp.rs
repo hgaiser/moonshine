@@ -11,6 +11,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use crate::ShutdownReason;
+use crate::healthcheck::supports_video_format;
 use crate::session::manager::SessionManager;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::audio::AudioChannels;
@@ -18,11 +19,11 @@ use crate::session::stream::audio::AudioConfig;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
-use crate::session::stream::video::VideoChromaSampling;
 use crate::session::stream::video::VideoDynamicRange;
 use crate::session::stream::video::VideoFormat;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
+use crate::session::stream::video::{BitDepth, ColorRange, NegotiatedVideoFormat, VideoChromaSampling};
 
 #[repr(u8)]
 enum ServerCapabilities {
@@ -45,9 +46,11 @@ pub struct RtspServer {
 	audio_config: AudioStreamConfig,
 	control_config: ControlStreamConfig,
 	session_manager: SessionManager,
+	supported_codecs: u32,
 }
 
 impl RtspServer {
+	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		address: String,
 		rtsp_port: u16,
@@ -55,6 +58,7 @@ impl RtspServer {
 		audio_config: AudioStreamConfig,
 		control_config: ControlStreamConfig,
 		session_manager: SessionManager,
+		supported_codecs: u32,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Self {
 		let server = Self {
@@ -64,6 +68,7 @@ impl RtspServer {
 			audio_config: audio_config.clone(),
 			control_config: control_config.clone(),
 			session_manager,
+			supported_codecs,
 		};
 
 		tokio::spawn({
@@ -361,6 +366,21 @@ impl RtspServer {
 			get_optional_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
 		let chroma_sampling_type = VideoChromaSampling::try_from(chroma_sampling_type).unwrap_or_default();
 
+		// New clients state bit depth explicitly.  Legacy Moonlight clients do
+		// not, so retain the established HDR10=10-bit / SDR=8-bit default only at
+		// this protocol compatibility boundary.
+		let bit_depth = match get_optional_sdp_attribute::<u32>(&sdp_session, "x-moonshine-video[0].bitDepth") {
+			Some(value) => match BitDepth::try_from(value) {
+				Ok(depth) => depth,
+				Err(()) => {
+					tracing::warn!(value, "Client requested an unsupported video bit depth");
+					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+				},
+			},
+			None if dynamic_range == VideoDynamicRange::Hdr => BitDepth::Ten,
+			None => BitDepth::Eight,
+		};
+
 		let max_reference_frames: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
 
@@ -394,6 +414,50 @@ impl RtspServer {
 		let client_encryption_flags: u8 =
 			get_optional_sdp_attribute(&sdp_session, "x-ss-general.encryptionEnabled").unwrap_or(0);
 
+		let range = if full_range {
+			ColorRange::Full
+		} else {
+			ColorRange::Limited
+		};
+		let format = if dynamic_range == VideoDynamicRange::Hdr {
+			let mut format = NegotiatedVideoFormat::hdr10(video_format, chroma_sampling_type, range);
+			// Preserve an explicit client bit-depth choice so validation rejects a
+			// contradictory 8-bit HDR request rather than silently promoting it.
+			format.bit_depth = bit_depth;
+			format
+		} else {
+			NegotiatedVideoFormat::sdr(video_format, chroma_sampling_type, bit_depth, range)
+		};
+		if let Err(reason) = format.validate() {
+			tracing::warn!(?format, reason, "Rejecting contradictory video format request");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		}
+		if !supports_video_format(self.supported_codecs, format) {
+			tracing::warn!(
+				codec = %format.codec,
+				chroma = %format.chroma,
+				bit_depth = format.bit_depth.bits(),
+				hdr = format.hdr,
+				"Requested video combination was not detected on this GPU/encoder; refusing silent fallback"
+			);
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::UnsupportedMediaType);
+		}
+
+		tracing::info!(
+			codec = %format.codec,
+			chroma = %format.chroma,
+			bit_depth = format.bit_depth.bits(),
+			primaries = ?format.primaries,
+			transfer = ?format.transfer,
+			matrix = ?format.matrix,
+			range = ?format.range,
+			hdr = format.hdr,
+			width,
+			height,
+			fps,
+			"Selected video mode"
+		);
+
 		let video_stream_context = VideoStreamContext {
 			width,
 			height,
@@ -402,11 +466,8 @@ impl RtspServer {
 			bitrate,
 			minimum_fec_packets,
 			qos: video_qos_type != "0",
-			video_format,
-			dynamic_range,
-			chroma_sampling_type,
+			format,
 			max_reference_frames,
-			full_range,
 			encrypt_video: self.video_config.encrypt && (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
 		};
 

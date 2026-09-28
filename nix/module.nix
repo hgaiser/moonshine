@@ -136,7 +136,12 @@ in
 
     # Puts `moonshine` on PATH for the healthcheck and pairing subcommands, and
     # is how the polkit rule below gets picked up.
-    environment.systemPackages = [ cfg.package ];
+    environment.systemPackages = [
+      cfg.package
+      pkgs.xdg-desktop-portal
+      pkgs.kdePackages.xdg-desktop-portal-kde
+      pkgs.pipewire
+    ];
 
     # The moonshine-wsi Vulkan layer routes a game's swapchain frames into
     # moonshine's compositor. It is an *implicit* layer, so the loader has to
@@ -198,7 +203,12 @@ in
       after = [ "user@${toString cfg.uid}.service" ];
       # The compositor spawns Xwayland (X11 games, i.e. most of Steam, run
       # under it) from the unit's PATH.
-      path = [ pkgs.xwayland ];
+      path = [
+        pkgs.xwayland
+        pkgs.dbus
+        pkgs.kdePackages.kwin
+        pkgs.kdePackages.plasma-workspace
+      ];
       environment = {
         MOONSHINE_LOG = cfg.logFilter;
         # What the user manager would have provided, set by hand as in

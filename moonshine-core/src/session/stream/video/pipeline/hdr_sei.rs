@@ -8,7 +8,7 @@
 //! Metadata is injected on key frames only, before the first VCL NAL unit.
 
 use crate::session::compositor::frame::HdrMetadata;
-use crate::session::stream::video::pipeline::VideoFormat;
+use crate::session::stream::video::VideoFormat;
 
 /// Build an H.264/H.265 MDCV SEI NAL unit.
 ///
@@ -323,6 +323,8 @@ pub(crate) fn inject_hdr_metadata(data: &[u8], metadata: &HdrMetadata, format: V
 		VideoFormat::H264 => inject_h264_sei(data, metadata),
 		VideoFormat::Hevc => inject_h265_sei(data, metadata),
 		VideoFormat::Av1 => inject_av1_metadata(data, metadata),
+		// PyroWave carries color metadata in its own sequence header.
+		VideoFormat::PyroWave => data.to_vec(),
 	}
 }
 

@@ -16,11 +16,9 @@ use moonshine_core::session::stream::audio::AudioStreamConfig;
 use moonshine_core::session::stream::audio::AudioStreamContext;
 use moonshine_core::session::stream::control::ControlStreamConfig;
 use moonshine_core::session::stream::video::FrameStats;
-use moonshine_core::session::stream::video::VideoChromaSampling;
-use moonshine_core::session::stream::video::VideoDynamicRange;
-use moonshine_core::session::stream::video::VideoFormat;
 use moonshine_core::session::stream::video::VideoStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamContext;
+use moonshine_core::session::stream::video::{BitDepth, ChromaFormat, ColorRange, NegotiatedVideoFormat, VideoCodec};
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -47,8 +45,20 @@ struct Args {
 	bitrate: usize,
 
 	/// Video codec.
-	#[arg(long, default_value = "h264", value_parser = ["h264", "hevc", "av1"])]
+	#[arg(long, default_value = "h264", value_parser = ["h264", "hevc", "av1", "pyrowave"])]
 	codec: String,
+
+	/// Chroma sampling mode.
+	#[arg(long, default_value = "420", value_parser = ["420", "444"])]
+	chroma: String,
+
+	/// Scaler/encoder bit depth.
+	#[arg(long, value_parser = parse_bit_depth)]
+	bit_depth: Option<u8>,
+
+	/// Encode full-range rather than limited-range YCbCr.
+	#[arg(long)]
+	full_range: bool,
 
 	/// Seconds to run before stopping (0 = run until Ctrl+C).
 	#[arg(long, default_value_t = 0)]
@@ -77,13 +87,54 @@ fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
 	Ok((w, h))
 }
 
-fn parse_codec(s: &str) -> VideoFormat {
+fn parse_bit_depth(value: &str) -> Result<u8, String> {
+	match value {
+		"8" => Ok(8),
+		"10" => Ok(10),
+		_ => Err("bit depth must be 8 or 10".to_string()),
+	}
+}
+
+fn parse_codec(s: &str) -> VideoCodec {
 	match s {
-		"h264" => VideoFormat::H264,
-		"hevc" => VideoFormat::Hevc,
-		"av1" => VideoFormat::Av1,
+		"h264" => VideoCodec::H264,
+		"hevc" => VideoCodec::Hevc,
+		"av1" => VideoCodec::Av1,
+		"pyrowave" => VideoCodec::PyroWave,
 		_ => unreachable!(),
 	}
+}
+
+fn selected_format(args: &Args, codec: VideoCodec) -> Result<NegotiatedVideoFormat, Box<dyn std::error::Error>> {
+	let chroma = match args.chroma.as_str() {
+		"420" => ChromaFormat::Yuv420,
+		"444" => ChromaFormat::Yuv444,
+		_ => unreachable!(),
+	};
+	let requested_depth = args.bit_depth.unwrap_or(if args.hdr { 10 } else { 8 });
+	let bit_depth = match requested_depth {
+		8 => BitDepth::Eight,
+		10 => BitDepth::Ten,
+		_ => unreachable!(),
+	};
+	let range = if args.full_range {
+		ColorRange::Full
+	} else {
+		ColorRange::Limited
+	};
+	let mut format = if args.hdr {
+		NegotiatedVideoFormat::hdr10(codec, chroma, range)
+	} else {
+		NegotiatedVideoFormat::sdr(codec, chroma, bit_depth, range)
+	};
+	// Preserve the command-line choice so contradictory HDR + 8-bit input is
+	// reported rather than silently changed by the HDR10 constructor.
+	format.bit_depth = bit_depth;
+	format.validate().map_err(|reason| boxed_error(reason.to_string()))?;
+	if codec == VideoCodec::PyroWave && range != ColorRange::Full {
+		return Err(boxed_error("PyroWave's scaled RGB path requires --full-range"));
+	}
+	Ok(format)
 }
 
 fn percentiles(samples: &[u64]) -> (u64, u64, u64) {
@@ -515,6 +566,7 @@ async fn run_benchmark(
 
 	let (width, height) = parse_resolution(resolution).map_err(boxed_error)?;
 	let video_format = parse_codec(codec);
+	let negotiated_format = selected_format(args, video_format)?;
 
 	tracing::info!("Starting Moonshine benchmark");
 	tracing::info!("  command:    {}", args.command.join(" "));
@@ -522,6 +574,9 @@ async fn run_benchmark(
 	tracing::info!("  fps:        {}", target_fps);
 	tracing::info!("  bitrate:    {} bps", args.bitrate);
 	tracing::info!("  codec:      {}", codec);
+	tracing::info!("  chroma:     {}", negotiated_format.chroma);
+	tracing::info!("  bit depth:  {}", negotiated_format.bit_depth.bits());
+	tracing::info!("  range:      {:?}", negotiated_format.range);
 	tracing::info!("  hdr:        {}", args.hdr);
 	let duration_str = if duration == 0 {
 		"infinite".to_string()
@@ -589,15 +644,8 @@ async fn run_benchmark(
 		bitrate: args.bitrate,
 		minimum_fec_packets: 2,
 		qos: false,
-		video_format,
-		dynamic_range: if args.hdr {
-			VideoDynamicRange::Hdr
-		} else {
-			VideoDynamicRange::Sdr
-		},
-		chroma_sampling_type: VideoChromaSampling::Yuv420,
+		format: negotiated_format,
 		max_reference_frames: 1,
-		full_range: false,
 		encrypt_video: false,
 	};
 

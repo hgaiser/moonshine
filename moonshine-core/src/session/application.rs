@@ -16,9 +16,53 @@ pub fn default_launch_timeout() -> u64 {
 	2
 }
 
+fn default_desktop_scale() -> f32 {
+	1.0
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ApplicationKind {
+	#[default]
+	Application,
+	Desktop,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DesktopEnvironment {
+	#[default]
+	Plasma,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DesktopConfig {
+	#[serde(default)]
+	pub environment: DesktopEnvironment,
+	#[serde(default = "default_desktop_scale")]
+	pub scale: f32,
+}
+
+impl Default for DesktopConfig {
+	fn default() -> Self {
+		Self {
+			environment: DesktopEnvironment::Plasma,
+			scale: default_desktop_scale(),
+		}
+	}
+}
+
 /// Configuration for a single application that can be launched in a session.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ApplicationConfig {
+	/// Launch a regular application or a managed desktop session.
+	#[serde(default, rename = "type")]
+	pub kind: ApplicationKind,
+
+	/// Desktop-session options, used when `type = "desktop"`.
+	#[serde(default, skip_serializing_if = "is_default_desktop_config")]
+	pub desktop: DesktopConfig,
+
 	/// Title of the application.
 	pub title: String,
 
@@ -52,6 +96,8 @@ pub struct ApplicationConfig {
 impl Default for ApplicationConfig {
 	fn default() -> Self {
 		Self {
+			kind: ApplicationKind::Application,
+			desktop: DesktopConfig::default(),
 			title: String::new(),
 			boxart: None,
 			command: Vec::new(),
@@ -62,6 +108,10 @@ impl Default for ApplicationConfig {
 			launch_timeout_secs: default_launch_timeout(),
 		}
 	}
+}
+
+fn is_default_desktop_config(config: &DesktopConfig) -> bool {
+	config.environment == DesktopEnvironment::Plasma && config.scale == default_desktop_scale()
 }
 
 impl ApplicationConfig {
@@ -127,6 +177,10 @@ pub(crate) struct ApplicationContext {
 	pub wayland_display: String,
 	/// Effective HDR mode — `true` only when the compositor confirmed an HDR-capable DMA-BUF format is in use.
 	pub hdr: bool,
+	/// Client-selected virtual output resolution.
+	pub resolution: (u32, u32),
+	/// Client-selected virtual output refresh rate.
+	pub refresh_rate: u32,
 	/// Environment variables to pass on.
 	pub extra_env: HashMap<String, String>,
 }
@@ -143,12 +197,40 @@ impl Application {
 		context: ApplicationContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		let Some(program) = config.command.first() else {
+		let effective_command = match config.kind {
+			ApplicationKind::Application => config.command.clone(),
+			ApplicationKind::Desktop => match config.desktop.environment {
+				DesktopEnvironment::Plasma => {
+					if !config.desktop.scale.is_finite() || !(0.5..=4.0).contains(&config.desktop.scale) {
+						tracing::error!(
+							scale = config.desktop.scale,
+							"Plasma desktop scale must be between 0.5 and 4.0"
+						);
+						return Err(());
+					}
+					let executable = std::env::current_exe()
+						.map_err(|error| tracing::error!(%error, "Could not locate the Moonshine executable"))?;
+					vec![
+						executable.to_string_lossy().into_owned(),
+						"plasma-session".to_string(),
+						"--width".to_string(),
+						context.resolution.0.to_string(),
+						"--height".to_string(),
+						context.resolution.1.to_string(),
+						"--refresh-rate".to_string(),
+						context.refresh_rate.to_string(),
+						"--scale".to_string(),
+						config.desktop.scale.to_string(),
+					]
+				},
+			},
+		};
+		let Some(program) = effective_command.first() else {
 			tracing::error!("Application command is empty.");
 			return Err(());
 		};
-		let args = &config.command[1..];
-		let envs = make_envs(&context)?;
+		let args = &effective_command[1..];
+		let envs = make_envs(&context, config.kind)?;
 
 		tracing::info!(program, ?args, "Launching application.");
 
@@ -211,7 +293,7 @@ impl Drop for Application {
 }
 
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
-fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
+fn make_envs(context: &ApplicationContext, kind: ApplicationKind) -> Result<Vec<String>, ()> {
 	// Build environment variables as "KEY=value" strings for systemd.
 	let mut envs: Vec<String> = vec![
 		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
@@ -233,17 +315,27 @@ fn make_envs(context: &ApplicationContext) -> Result<Vec<String>, ()> {
 		"PROTON_USE_PIPEWIRE=0".to_string(),
 	];
 
-	// Impersonate gamescope so Steam uses its external-overlay mode.
-	envs.push("XDG_CURRENT_DESKTOP=gamescope".to_string());
-	envs.push(format!("GAMESCOPE_WAYLAND_DISPLAY={}", context.wayland_display));
-	envs.push(format!("STEAM_GAME_DISPLAY_0=:{}", context.xdisplay));
-	// Steam keys gamescope features (HDR, VRR, scaling, FPS limit) off these.
-	envs.push("STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER=1".to_string());
-	envs.push("STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1".to_string());
-	envs.push("STEAM_GAMESCOPE_NIS_SUPPORTED=1".to_string());
-	envs.push("STEAM_GAMESCOPE_VRR_SUPPORTED=1".to_string());
-	if context.hdr {
-		envs.push("STEAM_GAMESCOPE_HDR_SUPPORTED=1".to_string());
+	match kind {
+		ApplicationKind::Application => {
+			// Impersonate gamescope so Steam uses its external-overlay mode.
+			envs.push("XDG_CURRENT_DESKTOP=gamescope".to_string());
+			envs.push(format!("GAMESCOPE_WAYLAND_DISPLAY={}", context.wayland_display));
+			envs.push(format!("STEAM_GAME_DISPLAY_0=:{}", context.xdisplay));
+			envs.push("STEAM_GAMESCOPE_DYNAMIC_FPSLIMITER=1".to_string());
+			envs.push("STEAM_GAMESCOPE_FANCY_SCALING_SUPPORT=1".to_string());
+			envs.push("STEAM_GAMESCOPE_NIS_SUPPORTED=1".to_string());
+			envs.push("STEAM_GAMESCOPE_VRR_SUPPORTED=1".to_string());
+			if context.hdr {
+				envs.push("STEAM_GAMESCOPE_HDR_SUPPORTED=1".to_string());
+			}
+		},
+		ApplicationKind::Desktop => {
+			envs.push("XDG_CURRENT_DESKTOP=KDE".to_string());
+			envs.push("XDG_SESSION_DESKTOP=KDE".to_string());
+			envs.push("XDG_SESSION_TYPE=wayland".to_string());
+			envs.push("KDE_FULL_SESSION=true".to_string());
+			envs.push("KDE_SESSION_VERSION=6".to_string());
+		},
 	}
 
 	if context.hdr {
@@ -775,7 +867,7 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
-	use super::split_standard_io;
+	use super::{ApplicationConfig, ApplicationKind, DesktopEnvironment, split_standard_io};
 
 	#[test]
 	fn test_standard_io_defaults_to_null() {
@@ -830,5 +922,26 @@ mod tests {
 			split_standard_io(&Some("fd:stdout".to_string())),
 			("fd".to_string(), Some(("FileDescriptorName", "stdout".to_string())))
 		);
+	}
+
+	#[test]
+	fn desktop_configuration_round_trips() {
+		let config: ApplicationConfig = toml::from_str(
+			r#"
+title = "Desktop"
+type = "desktop"
+command = []
+
+[desktop]
+environment = "plasma"
+scale = 1.5
+"#,
+		)
+		.unwrap();
+		assert_eq!(config.kind, ApplicationKind::Desktop);
+		assert_eq!(config.desktop.environment, DesktopEnvironment::Plasma);
+		assert_eq!(config.desktop.scale, 1.5);
+		let serialized = toml::to_string(&config).unwrap();
+		assert!(serialized.contains("type = \"desktop\""));
 	}
 }

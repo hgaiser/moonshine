@@ -2413,6 +2413,7 @@ dependencies = [
  "inout 0.2.2",
  "inputtino",
  "libc",
+ "libloading",
  "mdns-sd",
  "mio 1.2.2",
  "mio-timerfd",

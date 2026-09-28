@@ -132,6 +132,7 @@ pub(crate) fn scan_lutris_applications(config: &LutrisApplicationScannerConfig) 
 			stdout: config.stdout.clone(),
 			stderr: config.stderr.clone(),
 			launch_timeout_secs: config.launch_timeout_secs,
+			..Default::default()
 		};
 
 		applications.push(application);

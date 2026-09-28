@@ -36,6 +36,20 @@ struct Args {
 enum Command {
 	/// Run health checks and report results, then exit.
 	Healthcheck,
+	/// Internal managed Plasma-session entry point.
+	#[command(hide = true)]
+	PlasmaSession {
+		#[arg(long)]
+		width: u32,
+		#[arg(long)]
+		height: u32,
+		#[arg(long)]
+		refresh_rate: u32,
+		#[arg(long)]
+		scale: f32,
+		#[arg(long, default_value_t = false)]
+		inner: bool,
+	},
 }
 
 fn default_config_path() -> PathBuf {
@@ -53,6 +67,24 @@ async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
 	init_tracing();
+	if let Some(Command::PlasmaSession {
+		width,
+		height,
+		refresh_rate,
+		scale,
+		inner,
+	}) = &args.command
+	{
+		return moonshine_core::session::plasma::run(moonshine_core::session::plasma::PlasmaSessionOptions {
+			width: *width,
+			height: *height,
+			refresh_rate: *refresh_rate,
+			scale: *scale,
+			inner: *inner,
+		})
+		.await
+		.map_err(|error| tracing::error!(%error, "Plasma session failed"));
+	}
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
 	let mut config = Config::load_or_create(&config_path)?;
@@ -226,6 +258,7 @@ impl Moonshine {
 				config.stream.audio.clone(),
 				config.stream.control.clone(),
 				session_manager.clone(),
+				supported_codecs,
 				shutdown.clone(),
 			),
 			_session_manager: session_manager.clone(),

@@ -3,7 +3,7 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
-mod dmabuf;
+pub(super) mod dmabuf;
 mod hdr_sei;
 
 use std::sync::Arc;
@@ -19,9 +19,11 @@ use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetad
 use crate::session::manager::SessionShutdownReason;
 
 use crate::session::stream::video::packetizer::Packetizer;
+use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
-	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
+	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, FrameStats, NegotiatedVideoFormat, TransferFunction,
+	VideoCodec, VideoStreamConfig, VideoStreamContext,
 };
 
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
@@ -89,6 +91,15 @@ fn is_device_lost(e: &PixelForgeError) -> bool {
 		// lost. See <...>".
 		_ => e.to_string().contains("device has been lost"),
 	}
+}
+
+fn color_description_for(format: NegotiatedVideoFormat) -> Result<ColorDescription, String> {
+	let description = match (format.primaries, format.transfer) {
+		(ColorPrimaries::Bt709, TransferFunction::Bt709) => ColorDescription::bt709(),
+		(ColorPrimaries::Bt2020, TransferFunction::Pq) => ColorDescription::bt2020_pq(),
+		_ => return Err(format!("Unsupported color description: {format:?}")),
+	};
+	Ok(description.with_full_range(format.range == ColorRange::Full))
 }
 
 pub(crate) struct VideoPipeline {}
@@ -311,7 +322,7 @@ async fn run_packet_consumer(
 			// (e.g. scRGB swapchains carry no mastering metadata), staying
 			// consistent with the control-stream HDR metadata.
 			let m = frame_context.hdr_metadata.unwrap_or_else(HdrMetadata::fallback);
-			packet.data = hdr_sei::inject_hdr_metadata(&packet.data, &m, ctx.video_format);
+			packet.data = hdr_sei::inject_hdr_metadata(&packet.data, &m, ctx.format.codec);
 		}
 
 		let encoded_bytes = packet.data.len();
@@ -518,7 +529,24 @@ impl VideoPipelineInner {
 			return;
 		}
 
-		// Create the encoder.
+		if self.context.format.codec == VideoCodec::PyroWave {
+			if let Err(error) = self.run_pyrowave_encoding_loop(
+				frame_rx,
+				packet_tx,
+				idr_frame_request_rx,
+				invalidate_request_rx,
+				reset_request_rx,
+				stop_session_manager,
+				hdr_metadata_tx,
+				stats_tx,
+			) {
+				tracing::error!(%error, "PyroWave encoding loop failed");
+			}
+			tracing::debug!("Video pipeline stopped.");
+			return;
+		}
+
+		// Create the conventional Vulkan Video encoder.
 		let (context, encoder) = match self.create_encoder() {
 			Ok(result) => result,
 			Err(e) => {
@@ -550,6 +578,7 @@ impl VideoPipelineInner {
 
 	fn create_encoder(&self) -> Result<(VideoContext, Encoder), String> {
 		let ctx = &self.context;
+		ctx.format.validate().map_err(str::to_string)?;
 
 		// Create Vulkan video context.
 		let context = VideoContextBuilder::new()
@@ -557,29 +586,32 @@ impl VideoPipelineInner {
 			.map_err(|e| format!("Failed to create video context: {e}"))?;
 
 		// Convert our video format to pixelforge's codec.
-		let codec = match ctx.video_format {
-			VideoFormat::H264 => Codec::H264,
-			VideoFormat::Hevc => Codec::H265,
-			VideoFormat::Av1 => Codec::AV1,
+		let codec = match ctx.format.codec {
+			VideoCodec::H264 => Codec::H264,
+			VideoCodec::Hevc => Codec::H265,
+			VideoCodec::Av1 => Codec::AV1,
+			VideoCodec::PyroWave => return Err("PyroWave must use the PyroWave encoder backend".to_string()),
 		};
 
 		// Convert pixel format.
-		let pixel_format = match ctx.chroma_sampling_type {
-			VideoChromaSampling::Yuv420 => PixelFormat::Yuv420,
-			VideoChromaSampling::Yuv444 => PixelFormat::Yuv444,
+		let pixel_format = match ctx.format.chroma {
+			ChromaFormat::Yuv420 => PixelFormat::Yuv420,
+			ChromaFormat::Yuv444 => PixelFormat::Yuv444,
 		};
 
 		// Convert bit depth based on dynamic range.
-		let bit_depth = match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => pixelforge::EncodeBitDepth::Eight,
-			VideoDynamicRange::Hdr => pixelforge::EncodeBitDepth::Ten,
+		let bit_depth = match ctx.format.bit_depth {
+			BitDepth::Eight => pixelforge::EncodeBitDepth::Eight,
+			BitDepth::Ten => pixelforge::EncodeBitDepth::Ten,
 		};
 
 		// Select color description for VUI signaling.
-		let color_description = match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription::bt709().with_full_range(ctx.full_range),
-			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
+		let color_description = match (ctx.format.primaries, ctx.format.transfer) {
+			(ColorPrimaries::Bt709, TransferFunction::Bt709) => ColorDescription::bt709(),
+			(ColorPrimaries::Bt2020, TransferFunction::Pq) => ColorDescription::bt2020_pq(),
+			_ => return Err(format!("Unsupported color description: {:?}", ctx.format)),
 		};
+		let color_description = color_description.with_full_range(ctx.format.range == ColorRange::Full);
 
 		// Create encode configuration.
 		let config = match codec {
@@ -603,6 +635,184 @@ impl VideoPipelineInner {
 		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
 
 		Ok((context, encoder))
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	fn run_pyrowave_encoding_loop(
+		&self,
+		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		packet_tx: mpsc::Sender<ShardBatch>,
+		mut idr_frame_request_rx: broadcast::Receiver<()>,
+		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		mut reset_request_rx: broadcast::Receiver<()>,
+		stop_session_manager: ShutdownManager<SessionShutdownReason>,
+		hdr_metadata_tx: watch::Sender<HdrModeState>,
+		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	) -> Result<(), String> {
+		let ctx = &self.context;
+		ctx.format.validate().map_err(str::to_string)?;
+		let packet_boundary = Packetizer::pyrowave_codec_packet_boundary(ctx.packet_size)
+			.ok_or_else(|| "negotiated packet size is too small for PyroWave transport framing".to_string())?;
+		let video_context = VideoContextBuilder::new()
+			.build()
+			.map_err(|e| format!("Failed to create Vulkan context for PyroWave adapter matching: {e}"))?;
+		let mut encoder = PyroWaveEncoder::new(
+			&video_context,
+			ctx.format,
+			ctx.width,
+			ctx.height,
+			ctx.bitrate,
+			ctx.fps,
+			packet_boundary,
+		)?;
+		tracing::info!(
+			codec = "PyroWave",
+			chroma = %ctx.format.chroma,
+			bit_depth = ctx.format.bit_depth.bits(),
+			hdr = ctx.format.hdr,
+			maximum_frame_bytes = encoder.maximum_frame_bytes(),
+			packet_boundary,
+			pyrowave_source = SOURCE_URL,
+			pyrowave_revision = SOURCE_REVISION,
+			"Initialized zero-copy PyroWave encoder"
+		);
+
+		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
+		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
+		let mut frame_number = 0u32;
+		let mut sequence_number = 0u32;
+		let mut last_encoded = None;
+		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
+		let mut last_frame_time = std::time::Instant::now();
+
+		while !stop_session_manager.is_shutdown_triggered() {
+			let mut resend_last = false;
+			while matches!(
+				reset_request_rx.try_recv(),
+				Ok(()) | Err(broadcast::error::TryRecvError::Lagged(_))
+			) {
+				frame_number = 0;
+				sequence_number = 0;
+				resend_last = true;
+			}
+			while matches!(
+				idr_frame_request_rx.try_recv(),
+				Ok(()) | Err(broadcast::error::TryRecvError::Lagged(_))
+			) {
+				resend_last = true;
+			}
+			// PyroWave has no inter-frame references; loss reports require no
+			// encoder-state invalidation. Drain the channel so it cannot lag.
+			while invalidate_request_rx.try_recv().is_ok() {}
+
+			let received = match frame_rx.recv_timeout(frame_interval) {
+				Ok(frame) => Some(frame),
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
+				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+			};
+
+			let (encoded, created_at, buffer_index, channel_wait) = if let Some(frame) = received {
+				let received_at = std::time::Instant::now();
+				let created_at = frame.created_at;
+				let buffer_index = frame.buffer_index;
+				let encoded = match encoder.encode(&frame) {
+					Ok(encoded) => encoded,
+					Err(error) => {
+						frame.consumed.store(true, Ordering::Release);
+						tracing::warn!(%error, "Failed to encode PyroWave frame");
+						continue;
+					},
+				};
+				// compute_num_packets/packetize waited for the GPU read, so the
+				// compositor buffer is no longer referenced by PyroWave.
+				frame.consumed.store(true, Ordering::Release);
+				if ctx.format.hdr {
+					let state = HdrModeState {
+						enabled: true,
+						metadata: frame.hdr_metadata,
+					};
+					let _ = hdr_metadata_tx.send_if_modified(|current| {
+						if *current != state {
+							*current = state;
+							true
+						} else {
+							false
+						}
+					});
+				}
+				last_encoded = Some(encoded.clone());
+				last_frame_time = std::time::Instant::now();
+				(
+					encoded,
+					created_at,
+					buffer_index,
+					received_at.saturating_duration_since(created_at),
+				)
+			} else if resend_last {
+				let Some(encoded) = last_encoded.clone() else {
+					continue;
+				};
+				(
+					encoded,
+					std::time::Instant::now(),
+					usize::MAX,
+					std::time::Duration::ZERO,
+				)
+			} else {
+				if last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
+					tracing::warn!("No frames received for 5 seconds");
+					last_frame_time = std::time::Instant::now();
+				}
+				continue;
+			};
+
+			frame_number = frame_number.wrapping_add(1);
+			let before_packetize = std::time::Instant::now();
+			let latency = (before_packetize.duration_since(created_at).as_micros() / 100).min(u16::MAX as u128) as u16;
+			let rtp_timestamp = frame_number.wrapping_mul(90_000 / ctx.fps.max(1));
+			let shards = packetizer
+				.packetize_pyrowave(
+					&encoded.data,
+					&encoded.packets,
+					ctx.packet_size,
+					ctx.minimum_fec_packets,
+					self.config.fec_percentage,
+					frame_number,
+					&mut sequence_number,
+					rtp_timestamp,
+					latency,
+				)
+				.map_err(|()| "failed to packetize PyroWave frame".to_string())?;
+			let packetized = std::time::Instant::now();
+			packet_tx
+				.blocking_send(shards)
+				.map_err(|_| "video packet channel closed".to_string())?;
+			let sent = std::time::Instant::now();
+			let stats = FrameStats {
+				channel_wait,
+				import: encoded.import,
+				convert: std::time::Duration::ZERO,
+				submit: encoded.submit,
+				consumer_queue: std::time::Duration::ZERO,
+				encode_wait: encoded.encode_wait,
+				packetize: packetized.duration_since(before_packetize),
+				send: sent.duration_since(packetized),
+				total: sent.duration_since(created_at),
+				encoded_bytes: encoded.data.len(),
+				is_key_frame: true,
+			};
+			tracing::trace!(
+				frame_number,
+				buffer_index,
+				encoded_bytes = stats.encoded_bytes,
+				pyrowave_packets = encoded.packets.len(),
+				encode_wait_us = stats.encode_wait.as_micros() as u64,
+				total_us = stats.total.as_micros() as u64,
+				"Sent PyroWave frame"
+			);
+			let _ = stats_tx.send(stats);
+		}
+		Ok(())
 	}
 
 	#[allow(clippy::too_many_arguments)]
@@ -666,11 +876,11 @@ impl VideoPipelineInner {
 		let mut last_drop_warn: Option<std::time::Instant> = None;
 
 		// Determine output YUV format based on chroma sampling and dynamic range.
-		let output_format = match (ctx.chroma_sampling_type, ctx.dynamic_range) {
-			(VideoChromaSampling::Yuv420, VideoDynamicRange::Sdr) => OutputFormat::NV12,
-			(VideoChromaSampling::Yuv420, VideoDynamicRange::Hdr) => OutputFormat::P010,
-			(VideoChromaSampling::Yuv444, VideoDynamicRange::Sdr) => OutputFormat::YUV444,
-			(VideoChromaSampling::Yuv444, VideoDynamicRange::Hdr) => OutputFormat::YUV444P10,
+		let output_format = match (ctx.format.chroma, ctx.format.bit_depth) {
+			(ChromaFormat::Yuv420, BitDepth::Eight) => OutputFormat::NV12,
+			(ChromaFormat::Yuv420, BitDepth::Ten) => OutputFormat::P010,
+			(ChromaFormat::Yuv444, BitDepth::Eight) => OutputFormat::YUV444,
+			(ChromaFormat::Yuv444, BitDepth::Ten) => OutputFormat::YUV444P10,
 		};
 
 		// Converter per input format, plus the source import whose view it caches.
@@ -703,7 +913,7 @@ impl VideoPipelineInner {
 
 		// Track the last HDR mode state sent to the control stream.
 		let mut last_hdr_state = HdrModeState {
-			enabled: ctx.dynamic_range == VideoDynamicRange::Hdr,
+			enabled: ctx.format.hdr,
 			metadata: None,
 		};
 
@@ -711,10 +921,7 @@ impl VideoPipelineInner {
 		// to match what the encoder was created with. When the required
 		// color_desc differs, we call set_color_description() to update
 		// the SPS/sequence header.
-		let mut encoder_color_desc: Option<ColorDescription> = Some(match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription::bt709().with_full_range(ctx.full_range),
-			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
-		});
+		let mut encoder_color_desc: Option<ColorDescription> = Some(color_description_for(ctx.format)?);
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			let mut pending_idr = false;
@@ -930,10 +1137,12 @@ impl VideoPipelineInner {
 				let (converter, cached_source) = match color_converters.entry(frame.format) {
 					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
 					std::collections::hash_map::Entry::Vacant(e) => {
-						let (color_space, full_range) = match ctx.dynamic_range {
-							VideoDynamicRange::Sdr => (ColorSpace::Bt709, ctx.full_range),
-							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, ctx.full_range),
+						let color_space = if ctx.format.hdr {
+							ColorSpace::Bt2020
+						} else {
+							ColorSpace::Bt709
 						};
+						let full_range = ctx.format.range == ColorRange::Full;
 						let mut config =
 							ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
 						config.color_space = color_space;
@@ -956,27 +1165,27 @@ impl VideoPipelineInner {
 				// based on the frame's actual color space. SDR frames are
 				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
 				// dynamic VUI switching in the encoder.
-				if ctx.dynamic_range == VideoDynamicRange::Hdr {
+				if ctx.format.hdr {
 					let frame_cs = frame.color_space;
 					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
 					// scRGB 1.0 == 80 cd/m². The other paths ignore it.
 					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
 						FrameColorSpace::Srgb => (
 							ColorSpace::Bt709,
-							ctx.full_range,
-							ColorDescription::bt709().with_full_range(ctx.full_range),
+							ctx.format.range == ColorRange::Full,
+							ColorDescription::bt709().with_full_range(ctx.format.range == ColorRange::Full),
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::Bt2020Pq => (
 							ColorSpace::Bt2020,
-							ctx.full_range,
-							ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
+							ctx.format.range == ColorRange::Full,
+							ColorDescription::bt2020_pq().with_full_range(ctx.format.range == ColorRange::Full),
 							BT2408_SDR_REFERENCE_NITS,
 						),
 						FrameColorSpace::ScrgbLinear => (
 							ColorSpace::Bt709LinearToBt2020Pq,
-							ctx.full_range,
-							ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
+							ctx.format.range == ColorRange::Full,
+							ColorDescription::bt2020_pq().with_full_range(ctx.format.range == ColorRange::Full),
 							SCRGB_REFERENCE_WHITE_NITS,
 						),
 					};
@@ -1024,7 +1233,7 @@ impl VideoPipelineInner {
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
 				// frame is encoded as BT.2020+PQ (true) or BT.709 (false).
-				if ctx.dynamic_range == VideoDynamicRange::Hdr {
+				if ctx.format.hdr {
 					let hdr_enabled = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
 					let new_state = HdrModeState {
 						enabled: hdr_enabled,

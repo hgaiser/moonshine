@@ -8,10 +8,16 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
+mod format;
 mod gso_socket;
 mod packetizer;
 mod pipeline;
+pub(crate) mod pyrowave;
 mod shard_batch;
+pub use format::{
+	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
+	VideoChromaSampling, VideoCodec, VideoDynamicRange, VideoFormat,
+};
 use gso_socket::UdpGsoSocket;
 use pipeline::VideoPipeline;
 use shard_batch::ShardBatch;
@@ -116,65 +122,6 @@ pub struct FrameStats {
 	pub is_key_frame: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VideoFormat {
-	#[default]
-	H264,
-	Hevc,
-	Av1,
-}
-
-impl TryFrom<u32> for VideoFormat {
-	type Error = ();
-
-	fn try_from(value: u32) -> Result<Self, Self::Error> {
-		match value {
-			0 => Ok(Self::H264),
-			1 => Ok(Self::Hevc),
-			2 => Ok(Self::Av1),
-			_ => Err(()),
-		}
-	}
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VideoDynamicRange {
-	#[default]
-	Sdr,
-	Hdr,
-}
-
-impl TryFrom<u32> for VideoDynamicRange {
-	type Error = ();
-
-	fn try_from(value: u32) -> Result<Self, Self::Error> {
-		match value {
-			0 => Ok(Self::Sdr),
-			1 => Ok(Self::Hdr),
-			_ => Err(()),
-		}
-	}
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum VideoChromaSampling {
-	#[default]
-	Yuv420,
-	Yuv444,
-}
-
-impl TryFrom<u32> for VideoChromaSampling {
-	type Error = ();
-
-	fn try_from(value: u32) -> Result<Self, Self::Error> {
-		match value {
-			0 => Ok(Self::Yuv420),
-			1 => Ok(Self::Yuv444),
-			_ => Err(()),
-		}
-	}
-}
-
 #[derive(Clone, Debug, Default)]
 pub struct VideoStreamContext {
 	/// Width of the video stream in pixels.
@@ -198,21 +145,11 @@ pub struct VideoStreamContext {
 	/// Whether to apply QoS markings to video stream packets.
 	pub qos: bool,
 
-	/// Video format to use for encoding the stream.
-	pub video_format: VideoFormat,
-
-	/// Dynamic range of the video stream.
-	pub dynamic_range: VideoDynamicRange,
-
-	/// Chroma sampling type for the video stream.
-	pub chroma_sampling_type: VideoChromaSampling,
+	/// Fully negotiated codec, chroma, bit depth, and color representation.
+	pub format: NegotiatedVideoFormat,
 
 	/// Maximum number of reference frames for the video encoder.
 	pub max_reference_frames: u32,
-
-	/// Whether the client asked for full-range (0-255) rather than
-	/// limited-range (16-235) luma.
-	pub full_range: bool,
 
 	/// Whether the client has enabled video encryption.
 	pub encrypt_video: bool,

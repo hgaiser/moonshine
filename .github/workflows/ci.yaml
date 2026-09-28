@@ -52,5 +52,14 @@ jobs:
         if: matrix.deps
         uses: ./.github/actions/install-dependencies
 
+      - name: Build pinned PyroWave dependency
+        if: matrix.name == 'Test Suite'
+        run: |
+          ./scripts/build-pyrowave.sh "$RUNNER_TEMP/pyrowave" "$RUNNER_TEMP/pyrowave-install"
+          test -e "$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.0"
+          MOONSHINE_TEST_PYROWAVE=1 \
+          MOONSHINE_PYROWAVE_LIBRARY="$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.0" \
+            cargo test -p moonshine-core session::stream::video::pyrowave::tests::ffi_loads_pinned_api
+
       - name: ${{ matrix.name }}
         run: ${{ matrix.run }}
