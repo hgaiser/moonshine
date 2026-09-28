@@ -662,6 +662,7 @@ impl VideoPipelineInner {
 			PyroWaveEncoder::new(&video_context, ctx.format, ctx.width, ctx.height, ctx.bitrate, ctx.fps)?;
 		tracing::info!(
 			codec = "PyroWave",
+			gpu = encoder.device_name(),
 			chroma = %ctx.format.chroma,
 			bit_depth = ctx.format.bit_depth.bits(),
 			hdr = ctx.format.hdr,

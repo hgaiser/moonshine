@@ -46,6 +46,10 @@ shared HDR bit only when every advertised chroma mode also passes its 10-bit
 probe. Conventional codec bits are likewise set only after creating the exact
 Pixelforge pixel-format/bit-depth profile.
 
+PyroWave encoding requires a hardware Vulkan device. Software Vulkan devices
+are rejected explicitly, and the selected GPU is logged when the encoder starts;
+there is no CPU encoder or fallback to a conventional codec.
+
 The DESCRIBE response contains `a=x-ss-pyrowave.version:1`, and a PyroWave
 ANNOUNCE must echo the same attribute. This prevents a client and server with
 different private framing rules from accidentally selecting the codec.

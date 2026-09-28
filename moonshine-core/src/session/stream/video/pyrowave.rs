@@ -5,7 +5,7 @@
 //! package definition can still provide and pin the authoritative fork.
 
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{CStr, c_void};
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
 use std::ptr;
@@ -226,6 +226,7 @@ fn check(code: ResultCode, operation: &str) -> Result<(), String> {
 struct Device {
 	api: Rc<Api>,
 	handle: DeviceHandle,
+	name: String,
 }
 
 impl Device {
@@ -241,6 +242,14 @@ impl Device {
 			context
 				.instance()
 				.get_physical_device_properties2(context.physical_device(), &mut properties);
+		}
+		let device_name = unsafe { CStr::from_ptr(properties.properties.device_name.as_ptr()) }
+			.to_string_lossy()
+			.into_owned();
+		if properties.properties.device_type == vk::PhysicalDeviceType::CPU {
+			return Err(format!(
+				"PyroWave refuses software Vulkan device '{device_name}'; a hardware Vulkan GPU is required"
+			));
 		}
 		let device_uuid = Uuid { uuid: ids.device_uuid };
 		let driver_uuid = Uuid { uuid: ids.driver_uuid };
@@ -269,7 +278,11 @@ impl Device {
 			unsafe { (api.destroy_device)(handle) };
 			return Err("PyroWave device does not support DMA-BUF interoperability".to_string());
 		}
-		Ok(Rc::new(Self { api, handle }))
+		Ok(Rc::new(Self {
+			api,
+			handle,
+			name: device_name,
+		}))
 	}
 }
 
@@ -633,6 +646,10 @@ impl PyroWaveEncoder {
 
 	pub(crate) fn maximum_frame_bytes(&self) -> usize {
 		self.maximum_frame_bytes
+	}
+
+	pub(crate) fn device_name(&self) -> &str {
+		&self.device.name
 	}
 }
 
