@@ -21,8 +21,10 @@ transport handling, packaging, diagnostics, and desktop-session integration
 needed for this project's use cases. It is an independent community fork, not
 an official Moonshine or Moonlight release.
 
-The installed executable, systemd service, configuration directory, and Vulkan
-layer retain their `moonshine` names for compatibility with upstream tooling.
+Release packages install the public command and service as `pyroshine`. Internal
+crate, configuration, state, environment-variable, and Vulkan protocol names
+remain aligned with upstream Moonshine so upstream changes can be merged with
+minimal conflict.
 
 ## Features
 
@@ -48,37 +50,46 @@ layer retain their `moonshine` names for compatibility with upstream tooling.
 - A Moonlight-compatible client. Use Moonlight Qt PyroWave for the PyroWave
   codec; upstream Moonlight clients remain usable with conventional codecs.
 
-Run `moonshine healthcheck` after installation to see the exact capabilities
+Run `pyroshine healthcheck` after installation to see the exact capabilities
 available on the selected GPU.
 
 ## Installation
 
 Tagged builds are published on the
 [Pyroshine releases page](https://github.com/karsyboy/pyroshine/releases) as
-Debian and RPM packages plus a portable x86_64 archive. Package and service
-filenames currently use the compatible `moonshine` runtime name.
+Debian, RPM, and Arch packages plus a portable x86_64 archive.
+
+### Arch Linux or CachyOS
+
+Download the `.pkg.tar.zst` asset from the latest release, then install or
+upgrade it with pacman:
+
+```sh
+sudo pacman -U ./pyroshine-*.pkg.tar.zst
+sudo systemctl enable --now pyroshine@$USER
+```
 
 ### Debian or Ubuntu
 
 ```sh
-sudo apt install ./moonshine_*.deb
-sudo systemctl enable --now moonshine@$USER
+sudo apt install ./pyroshine_*.deb
+sudo systemctl enable --now pyroshine@$USER
 ```
 
 ### Fedora or RHEL
 
 ```sh
-sudo dnf install ./moonshine-*.rpm
-sudo systemctl enable --now moonshine@$USER
+sudo dnf install ./pyroshine-*.rpm
+sudo systemctl enable --now pyroshine@$USER
 ```
 
 ### SteamOS and other supported x86_64 systems
 
 ```sh
-curl -fsSL https://github.com/karsyboy/pyroshine/releases/latest/download/moonshine-install.sh | bash
+curl -fsSL https://github.com/karsyboy/pyroshine/releases/latest/download/pyroshine-install.sh | bash
 ```
 
-The installer places the portable build under `/opt/moonshine` and installs the
+The installer places the portable build under `/opt/pyroshine` and installs the
 required systemd, udev, modules-load, Vulkan-layer, and polkit files.
 
 For unattended headless use, enable lingering first:
@@ -96,13 +107,14 @@ sudo usermod -aG input "$USER"
 
 ### NixOS
 
-The flake exports a package and `services.moonshine` module. See
+The flake currently retains the upstream-compatible `services.moonshine`
+module. See
 [nix/README.md](nix/README.md) for a complete configuration.
 
 ### Build from source
 
-Install Rust plus the C/C++ and Linux development dependencies used by
-Moonshine, then build the pinned PyroWave library and the Rust workspace:
+Install Rust plus the project's C/C++ and Linux development dependencies, then
+build the pinned PyroWave library and the Rust workspace:
 
 ```sh
 ./scripts/build-pyrowave.sh /tmp/pyrowave-src /tmp/pyrowave-install
@@ -116,15 +128,28 @@ documented in [docs/PYROWAVE.md](docs/PYROWAVE.md). Pyroshine checks the exact C
 API version at runtime and leaves conventional codecs available when the
 optional library cannot be loaded.
 
-The upstream build still produces `target/release/moonshine` and
-`target/release/libmoonshine_wsi.so`. Follow Moonshine's system integration or
-the packaged files under `dist/` when installing a source build system-wide.
+The upstream-compatible workspace produces `target/release/moonshine` and
+`target/release/libmoonshine_wsi.so`; release packaging exposes the server as
+`pyroshine`. Use the packaged files under `dist/` when installing system-wide.
+
+### Publishing a release
+
+Pushing a semantic version tag builds and publishes all release assets using
+GitHub Actions:
+
+```sh
+git tag -a v0.16.3 -m "Pyroshine v0.16.3"
+git push origin v0.16.3
+```
+
+The workflow creates the GitHub Release automatically and attaches the portable
+archive, installer, native packages, and `SHA256SUMS`.
 
 ## Configuration and use
 
-Pyroshine reads the same TOML format and state locations as Moonshine. Packaged
-services use `~/.config/moonshine/config.toml`; a default file is created when
-the requested path does not exist.
+For straightforward upstream synchronization and upgrades from Moonshine,
+Pyroshine retains `~/.config/moonshine/config.toml` and
+`~/.local/share/moonshine` for configuration, certificates, and pairing state.
 
 Add a normal application with:
 
@@ -167,8 +192,8 @@ than the quick-start path.
 ## Upstream
 
 Pyroshine is derived from [Moonshine](https://github.com/hgaiser/moonshine) and
-retains its architecture, protocol implementation, runtime naming, and much of
-its documentation. Credit for that work belongs to Moonshine's authors and
+retains its architecture, protocol implementation, and much of its
+documentation. Credit for that work belongs to Moonshine's authors and
 contributors. Pyroshine-specific changes are maintained in this repository;
 they should not be presented as upstream Moonshine features.
 

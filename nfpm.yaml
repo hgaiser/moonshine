@@ -1,52 +1,61 @@
-# nfpm configuration — emits .deb and .rpm packages from the prebuilt
+# nfpm configuration — emits .deb, .rpm, and Arch packages from the prebuilt
 # binaries. Used by .github/workflows/release.yaml.
 #
 # VERSION is injected by the release workflow (GITHUB_REF_NAME minus the 'v').
 
-name: moonshine
-arch: amd64 # nfpm maps this per packager: amd64 (deb) / x86_64 (rpm)
+name: pyroshine
+arch: amd64 # nfpm maps this to the native architecture for each packager.
 platform: linux
 version: ${VERSION}
 release: "1"
 maintainer: "Pyroshine contributors"
 description: |
   Pyroshine streaming server for Moonlight clients.
-  Adds PyroWave and managed Plasma sessions to Moonshine.
+  Includes native PyroWave and managed Plasma sessions.
 homepage: "https://github.com/karsyboy/pyroshine"
 license: "BSD-2-Clause"
+replaces:
+  - moonshine
+  - moonshine-bin
+conflicts:
+  - moonshine
+  - moonshine-bin
 
 contents:
   - src: ./target/release/moonshine
-    dst: /usr/bin/moonshine
-  - src: ./dist/start-moonshine.sh
-    dst: /usr/bin/start-moonshine.sh
+    dst: /usr/bin/pyroshine
+  - src: ./dist/start-pyroshine.sh
+    dst: /usr/bin/start-pyroshine.sh
   - src: ./target/release/libmoonshine_wsi.so
-    dst: /usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so
+    dst: /usr/lib/pyroshine/vulkan-layers/libmoonshine_wsi.so
   - src: ./target/release/libpyrowave-shared.so.0
     dst: /usr/lib/libpyrowave-shared.so.0
-  - src: ./dist/60-moonshine.rules
-    dst: /usr/lib/udev/rules.d/60-moonshine.rules
-  - src: ./dist/moonshine-modules.conf
-    dst: /usr/lib/modules-load.d/moonshine.conf
-  - src: ./dist/moonshine@.service
-    dst: /usr/lib/systemd/system/moonshine@.service
-  - src: ./dist/VkLayer_moonshine_wsi.json
-    dst: /usr/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
-  - src: ./dist/50-moonshine-inhibit-sleep.rules
-    dst: /usr/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
-  - src: ./dist/moonshine-sysusers.conf
-    dst: /usr/lib/sysusers.d/moonshine.conf
+  - src: ./dist/60-pyroshine.rules
+    dst: /usr/lib/udev/rules.d/60-pyroshine.rules
+  - src: ./dist/pyroshine-modules.conf
+    dst: /usr/lib/modules-load.d/pyroshine.conf
+  - src: ./dist/pyroshine@.service
+    dst: /usr/lib/systemd/system/pyroshine@.service
+  - src: ./dist/VkLayer_pyroshine_wsi.json
+    dst: /usr/share/vulkan/implicit_layer.d/VkLayer_pyroshine_wsi.json
+  - src: ./dist/50-pyroshine-inhibit-sleep.rules
+    dst: /usr/share/polkit-1/rules.d/50-pyroshine-inhibit-sleep.rules
+  - src: ./dist/pyroshine-sysusers.conf
+    dst: /usr/lib/sysusers.d/pyroshine.conf
   # License locations differ per distro.
   - src: ./LICENSE
-    dst: /usr/share/licenses/moonshine/LICENSE
+    dst: /usr/share/licenses/pyroshine/LICENSE
     packager: rpm
   - src: ./LICENSE
-    dst: /usr/share/doc/moonshine/copyright
+    dst: /usr/share/doc/pyroshine/copyright
     packager: deb
+  - src: ./LICENSE
+    dst: /usr/share/licenses/pyroshine/LICENSE
+    packager: archlinux
 
 scripts:
-  postinstall: ./dist/nfpm/postinstall.sh
-  postremove: ./dist/nfpm/postremove.sh
+  postinstall: ./dist/nfpm/pyroshine-postinstall.sh
+  postremove: ./dist/nfpm/pyroshine-postremove.sh
 
 # Dependency names differ per distro.
 # (libwayland-client is needed by the WSI layer, which is dlopen'd into games.)
@@ -81,6 +90,24 @@ overrides:
       - xorg-x11-server-Xwayland
       - dbus-daemon
       - kwin-wayland
+      - plasma-workspace
+      - xdg-desktop-portal
+      - xdg-desktop-portal-kde
+      - pipewire
+  archlinux:
+    depends:
+      - glibc
+      - gcc-libs
+      - libdrm
+      - libevdev
+      - libffi
+      - libxkbcommon
+      - mesa
+      - opus
+      - wayland
+      - xorg-xwayland
+      - dbus
+      - kwin
       - plasma-workspace
       - xdg-desktop-portal
       - xdg-desktop-portal-kde

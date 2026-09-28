@@ -1,0 +1,18 @@
+[Unit]
+Description=Streaming server using the NVIDIA GameStream / Moonlight protocol.
+
+[Service]
+User=%i
+Group=%i
+SupplementaryGroups=pyroshine
+ExecStart=/usr/bin/start-pyroshine.sh /home/%i/.config/moonshine/config.toml
+Environment=MOONSHINE_LOG=moonshine=info
+Restart=always
+DeviceAllow=/dev/uinput rw
+DeviceAllow=/dev/uhid rw
+DeviceAllow=char-drm rw
+DeviceAllow=char-nvidia rw
+DeviceAllow=char-nvidia-uvm rw
+
+[Install]
+WantedBy=default.target

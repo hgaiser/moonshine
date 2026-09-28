@@ -1,6 +1,6 @@
 # Tips & Tricks
 
-Practical recipes for getting the most out of Moonshine.
+Practical recipes for getting the most out of Pyroshine.
 Each tip shows a real-world use of `pre_command` / `post_command` (or other configuration) to solve a common problem.
 See the [Configuration](../README.md#configuration) section of the README for the full schema of these fields.
 
@@ -10,7 +10,7 @@ See the [Configuration](../README.md#configuration) section of the README for th
 - [Prevent the host from suspending while streaming](#prevent-the-host-from-suspending-while-streaming)
 - [Run games in high-performance mode](#run-games-in-high-performance-mode)
 - [Use Gamescope with the client's resolution](#use-gamescope-with-the-clients-resolution)
-- [Run Flatpak Steam inside Moonshine's compositor](#run-flatpak-steam-inside-moonshines-compositor)
+- [Run Flatpak Steam inside Pyroshine's compositor](#run-flatpak-steam-inside-pyroshines-compositor)
 - [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 - [Debug a failing application](#debug-a-failing-application)
 
@@ -18,7 +18,7 @@ See the [Configuration](../README.md#configuration) section of the README for th
 
 ### How to
 
-Add a `pre_command` that shuts down any running desktop Steam before the stream starts, so Moonshine's instance becomes the primary one:
+Add a `pre_command` that shuts down any running desktop Steam before the stream starts, so Pyroshine's instance becomes the primary one:
 
 ```toml
 [[application]]
@@ -34,7 +34,7 @@ This asks any running Steam to shut down and waits (up to ~30s) for it to exit b
 ### Details
 
 This is the recommended workaround from issue [#134](https://github.com/hgaiser/moonshine/issues/134).
-Steam is single-instance per user, so when Moonshine launches Steam inside its own compositor while a desktop Steam is already running on the host, the `steam://` URL (for example "open big picture") is forwarded to the existing desktop instance instead of running inside Moonshine's compositor.
+Steam is single-instance per user, so when Pyroshine launches Steam inside its own compositor while a desktop Steam is already running on the host, the `steam://` URL (for example "open big picture") is forwarded to the existing desktop instance instead of running inside Pyroshine's compositor.
 The result is that Big Picture opens on the host's physical desktop and the streaming session fails (Moonlight sees a 503 error).
 Note that this closes your desktop Steam session when a stream starts.
 
@@ -42,22 +42,22 @@ Note that this closes your desktop Steam session when a stream starts.
 
 ### How to
 
-Make sure your user is in the `moonshine` group: `sudo usermod -aG moonshine $USER`.
-Moonshine then blocks sleep automatically for the duration of every stream — nothing else is required.
+Make sure your user is in the `pyroshine` group: `sudo usermod -aG pyroshine $USER`.
+Pyroshine then blocks sleep automatically for the duration of every stream — nothing else is required.
 If you want to disable this, set `inhibit_sleep = false` at the top of your configuration:
 
 ```toml
-name = "Moonshine"
+name = "Pyroshine"
 inhibit_sleep = false
 ```
 
 ### Details
 
-Moonshine asks logind (over D-Bus) to inhibit sleep when a session starts and releases it when the session ends.
-This is the same thing `systemd-inhibit` does, but handled by Moonshine itself, so you do not have to wrap each application's `command` with it.
-It requires the polkit rule shipped with Moonshine (`/usr/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules`) and membership in the `moonshine` group it is scoped to.
-When installed from a package, both are set up for you (via the sysusers.d drop-in and the package's post-install step); if you installed Moonshine manually, create the group with `sudo groupadd --system moonshine` and copy that polkit rule file into place yourself.
-If the user is not in the `moonshine` group (and has no active session), Moonshine logs a warning and streaming still works, but the host may suspend mid-stream.
+Pyroshine asks logind (over D-Bus) to inhibit sleep when a session starts and releases it when the session ends.
+This is the same thing `systemd-inhibit` does, but handled by Pyroshine itself, so you do not have to wrap each application's `command` with it.
+It requires the polkit rule shipped with Pyroshine (`/usr/share/polkit-1/rules.d/50-pyroshine-inhibit-sleep.rules`) and membership in the `pyroshine` group it is scoped to.
+When installed from a package, both are set up for you (via the sysusers.d drop-in and the package's post-install step); if you installed Pyroshine manually, create the group with `sudo groupadd --system pyroshine` and copy that polkit rule file into place yourself.
+If the user is not in the `pyroshine` group (and has no active session), Pyroshine logs a warning and streaming still works, but the host may suspend mid-stream.
 
 ## Run games in high-performance mode
 
@@ -70,7 +70,7 @@ Then for each Steam game you want to optimize (or globally in Steam's launch opt
 gamemoderun %command%
 ```
 
-Do **not** use `gamemoderun` with Steam anywhere in Moonshine's configuration, since that launches Steam itself under `LD_PRELOAD`, which leaks into Steam's child processes and can prevent the session from launching.
+Do **not** use `gamemoderun` with Steam anywhere in Pyroshine's configuration, since that launches Steam itself under `LD_PRELOAD`, which leaks into Steam's child processes and can prevent the session from launching.
 
 ### Details
 
@@ -101,7 +101,7 @@ For supersampling, render above the output resolution — here 1.5x the client r
 /usr/bin/gamescope -f -W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w $((MOONSHINE_CLIENT_WIDTH * 3 / 2)) -h $((MOONSHINE_CLIENT_HEIGHT * 3 / 2)) -r "$MOONSHINE_CLIENT_FRAMERATE" -- %command%
 ```
 
-Moonshine sets `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and `MOONSHINE_CLIENT_FRAMERATE` on the environment of the launched application, so they are inherited by Gamescope, Steam and `%command%`.
+Pyroshine sets `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and `MOONSHINE_CLIENT_FRAMERATE` on the environment of the launched application, so they are inherited by Gamescope, Steam and `%command%`.
 
 ### Details
 
@@ -109,11 +109,11 @@ Moonshine sets `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and `MOONSHIN
 - `-w`/`-h` set the resolution the game actually renders at. Rendering below the output resolution upscales (bilinear or FSR); rendering above it downsamples for supersampling. You can play with the values to trade quality against performance — when they match the client resolution you get a 1:1 image.
 - `-r` sets the refresh rate, e.g. from `MOONSHINE_CLIENT_FRAMERATE`.
 
-Wrapping the game in Gamescope can also work around focus or rendering issues: Gamescope provides its own Wayland/X11 surfaces and input handling, so games that misbehave under Moonshine's compositor directly (unfocused windows, scaling artifacts, etc.) often behave correctly when run inside it.
+Wrapping the game in Gamescope can also work around focus or rendering issues: Gamescope provides its own Wayland/X11 surfaces and input handling, so games that misbehave under Pyroshine's compositor directly (unfocused windows, scaling artifacts, etc.) often behave correctly when run inside it.
 
-Note that these environment variables are only set when the app is launched by Moonshine, so fall back to defaults (e.g. `${MOONSHINE_CLIENT_WIDTH:-2560}`) if you also run the same command outside a stream.
+Note that these environment variables are only set when the app is launched by Pyroshine, so fall back to defaults (e.g. `${MOONSHINE_CLIENT_WIDTH:-2560}`) if you also run the same command outside a stream.
 
-## Run Flatpak Steam inside Moonshine's compositor
+## Run Flatpak Steam inside Pyroshine's compositor
 
 ### How to
 
@@ -147,9 +147,9 @@ command = [
 ### Details
 
 The root cause is in how Flatpak's portal infrastructure interacts with the desktop environment.
-Flatpak uses the host's D-Bus session bus to communicate with portal backends. When setting up the sandbox, the portal backend tells Flatpak to expose the **host's** Wayland and display sockets, overriding the `WAYLAND_DISPLAY` and `DISPLAY` environment variables that Moonshine sets. This causes Steam to render on the host's physical desktop instead of inside Moonshine's headless compositor.
+Flatpak uses the host's D-Bus session bus to communicate with portal backends. When setting up the sandbox, the portal backend tells Flatpak to expose the **host's** Wayland and display sockets, overriding the `WAYLAND_DISPLAY` and `DISPLAY` environment variables that Pyroshine sets. This causes Steam to render on the host's physical desktop instead of inside Pyroshine's headless compositor.
 
-`dbus-run-session` spawns a fresh D-Bus daemon without the host's portal backend registered, so Flatpak cannot discover the host compositor through the portal and falls back to the environment variables inherited from Moonshine's systemd unit. Because the portal backend is responsible for both Wayland and audio setup, the `PULSE_SERVER` env var is also honored correctly without needing `--env=` overrides.
+`dbus-run-session` spawns a fresh D-Bus daemon without the host's portal backend registered, so Flatpak cannot discover the host compositor through the portal and falls back to the environment variables inherited from Pyroshine's systemd unit. Because the portal backend is responsible for both Wayland and audio setup, the `PULSE_SERVER` env var is also honored correctly without needing `--env=` overrides.
 
 ## Run a desktop environment for a full remote desktop
 
@@ -165,7 +165,7 @@ command = ["/usr/bin/start-cosmic"]
 
 ### Details
 
-Launching a desktop environment as an application turns the stream into a full remote desktop: the compositor boots inside Moonshine's headless compositor, and you use the desktop's own keybindings to launch programs. Other compositors work the same way, e.g. `["/usr/bin/sway"]`.
+Launching a desktop environment as an application turns the stream into a full remote desktop: the compositor boots inside Pyroshine's headless compositor, and you use the desktop's own keybindings to launch programs. Other compositors work the same way, e.g. `["/usr/bin/sway"]`.
 
 ## Debug a failing application
 
@@ -191,6 +191,6 @@ You can also add `-e` to jump to the end of the log and `-f` to follow it live w
 
 ### Details
 
-By default Moonshine launches applications with `StandardOutput=null` and `StandardError=null`, so an application that fails to start produces no diagnostic output at all. Redirecting to the journal makes its stderr (where most crash output and backtraces land) visible, which is usually the fastest way to find out why the session failed to launch.
+By default Pyroshine launches applications with `StandardOutput=null` and `StandardError=null`, so an application that fails to start produces no diagnostic output at all. Redirecting to the journal makes its stderr (where most crash output and backtraces land) visible, which is usually the fastest way to find out why the session failed to launch.
 
 These fields are also available on `[[application_scanner]]` configs for games launched through Steam/Lutris/Heroic. Instead of the journal you can also redirect to a file, e.g. `stdout = "file:/path/to/log.txt"`; any systemd `StandardOutput`/`StandardError` value (`journal`, `file:/path`, `append:/path`, `inherit`, ...) is accepted.

@@ -1,8 +1,9 @@
 name: Release
 
 on:
-  release:
-    types: [published]
+  push:
+    tags:
+      - "v[0-9]*"
   workflow_dispatch:
     inputs:
       tag:
@@ -27,6 +28,10 @@ jobs:
       id: tag
       run: |
         TAG="${{ github.event.inputs.tag || github.ref_name }}"
+        if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]; then
+          echo "Release tag must look like v1.2.3 or v1.2.3-rc.1, got: $TAG" >&2
+          exit 1
+        fi
         echo "tag=$TAG" >> "$GITHUB_OUTPUT"
         echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
 
@@ -61,24 +66,24 @@ jobs:
 
     - name: Bake version into install script
       run: |
-        sed -i 's/VERSION="__VERSION__"/VERSION="${{ steps.tag.outputs.tag }}"/' ./dist/moonshine-install.sh
+        sed -i 's/VERSION="__VERSION__"/VERSION="${{ steps.tag.outputs.tag }}"/' ./dist/pyroshine-install.sh
 
     # Portable tarball with an FHS-ish layout (bin/, lib/, share/).
     - name: Package portable tarball
       run: |
-        STAGE="$RUNNER_TEMP/moonshine"
-        mkdir -p "$STAGE/bin" "$STAGE/lib/moonshine/vulkan-layers" "$STAGE/share/moonshine"
-        cp ./target/release/moonshine "$STAGE/bin/"
+        STAGE="$RUNNER_TEMP/pyroshine"
+        mkdir -p "$STAGE/bin" "$STAGE/lib/pyroshine/vulkan-layers" "$STAGE/share/pyroshine"
+        cp ./target/release/moonshine "$STAGE/bin/pyroshine"
         cp ./target/release/libpyrowave-shared.so.0 "$STAGE/lib/"
-        cp ./target/release/libmoonshine_wsi.so "$STAGE/lib/moonshine/vulkan-layers/"
-        cp ./dist/start-moonshine.sh ./dist/60-moonshine.rules ./dist/50-moonshine-inhibit-sleep.rules \
-           ./dist/moonshine-modules.conf ./dist/moonshine-sysusers.conf \
-           ./dist/moonshine@.service ./dist/VkLayer_moonshine_wsi.json \
-           ./dist/moonshine-atomic-update.conf "$STAGE/share/moonshine/"
-        cp ./dist/moonshine-install.sh "$STAGE/bin/"
+        cp ./target/release/libmoonshine_wsi.so "$STAGE/lib/pyroshine/vulkan-layers/"
+        cp ./dist/start-pyroshine.sh ./dist/60-pyroshine.rules ./dist/50-pyroshine-inhibit-sleep.rules \
+           ./dist/pyroshine-modules.conf ./dist/pyroshine-sysusers.conf \
+           ./dist/pyroshine@.service ./dist/VkLayer_pyroshine_wsi.json \
+           ./dist/pyroshine-atomic-update.conf "$STAGE/share/pyroshine/"
+        cp ./dist/pyroshine-install.sh "$STAGE/bin/"
         cp README.md LICENSE "$STAGE/"
-        tar --zstd -cf "./moonshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst" \
-          -C "$RUNNER_TEMP" moonshine
+        tar --zstd -cf "./pyroshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst" \
+          -C "$RUNNER_TEMP" pyroshine
 
     - name: Install nfpm
       run: |
@@ -90,17 +95,30 @@ jobs:
     - name: Package native formats
       run: |
         export VERSION="${{ steps.tag.outputs.version }}"
-        for fmt in deb rpm; do
+        for fmt in deb rpm archlinux; do
           nfpm package --config nfpm.yaml --packager "$fmt" --target .
         done
 
-    - name: Release
+    - name: Generate checksums
+      run: |
+        sha256sum \
+          ./pyroshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst \
+          ./pyroshine_*.deb \
+          ./pyroshine-*.rpm \
+          ./pyroshine-*.pkg.tar.zst \
+          ./dist/pyroshine-install.sh \
+          > SHA256SUMS
+
+    - name: Create GitHub release
       uses: softprops/action-gh-release@v2
-      if: steps.tag.outputs.tag != ''
       with:
         tag_name: ${{ steps.tag.outputs.tag }}
+        generate_release_notes: true
+        fail_on_unmatched_files: true
         files: |
-          ./moonshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst
-          ./moonshine_*.deb
-          ./moonshine-*.rpm
-          ./dist/moonshine-install.sh
+          ./pyroshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst
+          ./pyroshine_*.deb
+          ./pyroshine-*.rpm
+          ./pyroshine-*.pkg.tar.zst
+          ./dist/pyroshine-install.sh
+          ./SHA256SUMS
