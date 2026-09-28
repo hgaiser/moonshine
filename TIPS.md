@@ -155,7 +155,16 @@ Flatpak uses the host's D-Bus session bus to communicate with portal backends. W
 
 ### How to
 
-Add the desktop environment as a regular application. For example, to stream a full COSMIC desktop instead of a single game:
+Add the desktop environment as a regular application. For Plasma:
+
+```toml
+[[application]]
+title = "Plasma Desktop"
+command = ["/usr/bin/startplasma-wayland"]
+```
+
+Log out of any existing local Plasma session before launching it. Other desktop
+environments use the same generic mechanism; for example:
 
 ```toml
 [[application]]
@@ -166,6 +175,22 @@ command = ["/usr/bin/start-cosmic"]
 ### Details
 
 Launching a desktop environment as an application turns the stream into a full remote desktop: the compositor boots inside Pyroshine's headless compositor, and you use the desktop's own keybindings to launch programs. Other compositors work the same way, e.g. `["/usr/bin/sway"]`.
+
+`startplasma-wayland` sets the Plasma identity and session variables itself. The
+packaged Pyroshine service already supplies the user's runtime directory and
+session bus, so no Plasma-specific wrapper or `dbus-run-session` prefix is
+needed for the supported single-session case.
+
+A full Plasma session uses per-user D-Bus names and systemd user services, so a
+second full session for the same user conflicts with the local one. Pyroshine
+does not isolate, clone, or manage Plasma state; log out locally before starting
+the streamed desktop.
+
+This application entry starts the already-authenticated user's session. It
+cannot show a real login screen. A display manager such as Plasma Login Manager
+or SDDM owns PAM authentication, logind/seat state, a VT, and the graphical
+session lifecycle, so it cannot be embedded safely as an ordinary Pyroshine
+application. Keep the system display manager responsible for host logins.
 
 ## Debug a failing application
 

@@ -931,14 +931,6 @@ impl MoonshineCompositor {
 				continue;
 			}
 
-			// Under Steam control only game, Steam UI, and streaming-client
-			// windows are focus candidates.
-			if steam_controlled
-				&& !(meta.has_game_id() || meta.is_steam() || meta.flags.contains(WindowFlags::STREAMING_CLIENT))
-			{
-				continue;
-			}
-
 			// A viewable InputOutput window with non-zero opacity (or the
 			// streaming client) is a candidate.
 			if meta.map_state_viewable
@@ -947,6 +939,22 @@ impl MoonshineCompositor {
 			{
 				candidates.push(window.clone());
 			}
+		}
+
+		// Steam's focus contract cannot name ordinary applications. Preserve
+		// Steam's filtering when a game/UI/client candidate is present, but fall
+		// back to normal compositor focus when the session contains only generic
+		// Wayland or X11 windows.
+		let filter_to_steam = steam_controlled
+			&& super::focus::should_filter_to_steam(
+				candidates.iter().filter_map(|window| self.window_metadata.get(window)),
+			);
+		if filter_to_steam {
+			candidates.retain(|window| {
+				self.window_metadata
+					.get(window)
+					.is_some_and(WindowMetadata::is_steam_controlled_candidate)
+			});
 		}
 
 		// Highest priority first (`is_focus_priority_greater`, stable sort).

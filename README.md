@@ -5,8 +5,7 @@
 Pyroshine is a maintained Linux game-streaming server based on
 [Moonshine](https://github.com/hgaiser/moonshine). It preserves Moonshine's
 isolated, headless streaming architecture and conventional H.264, HEVC, and AV1
-support while adding native PyroWave streaming and a managed KDE Plasma 6
-desktop session.
+support while adding native PyroWave streaming.
 
 Pyroshine speaks the Moonlight/GameStream protocol. Standard Moonlight clients
 can use its conventional codecs; PyroWave requires
@@ -17,9 +16,9 @@ another client implementing the same versioned extension.
 
 Moonshine provides a compact Rust host with a per-stream compositor. Pyroshine
 maintains the additional codec negotiation, zero-copy PyroWave encode path,
-transport handling, packaging, diagnostics, and desktop-session integration
-needed for this project's use cases. It is an independent community fork, not
-an official Moonshine or Moonlight release.
+transport handling, packaging, and diagnostics needed for this project's use
+cases. It is an independent community fork, not an official Moonshine or
+Moonlight release.
 
 Release packages install the public command and service as `pyroshine`. Internal
 crate, configuration, state, environment-variable, and Vulkan protocol names
@@ -32,7 +31,6 @@ minimal conflict.
 - Hardware Vulkan encode with DMA-BUF import and no CPU pixel conversion.
 - H.264, HEVC, and AV1 through Moonshine's existing Vulkan Video pipeline.
 - Isolated headless sessions that do not take over the host desktop.
-- Managed nested KDE Plasma 6 desktop sessions sized to the client.
 - Low-latency stale-frame handling, multi-block FEC, encryption, and UDP GSO.
 - Mouse, keyboard, touch, pen, controller, motion, haptics, and surround audio.
 - Focused health checks and `moonshine-bench` latency/throughput reporting.
@@ -45,8 +43,6 @@ minimal conflict.
 - For PyroWave: a hardware Vulkan GPU with the required compute, timeline
   semaphore, external-memory, and DMA-BUF interoperability features. Software
   Vulkan devices are intentionally rejected.
-- For the Desktop entry: KDE Plasma 6, KWin, Xwayland, D-Bus, PipeWire, and the
-  KDE desktop portal. See [docs/PLASMA.md](docs/PLASMA.md).
 - A Moonlight-compatible client. Use Moonlight Qt PyroWave for the PyroWave
   codec; upstream Moonlight clients remain usable with conventional codecs.
 
@@ -159,17 +155,18 @@ title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
 ```
 
-Add the managed desktop with:
+Plasma can be launched like any other application when no local Plasma session
+is active:
 
 ```toml
 [[application]]
-title = "Desktop"
-type = "desktop"
-
-[application.desktop]
-environment = "plasma"
-scale = 1.0
+title = "Plasma Desktop"
+command = ["/usr/bin/startplasma-wayland"]
 ```
+
+This is a normal application entry, not a managed desktop feature. See
+[TIPS.md](TIPS.md#run-a-desktop-environment-for-a-full-remote-desktop) for the
+known session and login-screen limitations.
 
 Start the service, add the host in Moonlight, and enter the displayed pairing
 PIN at `http://localhost:47989/pin`. PyroWave clients negotiate the codec only
@@ -181,7 +178,6 @@ or through a VPN and restrict the GameStream ports with a firewall.
 ## Documentation
 
 - [PyroWave architecture, negotiation, dependency pin, and validation](docs/PYROWAVE.md)
-- [Managed Plasma 6 desktop architecture and setup](docs/PLASMA.md)
 - [NixOS package and module](nix/README.md)
 - [Tips and troubleshooting](TIPS.md)
 

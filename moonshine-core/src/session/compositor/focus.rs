@@ -286,6 +286,11 @@ impl WindowMetadata {
 		self.steam_legacy_big_picture || self.app_id == crate::session::compositor::x11_focus::STEAM_BIG_PICTURE_APPID
 	}
 
+	/// Returns `true` if Steam's focus contract can identify this window.
+	pub fn is_steam_controlled_candidate(&self) -> bool {
+		self.has_game_id() || self.is_steam() || self.flags.contains(WindowFlags::STREAMING_CLIENT)
+	}
+
 	/// Returns `true` if the window should be held at the output size.
 	///
 	/// Only a window that actually went fullscreen is held at the output size;
@@ -308,6 +313,15 @@ impl WindowMetadata {
 	pub fn skip_and_not_fullscreen(&self) -> bool {
 		(self.skip_taskbar && self.skip_pager) && !self.fullscreen
 	}
+}
+
+/// Steam's focus filter is meaningful only when at least one candidate is
+/// represented in Steam's focus contract. Generic applications otherwise need
+/// the compositor's normal focus ranking.
+pub(crate) fn should_filter_to_steam<'a>(candidates: impl IntoIterator<Item = &'a WindowMetadata>) -> bool {
+	candidates
+		.into_iter()
+		.any(WindowMetadata::is_steam_controlled_candidate)
 }
 
 bitflags! {
@@ -561,6 +575,15 @@ mod tests {
 		let game = make_meta(&[("app_id", "12345")]);
 		let non_game = make_meta(&[("app_id", "0")]);
 		assert!(get_window_priority_key(&game) > get_window_priority_key(&non_game));
+	}
+
+	#[test]
+	fn test_steam_filter_falls_back_for_generic_applications() {
+		let generic_wayland = make_meta(&[("app_id", "0"), ("is_x11", "false")]);
+		assert!(!should_filter_to_steam([&generic_wayland]));
+
+		let steam_game = make_meta(&[("app_id", "12345")]);
+		assert!(should_filter_to_steam([&generic_wayland, &steam_game]));
 	}
 
 	#[test]

@@ -317,14 +317,6 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 	// --- External dependencies ---
 
 	check_xwayland(&mut report);
-	if config.is_some_and(|config| {
-		config
-			.applications
-			.iter()
-			.any(|app| app.kind == crate::session::application::ApplicationKind::Desktop)
-	}) {
-		check_plasma(&mut report);
-	}
 	check_xdg_runtime(&mut report);
 	check_inhibit(&mut report);
 	check_kcmp(&mut report);
@@ -924,50 +916,6 @@ fn check_xwayland(report: &mut HealthReport) {
 				start.elapsed().as_millis() as u64,
 			);
 		},
-	}
-}
-
-fn check_plasma(report: &mut HealthReport) {
-	let start = Instant::now();
-	let required = [
-		"dbus-run-session",
-		"kwin_wayland_wrapper",
-		"startplasma-wayland",
-		"plasma_session",
-		"plasmashell",
-	];
-	let missing: Vec<_> = required
-		.iter()
-		.copied()
-		.filter(|program| which::which(program).is_err())
-		.collect();
-	if !missing.is_empty() {
-		report.add_warn(
-			"Plasma 6",
-			format!(
-				"  Missing required desktop components: {}.\n  Install KDE Plasma 6, KWin, dbus, and Xwayland.",
-				missing.join(", ")
-			),
-			start.elapsed().as_millis() as u64,
-		);
-		return;
-	}
-
-	let version = std::process::Command::new("kwin_wayland")
-		.arg("--version")
-		.output()
-		.ok()
-		.filter(|output| output.status.success())
-		.map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
-		.unwrap_or_else(|| "KWin version unknown".to_string());
-	if !version.contains('6') {
-		report.add_warn(
-			"Plasma 6",
-			format!("  Expected KWin/Plasma 6, detected: {version}"),
-			start.elapsed().as_millis() as u64,
-		);
-	} else {
-		report.add_passed("Plasma 6", version, start.elapsed().as_millis() as u64);
 	}
 }
 

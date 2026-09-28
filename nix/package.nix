@@ -167,7 +167,7 @@ rustPlatform.buildRustPackage {
   '';
 
   meta = {
-    description = "Pyroshine server with PyroWave and managed Plasma sessions";
+    description = "Pyroshine server with native PyroWave support";
     homepage = "https://github.com/karsyboy/pyroshine";
     license = lib.licenses.bsd2;
     platforms = [

@@ -11,7 +11,7 @@ release: "1"
 maintainer: "Pyroshine contributors"
 description: |
   Pyroshine streaming server for Moonlight clients.
-  Includes native PyroWave and managed Plasma sessions.
+  Includes native PyroWave support.
 homepage: "https://github.com/karsyboy/pyroshine"
 license: "BSD-2-Clause"
 replaces:
@@ -71,12 +71,6 @@ overrides:
       - libgcc-s1
       - libwayland-client0
       - xwayland
-      - dbus-daemon
-      - kwin-wayland
-      - plasma-workspace
-      - xdg-desktop-portal
-      - xdg-desktop-portal-kde
-      - pipewire
   rpm:
     depends:
       - glibc
@@ -88,12 +82,6 @@ overrides:
       - libgcc
       - libwayland-client
       - xorg-x11-server-Xwayland
-      - dbus-daemon
-      - kwin-wayland
-      - plasma-workspace
-      - xdg-desktop-portal
-      - xdg-desktop-portal-kde
-      - pipewire
   archlinux:
     depends:
       - glibc
@@ -106,9 +94,3 @@ overrides:
       - opus
       - wayland
       - xorg-xwayland
-      - dbus
-      - kwin
-      - plasma-workspace
-      - xdg-desktop-portal
-      - xdg-desktop-portal-kde
-      - pipewire

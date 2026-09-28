@@ -31,7 +31,6 @@ pub mod application;
 pub mod compositor;
 pub mod inhibit;
 pub mod manager;
-pub mod plasma;
 pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.
@@ -208,8 +207,6 @@ impl InitializedSession {
 				xdisplay: ready.xdisplay,
 				wayland_display: ready.wayland_display.clone(),
 				hdr: ready.hdr,
-				resolution: context.resolution,
-				refresh_rate: context.refresh_rate,
 				// Populate extra_env with width, height and refreshrate values of the client for e.g. scripting
 				extra_env: HashMap::from([
 					("MOONSHINE_CLIENT_WIDTH".to_string(), context.resolution.0.to_string()),
