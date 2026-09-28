@@ -1,6 +1,8 @@
 //! Managed, isolated KDE Plasma 6 session for headless streaming.
 
+use std::ffi::OsStr;
 use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 
@@ -18,10 +20,13 @@ pub struct PlasmaSessionOptions {
 
 /// Run nested KWin and Plasma on Moonshine's Wayland output.
 ///
-/// The outer invocation creates a private XDG runtime/config tree and D-Bus
-/// session, then re-executes Moonshine in `inner` mode. The inner invocation
-/// starts KWin first. `startplasma-wayland` performs KDE's supported environment
-/// initialization, then its classic `plasma_session` path sees
+/// The outer invocation creates a private XDG runtime/config overlay and D-Bus
+/// session, then re-executes Moonshine in `inner` mode. The overlay snapshots the
+/// user's top-level Plasma configuration and links its application profile
+/// directories, while directing Plasma session writes and the classic-startup
+/// override to private storage. The inner invocation starts KWin first.
+/// `startplasma-wayland` performs KDE's supported environment initialization,
+/// then its classic `plasma_session` path sees
 /// `org.kde.KWinWrapper` already registered and uses that compositor instead of
 /// launching another.
 pub async fn run(options: PlasmaSessionOptions) -> Result<(), String> {
@@ -64,12 +69,17 @@ pub async fn run(options: PlasmaSessionOptions) -> Result<(), String> {
 		.map_err(|e| format!("securing isolated Plasma runtime: {e}"))?;
 	let config = isolation.path().join("config");
 	let cache = isolation.path().join("cache");
-	let data = isolation.path().join("data");
-	for directory in [&config, &cache, &data] {
+	for directory in [&config, &cache] {
 		std::fs::create_dir(directory).map_err(|e| format!("creating {}: {e}", directory.display()))?;
 	}
+	let profile_config = profile_config_directory(
+		std::env::var_os("XDG_CONFIG_HOME").as_deref(),
+		std::env::var_os("HOME").as_deref(),
+	)?;
+	populate_config_overlay(&profile_config, &config)?;
 	// The systemd boot mode would use the host user manager. Classic mode is
-	// Plasma's supported process startup path and stays on our private bus.
+	// Plasma's supported process startup path and stays on our private bus. This
+	// file intentionally replaces any value copied from the user's profile.
 	std::fs::write(config.join("startkderc"), b"[General]\nsystemdBoot=false\n")
 		.map_err(|e| format!("writing isolated Plasma startup config: {e}"))?;
 
@@ -80,7 +90,8 @@ pub async fn run(options: PlasmaSessionOptions) -> Result<(), String> {
 		refresh_rate = options.refresh_rate,
 		scale = options.scale,
 		outer_wayland = %outer_socket.display(),
-		"Starting isolated nested Plasma 6 session"
+		profile_config = %profile_config.display(),
+		"Starting isolated nested Plasma 6 session with user profile"
 	);
 	let mut command = Command::new("dbus-run-session");
 	command
@@ -99,7 +110,6 @@ pub async fn run(options: PlasmaSessionOptions) -> Result<(), String> {
 		.env("XDG_RUNTIME_DIR", isolation.path())
 		.env("XDG_CONFIG_HOME", &config)
 		.env("XDG_CACHE_HOME", &cache)
-		.env("XDG_DATA_HOME", &data)
 		.env("WAYLAND_DISPLAY", &outer_socket)
 		.env_remove("DISPLAY")
 		.stdin(Stdio::null())
@@ -118,6 +128,58 @@ pub async fn run(options: PlasmaSessionOptions) -> Result<(), String> {
 	} else {
 		Err(format!("Plasma session exited with {status}"))
 	}
+}
+
+fn profile_config_directory(xdg_config_home: Option<&OsStr>, home: Option<&OsStr>) -> Result<PathBuf, String> {
+	if let Some(value) = xdg_config_home.filter(|value| !value.is_empty()) {
+		let path = PathBuf::from(value);
+		if path.is_absolute() {
+			return Ok(path);
+		}
+		tracing::warn!(
+			xdg_config_home = %path.display(),
+			"Ignoring relative XDG_CONFIG_HOME while preparing Plasma profile"
+		);
+	}
+	let home = home
+		.filter(|value| !value.is_empty())
+		.map(PathBuf::from)
+		.ok_or_else(|| "HOME is not set; cannot locate the user's Plasma configuration".to_string())?;
+	if !home.is_absolute() {
+		return Err("HOME must be an absolute path to locate the user's Plasma configuration".to_string());
+	}
+	Ok(home.join(".config"))
+}
+
+fn populate_config_overlay(profile: &Path, overlay: &Path) -> Result<(), String> {
+	if !profile.exists() {
+		return Ok(());
+	}
+	let entries = std::fs::read_dir(profile)
+		.map_err(|e| format!("reading Plasma profile directory {}: {e}", profile.display()))?;
+	for entry in entries {
+		let entry = entry.map_err(|e| format!("reading an entry in {}: {e}", profile.display()))?;
+		if entry.file_name() == OsStr::new("startkderc") {
+			continue;
+		}
+		let source = entry.path();
+		let destination = overlay.join(entry.file_name());
+		let file_type = entry
+			.file_type()
+			.map_err(|e| format!("inspecting Plasma profile entry {}: {e}", source.display()))?;
+		if file_type.is_file() {
+			std::fs::copy(&source, &destination)
+				.map_err(|e| format!("copying Plasma profile file {}: {e}", source.display()))?;
+		} else if file_type.is_dir() || file_type.is_symlink() {
+			// Profile directories can be very large (browser profiles commonly live
+			// here), so link rather than recursively copying them for every stream.
+			symlink(&source, &destination)
+				.map_err(|e| format!("linking Plasma profile entry {}: {e}", source.display()))?;
+		} else {
+			tracing::debug!(path = %source.display(), "Skipping special file in Plasma profile");
+		}
+	}
+	Ok(())
 }
 
 async fn run_inner(options: PlasmaSessionOptions) -> Result<(), String> {
@@ -241,5 +303,54 @@ mod tests {
 		};
 		assert!(validate_options(&valid).is_ok());
 		assert!(validate_options(&PlasmaSessionOptions { scale: 0.0, ..valid }).is_err());
+	}
+
+	#[test]
+	fn resolves_profile_config_from_xdg_or_home() {
+		assert_eq!(
+			profile_config_directory(Some(OsStr::new("/custom/config")), Some(OsStr::new("/home/test"))).unwrap(),
+			PathBuf::from("/custom/config")
+		);
+		assert_eq!(
+			profile_config_directory(Some(OsStr::new("relative")), Some(OsStr::new("/home/test"))).unwrap(),
+			PathBuf::from("/home/test/.config")
+		);
+		assert!(profile_config_directory(None, None).is_err());
+		assert!(profile_config_directory(None, Some(OsStr::new("relative"))).is_err());
+	}
+
+	#[test]
+	fn materializes_profile_without_copying_large_directories() {
+		let profile = tempfile::tempdir().unwrap();
+		let overlay = tempfile::tempdir().unwrap();
+		std::fs::write(
+			profile.path().join("kdeglobals"),
+			b"[General]\nColorScheme=BreezeDark\n",
+		)
+		.unwrap();
+		std::fs::write(profile.path().join("startkderc"), b"[General]\nsystemdBoot=force\n").unwrap();
+		std::fs::create_dir(profile.path().join("plasma-workspace")).unwrap();
+		std::fs::write(profile.path().join("plasma-workspace/env.sh"), b"export TEST=1\n").unwrap();
+
+		populate_config_overlay(profile.path(), overlay.path()).unwrap();
+
+		assert_eq!(
+			std::fs::read_to_string(overlay.path().join("kdeglobals")).unwrap(),
+			"[General]\nColorScheme=BreezeDark\n"
+		);
+		assert!(!overlay.path().join("startkderc").exists());
+		assert!(
+			std::fs::symlink_metadata(overlay.path().join("plasma-workspace"))
+				.unwrap()
+				.file_type()
+				.is_symlink()
+		);
+		assert_eq!(
+			std::fs::read_to_string(overlay.path().join("plasma-workspace/env.sh")).unwrap(),
+			"export TEST=1\n"
+		);
+
+		std::fs::write(overlay.path().join("kdeglobals"), b"changed").unwrap();
+		assert_ne!(std::fs::read(profile.path().join("kdeglobals")).unwrap(), b"changed");
 	}
 }

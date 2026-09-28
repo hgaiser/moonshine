@@ -39,7 +39,14 @@ Moonshine to capture the nested output.
 Every launch gets:
 
 - a private `XDG_RUNTIME_DIR` with mode 0700;
-- private config, cache, and data directories;
+- a private writable config overlay and cache directory;
+- a snapshot of the launching user's top-level Plasma configuration, including
+  panels, widgets, shortcuts, theme, and other desktop settings;
+- links to the user's configuration directories, preserving autostart entries,
+  environment scripts, and application profiles without copying large browser
+  or application data on every connection;
+- the launching user's XDG data directory, so user-installed applications,
+  Plasma widgets, themes, icons, and other desktop assets remain available;
 - a private D-Bus daemon created by `dbus-run-session`;
 - a unique nested Wayland socket and a separate Xwayland instance;
 - the existing Moonshine PulseAudio socket for streamed desktop audio;
@@ -49,6 +56,13 @@ The outer Moonshine Wayland socket is passed to KWin by absolute path before
 the runtime directory is isolated. Consequently the nested desktop cannot
 reuse a local session's Wayland socket or session bus. A local Plasma login may
 continue simultaneously.
+
+The profile is inherited instead of starting from Plasma defaults. Top-level
+configuration writes go to the temporary overlay and are discarded when the
+stream ends, so changing a panel, theme, or shortcut in the streamed session
+does not overwrite its local-session counterpart. Existing nested application
+profiles, files in the user's home, and XDG data directories are the real user
+files and remain persistent.
 
 Plasma is launched in its official classic mode because systemd boot mode would
 attach services to the host user manager. Stopping the Moonshine transient unit

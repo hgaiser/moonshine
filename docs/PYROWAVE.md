@@ -156,5 +156,15 @@ GPU/encode wait, packetization, send, and total server-side latency. PyroWave's
 GPU scaler is included in its submit/wait measurements; it does not use the
 separate Pixelforge conversion stage.
 
+On the compatible Moonlight client, `frames dropped by client frame queue`
+means a complete decoded frame arrived while the client's single pending-frame
+mailbox was still occupied. It is a client presentation/pacing metric, not a
+PyroWave capability failure. At 120 fps the entire decode-and-present path has
+only 8.33 ms per frame; a 60 Hz display also cannot present 120 unique frames.
+First retest at the panel's actual refresh rate (normally 60 fps), then reduce
+resolution or use SDR/4:2:0 if the counter still grows. Failure to initialize
+the PyroWave decoder, an invalid decode result, or a Vulkan device-loss error
+indicates an actual compatibility problem instead.
+
 Do not describe a mode as runtime-validated merely because its unit tests or
 build passed.
