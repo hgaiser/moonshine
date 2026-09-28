@@ -111,7 +111,11 @@ copy the compressed bitstream to host memory to send it over UDP. Imported
 images are cached by DMA-BUF open-file description plus dimensions, modifier,
 format, offsets, and strides. File descriptors are duplicated because the C API
 takes ownership. The compositor buffer is released only after PyroWave's
-packetization call has waited for the GPU encode.
+packetization call has waited for the GPU encode. If synchronous encode falls
+behind, the integration releases stale queued compositor frames and encodes the
+newest one instead of emitting a catch-up burst. Encoded output storage is
+reused, and the send stage applies backpressure until the batch has been handed
+to the UDP socket rather than accumulating frames in the packet channel.
 
 `pyrowave.rs` is the only unsafe boundary. It loads a narrow handwritten set of
 C symbols, validates the exact ABI, owns every device/encoder/image handle, and
@@ -157,13 +161,14 @@ GPU scaler is included in its submit/wait measurements; it does not use the
 separate Pixelforge conversion stage.
 
 On the compatible Moonlight client, `frames dropped by client frame queue`
-means a complete decoded frame arrived while the client's single pending-frame
-mailbox was still occupied. It is a client presentation/pacing metric, not a
-PyroWave capability failure. At 120 fps the entire decode-and-present path has
-only 8.33 ms per frame; a 60 Hz display also cannot present 120 unique frames.
-First retest at the panel's actual refresh rate (normally 60 fps), then reduce
-resolution or use SDR/4:2:0 if the counter still grows. Failure to initialize
-the PyroWave decoder, an invalid decode result, or a Vulkan device-loss error
+means a complete reassembled encoded frame arrived while the client's single
+pending-frame mailbox was still occupied; it is counted before decode. The
+mailbox intentionally retains the newest frame to bound latency. PyroWave uses
+Moonlight direct submit to avoid an additional 15-frame decode-unit queue, and
+the render thread waits for presentation capacity before latching the mailbox.
+At 120 fps the decode-and-present path still has only 8.33 ms per frame; a 60 Hz
+display also cannot present 120 unique frames. Failure to initialize the
+PyroWave decoder, an invalid decode result, or a Vulkan device-loss error
 indicates an actual compatibility problem instead.
 
 Do not describe a mode as runtime-validated merely because its unit tests or

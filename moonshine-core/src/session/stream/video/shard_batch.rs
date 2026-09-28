@@ -8,6 +8,8 @@ pub(crate) struct ShardBatch {
 	data: Vec<u8>,
 	/// Size of each shard in bytes.
 	shard_size: usize,
+	/// Optional low-latency completion signal used by synchronous producers.
+	send_completion: Option<std::sync::mpsc::SyncSender<std::time::Instant>>,
 }
 
 impl ShardBatch {
@@ -16,6 +18,7 @@ impl ShardBatch {
 		Self {
 			data: Vec::new(),
 			shard_size: 0,
+			send_completion: None,
 		}
 	}
 
@@ -43,6 +46,17 @@ impl ShardBatch {
 			self.shard_size = other.shard_size;
 		}
 		self.data.extend_from_slice(&other.data);
+	}
+
+	pub fn set_send_completion(&mut self, completion: std::sync::mpsc::SyncSender<std::time::Instant>) {
+		debug_assert!(self.send_completion.is_none());
+		self.send_completion = Some(completion);
+	}
+
+	pub fn notify_sent(&mut self) {
+		if let Some(completion) = self.send_completion.take() {
+			let _ = completion.send(std::time::Instant::now());
+		}
 	}
 }
 
@@ -122,6 +136,7 @@ impl ShardBuf {
 		ShardBatch {
 			data: self.data,
 			shard_size: self.stride,
+			send_completion: None,
 		}
 	}
 }
@@ -141,5 +156,20 @@ impl AsRef<[u8]> for ShardSlice<'_> {
 impl AsMut<[u8]> for ShardSlice<'_> {
 	fn as_mut(&mut self) -> &mut [u8] {
 		self.0
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn send_completion_is_signalled_once() {
+		let mut batch = ShardBatch::empty();
+		let (tx, rx) = std::sync::mpsc::sync_channel(1);
+		batch.set_send_completion(tx);
+		batch.notify_sent();
+		assert!(rx.try_recv().is_ok());
+		batch.notify_sent();
 	}
 }

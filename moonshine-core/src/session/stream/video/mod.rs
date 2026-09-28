@@ -112,7 +112,9 @@ pub struct FrameStats {
 	pub encode_wait: std::time::Duration,
 	/// Time spent packetizing the encoded data.
 	pub packetize: std::time::Duration,
-	/// Time spent sending the packets over the channel.
+	/// Time from packetization through packet-channel handoff. PyroWave waits
+	/// through the final UDP socket submission; conventional codecs currently
+	/// stop this measurement when the packet channel accepts the batch.
 	pub send: std::time::Duration,
 	/// Total end-to-end latency for this frame.
 	pub total: std::time::Duration,
@@ -335,7 +337,7 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Ok(Some(batch)) => {
+						Ok(Some(mut batch)) => {
 							if let Some(addr) = client_address {
 								if batch.shard_count() == 0 {
 									continue;
@@ -361,6 +363,7 @@ fn spawn_handle_video_packets(
 									Err(_) => break,
 								}
 							}
+							batch.notify_sent();
 						},
 						Ok(None) => {
 							tracing::debug!("Video packet channel closed.");

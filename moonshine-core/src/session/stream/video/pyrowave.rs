@@ -314,9 +314,9 @@ impl Drop for ImportedImage {
 	}
 }
 
-#[derive(Clone)]
 pub(crate) struct EncodedFrame {
 	pub data: Vec<u8>,
+	pub data_size: usize,
 	pub import: std::time::Duration,
 	pub submit: std::time::Duration,
 	pub encode_wait: std::time::Duration,
@@ -529,7 +529,7 @@ impl PyroWaveEncoder {
 		Ok(view)
 	}
 
-	pub(crate) fn encode(&mut self, frame: &ExportedFrame) -> Result<EncodedFrame, String> {
+	pub(crate) fn encode(&mut self, frame: &ExportedFrame, mut data: Vec<u8>) -> Result<EncodedFrame, String> {
 		let started = std::time::Instant::now();
 		let view = self.import(frame)?;
 		let imported = std::time::Instant::now();
@@ -597,8 +597,11 @@ impl PyroWaveEncoder {
 				"PyroWave frame cannot be represented by wire version 1 (produced {packet_count} codec packets)"
 			));
 		}
-		let mut packets = vec![Packet::default(); packet_count];
-		let mut data = vec![0u8; self.maximum_frame_bytes + 4096];
+		let mut packet = Packet::default();
+		let output_capacity = self.maximum_frame_bytes + 4096;
+		if data.len() != output_capacity {
+			data.resize(output_capacity, 0);
+		}
 		let mut written_packets = packet_count;
 		// SAFETY: output arrays are sized as requested by compute_num_packets;
 		// PyroWave validates the bitstream buffer capacity.
@@ -606,7 +609,7 @@ impl PyroWaveEncoder {
 			unsafe {
 				(self.device.api.packetize)(
 					self.handle,
-					packets.as_mut_ptr(),
+					&mut packet,
 					PYROWAVE_MAX_FRAME_BYTES,
 					&mut written_packets,
 					data.as_mut_ptr().cast(),
@@ -615,13 +618,13 @@ impl PyroWaveEncoder {
 			},
 			"reading the PyroWave bitstream",
 		)?;
-		if written_packets != 1 || packets[0].offset != 0 || packets[0].size < 8 || packets[0].size > data.len() {
+		if written_packets != 1 || packet.offset != 0 || packet.size < 8 || packet.size > data.len() {
 			return Err("PyroWave returned an invalid wire-v1 frame".to_string());
 		}
-		data.truncate(packets[0].size);
 		let ready = std::time::Instant::now();
 		Ok(EncodedFrame {
 			data,
+			data_size: packet.size,
 			import: imported.duration_since(started),
 			submit: submitted.duration_since(imported),
 			encode_wait: ready.duration_since(submitted),

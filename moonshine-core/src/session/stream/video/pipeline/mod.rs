@@ -19,7 +19,7 @@ use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetad
 use crate::session::manager::SessionShutdownReason;
 
 use crate::session::stream::video::packetizer::Packetizer;
-use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
+use crate::session::stream::video::pyrowave::{EncodedFrame, PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, FrameStats, NegotiatedVideoFormat, TransferFunction,
@@ -52,6 +52,10 @@ const MAX_FRAMES_IN_FLIGHT: usize = 3;
 const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
 /// SDR reference white for HDR transport, per ITU-R BT.2408 (203 cd/m²).
 const BT2408_SDR_REFERENCE_NITS: f32 = 203.0;
+
+fn rtp_timestamp_for_frame(frame_number: u32, fps: u32) -> u32 {
+	((u64::from(frame_number) * 90_000) / u64::from(fps.max(1))) as u32
+}
 
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
@@ -701,11 +705,21 @@ impl VideoPipelineInner {
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
 			};
 
-			let (encoded, created_at, buffer_index, channel_wait) = if let Some(frame) = received {
+			let (encoded, created_at, buffer_index, channel_wait) = if let Some(mut frame) = received {
+				// The encoder is synchronous. If it fell behind, consume only the
+				// newest queued compositor frame instead of encoding a stale burst.
+				while let Ok(newer) = frame_rx.try_recv() {
+					frame.consumed.store(true, Ordering::Release);
+					frame = newer;
+				}
 				let received_at = std::time::Instant::now();
 				let created_at = frame.created_at;
 				let buffer_index = frame.buffer_index;
-				let encoded = match encoder.encode(&frame) {
+				let reusable = last_encoded
+					.take()
+					.map(|encoded: EncodedFrame| encoded.data)
+					.unwrap_or_default();
+				let encoded = match encoder.encode(&frame, reusable) {
 					Ok(encoded) => encoded,
 					Err(error) => {
 						frame.consumed.store(true, Ordering::Release);
@@ -730,7 +744,6 @@ impl VideoPipelineInner {
 						}
 					});
 				}
-				last_encoded = Some(encoded.clone());
 				last_frame_time = std::time::Instant::now();
 				(
 					encoded,
@@ -739,7 +752,7 @@ impl VideoPipelineInner {
 					received_at.saturating_duration_since(created_at),
 				)
 			} else if resend_last {
-				let Some(encoded) = last_encoded.clone() else {
+				let Some(encoded) = last_encoded.take() else {
 					continue;
 				};
 				(
@@ -759,13 +772,13 @@ impl VideoPipelineInner {
 			frame_number = frame_number.wrapping_add(1);
 			let before_packetize = std::time::Instant::now();
 			let latency = (before_packetize.duration_since(created_at).as_micros() / 100).min(u16::MAX as u128) as u16;
-			let rtp_timestamp = frame_number.wrapping_mul(90_000 / ctx.fps.max(1));
+			let rtp_timestamp = rtp_timestamp_for_frame(frame_number, ctx.fps);
 			// Wire version 1 transports one complete encoded frame through the
 			// ordinary GameStream packetizer. The client reassembles the decode
 			// unit before passing it to PyroWave.
 			let shards = packetizer
 				.packetize(
-					&encoded.data,
+					&encoded.data[..encoded.data_size],
 					true,
 					ctx.packet_size,
 					ctx.minimum_fec_packets,
@@ -777,10 +790,23 @@ impl VideoPipelineInner {
 				)
 				.map_err(|()| "failed to packetize PyroWave frame".to_string())?;
 			let packetized = std::time::Instant::now();
+			let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
+			let mut shards = shards;
+			shards.set_send_completion(completion_tx);
 			packet_tx
 				.blocking_send(shards)
 				.map_err(|_| "video packet channel closed".to_string())?;
-			let sent = std::time::Instant::now();
+			let sent = loop {
+				match completion_rx.recv_timeout(frame_interval) {
+					Ok(sent) => break sent,
+					Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+						if !stop_session_manager.is_shutdown_triggered() => {},
+					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(()),
+					Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+						return Err("video packet sender stopped before sending PyroWave frame".to_string());
+					},
+				}
+			};
 			let stats = FrameStats {
 				channel_wait,
 				import: encoded.import,
@@ -791,7 +817,7 @@ impl VideoPipelineInner {
 				packetize: packetized.duration_since(before_packetize),
 				send: sent.duration_since(packetized),
 				total: sent.duration_since(created_at),
-				encoded_bytes: encoded.data.len(),
+				encoded_bytes: encoded.data_size,
 				is_key_frame: true,
 			};
 			tracing::trace!(
@@ -803,6 +829,7 @@ impl VideoPipelineInner {
 				"Sent PyroWave frame"
 			);
 			let _ = stats_tx.send(stats);
+			last_encoded = Some(encoded);
 		}
 		Ok(())
 	}
@@ -1320,7 +1347,10 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
-	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost};
+	use super::{
+		BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost,
+		rtp_timestamp_for_frame,
+	};
 	use ash::vk;
 	use pixelforge::{InputFormat, PixelForgeError};
 
@@ -1402,5 +1432,12 @@ mod tests {
 		assert_eq!(SCRGB_REFERENCE_WHITE_NITS, 80.0);
 		// ITU-R BT.2408: 203 cd/m² diffuse white for SDR-in-HDR.
 		assert_eq!(BT2408_SDR_REFERENCE_NITS, 203.0);
+	}
+
+	#[test]
+	fn pyrowave_rtp_timestamps_do_not_accumulate_integer_division_error() {
+		assert_eq!(rtp_timestamp_for_frame(165, 165), 90_000);
+		assert_eq!(rtp_timestamp_for_frame(144, 144), 90_000);
+		assert_eq!(rtp_timestamp_for_frame(240, 240), 90_000);
 	}
 }
