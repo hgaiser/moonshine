@@ -31,19 +31,24 @@ implicit fallback.
 ## Capability and negotiation extension
 
 The normal `ServerCodecModeSupport` bits retain their existing meanings. The
-PyroWave-aware extension adds:
+PyroWave-aware wire-v1 extension uses orthogonal chroma and HDR bits:
 
 | Bit | Mode |
 | ---: | --- |
-| `0x00800000` | PyroWave, 4:2:0, 8-bit intermediate |
-| `0x01000000` | PyroWave, 4:2:0, 10-bit intermediate |
-| `0x02000000` | PyroWave, 4:4:4, 8-bit intermediate |
-| `0x04000000` | PyroWave, 4:4:4, 10-bit intermediate |
+| `0x00800000` | PyroWave 4:2:0 |
+| `0x01000000` | PyroWave 4:4:4 |
+| `0x02000000` | PyroWave HDR10 (with either advertised chroma mode) |
 
-The server advertises a bit only after loading API 0.7.0, matching PyroWave to
-the selected Vulkan adapter, confirming external-memory interoperability, and
-creating the corresponding chroma encoder. Conventional codec bits are likewise
-set only after creating the exact Pixelforge pixel-format/bit-depth profile.
+The server advertises a chroma bit only after loading API 0.7.0, matching
+PyroWave to the selected Vulkan adapter, confirming external-memory
+interoperability, and creating the corresponding SDR encoder. It advertises the
+shared HDR bit only when every advertised chroma mode also passes its 10-bit
+probe. Conventional codec bits are likewise set only after creating the exact
+Pixelforge pixel-format/bit-depth profile.
+
+The DESCRIBE response contains `a=x-ss-pyrowave.version:1`, and a PyroWave
+ANNOUNCE must echo the same attribute. This prevents a client and server with
+different private framing rules from accidentally selecting the codec.
 
 A compatible client selects the following ANNOUNCE SDP attributes:
 
@@ -51,12 +56,13 @@ A compatible client selects the following ANNOUNCE SDP attributes:
 | --- | --- |
 | `x-nv-vqos[0].bitStreamFormat` | `0` H.264, `1` HEVC, `2` AV1, `3` PyroWave |
 | `x-ss-video[0].chromaSamplingType` | `0` 4:2:0, `1` 4:4:4 |
-| `x-moonshine-video[0].bitDepth` | `8` or `10` |
 | `x-nv-video[0].dynamicRangeMode` | `0` SDR, `1` HDR10 |
 | `x-nv-video[0].encoderCscMode` bit 0 | `0` limited, `1` full range |
+| `x-ss-pyrowave.version` | `1` |
 
-Legacy clients need no new attributes and retain the established SDR 8-bit or
-HDR10 10-bit defaults. Unsupported combinations are rejected with RTSP 415;
+Wire v1 uses an 8-bit intermediate for SDR and a 10-bit intermediate for HDR10.
+The optional Moonshine bit-depth attribute remains available to conventional
+codecs, but contradictory or unsupported PyroWave combinations are rejected;
 Moonshine does not silently fall back to another chroma, depth, or codec.
 
 PyroWave's current scaled RGB API always produces full-range YCbCr, so only
@@ -73,9 +79,10 @@ intermediate planes; HDR10 always uses the R16 path with BT.2020/PQ metadata.
 
 Moonshine passes the client's requested bitrate to conventional encoders. For
 PyroWave, whose current API exposes a per-frame maximum rather than a CBR
-target, Moonshine derives that maximum from `bitrate / frame_rate`, with a
-64 KiB floor for codec overhead and complex frames. The value is logged when
-the encoder starts. There is no separate low bitrate cap for 4:4:4 or HDR.
+target, Moonshine derives that maximum from `bitrate / frame_rate`, aligned
+down to a 32-bit word exactly as wire-v1 clients do. Valid budgets range from
+1 KiB to just under 3 MiB. The value is logged when the encoder starts. There
+is no separate low bitrate cap for 4:4:4 or HDR.
 
 Actual bandwidth is content- and codec-dependent, so resolution alone does not
 produce an honest fixed estimate. At the same quality target, 4:4:4 generally
@@ -83,8 +90,10 @@ needs more data than 4:2:0, HDR/R16 can need more than SDR/R8, 120 Hz allows
 twice as many frames as 60 Hz, and 4K contains four times as many pixels as
 1080p (1440p contains about 1.78 times as many). Size the requested bitrate and
 network headroom accordingly, then measure the real workload. GameStream adds
-the configured FEC percentage plus RTP/NvVideoPacket, optional encryption, and
-the four-byte PyroWave packet-length prefix.
+the configured FEC percentage plus RTP/NvVideoPacket and optional encryption.
+For an unusually large encoded frame that would need more than four FEC blocks,
+Moonshine disables FEC for that frame and spreads it over four blocks instead
+of dropping it.
 
 ## GPU path and ownership
 
@@ -110,35 +119,27 @@ destroys child resources before the library/device can unload.
 
 ## Transport extension
 
-PyroWave first divides a frame into independently decodable codec packets. Each
-codec packet maps to exactly one GameStream data shard and is never split or
-coalesced. The payload following the ordinary GameStream frame header is:
-
-```text
-u32 little-endian codec_packet_length
-codec_packet[codec_packet_length]
-zero padding to the negotiated shard payload size
-```
-
-The corresponding client removes the four-byte length and padding, then calls
-`pyrowave_decoder_push_packet()` once per recovered data shard. Existing
-Moonlight RTP/NvVideoPacket sequencing, encryption, multi-block FEC, and frame
-boundaries remain unchanged. Every PyroWave frame is independently decodable,
-so IDR requests resend the last complete PyroWave frame and reference-frame
-invalidation has no codec state to modify.
+Wire version 1 asks PyroWave for one contiguous encoded frame (up to 3 MiB) and
+sends those bytes through the ordinary GameStream packetizer. Moonlight performs
+its normal RTP/NvVideoPacket reassembly and gives the complete decode unit to
+`pyrowave_decoder_push_packet()`. There is no per-shard PyroWave length prefix
+or padding inside the encoded frame. Existing sequencing, encryption,
+multi-block FEC, and frame boundaries remain unchanged. Every PyroWave frame is
+independently decodable, so IDR requests resend the last complete PyroWave frame
+and reference-frame invalidation has no codec state to modify.
 
 ## Validation matrix
 
-The automated suite covers format independence, profile masks, range rejection,
-dependency provenance, DMA-BUF identity, color selection, and codec-packet
-transport boundaries. Hardware validation still must cover, on each supported
-driver/GPU:
+The automated suite covers format independence, wire-v1 capability masks,
+range rejection, dependency provenance, DMA-BUF identity, color selection, and
+large-frame transport layout. Hardware validation still must cover, on each
+supported driver/GPU:
 
 1. 1080p60 and 4K60/120 where supported.
-2. 4:2:0 SDR 8-bit and R16-intermediate SDR.
-3. 4:4:4 SDR 8-bit and R16-intermediate SDR.
-4. 4:2:0 HDR10 and 4:4:4 HDR10.
-5. Packet loss with FEC recovery and partial-frame decode.
+2. 4:2:0 SDR and HDR10.
+3. 4:4:4 SDR and HDR10.
+4. Full-range metadata and SDR/HDR mode changes.
+5. Packet loss, FEC recovery, and oversized keyframe delivery.
 6. Long-running bitrate, latency, VRAM, and imported-image cache stability.
 7. A decoder built from the same authoritative fork.
 

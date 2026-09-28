@@ -49,6 +49,7 @@ use smithay::wayland::relative_pointer::RelativePointerManagerState;
 use smithay::wayland::selection::data_device::DataDeviceState;
 use smithay::wayland::shell::xdg::XdgShellState;
 use smithay::wayland::shm::ShmState;
+use smithay::wayland::single_pixel_buffer::SinglePixelBufferState;
 use smithay::wayland::socket::ListeningSocketSource;
 use smithay::wayland::tablet_manager::TabletManagerState;
 use smithay::wayland::xdg_activation::XdgActivationState;
@@ -216,6 +217,8 @@ pub(crate) struct MoonshineCompositor {
 	/// Wayland `xdg-activation` state, the Wayland analog of X11's
 	/// `_NET_ACTIVE_WINDOW`: clients request focus through it.
 	pub activation_state: XdgActivationState,
+	/// Solid-color buffers used by nested compositors such as KWin.
+	pub single_pixel_buffer_state: SinglePixelBufferState,
 
 	// -- Rendering --
 	pub output: Output,
@@ -508,6 +511,7 @@ impl MoonshineCompositor {
 		let output_manager_state = OutputManagerState::new_with_xdg_output::<Self>(&display_handle);
 		let data_device_state = DataDeviceState::new::<Self>(&display_handle);
 		let activation_state = XdgActivationState::new::<Self>(&display_handle);
+		let single_pixel_buffer_state = SinglePixelBufferState::new::<Self>(&display_handle);
 		let xwayland_shell_state = XWaylandShellState::new::<Self>(&display_handle);
 		RelativePointerManagerState::new::<Self>(&display_handle);
 		PointerConstraintsState::new::<Self>(&display_handle);
@@ -647,6 +651,7 @@ impl MoonshineCompositor {
 				output_manager_state,
 				data_device_state,
 				activation_state,
+				single_pixel_buffer_state,
 				output,
 				damage_tracker,
 				allocator,

@@ -651,27 +651,17 @@ impl VideoPipelineInner {
 	) -> Result<(), String> {
 		let ctx = &self.context;
 		ctx.format.validate().map_err(str::to_string)?;
-		let packet_boundary = Packetizer::pyrowave_codec_packet_boundary(ctx.packet_size)
-			.ok_or_else(|| "negotiated packet size is too small for PyroWave transport framing".to_string())?;
 		let video_context = VideoContextBuilder::new()
 			.build()
 			.map_err(|e| format!("Failed to create Vulkan context for PyroWave adapter matching: {e}"))?;
-		let mut encoder = PyroWaveEncoder::new(
-			&video_context,
-			ctx.format,
-			ctx.width,
-			ctx.height,
-			ctx.bitrate,
-			ctx.fps,
-			packet_boundary,
-		)?;
+		let mut encoder =
+			PyroWaveEncoder::new(&video_context, ctx.format, ctx.width, ctx.height, ctx.bitrate, ctx.fps)?;
 		tracing::info!(
 			codec = "PyroWave",
 			chroma = %ctx.format.chroma,
 			bit_depth = ctx.format.bit_depth.bits(),
 			hdr = ctx.format.hdr,
 			maximum_frame_bytes = encoder.maximum_frame_bytes(),
-			packet_boundary,
 			pyrowave_source = SOURCE_URL,
 			pyrowave_revision = SOURCE_REVISION,
 			"Initialized zero-copy PyroWave encoder"
@@ -770,10 +760,13 @@ impl VideoPipelineInner {
 			let before_packetize = std::time::Instant::now();
 			let latency = (before_packetize.duration_since(created_at).as_micros() / 100).min(u16::MAX as u128) as u16;
 			let rtp_timestamp = frame_number.wrapping_mul(90_000 / ctx.fps.max(1));
+			// Wire version 1 transports one complete encoded frame through the
+			// ordinary GameStream packetizer. The client reassembles the decode
+			// unit before passing it to PyroWave.
 			let shards = packetizer
-				.packetize_pyrowave(
+				.packetize(
 					&encoded.data,
-					&encoded.packets,
+					true,
 					ctx.packet_size,
 					ctx.minimum_fec_packets,
 					self.config.fec_percentage,
@@ -805,7 +798,6 @@ impl VideoPipelineInner {
 				frame_number,
 				buffer_index,
 				encoded_bytes = stats.encoded_bytes,
-				pyrowave_packets = encoded.packets.len(),
 				encode_wait_us = stats.encode_wait.as_micros() as u64,
 				total_us = stats.total.as_micros() as u64,
 				"Sent PyroWave frame"

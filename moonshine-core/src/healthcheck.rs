@@ -64,17 +64,32 @@ pub const CODEC_HEVC_REXT_8444: u32 = 0x00080000;
 pub const CODEC_HEVC_REXT_10444: u32 = 0x00100000;
 pub const CODEC_AV1_HIGH_8444: u32 = 0x00200000;
 pub const CODEC_AV1_HIGH_10444: u32 = 0x00400000;
-/// Moonshine extension bits. Stock Moonlight ignores unknown bits; a
-/// PyroWave-capable client treats these as four independent profiles.
-pub const CODEC_PYROWAVE_420_8: u32 = 0x00800000;
-pub const CODEC_PYROWAVE_420_10: u32 = 0x01000000;
-pub const CODEC_PYROWAVE_444_8: u32 = 0x02000000;
-pub const CODEC_PYROWAVE_444_10: u32 = 0x04000000;
-pub const CODEC_PYROWAVE: u32 = CODEC_PYROWAVE_420_8;
+/// Private Sunshine/Moonlight wire-v1 extension bits. Chroma and HDR are
+/// orthogonal capabilities; SDR uses the 8-bit intermediate and HDR10 uses 10-bit.
+pub const CODEC_PYROWAVE: u32 = 0x00800000;
+pub const CODEC_PYROWAVE_444: u32 = 0x01000000;
+pub const CODEC_PYROWAVE_HDR: u32 = 0x02000000;
+pub const CODEC_PYROWAVE_MASK: u32 = CODEC_PYROWAVE | CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR;
 
 /// Test a negotiated mode against the exact combinations successfully probed
 /// at startup.  This intentionally has no codec-name-only shortcut.
 pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -> bool {
+	if format.codec == VideoCodec::PyroWave {
+		if format.range != crate::session::stream::video::ColorRange::Full {
+			return false;
+		}
+		let chroma_supported = match format.chroma {
+			ChromaFormat::Yuv420 => capabilities & CODEC_PYROWAVE != 0,
+			ChromaFormat::Yuv444 => capabilities & CODEC_PYROWAVE_444 != 0,
+		};
+		let dynamic_range_supported = match (format.bit_depth, format.hdr) {
+			(BitDepth::Eight, false) => true,
+			(BitDepth::Ten, true) => capabilities & CODEC_PYROWAVE_HDR != 0,
+			_ => false,
+		};
+		return chroma_supported && dynamic_range_supported;
+	}
+
 	let bit = match (format.codec, format.chroma, format.bit_depth) {
 		(VideoCodec::H264, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_H264,
 		(VideoCodec::H264, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_H264_HIGH_8444,
@@ -86,15 +101,6 @@ pub fn supports_video_format(capabilities: u32, format: NegotiatedVideoFormat) -
 		(VideoCodec::Av1, ChromaFormat::Yuv420, BitDepth::Ten) => CODEC_AV1_MAIN10,
 		(VideoCodec::Av1, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_AV1_HIGH_8444,
 		(VideoCodec::Av1, ChromaFormat::Yuv444, BitDepth::Ten) => CODEC_AV1_HIGH_10444,
-		// The fork's scaled RGB path emits full-range YCbCr. Refuse to advertise
-		// limited range rather than putting incorrect range metadata on the wire.
-		(VideoCodec::PyroWave, _, _) if format.range != crate::session::stream::video::ColorRange::Full => {
-			return false;
-		},
-		(VideoCodec::PyroWave, ChromaFormat::Yuv420, BitDepth::Eight) => CODEC_PYROWAVE_420_8,
-		(VideoCodec::PyroWave, ChromaFormat::Yuv420, BitDepth::Ten) => CODEC_PYROWAVE_420_10,
-		(VideoCodec::PyroWave, ChromaFormat::Yuv444, BitDepth::Eight) => CODEC_PYROWAVE_444_8,
-		(VideoCodec::PyroWave, ChromaFormat::Yuv444, BitDepth::Ten) => CODEC_PYROWAVE_444_10,
 		_ => return false,
 	};
 	capabilities & bit != 0
@@ -749,35 +755,24 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 	// library ABI, same-adapter creation, external-memory interop, and both
 	// chroma encoder configurations independently.
 	let mut pyrowave_errors = Vec::new();
-	for (chroma, depth, bit, label) in [
-		(
-			ChromaFormat::Yuv420,
-			BitDepth::Eight,
-			CODEC_PYROWAVE_420_8,
-			"PyroWave 4:2:0 8-bit",
-		),
-		(
-			ChromaFormat::Yuv420,
-			BitDepth::Ten,
-			CODEC_PYROWAVE_420_10,
-			"PyroWave 4:2:0 10-bit",
-		),
-		(
-			ChromaFormat::Yuv444,
-			BitDepth::Eight,
-			CODEC_PYROWAVE_444_8,
-			"PyroWave 4:4:4 8-bit",
-		),
-		(
-			ChromaFormat::Yuv444,
-			BitDepth::Ten,
-			CODEC_PYROWAVE_444_10,
-			"PyroWave 4:4:4 10-bit",
-		),
+	let mut pyrowave_420_8 = false;
+	let mut pyrowave_420_10 = false;
+	let mut pyrowave_444_8 = false;
+	let mut pyrowave_444_10 = false;
+	for (chroma, depth, label) in [
+		(ChromaFormat::Yuv420, BitDepth::Eight, "PyroWave 4:2:0 8-bit"),
+		(ChromaFormat::Yuv420, BitDepth::Ten, "PyroWave 4:2:0 10-bit"),
+		(ChromaFormat::Yuv444, BitDepth::Eight, "PyroWave 4:4:4 8-bit"),
+		(ChromaFormat::Yuv444, BitDepth::Ten, "PyroWave 4:4:4 10-bit"),
 	] {
 		match PyroWaveEncoder::is_available(ctx, chroma, depth) {
 			Ok(()) => {
-				supported |= bit;
+				match (chroma, depth) {
+					(ChromaFormat::Yuv420, BitDepth::Eight) => pyrowave_420_8 = true,
+					(ChromaFormat::Yuv420, BitDepth::Ten) => pyrowave_420_10 = true,
+					(ChromaFormat::Yuv444, BitDepth::Eight) => pyrowave_444_8 = true,
+					(ChromaFormat::Yuv444, BitDepth::Ten) => pyrowave_444_10 = true,
+				}
 				names.push(label);
 			},
 			Err(error) => {
@@ -785,6 +780,20 @@ fn check_codecs(report: &mut HealthReport, context: Option<&VideoContext>) {
 				pyrowave_errors.push(format!("{chroma} {}-bit: {error}", depth.bits()));
 			},
 		}
+	}
+	if pyrowave_420_8 {
+		supported |= CODEC_PYROWAVE;
+	}
+	if pyrowave_444_8 {
+		supported |= CODEC_PYROWAVE_444;
+	}
+	// The HDR flag is shared by every advertised chroma mode. Only advertise
+	// it when each SDR-capable mode also passed its 10-bit probe.
+	if (pyrowave_420_8 || pyrowave_444_8)
+		&& (!pyrowave_420_8 || pyrowave_420_10)
+		&& (!pyrowave_444_8 || pyrowave_444_10)
+	{
+		supported |= CODEC_PYROWAVE_HDR;
 	}
 	if pyrowave_errors.is_empty() {
 		report.add_passed(
@@ -1496,24 +1505,39 @@ mod tests {
 	}
 
 	#[test]
-	fn pyrowave_profiles_require_their_bit_and_full_range() {
-		let caps = CODEC_PYROWAVE_444_10;
+	fn pyrowave_profiles_require_chroma_hdr_bits_and_full_range() {
+		assert_eq!(CODEC_PYROWAVE, 0x00800000);
+		assert_eq!(CODEC_PYROWAVE_444, 0x01000000);
+		assert_eq!(CODEC_PYROWAVE_HDR, 0x02000000);
+		let caps = CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR;
 		assert!(supports_video_format(
 			caps,
+			NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, ColorRange::Full,)
+		));
+		assert!(!supports_video_format(
+			caps,
+			NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, ColorRange::Limited,)
+		));
+		assert!(!supports_video_format(
+			CODEC_PYROWAVE_444,
+			NegotiatedVideoFormat::hdr10(VideoCodec::PyroWave, ChromaFormat::Yuv444, ColorRange::Full)
+		));
+		assert!(supports_video_format(
+			CODEC_PYROWAVE,
 			NegotiatedVideoFormat::sdr(
 				VideoCodec::PyroWave,
-				ChromaFormat::Yuv444,
-				BitDepth::Ten,
+				ChromaFormat::Yuv420,
+				BitDepth::Eight,
 				ColorRange::Full,
 			)
 		));
 		assert!(!supports_video_format(
-			caps,
+			CODEC_PYROWAVE | CODEC_PYROWAVE_HDR,
 			NegotiatedVideoFormat::sdr(
 				VideoCodec::PyroWave,
-				ChromaFormat::Yuv444,
+				ChromaFormat::Yuv420,
 				BitDepth::Ten,
-				ColorRange::Limited,
+				ColorRange::Full,
 			)
 		));
 	}

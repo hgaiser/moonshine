@@ -4,8 +4,6 @@ use aes_gcm::{
 };
 use fec_rs::ReedSolomon;
 use std::collections::{HashMap, hash_map::Entry};
-use std::mem::size_of;
-use std::ops::Range;
 use std::time::Instant;
 
 use crate::session::SessionKeysReceiver;
@@ -14,6 +12,10 @@ use crate::session::stream::video::shard_batch::{ShardBatch, ShardBuf};
 
 /// Maximum allowed number of shards in the encoder (data + parity).
 pub(crate) const MAX_SHARDS: usize = 255;
+/// The GameStream FEC header allocates 10 bits to the data-shard count.
+const MAX_DATA_SHARDS_WITHOUT_FEC: usize = 1023;
+/// The GameStream multi-FEC header allocates two bits to the last block index.
+const MAX_FEC_BLOCKS: usize = 4;
 
 const NV_VIDEO_PACKET_SIZE: usize = 16;
 const RTP_HEADER_SIZE: usize = 12;
@@ -125,15 +127,6 @@ pub(crate) struct Packetizer {
 }
 
 impl Packetizer {
-	/// Maximum PyroWave codec-packet size that preserves a one-to-one mapping
-	/// to GameStream shards. Reserve the legacy frame header and our length
-	/// prefix in the first (smallest) shard.
-	pub fn pyrowave_codec_packet_boundary(requested_packet_size: usize) -> Option<usize> {
-		requested_packet_size
-			.checked_sub(NV_VIDEO_PACKET_SIZE)?
-			.checked_sub(VIDEO_FRAME_HEADER_SIZE + size_of::<u32>())
-	}
-
 	pub fn new(encrypt: bool, keys_rx: SessionKeysReceiver) -> Self {
 		Self {
 			fec_encoders: HashMap::new(),
@@ -188,45 +181,6 @@ impl Packetizer {
 		tracing::debug!("FEC encoder cache warmed with {} entries.", self.fec_encoders.len());
 	}
 
-	/// Packetize a PyroWave frame while retaining each codec packet as exactly
-	/// one GameStream data shard. The four-byte little-endian length prefix lets
-	/// the PyroWave client remove transport padding before calling
-	/// `pyrowave_decoder_push_packet`.
-	///
-	/// Wire payload (after the ordinary GameStream frame header on shard zero):
-	/// `u32 codec_packet_length | codec_packet | zero padding`.
-	#[allow(clippy::too_many_arguments)]
-	pub fn packetize_pyrowave(
-		&mut self,
-		encoded_data: &[u8],
-		codec_packets: &[Range<usize>],
-		requested_packet_size: usize,
-		minimum_fec_packets: u32,
-		fec_percentage: u8,
-		frame_number: u32,
-		sequence_number: &mut u32,
-		rtp_timestamp: u32,
-		frame_processing_latency: u16,
-	) -> Result<ShardBatch, ()> {
-		let payload_size = requested_packet_size
-			.checked_sub(NV_VIDEO_PACKET_SIZE)
-			.ok_or_else(|| tracing::warn!("PyroWave packet size is smaller than the transport header"))?;
-		let framed = frame_pyrowave_packets(encoded_data, codec_packets, payload_size)?;
-		// PyroWave frames are independently decodable; mark every one as a
-		// recovery frame in the legacy GameStream header.
-		self.packetize(
-			&framed,
-			true,
-			requested_packet_size,
-			minimum_fec_packets,
-			fec_percentage,
-			frame_number,
-			sequence_number,
-			rtp_timestamp,
-			frame_processing_latency,
-		)
-	}
-
 	/// Packetize an encoded frame into a batch of network-ready shards.
 	///
 	/// Returns a `ShardBatch` containing all data + parity shards packed
@@ -254,7 +208,17 @@ impl Packetizer {
 			is_key_frame
 		);
 
-		let requested_shard_payload_size = requested_packet_size - NV_VIDEO_PACKET_SIZE;
+		let requested_shard_payload_size =
+			requested_packet_size.checked_sub(NV_VIDEO_PACKET_SIZE).ok_or_else(|| {
+				tracing::warn!(
+					requested_packet_size,
+					"Video packet size is smaller than the transport header"
+				)
+			})?;
+		if requested_shard_payload_size == 0 {
+			tracing::warn!(requested_packet_size, "Video packet size leaves no room for a payload");
+			return Err(());
+		}
 		let packet_data_len = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
 		let last_shard_size = packet_data_len % requested_shard_payload_size;
 		let last_shard_size = if last_shard_size == 0 {
@@ -282,26 +246,17 @@ impl Packetizer {
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
 
-		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
-		if nr_data_shards > nr_data_shards_per_block * 4 {
-			tracing::warn!(
-				nr_data_shards,
-				max_data_shards = nr_data_shards_per_block * 4,
-				"Encoded frame exceeds the four-block GameStream transport limit"
-			);
-			return Err(());
-		}
-
-		// We need to subtract number of data shards by 1, otherwise you can get a situation where
-		// there are for example 100 data shards allowed per block and also 100 data shards available.
-		// In this case, nr_blocks = 100 / 100 + 1 = 2, but we only need to send 1 block.
-		// Subtracting the value of nr_data_shards by 1 avoids this situation.
-		let nr_blocks = (nr_data_shards - 1) / nr_data_shards_per_block + 1;
-		let last_block_index = (nr_blocks.min(4) as u8 - 1) << 6; // TODO: Why the bit shift? To 'force' a limit of 4 blocks?
+		let layout = packet_layout(nr_data_shards, fec_percentage)?;
+		let nr_blocks = layout.blocks;
+		let nr_data_shards_per_block = layout.data_shards_per_block;
+		let fec_percentage = layout.fec_percentage;
+		let disable_fec = layout.disable_fec;
+		let last_block_index = (nr_blocks as u8 - 1) << 6;
 
 		tracing::trace!(
-			"Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block."
+			nr_data_shards_per_block,
+			fec_percentage,
+			"Selected video FEC block layout"
 		);
 		tracing::trace!("Sending {nr_blocks} blocks of video data.");
 
@@ -317,21 +272,18 @@ impl Packetizer {
 
 		for block_index in 0..nr_blocks {
 			let start = block_index * nr_data_shards_per_block;
-			let mut end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
-
-			if block_index == 3 {
-				tracing::debug!(
-					"Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC."
-				);
-				end = nr_data_shards;
-			}
+			let end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
 
 			let nr_data_shards = end - start;
 			assert!(nr_data_shards != 0);
 
-			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize)
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
+			let nr_parity_shards = if disable_fec {
+				0
+			} else {
+				(nr_data_shards * fec_percentage as usize / 100)
+					.max(minimum_fec_packets as usize)
+					.min(MAX_SHARDS.saturating_sub(nr_data_shards))
+			};
 
 			let t_fec_encoder = Instant::now();
 			let encoder = if nr_parity_shards > 0 {
@@ -472,10 +424,6 @@ impl Packetizer {
 			total_extend_us += t_extend.elapsed().as_micros();
 
 			tracing::trace!("Finished sending frame {frame_number}.");
-
-			if block_index == 3 {
-				break;
-			}
 		}
 
 		tracing::trace!(
@@ -505,52 +453,48 @@ impl Packetizer {
 	}
 }
 
-/// Arrange codec packets so the generic packetizer's fixed-size cuts fall
-/// exactly between PyroWave packets. Shard zero has eight fewer bytes because
-/// the generic path prepends its `VideoFrameHeader` there.
-fn frame_pyrowave_packets(
-	encoded_data: &[u8],
-	codec_packets: &[Range<usize>],
-	shard_payload_size: usize,
-) -> Result<Vec<u8>, ()> {
-	if codec_packets.is_empty() || shard_payload_size <= VIDEO_FRAME_HEADER_SIZE + size_of::<u32>() {
-		tracing::warn!("Invalid PyroWave packet framing parameters");
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PacketLayout {
+	blocks: usize,
+	data_shards_per_block: usize,
+	fec_percentage: u8,
+	disable_fec: bool,
+}
+
+/// Select a transport layout compatible with Moonlight's four-block and
+/// 10-bit shard-count fields. Oversized keyframes are still deliverable: like
+/// Sunshine, disable FEC for that frame and spread it over all four blocks.
+fn packet_layout(nr_data_shards: usize, requested_fec_percentage: u8) -> Result<PacketLayout, ()> {
+	debug_assert!(nr_data_shards > 0);
+	let max_data_shards_per_fec_block = MAX_SHARDS * 100 / (100 + requested_fec_percentage as usize);
+	let fec_blocks_needed = nr_data_shards.div_ceil(max_data_shards_per_fec_block);
+
+	let (blocks, fec_percentage, disable_fec) = if fec_blocks_needed <= MAX_FEC_BLOCKS {
+		(fec_blocks_needed, requested_fec_percentage, false)
+	} else {
+		tracing::warn!(
+			nr_data_shards,
+			fec_blocks_needed,
+			"Skipping FEC for abnormally large encoded frame"
+		);
+		(MAX_FEC_BLOCKS, 0, true)
+	};
+	let data_shards_per_block = nr_data_shards.div_ceil(blocks);
+	if data_shards_per_block > MAX_DATA_SHARDS_WITHOUT_FEC {
+		tracing::error!(
+			nr_data_shards,
+			data_shards_per_block,
+			"Encoded frame exceeds the GameStream 10-bit shard-count limit"
+		);
 		return Err(());
 	}
-	let framed_len = codec_packets
-		.len()
-		.checked_mul(shard_payload_size)
-		.and_then(|len| len.checked_sub(VIDEO_FRAME_HEADER_SIZE))
-		.ok_or_else(|| tracing::warn!("PyroWave transport frame size overflow"))?;
-	let mut framed = Vec::with_capacity(framed_len);
-	for (index, range) in codec_packets.iter().enumerate() {
-		let capacity = if index == 0 {
-			shard_payload_size - VIDEO_FRAME_HEADER_SIZE
-		} else {
-			shard_payload_size
-		};
-		let Some(packet) = encoded_data.get(range.clone()) else {
-			tracing::warn!(
-				?range,
-				encoded_len = encoded_data.len(),
-				"Invalid PyroWave packet range"
-			);
-			return Err(());
-		};
-		if packet.len() + size_of::<u32>() > capacity || packet.len() > u32::MAX as usize {
-			tracing::warn!(
-				packet_len = packet.len(),
-				capacity,
-				"PyroWave codec packet does not fit its transport shard"
-			);
-			return Err(());
-		}
-		framed.extend_from_slice(&(packet.len() as u32).to_le_bytes());
-		framed.extend_from_slice(packet);
-		framed.resize(framed.len() + capacity - size_of::<u32>() - packet.len(), 0);
-	}
-	debug_assert_eq!(framed.len(), framed_len);
-	Ok(framed)
+
+	Ok(PacketLayout {
+		blocks,
+		data_shards_per_block,
+		fec_percentage,
+		disable_fec,
+	})
 }
 
 #[cfg(test)]
@@ -558,22 +502,30 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn pyrowave_packets_stay_on_transport_boundaries() {
-		let encoded: Vec<u8> = (0..10).collect();
-		let framed = frame_pyrowave_packets(&encoded, &[0..3, 3..10], 20).unwrap();
-		assert_eq!(framed.len(), 32); // two outer payloads minus legacy header
-		assert_eq!(&framed[0..4], &3u32.to_le_bytes());
-		assert_eq!(&framed[4..7], &encoded[0..3]);
-		assert!(framed[7..12].iter().all(|byte| *byte == 0));
-		assert_eq!(&framed[12..16], &7u32.to_le_bytes());
-		assert_eq!(&framed[16..23], &encoded[3..10]);
-		assert!(framed[23..].iter().all(|byte| *byte == 0));
+	fn ordinary_frames_keep_fec() {
+		let layout = packet_layout(400, 20).unwrap();
+		assert_eq!(layout.fec_percentage, 20);
+		assert!(!layout.disable_fec);
+		assert_eq!(layout.blocks, 2);
+		assert_eq!(layout.data_shards_per_block, 200);
 	}
 
 	#[test]
-	fn pyrowave_rejects_a_packet_that_would_cross_a_shard() {
-		let encoded = vec![0u8; 9];
-		let packets = std::iter::once(0..9).collect::<Vec<_>>();
-		assert!(frame_pyrowave_packets(&encoded, &packets, 20).is_err());
+	fn oversized_keyframes_use_four_blocks_without_fec() {
+		let layout = packet_layout(934, 20).unwrap();
+		assert_eq!(
+			layout,
+			PacketLayout {
+				blocks: 4,
+				data_shards_per_block: 234,
+				fec_percentage: 0,
+				disable_fec: true,
+			}
+		);
+	}
+
+	#[test]
+	fn frames_beyond_the_header_limit_are_rejected() {
+		assert!(packet_layout(MAX_DATA_SHARDS_WITHOUT_FEC * MAX_FEC_BLOCKS + 1, 20).is_err());
 	}
 }

@@ -6,7 +6,6 @@
 
 use std::collections::HashMap;
 use std::ffi::c_void;
-use std::ops::Range;
 use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
 use std::ptr;
@@ -24,10 +23,18 @@ use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
 
 pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
 pub(crate) const SOURCE_REVISION: &str = "e344479d6c0439e346c788a918ad5645713f7573";
+/// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
+const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 const API_VERSION: (u32, u32, u32) = (0, 7, 0);
 
 type ResultCode = i32;
 const SUCCESS: ResultCode = 0;
+
+fn wire_v1_frame_budget(bitrate: usize, fps: u32) -> Option<usize> {
+	let divisor = (fps as usize).checked_mul(8)?;
+	let bytes = bitrate.checked_div(divisor)? & !3;
+	(1024..=PYROWAVE_MAX_FRAME_BYTES - 8).contains(&bytes).then_some(bytes)
+}
 
 type DeviceHandle = *mut c_void;
 type EncoderHandle = *mut c_void;
@@ -310,7 +317,6 @@ impl Drop for ImportedImage {
 #[derive(Clone)]
 pub(crate) struct EncodedFrame {
 	pub data: Vec<u8>,
-	pub packets: Vec<Range<usize>>,
 	pub import: std::time::Duration,
 	pub submit: std::time::Duration,
 	pub encode_wait: std::time::Duration,
@@ -321,7 +327,6 @@ pub(crate) struct PyroWaveEncoder {
 	handle: EncoderHandle,
 	format: NegotiatedVideoFormat,
 	maximum_frame_bytes: usize,
-	packet_boundary: usize,
 	images: HashMap<RawFd, ImportedImage>,
 }
 
@@ -379,11 +384,17 @@ impl PyroWaveEncoder {
 		height: u32,
 		bitrate: usize,
 		fps: u32,
-		packet_boundary: usize,
 	) -> Result<Self, String> {
 		if format.range != ColorRange::Full {
 			return Err("PyroWave's scaled RGB path currently supports full-range output only".to_string());
 		}
+		let maximum_frame_bytes = wire_v1_frame_budget(bitrate, fps).ok_or_else(|| {
+			let bytes = bitrate
+				.checked_div((fps as usize).saturating_mul(8))
+				.unwrap_or_default()
+				& !3;
+			format!("PyroWave frame budget {bytes} is outside the wire-v1 range (1 KiB to 3 MiB)")
+		})?;
 		let api = Api::load()?;
 		let device = Device::for_video_context(api, context)?;
 		let info = EncoderCreateInfo {
@@ -404,13 +415,11 @@ impl PyroWaveEncoder {
 		if handle.is_null() {
 			return Err("PyroWave returned a null encoder".to_string());
 		}
-		let maximum_frame_bytes = bitrate.div_ceil(8).div_ceil(fps.max(1) as usize).max(64 * 1024);
 		Ok(Self {
 			device,
 			handle,
 			format,
 			maximum_frame_bytes,
-			packet_boundary,
 			images: HashMap::new(),
 		})
 	}
@@ -580,11 +589,13 @@ impl PyroWaveEncoder {
 		let mut packet_count = 0usize;
 		// SAFETY: packet_count is a valid out pointer; this waits for GPU work.
 		check(
-			unsafe { (self.device.api.compute_num_packets)(self.handle, self.packet_boundary, &mut packet_count) },
+			unsafe { (self.device.api.compute_num_packets)(self.handle, PYROWAVE_MAX_FRAME_BYTES, &mut packet_count) },
 			"computing PyroWave packet count",
 		)?;
-		if packet_count == 0 {
-			return Err("PyroWave produced no packets".to_string());
+		if packet_count != 1 {
+			return Err(format!(
+				"PyroWave frame cannot be represented by wire version 1 (produced {packet_count} codec packets)"
+			));
 		}
 		let mut packets = vec![Packet::default(); packet_count];
 		let mut data = vec![0u8; self.maximum_frame_bytes + 4096];
@@ -596,7 +607,7 @@ impl PyroWaveEncoder {
 				(self.device.api.packetize)(
 					self.handle,
 					packets.as_mut_ptr(),
-					self.packet_boundary,
+					PYROWAVE_MAX_FRAME_BYTES,
 					&mut written_packets,
 					data.as_mut_ptr().cast(),
 					data.len(),
@@ -604,24 +615,13 @@ impl PyroWaveEncoder {
 			},
 			"reading the PyroWave bitstream",
 		)?;
-		packets.truncate(written_packets);
-		let end = packets
-			.iter()
-			.map(|packet| packet.offset.saturating_add(packet.size))
-			.max()
-			.ok_or_else(|| "PyroWave returned an empty packet table".to_string())?;
-		if end > data.len() {
-			return Err("PyroWave returned an out-of-bounds packet table".to_string());
+		if written_packets != 1 || packets[0].offset != 0 || packets[0].size < 8 || packets[0].size > data.len() {
+			return Err("PyroWave returned an invalid wire-v1 frame".to_string());
 		}
-		data.truncate(end);
-		let ranges = packets
-			.into_iter()
-			.map(|packet| packet.offset..packet.offset + packet.size)
-			.collect();
+		data.truncate(packets[0].size);
 		let ready = std::time::Instant::now();
 		Ok(EncodedFrame {
 			data,
-			packets: ranges,
 			import: imported.duration_since(started),
 			submit: submitted.duration_since(imported),
 			encode_wait: ready.duration_since(submitted),
@@ -676,6 +676,15 @@ mod tests {
 		for fourcc in [0x34324241, 0x34325241, 0x30334241, 0x30335241, 0x48344241] {
 			assert!(drm_fourcc_to_vk(fourcc).is_ok());
 		}
+	}
+
+	#[test]
+	fn wire_v1_budget_matches_the_client_protocol() {
+		assert_eq!(wire_v1_frame_budget(200_000_000, 60), Some(416_664));
+		assert_eq!(wire_v1_frame_budget(1_000_000_000, 120), Some(1_041_664));
+		assert_eq!(wire_v1_frame_budget(2_000_000_000, 120), Some(2_083_332));
+		assert_eq!(wire_v1_frame_budget(2_000_000_000, 60), None);
+		assert_eq!(wire_v1_frame_budget(200_000_000, 0), None);
 	}
 
 	#[test]

@@ -11,7 +11,7 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use crate::ShutdownReason;
-use crate::healthcheck::supports_video_format;
+use crate::healthcheck::{CODEC_PYROWAVE_MASK, supports_video_format};
 use crate::session::manager::SessionManager;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::audio::AudioChannels;
@@ -23,7 +23,7 @@ use crate::session::stream::video::VideoDynamicRange;
 use crate::session::stream::video::VideoFormat;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
-use crate::session::stream::video::{BitDepth, ColorRange, NegotiatedVideoFormat, VideoChromaSampling};
+use crate::session::stream::video::{BitDepth, ColorRange, NegotiatedVideoFormat, VideoChromaSampling, VideoCodec};
 
 #[repr(u8)]
 enum ServerCapabilities {
@@ -142,15 +142,18 @@ impl RtspServer {
 		//       "<AUDIO STREAM MAPPING>"
 		let mut result = String::new();
 
-		result.push_str(&format!("a=x-ss-general.featureFlags:{}\n", self.capabilities()));
+		result.push_str(&format!("a=x-ss-general.featureFlags:{}\r\n", self.capabilities()));
 		result.push_str(&format!(
-			"a=x-ss-general.encryptionSupported:{}\n",
+			"a=x-ss-general.encryptionSupported:{}\r\n",
 			self.encryption_flags_supported()
 		));
-		result.push_str("sprop-parameter-sets=AAAAAU\n");
-		result.push_str("a=x-nv-video[0].refPicInvalidation:1\n");
-		result.push_str("a=rtpmap:98 AV1/90000\n");
-		result.push_str("a=fmtp:96 packetization-mode=1\n");
+		result.push_str("sprop-parameter-sets=AAAAAU\r\n");
+		result.push_str("a=x-nv-video[0].refPicInvalidation:1\r\n");
+		result.push_str("a=rtpmap:98 AV1/90000\r\n");
+		result.push_str("a=fmtp:96 packetization-mode=1\r\n");
+		if self.supported_codecs & CODEC_PYROWAVE_MASK != 0 {
+			result.push_str("a=x-ss-pyrowave.version:1\r\n");
+		}
 
 		// Emit surround-params for each Opus configuration.
 		// Moonlight selects the appropriate config at ANNOUNCE based on channel count and quality.
@@ -173,7 +176,7 @@ impl RtspServer {
 			for &m in mapping.iter().take(config.channels as usize) {
 				params.push_str(&format!("{}", m));
 			}
-			result.push_str(&format!("a=fmtp:97 surround-params={}\n", params));
+			result.push_str(&format!("a=fmtp:97 surround-params={}\r\n", params));
 		}
 
 		result
@@ -357,6 +360,12 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
+		if video_format == VideoCodec::PyroWave
+			&& get_optional_sdp_attribute::<String>(&sdp_session, "x-ss-pyrowave.version").as_deref() != Some("1")
+		{
+			tracing::warn!("Client requested PyroWave without the supported wire version 1");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		}
 
 		let dynamic_range: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].dynamicRangeMode").unwrap_or_default();

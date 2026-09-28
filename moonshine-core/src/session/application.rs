@@ -70,6 +70,7 @@ pub struct ApplicationConfig {
 	pub boxart: Option<PathBuf>,
 
 	/// The command to run.
+	#[serde(default)]
 	pub command: Vec<String>,
 
 	/// Commands to run before launching the application.
@@ -930,7 +931,6 @@ mod tests {
 			r#"
 title = "Desktop"
 type = "desktop"
-command = []
 
 [desktop]
 environment = "plasma"
@@ -939,6 +939,7 @@ scale = 1.5
 		)
 		.unwrap();
 		assert_eq!(config.kind, ApplicationKind::Desktop);
+		assert!(config.command.is_empty());
 		assert_eq!(config.desktop.environment, DesktopEnvironment::Plasma);
 		assert_eq!(config.desktop.scale, 1.5);
 		let serialized = toml::to_string(&config).unwrap();
