@@ -8,11 +8,11 @@ arch: amd64 # nfpm maps this per packager: amd64 (deb) / x86_64 (rpm)
 platform: linux
 version: ${VERSION}
 release: "1"
-maintainer: "Hans Gaiser <hansg91@gmail.com>"
+maintainer: "Pyroshine contributors"
 description: |
-  Streaming server for Moonlight clients, written in Rust.
-  Each streaming session runs in its own isolated compositor.
-homepage: "https://github.com/hgaiser/moonshine"
+  Pyroshine streaming server for Moonlight clients.
+  Adds PyroWave and managed Plasma sessions to Moonshine.
+homepage: "https://github.com/karsyboy/pyroshine"
 license: "BSD-2-Clause"
 
 contents:

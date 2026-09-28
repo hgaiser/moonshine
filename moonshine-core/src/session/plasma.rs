@@ -18,10 +18,10 @@ pub struct PlasmaSessionOptions {
 	pub inner: bool,
 }
 
-/// Run nested KWin and Plasma on Moonshine's Wayland output.
+/// Run nested KWin and Plasma on Pyroshine's Wayland output.
 ///
 /// The outer invocation creates a private XDG runtime/config overlay and D-Bus
-/// session, then re-executes Moonshine in `inner` mode. The overlay snapshots the
+/// session, then re-executes Pyroshine in `inner` mode. The overlay snapshots the
 /// user's top-level Plasma configuration and links its application profile
 /// directories, while directing Plasma session writes and the classic-startup
 /// override to private storage. The inner invocation starts KWin first.
@@ -46,9 +46,9 @@ pub async fn run(options: PlasmaSessionOptions) -> Result<(), String> {
 
 	let outer_runtime = std::env::var_os("XDG_RUNTIME_DIR")
 		.map(PathBuf::from)
-		.ok_or_else(|| "XDG_RUNTIME_DIR is not set for the Moonshine session".to_string())?;
+		.ok_or_else(|| "XDG_RUNTIME_DIR is not set for the Pyroshine session".to_string())?;
 	let outer_display = std::env::var_os("WAYLAND_DISPLAY")
-		.ok_or_else(|| "WAYLAND_DISPLAY is not set for the Moonshine compositor".to_string())?;
+		.ok_or_else(|| "WAYLAND_DISPLAY is not set for the Pyroshine compositor".to_string())?;
 	let outer_socket = if Path::new(&outer_display).is_absolute() {
 		PathBuf::from(outer_display)
 	} else {
@@ -56,7 +56,7 @@ pub async fn run(options: PlasmaSessionOptions) -> Result<(), String> {
 	};
 	if !outer_socket.exists() {
 		return Err(format!(
-			"Moonshine Wayland socket does not exist: {}",
+			"Pyroshine Wayland socket does not exist: {}",
 			outer_socket.display()
 		));
 	}
@@ -83,7 +83,7 @@ pub async fn run(options: PlasmaSessionOptions) -> Result<(), String> {
 	std::fs::write(config.join("startkderc"), b"[General]\nsystemdBoot=false\n")
 		.map_err(|e| format!("writing isolated Plasma startup config: {e}"))?;
 
-	let executable = std::env::current_exe().map_err(|e| format!("locating Moonshine executable: {e}"))?;
+	let executable = std::env::current_exe().map_err(|e| format!("locating Pyroshine executable: {e}"))?;
 	tracing::info!(
 		width = options.width,
 		height = options.height,
@@ -191,7 +191,7 @@ async fn run_inner(options: PlasmaSessionOptions) -> Result<(), String> {
 		.ok_or_else(|| "isolated Plasma process has no outer WAYLAND_DISPLAY".to_string())?;
 	let socket_name = format!("moonshine-plasma-{}", std::process::id());
 
-	// KWin is paced by frame callbacks from Moonshine's client-mode output;
+	// KWin is paced by frame callbacks from Pyroshine's client-mode output;
 	// that outer output already carries the client-selected refresh rate.
 	tracing::info!(
 		width = options.width,

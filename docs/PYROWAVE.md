@@ -1,6 +1,6 @@
-# PyroWave and explicit video formats
+# PyroWave architecture
 
-Moonshine treats codec, chroma sampling, bit depth, transfer function, color
+Pyroshine treats codec, chroma sampling, bit depth, transfer function, color
 primaries, matrix, range, and HDR state as independent negotiated properties.
 The conventional H.264, HEVC, and AV1 paths continue to use Pixelforge and
 Vulkan Video; PyroWave is a separate codec backend and never impersonates one
@@ -27,6 +27,18 @@ revision above in the Nix expression and build script, update `SOURCE_REVISION`
 and the required API version in `pyrowave.rs`, then run the full test suite and
 the manual GPU matrix below. Never substitute the Themaister repository as an
 implicit fallback.
+
+At runtime Pyroshine normally searches the loader paths for
+`libpyrowave-shared.so.0` and then `libpyrowave-shared.so`. Administrators and
+developers may set `MOONSHINE_PYROWAVE_LIBRARY` to one explicit library path
+for packaging tests or diagnostics. When set, no fallback path is attempted;
+the library must expose exactly C API 0.7.0.
+
+Two inherited video options are particularly useful on unusual networks:
+`stream.video.max_packet_size` caps a client's requested packet size, and
+`stream.video.log_frame_spikes = true` emits warnings for frames that exceed
+their time budget. Leave both at their defaults unless troubleshooting a known
+MTU or latency problem.
 
 ## Capability and negotiation extension
 
@@ -65,9 +77,9 @@ A compatible client selects the following ANNOUNCE SDP attributes:
 | `x-ss-pyrowave.version` | `1` |
 
 Wire v1 uses an 8-bit intermediate for SDR and a 10-bit intermediate for HDR10.
-The optional Moonshine bit-depth attribute remains available to conventional
+The optional Pyroshine bit-depth attribute remains available to conventional
 codecs, but contradictory or unsupported PyroWave combinations are rejected;
-Moonshine does not silently fall back to another chroma, depth, or codec.
+Pyroshine does not silently fall back to another chroma, depth, or codec.
 
 PyroWave's current scaled RGB API always produces full-range YCbCr, so only
 full-range PyroWave modes are advertised. Conventional codecs support either
@@ -76,14 +88,14 @@ clean output-range control in the fork's scaler; lying in bitstream metadata is
 not an acceptable workaround.
 
 PyroWave has floating-point decoded samples rather than a coded 8/10-bit
-profile. Moonshine's bit-depth selection controls the scaler's R8 or R16
+profile. Pyroshine's bit-depth selection controls the scaler's R8 or R16
 intermediate planes; HDR10 always uses the R16 path with BT.2020/PQ metadata.
 
 ## Bitrate and bandwidth
 
-Moonshine passes the client's requested bitrate to conventional encoders. For
+Pyroshine passes the client's requested bitrate to conventional encoders. For
 PyroWave, whose current API exposes a per-frame maximum rather than a CBR
-target, Moonshine derives that maximum from `bitrate / frame_rate`, aligned
+target, Pyroshine derives that maximum from `bitrate / frame_rate`, aligned
 down to a 32-bit word exactly as wire-v1 clients do. Valid budgets range from
 1 KiB to just under 3 MiB. The value is logged when the encoder starts. There
 is no separate low bitrate cap for 4:4:4 or HDR.
@@ -96,7 +108,7 @@ twice as many frames as 60 Hz, and 4K contains four times as many pixels as
 network headroom accordingly, then measure the real workload. GameStream adds
 the configured FEC percentage plus RTP/NvVideoPacket and optional encryption.
 For an unusually large encoded frame that would need more than four FEC blocks,
-Moonshine disables FEC for that frame and spreads it over four blocks instead
+Pyroshine disables FEC for that frame and spreads it over four blocks instead
 of dropping it.
 
 ## GPU path and ownership
@@ -104,13 +116,13 @@ of dropping it.
 The production data path is:
 
 ```text
-application -> Moonshine compositor GBM image -> DMA-BUF fd
+application -> Pyroshine compositor GBM image -> DMA-BUF fd
             -> PyroWave-owned Vulkan device on the same physical GPU
             -> imported VkImage in GENERAL layout -> GPU scaler/color transform
             -> GPU wavelet encode -> persistently mapped encoded bitstream
 ```
 
-There is no CPU framebuffer readback or CPU RGB/YUV conversion. Moonshine must
+There is no CPU framebuffer readback or CPU RGB/YUV conversion. Pyroshine must
 copy the compressed bitstream to host memory to send it over UDP. Imported
 images are cached by DMA-BUF open-file description plus dimensions, modifier,
 format, offsets, and strides. File descriptors are duplicated because the C API
@@ -164,16 +176,22 @@ GPU/encode wait, packetization, send, and total server-side latency. PyroWave's
 GPU scaler is included in its submit/wait measurements; it does not use the
 separate Pixelforge conversion stage.
 
-On the compatible Moonlight client, `frames dropped by client frame queue`
+On Moonlight Qt PyroWave, `frames dropped by client frame queue`
 means a complete reassembled encoded frame arrived while the client's single
 pending-frame mailbox was still occupied; it is counted before decode. The
 mailbox intentionally retains the newest frame to bound latency. PyroWave uses
-Moonlight direct submit to avoid an additional 15-frame decode-unit queue, and
-the render thread waits for presentation capacity before latching the mailbox.
-At 120 fps the decode-and-present path still has only 8.33 ms per frame; a 60 Hz
-display also cannot present 120 unique frames. Failure to initialize the
-PyroWave decoder, an invalid decode result, or a Vulkan device-loss error
-indicates an actual compatibility problem instead.
+Moonlight direct submit to avoid an additional 15-frame decode-unit queue. The
+render thread takes the newest complete frame, submits decode, and then waits
+for presentation capacity so GPU decode can overlap the swapchain wait.
+
+V-Sync remains a normal Moonlight user preference. If a high-refresh PyroWave
+stream is unexpectedly presentation-limited, test with Moonlight V-Sync
+disabled; this selects the lowest-latency present mode supported by the Vulkan
+driver. This is a troubleshooting step, not a universal requirement. At 120 fps
+the decode-and-present path still has only 8.33 ms per frame, and a 60 Hz
+display cannot present 120 unique frames. Failure to initialize the decoder, an
+invalid decode result, or Vulkan device loss indicates a compatibility problem
+rather than a pacing preference.
 
 Do not describe a mode as runtime-validated merely because its unit tests or
 build passed.

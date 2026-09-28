@@ -1,324 +1,182 @@
-[![CI](https://github.com/hgaiser/moonshine/actions/workflows/ci.yaml/badge.svg)](https://github.com/hgaiser/moonshine/actions)
+[![CI](https://github.com/karsyboy/pyroshine/actions/workflows/ci.yaml/badge.svg)](https://github.com/karsyboy/pyroshine/actions/workflows/ci.yaml)
 
-# Moonshine 🌙
+# Pyroshine
 
-Moonshine lets you stream games from your PC to any device running [Moonlight](https://moonlight-stream.org/).
-Your keyboard, mouse, and controller inputs are sent back to the host so you can play games remotely as if you were sitting in front of it.
+Pyroshine is a maintained Linux game-streaming server based on
+[Moonshine](https://github.com/hgaiser/moonshine). It preserves Moonshine's
+isolated, headless streaming architecture and conventional H.264, HEVC, and AV1
+support while adding native PyroWave streaming and a managed KDE Plasma 6
+desktop session.
+
+Pyroshine speaks the Moonlight/GameStream protocol. Standard Moonlight clients
+can use its conventional codecs; PyroWave requires
+[Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave) or
+another client implementing the same versioned extension.
+
+## Why this fork exists
+
+Moonshine provides a compact Rust host with a per-stream compositor. Pyroshine
+maintains the additional codec negotiation, zero-copy PyroWave encode path,
+transport handling, packaging, diagnostics, and desktop-session integration
+needed for this project's use cases. It is an independent community fork, not
+an official Moonshine or Moonlight release.
+
+The installed executable, systemd service, configuration directory, and Vulkan
+layer retain their `moonshine` names for compatibility with upstream tooling.
 
 ## Features
 
-- **Isolated streaming sessions**: Each stream runs in its own compositor, completely separate from your desktop environment. Your host PC can still be used for other things while you stream.
-- **No monitor required**: Works on headless servers — no HDMI dummy plug needed.
-- **GPU video encoding**: H.264, H.265, AV1, and optional PyroWave, with independently negotiated 4:2:0/4:4:4 and bit depth.
-- **HDR support**: True 10-bit HDR streaming for supported games.
-- **Headless Plasma 6 desktop**: Managed support for an isolated nested KWin/Plasma session sized for the client.
-- **Full input support**: Mouse, keyboard, touchscreen, pen/stylus, and gamepad (including motion, touchpad, and haptics).
-- **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
+- Native PyroWave 4:2:0 and 4:4:4 streaming in SDR and HDR10.
+- Hardware Vulkan encode with DMA-BUF import and no CPU pixel conversion.
+- H.264, HEVC, and AV1 through Moonshine's existing Vulkan Video pipeline.
+- Isolated headless sessions that do not take over the host desktop.
+- Managed nested KDE Plasma 6 desktop sessions sized to the client.
+- Low-latency stale-frame handling, multi-block FEC, encryption, and UDP GSO.
+- Mouse, keyboard, touch, pen, controller, motion, haptics, and surround audio.
+- Focused health checks and `moonshine-bench` latency/throughput reporting.
 
 ## Requirements
 
-1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and an install script for SteamOS. Tested on Arch Linux, but reported to work on other distributions too.
-1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
-1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
-1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
+- Linux with systemd and a working Wayland/Vulkan stack.
+- A GPU and driver supported by Moonshine/Pixelforge for conventional hardware
+  encoding.
+- For PyroWave: a hardware Vulkan GPU with the required compute, timeline
+  semaphore, external-memory, and DMA-BUF interoperability features. Software
+  Vulkan devices are intentionally rejected.
+- For the Desktop entry: KDE Plasma 6, KWin, Xwayland, D-Bus, PipeWire, and the
+  KDE desktop portal. See [docs/PLASMA.md](docs/PLASMA.md).
+- A Moonlight-compatible client. Use Moonlight Qt PyroWave for the PyroWave
+  codec; upstream Moonlight clients remain usable with conventional codecs.
+
+Run `moonshine healthcheck` after installation to see the exact capabilities
+available on the selected GPU.
 
 ## Installation
 
-### Arch
+Tagged builds are published on the
+[Pyroshine releases page](https://github.com/karsyboy/pyroshine/releases) as
+Debian and RPM packages plus a portable x86_64 archive. Package and service
+filenames currently use the compatible `moonshine` runtime name.
 
-The recommended method is to install through the AUR using:
-
-```
-yay -S moonshine-bin
-```
-
-After installing, follow the distro-agnostic [Enable the service](#enable-the-service) steps below.
-
-### Debian / Ubuntu (.deb)
-
-Download the latest `.deb` from the [releases page](https://github.com/hgaiser/moonshine/releases) and install it:
+### Debian or Ubuntu
 
 ```sh
 sudo apt install ./moonshine_*.deb
+sudo systemctl enable --now moonshine@$USER
 ```
 
-After installing, follow the [Enable the service](#enable-the-service) steps below.
-
-### Fedora / RHEL (.rpm)
-
-Download the latest `.rpm` from the [releases page](https://github.com/hgaiser/moonshine/releases) and install it:
+### Fedora or RHEL
 
 ```sh
 sudo dnf install ./moonshine-*.rpm
+sudo systemctl enable --now moonshine@$USER
 ```
 
-The package's post-install scripts set up udev rules, kernel modules, and the `moonshine` group automatically.
-After installing, follow the [Enable the service](#enable-the-service) steps below.
-
-### Nix
-
-This repository is also a nix flake, providing a package and a NixOS module that sets up the service for you.
-See [nix/README.md](nix/README.md) for instructions, or install just the package on any distro with:
+### SteamOS and other supported x86_64 systems
 
 ```sh
-nix profile install github:hgaiser/moonshine
+curl -fsSL https://github.com/karsyboy/pyroshine/releases/latest/download/moonshine-install.sh | bash
 ```
 
-After installing, follow the [Enable the service](#enable-the-service) steps below (the NixOS module handles this for you when enabled).
+The installer places the portable build under `/opt/moonshine` and installs the
+required systemd, udev, modules-load, Vulkan-layer, and polkit files.
 
-### Bazzite / Silverblue / Atomic distros
-
-On Fedora Atomic distros, download the `.rpm` from the [releases page](https://github.com/hgaiser/moonshine/releases) and layer it:
+For unattended headless use, enable lingering first:
 
 ```sh
-sudo rpm-ostree install ./moonshine-*.rpm
-sudo systemctl reboot
+sudo loginctl enable-linger "$USER"
 ```
 
-After reboot, follow the [Enable the service](#enable-the-service) steps below.
-
-### SteamOS
-
-Use the installer script:
+For headless gamepad access, add the streaming user to `input`, then log out and
+back in:
 
 ```sh
-curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash
+sudo usermod -aG input "$USER"
 ```
 
-This deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`. The installer registers these files with SteamOS so they persist across atomic updates.
+### NixOS
 
-### Enable the service
+The flake exports a package and `services.moonshine` module. See
+[nix/README.md](nix/README.md) for a complete configuration.
 
-These steps apply to every installation method above (the service is a systemd unit).
+### Build from source
 
-1. **Enable user lingering**:
-   ```sh
-   sudo loginctl enable-linger $USER
-   ```
-   This allows Moonshine to run applications in the user's session even when the user is not logged in (when running headless).
-
-   If your user is always logged in when you want to stream, you can skip this step.
-
-2. **Enable the service to start on boot and run immediately**:
-   ```sh
-   sudo systemctl enable --now moonshine@$USER
-   ```
-
-3. **Gamepad support when streaming headless** (no active desktop session): add your user to the `input` group, then log out and back in (or reboot) for it to take effect:
-   ```sh
-   sudo usermod -aG input $USER
-   ```
-   Moonshine creates a virtual gamepad per streamed controller, and the streamed game must be able to read it. When streaming while a desktop session is active, your user is already granted access to input devices as the active seat, so this step is not needed there. Run `moonshine healthcheck` to verify — it reports an `input group` warning if the group is missing.
-
-### Source
-
-The following dependencies are required to build and run:
+Install Rust plus the C/C++ and Linux development dependencies used by
+Moonshine, then build the pinned PyroWave library and the Rust workspace:
 
 ```sh
-# Build dependencies
-sudo pacman -S --asdeps \
-   clang \
-   cmake \
-   libc++ \
-   rust
-
-# Runtime dependencies
-sudo pacman -S \
-   gcc-libs \
-   glibc \
-   libevdev \
-   libxkbcommon \
-   mesa \
-   opus \
-   wayland
-```
-
-Then build:
-
-```sh
+./scripts/build-pyrowave.sh /tmp/pyrowave-src /tmp/pyrowave-install
+export LD_LIBRARY_PATH="/tmp/pyrowave-install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 cargo build --release --workspace
 ```
 
-Set up the environment:
+The release and Nix builds pin
+[`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave) at the revision
+documented in [docs/PYROWAVE.md](docs/PYROWAVE.md). Pyroshine checks the exact C
+API version at runtime and leaves conventional codecs available when the
+optional library cannot be loaded.
 
-```sh
-# Install uinput/uhid kernel modules
-sudo install -Dm644 dist/moonshine-modules.conf /usr/lib/modules-load.d/moonshine.conf
-sudo modprobe uinput uhid
+The upstream build still produces `target/release/moonshine` and
+`target/release/libmoonshine_wsi.so`. Follow Moonshine's system integration or
+the packaged files under `dist/` when installing a source build system-wide.
 
-# Install udev rules for input device access
-sudo install -Dm644 dist/60-moonshine.rules /usr/lib/udev/rules.d/60-moonshine.rules
-sudo udevadm control --reload-rules
+## Configuration and use
 
-# Install the Vulkan WSI layer for game rendering
-sudo install -Dm755 target/release/libmoonshine_wsi.so /usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so
-sudo install -Dm644 dist/VkLayer_moonshine_wsi.json /usr/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
-```
+Pyroshine reads the same TOML format and state locations as Moonshine. Packaged
+services use `~/.config/moonshine/config.toml`; a default file is created when
+the requested path does not exist.
 
-Then run:
-
-```sh
-cargo run --release -- /path/to/config.toml
-```
-
-## Configuration
-
-A configuration file is created automatically if the path you provide doesn't exist.
-When using the AUR package, it defaults to `$XDG_CONFIG_HOME/moonshine/config.toml`.
-
-### Pairing with a client
-
-When you connect with Moonlight for the first time, it will show a PIN.
-A notification will appear on the host that you can click to open the pairing page, or you can visit it manually at http://localhost:47989/pin .
-
-You can also pair from the command line:
-
-```sh
-curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
-```
-
-### Adding applications
-
-Each application runs in its own isolated streaming session. Add them to `config.toml` like this:
-
-```toml
-[[application]]
-title = "Steam"
-boxart = "/path/to/steam.png"  # optional
-command = ["/usr/bin/steam", "steam://open/bigpicture"]
-```
-
-- `title`: The name shown in Moonlight.
-- `boxart` (optional): Path to a cover image.
-- `command`: The command to run. First entry is the executable, the rest are arguments.
-- `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. Runs synchronously — the session waits for all to finish.
-- `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. Runs synchronously — the server waits for all to finish.
-
-Example:
+Add a normal application with:
 
 ```toml
 [[application]]
 title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
-pre_command = [
-    ["/usr/bin/systemctl", "stop", "conflicting.service"],
-]
-post_command = [
-    ["/usr/bin/systemctl", "start", "conflicting.service"],
-]
 ```
 
-For a complete isolated KDE Plasma 6 desktop, use `type = "desktop"`; Moonshine
-manages KWin, Plasma, its private D-Bus, display mode, input, audio, and
-lifecycle. See [docs/PLASMA.md](docs/PLASMA.md) for configuration, dependencies,
-architecture, and the runtime validation checklist.
-
-PyroWave-aware clients can negotiate the codec explicitly without affecting
-stock Moonlight clients. The authoritative fork pin, capability bits, SDP
-extension, packet framing, zero-copy Vulkan path, and limitations are specified
-in [docs/PYROWAVE.md](docs/PYROWAVE.md).
-
-### Application scanners
-
-Scanners automatically detect installed applications so you don't have to add them manually.
-
-**Steam scanner** — finds all installed Steam games:
+Add the managed desktop with:
 
 ```toml
-[[application_scanner]]
-type = "steam"
-library = "$HOME/.local/share/Steam"
-command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
-```
-
-**Desktop scanner** — finds applications from `.desktop` files:
-
-```toml
-[[application_scanner]]
+[[application]]
+title = "Desktop"
 type = "desktop"
-directories = [
-  "$HOME/.local/share/applications",
-  "/usr/share/applications",
-]
-include_terminal = false
-resolve_icons = true
+
+[application.desktop]
+environment = "plasma"
+scale = 1.0
 ```
 
-**Lutris scanner** — finds all installed Lutris games:
+Start the service, add the host in Moonlight, and enter the displayed pairing
+PIN at `http://localhost:47989/pin`. PyroWave clients negotiate the codec only
+when both sides advertise wire version 1; conventional clients are unaffected.
 
-```toml
-[[application_scanner]]
-type = "lutris"
-command = ["/usr/bin/lutris", "lutris:rungame/{slug}"]
-```
+Do not expose Pyroshine directly to the public internet. Use it on a trusted LAN
+or through a VPN and restrict the GameStream ports with a firewall.
 
-Games are matched by their Lutris slug.
-Box art is automatically loaded from Lutris's `coverart/` directory when available.
-The default database path is `~/.local/share/lutris/pga.db`.
-You can override it with the `pga_db` option to point at a custom database location.
+## Documentation
 
-**Heroic scanner** — finds all installed [Heroic Games Launcher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) games (Epic, GOG, Amazon and manually added games):
+- [PyroWave architecture, negotiation, dependency pin, and validation](docs/PYROWAVE.md)
+- [Managed Plasma 6 desktop architecture and setup](docs/PLASMA.md)
+- [NixOS package and module](nix/README.md)
+- [Tips and troubleshooting](TIPS.md)
 
-```toml
-[[application_scanner]]
-type = "heroic"
-command = ["heroic", "--no-gui", "heroic://launch?appName={app_name}&runner={runner}"]
-```
+Advanced options such as `MOONSHINE_PYROWAVE_LIBRARY`, packet-size caps,
+benchmarking, and manual GPU validation live in the detailed documents rather
+than the quick-start path.
 
-If you installed Heroic from Flathub, launch it through Flatpak instead:
+## Upstream
 
-```toml
-[[application_scanner]]
-type = "heroic"
-command = [
-  "dbus-run-session", "--",
-  "flatpak", "run", "com.heroicgameslauncher.hgl",
-  "--no-gui", "heroic://launch?appName={app_name}&runner={runner}",
-]
-```
+Pyroshine is derived from [Moonshine](https://github.com/hgaiser/moonshine) and
+retains its architecture, protocol implementation, runtime naming, and much of
+its documentation. Credit for that work belongs to Moonshine's authors and
+contributors. Pyroshine-specific changes are maintained in this repository;
+they should not be presented as upstream Moonshine features.
 
-The `dbus-run-session` prefix keeps the game inside Moonshine's compositor instead of on your desktop.
-See [TIPS.md](TIPS.md) for why Flatpak needs it.
+Moonshine in turn builds on the Moonlight ecosystem and work pioneered by
+[Sunshine](https://github.com/LizardByte/Sunshine).
 
-`{app_name}` is Heroic's internal game id and `{runner}` is the store it came from (`legendary` for Epic, `gog` for GOG, `nile` for Amazon, `sideload` for manually added games).
-Commands are resolved against Moonshine's own `PATH`, which under the packaged systemd service is systemd's default rather than your login shell's.
-A bare `heroic` therefore works for packages that install into `/usr/bin`, but not for an AppImage or anything under `~/.local/bin`; use an absolute path in those cases.
-Box art is automatically loaded from Heroic's `images-cache/` directory for any art Heroic has already downloaded.
+## License and acknowledgements
 
-The default configuration directory is `~/.config/heroic`, falling back to `~/.var/app/com.heroicgameslauncher.hgl/config/heroic` when only the Flatpak is installed.
-You can override it with the `config_dir` option.
-
-## Tips & Tricks
-
-See [TIPS.md](TIPS.md) for practical recipes and workarounds.
-
-## FAQ
-
-1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**
-   - Sunshine supports more platforms and has more features overall. Moonshine is Linux-only.
-   - Moonshine runs each streaming session in its own isolated environment, separate from your desktop. This means your host PC stays usable while you stream, and it works without an active desktop session.
-2. **Can I use Moonshine to stream to two clients simultaneously?**
-
-   This is currently not a supported feature and not a focus of Moonshine. If you are interested in adding support for this, feel free to open an issue or discuss on [Discord](https://discord.com/invite/moonlight-stream-352065098472488960).
-
-3. **How do I run the healthcheck?**
-
-   Run `moonshine healthcheck` to check GPU capabilities, codec support, and port availability. Pass `--config <path>` to also check configured ports and GPU preferences.
-
-## Security
-
-Moonshine is **not designed for use on public networks**.
-The underlying GameStream protocol has limitations that mean traffic is not fully encrypted at the application level.
-
-If you need to stream over the internet, use a VPN such as [Tailscale](https://tailscale.com/), [WireGuard](https://www.wireguard.com/), or [ZeroTier](https://www.zerotier.com/).
-
-**Do not expose Moonshine ports directly to the internet.**
-
-## Acknowledgement
-
-This wouldn't have been possible without the incredible work by the people behind the following projects:
-
-1. [Moonlight](https://moonlight-stream.org/), without it there would be no client for Moonshine.
-2. [Sunshine](https://github.com/LizardByte/Sunshine), which laid a lot of the groundwork for the host part of the API.
-3. [Inputtino](https://github.com/games-on-whales/inputtino), for a thorough implementation of input devices.
-4. [magic-mirror](https://github.com/colinmarc/magic-mirror), for inspiration of using Vulkan and a Wayland compositor for headless streaming.
+Pyroshine remains licensed under the [BSD 2-Clause License](LICENSE). The
+original Moonshine copyright and license notices are preserved. PyroWave and
+other dependencies retain their own licenses and notices.

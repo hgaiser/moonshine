@@ -428,6 +428,23 @@ impl PyroWaveEncoder {
 		if handle.is_null() {
 			return Err("PyroWave returned a null encoder".to_string());
 		}
+		let metadata = ColorMetadata {
+			color_primaries: u32::from(format.primaries == ColorPrimaries::Bt2020),
+			transfer_function: u32::from(format.transfer == TransferFunction::Pq),
+			ycbcr_transform: u32::from(format.matrix == MatrixCoefficients::Bt2020Ncl),
+			ycbcr_range: u32::from(format.range == ColorRange::Limited),
+			chroma_siting: 0,
+		};
+		// The negotiated format is immutable for the encoder lifetime, so set its
+		// bitstream metadata once before the first submission.
+		if let Err(error) = check(
+			unsafe { (device.api.set_color_metadata)(handle, &metadata) },
+			"setting PyroWave color metadata",
+		) {
+			// SAFETY: the handle was created above and no encode is pending.
+			unsafe { (device.api.destroy_encoder)(handle) };
+			return Err(error);
+		}
 		Ok(Self {
 			device,
 			handle,
@@ -582,22 +599,6 @@ impl PyroWaveEncoder {
 			"submitting the PyroWave GPU encode",
 		)?;
 		let submitted = std::time::Instant::now();
-
-		// The scaled path chooses the transform, but setting the metadata here
-		// makes the negotiated primaries/range explicit and guards future API
-		// changes. The current production path accepts full range only.
-		let metadata = ColorMetadata {
-			color_primaries: u32::from(self.format.primaries == ColorPrimaries::Bt2020),
-			transfer_function: u32::from(self.format.transfer == TransferFunction::Pq),
-			ycbcr_transform: u32::from(self.format.matrix == MatrixCoefficients::Bt2020Ncl),
-			ycbcr_range: u32::from(self.format.range == ColorRange::Limited),
-			chroma_siting: 0,
-		};
-		// SAFETY: encoder and metadata are valid for the call.
-		check(
-			unsafe { (self.device.api.set_color_metadata)(self.handle, &metadata) },
-			"setting PyroWave color metadata",
-		)?;
 
 		let mut packet_count = 0usize;
 		// SAFETY: packet_count is a valid out pointer; this waits for GPU work.

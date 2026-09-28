@@ -23,7 +23,7 @@ impl TryFrom<u32> for VideoCodec {
 			0 => Ok(Self::H264),
 			1 => Ok(Self::Hevc),
 			2 => Ok(Self::Av1),
-			// Moonshine extension.  This value is only sent by a client which
+			// Pyroshine extension. This value is only sent by a client which
 			// advertised the PyroWave extension; it never impersonates AV1/HEVC.
 			3 => Ok(Self::PyroWave),
 			_ => Err(()),

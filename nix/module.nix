@@ -1,4 +1,4 @@
-# NixOS module for the Moonshine game streaming server.
+# NixOS module for the Pyroshine game streaming server.
 #
 # Runs moonshine as a *system* service on behalf of a regular user (upstream's
 # moonshine@.service template, with start-moonshine.sh's env bootstrapping done
@@ -43,7 +43,7 @@ let
 in
 {
   options.services.moonshine = {
-    enable = lib.mkEnableOption "Moonshine, a game streaming server for Moonlight clients";
+    enable = lib.mkEnableOption "Pyroshine, a game streaming server for Moonlight clients";
 
     package = lib.mkPackageOption pkgs "moonshine" { };
 
@@ -77,7 +77,7 @@ in
       default = { };
       example = lib.literalExpression ''
         {
-          name = "Moonshine";
+          name = "Pyroshine";
           application = [
             {
               title = "Steam";
@@ -87,11 +87,11 @@ in
         }
       '';
       description = ''
-        Moonshine configuration, generated into a TOML file in the store and
+        Pyroshine configuration, generated into a TOML file in the store and
         passed to the daemon. Settings left out fall back to upstream's
         defaults (note: the default application list points at
         `/usr/bin/steam`, so you will want to at least set `application`).
-        See <https://github.com/hgaiser/moonshine> for the format.
+        See <https://github.com/karsyboy/pyroshine> for the format.
       '';
     };
 
@@ -113,7 +113,7 @@ in
       description = ''
         Open the GameStream ports in the firewall: HTTP pairing/discovery,
         HTTPS, and RTSP over TCP; video/control/audio over UDP. Port numbers
-        follow {option}`services.moonshine.settings` where set. Moonshine is
+        follow {option}`services.moonshine.settings` where set. Pyroshine is
         not designed for public networks — only enable this on a LAN or
         VPN-facing firewall.
       '';
@@ -195,7 +195,7 @@ in
     users.users.${cfg.user}.linger = true;
 
     systemd.services.moonshine = {
-      description = "Moonshine game streaming server (Moonlight protocol)";
+      description = "Pyroshine game streaming server (Moonlight protocol)";
       wantedBy = [ "multi-user.target" ];
       # The user manager owns the runtime dir, session bus, and the transient
       # units moonshine launches apps as (moonshine-session.service).

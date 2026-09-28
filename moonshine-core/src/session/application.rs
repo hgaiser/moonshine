@@ -210,7 +210,7 @@ impl Application {
 						return Err(());
 					}
 					let executable = std::env::current_exe()
-						.map_err(|error| tracing::error!(%error, "Could not locate the Moonshine executable"))?;
+						.map_err(|error| tracing::error!(%error, "Could not locate the Pyroshine executable"))?;
 					vec![
 						executable.to_string_lossy().into_owned(),
 						"plasma-session".to_string(),

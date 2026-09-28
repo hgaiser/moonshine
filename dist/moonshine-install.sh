@@ -68,7 +68,7 @@ prompt_text() {
 # --- help ---
 
 print_help() {
-  echo "moonshine-install.sh — install moonshine"
+  echo "moonshine-install.sh — install Pyroshine (moonshine runtime)"
   echo ""
   echo "Options:"
   echo "  --uninstall      Remove moonshine completely"
@@ -167,16 +167,16 @@ fi
 VERSION="__VERSION__"
 if [[ "$VERSION" == "__VERSION__" ]]; then
   info "Resolving latest release"
-  VERSION=$(curl -fsSL "https://api.github.com/repos/hgaiser/moonshine/releases/latest" \
+  VERSION=$(curl -fsSL "https://api.github.com/repos/karsyboy/pyroshine/releases/latest" \
     | grep -oP '"tag_name":\s*"\K[^"]+')
   if [[ -z "$VERSION" ]]; then
     die "could not resolve latest version from GitHub API"
   fi
 fi
 
-info "Installing moonshine ${VERSION}"
+info "Installing Pyroshine ${VERSION}"
 
-URL="https://github.com/hgaiser/moonshine/releases/download/${VERSION}/moonshine-${VERSION}-linux-amd64.tar.zst"
+URL="https://github.com/karsyboy/pyroshine/releases/download/${VERSION}/moonshine-${VERSION}-linux-amd64.tar.zst"
 step "Downloading ${DIM}${URL}${RESET}"
 TMPFILE="$(mktemp)"
 curl -fsSL --retry 3 -o "$TMPFILE" "$URL"
@@ -339,7 +339,7 @@ sudo bash -c "$(printf '%s\n' "${CMDS[@]}")"
 # Cleanup temp files
 rm -rf "$TMPDIR" "$TMPFILE"
 
-ok "moonshine ${VERSION} installed"
+ok "Pyroshine ${VERSION} installed"
 
 if [[ "$ENABLE_ON_BOOT" != "true" ]] && [[ "$START_NOW" != "true" ]]; then
   echo ""

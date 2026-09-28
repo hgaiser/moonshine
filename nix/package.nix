@@ -167,8 +167,8 @@ rustPlatform.buildRustPackage {
   '';
 
   meta = {
-    description = "Streaming server for Moonlight clients, written in Rust";
-    homepage = "https://github.com/hgaiser/moonshine";
+    description = "Pyroshine server with PyroWave and managed Plasma sessions";
+    homepage = "https://github.com/karsyboy/pyroshine";
     license = lib.licenses.bsd2;
     platforms = [
       "x86_64-linux"

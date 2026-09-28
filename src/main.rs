@@ -172,7 +172,7 @@ async fn main() -> Result<(), ()> {
 	});
 
 	let moonshine = Moonshine::new(config, supported_codecs, hdr_supported, shutdown.clone())?;
-	tracing::info!("Moonshine is ready and waiting for connections.");
+	tracing::info!("Pyroshine is ready and waiting for connections.");
 
 	shutdown.wait_shutdown_triggered().await;
 	drop(moonshine);

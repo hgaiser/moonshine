@@ -1,17 +1,19 @@
-# Moonshine on NixOS ❄️
+# Pyroshine on NixOS
 
-This directory contains a [nix flake](https://wiki.nixos.org/wiki/Flakes) that builds Moonshine and provides a NixOS module for running it as a service.
+This directory contains a [Nix flake](https://wiki.nixos.org/wiki/Flakes) that
+builds Pyroshine and provides a NixOS module for running it as a service. The
+package, executable, and module retain the upstream `moonshine` names.
 
 ## What you get
 
 - **A package**: the `moonshine` binary, the moonshine-wsi Vulkan layer, and the udev rules, built from this repository.
 - **A NixOS module**: a `services.moonshine` service that takes care of everything from the [installation steps](../README.md#installation): lingering, kernel modules, device permissions, and the systemd service.
-- **A dev shell**: the full build environment for working on Moonshine.
+- **A dev shell**: the full build environment for working on Pyroshine.
 
 ## Building
 
 ```sh
-nix build github:hgaiser/moonshine
+nix build github:karsyboy/pyroshine
 ./result/bin/moonshine --help
 ```
 
@@ -20,7 +22,7 @@ nix build github:hgaiser/moonshine
 Add the flake to the inputs of your system flake:
 
 ```nix
-inputs.moonshine.url = "github:hgaiser/moonshine";
+inputs.pyroshine.url = "github:karsyboy/pyroshine";
 ```
 
 Then import the module and enable the service in your configuration:
@@ -28,7 +30,7 @@ Then import the module and enable the service in your configuration:
 ```nix
 { inputs, ... }:
 {
-  imports = [ inputs.moonshine.nixosModules.default ];
+  imports = [ inputs.pyroshine.nixosModules.default ];
 
   services.moonshine = {
     enable = true;
@@ -70,7 +72,9 @@ users.users.alice.extraGroups = [ "input" ];
 
 When streaming while a desktop session is active this is not required — the active seat user is granted access to input devices via ACLs.
 
-Settings you leave out fall back to Moonshine's defaults. Note that the default application list points at `/usr/bin/steam`, which doesn't exist on NixOS, so you will want to set `application` as shown above.
+Settings you leave out fall back to Pyroshine's inherited defaults. Note that
+the default application list points at `/usr/bin/steam`, which does not exist
+on NixOS, so set `application` as shown above.
 
 ## Development
 

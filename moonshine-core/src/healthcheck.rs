@@ -612,7 +612,7 @@ fn check_egl(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(Strin
 
 fn check_vulkan(report: &mut HealthReport) -> Option<VideoContext> {
 	let start = Instant::now();
-	match VideoContextBuilder::new().app_name("Moonshine Health Check").build() {
+	match VideoContextBuilder::new().app_name("Pyroshine Health Check").build() {
 		Ok(ctx) => {
 			let props = ctx.device_properties();
 			let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }

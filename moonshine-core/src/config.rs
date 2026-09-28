@@ -108,7 +108,7 @@ impl Config {
 impl Default for Config {
 	fn default() -> Self {
 		Self {
-			name: "Moonshine".to_string(),
+			name: "Pyroshine".to_string(),
 			// IPv4-only by default; set to `::` to bind dual-stack (the webserver
 			// disables IPV6_V6ONLY, so that single address covers both).
 			address: "0.0.0.0".to_string(),

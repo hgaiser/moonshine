@@ -7,7 +7,7 @@
 }:
 
 let
-  # Authoritative Moonshine source. Never replace this with Themaister's
+  # Authoritative Pyroshine source. Never replace this with Themaister's
   # upstream repository: the fork carries the color-metadata API used here.
   sourceUrl = "https://github.com/karsyboy/pyrowave";
   sourceRevision = "e344479d6c0439e346c788a918ad5645713f7573";
@@ -33,7 +33,7 @@ let
   };
 in
 stdenv.mkDerivation {
-  pname = "pyrowave-moonshine";
+  pname = "pyrowave-pyroshine";
   version = "0.7.0-${builtins.substring 0 8 sourceRevision}";
   inherit src;
 
@@ -60,11 +60,11 @@ stdenv.mkDerivation {
   ];
 
   # Runtime tests need a Vulkan GPU; the fork's CPU-only packet validation is
-  # exercised by its own CI and Moonshine checks its ABI at startup.
+  # exercised by its own CI and Pyroshine checks its ABI at startup.
   doCheck = false;
 
   meta = {
-    description = "Pinned PyroWave build for Moonshine";
+    description = "Pinned PyroWave build for Pyroshine";
     homepage = sourceUrl;
     license = lib.licenses.mit;
     platforms = lib.platforms.linux;

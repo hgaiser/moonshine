@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Reproducible build of Moonshine's authoritative PyroWave dependency.
+# Reproducible build of Pyroshine's authoritative PyroWave dependency.
 SOURCE_URL="https://github.com/karsyboy/pyrowave"
 SOURCE_REVISION="e344479d6c0439e346c788a918ad5645713f7573"
 GRANITE_REVISION="1b2d1801d2910fb09ebcded2f0bb3a3a781103b5"
