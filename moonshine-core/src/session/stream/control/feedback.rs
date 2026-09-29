@@ -71,7 +71,9 @@ impl SetLedCommand {
 	pub fn as_packet(&self) -> [u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH] {
 		let mut buffer = [0u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH];
 
-		buffer[0..2].copy_from_slice(&(ControlMessageType::SetRgbLed as u16).to_le_bytes());
+		// 0x5502 is direction-dependent: host->client RGB feedback and
+		// client->host Sunshine frame-FEC status share the same packet type.
+		buffer[0..2].copy_from_slice(&(ControlMessageType::FrameFecStatus as u16).to_le_bytes());
 		buffer[2..4].copy_from_slice(&(Self::PAYLOAD_LENGTH as u16).to_le_bytes());
 		buffer[4..6].copy_from_slice(&self.id.to_le_bytes());
 		buffer[6] = self.rgb.0;

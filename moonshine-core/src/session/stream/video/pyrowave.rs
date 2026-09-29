@@ -25,6 +25,32 @@ pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
 pub(crate) const SOURCE_REVISION: &str = "e344479d6c0439e346c788a918ad5645713f7573";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
 const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
+const QUALITY_REFERENCE_4K_420_SDR_BYTES: u64 = 400_000;
+
+/// Quality-oriented tuning seed shared with the client default model. This is
+/// diagnostic guidance, not a codec limit or a replacement for manual bitrate.
+pub(crate) fn quality_reference_frame_bytes(
+	width: u32,
+	height: u32,
+	chroma: ChromaFormat,
+	bit_depth: BitDepth,
+) -> usize {
+	let mut bytes = QUALITY_REFERENCE_4K_420_SDR_BYTES
+		.saturating_mul(u64::from(width))
+		.saturating_mul(u64::from(height))
+		/ (3840 * 2160);
+	if chroma == ChromaFormat::Yuv444 {
+		// PyroWave's checked-in objective/subjective evaluation measured a
+		// roughly 15-20% 4:4:4 penalty at equal luminance quality.
+		bytes = bytes.saturating_mul(6) / 5;
+	}
+	if bit_depth == BitDepth::Ten {
+		// The codec's preliminary HDR evaluation uses about 20% headroom. This
+		// remains a tuning seed rather than a universal compression ratio.
+		bytes = bytes.saturating_mul(6) / 5;
+	}
+	usize::try_from(bytes).unwrap_or(usize::MAX) & !3
+}
 const API_VERSION: (u32, u32, u32) = (0, 7, 0);
 
 type ResultCode = i32;
@@ -339,8 +365,13 @@ pub(crate) struct PyroWaveEncoder {
 	device: Rc<Device>,
 	handle: EncoderHandle,
 	format: NegotiatedVideoFormat,
+	visible_width: u32,
+	visible_height: u32,
 	maximum_frame_bytes: usize,
 	images: HashMap<RawFd, ImportedImage>,
+	consecutive_near_limit_frames: u32,
+	last_limit_warning: Option<std::time::Instant>,
+	scaling_logged: bool,
 }
 
 impl PyroWaveEncoder {
@@ -449,8 +480,13 @@ impl PyroWaveEncoder {
 			device,
 			handle,
 			format,
+			visible_width: width,
+			visible_height: height,
 			maximum_frame_bytes,
 			images: HashMap::new(),
+			consecutive_near_limit_frames: 0,
+			last_limit_warning: None,
+			scaling_logged: false,
 		})
 	}
 
@@ -561,6 +597,24 @@ impl PyroWaveEncoder {
 
 	pub(crate) fn encode(&mut self, frame: &ExportedFrame, mut data: Vec<u8>) -> Result<EncodedFrame, String> {
 		let started = std::time::Instant::now();
+		if !self.scaling_logged {
+			if frame.width == self.visible_width && frame.height == self.visible_height {
+				tracing::debug!(
+					width = frame.width,
+					height = frame.height,
+					"PyroWave source matches the visible stream extent; spatial scaling is bypassed"
+				);
+			} else {
+				tracing::warn!(
+					source_width = frame.width,
+					source_height = frame.height,
+					visible_width = self.visible_width,
+					visible_height = self.visible_height,
+					"PyroWave is using its GPU scaler for a non-native source extent"
+				);
+			}
+			self.scaling_logged = true;
+		}
 		let view = self.import(frame)?;
 		let imported = std::time::Instant::now();
 		let input_color_space = match frame.color_space {
@@ -585,6 +639,8 @@ impl PyroWaveEncoder {
 				BitDepth::Eight => 128.0 / 255.0,
 				BitDepth::Ten => 512.0 / 1023.0,
 			},
+			// Preserve exact texels at 1:1. For actual resizing, false selects
+			// PyroWave's higher-quality scaler rather than forced bilinear sampling.
 			force_linear_filtering: false,
 			skip_dither: false,
 			crop_rect: ptr::null(),
@@ -636,6 +692,23 @@ impl PyroWaveEncoder {
 			return Err("PyroWave returned an invalid wire-v1 frame".to_string());
 		}
 		let ready = std::time::Instant::now();
+		if packet.size.saturating_mul(100) >= self.maximum_frame_bytes.saturating_mul(98) {
+			self.consecutive_near_limit_frames = self.consecutive_near_limit_frames.saturating_add(1);
+			if self.consecutive_near_limit_frames >= 30
+				&& self
+					.last_limit_warning
+					.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(30))
+			{
+				tracing::warn!(
+					encoded_bytes = packet.size,
+					maximum_frame_bytes = self.maximum_frame_bytes,
+					"PyroWave frames repeatedly saturate the configured frame budget; image quality may be rate-limited"
+				);
+				self.last_limit_warning = Some(std::time::Instant::now());
+			}
+		} else {
+			self.consecutive_near_limit_frames = 0;
+		}
 		Ok(EncodedFrame {
 			data,
 			data_size: packet.size,
@@ -706,6 +779,26 @@ mod tests {
 		assert_eq!(wire_v1_frame_budget(2_000_000_000, 120), Some(2_083_332));
 		assert_eq!(wire_v1_frame_budget(2_000_000_000, 60), None);
 		assert_eq!(wire_v1_frame_budget(200_000_000, 0), None);
+	}
+
+	#[test]
+	fn quality_reference_preserves_bytes_per_frame_across_fps() {
+		assert_eq!(
+			quality_reference_frame_bytes(3840, 2160, ChromaFormat::Yuv420, BitDepth::Eight),
+			400_000
+		);
+		assert_eq!(
+			quality_reference_frame_bytes(1920, 1080, ChromaFormat::Yuv420, BitDepth::Eight),
+			100_000
+		);
+		assert_eq!(
+			quality_reference_frame_bytes(3840, 2160, ChromaFormat::Yuv444, BitDepth::Eight),
+			480_000
+		);
+		assert_eq!(
+			quality_reference_frame_bytes(3840, 2160, ChromaFormat::Yuv420, BitDepth::Ten),
+			480_000
+		);
 	}
 
 	#[test]

@@ -19,6 +19,7 @@ use crate::session::compositor::{
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::audio::AudioStartHandle;
 use crate::session::stream::video::VideoStreamHandle;
+use crate::session::stream::video::fec::FrameFecStatus;
 
 mod feedback;
 pub(crate) mod input;
@@ -62,7 +63,7 @@ enum ControlMessageType {
 	StartB = 0x0307,
 	RumbleTriggers = 0x5500,
 	SetMotionEvent = 0x5501,
-	SetRgbLed = 0x5502,
+	FrameFecStatus = 0x5502,
 	SetTriggerEffect = 0x5503,
 }
 
@@ -84,7 +85,7 @@ impl TryFrom<u16> for ControlMessageType {
 			x if x == Self::StartB as u16 => Ok(Self::StartB),
 			x if x == Self::RumbleTriggers as u16 => Ok(Self::RumbleTriggers),
 			x if x == Self::SetMotionEvent as u16 => Ok(Self::SetMotionEvent),
-			x if x == Self::SetRgbLed as u16 => Ok(Self::SetRgbLed),
+			x if x == Self::FrameFecStatus as u16 => Ok(Self::FrameFecStatus),
 			x if x == Self::SetTriggerEffect as u16 => Ok(Self::SetTriggerEffect),
 			_ => Err(()),
 		}
@@ -106,7 +107,7 @@ enum ControlMessage<'a> {
 	StartB,
 	RumbleTriggers,
 	SetMotionEvent,
-	SetRgbLed,
+	FrameFecStatus(FrameFecStatus),
 	SetTriggerEffect,
 }
 
@@ -196,7 +197,29 @@ impl<'a> ControlMessage<'a> {
 			ControlMessageType::HdrMode => Ok(Self::HdrMode),
 			ControlMessageType::RumbleTriggers => Ok(Self::RumbleTriggers),
 			ControlMessageType::SetMotionEvent => Ok(Self::SetMotionEvent),
-			ControlMessageType::SetRgbLed => Ok(Self::SetRgbLed),
+			ControlMessageType::FrameFecStatus => {
+				// Moonlight sends the packed structure in network byte order. The
+				// C structure may include trailing padding, which is intentionally
+				// ignored here.
+				if buffer.len() < 25 {
+					tracing::warn!(length = buffer.len(), "Received a truncated frame FEC status");
+					return Err(());
+				}
+				Ok(Self::FrameFecStatus(FrameFecStatus {
+					frame_index: u32::from_be_bytes(buffer[4..8].try_into().unwrap()),
+					highest_received_sequence_number: u16::from_be_bytes(buffer[8..10].try_into().unwrap()),
+					next_contiguous_sequence_number: u16::from_be_bytes(buffer[10..12].try_into().unwrap()),
+					missing_packets_before_highest: u16::from_be_bytes(buffer[12..14].try_into().unwrap()),
+					total_data_packets: u16::from_be_bytes(buffer[14..16].try_into().unwrap()),
+					total_parity_packets: u16::from_be_bytes(buffer[16..18].try_into().unwrap()),
+					received_data_packets: u16::from_be_bytes(buffer[18..20].try_into().unwrap()),
+					received_parity_packets: u16::from_be_bytes(buffer[20..22].try_into().unwrap()),
+					fec_percentage: buffer[22],
+					block_index: buffer[23],
+					block_count: buffer[24],
+					..Default::default()
+				}))
+			},
 			ControlMessageType::SetTriggerEffect => Ok(Self::SetTriggerEffect),
 		}
 	}
@@ -573,6 +596,9 @@ async fn run_control_loop(
 					ControlMessage::HdrMode => {
 						tracing::info!("Received HdrMode toggle from client");
 					},
+					ControlMessage::FrameFecStatus(status) => {
+						video_handle.report_fec_status(status);
+					},
 					skipped_message => {
 						tracing::trace!("Skipped control message: {skipped_message:?}");
 					},
@@ -635,4 +661,42 @@ async fn run_control_loop(
 	// returns. Without this, the next session's control stream may
 	// fail to bind to the same port.
 	drop(host);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn parses_sunshine_frame_fec_status_in_network_byte_order() {
+		let mut packet = vec![0u8; 28];
+		packet[0..2].copy_from_slice(&(ControlMessageType::FrameFecStatus as u16).to_le_bytes());
+		packet[2..4].copy_from_slice(&24u16.to_le_bytes());
+		packet[4..8].copy_from_slice(&42u32.to_be_bytes());
+		packet[8..10].copy_from_slice(&500u16.to_be_bytes());
+		packet[10..12].copy_from_slice(&497u16.to_be_bytes());
+		packet[12..14].copy_from_slice(&3u16.to_be_bytes());
+		packet[14..16].copy_from_slice(&100u16.to_be_bytes());
+		packet[16..18].copy_from_slice(&20u16.to_be_bytes());
+		packet[18..20].copy_from_slice(&98u16.to_be_bytes());
+		packet[20..22].copy_from_slice(&18u16.to_be_bytes());
+		packet[22] = 20;
+		packet[23] = 1;
+		packet[24] = 2;
+
+		let ControlMessage::FrameFecStatus(status) = ControlMessage::from_bytes(&packet).unwrap() else {
+			panic!("wrong control message type");
+		};
+		assert_eq!(status.frame_index, 42);
+		assert_eq!(status.highest_received_sequence_number, 500);
+		assert_eq!(status.next_contiguous_sequence_number, 497);
+		assert_eq!(status.missing_packets_before_highest, 3);
+		assert_eq!(status.total_data_packets, 100);
+		assert_eq!(status.total_parity_packets, 20);
+		assert_eq!(status.received_data_packets, 98);
+		assert_eq!(status.received_parity_packets, 18);
+		assert_eq!(status.fec_percentage, 20);
+		assert_eq!(status.block_index, 1);
+		assert_eq!(status.block_count, 2);
+	}
 }

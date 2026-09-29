@@ -18,8 +18,11 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
+use crate::session::stream::video::fec::{FecController, FrameFecStatus};
 use crate::session::stream::video::packetizer::Packetizer;
-use crate::session::stream::video::pyrowave::{EncodedFrame, PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
+use crate::session::stream::video::pyrowave::{
+	EncodedFrame, PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL, quality_reference_frame_bytes,
+};
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, FrameStats, NegotiatedVideoFormat, TransferFunction,
@@ -120,6 +123,8 @@ struct LatencySample {
 	send: std::time::Duration,
 	total: std::time::Duration,
 	encoded_bytes: usize,
+	wire_bytes: usize,
+	packet_count: usize,
 	is_key_frame: bool,
 }
 
@@ -135,6 +140,8 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 
 	let elapsed_s = elapsed.as_secs_f64().max(f64::EPSILON);
 	let bytes_total: usize = samples.iter().map(|s| s.encoded_bytes).sum();
+	let wire_bytes_total: usize = samples.iter().map(|s| s.wire_bytes).sum();
+	let packet_count: usize = samples.iter().map(|s| s.packet_count).sum();
 	let keyframes = samples.iter().filter(|s| s.is_key_frame).count();
 
 	let mut totals: Vec<u64> = samples.iter().map(|s| s.total.as_micros() as u64).collect();
@@ -172,6 +179,8 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 		frames = n,
 		fps = (n as f64 / elapsed_s).round() as u32,
 		bitrate_kbps = ((bytes_total * 8) as f64 / elapsed_s / 1000.0).round() as u64,
+		wire_bitrate_kbps = ((wire_bytes_total * 8) as f64 / elapsed_s / 1000.0).round() as u64,
+		packets = packet_count,
 		keyframes,
 		total_p50_us = p50(&totals),
 		total_p95_us = p95(&totals),
@@ -272,16 +281,27 @@ async fn run_packet_consumer(
 	mut packetizer: Packetizer,
 	ctx: VideoStreamContext,
 	config: VideoStreamConfig,
+	mut fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 ) {
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
 	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
 	let mut last_summary_time = std::time::Instant::now();
 	let frame_interval_us = 1_000_000 / ctx.fps as u128;
+	let mut fec_controller = FecController::new(
+		config.fec_mode,
+		config.fec_percentage,
+		config.fec_min_percentage,
+		config.fec_max_percentage,
+		false,
+	);
 
 	// Driven by the message channel: one `Frame` per submitted frame. When the
 	// encoding thread drops its sender, this loop ends after the last frame.
 	while let Some(msg) = ctx_rx.recv().await {
+		if fec_feedback_rx.has_changed().unwrap_or(false) {
+			fec_controller.observe(*fec_feedback_rx.borrow_and_update());
+		}
 		let (frame_context, future) = match msg {
 			ConsumerMessage::ResetCounters => {
 				frame_number = 0;
@@ -347,8 +367,8 @@ async fn run_packet_consumer(
 			&packet.data,
 			is_key_frame,
 			ctx.packet_size,
-			ctx.minimum_fec_packets,
-			config.fec_percentage,
+			fec_controller.minimum_packets(ctx.minimum_fec_packets),
+			fec_controller.percentage(),
 			frame_number,
 			&mut sequence_number,
 			rtp_timestamp,
@@ -363,6 +383,8 @@ async fn run_packet_consumer(
 				continue;
 			},
 		};
+		let wire_bytes = shards.as_bytes().len();
+		let packet_count = shards.shard_count();
 
 		let t_packetized = std::time::Instant::now();
 
@@ -412,6 +434,8 @@ async fn run_packet_consumer(
 			send: send_dur,
 			total,
 			encoded_bytes,
+			wire_bytes,
+			packet_count,
 			is_key_frame,
 		});
 
@@ -426,6 +450,9 @@ async fn run_packet_consumer(
 			send: send_dur,
 			total,
 			encoded_bytes,
+			wire_bytes,
+			packet_count,
+			stale_frames_dropped: 0,
 			is_key_frame,
 		});
 
@@ -454,6 +481,7 @@ impl VideoPipeline {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -461,6 +489,7 @@ impl VideoPipeline {
 			config,
 			context,
 			keys_rx,
+			fec_feedback_rx,
 		};
 
 		// Capture the main (multi-threaded) runtime handle so the OS-threaded
@@ -495,6 +524,7 @@ struct VideoPipelineInner {
 	config: VideoStreamConfig,
 	context: VideoStreamContext,
 	keys_rx: SessionKeysReceiver,
+	fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 }
 
 impl VideoPipelineInner {
@@ -660,27 +690,71 @@ impl VideoPipelineInner {
 			.map_err(|e| format!("Failed to create Vulkan context for PyroWave adapter matching: {e}"))?;
 		let mut encoder =
 			PyroWaveEncoder::new(&video_context, ctx.format, ctx.width, ctx.height, ctx.bitrate, ctx.fps)?;
+		let quality_reference_bytes =
+			quality_reference_frame_bytes(ctx.width, ctx.height, ctx.format.chroma, ctx.format.bit_depth);
+		let mut fec_controller = FecController::new(
+			self.config.fec_mode,
+			self.config.fec_percentage,
+			self.config.fec_min_percentage,
+			self.config.fec_max_percentage,
+			true,
+		);
 		tracing::info!(
 			codec = "PyroWave",
 			gpu = encoder.device_name(),
+			visible_width = ctx.width,
+			visible_height = ctx.height,
+			fps = ctx.fps,
 			chroma = %ctx.format.chroma,
 			bit_depth = ctx.format.bit_depth.bits(),
 			hdr = ctx.format.hdr,
+			requested_bitrate_bps = ctx.bitrate,
 			maximum_frame_bytes = encoder.maximum_frame_bytes(),
+			quality_reference_frame_bytes = quality_reference_bytes,
+			effective_packet_size = ctx.packet_size,
+			fec_mode = ?self.config.fec_mode,
+			fec_min_percentage = self.config.fec_min_percentage,
+			fec_max_percentage = self.config.fec_max_percentage,
+			initial_fec_percentage = fec_controller.percentage(),
 			pyrowave_source = SOURCE_URL,
 			pyrowave_revision = SOURCE_REVISION,
 			"Initialized zero-copy PyroWave encoder"
 		);
+		if encoder.maximum_frame_bytes().saturating_mul(4) < quality_reference_bytes.saturating_mul(3) {
+			tracing::warn!(
+				maximum_frame_bytes = encoder.maximum_frame_bytes(),
+				quality_reference_frame_bytes = quality_reference_bytes,
+				"Requested PyroWave bitrate provides a suspiciously low per-frame quality budget"
+			);
+		}
+		if fec_controller.percentage() >= 10 {
+			let estimated_fec_bps = ctx.bitrate.saturating_mul(fec_controller.percentage() as usize) / 100;
+			tracing::warn!(
+				encoded_bitrate_bps = ctx.bitrate,
+				estimated_fec_bitrate_bps = estimated_fec_bps,
+				estimated_wire_bitrate_bps = ctx.bitrate.saturating_add(estimated_fec_bps),
+				"PyroWave wire bandwidth substantially exceeds its encoded bitrate because of FEC (before remaining packet overhead)"
+			);
+		}
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
-		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
+		let mut fec_feedback_rx = self.fec_feedback_rx.clone();
+		packetizer.warm_up(
+			fec_controller.percentage(),
+			fec_controller.minimum_packets(ctx.minimum_fec_packets),
+		);
 		let mut frame_number = 0u32;
 		let mut sequence_number = 0u32;
 		let mut last_encoded = None;
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
 		let mut last_frame_time = std::time::Instant::now();
+		let mut consecutive_slow_sends = 0u32;
+		let mut last_slow_send_warning: Option<std::time::Instant> = None;
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			if fec_feedback_rx.has_changed().unwrap_or(false) {
+				fec_controller.observe(*fec_feedback_rx.borrow_and_update());
+			}
 			let mut resend_last = false;
 			while matches!(
 				reset_request_rx.try_recv(),
@@ -706,12 +780,14 @@ impl VideoPipelineInner {
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
 			};
 
+			let mut stale_frames_dropped = 0u32;
 			let (encoded, created_at, buffer_index, channel_wait) = if let Some(mut frame) = received {
 				// The encoder is synchronous. If it fell behind, consume only the
 				// newest queued compositor frame instead of encoding a stale burst.
 				while let Ok(newer) = frame_rx.try_recv() {
 					frame.consumed.store(true, Ordering::Release);
 					frame = newer;
+					stale_frames_dropped = stale_frames_dropped.saturating_add(1);
 				}
 				let received_at = std::time::Instant::now();
 				let created_at = frame.created_at;
@@ -782,14 +858,16 @@ impl VideoPipelineInner {
 					&encoded.data[..encoded.data_size],
 					true,
 					ctx.packet_size,
-					ctx.minimum_fec_packets,
-					self.config.fec_percentage,
+					fec_controller.minimum_packets(ctx.minimum_fec_packets),
+					fec_controller.percentage(),
 					frame_number,
 					&mut sequence_number,
 					rtp_timestamp,
 					latency,
 				)
 				.map_err(|()| "failed to packetize PyroWave frame".to_string())?;
+			let wire_bytes = shards.as_bytes().len();
+			let packet_count = shards.shard_count();
 			let packetized = std::time::Instant::now();
 			let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
 			let mut shards = shards;
@@ -819,8 +897,26 @@ impl VideoPipelineInner {
 				send: sent.duration_since(packetized),
 				total: sent.duration_since(created_at),
 				encoded_bytes: encoded.data_size,
+				wire_bytes,
+				packet_count,
+				stale_frames_dropped,
 				is_key_frame: true,
 			};
+			if stats.send > frame_interval {
+				consecutive_slow_sends = consecutive_slow_sends.saturating_add(1);
+				if consecutive_slow_sends >= 30
+					&& last_slow_send_warning.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(30))
+				{
+					tracing::warn!(
+						send_us = stats.send.as_micros() as u64,
+						frame_budget_us = frame_interval.as_micros() as u64,
+						"PyroWave send backpressure is consistently exceeding the frame budget"
+					);
+					last_slow_send_warning = Some(std::time::Instant::now());
+				}
+			} else {
+				consecutive_slow_sends = 0;
+			}
 			tracing::trace!(
 				frame_number,
 				buffer_index,
@@ -854,7 +950,14 @@ impl VideoPipelineInner {
 		let ctx = &self.context;
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
-		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
+		packetizer.warm_up(
+			self.config.fec_percentage,
+			if self.config.fec_mode == crate::session::stream::video::FecMode::Off {
+				0
+			} else {
+				ctx.minimum_fec_packets
+			},
+		);
 
 		// The encoder is asynchronous: each `encode()` returns a future that
 		// resolves with that frame's packet once the GPU finishes. We hand each
@@ -873,6 +976,7 @@ impl VideoPipelineInner {
 		let consumer = {
 			let ctx = self.context.clone();
 			let config = self.config.clone();
+			let fec_feedback_rx = self.fec_feedback_rx.clone();
 			let in_flight = in_flight.clone();
 			// The packetize/send half is pure async work (await the encode future,
 			// packetize, send) with no blocking GPU calls, so it runs as a task on
@@ -889,6 +993,7 @@ impl VideoPipelineInner {
 				packetizer,
 				ctx,
 				config,
+				fec_feedback_rx,
 			))
 		};
 

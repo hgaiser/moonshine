@@ -32,6 +32,10 @@ struct Args {
 	#[arg(long)]
 	matrix: bool,
 
+	/// Run a PyroWave-focused 1080p/1440p/4K x 60/120/144 FPS matrix.
+	#[arg(long)]
+	pyrowave_matrix: bool,
+
 	/// Stream resolution (WxH).
 	#[arg(long, default_value = "1920x1080")]
 	resolution: String,
@@ -117,7 +121,7 @@ fn selected_format(args: &Args, codec: VideoCodec) -> Result<NegotiatedVideoForm
 		10 => BitDepth::Ten,
 		_ => unreachable!(),
 	};
-	let range = if args.full_range {
+	let range = if codec == VideoCodec::PyroWave || args.full_range {
 		ColorRange::Full
 	} else {
 		ColorRange::Limited
@@ -131,9 +135,6 @@ fn selected_format(args: &Args, codec: VideoCodec) -> Result<NegotiatedVideoForm
 	// reported rather than silently changed by the HDR10 constructor.
 	format.bit_depth = bit_depth;
 	format.validate().map_err(|reason| boxed_error(reason.to_string()))?;
-	if codec == VideoCodec::PyroWave && range != ColorRange::Full {
-		return Err(boxed_error("PyroWave's scaled RGB path requires --full-range"));
-	}
 	Ok(format)
 }
 
@@ -206,6 +207,10 @@ struct StatsSummary {
 	count: u64,
 	fps: f64,
 	mbps: f64,
+	wire_mbps: f64,
+	encoded_size: SizeDistribution,
+	avg_packets_per_frame: f64,
+	stale_frames_dropped: u64,
 	total: LatencyDistribution,
 	submit: LatencyDistribution,
 	encode_wait: LatencyDistribution,
@@ -216,6 +221,37 @@ struct StatsSummary {
 	avg_packetize_us: f64,
 	avg_send_us: f64,
 	key_frames: u64,
+}
+
+#[derive(Clone, Debug)]
+struct SizeDistribution {
+	avg_bytes: f64,
+	p50_bytes: u64,
+	p95_bytes: u64,
+	p99_bytes: u64,
+	max_bytes: u64,
+}
+
+impl SizeDistribution {
+	fn new(total: u64, samples: &[u64]) -> Self {
+		if samples.is_empty() {
+			return Self {
+				avg_bytes: 0.0,
+				p50_bytes: 0,
+				p95_bytes: 0,
+				p99_bytes: 0,
+				max_bytes: 0,
+			};
+		}
+		let (p50_bytes, p95_bytes, p99_bytes) = percentiles(samples);
+		Self {
+			avg_bytes: total as f64 / samples.len() as f64,
+			p50_bytes,
+			p95_bytes,
+			p99_bytes,
+			max_bytes: samples.iter().copied().max().unwrap_or(0),
+		}
+	}
 }
 
 impl StatsSummary {
@@ -273,6 +309,10 @@ struct StatsAccumulator {
 	encode_wait_samples_us: Vec<u64>,
 	key_frames: u64,
 	encoded_bytes: u64,
+	wire_bytes: u64,
+	packet_count: u64,
+	encoded_size_samples: Vec<u64>,
+	stale_frames_dropped: u64,
 	start: Instant,
 	last_print: Instant,
 }
@@ -296,6 +336,10 @@ impl StatsAccumulator {
 			encode_wait_samples_us: Vec::new(),
 			key_frames: 0,
 			encoded_bytes: 0,
+			wire_bytes: 0,
+			packet_count: 0,
+			encoded_size_samples: Vec::new(),
+			stale_frames_dropped: 0,
 			start: now,
 			last_print: now,
 		}
@@ -327,6 +371,10 @@ impl StatsAccumulator {
 			self.key_frames += 1;
 		}
 		self.encoded_bytes += stats.encoded_bytes as u64;
+		self.wire_bytes += stats.wire_bytes as u64;
+		self.packet_count += stats.packet_count as u64;
+		self.encoded_size_samples.push(stats.encoded_bytes as u64);
+		self.stale_frames_dropped += u64::from(stats.stale_frames_dropped);
 	}
 
 	fn summary(&self) -> Option<StatsSummary> {
@@ -344,11 +392,20 @@ impl StatsAccumulator {
 		} else {
 			0.0
 		};
+		let wire_mbps = if elapsed > 0.0 {
+			self.wire_bytes as f64 * 8.0 / elapsed / 1_000_000.0
+		} else {
+			0.0
+		};
 
 		Some(StatsSummary {
 			count: self.count,
 			fps,
 			mbps,
+			wire_mbps,
+			encoded_size: SizeDistribution::new(self.encoded_bytes, &self.encoded_size_samples),
+			avg_packets_per_frame: self.packet_count as f64 / self.count as f64,
+			stale_frames_dropped: self.stale_frames_dropped,
 			total: LatencyDistribution::new(self.total_us, &self.total_samples_us),
 			submit: LatencyDistribution::new(self.submit_us, &self.submit_samples_us),
 			encode_wait: LatencyDistribution::new(self.encode_wait_us, &self.encode_wait_samples_us),
@@ -366,11 +423,21 @@ impl StatsAccumulator {
 		let summary = self.summary()?;
 
 		tracing::info!(
-			"{} [{} frames, {:.1} fps, {:.2} Mbps]",
+			"{} [{} frames, {:.1} fps, {:.2} Mbps encoded, {:.2} Mbps wire]",
 			label,
 			summary.count,
 			summary.fps,
-			summary.mbps
+			summary.mbps,
+			summary.wire_mbps
+		);
+		tracing::info!(
+			"  frame size: avg={:.0}B p50={}B p95={}B p99={}B max={}B packets/frame={:.1}",
+			summary.encoded_size.avg_bytes,
+			summary.encoded_size.p50_bytes,
+			summary.encoded_size.p95_bytes,
+			summary.encoded_size.p99_bytes,
+			summary.encoded_size.max_bytes,
+			summary.avg_packets_per_frame,
 		);
 		tracing::info!(
 			"  total:    avg={avg_total:.0}us  min={}us  max={}us",
@@ -425,6 +492,7 @@ impl StatsAccumulator {
 			avg_consumer_queue = summary.avg_consumer_queue_us
 		);
 		tracing::info!("  key_frames: {}", summary.key_frames);
+		tracing::info!("  stale compositor frames dropped: {}", summary.stale_frames_dropped);
 
 		Some(summary)
 	}
@@ -449,7 +517,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		std::process::exit(1);
 	}
 
-	if args.matrix {
+	if args.matrix || args.pyrowave_matrix {
 		run_matrix(&args).await
 	} else {
 		run_single(&args).await
@@ -463,8 +531,20 @@ async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 	const RESOLUTIONS: [(&str, &str); 3] = [("4k", "3840x2160"), ("1440p", "2560x1440"), ("1080p", "1920x1080")];
-	const FPS_VALUES: [u32; 3] = [60, 120, 360];
-	const CODECS: [&str; 3] = ["hevc", "h264", "av1"];
+	const CONVENTIONAL_FPS_VALUES: [u32; 3] = [60, 120, 360];
+	const PYROWAVE_FPS_VALUES: [u32; 3] = [60, 120, 144];
+	const CONVENTIONAL_CODECS: [&str; 3] = ["hevc", "h264", "av1"];
+	const PYROWAVE_CODECS: [&str; 1] = ["pyrowave"];
+	let fps_values = if args.pyrowave_matrix {
+		&PYROWAVE_FPS_VALUES
+	} else {
+		&CONVENTIONAL_FPS_VALUES
+	};
+	let codecs: &[&str] = if args.pyrowave_matrix {
+		&PYROWAVE_CODECS
+	} else {
+		&CONVENTIONAL_CODECS
+	};
 
 	let duration = if args.duration == 0 {
 		tracing::info!("Matrix mode requires a finite duration; defaulting to 8s. Pass --duration to override.");
@@ -480,13 +560,13 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 	tracing::info!("  command:    {}", args.command.join(" "));
 	tracing::info!("  duration:   {}s", duration);
 	tracing::info!("  warmup:     {}s", args.warmup);
-	tracing::info!("  fps:        {:?}", FPS_VALUES);
+	tracing::info!("  fps:        {:?}", fps_values);
 	tracing::info!("  bitrate:    {} bps", args.bitrate);
 	tracing::info!("  hdr:        {}", args.hdr);
 
 	'outer: for (resolution_label, resolution) in RESOLUTIONS {
-		for fps in FPS_VALUES {
-			for codec in CODECS {
+		for &fps in fps_values {
+			for &codec in codecs {
 				tracing::info!(
 					"Starting matrix run: {} {} {}fps {}",
 					resolution_label,

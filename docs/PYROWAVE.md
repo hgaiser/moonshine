@@ -100,16 +100,78 @@ down to a 32-bit word exactly as wire-v1 clients do. Valid budgets range from
 1 KiB to just under 3 MiB. The value is logged when the encoder starts. There
 is no separate low bitrate cap for 4:4:4 or HDR.
 
+Moonlight's conventional default is intentionally sublinear above 60 FPS
+because predictive codecs amortize detail through time. That model made
+PyroWave's bytes per frame decrease at high refresh rates. The PyroWave fork
+therefore uses a separate bytes-per-frame model, starting at 400,000 bytes for
+3840x2160 4:2:0 SDR and scaling with pixel count. The codec repository's
+objective/subjective evaluation found roughly a 15-20% 4:4:4 bitrate penalty
+at equal luminance quality and uses a preliminary ~20% HDR allowance, so this
+model conservatively applies 20% for each axis rather than scaling by raw sample
+count.
+Those constants are quality-oriented tuning seeds and should be calibrated with
+objective and subjective codec measurements. FPS is applied only afterward:
+`bitrate = frame_bytes * fps * 8`. A manual bitrate disables Moonlight's
+default-tracking behavior and remains authoritative.
+
+Moonlight's `autoAdjustBitrate` preference is settings UX, not a live
+congestion controller: it recalculates the default after resolution, FPS,
+codec, chroma, or HDR changes. PyroWave codec bitrate is not reduced in response
+to FEC feedback. Adaptive FEC is the first response to changing loss; an
+end-to-end capacity estimator would be required before safely adding live
+PyroWave bitrate reduction.
+
 Actual bandwidth is content- and codec-dependent, so resolution alone does not
 produce an honest fixed estimate. At the same quality target, 4:4:4 generally
 needs more data than 4:2:0, HDR/R16 can need more than SDR/R8, 120 Hz allows
 twice as many frames as 60 Hz, and 4K contains four times as many pixels as
 1080p (1440p contains about 1.78 times as many). Size the requested bitrate and
 network headroom accordingly, then measure the real workload. GameStream adds
-the configured FEC percentage plus RTP/NvVideoPacket and optional encryption.
-For an unusually large encoded frame that would need more than four FEC blocks,
-Pyroshine disables FEC for that frame and spreads it over four blocks instead
-of dropping it.
+FEC parity, RTP/NvVideoPacket headers, and optional encryption. Diagnostics and
+the benchmark distinguish encoded payload bitrate from approximate wire
+bitrate. For a frame that cannot fit the requested protection into four
+Reed-Solomon blocks, Pyroshine selects the largest lower integer percentage
+that Moonlight can decode exactly. A request for 20% can therefore become
+roughly 8-9% rather than abruptly becoming unprotected. Zero FEC is used only
+when no protected layout is representable.
+
+## FEC policy
+
+Video FEC is configured under `[stream.video]`:
+
+```toml
+fec_mode = "auto"       # off, fixed, or auto
+fec_percentage = 20     # fixed percentage or auto starting point
+fec_min_percentage = 0
+fec_max_percentage = 25
+```
+
+The default mode is `fixed`, preserving existing configurations that only set
+`fec_percentage`. `off` emits exactly zero parity and overrides Moonlight's
+minimum-parity request. `fixed` retains that minimum for small frames. `auto`
+consumes Moonlight's existing Sunshine `SS_FRAME_FEC_STATUS` feedback, raises
+protection after persistent/recovered loss (more quickly after unrecoverable
+blocks), and decays slowly after sustained clean windows. Changes are clamped
+to the configured range and take effect only at a subsequent frame boundary.
+The PyroWave policy decays clean-link protection sooner because every frame is
+independently decodable.
+
+Sender parity uses the same rule as Moonlight's receiver:
+`ceil(data_shards * fec_percentage / 100)`. The emitted integer percentage is
+chosen first, so metadata always reconstructs the exact parity count. FEC is
+computed over the complete plaintext shard and each transmitted shard is then
+encrypted independently; changing that ordering would break recovery.
+
+## Visible dimensions and scaling
+
+The negotiated/compositor, bitstream, decoder output, and libplacebo crop all
+use the true visible dimensions. PyroWave alone aligns its wavelet storage to
+32 pixels internally (for example, 3840x2160 uses an internal height of 2176).
+Moonlight allocates visible-sized output planes, so padded rows or columns are
+never presented or fractionally rescaled. At matching source and stream sizes,
+the GPU path preserves 1:1 texels. A differing compositor extent uses the
+existing PyroWave GPU scaler with its quality path; it does not introduce CPU
+readback or a software conversion.
 
 ## GPU path and ownership
 
@@ -163,7 +225,9 @@ supported driver/GPU:
 6. Long-running bitrate, latency, VRAM, and imported-image cache stability.
 7. A decoder built from the same authoritative fork.
 
-`moonshine-bench` can exercise the format axes directly. For example:
+`moonshine-bench` can exercise the format axes directly. Its
+`--pyrowave-matrix` mode covers 1080p, 1440p, and 4K at 60/120/144 FPS for the
+selected chroma/HDR configuration. For example:
 
 ```sh
 moonshine-bench --codec pyrowave --chroma 444 --bit-depth 10 \
@@ -171,8 +235,10 @@ moonshine-bench --codec pyrowave --chroma 444 --bit-depth 10 \
   --duration 30 -- your-test-application
 ```
 
-Its report separates compositor queueing, import, conversion, submit,
-GPU/encode wait, packetization, send, and total server-side latency. PyroWave's
+Its report includes encoded frame-size percentiles, encoded and approximate
+wire throughput, packets per frame, and separates compositor queueing, import,
+conversion, submit, GPU/encode wait, packetization, send, and total server-side
+latency. PyroWave's
 GPU scaler is included in its submit/wait measurements; it does not use the
 separate Pixelforge conversion stage.
 

@@ -124,6 +124,8 @@ pub(crate) struct Packetizer {
 	last_key_id: i64,
 	/// Monotonically increasing IV counter (one increment per encrypted shard).
 	gcm_iv_counter: u64,
+	/// Rate limit recurring layout warnings for consistently large frames.
+	last_fec_warning: Option<Instant>,
 }
 
 impl Packetizer {
@@ -135,6 +137,7 @@ impl Packetizer {
 			cipher: None,
 			last_key_id: i64::MIN,
 			gcm_iv_counter: 0,
+			last_fec_warning: None,
 		}
 	}
 
@@ -166,14 +169,11 @@ impl Packetizer {
 	/// Pre-create FEC encoders for all possible block sizes to avoid
 	/// expensive ReedSolomon matrix construction during frame processing.
 	pub fn warm_up(&mut self, fec_percentage: u8, minimum_fec_packets: u32) {
-		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
-
-		for nr_data_shards in 1..=nr_data_shards_per_block {
-			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize)
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
-			if nr_parity_shards > 0 {
+		for nr_data_shards in 1..MAX_SHARDS {
+			if let Some((_, nr_parity_shards)) =
+				block_fec_parameters(nr_data_shards, fec_percentage, minimum_fec_packets as usize)
+				&& nr_parity_shards > 0
+			{
 				let _ = self.get_fec_encoder(nr_data_shards, nr_parity_shards);
 			}
 		}
@@ -246,7 +246,30 @@ impl Packetizer {
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
 
-		let layout = packet_layout(nr_data_shards, fec_percentage)?;
+		let layout = packet_layout(nr_data_shards, fec_percentage, minimum_fec_packets as usize)?;
+		if (layout.fec_percentage < fec_percentage || (layout.disable_fec && minimum_fec_packets > 0))
+			&& self
+				.last_fec_warning
+				.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(5))
+		{
+			if layout.disable_fec {
+				tracing::warn!(
+					nr_data_shards,
+					requested_fec_percentage = fec_percentage,
+					minimum_fec_packets,
+					"No protected video FEC layout is representable; sending this frame without parity"
+				);
+			} else {
+				tracing::warn!(
+					nr_data_shards,
+					requested_fec_percentage = fec_percentage,
+					effective_fec_percentage = layout.fec_percentage,
+					blocks = layout.blocks,
+					"Reduced video FEC to fit the GameStream four-block limit"
+				);
+			}
+			self.last_fec_warning = Some(Instant::now());
+		}
 		let nr_blocks = layout.blocks;
 		let nr_data_shards_per_block = layout.data_shards_per_block;
 		let fec_percentage = layout.fec_percentage;
@@ -277,12 +300,11 @@ impl Packetizer {
 			let nr_data_shards = end - start;
 			assert!(nr_data_shards != 0);
 
-			let nr_parity_shards = if disable_fec {
-				0
+			let (fec_percentage, nr_parity_shards) = if disable_fec {
+				(0, 0)
 			} else {
-				(nr_data_shards * fec_percentage as usize / 100)
-					.max(minimum_fec_packets as usize)
-					.min(MAX_SHARDS.saturating_sub(nr_data_shards))
+				block_fec_parameters(nr_data_shards, fec_percentage, minimum_fec_packets as usize)
+					.ok_or_else(|| tracing::error!(nr_data_shards, "Selected video FEC layout became invalid"))?
 			};
 
 			let t_fec_encoder = Instant::now();
@@ -292,9 +314,6 @@ impl Packetizer {
 				None
 			};
 			total_fec_encoder_us += t_fec_encoder.elapsed().as_micros();
-
-			// Recompute the actual FEC percentage in case of a rounding error or when there are 0 parity shards.
-			let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
 
 			tracing::trace!(
 				"Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards."
@@ -334,7 +353,7 @@ impl Packetizer {
 					frame_number,
 					flags,
 					((block_index as u8) << 4) | last_block_index,
-					(block_shard_index << 12 | nr_data_shards << 22 | fec_percentage << 4) as u32,
+					(block_shard_index << 12 | nr_data_shards << 22 | usize::from(fec_percentage) << 4) as u32,
 				);
 
 				// Copy payload from [header ++ encoded_data].
@@ -385,7 +404,7 @@ impl Packetizer {
 					nv[11] = ((block_index as u8) << 4) | last_block_index; // multi_fec_blocks
 					let fec_info = ((nr_data_shards + block_shard_index) << 12
 						| nr_data_shards << 22
-						| fec_percentage << 4) as u32;
+						| usize::from(fec_percentage) << 4) as u32;
 					nv[12..16].copy_from_slice(&fec_info.to_le_bytes()); // fec_info
 
 					*sequence_number += 1;
@@ -461,39 +480,90 @@ struct PacketLayout {
 	disable_fec: bool,
 }
 
-/// Select a transport layout compatible with Moonlight's four-block and
-/// 10-bit shard-count fields. Oversized keyframes are still deliverable: like
-/// Sunshine, disable FEC for that frame and spread it over all four blocks.
-fn packet_layout(nr_data_shards: usize, requested_fec_percentage: u8) -> Result<PacketLayout, ()> {
-	debug_assert!(nr_data_shards > 0);
-	let max_data_shards_per_fec_block = MAX_SHARDS * 100 / (100 + requested_fec_percentage as usize);
-	let fec_blocks_needed = nr_data_shards.div_ceil(max_data_shards_per_fec_block);
+/// Moonlight derives parity as `ceil(data * percentage / 100)`. Keeping this
+/// as the single sender-side rule guarantees that the percentage written to
+/// `fecInfo` describes exactly the number of emitted parity shards.
+fn receiver_parity_shards(nr_data_shards: usize, fec_percentage: u8) -> usize {
+	(nr_data_shards * fec_percentage as usize).div_ceil(100)
+}
 
-	let (blocks, fec_percentage, disable_fec) = if fec_blocks_needed <= MAX_FEC_BLOCKS {
-		(fec_blocks_needed, requested_fec_percentage, false)
-	} else {
-		tracing::warn!(
-			nr_data_shards,
-			fec_blocks_needed,
-			"Skipping FEC for abnormally large encoded frame"
-		);
-		(MAX_FEC_BLOCKS, 0, true)
-	};
-	let data_shards_per_block = nr_data_shards.div_ceil(blocks);
-	if data_shards_per_block > MAX_DATA_SHARDS_WITHOUT_FEC {
+/// Select the smallest wire percentage at or above `requested_percentage`
+/// that also satisfies the client minimum. Some parity counts are not
+/// representable by Moonlight's integer percentage formula, so parity is
+/// always derived from the selected wire percentage rather than vice versa.
+fn block_fec_parameters(
+	nr_data_shards: usize,
+	requested_percentage: u8,
+	minimum_parity_shards: usize,
+) -> Option<(u8, usize)> {
+	for percentage in requested_percentage..=u8::MAX {
+		let parity = receiver_parity_shards(nr_data_shards, percentage);
+		if parity >= minimum_parity_shards && nr_data_shards + parity <= MAX_SHARDS {
+			return Some((percentage, parity));
+		}
+	}
+	None
+}
+
+/// Select a transport layout compatible with Moonlight's four-block and
+/// Reed-Solomon's 255-shard limit. If the requested percentage does not fit,
+/// protection is reduced one representable percentage point at a time. Only
+/// when no protected four-block layout exists is FEC disabled for the frame.
+fn packet_layout(
+	nr_data_shards: usize,
+	requested_fec_percentage: u8,
+	minimum_parity_shards: usize,
+) -> Result<PacketLayout, ()> {
+	debug_assert!(nr_data_shards > 0);
+	if requested_fec_percentage == 0 && minimum_parity_shards == 0 {
+		let blocks = nr_data_shards.div_ceil(MAX_DATA_SHARDS_WITHOUT_FEC);
+		if blocks > MAX_FEC_BLOCKS {
+			return Err(());
+		}
+		return Ok(PacketLayout {
+			blocks,
+			data_shards_per_block: nr_data_shards.div_ceil(blocks),
+			fec_percentage: 0,
+			disable_fec: true,
+		});
+	}
+
+	for fec_percentage in (0..=requested_fec_percentage).rev() {
+		for blocks in 1..=MAX_FEC_BLOCKS {
+			let data_shards_per_block = nr_data_shards.div_ceil(blocks);
+			if data_shards_per_block > MAX_SHARDS {
+				continue;
+			}
+			let valid = (0..blocks).all(|block_index| {
+				let start = block_index * data_shards_per_block;
+				let data = nr_data_shards.saturating_sub(start).min(data_shards_per_block);
+				data > 0 && block_fec_parameters(data, fec_percentage, minimum_parity_shards).is_some()
+			});
+			if valid {
+				return Ok(PacketLayout {
+					blocks,
+					data_shards_per_block,
+					fec_percentage,
+					disable_fec: fec_percentage == 0 && minimum_parity_shards == 0,
+				});
+			}
+		}
+	}
+
+	let blocks = nr_data_shards.div_ceil(MAX_DATA_SHARDS_WITHOUT_FEC);
+	if blocks > MAX_FEC_BLOCKS {
 		tracing::error!(
 			nr_data_shards,
-			data_shards_per_block,
 			"Encoded frame exceeds the GameStream 10-bit shard-count limit"
 		);
 		return Err(());
 	}
-
+	let data_shards_per_block = nr_data_shards.div_ceil(blocks);
 	Ok(PacketLayout {
 		blocks,
 		data_shards_per_block,
-		fec_percentage,
-		disable_fec,
+		fec_percentage: 0,
+		disable_fec: true,
 	})
 }
 
@@ -503,7 +573,7 @@ mod tests {
 
 	#[test]
 	fn ordinary_frames_keep_fec() {
-		let layout = packet_layout(400, 20).unwrap();
+		let layout = packet_layout(400, 20, 0).unwrap();
 		assert_eq!(layout.fec_percentage, 20);
 		assert!(!layout.disable_fec);
 		assert_eq!(layout.blocks, 2);
@@ -511,21 +581,129 @@ mod tests {
 	}
 
 	#[test]
-	fn oversized_keyframes_use_four_blocks_without_fec() {
-		let layout = packet_layout(934, 20).unwrap();
+	fn oversized_frames_reduce_fec_instead_of_disabling_it() {
+		let layout = packet_layout(934, 20, 0).unwrap();
 		assert_eq!(
 			layout,
 			PacketLayout {
 				blocks: 4,
 				data_shards_per_block: 234,
-				fec_percentage: 0,
-				disable_fec: true,
+				fec_percentage: 8,
+				disable_fec: false,
 			}
 		);
 	}
 
 	#[test]
 	fn frames_beyond_the_header_limit_are_rejected() {
-		assert!(packet_layout(MAX_DATA_SHARDS_WITHOUT_FEC * MAX_FEC_BLOCKS + 1, 20).is_err());
+		assert!(packet_layout(MAX_DATA_SHARDS_WITHOUT_FEC * MAX_FEC_BLOCKS + 1, 20, 0).is_err());
+	}
+
+	#[test]
+	fn zero_percentage_and_zero_minimum_disable_fec() {
+		let layout = packet_layout(100, 0, 0).unwrap();
+		assert!(layout.disable_fec);
+		assert_eq!(layout.fec_percentage, 0);
+	}
+
+	fn packetizer() -> Packetizer {
+		let (_tx, rx) = tokio::sync::watch::channel(crate::session::SessionKeyData {
+			remote_input_key: vec![0; 16],
+			remote_input_key_id: 0,
+		});
+		Packetizer::new(false, rx)
+	}
+
+	#[test]
+	fn emitted_metadata_reconstructs_the_actual_parity_count() {
+		for percentage in [5, 10, 20, 25] {
+			let mut packetizer = packetizer();
+			let mut sequence = 0;
+			let batch = packetizer
+				.packetize(&vec![0x55; 992], true, 116, 0, percentage, 1, &mut sequence, 0, 0)
+				.unwrap();
+			let first = &batch.as_bytes()[..batch.shard_size()];
+			let fec_info = u32::from_le_bytes(first[NV_PACKET_OFFSET + 12..NV_PACKET_OFFSET + 16].try_into().unwrap());
+			let data = ((fec_info >> 22) & 0x3ff) as usize;
+			let wire_percentage = ((fec_info >> 4) & 0xff) as u8;
+			let parity = batch.shard_count() - data;
+			assert_eq!(wire_percentage, percentage);
+			assert_eq!(parity, receiver_parity_shards(data, wire_percentage));
+		}
+	}
+
+	#[test]
+	fn minimum_parity_metadata_is_receiver_symmetric_for_a_tiny_frame() {
+		let mut packetizer = packetizer();
+		let mut sequence = 0;
+		let batch = packetizer
+			.packetize(&[0x55; 16], true, 116, 2, 20, 1, &mut sequence, 0, 0)
+			.unwrap();
+		let first = &batch.as_bytes()[..batch.shard_size()];
+		let fec_info = u32::from_le_bytes(first[NV_PACKET_OFFSET + 12..NV_PACKET_OFFSET + 16].try_into().unwrap());
+		let data = ((fec_info >> 22) & 0x3ff) as usize;
+		let wire_percentage = ((fec_info >> 4) & 0xff) as u8;
+		assert_eq!(data, 1);
+		assert_eq!(batch.shard_count(), 3);
+		assert_eq!(receiver_parity_shards(data, wire_percentage), 2);
+	}
+
+	#[test]
+	fn reed_solomon_recovers_up_to_parity_count_including_bursts() {
+		let data_shards = 50;
+		let parity_shards = receiver_parity_shards(data_shards, 20);
+		let encoder = ReedSolomon::new(data_shards, parity_shards).unwrap();
+		let mut shards: Vec<Vec<u8>> = (0..data_shards + parity_shards)
+			.map(|index| {
+				if index < data_shards {
+					(0..128).map(|byte| (index ^ byte) as u8).collect()
+				} else {
+					vec![0; 128]
+				}
+			})
+			.collect();
+		encoder.encode(&mut shards).unwrap();
+		let original = shards.clone();
+
+		let mut recoverable: Vec<Option<Vec<u8>>> = shards.iter().cloned().map(Some).collect();
+		for shard in &mut recoverable[7..7 + parity_shards] {
+			*shard = None;
+		}
+		encoder.reconstruct(&mut recoverable).unwrap();
+		for index in 0..data_shards {
+			assert_eq!(recoverable[index].as_ref().unwrap(), &original[index]);
+		}
+
+		let mut unrecoverable: Vec<Option<Vec<u8>>> = shards.into_iter().map(Some).collect();
+		for shard in &mut unrecoverable[7..7 + parity_shards + 1] {
+			*shard = None;
+		}
+		assert!(encoder.reconstruct(&mut unrecoverable).is_err());
+	}
+
+	#[test]
+	fn client_minimum_uses_a_receiver_representable_percentage() {
+		for data in 1..=255 {
+			for requested in [0, 1, 5, 10, 20, 25] {
+				for minimum in [0, 1, 2] {
+					if let Some((percentage, parity)) = block_fec_parameters(data, requested, minimum) {
+						assert_eq!(receiver_parity_shards(data, percentage), parity);
+						assert!(parity >= minimum);
+						assert!(data + parity <= MAX_SHARDS);
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn four_block_boundary_degrades_smoothly() {
+		let before = packet_layout(848, 20, 0).unwrap();
+		let after = packet_layout(849, 20, 0).unwrap();
+		assert_eq!(before.blocks, 4);
+		assert_eq!(before.fec_percentage, 20);
+		assert_eq!(after.blocks, 4);
+		assert!(after.fec_percentage > 0);
+		assert!(after.fec_percentage <= 20);
 	}
 }

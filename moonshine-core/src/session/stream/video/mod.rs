@@ -8,12 +8,15 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
+pub(crate) mod fec;
 mod format;
 mod gso_socket;
 mod packetizer;
 mod pipeline;
 pub(crate) mod pyrowave;
 mod shard_batch;
+pub use fec::FecMode;
+use fec::FrameFecStatus;
 pub use format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 	VideoChromaSampling, VideoCodec, VideoDynamicRange, VideoFormat,
@@ -31,6 +34,15 @@ pub struct VideoStreamConfig {
 
 	/// What percentage of data packets should be parity packets.
 	pub fec_percentage: u8,
+
+	/// Whether FEC is disabled, fixed, or driven by client feedback.
+	pub fec_mode: FecMode,
+
+	/// Lower bound for automatic FEC.
+	pub fec_min_percentage: u8,
+
+	/// Upper bound for automatic FEC.
+	pub fec_max_percentage: u8,
 
 	/// Whether to enable video stream encryption (AES-128-GCM).
 	#[serde(default)]
@@ -86,6 +98,11 @@ impl Default for VideoStreamConfig {
 		Self {
 			port: 47998,
 			fec_percentage: 20,
+			// Fixed preserves the behavior of configurations written before the
+			// explicit policy fields existed. Users opt into feedback with `auto`.
+			fec_mode: FecMode::Fixed,
+			fec_min_percentage: 0,
+			fec_max_percentage: 25,
 			encrypt: false,
 			log_frame_spikes: false,
 			max_packet_size: 0,
@@ -120,6 +137,12 @@ pub struct FrameStats {
 	pub total: std::time::Duration,
 	/// Number of bytes encoded for this frame.
 	pub encoded_bytes: usize,
+	/// Approximate transmitted bytes including FEC, packet headers, and encryption prefix.
+	pub wire_bytes: usize,
+	/// Number of UDP video shards emitted for this frame.
+	pub packet_count: usize,
+	/// Stale compositor frames discarded before this frame was encoded.
+	pub stale_frames_dropped: u32,
 	/// Whether this frame is a key (IDR) frame.
 	pub is_key_frame: bool,
 }
@@ -169,6 +192,7 @@ pub(crate) struct VideoStreamHandle {
 	/// `[first, last]` client frame-index range the client could not decode.
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
 	reset_tx: broadcast::Sender<()>,
+	fec_feedback_tx: watch::Sender<FrameFecStatus>,
 }
 
 impl VideoStreamHandle {
@@ -206,6 +230,26 @@ impl VideoStreamHandle {
 	/// IDR so the resumed client has a decodable starting frame.
 	pub fn request_reset(&self) {
 		let _ = self.reset_tx.send(());
+	}
+
+	pub(crate) fn report_fec_status(&self, mut status: FrameFecStatus) {
+		tracing::trace!(
+			frame_index = status.frame_index,
+			highest_sequence = status.highest_received_sequence_number,
+			next_contiguous_sequence = status.next_contiguous_sequence_number,
+			missing_before_highest = status.missing_packets_before_highest,
+			data_packets = status.total_data_packets,
+			parity_packets = status.total_parity_packets,
+			received_data_packets = status.received_data_packets,
+			received_parity_packets = status.received_parity_packets,
+			fec_percentage = status.fec_percentage,
+			block_index = status.block_index,
+			block_count = status.block_count,
+			"Received Moonlight frame FEC status"
+		);
+		let serial = self.fec_feedback_tx.borrow().serial.wrapping_add(1).max(1);
+		status.serial = serial;
+		self.fec_feedback_tx.send_replace(status);
 	}
 
 	/// Clone the start notify for external triggering (e.g. bench binary).
@@ -281,6 +325,7 @@ impl VideoStream {
 
 		// Stream-reset broadcast channel (client reconnect/resume).
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
+		let (fec_feedback_tx, fec_feedback_rx) = watch::channel(FrameFecStatus::default());
 
 		// Packet channel.
 		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
@@ -303,6 +348,7 @@ impl VideoStream {
 			hdr_metadata_tx,
 			start_notify.clone(),
 			stats_tx,
+			fec_feedback_rx,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
@@ -311,6 +357,7 @@ impl VideoStream {
 			idr_tx,
 			invalidate_tx,
 			reset_tx,
+			fec_feedback_tx,
 		})
 	}
 }
