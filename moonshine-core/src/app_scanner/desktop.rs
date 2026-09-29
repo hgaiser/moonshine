@@ -149,7 +149,6 @@ fn parse_desktop_application(
 		stdout: config.stdout.clone(),
 		stderr: config.stderr.clone(),
 		launch_timeout_secs: config.launch_timeout_secs,
-		..Default::default()
 	}))
 }
 
