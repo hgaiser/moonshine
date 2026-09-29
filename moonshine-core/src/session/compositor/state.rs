@@ -901,25 +901,36 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Committed buffer size of the window's content, if any.
+	/// Rendered logical size of the window's content, if any.
 	///
 	/// A window whose content is overridden by the WSI presents the override
-	/// surface, so its buffer is the override's.
+	/// surface, so its rendered size is the override's.
 	fn window_source_size(&self, window: &smithay::desktop::Window) -> Option<(i32, i32)> {
 		if let Some(x11_id) = window.x11_surface().map(|x| x.window_id())
 			&& let Some((surface, render_window)) = self.override_surface.as_ref()
 			&& *render_window == x11_id
 			&& surface.alive()
-			&& let Some(size) = Self::surface_buffer_size(surface)
+			&& let Some(size) = Self::surface_source_size(surface)
 		{
 			return Some(size);
 		}
-		window.wl_surface().as_deref().and_then(Self::surface_buffer_size)
+		window.wl_surface().as_deref().and_then(Self::surface_source_size)
 	}
 
-	/// The committed buffer size of a `wl_surface`, in buffer pixels.
-	fn surface_buffer_size(surface: &WlSurface) -> Option<(i32, i32)> {
-		with_renderer_surface_state(surface, |st| st.buffer_size().map(|s| (s.w, s.h))).flatten()
+	/// The logical destination size Smithay renders for a `wl_surface`.
+	///
+	/// A viewport can make this differ from the attached buffer's logical size.
+	/// Scaling the composed scene from the buffer size would apply that viewport
+	/// transform twice, causing fractional-scale clients to appear blurred or
+	/// cropped. Fall back to the buffer size only before a surface view exists.
+	fn surface_source_size(surface: &WlSurface) -> Option<(i32, i32)> {
+		with_renderer_surface_state(surface, |st| {
+			select_surface_source_size(
+				st.surface_size().map(|s| (s.w, s.h)),
+				st.buffer_size().map(|s| (s.w, s.h)),
+			)
+		})
+		.flatten()
 	}
 
 	/// Raise/lower the Steam overlay above/below the game when `STEAM_OVERLAY`
@@ -2128,6 +2139,10 @@ impl MoonshineCompositor {
 	}
 }
 
+fn select_surface_source_size(surface_size: Option<(i32, i32)>, buffer_size: Option<(i32, i32)>) -> Option<(i32, i32)> {
+	surface_size.or(buffer_size)
+}
+
 /// Convert a Smithay Dmabuf into our pipeline's ExportedFrame.
 ///
 /// Export a DMA-BUF as an `ExportedFrame` for the video encoder.
@@ -2165,4 +2180,22 @@ fn export_dmabuf(
 		color_space: surface_color_space.unwrap_or(FrameColorSpace::Srgb),
 		hdr_metadata,
 	})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::select_surface_source_size;
+
+	#[test]
+	fn viewport_destination_wins_over_buffer_size() {
+		assert_eq!(
+			select_surface_source_size(Some((2880, 1920)), Some((4320, 2880))),
+			Some((2880, 1920))
+		);
+	}
+
+	#[test]
+	fn buffer_size_is_used_before_surface_view_exists() {
+		assert_eq!(select_surface_source_size(None, Some((1280, 720))), Some((1280, 720)));
+	}
 }
