@@ -34,7 +34,7 @@ impl Default for AudioStreamConfig {
 }
 
 /// Number of audio channels requested by the client.
-#[derive(Clone, Copy, Debug, Default, Display, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Display, PartialEq, Eq, PartialOrd)]
 pub enum AudioChannels {
 	#[default]
 	Stereo = 2,
@@ -53,7 +53,7 @@ impl From<u8> for AudioChannels {
 }
 
 /// Opus multistream configuration for a specific channel layout.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpusStreamConfig {
 	pub channels: AudioChannels,
 	pub streams: u8,
@@ -122,7 +122,7 @@ pub(crate) const ALL_AUDIO_CONFIGS: [&OpusStreamConfig; 6] = [
 ];
 
 /// Audio configuration negotiated between client and server.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AudioConfig {
 	pub channels: AudioChannels,
 	pub channel_mask: u32,
@@ -161,7 +161,7 @@ impl AudioConfig {
 	}
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AudioStreamContext {
 	/// Duration of each audio packet in milliseconds, typically 20ms for Opus.
 	pub packet_duration_ms: u32,
@@ -178,8 +178,32 @@ pub struct AudioStreamContext {
 /// The encoder and packet handler are spawned immediately but block on a `Notify`
 /// until `trigger()` is called. PulseServer starts immediately (it just mixes audio,
 /// no network impact).
+#[derive(Clone)]
 pub(crate) struct AudioStartHandle {
 	notify: Arc<Notify>,
+	packet_tx: mpsc::Sender<AudioPacketMessage>,
+	encoder_reconfigure_tx: crossbeam_channel::Sender<AudioEncoderReconfigure>,
+	pulse_reconfigure_tx: crossbeam_channel::Sender<PulseReconfigure>,
+}
+
+pub(crate) struct AudioEncoderReconfigure {
+	context: AudioStreamContext,
+	applied: tokio::sync::oneshot::Sender<Result<(), ()>>,
+}
+
+pub(crate) struct PulseReconfigure {
+	channels: u8,
+	packet_duration_ms: u32,
+	applied: tokio::sync::oneshot::Sender<Result<(), String>>,
+}
+
+pub(crate) enum AudioPacketMessage {
+	Packet(Vec<u8>),
+	Pause(tokio::sync::oneshot::Sender<()>),
+	BeginEpoch {
+		qos: bool,
+		ready: tokio::sync::oneshot::Sender<()>,
+	},
 }
 
 impl AudioStartHandle {
@@ -196,6 +220,38 @@ impl AudioStartHandle {
 	/// Clone the start notify for external triggering (e.g. bench binary).
 	pub fn clone_start_notify(&self) -> Arc<Notify> {
 		self.notify.clone()
+	}
+
+	pub async fn pause_for_reconfigure(&self) -> Result<(), ()> {
+		let (ready, waiting) = tokio::sync::oneshot::channel();
+		self.packet_tx
+			.send(AudioPacketMessage::Pause(ready))
+			.await
+			.map_err(|_| ())?;
+		waiting.await.map_err(|_| ())
+	}
+
+	pub async fn reconfigure(&self, context: AudioStreamContext, reconfigure_capture: bool) -> Result<(), ()> {
+		if reconfigure_capture {
+			let (pulse_applied, pulse_waiting) = tokio::sync::oneshot::channel();
+			self.pulse_reconfigure_tx
+				.send(PulseReconfigure {
+					channels: context.audio_config.channels as u8,
+					packet_duration_ms: context.packet_duration_ms,
+					applied: pulse_applied,
+				})
+				.map_err(|_| ())?;
+			pulse_waiting
+				.await
+				.map_err(|_| ())?
+				.map_err(|error| tracing::warn!(%error, "PulseAudio capture reconfiguration failed"))?;
+		}
+
+		let (applied, waiting) = tokio::sync::oneshot::channel();
+		self.encoder_reconfigure_tx
+			.send(AudioEncoderReconfigure { context, applied })
+			.map_err(|_| ())?;
+		waiting.await.map_err(|_| ())?
 	}
 }
 
@@ -254,7 +310,7 @@ impl AudioStream {
 		let start_notify = Arc::new(Notify::new());
 
 		// Create packet channel and spawn handler — gated behind start_notify.
-		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(10);
+		let (packet_tx, packet_rx) = mpsc::channel::<AudioPacketMessage>(16);
 		spawn_handle_audio_packets(packet_rx, self.udp_socket, start_notify.clone(), self.stop.clone());
 
 		// Create frame channels for PulseServer and encoder communication.
@@ -262,6 +318,7 @@ impl AudioStream {
 		let (frame_recycle_tx, frame_recycle_rx) = crossbeam_channel::bounded(3);
 
 		// Spawn PulseServer immediately (no gating — it just mixes audio, no network impact).
+		let (pulse_reconfigure_tx, pulse_reconfigure_rx) = crossbeam_channel::unbounded();
 		PulseServer::spawn(
 			self.pulse_socket,
 			self.pulse_socket_path.clone(),
@@ -270,28 +327,35 @@ impl AudioStream {
 			frame_tx,
 			frame_recycle_rx,
 			self.stop.clone(),
+			pulse_reconfigure_rx,
 		)
 		.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?;
 
 		// Spawn audio encoder — gated behind start_notify.
+		let (encoder_reconfigure_tx, encoder_reconfigure_rx) = crossbeam_channel::unbounded();
 		AudioEncoder::spawn(
 			CAPTURE_SAMPLE_RATE,
-			&context.audio_config.stream_config,
+			context.clone(),
 			frame_rx,
 			frame_recycle_tx,
 			keys_rx,
-			context.encrypt_audio,
-			packet_tx,
+			packet_tx.clone(),
 			self.stop.clone(),
 			start_notify.clone(),
+			encoder_reconfigure_rx,
 		)?;
 
-		Ok(AudioStartHandle { notify: start_notify })
+		Ok(AudioStartHandle {
+			notify: start_notify,
+			packet_tx,
+			encoder_reconfigure_tx,
+			pulse_reconfigure_tx,
+		})
 	}
 }
 
 fn spawn_handle_audio_packets(
-	mut packet_rx: mpsc::Receiver<Vec<u8>>,
+	mut packet_rx: mpsc::Receiver<AudioPacketMessage>,
 	socket: UdpSocket,
 	start: Arc<Notify>,
 	stop: ShutdownManager<SessionShutdownReason>,
@@ -308,9 +372,17 @@ fn spawn_handle_audio_packets(
 
 		while !stop.is_shutdown_triggered() {
 			tokio::select! {
-				packet = stop.wrap_cancel(packet_rx.recv()) => {
-					match packet {
-						Ok(Some(packet)) => {
+				message = stop.wrap_cancel(packet_rx.recv()) => {
+					match message {
+						Ok(Some(AudioPacketMessage::Pause(ready))) => {
+							client_address = None;
+							let _ = ready.send(());
+						},
+						Ok(Some(AudioPacketMessage::BeginEpoch { qos, ready })) => {
+							let _ = socket.set_tos_v4(if qos { 224 } else { 0 });
+							let _ = ready.send(());
+						},
+						Ok(Some(AudioPacketMessage::Packet(packet))) => {
 							if let Some(client_address) = client_address
 								&& let Err(e) = socket.send_to(packet.as_slice(), client_address).await {
 									tracing::warn!("Failed to send packet to client: {e}");

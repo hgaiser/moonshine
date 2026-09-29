@@ -104,6 +104,18 @@ pub struct SessionContext {
 	pub hdr: bool,
 }
 
+/// Session-level values carried by the authenticated HTTP `/resume` request.
+/// RTSP ANNOUNCE remains authoritative for encoded stream properties; these
+/// values are retained to drive and diagnose compositor/capture changes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ResumeRequest {
+	pub resolution: Option<(u32, u32)>,
+	pub refresh_rate: Option<u32>,
+	pub hdr: Option<bool>,
+	pub audio_channels: Option<AudioChannels>,
+	pub audio_channel_mask: Option<u32>,
+}
+
 /// The state of the session. This enum enforces the session lifecycle:
 ///
 /// 1. `Initialized` — Session created; compositor and app not yet started.
@@ -206,7 +218,9 @@ impl InitializedSession {
 				pulse_socket_path,
 				xdisplay: ready.xdisplay,
 				wayland_display: ready.wayland_display.clone(),
-				hdr: ready.hdr,
+				// Keep HDR-capable application paths enabled so a later reconnect can
+				// switch SDR/HDR without relaunching the application.
+				hdr: ready.hdr_capable,
 				// Populate extra_env with width, height and refreshrate values of the client for e.g. scripting
 				extra_env: HashMap::from([
 					("MOONSHINE_CLIENT_WIDTH".to_string(), context.resolution.0.to_string()),
@@ -268,10 +282,6 @@ impl LaunchedSession {
 			hdr_metadata_rx,
 		} = self;
 
-		// The compositor reports the *effective* HDR: false when HDR was requested
-		// but the GPU fell back to an SDR format.
-		let hdr_effective = launched_compositor.hdr();
-
 		// Extract the watch receiver for streams.
 		let keys_rx = context.keys.clone_rx().ok_or_else(|| {
 			tracing::error!("Session keys not initialized");
@@ -279,24 +289,25 @@ impl LaunchedSession {
 
 		// Start video stream — gated, returns VideoStreamHandle.
 		let video_handle = video_stream
-			.start(video_config, video_ctx, keys_rx.clone(), stop.clone())
+			.start(video_config, video_ctx.clone(), keys_rx.clone(), stop.clone())
 			.map_err(|()| tracing::error!("Failed to start video stream"))?;
 
 		// Start audio stream — gated, returns AudioStartHandle.
 		let audio_trigger = audio
-			.start(audio_ctx, keys_rx)
+			.start(audio_ctx.clone(), keys_rx)
 			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
 
 		// Clone the start notifies for external triggering (e.g. bench binary).
 		let video_start_notify = video_handle.clone_start_notify();
 		let audio_start_notify = audio_trigger.clone_start_notify();
+		let audio_handle_for_resume = audio_trigger.clone();
 
 		// Keep a handle to the video stream so a resuming client can reset its
 		// frame counters (see `ActiveSession::reset_video_stream`).
 		let video_handle_for_resume = video_handle.clone();
 
 		// Start control stream — receives both handles.
-		let control_ctx = ControlStreamContext::new(&context, hdr_effective);
+		let control_ctx = ControlStreamContext::new(&context);
 		control_stream.start(
 			stream_timeout,
 			control_ctx,
@@ -315,7 +326,11 @@ impl LaunchedSession {
 			ActiveSession {
 				context,
 				_application: application,
+				compositor: launched_compositor,
 				video_handle: video_handle_for_resume,
+				audio_handle: audio_handle_for_resume,
+				video_context: video_ctx,
+				audio_context: audio_ctx,
 				sleep_inhibitor,
 			},
 			video_start_notify,
@@ -328,7 +343,11 @@ impl LaunchedSession {
 pub(crate) struct ActiveSession {
 	context: SessionContext,
 	_application: Application,
+	compositor: LaunchedCompositor,
 	video_handle: VideoStreamHandle,
+	audio_handle: stream::audio::AudioStartHandle,
+	video_context: VideoStreamContext,
+	audio_context: AudioStreamContext,
 	/// Held while the session is active to keep the host awake; dropped on teardown.
 	#[allow(dead_code)]
 	sleep_inhibitor: Option<SleepInhibitor>,
@@ -342,5 +361,54 @@ impl ActiveSession {
 	/// Reset the video stream's frame counters and force an IDR for a resuming client.
 	pub(crate) fn reset_video_stream(&self) {
 		self.video_handle.request_reset();
+	}
+
+	pub(crate) fn video_context(&self) -> &VideoStreamContext {
+		&self.video_context
+	}
+
+	pub(crate) fn audio_context(&self) -> &AudioStreamContext {
+		&self.audio_context
+	}
+
+	pub(crate) fn video_handle(&self) -> VideoStreamHandle {
+		self.video_handle.clone()
+	}
+
+	pub(crate) fn audio_handle(&self) -> stream::audio::AudioStartHandle {
+		self.audio_handle.clone()
+	}
+
+	pub(crate) async fn reconfigure_video(&mut self, context: VideoStreamContext) -> Result<(), ()> {
+		let effective_hdr = self
+			.compositor
+			.reconfigure(context.width, context.height, context.fps, context.format.hdr)
+			.await?;
+		if effective_hdr != context.format.hdr {
+			tracing::warn!(
+				requested_hdr = context.format.hdr,
+				effective_hdr,
+				"Compositor could not apply the negotiated HDR mode"
+			);
+			return Err(());
+		}
+		self.video_handle.reconfigure(context.clone()).await?;
+		self.context.resolution = (context.width, context.height);
+		self.context.refresh_rate = context.fps;
+		self.context.hdr = effective_hdr;
+		self.video_context = context;
+		Ok(())
+	}
+
+	pub(crate) async fn reconfigure_audio(&mut self, context: AudioStreamContext) -> Result<(), ()> {
+		let reconfigure_capture = self.audio_context.packet_duration_ms != context.packet_duration_ms
+			|| self.audio_context.audio_config.channels != context.audio_config.channels;
+		self.audio_handle
+			.reconfigure(context.clone(), reconfigure_capture)
+			.await?;
+		self.context.audio_channels = context.audio_config.channels;
+		self.context.audio_channel_mask = context.audio_config.channel_mask;
+		self.audio_context = context;
+		Ok(())
 	}
 }

@@ -24,10 +24,9 @@ use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::pyrowave::{
 	EncodedFrame, PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL, quality_reference_frame_bytes,
 };
-use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, FrameStats, NegotiatedVideoFormat, TransferFunction,
-	VideoCodec, VideoStreamConfig, VideoStreamContext,
+	VideoCodec, VideoPacketMessage, VideoReconfigureCommand, VideoStreamConfig, VideoStreamContext,
 };
 
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
@@ -279,7 +278,7 @@ impl Drop for InFlightGuard {
 #[allow(clippy::too_many_arguments)]
 async fn run_packet_consumer(
 	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
-	packet_tx: mpsc::Sender<ShardBatch>,
+	packet_tx: mpsc::Sender<VideoPacketMessage>,
 	stats_tx: broadcast::Sender<FrameStats>,
 	in_flight: Arc<AtomicUsize>,
 	idr_tx: broadcast::Sender<()>,
@@ -397,7 +396,7 @@ async fn run_packet_consumer(
 		// session is already tearing down. Stop the consumer; the encoding thread
 		// then sees its `frame_ctx_tx` fail and exits too, which drops the
 		// video-pipeline shutdown token and tears the session down.
-		if packet_tx.send(shards).await.is_err() {
+		if packet_tx.send(VideoPacketMessage::Batch(shards)).await.is_err() {
 			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
 			break;
 		}
@@ -477,7 +476,7 @@ impl VideoPipeline {
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
@@ -487,6 +486,7 @@ impl VideoPipeline {
 		start_notify: Arc<Notify>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 		fec_feedback_rx: watch::Receiver<FrameFecStatus>,
+		reconfigure_rx: std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -517,6 +517,7 @@ impl VideoPipeline {
 					hdr_metadata_tx,
 					start_notify,
 					stats_tx,
+					reconfigure_rx,
 				);
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
@@ -533,20 +534,45 @@ struct VideoPipelineInner {
 }
 
 impl VideoPipelineInner {
+	fn activate_reconfigured_epoch(
+		&self,
+		runtime: &tokio::runtime::Handle,
+		packet_tx: &mpsc::Sender<VideoPacketMessage>,
+		applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+	) -> Result<(), String> {
+		let Some(applied) = applied else {
+			return Ok(());
+		};
+		let (ready, waiting) = tokio::sync::oneshot::channel();
+		packet_tx
+			.blocking_send(VideoPacketMessage::BeginEpoch {
+				context: self.context.clone(),
+				ready,
+			})
+			.map_err(|_| "video packet channel closed during reconfiguration".to_string())?;
+		if runtime.block_on(waiting).is_err() {
+			let _ = applied.send(Err(()));
+			return Err("video packet handler stopped during reconfiguration".to_string());
+		}
+		let _ = applied.send(Ok(()));
+		Ok(())
+	}
+
 	#[allow(clippy::too_many_arguments)]
 	fn run(
-		self,
+		mut self,
 		runtime: tokio::runtime::Handle,
 		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_tx: broadcast::Sender<()>,
-		idr_frame_request_rx: broadcast::Receiver<()>,
-		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: broadcast::Receiver<()>,
+		mut idr_frame_request_rx: broadcast::Receiver<()>,
+		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		mut reset_request_rx: broadcast::Receiver<()>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		reconfigure_rx: std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 	) {
 		tracing::debug!("Starting video pipeline.");
 
@@ -568,48 +594,64 @@ impl VideoPipelineInner {
 			return;
 		}
 
-		if self.context.format.codec == VideoCodec::PyroWave {
-			if let Err(error) = self.run_pyrowave_encoding_loop(
-				frame_rx,
-				packet_tx,
-				idr_frame_request_rx,
-				invalidate_request_rx,
-				reset_request_rx,
-				stop_session_manager,
-				hdr_metadata_tx,
-				stats_tx,
-			) {
-				tracing::error!(%error, "PyroWave encoding loop failed");
+		let mut pending_applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>> = None;
+		loop {
+			if stop_session_manager.is_shutdown_triggered() {
+				if let Some(applied) = pending_applied.take() {
+					let _ = applied.send(Err(()));
+				}
+				break;
 			}
-			tracing::debug!("Video pipeline stopped.");
-			return;
-		}
+			let result = if self.context.format.codec == VideoCodec::PyroWave {
+				self.run_pyrowave_encoding_loop(
+					&frame_rx,
+					packet_tx.clone(),
+					&mut idr_frame_request_rx,
+					&mut invalidate_request_rx,
+					&mut reset_request_rx,
+					&reconfigure_rx,
+					stop_session_manager.clone(),
+					hdr_metadata_tx.clone(),
+					stats_tx.clone(),
+					pending_applied.take(),
+					&runtime,
+				)
+			} else {
+				match self.create_encoder() {
+					Ok((context, encoder)) => self.run_encoding_loop(
+						&runtime,
+						&frame_rx,
+						context,
+						encoder,
+						packet_tx.clone(),
+						idr_tx.clone(),
+						&mut idr_frame_request_rx,
+						&mut invalidate_request_rx,
+						&mut reset_request_rx,
+						&reconfigure_rx,
+						stop_session_manager.clone(),
+						hdr_metadata_tx.clone(),
+						stats_tx.clone(),
+						pending_applied.take(),
+					),
+					Err(error) => Err(error),
+				}
+			};
 
-		// Create the conventional Vulkan Video encoder.
-		let (context, encoder) = match self.create_encoder() {
-			Ok(result) => result,
-			Err(e) => {
-				tracing::error!("Failed to create video encoder: {e}");
-				return;
-			},
-		};
-
-		// Start the capture and encoding loop.
-		if let Err(e) = self.run_encoding_loop(
-			runtime,
-			frame_rx,
-			context,
-			encoder,
-			packet_tx,
-			idr_tx,
-			idr_frame_request_rx,
-			invalidate_request_rx,
-			reset_request_rx,
-			stop_session_manager,
-			hdr_metadata_tx,
-			stats_tx,
-		) {
-			tracing::error!("Video encoding loop failed: {e}");
+			match result {
+				Ok(Some(command)) => {
+					self.context = command.context;
+					pending_applied = Some(command.applied);
+				},
+				Ok(None) => break,
+				Err(error) => {
+					if let Some(applied) = pending_applied.take() {
+						let _ = applied.send(Err(()));
+					}
+					tracing::error!(%error, "Video encoding loop failed");
+					break;
+				},
+			}
 		}
 
 		tracing::debug!("Video pipeline stopped.");
@@ -681,15 +723,18 @@ impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run_pyrowave_encoding_loop(
 		&self,
-		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
-		packet_tx: mpsc::Sender<ShardBatch>,
-		mut idr_frame_request_rx: broadcast::Receiver<()>,
-		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		mut reset_request_rx: broadcast::Receiver<()>,
+		frame_rx: &std::sync::mpsc::Receiver<ExportedFrame>,
+		packet_tx: mpsc::Sender<VideoPacketMessage>,
+		idr_frame_request_rx: &mut broadcast::Receiver<()>,
+		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
+		reset_request_rx: &mut broadcast::Receiver<()>,
+		reconfigure_rx: &std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
-	) -> Result<(), String> {
+		applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+		runtime: &tokio::runtime::Handle,
+	) -> Result<Option<VideoReconfigureCommand>, String> {
 		let ctx = &self.context;
 		ctx.format.validate().map_err(str::to_string)?;
 		let video_context = VideoContextBuilder::new()
@@ -697,6 +742,8 @@ impl VideoPipelineInner {
 			.map_err(|e| format!("Failed to create Vulkan context for PyroWave adapter matching: {e}"))?;
 		let mut encoder =
 			PyroWaveEncoder::new(&video_context, ctx.format, ctx.width, ctx.height, ctx.bitrate, ctx.fps)?;
+		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
+		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
 		let quality_reference_bytes =
 			quality_reference_frame_bytes(ctx.width, ctx.height, ctx.format.chroma, ctx.format.bit_depth);
 		let mut fec_controller = FecController::new(
@@ -759,6 +806,9 @@ impl VideoPipelineInner {
 		let mut last_slow_send_warning: Option<std::time::Instant> = None;
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			if let Ok(command) = reconfigure_rx.try_recv() {
+				return Ok(Some(command));
+			}
 			if fec_feedback_rx.has_changed().unwrap_or(false) {
 				fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 			}
@@ -884,7 +934,7 @@ impl VideoPipelineInner {
 			let mut shards = shards;
 			shards.set_send_completion(completion_tx);
 			packet_tx
-				.blocking_send(shards)
+				.blocking_send(VideoPacketMessage::Batch(shards))
 				.map_err(|_| "video packet channel closed".to_string())?;
 			let queued = std::time::Instant::now();
 			let sent = loop {
@@ -892,7 +942,7 @@ impl VideoPipelineInner {
 					Ok(sent) => break sent,
 					Err(std::sync::mpsc::RecvTimeoutError::Timeout)
 						if !stop_session_manager.is_shutdown_triggered() => {},
-					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(()),
+					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
 					Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
 						return Err("video packet sender stopped before sending PyroWave frame".to_string());
 					},
@@ -942,26 +992,30 @@ impl VideoPipelineInner {
 			let _ = stats_tx.send(stats);
 			last_encoded = Some(encoded);
 		}
-		Ok(())
+		Ok(None)
 	}
 
 	#[allow(clippy::too_many_arguments)]
 	fn run_encoding_loop(
 		&self,
-		runtime: tokio::runtime::Handle,
-		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		runtime: &tokio::runtime::Handle,
+		frame_rx: &std::sync::mpsc::Receiver<ExportedFrame>,
 		context: VideoContext,
 		mut encoder: Encoder,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_tx: broadcast::Sender<()>,
-		mut idr_frame_request_rx: broadcast::Receiver<()>,
-		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		mut reset_request_rx: broadcast::Receiver<()>,
+		idr_frame_request_rx: &mut broadcast::Receiver<()>,
+		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
+		reset_request_rx: &mut broadcast::Receiver<()>,
+		reconfigure_rx: &std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
-	) -> Result<(), String> {
+		applied: Option<tokio::sync::oneshot::Sender<Result<(), ()>>>,
+	) -> Result<Option<VideoReconfigureCommand>, String> {
 		let ctx = &self.context;
+		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
+		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
 		packetizer.warm_up(
@@ -1063,6 +1117,19 @@ impl VideoPipelineInner {
 		let mut encoder_color_desc: Option<ColorDescription> = Some(color_description_for(ctx.format)?);
 
 		while !stop_session_manager.is_shutdown_triggered() {
+			let reconfigure = reconfigure_rx.try_recv().ok();
+			if reconfigure.is_some() {
+				// Exit through the flush/drain barrier below. It guarantees every
+				// packet from the old encoder epoch is consumed before activation.
+				if let Err(e) = encoder.flush() {
+					tracing::warn!("Failed to flush encoder during reconfiguration: {e}");
+				}
+				drop(frame_ctx_tx);
+				if let Err(e) = runtime.block_on(consumer) {
+					tracing::warn!("Packet consumer task panicked: {e:?}");
+				}
+				return Ok(reconfigure);
+			}
 			let mut pending_idr = false;
 
 			// Drain any pending stream-reset requests (client reconnect/resume).
@@ -1461,7 +1528,7 @@ impl VideoPipelineInner {
 			tracing::warn!("Packet consumer task panicked: {e:?}");
 		}
 
-		Ok(())
+		Ok(None)
 	}
 }
 

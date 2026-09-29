@@ -6,6 +6,7 @@ use tokio::sync::{Mutex, broadcast, watch};
 use crate::ShutdownReason;
 use crate::session::FrameStats;
 use crate::session::InitializedSession;
+use crate::session::ResumeRequest;
 use crate::session::SessionContext;
 use crate::session::SessionKeyData;
 use crate::session::SessionKeys;
@@ -19,6 +20,38 @@ use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectDecision {
+	FastResume,
+	Reconfigure {
+		video_changed_fields: Vec<&'static str>,
+		audio_changed: bool,
+	},
+	RejectShuttingDown,
+}
+
+fn reconnect_decision(
+	active_video: &VideoStreamContext,
+	requested_video: &VideoStreamContext,
+	active_audio: &AudioStreamContext,
+	requested_audio: &AudioStreamContext,
+	shutting_down: bool,
+) -> ReconnectDecision {
+	if shutting_down {
+		return ReconnectDecision::RejectShuttingDown;
+	}
+	let video_changed_fields = active_video.changed_fields(requested_video);
+	let audio_changed = active_audio != requested_audio;
+	if video_changed_fields.is_empty() && !audio_changed {
+		ReconnectDecision::FastResume
+	} else {
+		ReconnectDecision::Reconfigure {
+			video_changed_fields,
+			audio_changed,
+		}
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionShutdownReason {
@@ -79,9 +112,13 @@ struct SessionManagerInner {
 	/// Subsystems that get updated are: video encoder, audio encoder and input handler.
 	keys_tx: Option<SessionKeysSender>,
 
-	/// Stream contexts received via RTSP ANNOUNCE, consumed by `start_session`.
-	video_stream_context: Option<VideoStreamContext>,
-	audio_stream_context: Option<AudioStreamContext>,
+	/// Pending stream contexts received via RTSP ANNOUNCE. For an active
+	/// session these belong to the reconnecting client and are not the contexts
+	/// currently used by the live encoders until PLAY commits the new epoch.
+	pending_video_stream_context: Option<VideoStreamContext>,
+	pending_audio_stream_context: Option<AudioStreamContext>,
+	/// Authenticated session-level settings from the most recent `/resume`.
+	resume_request: Option<ResumeRequest>,
 
 	/// Broadcast sender for per-frame encoding statistics.
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -116,8 +153,9 @@ impl SessionManagerInner {
 		}
 		self.session = None;
 		self.keys_tx = None;
-		self.video_stream_context = None;
-		self.audio_stream_context = None;
+		self.pending_video_stream_context = None;
+		self.pending_audio_stream_context = None;
+		self.resume_request = None;
 		self.video_start_notify = None;
 		self.audio_start_notify = None;
 		self.stop = ShutdownManager::new();
@@ -174,8 +212,9 @@ impl SessionManager {
 			session: None,
 			stop: ShutdownManager::new(),
 			keys_tx: None,
-			video_stream_context: None,
-			audio_stream_context: None,
+			pending_video_stream_context: None,
+			pending_audio_stream_context: None,
+			resume_request: None,
 			stats_tx: tokio::sync::broadcast::channel(256).0,
 			stop_watcher: None,
 			video_start_notify: None,
@@ -227,30 +266,81 @@ impl SessionManager {
 		audio_stream_context: AudioStreamContext,
 	) -> Result<(), ()> {
 		let mut guard = self.inner.lock().await;
-		match guard.session.as_ref() {
+		let resume_request = guard.resume_request.clone();
+		let (pause_video, pause_audio) = match guard.session.as_ref() {
 			Some(SessionState::Launched(_)) => {
 				tracing::debug!("Stream contexts received via RTSP ANNOUNCE.");
-				guard.video_stream_context = Some(video_stream_context);
-				guard.audio_stream_context = Some(audio_stream_context);
-				Ok(())
+				guard.pending_video_stream_context = Some(video_stream_context);
+				guard.pending_audio_stream_context = Some(audio_stream_context);
+				(None, None)
 			},
 			Some(SessionState::Initialized(_)) => {
 				tracing::warn!("SetStreamContext rejected: session not yet launched (Initialized state)");
-				Err(())
+				return Err(());
 			},
-			Some(SessionState::Active(_)) => {
-				// Client is resuming an already-running session (reconnect). The video,
-				// audio, and control streams are still running and re-learn the client's
-				// address from its PINGs (with refreshed keys via `/resume`), so there is
-				// nothing to rebuild — accept the re-ANNOUNCE without storing new contexts.
-				tracing::info!("Resuming active session: accepting RTSP ANNOUNCE from reconnecting client.");
-				Ok(())
+			Some(SessionState::Active(active)) => {
+				let changed = active.video_context().changed_fields(&video_stream_context);
+				let audio_changed = active.audio_context() != &audio_stream_context;
+				tracing::info!(
+					active_width = active.video_context().width,
+					active_height = active.video_context().height,
+					active_fps = active.video_context().fps,
+					active_codec = %active.video_context().format.codec,
+					active_chroma = %active.video_context().format.chroma,
+					active_bit_depth = active.video_context().format.bit_depth.bits(),
+					active_hdr = active.video_context().format.hdr,
+					active_bitrate = active.video_context().bitrate,
+					requested_width = video_stream_context.width,
+					requested_height = video_stream_context.height,
+					requested_fps = video_stream_context.fps,
+					requested_codec = %video_stream_context.format.codec,
+					requested_chroma = %video_stream_context.format.chroma,
+					requested_bit_depth = video_stream_context.format.bit_depth.bits(),
+					requested_hdr = video_stream_context.format.hdr,
+					requested_bitrate = video_stream_context.bitrate,
+					changed_fields = ?changed,
+					audio_changed,
+					"Reconnect negotiation received"
+				);
+				if let Some(request) = resume_request
+					&& (request
+						.resolution
+						.is_some_and(|value| value != (video_stream_context.width, video_stream_context.height))
+						|| request
+							.refresh_rate
+							.is_some_and(|value| value != video_stream_context.fps)
+						|| request
+							.hdr
+							.is_some_and(|value| value != video_stream_context.format.hdr))
+				{
+					tracing::warn!(
+						?request,
+						"HTTP resume parameters differ from authoritative RTSP negotiation"
+					);
+				}
+				let pause_video = (!changed.is_empty()).then(|| active.video_handle());
+				let pause_audio = audio_changed.then(|| active.audio_handle());
+				guard.pending_video_stream_context = Some(video_stream_context);
+				guard.pending_audio_stream_context = Some(audio_stream_context);
+				(pause_video, pause_audio)
 			},
 			None => {
 				tracing::warn!("SetStreamContext rejected: no active session");
-				Err(())
+				return Err(());
 			},
+		};
+		drop(guard);
+		if let Some(handle) = pause_video {
+			handle.pause_for_reconfigure().await.map_err(|()| {
+				tracing::warn!("Failed to pause the active video epoch for reconnect reconfiguration");
+			})?;
 		}
+		if let Some(handle) = pause_audio {
+			handle.pause_for_reconfigure().await.map_err(|()| {
+				tracing::warn!("Failed to pause the active audio epoch for reconnect reconfiguration");
+			})?;
+		}
+		Ok(())
 	}
 
 	/// Get the current session context if there is an active session; otherwise return `None`.
@@ -354,10 +444,79 @@ impl SessionManager {
 	/// Returns `Ok(())` only after all three streams (video, audio, control) are
 	/// successfully constructed. Returns `Err(())` if any stream fails to initialize.
 	pub async fn start_session(&self) -> Result<(), ()> {
+		// Active sessions take an explicit resume path. Temporarily taking the
+		// state prevents a concurrent PLAY from racing the epoch transition.
+		let resume = {
+			let mut guard = self.inner.lock().await;
+			if matches!(guard.session, Some(SessionState::Active(_))) {
+				let video = guard.pending_video_stream_context.take();
+				let audio = guard.pending_audio_stream_context.take();
+				let active = match guard.session.take() {
+					Some(SessionState::Active(active)) => active,
+					_ => unreachable!(),
+				};
+				guard.resume_request = None;
+				Some((active, video, audio, guard.stop.clone()))
+			} else {
+				None
+			}
+		};
+
+		if let Some((mut active, video, audio, stop)) = resume {
+			let video =
+				video.ok_or_else(|| tracing::error!("Reconnect PLAY received without a pending video context"))?;
+			let audio =
+				audio.ok_or_else(|| tracing::error!("Reconnect PLAY received without a pending audio context"))?;
+			let decision = reconnect_decision(
+				active.video_context(),
+				&video,
+				active.audio_context(),
+				&audio,
+				stop.is_shutdown_triggered(),
+			);
+
+			let result = match decision {
+				ReconnectDecision::RejectShuttingDown => {
+					tracing::warn!("Session is shutting down; rejecting reconnect PLAY");
+					Err(())
+				},
+				ReconnectDecision::FastResume => {
+					active.reset_video_stream();
+					tracing::info!("Reconnect stream configuration unchanged; using fast resume path");
+					Ok(())
+				},
+				ReconnectDecision::Reconfigure {
+					video_changed_fields,
+					audio_changed,
+				} => {
+					let video_result = if video_changed_fields.is_empty() {
+						active.reset_video_stream();
+						Ok(())
+					} else {
+						tracing::info!(changed_fields = ?video_changed_fields, "Recreating video pipeline for changed reconnect configuration");
+						active.reconfigure_video(video).await
+					};
+					let audio_result = if audio_changed {
+						tracing::info!("Recreating audio epoch for changed reconnect configuration");
+						active.reconfigure_audio(audio).await
+					} else {
+						Ok(())
+					};
+					video_result.and(audio_result)
+				},
+			};
+
+			let mut guard = self.inner.lock().await;
+			if guard.session.is_none() && !stop.is_shutdown_triggered() && !guard.stop.is_shutdown_triggered() {
+				guard.session = Some(SessionState::Active(active));
+			}
+			return result;
+		}
+
 		let (launched, video_stream_context, audio_stream_context, stop) = {
 			let mut guard = self.inner.lock().await;
-			let video_stream_context = guard.video_stream_context.take();
-			let audio_stream_context = guard.audio_stream_context.take();
+			let video_stream_context = guard.pending_video_stream_context.take();
+			let audio_stream_context = guard.pending_audio_stream_context.take();
 			match guard.session.take() {
 				Some(SessionState::Launched(launched)) => {
 					(launched, video_stream_context, audio_stream_context, guard.stop.clone())
@@ -368,18 +527,9 @@ impl SessionManager {
 					return Err(());
 				},
 				Some(SessionState::Active(active)) => {
-					// Resume (reconnect): the streams are already running, so PLAY is a
-					// no-op — the client picks up the existing streams once it PINGs.
-					// The reconnecting client is a fresh Moonlight session that expects
-					// frame numbers to start at 1, so reset the video frame counters and
-					// force an IDR; otherwise it sees the running counter as a huge frame
-					// gap and reports a poor connection.
-					active.reset_video_stream();
 					guard.session = Some(SessionState::Active(active));
-					tracing::info!(
-						"Resuming active session: resetting video frame counter and treating PLAY as no-op."
-					);
-					return Ok(());
+					tracing::warn!("Concurrent reconnect transition already in progress");
+					return Err(());
 				},
 				None => {
 					tracing::warn!("StartSession rejected: no active session");
@@ -448,9 +598,9 @@ impl SessionManager {
 		Ok(())
 	}
 
-	/// Update the session keys for the active session.
-	pub(crate) async fn update_keys(&self, keys: SessionKeyData) -> Result<(), ()> {
-		let guard = self.inner.lock().await;
+	/// Update keys and retain authenticated session-level resume parameters.
+	pub(crate) async fn resume_session(&self, keys: SessionKeyData, request: ResumeRequest) -> Result<(), ()> {
+		let mut guard = self.inner.lock().await;
 
 		if guard.stop.is_shutdown_triggered() {
 			tracing::warn!("Session is shutting down; rejecting resume key update.");
@@ -468,6 +618,7 @@ impl SessionManager {
 			tracing::warn!("Active streaming session has no key sender; rejecting resume.");
 			return Err(());
 		}
+		guard.resume_request = Some(request);
 
 		Ok(())
 	}
@@ -530,5 +681,202 @@ async fn wait_for_session_shutdown(
 			let _ = shutdown.trigger_shutdown(ShutdownReason::SessionManagerShutdown);
 			Err(())
 		},
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::session::stream::audio::{AudioChannels, AudioConfig};
+	use crate::session::stream::video::{BitDepth, ChromaFormat, ColorRange, NegotiatedVideoFormat, VideoCodec};
+
+	fn video(codec: VideoCodec) -> VideoStreamContext {
+		VideoStreamContext {
+			width: 1920,
+			height: 1080,
+			fps: 60,
+			packet_size: 1392,
+			bitrate: 20_000_000,
+			minimum_fec_packets: 2,
+			qos: true,
+			format: NegotiatedVideoFormat::sdr(codec, ChromaFormat::Yuv420, BitDepth::Eight, ColorRange::Limited),
+			max_reference_frames: 1,
+			encrypt_video: false,
+		}
+	}
+
+	fn audio() -> AudioStreamContext {
+		AudioStreamContext {
+			packet_duration_ms: 5,
+			qos: true,
+			audio_config: AudioConfig::from_channels(AudioChannels::Stereo, 0x3, true),
+			encrypt_audio: false,
+		}
+	}
+
+	fn assert_video_reconfigure(active: &VideoStreamContext, requested: &VideoStreamContext) {
+		assert!(matches!(
+			reconnect_decision(active, requested, &audio(), &audio(), false),
+			ReconnectDecision::Reconfigure {
+				audio_changed: false,
+				..
+			}
+		));
+	}
+
+	#[test]
+	fn identical_reconnect_uses_fast_resume() {
+		assert_eq!(
+			reconnect_decision(
+				&video(VideoCodec::H264),
+				&video(VideoCodec::H264),
+				&audio(),
+				&audio(),
+				false
+			),
+			ReconnectDecision::FastResume
+		);
+	}
+
+	#[test]
+	fn resolution_change_reconfigures() {
+		let active = video(VideoCodec::H264);
+		let mut requested = active.clone();
+		requested.width = 3840;
+		requested.height = 2160;
+		assert_video_reconfigure(&active, &requested);
+	}
+
+	#[test]
+	fn fps_change_reconfigures() {
+		let active = video(VideoCodec::H264);
+		let mut requested = active.clone();
+		requested.fps = 120;
+		assert_video_reconfigure(&active, &requested);
+	}
+
+	#[test]
+	fn bitrate_only_change_reconfigures() {
+		let active = video(VideoCodec::H264);
+		let mut requested = active.clone();
+		requested.bitrate *= 2;
+		assert_video_reconfigure(&active, &requested);
+	}
+
+	#[test]
+	fn codec_transitions_reconfigure() {
+		for (from, to) in [
+			(VideoCodec::H264, VideoCodec::Hevc),
+			(VideoCodec::Hevc, VideoCodec::Av1),
+			(VideoCodec::Av1, VideoCodec::PyroWave),
+			(VideoCodec::PyroWave, VideoCodec::H264),
+		] {
+			assert_video_reconfigure(&video(from), &video(to));
+		}
+	}
+
+	#[test]
+	fn dynamic_range_transitions_reconfigure() {
+		let sdr = video(VideoCodec::Hevc);
+		let mut hdr = sdr.clone();
+		hdr.format = NegotiatedVideoFormat::hdr10(VideoCodec::Hevc, ChromaFormat::Yuv420, ColorRange::Limited);
+		assert_video_reconfigure(&sdr, &hdr);
+		assert_video_reconfigure(&hdr, &sdr);
+	}
+
+	#[test]
+	fn chroma_and_bit_depth_changes_reconfigure() {
+		let active = video(VideoCodec::Hevc);
+		let mut chroma = active.clone();
+		chroma.format.chroma = ChromaFormat::Yuv444;
+		assert_video_reconfigure(&active, &chroma);
+		let mut ten_bit = active.clone();
+		ten_bit.format.bit_depth = BitDepth::Ten;
+		assert_video_reconfigure(&active, &ten_bit);
+	}
+
+	#[test]
+	fn packet_size_change_reconfigures() {
+		let active = video(VideoCodec::H264);
+		let mut requested = active.clone();
+		requested.packet_size = 1200;
+		assert_video_reconfigure(&active, &requested);
+	}
+
+	#[test]
+	fn packetizer_transport_reference_and_color_changes_reconfigure() {
+		let active = video(VideoCodec::Hevc);
+		for requested in [
+			{
+				let mut value = active.clone();
+				value.minimum_fec_packets += 1;
+				value
+			},
+			{
+				let mut value = active.clone();
+				value.qos = !value.qos;
+				value
+			},
+			{
+				let mut value = active.clone();
+				value.max_reference_frames += 1;
+				value
+			},
+			{
+				let mut value = active.clone();
+				value.format.range = ColorRange::Full;
+				value
+			},
+		] {
+			assert_video_reconfigure(&active, &requested);
+		}
+	}
+
+	#[test]
+	fn audio_context_change_reconfigures_audio() {
+		let active_audio = audio();
+		let mut requested_audio = active_audio.clone();
+		requested_audio.audio_config = AudioConfig::from_channels(AudioChannels::Surround51, 0x3f, true);
+		assert_eq!(
+			reconnect_decision(
+				&video(VideoCodec::H264),
+				&video(VideoCodec::H264),
+				&active_audio,
+				&requested_audio,
+				false,
+			),
+			ReconnectDecision::Reconfigure {
+				video_changed_fields: Vec::new(),
+				audio_changed: true,
+			}
+		);
+	}
+
+	#[test]
+	fn encryption_mode_change_reconfigures_but_key_refresh_does_not() {
+		let active = video(VideoCodec::H264);
+		let mut encrypted = active.clone();
+		encrypted.encrypt_video = true;
+		assert_video_reconfigure(&active, &encrypted);
+		// Session keys are refreshed through a watch channel and deliberately do
+		// not participate in negotiated-context equality.
+		assert_eq!(
+			reconnect_decision(&active, &active, &audio(), &audio(), false),
+			ReconnectDecision::FastResume
+		);
+	}
+
+	#[test]
+	fn shutdown_rejects_reconnect() {
+		assert_eq!(
+			reconnect_decision(
+				&video(VideoCodec::H264),
+				&video(VideoCodec::H264),
+				&audio(),
+				&audio(),
+				true
+			),
+			ReconnectDecision::RejectShuttingDown
+		);
 	}
 }

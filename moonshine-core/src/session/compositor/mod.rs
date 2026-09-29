@@ -16,6 +16,8 @@ mod scaling;
 mod state;
 mod x11_focus;
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 
 use async_shutdown::ShutdownManager;
@@ -131,8 +133,16 @@ pub(crate) struct CompositorReady {
 	pub xdisplay: u32,
 	/// Wayland socket name for the session compositor.
 	pub wayland_display: String,
-	/// Whether HDR mode is active for this session.
-	pub hdr: bool,
+	/// Whether this compositor can switch HDR on later without restarting.
+	pub hdr_capable: bool,
+}
+
+struct CompositorReconfigure {
+	width: u32,
+	height: u32,
+	refresh_rate: u32,
+	hdr: bool,
+	applied: tokio::sync::oneshot::Sender<Result<bool, String>>,
 }
 
 /// Handles returned by `Compositor::new()` for wiring into streams.
@@ -150,11 +160,14 @@ pub(crate) struct Compositor {
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
 	ready_tx: std::sync::mpsc::SyncSender<CompositorReady>,
 	ready_rx: std::sync::mpsc::Receiver<CompositorReady>,
+	reconfigure_tx: calloop::channel::Sender<CompositorReconfigure>,
+	reconfigure_rx: calloop::channel::Channel<CompositorReconfigure>,
 }
 
 /// Launched compositor — can be queried, cannot be launched again.
 pub(crate) struct LaunchedCompositor {
 	ready: CompositorReady,
+	reconfigure_tx: calloop::channel::Sender<CompositorReconfigure>,
 }
 
 impl From<&SessionContext> for CompositorContext {
@@ -192,6 +205,7 @@ impl Compositor {
 		let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(2);
 		let (input_tx, input_rx) = calloop::channel::channel();
 		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
+		let (reconfigure_tx, reconfigure_rx) = calloop::channel::channel();
 
 		(
 			Self {
@@ -202,6 +216,8 @@ impl Compositor {
 				input_rx,
 				ready_tx,
 				ready_rx,
+				reconfigure_tx,
+				reconfigure_rx,
 			},
 			CompositorHandles { frame_rx, input_tx },
 		)
@@ -216,12 +232,14 @@ impl Compositor {
 			input_rx,
 			ready_tx,
 			ready_rx,
+			reconfigure_tx,
+			reconfigure_rx,
 		} = self;
 
 		std::thread::Builder::new()
 			.name("compositor".to_string())
 			.spawn(move || {
-				if let Err(e) = run_compositor(config, context, frame_tx, input_rx, ready_tx, stop) {
+				if let Err(e) = run_compositor(config, context, frame_tx, input_rx, reconfigure_rx, ready_tx, stop) {
 					tracing::error!("Compositor failed: {e}");
 				}
 			})
@@ -233,7 +251,7 @@ impl Compositor {
 			tracing::warn!("Timed out waiting for compositor ready: {e}");
 		})?;
 
-		Ok(LaunchedCompositor { ready })
+		Ok(LaunchedCompositor { ready, reconfigure_tx })
 	}
 }
 
@@ -241,8 +259,21 @@ impl LaunchedCompositor {
 	pub fn ready(&self) -> &CompositorReady {
 		&self.ready
 	}
-	pub fn hdr(&self) -> bool {
-		self.ready.hdr
+	pub async fn reconfigure(&self, width: u32, height: u32, refresh_rate: u32, hdr: bool) -> Result<bool, ()> {
+		let (applied, waiting) = tokio::sync::oneshot::channel();
+		self.reconfigure_tx
+			.send(CompositorReconfigure {
+				width,
+				height,
+				refresh_rate,
+				hdr,
+				applied,
+			})
+			.map_err(|_| ())?;
+		waiting
+			.await
+			.map_err(|_| ())?
+			.map_err(|error| tracing::warn!(%error, "Compositor reconfiguration failed"))
 	}
 }
 
@@ -252,6 +283,7 @@ fn run_compositor(
 	context: CompositorContext,
 	frame_tx: mpsc::SyncSender<ExportedFrame>,
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
+	reconfigure_rx: calloop::channel::Channel<CompositorReconfigure>,
 	ready_tx: mpsc::SyncSender<CompositorReady>,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) -> Result<(), String> {
@@ -315,19 +347,8 @@ fn run_compositor(
 	// SDR: prefer 8-bit ABGR/XBGR to match Vulkan WSI and avoid GL R↔B channel swaps.
 	// Vulkan WSI on Wayland defaults to XBGR/ABGR formats, so using ARGB causes
 	// GL to incorrectly swap red/blue channels during blit operations.
-	let preferred_fourccs: Vec<Fourcc> = if config.hdr && context.hdr {
-		vec![
-			Fourcc::Abgr16161616f,
-			Fourcc::Abgr2101010,
-			Fourcc::Abgr8888,
-			Fourcc::Xbgr8888,
-		]
-	} else {
-		vec![Fourcc::Abgr8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888]
-	};
-	let (render_fourcc, render_modifiers) = preferred_fourccs
-		.iter()
-		.find_map(|&fourcc| {
+	let select_format = |preferred_fourccs: &[Fourcc]| {
+		preferred_fourccs.iter().find_map(|&fourcc| {
 			let modifiers: Vec<Modifier> = render_formats
 				.iter()
 				.filter(|f| f.code == fourcc)
@@ -339,6 +360,8 @@ fn run_compositor(
 				Some((fourcc, modifiers))
 			}
 		})
+	};
+	let sdr_render_format = select_format(&[Fourcc::Abgr8888, Fourcc::Xbgr8888, Fourcc::Argb8888, Fourcc::Xrgb8888])
 		.or_else(|| {
 			// Fall back to first available format, collecting all its modifiers.
 			let first = render_formats.iter().next()?;
@@ -351,6 +374,17 @@ fn run_compositor(
 			Some((fourcc, modifiers))
 		})
 		.ok_or_else(|| "No supported DMA-BUF render formats found".to_string())?;
+	let hdr_render_format = config
+		.hdr
+		.then(|| select_format(&[Fourcc::Abgr16161616f, Fourcc::Abgr2101010]))
+		.flatten();
+	let hdr_capable = hdr_render_format.is_some();
+	let hdr = context.hdr && hdr_capable;
+	let (render_fourcc, render_modifiers) = if hdr {
+		hdr_render_format.clone().expect("HDR capability checked")
+	} else {
+		sdr_render_format.clone()
+	};
 
 	tracing::debug!(
 		"Selected render format: {:?} with {} modifier(s)",
@@ -358,8 +392,6 @@ fn run_compositor(
 		render_modifiers.len()
 	);
 
-	// Derive effective HDR: only if an HDR-capable format was actually selected.
-	let hdr = config.hdr && context.hdr && matches!(render_fourcc, Fourcc::Abgr16161616f | Fourcc::Abgr2101010);
 	if config.hdr && context.hdr && !hdr {
 		tracing::warn!(
 			"HDR requested but no HDR-capable format available (using {:?}), falling back to SDR",
@@ -431,9 +463,12 @@ fn run_compositor(
 		context.height,
 		render_fourcc,
 		render_modifiers,
+		sdr_render_format,
+		hdr_render_format,
 		ready_tx,
 		&render_node,
 		hdr,
+		hdr_capable,
 		config.steam_mode,
 		config.virtual_connector_strategy,
 		config.keyboard.clone(),
@@ -487,12 +522,28 @@ fn run_compositor(
 		})
 		.map_err(|e| format!("Failed to insert input channel: {e}"))?;
 
+	let refresh_rate = Arc::new(AtomicU32::new(context.refresh_rate.max(1)));
+	let reconfigured_refresh_rate = refresh_rate.clone();
+	event_loop
+		.handle()
+		.insert_source(reconfigure_rx, move |event, _, state: &mut MoonshineCompositor| {
+			if let calloop::channel::Event::Msg(request) = event {
+				let result = state.reconfigure_output(request.width, request.height, request.refresh_rate, request.hdr);
+				if result.is_ok() {
+					reconfigured_refresh_rate.store(request.refresh_rate.max(1), Ordering::Release);
+				}
+				let effective_hdr = result.map(|()| state.hdr);
+				let _ = request.applied.send(effective_hdr);
+			}
+		})
+		.map_err(|e| format!("Failed to insert compositor reconfiguration channel: {e}"))?;
+
 	// Set up the frame timer.
 	// Use Instant-based absolute scheduling so that render time inside
 	// the callback doesn't drift the cadence. `ToDuration` would add the
 	// interval *after* the callback returns, progressively skewing the
 	// actual period and producing ~58 Hz instead of 60 Hz.
-	let frame_nanos: u64 = 1_000_000_000u64 / context.refresh_rate as u64;
+	let frame_nanos: u64 = 1_000_000_000u64 / u64::from(context.refresh_rate.max(1));
 	let frame_interval = std::time::Duration::from_nanos(frame_nanos);
 	let mut next_frame = std::time::Instant::now() + frame_interval;
 	let timer = smithay::reexports::calloop::timer::Timer::from_duration(frame_interval);
@@ -505,11 +556,14 @@ fn run_compositor(
 			// Schedule the next frame relative to the ideal wall-clock
 			// target, not relative to "now". This absorbs render-time
 			// jitter and keeps a steady cadence.
-			next_frame += frame_interval;
+			let interval = std::time::Duration::from_nanos(
+				1_000_000_000u64 / u64::from(refresh_rate.load(Ordering::Acquire).max(1)),
+			);
+			next_frame += interval;
 			let now = std::time::Instant::now();
 			if next_frame <= now {
 				// We fell behind — snap forward instead of bursting.
-				next_frame = now + frame_interval;
+				next_frame = now + interval;
 			}
 			smithay::reexports::calloop::timer::TimeoutAction::ToInstant(next_frame)
 		})

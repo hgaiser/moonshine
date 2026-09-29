@@ -903,12 +903,52 @@ impl Webserver {
 			},
 		};
 
+		let mut resume_request = crate::session::ResumeRequest::default();
+		if let Some(mode) = params.remove("mode") {
+			let parts: Vec<&str> = mode.split('x').collect();
+			if parts.len() != 3 {
+				return xml_error(400, &format!("Expected mode in format WxHxR, but got '{mode}'."));
+			}
+			let parsed = (
+				parts[0].parse::<u32>(),
+				parts[1].parse::<u32>(),
+				parts[2].parse::<u32>(),
+			);
+			match parsed {
+				(Ok(width), Ok(height), Ok(refresh_rate)) if width != 0 && height != 0 && refresh_rate != 0 => {
+					resume_request.resolution = Some((width, height));
+					resume_request.refresh_rate = Some(refresh_rate);
+				},
+				_ => return xml_error(400, &format!("Invalid mode in resume request: '{mode}'.")),
+			}
+		}
+		if let Some(hdr_mode) = params.remove("hdrMode") {
+			match hdr_mode.parse::<u32>() {
+				Ok(value) => resume_request.hdr = Some(value != 0),
+				Err(error) => return xml_error(400, &format!("Invalid hdrMode in resume request: {error}.")),
+			}
+		}
+		if let Some(surround_audio_info) = params.remove("surroundAudioInfo") {
+			match surround_audio_info.parse::<u32>() {
+				Ok(value) => {
+					resume_request.audio_channels = Some(AudioChannels::from((value & 0xFFFF) as u8));
+					resume_request.audio_channel_mask = Some(value >> 16);
+				},
+				Err(error) => {
+					return xml_error(400, &format!("Invalid surroundAudioInfo in resume request: {error}."));
+				},
+			}
+		}
+
 		match self
 			.session_manager
-			.update_keys(SessionKeyData {
-				remote_input_key,
-				remote_input_key_id,
-			})
+			.resume_session(
+				SessionKeyData {
+					remote_input_key,
+					remote_input_key_id,
+				},
+				resume_request,
+			)
 			.await
 		{
 			Ok(()) => {},

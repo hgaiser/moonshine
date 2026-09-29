@@ -8,8 +8,10 @@ use crate::session::SessionKeysReceiver;
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::RtpHeader;
 
-use crate::session::stream::audio::OpusStreamConfig;
 use crate::session::stream::audio::pulse_server::AudioFrame;
+use crate::session::stream::audio::{
+	AudioEncoderReconfigure, AudioPacketMessage, AudioStreamContext, OpusStreamConfig,
+};
 
 const NR_DATA_SHARDS: usize = 4;
 const NR_PARITY_SHARDS: usize = 2;
@@ -32,15 +34,16 @@ impl AudioEncoder {
 	#[allow(clippy::too_many_arguments)]
 	pub fn spawn(
 		sample_rate: u32,
-		stream_config: &OpusStreamConfig,
+		context: AudioStreamContext,
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		keys_rx: SessionKeysReceiver,
-		encrypt: bool,
-		packet_tx: mpsc::Sender<Vec<u8>>,
+		packet_tx: mpsc::Sender<AudioPacketMessage>,
 		stop: ShutdownManager<SessionShutdownReason>,
 		start_notify: Arc<tokio::sync::Notify>,
+		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
 	) -> Result<(), ()> {
+		let stream_config = &context.audio_config.stream_config;
 		tracing::debug!("Starting audio encoder.");
 		tracing::debug!(
 			"Creating audio encoder with sample rate {}, {} channels ({} streams, {} coupled).",
@@ -50,22 +53,7 @@ impl AudioEncoder {
 			stream_config.coupled_streams,
 		);
 
-		let mut encoder = opus::MSEncoder::new(
-			sample_rate,
-			stream_config.streams,
-			stream_config.coupled_streams,
-			&stream_config.mapping[..stream_config.channels as usize],
-			opus::Application::LowDelay,
-		)
-		.map_err(|e| tracing::warn!("Failed to create audio encoder: {e}"))?;
-
-		// Moonlight expects a constant bitrate.
-		encoder
-			.set_vbr(false)
-			.map_err(|e| tracing::warn!("Failed to disable variable bitrate: {e}"))?;
-		encoder
-			.set_bitrate(opus::Bitrate::Bits(stream_config.bitrate as i32))
-			.map_err(|e| tracing::warn!("Failed to set audio bitrate: {e}"))?;
+		let encoder = create_encoder(sample_rate, stream_config)?;
 
 		let fec_encoder = ReedSolomon::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
 			.map_err(|e| tracing::warn!("Failed to create FEC encoder: {e}"))?;
@@ -75,15 +63,17 @@ impl AudioEncoder {
 			.name("audio-encode".to_string())
 			.spawn(move || {
 				inner.run(
+					sample_rate,
 					frame_rx,
 					frame_recycle_tx,
 					fec_encoder,
 					encoder,
 					keys_rx,
-					encrypt,
+					context.encrypt_audio,
 					packet_tx,
 					stop,
 					start_notify,
+					reconfigure_rx,
 				)
 			})
 			.map_err(|e| tracing::error!("Failed to start audio encode thread: {e}"))?;
@@ -92,21 +82,41 @@ impl AudioEncoder {
 	}
 }
 
+fn create_encoder(sample_rate: u32, stream_config: &OpusStreamConfig) -> Result<opus::MSEncoder, ()> {
+	let mut encoder = opus::MSEncoder::new(
+		sample_rate,
+		stream_config.streams,
+		stream_config.coupled_streams,
+		&stream_config.mapping[..stream_config.channels as usize],
+		opus::Application::LowDelay,
+	)
+	.map_err(|e| tracing::warn!("Failed to create audio encoder: {e}"))?;
+	encoder
+		.set_vbr(false)
+		.map_err(|e| tracing::warn!("Failed to disable variable bitrate: {e}"))?;
+	encoder
+		.set_bitrate(opus::Bitrate::Bits(stream_config.bitrate as i32))
+		.map_err(|e| tracing::warn!("Failed to set audio bitrate: {e}"))?;
+	Ok(encoder)
+}
+
 struct AudioEncoderInner {}
 
 impl AudioEncoderInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run(
 		self,
+		sample_rate: u32,
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		mut fec_encoder: ReedSolomon,
 		mut encoder: opus::MSEncoder,
 		keys_rx: SessionKeysReceiver,
-		encrypt: bool,
-		packet_tx: mpsc::Sender<Vec<u8>>,
+		mut encrypt: bool,
+		packet_tx: mpsc::Sender<AudioPacketMessage>,
 		stop: ShutdownManager<SessionShutdownReason>,
 		start_notify: Arc<tokio::sync::Notify>,
+		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
 	) {
 		// Trigger session shutdown when the audio encoder stops.
 		let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioEncoderStopped);
@@ -123,7 +133,7 @@ impl AudioEncoderInner {
 		}
 
 		let mut sequence_number = 0u16;
-		let stream_start_time = std::time::Instant::now();
+		let mut stream_start_time = std::time::Instant::now();
 
 		// For unknown reasons, the RS parity matrix computed by our RS implementation.
 		// doesn't match the one Nvidia uses for audio data. I'm not exactly sure why,
@@ -156,12 +166,51 @@ impl AudioEncoderInner {
 		}
 
 		while !stop.is_shutdown_triggered() {
-			let frame = match frame_rx.recv() {
-				Ok(frame) => frame,
-				Err(_) => {
-					tracing::debug!("PulseServer channel closed.");
-					break;
-				},
+			let frame = loop {
+				crossbeam_channel::select! {
+					recv(reconfigure_rx) -> command => {
+						let command = match command {
+							Ok(command) => command,
+							Err(_) => return,
+						};
+						match create_encoder(sample_rate, &command.context.audio_config.stream_config) {
+							Ok(reconfigured) => encoder = reconfigured,
+							Err(()) => {
+								let _ = command.applied.send(Err(()));
+								return;
+							},
+						}
+						encrypt = command.context.encrypt_audio;
+						sequence_number = 0;
+						stream_start_time = std::time::Instant::now();
+						fec_encoder.reset_force();
+						for shard in &mut shards {
+							shard.fill(0);
+						}
+						while let Ok(stale) = frame_rx.try_recv() {
+							let _ = frame_recycle_tx.try_send(AudioFrame {
+								buf: stale.buf,
+								capture_ts_ms: 0,
+							});
+						}
+						let (ready, waiting) = tokio::sync::oneshot::channel();
+						if packet_tx.blocking_send(AudioPacketMessage::BeginEpoch {
+							qos: command.context.qos,
+							ready,
+						}).is_err() || rt.block_on(waiting).is_err() {
+							let _ = command.applied.send(Err(()));
+							return;
+						}
+						let _ = command.applied.send(Ok(()));
+					},
+					recv(frame_rx) -> frame => match frame {
+						Ok(frame) => break frame,
+						Err(_) => {
+							tracing::debug!("PulseServer channel closed.");
+							return;
+						},
+					},
+				}
 			};
 
 			// TODO: Figure out the 1000 / 90 value.
@@ -240,7 +289,7 @@ impl AudioEncoderInner {
 			let data_shard_size = std::mem::size_of::<RtpHeader>() + payload.len();
 			let data_shard = shard[..data_shard_size].to_vec();
 
-			if packet_tx.blocking_send(data_shard).is_err() {
+			if packet_tx.blocking_send(AudioPacketMessage::Packet(data_shard)).is_err() {
 				tracing::debug!("Failed to send packet over channel, channel is likely closed.");
 				break;
 			}
@@ -300,7 +349,10 @@ impl AudioEncoderInner {
 						std::mem::size_of::<RtpHeader>() + std::mem::size_of::<AudioFecHeader>() + payload.len();
 					let parity_shard = shard[..parity_shard_size].to_vec();
 
-					if packet_tx.blocking_send(parity_shard).is_err() {
+					if packet_tx
+						.blocking_send(AudioPacketMessage::Packet(parity_shard))
+						.is_err()
+					{
 						tracing::debug!("Failed to send packet over channel, channel is likely closed.");
 						break;
 					}

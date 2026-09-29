@@ -283,20 +283,14 @@ fn encode_control(key: &[u8], sequence_number: u32, payload: &[u8]) -> Result<Ve
 #[derive(Clone)]
 pub(crate) struct ControlStreamContext {
 	pub keys_rx: SessionKeysReceiver,
-	pub hdr: bool,
 }
 
 impl ControlStreamContext {
-	/// Create a `ControlStreamContext` from a session context and the *effective*
-	/// HDR flag reported by the compositor after launch.
-	///
-	/// `hdr_effective` may differ from `ctx.hdr` when the client requested HDR but
-	/// the GPU does not support an HDR-capable DMA-BUF format (compositor falls back
-	/// to SDR and reports `hdr = false` in `CompositorReady`).
-	pub fn new(ctx: &SessionContext, hdr_effective: bool) -> Self {
+	/// Create the control stream's key context. HDR state is delivered through
+	/// the live metadata watch so it can change between reconnect epochs.
+	pub fn new(ctx: &SessionContext) -> Self {
 		Self {
 			keys_rx: ctx.keys.clone_rx().expect("session keys not initialized"),
-			hdr: hdr_effective,
 		}
 	}
 }
@@ -585,7 +579,7 @@ async fn run_control_loop(
 							audio_trigger.trigger();
 							audio_triggered = true;
 						}
-						send_hdr_mode = context.hdr;
+						send_hdr_mode = true;
 					},
 					ControlMessage::Ping => {
 						stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
@@ -620,8 +614,7 @@ async fn run_control_loop(
 		}
 
 		// Check for HDR metadata updates from the video pipeline.
-		if context.hdr
-			&& hdr_metadata_rx.has_changed().unwrap_or(false)
+		if hdr_metadata_rx.has_changed().unwrap_or(false)
 			&& let Some(peer_id) = connected_peer
 		{
 			let state = hdr_metadata_rx.borrow_and_update().clone();

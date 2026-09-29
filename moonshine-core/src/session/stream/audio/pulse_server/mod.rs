@@ -15,6 +15,7 @@ use pulseaudio::protocol::{self as pulse};
 use dyn_buffer::DynPlaybackBuffer;
 
 use crate::session::manager::SessionShutdownReason;
+use crate::session::stream::audio::PulseReconfigure;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
 
@@ -158,6 +159,7 @@ pub(crate) struct PulseServer {
 
 	clients: BTreeMap<mio::Token, Client>,
 	server_state: ServerState,
+	reconfigure_rx: crossbeam_channel::Receiver<PulseReconfigure>,
 
 	epoch: time::Instant,
 }
@@ -185,6 +187,7 @@ fn pop_missing(missing: &mut i64, requested: &mut usize, min_req: usize, in_preb
 }
 
 impl PulseServer {
+	#[allow(clippy::too_many_arguments)]
 	pub fn spawn(
 		listener: std::os::unix::net::UnixListener,
 		_socket_path: PathBuf,
@@ -193,6 +196,7 @@ impl PulseServer {
 		frame_tx: crossbeam_channel::Sender<AudioFrame>,
 		frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
 		stop: ShutdownManager<SessionShutdownReason>,
+		reconfigure_rx: crossbeam_channel::Receiver<PulseReconfigure>,
 	) -> Result<(), Error> {
 		listener.set_nonblocking(true)?;
 		let listener = UnixListener::from_std(listener);
@@ -324,6 +328,7 @@ impl PulseServer {
 				capture_channels: channels,
 				capture_spec,
 			},
+			reconfigure_rx,
 			epoch: time::Instant::now(),
 		};
 
@@ -355,7 +360,12 @@ impl PulseServer {
 		let mut events = mio::Events::with_capacity(1024);
 
 		loop {
-			match self.poll.poll(&mut events, Some(time::Duration::from_secs(1))) {
+			while let Ok(request) = self.reconfigure_rx.try_recv() {
+				let result = self.reconfigure(request.channels, request.packet_duration_ms);
+				let _ = request.applied.send(result.map_err(|error| error.to_string()));
+			}
+
+			match self.poll.poll(&mut events, Some(time::Duration::from_millis(50))) {
 				Ok(_) => (),
 				Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
 				Err(e) => return Err(e.into()),
@@ -427,6 +437,95 @@ impl PulseServer {
 				}
 			}
 		}
+	}
+
+	fn reconfigure(&mut self, channels: u8, packet_duration_ms: u32) -> Result<(), Error> {
+		let channels = match channels {
+			6 | 8 => channels,
+			_ => 2,
+		};
+		let clock_rate_hz = match packet_duration_ms {
+			5 | 10 => 1000 / packet_duration_ms,
+			_ => DEFAULT_CLOCK_RATE_HZ,
+		};
+		self.clock
+			.set_timeout_interval(&time::Duration::from_nanos(1_000_000_000 / u64::from(clock_rate_hz)))?;
+		self.clock_rate_hz = clock_rate_hz;
+
+		// Existing playback streams were negotiated against the old virtual sink
+		// format. Disconnect them so PulseAudio clients reconnect and negotiate the
+		// new channel layout rather than mixing with stale channel assumptions.
+		for (_, mut client) in std::mem::take(&mut self.clients) {
+			let _ = self.poll.registry().deregister(&mut client.socket);
+		}
+
+		let channel_map = match channels {
+			6 => pulse::ChannelMap::new([
+				pulse::ChannelPosition::FrontLeft,
+				pulse::ChannelPosition::FrontRight,
+				pulse::ChannelPosition::FrontCenter,
+				pulse::ChannelPosition::Lfe,
+				pulse::ChannelPosition::RearLeft,
+				pulse::ChannelPosition::RearRight,
+			]),
+			8 => pulse::ChannelMap::new([
+				pulse::ChannelPosition::FrontLeft,
+				pulse::ChannelPosition::FrontRight,
+				pulse::ChannelPosition::FrontCenter,
+				pulse::ChannelPosition::Lfe,
+				pulse::ChannelPosition::RearLeft,
+				pulse::ChannelPosition::RearRight,
+				pulse::ChannelPosition::SideLeft,
+				pulse::ChannelPosition::SideRight,
+			]),
+			_ => pulse::ChannelMap::stereo(),
+		};
+		let capture_spec = pulse::SampleSpec {
+			format: pulse::SampleFormat::Float32Le,
+			channels,
+			sample_rate: CAPTURE_SAMPLE_RATE,
+		};
+		self.server_state.capture_channels = channels;
+		self.server_state.capture_spec = capture_spec;
+		self.server_state.server_info.sample_spec = capture_spec;
+		self.server_state.server_info.channel_map = channel_map;
+		self.server_state.sink_volume = vec![1.0; channels as usize];
+		let channel_map_str = match channels {
+			6 => "front-left,front-right,front-center,lfe,rear-left,rear-right",
+			8 => "front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right",
+			_ => "front-left,front-right",
+		};
+		let mut format_props = pulse::Props::new();
+		format_props.set(
+			pulse::Prop::FormatChannels,
+			std::ffi::CString::new(channels.to_string()).unwrap(),
+		);
+		format_props.set(
+			pulse::Prop::FormatChannelMap,
+			std::ffi::CString::new(channel_map_str).unwrap(),
+		);
+		format_props.set(
+			pulse::Prop::FormatSampleFormat,
+			std::ffi::CString::new("float32le").unwrap(),
+		);
+		format_props.set(
+			pulse::Prop::FormatRate,
+			std::ffi::CString::new(CAPTURE_SAMPLE_RATE.to_string()).unwrap(),
+		);
+		self.server_state.default_format_info = pulse::FormatInfo {
+			encoding: pulse::FormatEncoding::Pcm,
+			props: format_props,
+		};
+		if let Some(sink) = self.server_state.sinks.first_mut() {
+			sink.sample_spec = capture_spec;
+			sink.channel_map = channel_map;
+			sink.cvolume = pulse::ChannelVolume::norm(channels);
+			sink.formats[0] = self.server_state.default_format_info.clone();
+		}
+		self.spare_frame = None;
+		self.epoch = time::Instant::now();
+		tracing::info!(channels, packet_duration_ms, "Reconfigured live PulseAudio capture");
+		Ok(())
 	}
 
 	fn recv(&mut self, client_token: mio::Token) -> Result<(), Error> {

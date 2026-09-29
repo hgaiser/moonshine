@@ -33,7 +33,7 @@ use smithay::input::keyboard::XkbConfig;
 use smithay::input::pointer::{CursorImageAttributes, CursorImageStatus};
 use smithay::input::tablet::{TabletDescriptor, TabletSeatTrait};
 use smithay::input::{Seat, SeatState};
-use smithay::output::Output;
+use smithay::output::{Mode, Output};
 use smithay::reexports::calloop::{LoopHandle, RegistrationToken};
 use smithay::reexports::wayland_server::backend::ClientData;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
@@ -262,9 +262,14 @@ pub(crate) struct MoonshineCompositor {
 	// -- Render format --
 	pub render_fourcc: Fourcc,
 	pub render_modifiers: Vec<Modifier>,
+	sdr_render_format: (Fourcc, Vec<Modifier>),
+	hdr_render_format: Option<(Fourcc, Vec<Modifier>)>,
 
 	// -- Buffer pool --
 	pub(crate) buffer_pool: Vec<GbmBufferSlot>,
+	/// Pools retired by a live resolution change. They remain alive until the
+	/// encoder releases every exported DMA-BUF from the old stream epoch.
+	retired_buffer_pools: Vec<Vec<GbmBufferSlot>>,
 	pub next_buffer_index: usize,
 	/// Per-buffer render count for damage tracking.  `None` means the buffer
 	/// has never been rendered to yet (age = 0 → full redraw).
@@ -326,6 +331,7 @@ pub(crate) struct MoonshineCompositor {
 
 	/// Whether HDR mode is active for this session.
 	pub hdr: bool,
+	pub hdr_capable: bool,
 
 	/// Steam integration mode (gamescope's `-e`). Promotes the connector
 	/// strategy to `SteamControlled` and enables Steam window filtering.
@@ -482,6 +488,72 @@ impl ClientData for ClientState {
 }
 
 impl MoonshineCompositor {
+	/// Apply a client-requested output mode without replacing the compositor or
+	/// disconnecting the launched application.
+	pub(crate) fn reconfigure_output(
+		&mut self,
+		width: u32,
+		height: u32,
+		refresh_rate: u32,
+		hdr: bool,
+	) -> Result<(), String> {
+		if width == 0 || height == 0 || refresh_rate == 0 {
+			return Err("output dimensions and refresh rate must be non-zero".to_string());
+		}
+		if hdr && !self.hdr_capable {
+			return Err("HDR was requested but the live compositor is not HDR capable".to_string());
+		}
+
+		let (desired_fourcc, desired_modifiers) = if hdr {
+			self.hdr_render_format
+				.clone()
+				.ok_or_else(|| "HDR render format is unavailable".to_string())?
+		} else {
+			self.sdr_render_format.clone()
+		};
+		if self.width != width || self.height != height || self.render_fourcc != desired_fourcc {
+			let mut replacement = Vec::with_capacity(BUFFER_POOL_SIZE);
+			for index in 0..BUFFER_POOL_SIZE {
+				let buffer = self
+					.allocator
+					.create_buffer(width, height, desired_fourcc, &desired_modifiers)
+					.map_err(|error| format!("failed to allocate reconfigured GBM buffer {index}: {error}"))?;
+				let dmabuf = buffer
+					.export()
+					.map_err(|error| format!("failed to export reconfigured GBM buffer {index}: {error}"))?;
+				replacement.push(GbmBufferSlot {
+					dmabuf,
+					consumed: Arc::new(AtomicBool::new(true)),
+				});
+			}
+			let retired = std::mem::replace(&mut self.buffer_pool, replacement);
+			self.retired_buffer_pools.push(retired);
+			self.width = width;
+			self.height = height;
+			self.render_fourcc = desired_fourcc;
+			self.render_modifiers = desired_modifiers;
+			self.next_buffer_index = 0;
+			self.buffer_last_rendered_at = [None; BUFFER_POOL_SIZE];
+			self.scanout_buffer_map.clear();
+			self.last_scanout_buffer_desc = None;
+		}
+
+		self.hdr = hdr;
+		if let Some(color_management) = self.color_management.as_mut() {
+			color_management.hdr = hdr;
+		}
+		let mode = Mode {
+			size: (width as i32, height as i32).into(),
+			refresh: (refresh_rate * 1000) as i32,
+		};
+		self.output.change_current_state(Some(mode), None, None, None);
+		self.output.set_preferred(mode);
+		self.damage_tracker = OutputDamageTracker::from_output(&self.output);
+		self.screen_dirty = true;
+		tracing::info!(width, height, refresh_rate, hdr, "Reconfigured live compositor output");
+		Ok(())
+	}
+
 	/// Create a new compositor state.
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
@@ -497,9 +569,12 @@ impl MoonshineCompositor {
 		height: u32,
 		render_fourcc: Fourcc,
 		render_modifiers: Vec<Modifier>,
+		sdr_render_format: (Fourcc, Vec<Modifier>),
+		hdr_render_format: Option<(Fourcc, Vec<Modifier>)>,
 		xdisplay_tx: mpsc::SyncSender<super::CompositorReady>,
 		render_node: &std::path::Path,
 		hdr: bool,
+		hdr_capable: bool,
 		steam_mode: bool,
 		virtual_connector_strategy: super::VirtualConnectorStrategy,
 		keyboard_config: KeyboardConfig,
@@ -633,7 +708,7 @@ impl MoonshineCompositor {
 		tracing::debug!("Pre-allocated {BUFFER_POOL_SIZE} GBM buffers for frame pool.");
 
 		// Initialize color management protocol when HDR is active.
-		let color_management = if hdr {
+		let color_management = if hdr_capable {
 			Some(super::color_management::ColorManagementState::new(&display_handle, hdr))
 		} else {
 			None
@@ -643,7 +718,7 @@ impl MoonshineCompositor {
 		// Moonshine globals are always needed (for XWayland bypass, refresh_cycle, retire handling).
 		// Gamescope globals are gated on HDR to avoid advertising HDR capability on SDR sessions.
 		super::gamescope_swapchain::register_moonshine_globals(&display_handle);
-		if hdr {
+		if hdr_capable {
 			super::gamescope_swapchain::register_gamescope_globals(&display_handle);
 		}
 
@@ -681,7 +756,10 @@ impl MoonshineCompositor {
 				height,
 				render_fourcc,
 				render_modifiers,
+				sdr_render_format,
+				hdr_render_format,
 				buffer_pool,
+				retired_buffer_pools: Vec::new(),
 				next_buffer_index: 0,
 				buffer_last_rendered_at: [None; BUFFER_POOL_SIZE],
 				render_count: 0,
@@ -701,6 +779,7 @@ impl MoonshineCompositor {
 				wayland_socket_token: Some(wayland_socket_token),
 				wayland_display,
 				hdr: hdr_active,
+				hdr_capable,
 				steam_mode,
 				virtual_connector_strategy,
 				override_surface: None,
@@ -1062,6 +1141,8 @@ impl MoonshineCompositor {
 
 	/// Render the current scene and export the frame to the encoder.
 	pub fn render_and_export(&mut self) {
+		self.retired_buffer_pools
+			.retain(|pool| !pool.iter().all(|slot| slot.consumed.load(Ordering::Acquire)));
 		// Keep the Steam overlay z-ordered above the game while it is open.
 		// Must run before the static-screen early return so the raise/lower
 		// is detected as soon as the overlay window commits a frame.
@@ -2054,7 +2135,7 @@ impl MoonshineCompositor {
 						let _ = tx.send(super::CompositorReady {
 							xdisplay: display_number,
 							wayland_display: data.wayland_display.clone(),
-							hdr: data.hdr,
+							hdr_capable: data.hdr_capable,
 						});
 					}
 				},

@@ -147,7 +147,7 @@ pub struct FrameStats {
 	pub is_key_frame: bool,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VideoStreamContext {
 	/// Width of the video stream in pixels.
 	pub width: u32,
@@ -180,6 +180,68 @@ pub struct VideoStreamContext {
 	pub encrypt_video: bool,
 }
 
+impl VideoStreamContext {
+	/// Names of negotiated properties whose change requires a new stream epoch.
+	///
+	/// Keep this list next to the context definition so newly-added negotiated
+	/// fields cannot silently fall through the reconnect fast path.
+	pub(crate) fn changed_fields(&self, requested: &Self) -> Vec<&'static str> {
+		let mut changed = Vec::new();
+		macro_rules! changed {
+			($field:ident, $name:literal) => {
+				if self.$field != requested.$field {
+					changed.push($name);
+				}
+			};
+		}
+		changed!(width, "width");
+		changed!(height, "height");
+		changed!(fps, "fps");
+		changed!(packet_size, "packet size");
+		changed!(bitrate, "bitrate");
+		changed!(minimum_fec_packets, "minimum FEC packets");
+		changed!(qos, "QoS");
+		changed!(max_reference_frames, "max reference frames");
+		changed!(encrypt_video, "video encryption");
+		if self.format.codec != requested.format.codec {
+			changed.push("codec");
+		}
+		if self.format.chroma != requested.format.chroma {
+			changed.push("chroma sampling");
+		}
+		if self.format.bit_depth != requested.format.bit_depth {
+			changed.push("bit depth");
+		}
+		if self.format.hdr != requested.format.hdr {
+			changed.push("dynamic range");
+		}
+		if self.format.primaries != requested.format.primaries {
+			changed.push("color primaries");
+		}
+		if self.format.transfer != requested.format.transfer {
+			changed.push("transfer function");
+		}
+		if self.format.matrix != requested.format.matrix {
+			changed.push("matrix coefficients");
+		}
+		if self.format.range != requested.format.range {
+			changed.push("color range");
+		}
+		let known_format_change = self.format.codec != requested.format.codec
+			|| self.format.chroma != requested.format.chroma
+			|| self.format.bit_depth != requested.format.bit_depth
+			|| self.format.hdr != requested.format.hdr
+			|| self.format.primaries != requested.format.primaries
+			|| self.format.transfer != requested.format.transfer
+			|| self.format.matrix != requested.format.matrix
+			|| self.format.range != requested.format.range;
+		if self.format != requested.format && !known_format_change {
+			changed.push("other video format property");
+		}
+		changed
+	}
+}
+
 /// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
 ///
 /// The pipeline and packet handler are spawned immediately but block on a `Notify`
@@ -193,6 +255,22 @@ pub(crate) struct VideoStreamHandle {
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
 	reset_tx: broadcast::Sender<()>,
 	fec_feedback_tx: watch::Sender<FrameFecStatus>,
+	packet_tx: mpsc::Sender<VideoPacketMessage>,
+	reconfigure_tx: std::sync::mpsc::Sender<VideoReconfigureCommand>,
+}
+
+pub(super) struct VideoReconfigureCommand {
+	pub context: VideoStreamContext,
+	pub applied: tokio::sync::oneshot::Sender<Result<(), ()>>,
+}
+
+pub(super) enum VideoPacketMessage {
+	Batch(ShardBatch),
+	Pause(tokio::sync::oneshot::Sender<()>),
+	BeginEpoch {
+		context: VideoStreamContext,
+		ready: tokio::sync::oneshot::Sender<()>,
+	},
 }
 
 impl VideoStreamHandle {
@@ -230,6 +308,25 @@ impl VideoStreamHandle {
 	/// IDR so the resumed client has a decodable starting frame.
 	pub fn request_reset(&self) {
 		let _ = self.reset_tx.send(());
+	}
+
+	/// Stop delivering packets while a changed reconnect is negotiated.
+	pub async fn pause_for_reconfigure(&self) -> Result<(), ()> {
+		let (ready, waiting) = tokio::sync::oneshot::channel();
+		self.packet_tx
+			.send(VideoPacketMessage::Pause(ready))
+			.await
+			.map_err(|_| ())?;
+		waiting.await.map_err(|_| ())
+	}
+
+	/// Replace the encoder/packetizer epoch and wait until it is ready.
+	pub async fn reconfigure(&self, context: VideoStreamContext) -> Result<(), ()> {
+		let (applied, waiting) = tokio::sync::oneshot::channel();
+		self.reconfigure_tx
+			.send(VideoReconfigureCommand { context, applied })
+			.map_err(|_| ())?;
+		waiting.await.map_err(|_| ())?
 	}
 
 	pub(crate) fn report_fec_status(&self, mut status: FrameFecStatus) {
@@ -328,7 +425,8 @@ impl VideoStream {
 		let (fec_feedback_tx, fec_feedback_rx) = watch::channel(FrameFecStatus::default());
 
 		// Packet channel.
-		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
+		let (packet_tx, packet_rx) = mpsc::channel::<VideoPacketMessage>(128);
+		let (reconfigure_tx, reconfigure_rx) = std::sync::mpsc::channel();
 		let pacing_bitrate =
 			(context.format.codec == VideoCodec::PyroWave).then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
 
@@ -348,7 +446,7 @@ impl VideoStream {
 			config,
 			context,
 			keys_rx,
-			packet_tx,
+			packet_tx.clone(),
 			idr_tx.clone(),
 			idr_tx.subscribe(),
 			invalidate_tx.subscribe(),
@@ -358,6 +456,7 @@ impl VideoStream {
 			start_notify.clone(),
 			stats_tx,
 			fec_feedback_rx,
+			reconfigure_rx,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
@@ -367,17 +466,19 @@ impl VideoStream {
 			invalidate_tx,
 			reset_tx,
 			fec_feedback_tx,
+			packet_tx,
+			reconfigure_tx,
 		})
 	}
 }
 
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<ShardBatch>,
+	mut packet_rx: mpsc::Receiver<VideoPacketMessage>,
 	socket: UdpGsoSocket,
 	start: Arc<Notify>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
-	pacing_bitrate: Option<u64>,
-	fps: u32,
+	mut pacing_bitrate: Option<u64>,
+	mut fps: u32,
 ) {
 	tokio::spawn(async move {
 		start.notified().await;
@@ -393,9 +494,21 @@ fn spawn_handle_video_packets(
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			tokio::select! {
-				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
-					match batch {
-						Ok(Some(mut batch)) => {
+				message = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
+					match message {
+						Ok(Some(VideoPacketMessage::Pause(ready))) => {
+							client_address = None;
+							let _ = ready.send(());
+						},
+						Ok(Some(VideoPacketMessage::BeginEpoch { context, ready })) => {
+							pacing_bitrate = (context.format.codec == VideoCodec::PyroWave)
+								.then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
+							fps = context.fps;
+							let tos = if context.qos { 160 } else { 0 };
+							let _ = socket.set_tos_v4(tos);
+							let _ = ready.send(());
+						},
+						Ok(Some(VideoPacketMessage::Batch(mut batch))) => {
 							if let Some(addr) = client_address {
 								if batch.shard_count() == 0 {
 									continue;
