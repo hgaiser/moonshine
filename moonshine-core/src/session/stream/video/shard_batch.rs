@@ -8,6 +8,14 @@ pub(crate) struct ShardBatch {
 	data: Vec<u8>,
 	/// Size of each shard in bytes.
 	shard_size: usize,
+	/// Transport metadata used for pacing and low-overhead frame diagnostics.
+	frame_number: u32,
+	encoded_size: usize,
+	data_shards: usize,
+	parity_shards: usize,
+	fec_blocks: usize,
+	/// Capture timestamp used as the origin of frame-aware transport pacing.
+	pacing_origin: Option<std::time::Instant>,
 	/// Optional low-latency completion signal used by synchronous producers.
 	send_completion: Option<std::sync::mpsc::SyncSender<std::time::Instant>>,
 }
@@ -18,6 +26,12 @@ impl ShardBatch {
 		Self {
 			data: Vec::new(),
 			shard_size: 0,
+			frame_number: 0,
+			encoded_size: 0,
+			data_shards: 0,
+			parity_shards: 0,
+			fec_blocks: 0,
+			pacing_origin: None,
 			send_completion: None,
 		}
 	}
@@ -35,6 +49,49 @@ impl ShardBatch {
 	/// Number of shards in this batch.
 	pub fn shard_count(&self) -> usize {
 		self.data.len().checked_div(self.shard_size).unwrap_or(0)
+	}
+
+	pub fn frame_number(&self) -> u32 {
+		self.frame_number
+	}
+
+	pub fn encoded_size(&self) -> usize {
+		self.encoded_size
+	}
+
+	pub fn data_shards(&self) -> usize {
+		self.data_shards
+	}
+
+	pub fn parity_shards(&self) -> usize {
+		self.parity_shards
+	}
+
+	pub fn fec_blocks(&self) -> usize {
+		self.fec_blocks
+	}
+
+	pub fn pacing_origin(&self) -> Option<std::time::Instant> {
+		self.pacing_origin
+	}
+
+	pub fn set_pacing_origin(&mut self, origin: std::time::Instant) {
+		self.pacing_origin = Some(origin);
+	}
+
+	pub fn set_frame_metadata(
+		&mut self,
+		frame_number: u32,
+		encoded_size: usize,
+		data_shards: usize,
+		parity_shards: usize,
+		fec_blocks: usize,
+	) {
+		self.frame_number = frame_number;
+		self.encoded_size = encoded_size;
+		self.data_shards = data_shards;
+		self.parity_shards = parity_shards;
+		self.fec_blocks = fec_blocks;
 	}
 
 	/// Append all shards from `other` into this batch.
@@ -136,6 +193,12 @@ impl ShardBuf {
 		ShardBatch {
 			data: self.data,
 			shard_size: self.stride,
+			frame_number: 0,
+			encoded_size: 0,
+			data_shards: 0,
+			parity_shards: 0,
+			fec_blocks: 0,
+			pacing_origin: None,
 			send_completion: None,
 		}
 	}

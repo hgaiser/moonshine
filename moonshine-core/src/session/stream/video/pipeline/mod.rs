@@ -19,6 +19,7 @@ use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetad
 use crate::session::manager::SessionShutdownReason;
 
 use crate::session::stream::video::fec::{FecController, FrameFecStatus};
+use crate::session::stream::video::gso_socket::duration_micros_u64;
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::pyrowave::{
 	EncodedFrame, PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL, quality_reference_frame_bytes,
@@ -139,8 +140,12 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 	}
 
 	let elapsed_s = elapsed.as_secs_f64().max(f64::EPSILON);
-	let bytes_total: usize = samples.iter().map(|s| s.encoded_bytes).sum();
-	let wire_bytes_total: usize = samples.iter().map(|s| s.wire_bytes).sum();
+	let bytes_total = samples.iter().fold(0u128, |total, sample| {
+		total.saturating_add(sample.encoded_bytes as u128)
+	});
+	let wire_bytes_total = samples
+		.iter()
+		.fold(0u128, |total, sample| total.saturating_add(sample.wire_bytes as u128));
 	let packet_count: usize = samples.iter().map(|s| s.packet_count).sum();
 	let keyframes = samples.iter().filter(|s| s.is_key_frame).count();
 
@@ -178,8 +183,8 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 	tracing::debug!(
 		frames = n,
 		fps = (n as f64 / elapsed_s).round() as u32,
-		bitrate_kbps = ((bytes_total * 8) as f64 / elapsed_s / 1000.0).round() as u64,
-		wire_bitrate_kbps = ((wire_bytes_total * 8) as f64 / elapsed_s / 1000.0).round() as u64,
+		bitrate_kbps = (bytes_total.saturating_mul(8) as f64 / elapsed_s / 1000.0).round() as u64,
+		wire_bitrate_kbps = (wire_bytes_total.saturating_mul(8) as f64 / elapsed_s / 1000.0).round() as u64,
 		packets = packet_count,
 		keyframes,
 		total_p50_us = p50(&totals),
@@ -648,6 +653,8 @@ impl VideoPipelineInner {
 		let color_description = color_description.with_full_range(ctx.format.range == ColorRange::Full);
 
 		// Create encode configuration.
+		let target_bitrate = u32::try_from(ctx.bitrate)
+			.map_err(|_| format!("Configured bitrate {} bps exceeds the encoder API range", ctx.bitrate))?;
 		let config = match codec {
 			Codec::H264 => EncodeConfig::h264(ctx.width, ctx.height),
 			Codec::H265 => EncodeConfig::h265(ctx.width, ctx.height),
@@ -658,7 +665,7 @@ impl VideoPipelineInner {
 		.with_bit_depth(bit_depth)
 		.with_color_description(color_description)
 		.with_rate_control(RateControlMode::Cbr)
-		.with_target_bitrate(ctx.bitrate as u32)
+		.with_target_bitrate(target_bitrate)
 		.with_frame_rate(ctx.fps, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
 		.with_b_frames(0) // No B-frames for low latency
@@ -853,7 +860,7 @@ impl VideoPipelineInner {
 			// Wire version 1 transports one complete encoded frame through the
 			// ordinary GameStream packetizer. The client reassembles the decode
 			// unit before passing it to PyroWave.
-			let shards = packetizer
+			let mut shards = packetizer
 				.packetize(
 					&encoded.data[..encoded.data_size],
 					true,
@@ -866,6 +873,10 @@ impl VideoPipelineInner {
 					latency,
 				)
 				.map_err(|()| "failed to packetize PyroWave frame".to_string())?;
+			// Anchor transport pacing to capture time. Encoding time therefore
+			// consumes part of this frame's pacing window instead of being added
+			// on top of it, preserving the negotiated frame cadence.
+			shards.set_pacing_origin(created_at);
 			let wire_bytes = shards.as_bytes().len();
 			let packet_count = shards.shard_count();
 			let packetized = std::time::Instant::now();
@@ -875,6 +886,7 @@ impl VideoPipelineInner {
 			packet_tx
 				.blocking_send(shards)
 				.map_err(|_| "video packet channel closed".to_string())?;
+			let queued = std::time::Instant::now();
 			let sent = loop {
 				match completion_rx.recv_timeout(frame_interval) {
 					Ok(sent) => break sent,
@@ -908,8 +920,8 @@ impl VideoPipelineInner {
 					&& last_slow_send_warning.is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(30))
 				{
 					tracing::warn!(
-						send_us = stats.send.as_micros() as u64,
-						frame_budget_us = frame_interval.as_micros() as u64,
+						send_us = duration_micros_u64(stats.send),
+						frame_budget_us = duration_micros_u64(frame_interval),
 						"PyroWave send backpressure is consistently exceeding the frame budget"
 					);
 					last_slow_send_warning = Some(std::time::Instant::now());
@@ -921,8 +933,10 @@ impl VideoPipelineInner {
 				frame_number,
 				buffer_index,
 				encoded_bytes = stats.encoded_bytes,
-				encode_wait_us = stats.encode_wait.as_micros() as u64,
-				total_us = stats.total.as_micros() as u64,
+				encode_wait_us = duration_micros_u64(stats.encode_wait),
+				packet_channel_wait_us = duration_micros_u64(queued.duration_since(packetized)),
+				socket_send_us = duration_micros_u64(sent.duration_since(queued)),
+				total_us = duration_micros_u64(stats.total),
 				"Sent PyroWave frame"
 			);
 			let _ = stats_tx.send(stats);

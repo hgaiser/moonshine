@@ -21,7 +21,7 @@ pub use format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 	VideoChromaSampling, VideoCodec, VideoDynamicRange, VideoFormat,
 };
-use gso_socket::UdpGsoSocket;
+use gso_socket::{UdpGsoSocket, duration_micros_u64};
 use pipeline::VideoPipeline;
 use shard_batch::ShardBatch;
 
@@ -329,9 +329,18 @@ impl VideoStream {
 
 		// Packet channel.
 		let (packet_tx, packet_rx) = mpsc::channel::<ShardBatch>(128);
+		let pacing_bitrate =
+			(context.format.codec == VideoCodec::PyroWave).then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
 
 		// Spawn packet handler — gated behind start_notify.
-		spawn_handle_video_packets(packet_rx, socket, start_notify.clone(), stop.clone());
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			start_notify.clone(),
+			stop.clone(),
+			pacing_bitrate,
+			context.fps,
+		);
 
 		// Spawn pipeline thread — gated behind start_notify.
 		VideoPipeline::new(
@@ -367,6 +376,8 @@ fn spawn_handle_video_packets(
 	socket: UdpGsoSocket,
 	start: Arc<Notify>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	pacing_bitrate: Option<u64>,
+	fps: u32,
 ) {
 	tokio::spawn(async move {
 		start.notified().await;
@@ -393,18 +404,57 @@ fn spawn_handle_video_packets(
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
 								match stop_session_manager
-									.wrap_cancel(socket.send_batch(&batch, addr))
+									.wrap_cancel(socket.send_batch(&batch, addr, pacing_bitrate))
 									.await
 								{
-									Ok(failed_chunks) => {
-										if failed_chunks > 0
+									Ok(send_stats) => {
+										if send_stats.fallback_chunks > 0
 											&& last_send_warn
 												.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
 										{
 											tracing::warn!(
-												"GSO send failed for {failed_chunks} chunk(s), sent per-shard instead"
+												"GSO send failed for {} chunk(s), sent per-shard instead",
+												send_stats.fallback_chunks
 											);
 											last_send_warn = Some(std::time::Instant::now());
+										}
+										if tracing::enabled!(tracing::Level::TRACE) {
+											let effective_wire_bitrate = if send_stats.elapsed.is_zero() {
+												0
+											} else {
+												(u128::from(send_stats.wire_bytes)
+													.saturating_mul(8)
+													.saturating_mul(1_000_000)
+													/ send_stats.elapsed.as_micros().max(1))
+													.min(u128::from(u64::MAX)) as u64
+											};
+											tracing::trace!(
+												frame_number = batch.frame_number(),
+												fps,
+												shard_size = batch.shard_size(),
+												encoded_bytes = batch.encoded_size(),
+												wire_bytes = send_stats.wire_bytes,
+												data_shards = batch.data_shards(),
+												parity_shards = batch.parity_shards(),
+												total_shards = batch.shard_count(),
+												fec_blocks = batch.fec_blocks(),
+												gso_segments_per_send = send_stats.gso_segments_per_send,
+												gso_sends = send_stats.gso_sends,
+												final_chunk_segments = send_stats.final_chunk_segments,
+												final_chunk_bytes = send_stats.final_chunk_bytes,
+												per_shard_sends = send_stats.per_shard_sends,
+												would_block_events = send_stats.would_block_events,
+												gso_fallback_chunks = send_stats.fallback_chunks,
+												send_us = duration_micros_u64(send_stats.elapsed),
+												pacing_window_us = duration_micros_u64(send_stats.pacing_duration),
+												scheduled_pacing_us = duration_micros_u64(send_stats.scheduled_pacing_duration),
+												initial_pacing_lateness_us = duration_micros_u64(send_stats.initial_pacing_lateness),
+												max_pacing_lateness_us = duration_micros_u64(send_stats.max_pacing_lateness),
+												pacing_rebased = send_stats.pacing_rebased,
+												backpressure_rebases = send_stats.backpressure_rebases,
+												effective_wire_bitrate,
+												"Video frame transport"
+											);
 										}
 									},
 									Err(_) => break,

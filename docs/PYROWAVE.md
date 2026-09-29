@@ -135,6 +135,36 @@ that Moonlight can decode exactly. A request for 20% can therefore become
 roughly 8-9% rather than abruptly becoming unprotected. Zero FEC is used only
 when no protected layout is representable.
 
+## Transport pacing and diagnostics
+
+PyroWave produces a complete intra frame at once. Pyroshine retains UDP GSO,
+but spaces GSO super-packets across the frame's bitrate-derived transmit window
+instead of submitting every chunk back-to-back. The schedule is anchored to the
+capture timestamp, so GPU encode time consumes part of the window rather than
+being added to it. The sender distributes chunks across the remaining time
+without reordering or interleaving frames. If the whole window elapsed during
+encode, or socket backpressure consumes scheduled slots, it rebases the
+remaining schedule instead of emitting an unbounded catch-up burst. The
+PyroWave pipeline still waits for the complete
+frame submission and discards stale
+captured frames, so transport pacing cannot grow an unbounded video queue.
+
+With Moonlight's usual 1392-byte request, packetization produces a 1376-byte
+frame payload in a 1408-byte UDP shard. The IPv4 datagram limit permits 46 such
+segments per GSO submission. Seven submissions hold 322 shards, or 443064
+encoded bytes after the frame header; at 120 FPS that is 425341440 bps. The
+next shard previously changed a frame from seven immediate GSO submissions to
+eight. These values explain the observed boundary, but are inputs to the
+general packetization and pacing model rather than transport limits.
+
+Trace logging emits one `Video frame transport` event per frame with encoded
+and wire bytes, data/parity shard counts, FEC blocks, GSO chunks, final partial
+chunk size, `WouldBlock`/fallback counts, pacing lateness, send duration, and
+effective wire bitrate. For a diagnostic A/B test only, setting
+`MOONSHINE_VIDEO_DISABLE_GSO=1` sends individual shards while retaining the
+same frame-aware pacing cadence. This is intentionally not a configuration
+setting or a recommended production mode.
+
 ## FEC policy
 
 Video FEC is configured under `[stream.video]`:

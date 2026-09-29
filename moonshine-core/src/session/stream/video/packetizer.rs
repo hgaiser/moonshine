@@ -292,6 +292,7 @@ impl Packetizer {
 		let mut total_fec_compute_us = 0u128;
 		let mut total_fec_headers_us = 0u128;
 		let mut total_extend_us = 0u128;
+		let mut total_parity_shards = 0usize;
 
 		for block_index in 0..nr_blocks {
 			let start = block_index * nr_data_shards_per_block;
@@ -321,6 +322,9 @@ impl Packetizer {
 
 			// Single allocation for all shards in this block (data + parity), zeroed.
 			let total_shards = nr_data_shards + nr_parity_shards;
+			total_parity_shards = total_parity_shards
+				.checked_add(nr_parity_shards)
+				.ok_or_else(|| tracing::error!("Video parity-shard count overflow"))?;
 			let t_alloc = Instant::now();
 			let mut shard_buf = ShardBuf::new(total_shards, requested_shard_size, prefix_size);
 			total_alloc_us += t_alloc.elapsed().as_micros();
@@ -449,6 +453,13 @@ impl Packetizer {
 			"Packetize breakdown: alloc_us={total_alloc_us} data_write_us={total_data_write_us} fec_encoder_us={total_fec_encoder_us} fec_compute_us={total_fec_compute_us} fec_headers_us={total_fec_headers_us} extend_us={total_extend_us}",
 		);
 
+		all_shards.set_frame_metadata(
+			frame_number,
+			encoded_data.len(),
+			nr_data_shards,
+			total_parity_shards,
+			nr_blocks,
+		);
 		Ok(all_shards)
 	}
 
@@ -627,6 +638,11 @@ mod tests {
 			let data = ((fec_info >> 22) & 0x3ff) as usize;
 			let wire_percentage = ((fec_info >> 4) & 0xff) as u8;
 			let parity = batch.shard_count() - data;
+			assert_eq!(batch.frame_number(), 1);
+			assert_eq!(batch.encoded_size(), 992);
+			assert_eq!(batch.data_shards(), data);
+			assert_eq!(batch.parity_shards(), parity);
+			assert_eq!(batch.fec_blocks(), 1);
 			assert_eq!(wire_percentage, percentage);
 			assert_eq!(parity, receiver_parity_shards(data, wire_percentage));
 		}
@@ -646,6 +662,22 @@ mod tests {
 		assert_eq!(data, 1);
 		assert_eq!(batch.shard_count(), 3);
 		assert_eq!(receiver_parity_shards(data, wire_percentage), 2);
+	}
+
+	#[test]
+	fn no_fec_packetization_is_continuous_across_gso_chunk_boundaries() {
+		for data_shards in [46 * 6, 46 * 7, 46 * 7 + 1, 46 * 8 - 7, 46 * 8] {
+			let encoded_size = data_shards * 1376 - VIDEO_FRAME_HEADER_SIZE;
+			let mut packetizer = packetizer();
+			let mut sequence = 0;
+			let batch = packetizer
+				.packetize(&vec![0x55; encoded_size], true, 1392, 0, 0, 1, &mut sequence, 0, 0)
+				.unwrap();
+			assert_eq!(batch.shard_size(), 1408);
+			assert_eq!(batch.data_shards(), data_shards);
+			assert_eq!(batch.parity_shards(), 0);
+			assert_eq!(batch.shard_count(), data_shards);
+		}
 	}
 
 	#[test]

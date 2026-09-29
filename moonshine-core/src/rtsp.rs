@@ -324,14 +324,23 @@ impl RtspServer {
 		if packet_size != requested_packet_size {
 			tracing::info!("Clamping client video packet size from {requested_packet_size} to {packet_size} bytes.");
 		}
-		let mut bitrate = match get_sdp_attribute(&sdp_session, "x-ml-video.configuredBitrateKbps") {
+		let bitrate_kbps: u64 = match get_sdp_attribute(&sdp_session, "x-ml-video.configuredBitrateKbps") {
 			Ok(bitrate) => bitrate,
 			Err(()) => {
 				tracing::warn!("Failed to parse x-ml-video.configuredBitrateKbps in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
-		bitrate *= 1000; // Convert from kbps to bps.
+		let bitrate = match bitrate_bps_from_kbps(bitrate_kbps) {
+			Some(bitrate) => bitrate,
+			None => {
+				tracing::warn!(
+					bitrate_kbps,
+					"Configured video bitrate is outside the supported numeric range"
+				);
+				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+			},
+		};
 		let minimum_fec_packets = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].fec.minRequiredFecPackets") {
 			Ok(minimum_fec_packets) => minimum_fec_packets,
 			Err(()) => {
@@ -681,6 +690,12 @@ fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attr
 		.and_then(|s| s.parse().ok())
 }
 
+fn bitrate_bps_from_kbps(bitrate_kbps: u64) -> Option<usize> {
+	bitrate_kbps
+		.checked_mul(1000)
+		.and_then(|bitrate| usize::try_from(bitrate).ok())
+}
+
 fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Result<F, ()> {
 	sdp_session
 		.get_first_attribute_value(attribute)
@@ -689,4 +704,28 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 		.trim()
 		.parse()
 		.map_err(|_| tracing::warn!("Attribute {attribute} can't be parsed."))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::bitrate_bps_from_kbps;
+
+	#[test]
+	fn bitrate_conversion_is_wide_and_checked() {
+		for mbps in [400u64, 424, 425, 426, 500, 750, 1_000, 2_000] {
+			assert_eq!(bitrate_bps_from_kbps(mbps * 1000), Some((mbps * 1_000_000) as usize));
+		}
+		if usize::BITS >= 64 {
+			assert_eq!(bitrate_bps_from_kbps(4_294_967), Some(4_294_967_000));
+			assert_eq!(bitrate_bps_from_kbps(4_294_968), Some(4_294_968_000));
+		}
+		let max_safe_kbps = (usize::MAX as u64) / 1000;
+		assert_eq!(
+			bitrate_bps_from_kbps(max_safe_kbps),
+			Some((max_safe_kbps * 1000) as usize)
+		);
+		assert_eq!(bitrate_bps_from_kbps(max_safe_kbps + 1), None);
+		assert_eq!(bitrate_bps_from_kbps(u64::MAX), None);
+		assert_eq!(bitrate_bps_from_kbps(u64::MAX / 1000 + 1), None);
+	}
 }
