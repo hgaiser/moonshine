@@ -99,6 +99,7 @@ pub(crate) fn scan_steam_applications(config: &SteamApplicationScannerConfig) ->
 					.iter()
 					.map(|cmd| cmd.replace("{game_id}", &app.app_id.to_string()))
 					.collect(),
+				output_scale: None,
 				boxart: None,
 				stdout: config.stdout.clone(),
 				stderr: config.stderr.clone(),

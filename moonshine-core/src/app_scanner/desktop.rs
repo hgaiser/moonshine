@@ -144,6 +144,7 @@ fn parse_desktop_application(
 		title,
 		boxart,
 		command,
+		output_scale: None,
 		pre_command: config.pre_command.clone(),
 		post_command: config.post_command.clone(),
 		stdout: config.stdout.clone(),

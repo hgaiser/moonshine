@@ -161,7 +161,14 @@ Add the desktop environment as a regular application. For Plasma:
 [[application]]
 title = "Plasma Desktop"
 command = ["/usr/bin/startplasma-wayland"]
+output_scale = 1.5
 ```
+
+`output_scale` is optional; omit it for the default scale of `1.0`. It is a
+generic per-application Wayland output setting, so it can be used with any
+application or nested compositor. The video stream remains at the Moonlight
+client's physical resolution while applications receive a correspondingly
+smaller logical output and render at the requested scale.
 
 Log out of any existing local Plasma session before launching it. Other desktop
 environments use the same generic mechanism; for example:
@@ -180,6 +187,14 @@ Launching a desktop environment as an application turns the stream into a full r
 packaged Pyroshine service already supplies the user's runtime directory and
 session bus, so no Plasma-specific wrapper or `dbus-run-session` prefix is
 needed for the supported single-session case.
+
+Set the scale in Pyroshine's application entry before starting the session and
+fully stop and relaunch the stream after changing it. In a nested session, KWin
+gets its output size and preferred fractional scale from the outer Pyroshine
+compositor. Changing the nested `WL-0` output with `kscreen-doctor` is therefore
+not effective. Avoid `QT_SCALE_FACTOR`: it scales Qt processes independently of
+the output geometry, which can produce mixed-size applications and clipped
+desktop panels.
 
 A full Plasma session uses per-user D-Bus names and systemd user services, so a
 second full session for the same user conflicts with the local one. Pyroshine

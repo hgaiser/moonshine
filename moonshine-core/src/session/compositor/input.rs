@@ -163,11 +163,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 			screen_height,
 		} => {
 			tracing::trace!(target: "input", "Mouse absolute: ({x}, {y}) screen: ({screen_width}x{screen_height})");
-			let output_size = state
-				.output
-				.current_mode()
-				.map(|m| m.size)
-				.unwrap_or((state.width as i32, state.height as i32).into());
+			let output_size = state.output_rect().size;
 
 			let new_x = if screen_width > 0 {
 				x as f64 / screen_width as f64 * output_size.w as f64
@@ -718,11 +714,7 @@ fn process_pen_input(
 }
 
 fn normalized_pointer_location(state: &MoonshineCompositor, x: f32, y: f32) -> Point<f64, Logical> {
-	let output_size = state
-		.output
-		.current_mode()
-		.map(|mode| mode.size)
-		.unwrap_or((state.width as i32, state.height as i32).into());
+	let output_size = state.output_rect().size;
 	let max_x = output_size.w.saturating_sub(1).max(0) as f64;
 	let max_y = output_size.h.saturating_sub(1).max(0) as f64;
 	Point::from((x.clamp(0.0, 1.0) as f64 * max_x, y.clamp(0.0, 1.0) as f64 * max_y))
@@ -735,11 +727,7 @@ fn normalized_pointer_location(state: &MoonshineCompositor, x: f32, y: f32) -> P
 /// so the cursor can move within the dropdown area without being clamped
 /// to the output bounds.
 fn clamp_cursor(state: &mut MoonshineCompositor) {
-	let output_size = state
-		.output
-		.current_mode()
-		.map(|m| m.size)
-		.unwrap_or((state.width as i32, state.height as i32).into());
+	let output_size = state.output_rect().size;
 
 	// Start with output bounds.
 	let mut min_x: f64 = 0.0;

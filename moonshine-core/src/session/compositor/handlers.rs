@@ -412,11 +412,12 @@ impl CompositorHandler for MoonshineCompositor {
 			// wlroots' wayland backend drops the size from the initial
 			// configure (output not enabled yet); re-send it on each
 			// mismatched commit so nested compositors adopt the session size.
+			let output_size = self.output_rect().size;
 			if let Some(toplevel) = window.toplevel()
-				&& window.geometry().size != (self.width as i32, self.height as i32).into()
+				&& window.geometry().size != output_size
 			{
 				toplevel.with_pending_state(|state| {
-					state.size = Some((self.width as i32, self.height as i32).into());
+					state.size = Some(output_size);
 				});
 				toplevel.send_configure();
 			}
@@ -482,7 +483,9 @@ impl MoonshineCompositor {
 
 	/// The output rectangle, which every fullscreen window is held at.
 	pub(crate) fn output_rect(&self) -> Rectangle<i32, Logical> {
-		Rectangle::new((0, 0).into(), (self.width as i32, self.height as i32).into())
+		self.space
+			.output_geometry(&self.output)
+			.unwrap_or_else(|| Rectangle::new((0, 0).into(), (self.width as i32, self.height as i32).into()))
 	}
 
 	/// Helper to read an X11 window property via `X11Focus`, returning a
@@ -623,7 +626,7 @@ impl MoonshineCompositor {
 		// interactive overlay (full root-window width or asking for input) and
 		// notifications (everything else) at focus time.
 		let is_overlay = self.with_x11_focus(|xf| xf.get_steam_overlay_value(window.window_id())) != 0;
-		let interactive_overlay = window.geometry().size.w >= self.width as i32 || input_focus_mode != 0;
+		let interactive_overlay = window.geometry().size.w >= self.output_rect().size.w || input_focus_mode != 0;
 
 		// Build WindowFlags: overlay/tray/streaming/VR classification.
 		// Packed into a single u8 instead of 7 separate bool fields.
@@ -829,7 +832,7 @@ impl MoonshineCompositor {
 			};
 
 			if meta.is_overlay {
-				let interactive = meta.geometry.size.w >= self.width as i32 || meta.input_focus_mode != 0;
+				let interactive = meta.geometry.size.w >= self.output_rect().size.w || meta.input_focus_mode != 0;
 				if interactive && meta.opacity >= max_overlay_opacity {
 					best_overlay = Some(window.clone());
 					max_overlay_opacity = meta.opacity;
@@ -1819,7 +1822,7 @@ impl XdgShellHandler for MoonshineCompositor {
 		// size. Don't claim Maximized: Wine then treats the window as a
 		// maximized, decorated Win32 window and draws its own frame.
 		surface.with_pending_state(|state| {
-			state.size = Some((self.width as i32, self.height as i32).into());
+			state.size = Some(self.output_rect().size);
 		});
 		surface.send_configure();
 
@@ -1908,7 +1911,7 @@ impl XdgShellHandler for MoonshineCompositor {
 		// longer marked Maximized, which used to guarantee this.
 		surface.with_pending_state(|state| {
 			state.states.unset(XdgToplevelState::Fullscreen);
-			state.size = Some((self.width as i32, self.height as i32).into());
+			state.size = Some(self.output_rect().size);
 		});
 		surface.send_configure();
 
@@ -2246,7 +2249,7 @@ impl XwmHandler for MoonshineCompositor {
 						xf.get_input_focus_mode(window_id),
 					)
 				});
-				let interactive = window.geometry().size.w >= self.width as i32 || input_focus_mode != 0;
+				let interactive = window.geometry().size.w >= self.output_rect().size.w || input_focus_mode != 0;
 				if let Some(meta) = self.window_metadata.get_mut(&elem) {
 					meta.is_overlay = is_overlay;
 					meta.opacity = opacity;
@@ -2482,11 +2485,7 @@ impl XwmHandler for MoonshineCompositor {
 			let meta = self.window_metadata.get(&win).expect("metadata was just inserted");
 
 			// Validate the dropdown is on-screen (Task 3.1).
-			let output_size = self
-				.output
-				.current_mode()
-				.map(|m| m.size)
-				.unwrap_or((self.width as i32, self.height as i32).into());
+			let output_size = self.output_rect().size;
 			let geo = &meta.geometry;
 			let on_screen = geo.loc.x + geo.size.w > 0
 				&& geo.loc.x < output_size.w
@@ -2657,7 +2656,7 @@ impl XwmHandler for MoonshineCompositor {
 		// boundary must switch flags; stale flags route input to the wrong
 		// Steam window.
 		let window_id = window.window_id();
-		let root_width = self.width as i32;
+		let root_width = self.output_rect().size.w;
 		let needs_reclassify = self.window_metadata.get(&elem).is_some_and(|m| m.is_overlay);
 
 		// Read steam_overlay_value BEFORE the mutable borrow to avoid conflict.

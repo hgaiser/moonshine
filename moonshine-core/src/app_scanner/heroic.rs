@@ -251,6 +251,7 @@ pub(crate) fn scan_heroic_applications(config: &HeroicApplicationScannerConfig) 
 					.iter()
 					.map(|cmd| cmd.replace("{app_name}", &game.app_name).replace("{runner}", runner))
 					.collect(),
+				output_scale: None,
 				boxart,
 				stdout: config.stdout.clone(),
 				stderr: config.stderr.clone(),

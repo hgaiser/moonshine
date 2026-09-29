@@ -25,7 +25,7 @@ use smithay::backend::allocator::{Fourcc, Modifier};
 use smithay::backend::egl::{EGLContext, EGLDisplay};
 use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::gles::{Capability, GlesRenderer};
-use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+use smithay::output::{Mode, Output, PhysicalProperties, Scale, Subpixel};
 use smithay::reexports::calloop::EventLoop;
 use smithay::utils::Transform;
 
@@ -122,6 +122,7 @@ pub(crate) struct CompositorContext {
 	pub height: u32,
 	pub refresh_rate: u32,
 	pub hdr: bool,
+	pub output_scale: f64,
 }
 
 /// Information sent from the compositor thread once XWayland is ready.
@@ -158,12 +159,27 @@ pub(crate) struct LaunchedCompositor {
 
 impl From<&SessionContext> for CompositorContext {
 	fn from(ctx: &SessionContext) -> Self {
+		let output_scale = sanitize_output_scale(ctx.application.output_scale);
+		if ctx.application.output_scale.is_some_and(|scale| scale != output_scale) {
+			tracing::warn!(
+				scale = ctx.application.output_scale,
+				"Invalid application output scale; using 1.0"
+			);
+		}
 		Self {
 			width: ctx.resolution.0,
 			height: ctx.resolution.1,
 			refresh_rate: ctx.refresh_rate,
 			hdr: ctx.hdr,
+			output_scale,
 		}
+	}
+}
+
+fn sanitize_output_scale(scale: Option<f64>) -> f64 {
+	match scale {
+		Some(scale) if scale.is_finite() && (0.25..=8.0).contains(&scale) => scale,
+		_ => 1.0,
 	}
 }
 
@@ -390,7 +406,12 @@ fn run_compositor(
 			serial_number: "".into(),
 		},
 	);
-	output.change_current_state(Some(mode), Some(Transform::Normal), None, Some((0, 0).into()));
+	output.change_current_state(
+		Some(mode),
+		Some(Transform::Normal),
+		Some(Scale::Fractional(context.output_scale)),
+		Some((0, 0).into()),
+	);
 	output.set_preferred(mode);
 
 	// Create the damage tracker for this output.
@@ -495,10 +516,11 @@ fn run_compositor(
 		.map_err(|e| format!("Failed to insert frame timer: {e}"))?;
 
 	tracing::info!(
-		"Compositor started: {}x{} @ {}Hz",
+		"Compositor started: {}x{} @ {}Hz, output scale {}",
 		context.width,
 		context.height,
-		context.refresh_rate
+		context.refresh_rate,
+		context.output_scale
 	);
 
 	// Run the event loop.
@@ -535,4 +557,23 @@ fn run_compositor(
 /// Delegates to the shared implementation in the healthcheck module.
 fn find_render_node(gpu_config: &Option<String>) -> Result<std::path::PathBuf, String> {
 	crate::healthcheck::find_render_node(gpu_config)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::sanitize_output_scale;
+
+	#[test]
+	fn output_scale_accepts_fractional_values() {
+		assert_eq!(sanitize_output_scale(Some(1.5)), 1.5);
+		assert_eq!(sanitize_output_scale(Some(2.0)), 2.0);
+	}
+
+	#[test]
+	fn output_scale_defaults_or_rejects_invalid_values() {
+		assert_eq!(sanitize_output_scale(None), 1.0);
+		assert_eq!(sanitize_output_scale(Some(0.0)), 1.0);
+		assert_eq!(sanitize_output_scale(Some(f64::NAN)), 1.0);
+		assert_eq!(sanitize_output_scale(Some(9.0)), 1.0);
+	}
 }

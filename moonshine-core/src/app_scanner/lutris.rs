@@ -128,6 +128,7 @@ pub(crate) fn scan_lutris_applications(config: &LutrisApplicationScannerConfig) 
 			pre_command: config.pre_command.clone(),
 			post_command: config.post_command.clone(),
 			command: config.command.iter().map(|cmd| cmd.replace("{slug}", &slug)).collect(),
+			output_scale: None,
 			boxart: boxart_path,
 			stdout: config.stdout.clone(),
 			stderr: config.stderr.clone(),

@@ -28,6 +28,11 @@ pub struct ApplicationConfig {
 	/// The command to run.
 	pub command: Vec<String>,
 
+	/// Optional scale advertised by the compositor for this application's output.
+	/// The stream resolution remains the physical framebuffer size.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub output_scale: Option<f64>,
+
 	/// Commands to run before launching the application.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub pre_command: Vec<Vec<String>>,
@@ -55,6 +60,7 @@ impl Default for ApplicationConfig {
 			title: String::new(),
 			boxart: None,
 			command: Vec::new(),
+			output_scale: None,
 			pre_command: Vec::new(),
 			post_command: Vec::new(),
 			stdout: None,
@@ -774,7 +780,29 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
-	use super::split_standard_io;
+	use super::{ApplicationConfig, split_standard_io};
+
+	#[test]
+	fn application_output_scale_is_optional_and_deserializes() {
+		let unscaled: ApplicationConfig = toml::from_str(
+			r#"
+title = "Example"
+command = ["example"]
+"#,
+		)
+		.unwrap();
+		assert_eq!(unscaled.output_scale, None);
+
+		let scaled: ApplicationConfig = toml::from_str(
+			r#"
+title = "Example"
+command = ["example"]
+output_scale = 1.5
+"#,
+		)
+		.unwrap();
+		assert_eq!(scaled.output_scale, Some(1.5));
+	}
 
 	#[test]
 	fn test_standard_io_defaults_to_null() {

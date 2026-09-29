@@ -584,6 +584,12 @@ impl MoonshineCompositor {
 		// knows the output geometry and can associate mapped windows
 		// with it. Without this, no render elements are produced.
 		space.map_output(&output, (0, 0));
+		let logical_output_size = space
+			.output_geometry(&output)
+			.map(|geometry| geometry.size)
+			.unwrap_or_else(|| (width as i32, height as i32).into());
+		let initial_cursor_position =
+			Point::from((logical_output_size.w as f64 / 2.0, logical_output_size.h as f64 / 2.0));
 
 		// Advertise wp_linux_dmabuf_v1 (version 6 with device feedback) so
 		// Vulkan WSI and other GPU clients can create DMA-BUF-backed
@@ -661,7 +667,7 @@ impl MoonshineCompositor {
 				frame_tx,
 				seat,
 				pending_text: String::new(),
-				cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
+				cursor_position: initial_cursor_position,
 				cursor_status: CursorImageStatus::default_named(),
 				pointer_element,
 				last_pointer_activity: None,
@@ -682,7 +688,7 @@ impl MoonshineCompositor {
 				screen_dirty: true,
 				last_frame_sent_at: std::time::Instant::now(),
 				overlay_dirty: true,
-				last_cursor_position: Point::from((width as f64 / 2.0, height as f64 / 2.0)),
+				last_cursor_position: initial_cursor_position,
 				overlay_raised: false,
 				overlay_z_x11_window: None,
 				viewporter_state,
@@ -855,10 +861,8 @@ impl MoonshineCompositor {
 			return None;
 		}
 
-		let origin = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
-			geo.loc.x - out.loc.x,
-			geo.loc.y - out.loc.y,
-		));
+		let output_scale = smithay::utils::Scale::from(self.output.current_scale().fractional_scale());
+		let origin = (geo.loc - out.loc).to_physical_precise_round(output_scale);
 		tracing::debug!(
 			target: "focus",
 			base_x11 = ?window.x11_surface().map(|x| x.window_id()),
@@ -895,9 +899,13 @@ impl MoonshineCompositor {
 	/// Scene-space per output-pixel ratio for relative input, inverting the
 	/// output scaling (`1.0` per axis when no scaling is active).
 	pub fn scene_input_ratio(&self) -> (f64, f64) {
+		let output_scale = self.output.current_scale().fractional_scale();
 		match self.compute_output_scale() {
-			Some((scale, _)) => (1.0 / scale.scale_x, 1.0 / scale.scale_y),
-			None => (1.0, 1.0),
+			Some((scale, _)) => (
+				1.0 / (output_scale * scale.scale_x),
+				1.0 / (output_scale * scale.scale_y),
+			),
+			None => (1.0 / output_scale, 1.0 / output_scale),
 		}
 	}
 
@@ -1215,7 +1223,7 @@ impl MoonshineCompositor {
 			(0, 0).into()
 		};
 
-		let scale = smithay::utils::Scale::from(1.0);
+		let scale = smithay::utils::Scale::from(self.output.current_scale().fractional_scale());
 		let cursor_pos = self.cursor_position;
 		let cursor_elements: Vec<OutputRenderElements> = self.pointer_element.render_elements(
 			&mut self.renderer,
@@ -1267,9 +1275,10 @@ impl MoonshineCompositor {
 			.unwrap_or(0);
 
 		let render_result = if let Some((scale, origin)) = output_scale {
+			let output_scale = self.output.current_scale().fractional_scale();
 			let center = smithay::utils::Point::<i32, smithay::utils::Physical>::from((
-				scale.offset_x.round() as i32,
-				scale.offset_y.round() as i32,
+				(scale.offset_x * output_scale).round() as i32,
+				(scale.offset_y * output_scale).round() as i32,
 			));
 			let scaled: Vec<ScaledOutputElement> = elements
 				.into_iter()
