@@ -70,7 +70,11 @@ def release_notes(root, tag=None):
     entries = sections((root / "docs/CHANGELOG.md").read_text())
     releases = [name for name in entries if name != "Unreleased"]
     if not releases or releases[0] != tag:
-        raise ValueError(f"The latest dated changelog entry must be {tag}. Prepare it before tagging.")
+        raise ValueError(
+            f"The latest dated changelog entry must be {tag}. "
+            "Run python3 scripts/changelog.py prepare --date YYYY-MM-DD, "
+            "then commit the changelog before tagging. The check command only validates entries."
+        )
     return entries[tag][2] + "\n"
 
 

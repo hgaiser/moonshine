@@ -195,6 +195,10 @@ changelog together with the version bump. To inspect the exact release body:
 python3 scripts/changelog.py notes --tag vX.Y.Z
 ```
 
+`check` and CI only validate entries; they do not create or commit them. If a
+release tag was pushed before preparation, rerunning that tag still checks the
+old commit. The release tag must point to a commit containing the prepared entry.
+
 Run the workspace checks above and verify the packaged service and PyroWave
 library before tagging that commit. Use the same semantic version as the
 workspace and changelog:
