@@ -70,6 +70,19 @@ pub fn scan_applications(application_scanners: &Vec<ApplicationScannerConfig>) -
 	applications
 }
 
+/// Combine the configured applications with freshly scanned ones and resolve missing boxart.
+pub fn load_applications(
+	configured_applications: &[ApplicationConfig],
+	application_scanners: &Vec<ApplicationScannerConfig>,
+) -> Vec<ApplicationConfig> {
+	let mut applications = configured_applications.to_vec();
+	let scanned_applications = scan_applications(application_scanners);
+	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
+	applications.extend(scanned_applications);
+	resolve_missing_boxart(&mut applications);
+	applications
+}
+
 /// Resolve missing boxart for applications by searching for icons matching the application title.
 pub fn resolve_missing_boxart(applications: &mut [ApplicationConfig]) {
 	let resolver = desktop::IconResolver::new(true);
