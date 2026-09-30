@@ -15,12 +15,16 @@ without executable-name or engine-name matching.
 
 ## Negotiation
 
-- Instance creation enumerates downstream extensions before privately enabling
+- Instance creation uses the loader's global extension enumeration before privately enabling
   `VK_KHR_get_surface_capabilities2`, `VK_EXT_surface_maintenance1`, and
   `VK_KHR_get_physical_device_properties2` (or using Vulkan 1.1 features queries).
   WSI platform extensions are also enabled only when available. None of these
-  extensions is newly advertised by the layer. Application instance entry
-  points remain gated by the application's enabled extensions.
+  extensions is newly advertised by the layer. WSI instance entry points remain
+  gated by the application's enabled extensions. The properties2/features2 KHR
+  aliases follow the actual downstream enabled extensions: the Vulkan loader
+  needs these aliases for core-query dispatch after private enablement.
+  Global enumeration does not use the next instance layer's dispatch function
+  with a null instance; that can crash layers such as Mesa device-select.
 - Device creation checks downstream `VK_EXT_swapchain_maintenance1` support and
   queries `VkPhysicalDeviceSwapchainMaintenance1FeaturesEXT`. It enables that
   feature only when supported and `VK_KHR_swapchain` is enabled. An existing
@@ -86,6 +90,34 @@ compatible FIFO switching, limiter fallback, and mocked ICD tests checking
 extension/feature gates and the synchronous lifetime and structure types of
 capability query chains. Workspace loopback socket tests require permission to
 bind UDP sockets.
+
+## 0.16.10 dispatch regression verification
+
+The 0.16.9 extension gate withheld properties2/features2 KHR pointers when the
+layer privately enabled their extension. The loader could then route a core
+query to a null pointer, crashing Steam's GPU process and forcing software
+compositing in Big Picture. These aliases now follow downstream enablement.
+Instance extension discovery also uses the loader's global enumeration entry
+point, avoiding a null-instance dispatch lookup in Mesa device-select.
+
+Regression tests call both formerly missing aliases, cover active and degraded
+instances with and without application enablement, and verify that private
+surface-capabilities enablement still leaves its application entry point gated.
+The private-properties test fails with the original 0.16.9 gate.
+
+On the RX 9070 XT with RADV/Mesa 26.2.3, an isolated Vulkan 1.0 instance with no
+application extensions reproduced a SIGSEGV with 0.16.9. The 0.16.10 release
+library completed both core queries with Mesa device-select enabled and disabled.
+This probe enabled extension injection but used an unavailable compositor socket;
+it validates loader initialization and dispatch, not frame presentation.
+
+All 237 workspace Rust tests, eight changelog tests, formatting, all-targets
+Clippy, documentation with warnings denied, and the workspace release build
+passed. The candidate server's host healthcheck passed with ephemeral ports in
+a temporary config, including H.264, HEVC, AV1, PyroWave SDR/HDR profiles and
+DMA-BUF support. The installed PyroWave C API load test also passed.
+An end-to-end Big Picture FPS comparison remains unperformed; the installed
+service and Steam session were not replaced during validation.
 
 ## Validation recorded on 2026-09-30
 

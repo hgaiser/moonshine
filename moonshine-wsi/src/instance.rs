@@ -31,6 +31,30 @@ fn moonshine_wayland_display() -> Option<CString> {
 	CString::new(val).ok()
 }
 
+/// Global enumeration uses the loader's pre-instance chain, not an instance
+/// layer's GIPA. Layers such as Mesa device-select require a live instance
+/// when forwarding commands they do not intercept.
+unsafe fn supported_instance_extensions() -> Vec<ash::vk::ExtensionProperties> {
+	unsafe {
+		// The loader is already present, possibly with RTLD_LOCAL (e.g. CEF).
+		// NOLOAD keeps this query tied to that loader without loading a new one.
+		let loader = libc::dlopen(c"libvulkan.so.1".as_ptr(), libc::RTLD_NOW | libc::RTLD_NOLOAD);
+		if loader.is_null() {
+			crate::log_warn!("Vulkan loader unavailable for instance extension discovery; skipping injection");
+			return Vec::new();
+		}
+		let proc = libc::dlsym(loader, c"vkEnumerateInstanceExtensionProperties".as_ptr());
+		let supported = if proc.is_null() {
+			Vec::new()
+		} else {
+			let enumerate: ash::vk::PFN_vkEnumerateInstanceExtensionProperties = std::mem::transmute(proc);
+			enumerate_extensions(|count, props| enumerate(std::ptr::null(), count, props))
+		};
+		libc::dlclose(loader);
+		supported
+	}
+}
+
 pub unsafe extern "C" fn create_instance(
 	p_create_info: *const VkInstanceCreateInfo,
 	p_allocator: *const VkAllocationCallbacks,
@@ -79,15 +103,7 @@ pub unsafe extern "C" fn create_instance(
 		let mut surface_maintenance1 = false;
 		if is_active {
 			// Optional functionality must be discovered before it is enabled.
-			let enumerate = next_get_proc_addr(VkInstance::null(), c"vkEnumerateInstanceExtensionProperties".as_ptr())
-				.map(|f| {
-					std::mem::transmute::<unsafe extern "C" fn(), ash::vk::PFN_vkEnumerateInstanceExtensionProperties>(
-						f,
-					)
-				});
-			let supported = enumerate
-				.map(|f| enumerate_extensions(|count, props| f(std::ptr::null(), count, props)))
-				.unwrap_or_default();
+			let supported = supported_instance_extensions();
 			let supports = |name: &CStr| {
 				supported
 					.iter()

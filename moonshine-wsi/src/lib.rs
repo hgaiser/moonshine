@@ -175,7 +175,15 @@ pub unsafe extern "C" fn moonshine_vk_get_instance_proc_addr(
 			};
 			if let Some(ext) = required_extension {
 				let enabled = state::with_instance(instance_key_of(instance), |d| {
-					d.app_extensions.iter().any(|name| name.as_c_str() == ext)
+					// The loader builds its promoted core-query fallback from these
+					// KHR aliases. If we enabled properties2 downstream, withholding
+					// its pointers leaves that fallback dispatch entry null.
+					let extensions = if ext == c"VK_KHR_get_physical_device_properties2" {
+						&d.downstream_extensions
+					} else {
+						&d.app_extensions
+					};
+					extensions.iter().any(|name| name.as_c_str() == ext)
 				})
 				.unwrap_or(false);
 				if !enabled {

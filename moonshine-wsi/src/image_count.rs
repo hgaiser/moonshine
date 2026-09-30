@@ -481,8 +481,21 @@ mod driver_tests {
 			remove_instance(InstanceKey(self.0.dispatch_key));
 		}
 	}
-	unsafe extern "C" fn get_proc(_: VkInstance, _: *const std::ffi::c_char) -> PFN_vkVoidFunction {
-		None
+	unsafe extern "C" fn get_proc(_: VkInstance, name: *const std::ffi::c_char) -> PFN_vkVoidFunction {
+		match unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes() {
+			b"vkGetPhysicalDeviceProperties2KHR" => Some(unsafe {
+				std::mem::transmute::<ash::vk::PFN_vkGetPhysicalDeviceProperties2, unsafe extern "C" fn()>(properties)
+			}),
+			b"vkGetPhysicalDeviceFeatures2KHR" => Some(unsafe {
+				std::mem::transmute::<ash::vk::PFN_vkGetPhysicalDeviceFeatures2, unsafe extern "C" fn()>(features)
+			}),
+			_ => None,
+		}
+	}
+	unsafe extern "system" fn properties(_: VkPhysicalDevice, info: *mut vk::PhysicalDeviceProperties2) {
+		unsafe {
+			(*info).properties.device_id = 0x1609;
+		}
 	}
 	unsafe extern "C" fn destroy(_: VkInstance, _: *const VkAllocationCallbacks) {}
 	unsafe extern "C" fn create(
@@ -569,6 +582,15 @@ mod driver_tests {
 	fn private_capabilities2_enablement_does_not_expose_app_entrypoint() {
 		let f = Fixture::new(true, true, true);
 		let instance = VkInstance::from_raw(f.physical().as_raw());
+		use crate::state::RwLockExt;
+		crate::state::INSTANCE_MAP
+			.get()
+			.unwrap()
+			.force_write()
+			.get_mut(&InstanceKey(f.0.dispatch_key))
+			.unwrap()
+			.downstream_extensions
+			.push(c"VK_KHR_get_surface_capabilities2".to_owned());
 		assert!(
 			unsafe {
 				crate::moonshine_vk_get_instance_proc_addr(
@@ -578,7 +600,6 @@ mod driver_tests {
 			}
 			.is_none()
 		);
-		use crate::state::RwLockExt;
 		crate::state::INSTANCE_MAP
 			.get()
 			.unwrap()
@@ -596,6 +617,77 @@ mod driver_tests {
 			}
 			.is_some()
 		);
+	}
+
+	#[test]
+	fn privately_enabled_properties2_preserves_loader_core_fallback() {
+		let f = Fixture::new(true, true, true);
+		use crate::state::RwLockExt;
+		let instance = VkInstance::from_raw(f.physical().as_raw());
+		crate::state::INSTANCE_MAP
+			.get()
+			.unwrap()
+			.force_write()
+			.get_mut(&InstanceKey(f.0.dispatch_key))
+			.unwrap()
+			.downstream_extensions
+			.push(c"VK_KHR_get_physical_device_properties2".to_owned());
+		// The application did not request the KHR extension. The loader still
+		// needs the alias after our private enablement, e.g. a Vulkan 1.0 CEF
+		// instance calling the core query on a physical device supporting 1.1.
+		let alias = unsafe {
+			crate::moonshine_vk_get_instance_proc_addr(instance, c"vkGetPhysicalDeviceProperties2KHR".as_ptr())
+		}
+		.expect("loader fallback must not contain a null properties2 entry");
+		let query: ash::vk::PFN_vkGetPhysicalDeviceProperties2 = unsafe { std::mem::transmute(alias) };
+		let mut output = vk::PhysicalDeviceProperties2::default();
+		unsafe {
+			query(f.physical(), &mut output);
+		}
+		assert_eq!(output.properties.device_id, 0x1609);
+
+		let alias = unsafe {
+			crate::moonshine_vk_get_instance_proc_addr(instance, c"vkGetPhysicalDeviceFeatures2KHR".as_ptr())
+		}
+		.expect("loader fallback must not contain a null features2 entry");
+		let query: ash::vk::PFN_vkGetPhysicalDeviceFeatures2 = unsafe { std::mem::transmute(alias) };
+		let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
+		let mut output = vk::PhysicalDeviceFeatures2 {
+			p_next: (&mut maintenance as *mut vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT).cast(),
+			..Default::default()
+		};
+		unsafe {
+			query(f.physical(), &mut output);
+		}
+		assert_eq!(maintenance.swapchain_maintenance1, vk::TRUE);
+		assert_eq!(f.0.calls.load(Ordering::Relaxed), 1);
+	}
+
+	#[test]
+	fn properties2_aliases_respect_actual_enablement_in_active_and_degraded_instances() {
+		use crate::state::RwLockExt;
+		for status in [LayerStatus::Active, LayerStatus::Degraded] {
+			let active = matches!(status, LayerStatus::Active);
+			for enabled in [false, true] {
+				let f = Fixture::new(true, true, true);
+				let instance = VkInstance::from_raw(f.physical().as_raw());
+				{
+					let mut instances = crate::state::INSTANCE_MAP.get().unwrap().force_write();
+					let data = instances.get_mut(&InstanceKey(f.0.dispatch_key)).unwrap();
+					data.status = status;
+					if enabled {
+						data.app_extensions
+							.push(c"VK_KHR_get_physical_device_properties2".to_owned());
+						data.downstream_extensions
+							.push(c"VK_KHR_get_physical_device_properties2".to_owned());
+					}
+				}
+				for name in [c"vkGetPhysicalDeviceProperties2KHR", c"vkGetPhysicalDeviceFeatures2KHR"] {
+					let alias = unsafe { crate::moonshine_vk_get_instance_proc_addr(instance, name.as_ptr()) };
+					assert_eq!(alias.is_some(), enabled, "active={active}, {name:?}, enabled={enabled}");
+				}
+			}
+		}
 	}
 
 	#[test]
