@@ -11,6 +11,10 @@ use crate::session::stream::control::{
 	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
 };
 
+const SONY_VENDOR: u16 = 0x054c;
+const DUALSENSE_PRODUCT: u16 = 0x0ce6;
+const DUALSENSE_EDGE_PRODUCT: u16 = 0x0df2;
+
 /// Configuration for the hold-to-Home gamepad button remap.
 ///
 /// When enabled, holding the Back/Select button for `hold_ms` emits the
@@ -120,14 +124,17 @@ enum GamepadCapability {
 
 	// Can set RGB LED state.
 	_RgbLed = 0x80,
+
+	/// LI_CCAP_DUALSENSE_EDGE; subtype, never a new controller family.
+	DualSenseEdge = 0x200,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct GamepadInfo {
 	pub index: u8,
 	kind: GamepadKind,
 	capabilities: u16,
-	_supported_buttons: u32,
+	supported_buttons: u32,
 }
 
 impl GamepadInfo {
@@ -154,8 +161,20 @@ impl GamepadInfo {
 				GamepadKind::Unknown
 			}),
 			capabilities: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
-			_supported_buttons: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
+			supported_buttons: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 		})
+	}
+
+	fn is_dualsense_edge(&self) -> bool {
+		self.kind == GamepadKind::PlayStation && self.has_capability(&GamepadCapability::DualSenseEdge)
+	}
+
+	fn playstation_product(&self) -> u16 {
+		if self.is_dualsense_edge() {
+			DUALSENSE_EDGE_PRODUCT
+		} else {
+			DUALSENSE_PRODUCT
+		}
 	}
 
 	pub fn default_for_index(index: u8) -> Self {
@@ -163,11 +182,10 @@ impl GamepadInfo {
 			index,
 			kind: GamepadKind::Unknown,
 			capabilities: 0,
-			_supported_buttons: 0,
+			supported_buttons: 0,
 		}
 	}
 
-	#[allow(dead_code)]
 	fn has_capability(&self, capability: &GamepadCapability) -> bool {
 		(self.capabilities & *capability as u16) != 0
 	}
@@ -382,8 +400,11 @@ impl Gamepad {
 		policy: GamepadEmulation,
 	) -> Result<Self, ()> {
 		let kind = policy.target(info.kind);
-		tracing::debug!(index = info.index, incoming = ?info.kind, ?policy, virtual_kind = ?kind, "Creating virtual controller");
-		let id = format!("00:11:22:33:{:02x}", info.index);
+		tracing::debug!(index = info.index, incoming = ?info.kind, ?policy, virtual_kind = ?kind,
+			edge = info.is_dualsense_edge(), supported_buttons = format_args!("{:#010x}", info.supported_buttons),
+			capabilities = format_args!("{:#06x}", info.capabilities),
+			"Creating virtual controller");
+		let id = format!("00:11:22:33:44:{:02x}", info.index);
 		let definition = match kind {
 			GamepadKind::Unknown | GamepadKind::Steam | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
@@ -394,9 +415,13 @@ impl Gamepad {
 				id.as_str(),
 			),
 			GamepadKind::PlayStation => DeviceDefinition::new(
-				"Moonshine PS5 controller",
-				0x054C,
-				0x0CE6,
+				if info.is_dualsense_edge() {
+					"Moonshine DualSense Edge controller"
+				} else {
+					"Moonshine PS5 controller"
+				},
+				SONY_VENDOR,
+				info.playstation_product(),
 				0x8111,
 				id.as_str(),
 				id.as_str(),
@@ -410,6 +435,14 @@ impl Gamepad {
 				id.as_str(),
 			),
 		};
+
+		if kind == GamepadKind::PlayStation {
+			tracing::debug!(
+				vendor = format_args!("{SONY_VENDOR:#06x}"),
+				product = format_args!("{:#06x}", info.playstation_product()),
+				"Selected virtual PlayStation identity"
+			);
+		}
 
 		let mut gamepad = match kind {
 			GamepadKind::Unknown | GamepadKind::Steam | GamepadKind::Xbox => Joypad::XboxOne(
@@ -601,6 +634,65 @@ mod compatibility_tests {
 		assert_eq!(GamepadEmulation::Auto.target(GamepadKind::Steam), GamepadKind::Xbox);
 		assert_eq!(GamepadEmulation::Auto.target(GamepadKind::Unknown), GamepadKind::Xbox);
 	}
+	#[test]
+	fn edge_identity_requires_playstation_and_explicit_capability() {
+		for kind in [0, 1, 2, 3, 4, 255] {
+			for caps in [0u16, 0xff, 0x100, 0x200, 0xffff] {
+				let mut arrival = [0u8; 8];
+				arrival[1] = kind;
+				arrival[2..4].copy_from_slice(&caps.to_le_bytes());
+				arrival[4..8].copy_from_slice(&0x000f0000u32.to_le_bytes());
+				let info = GamepadInfo::from_bytes(&arrival).unwrap();
+				let edge = kind == 2 && caps & 0x200 != 0;
+				assert_eq!(info.is_dualsense_edge(), edge);
+				assert_eq!(info.playstation_product(), if edge { 0x0df2 } else { 0x0ce6 });
+				assert_eq!(
+					GamepadEmulation::Playstation.target(info.kind),
+					GamepadKind::PlayStation
+				);
+			}
+		}
+		assert!(!GamepadInfo::default_for_index(0).is_dualsense_edge());
+	}
+
+	#[test]
+	fn extended_buttons_round_trip_press_release_and_ordinary_buttons() {
+		for flags in [0u32, 0x10000, 0x20000, 0x40000, 0x80000, 0x3f0000, 0x3ff3ff, 0] {
+			let mut packet = [0u8; 26];
+			packet[8..10].copy_from_slice(&(flags as u16).to_le_bytes());
+			packet[22..24].copy_from_slice(&((flags >> 16) as u16).to_le_bytes());
+			assert_eq!(GamepadUpdate::from_bytes(&packet).unwrap().button_flags(), flags);
+		}
+		assert!(GamepadUpdate::from_bytes(&[0; 25]).is_err());
+	}
+
+	#[test]
+	fn edge_buttons_survive_home_remap_and_timer_without_stuck_release() {
+		use super::super::remap::{BACK_FLAG, HoldToHome, SPECIAL_FLAG};
+		use std::time::{Duration, Instant};
+		let now = Instant::now();
+		for paddle in [0x10000, 0x20000, 0x40000, 0x80000] {
+			let mut config = GamepadConfig::default();
+			let mut remap = HoldToHome::new(&config);
+			assert_eq!(remap.apply(paddle | 0x1000, now).0, paddle | 0x1000);
+			assert_eq!(remap.apply(0, now).0, 0);
+			config.home_button.hold_ms = 500;
+			config.home_button.suppress_home = true;
+			let mut remap = HoldToHome::new(&config);
+			assert_eq!(remap.apply(paddle | 0x1000 | BACK_FLAG, now).0, paddle | 0x1000);
+			let deadline = now + Duration::from_millis(500);
+			assert_eq!(remap.advance(deadline).0, paddle | 0x1000 | SPECIAL_FLAG);
+			assert_eq!(remap.apply(0, deadline).0, 0);
+			assert!(remap.next_deadline().is_none());
+			// A release while the Home timer is pending must not reassert a paddle.
+			let mut remap = HoldToHome::new(&config);
+			remap.apply(paddle | BACK_FLAG, now);
+			remap.apply(BACK_FLAG, now + Duration::from_millis(100));
+			assert_eq!(remap.advance(deadline).0, SPECIAL_FLAG);
+			assert_eq!(remap.apply(0, deadline).0, 0);
+		}
+	}
+
 	#[test]
 	fn configuration_defaults_and_invalid_policies() {
 		let config: GamepadConfig = toml::from_str("").unwrap();

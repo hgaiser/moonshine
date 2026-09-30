@@ -3,7 +3,7 @@ members = [".", "moonshine-core", "moonshine-tools", "moonshine-wsi"]
 resolver = "2"
 
 [workspace.package]
-version = "0.16.7"
+version = "0.16.8"
 
 [package]
 name = "moonshine"
@@ -18,3 +18,7 @@ tokio = { version = "1.52.3", features = ["rt-multi-thread", "signal", "sync", "
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 zbus = "5.18.0"
+
+# Keep the upstream Rust API; patch only its native backend at the locked revision.
+[patch."https://github.com/games-on-whales/inputtino"]
+inputtino-sys = { path = "vendor/inputtino/bindings/rust/inputtino-sys" }

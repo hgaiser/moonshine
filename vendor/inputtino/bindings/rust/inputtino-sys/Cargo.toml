@@ -1,0 +1,12 @@
+[package]
+name = "inputtino-sys"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+homepage = "https://github.com/games-on-whales/inputtino"
+authors = ["ABeltramo"]
+description = "Rust bindings for inputtino"
+
+[build-dependencies]
+bindgen = "0.69.4"
+cmake = "0.1.52"

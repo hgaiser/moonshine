@@ -34,27 +34,8 @@ let
       ../moonshine-wsi
       ../assets
       ../dist
+      ../vendor
     ];
-  };
-
-  # inputtino-sys's build.rs compiles the C++ libinputtino with cmake from
-  # `../../../` — the root of the inputtino git repo, of which the vendored
-  # crate is only the bindings/rust/inputtino-sys subdirectory. Plain cargo
-  # keeps full git checkouts so that works everywhere else, but nix vendoring
-  # extracts just the crate, so the path escapes the vendor tree and cmake
-  # finds no CMakeLists.txt. Graft the full repo into the vendored crate (see
-  # postPatch) and aim build.rs at it. The rev is parsed out of Cargo.lock so
-  # dependency bumps upstream are picked up without touching the nix code.
-  inputtinoLockEntry =
-    lib.findFirst (p: p.name == "inputtino-sys")
-      (throw "inputtino-sys not found in Cargo.lock; drop the graft in nix/package.nix")
-      (lib.importTOML ../Cargo.lock).package;
-  # e.g. "git+https://github.com/games-on-whales/inputtino#<rev>"
-  inputtinoMatch = builtins.match "git\\+([^?#]+)(\\?[^#]*)?#(.+)" inputtinoLockEntry.source;
-  inputtinoRepo = builtins.fetchGit {
-    url = builtins.elemAt inputtinoMatch 0;
-    rev = builtins.elemAt inputtinoMatch 2;
-    allRefs = true;
   };
 in
 rustPlatform.buildRustPackage {
@@ -79,17 +60,9 @@ rustPlatform.buildRustPackage {
     };
   };
 
-  # The inputtino graft described above. The cargo setup hook has already
-  # copied the vendor dir into the build tree as $cargoDepsCopy (writable,
-  # symlinks dereferenced); this attr runs before the hook that unsets it.
-  # The crate's .cargo-checksum.json lists no files, so cargo accepts the
-  # edits. While in there, also drop the unconditional `-lc++` (LLVM libc++)
-  # link — redundant next to `-lstdc++` and absent from a gcc stdenv.
+  # The local inputtino-sys patch includes its native C++ source tree.
   postPatch = ''
-    sysdir=$(echo "$cargoDepsCopy"/inputtino-sys-*)
-    cp -r ${inputtinoRepo} "$sysdir/inputtino-repo"
-    substituteInPlace "$sysdir/build.rs" \
-      --replace-fail '"../../../"' '"inputtino-repo"' \
+    substituteInPlace vendor/inputtino/bindings/rust/inputtino-sys/build.rs \
       --replace-fail 'println!("cargo:rustc-link-lib=c++");' ""
   '';
 

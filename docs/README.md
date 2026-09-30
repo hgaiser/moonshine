@@ -6,6 +6,7 @@ Start with the [project README](../README.md) for requirements and a quick start
 
 - [Installation and upgrades](INSTALLATION.md): native packages, portable builds, headless setup, and service diagnostics.
 - [Configuration reference](CONFIGURATION.md): every supported `config.toml` setting, defaults, and examples.
+- [DualSense Edge](DUALSENSE_EDGE.md): native controller mapping, dependency patch, and Steam acceptance checks.
 - [Tips and troubleshooting](TIPS.md): Steam, Flatpak, Gamescope, desktop sessions, and application logs.
 - [NixOS](NIXOS.md): flake package, service module, and development shell.
 - [Changelog](CHANGELOG.md): Pyroshine fork releases and upcoming changes.

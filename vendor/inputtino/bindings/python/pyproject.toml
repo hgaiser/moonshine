@@ -1,0 +1,178 @@
+[project]
+name = "inputtino-python"
+version = "0.1.0"
+description = "Python bindings for the inputtino library, providing virtual input device control for Linux."
+license-files = ["LICENSE"]
+readme = "README.md"
+authors = [
+    { name = "Geson-anko", email = "59220704+Geson-anko@users.noreply.github.com" }
+]
+requires-python = ">=3.10"
+dependencies = [
+    "typing-extensions>=4.12.2",
+]
+
+keywords = [
+  "control",
+  "gui",
+  "automation",
+  "keyboard",
+  "mouse",
+  "joypad",
+  "pentablet",
+  "touchscreen",
+  "linux",
+  "uinput",
+  "trackpad",
+]
+
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: POSIX :: Linux",
+  "Environment :: X11 Applications",
+  "Natural Language :: English",
+  "Natural Language :: Japanese",
+  "Intended Audience :: Developers",
+  "Typing :: Typed",
+  "Programming Language :: C++",
+  "Programming Language :: Python",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Repository = "https://github.com/games-on-whales/inputtino"
+Issues = "https://github.com/games-on-whales/inputtino/issues"
+
+[tool.uv]
+python-preference = "only-managed"
+
+[tool.scikit-build]
+wheel.packages = ["src/inputtino"]
+minimum-version = "build-system.requires"
+build-dir = "build/{wheel_tag}"
+
+[build-system]
+requires = ["scikit-build-core>=0.10", "pybind11"]
+build-backend = "scikit_build_core.build"
+
+[dependency-groups]
+dev = [
+    "docformatter>=1.7.5",
+    "pybind11>=2.13.6",
+    "pybind11-stubgen>=2.5.1",
+    "pyright>=1.1.393",
+    "pytest>=8.3.4",
+    "pytest-cov>=6.0.0",
+    "pyupgrade>=3.19.1",
+    "ruff>=0.9.5",
+]
+
+[tool.pyright]
+pythonVersion = "3.10"
+exclude = [
+  "**/node_modules",
+  "**/__pycache__",
+]
+strict = ["./src/"]
+reportMissingModuleSource = "none"
+
+[tool.pytest.ini_options]
+addopts = [
+  "--color=yes",
+  "--durations=0",
+  "--strict-markers",
+  "--doctest-modules",
+]
+filterwarnings = [
+  "ignore::DeprecationWarning",
+  "ignore::UserWarning",
+]
+log_cli = "True"
+
+minversion = "6.0"
+testpaths = "tests/"
+
+markers = [
+    "practical: tests that interact with actual endpoints",
+]
+
+
+[tool.ruff]
+
+# Same as Black.
+line-length = 88
+indent-width = 4
+
+# Assume Python 3.10
+target-version = "py310"
+
+include = ["*.py"]
+
+# Exclude a variety of commonly ignored directories.
+exclude = [
+    ".git",
+    ".ipynb_checkpoints",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".venv",
+    ".vscode",
+    "build",
+    "dist",
+    "node_modules",
+    ".venv",
+]
+
+# Linter ignore codes
+[tool.ruff.lint]
+
+select = [
+  "E",
+  "F",
+  "W",
+  "I",
+]
+
+ignore = [
+  "E203", # Whitespace before ':' (E203)
+  "E402", # Module level import not at top of file.
+  "E501", # Line too long (82 &gt; 79 characters) (E501)
+  "F811", # Redefinition of unused name from line n (F811)
+  "E741", # Do not define classes named 'I', 'O', or 'l' (E742)
+  "E266", # too many leading '#' for block comment (E266)
+  "F401", # Module imported but unused,
+]
+
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.ruff.format]
+# Like Black, use double quotes for strings.
+quote-style = "double"
+
+# Like Black, indent with spaces, rather than tabs.
+indent-style = "space"
+
+# Like Black, respect magic trailing commas.
+skip-magic-trailing-comma = false
+
+# Like Black, automatically detect the appropriate line ending.
+line-ending = "auto"
+
+[tool.coverage.run]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if __name__ == __main__:",
+    "pass",
+    "raise ImportError",
+]

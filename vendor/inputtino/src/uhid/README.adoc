@@ -1,0 +1,63 @@
+== What's this?
+
+Here we implement virtual devices using the low level https://dri.freedesktop.org/docs/drm/hid/uhid.html[uhid]
+
+== Why can't we use udev?
+
+To answer this question we need to dive deeper into how the DualSense controller works, bear with me..
+
+The PS4 and PS5 controllers also include a Gyroscope, Accelerometer and a Touchpad.
+The DualSense controller also includes a microphone and a speaker.
+The open source driver `hid-playstation` exposes these features as 3 separate input devices:
+
+----
+/dev/input/event20:	Sony Interactive Entertainment Wireless Controller
+/dev/input/event21:	Sony Interactive Entertainment Wireless Controller Motion Sensors
+/dev/input/event22:	Sony Interactive Entertainment Wireless Controller Touchpad
+----
+
+Ideally we should be able to use udev to create these devices independently, unfortunately the issue is in linking these 3 devices together.
+
+=== How SDL2 links these 3 devices into a single joypad?
+
+First off, SDL2 assumes that every `/dev/input/event*` device might be a joypad, so it opens them all to check if they are based on some heuristics.
+Normally, the motion sensor device that you create with udev will be opened by SDL2 and it will be recognized as a joypad.
+To get around this you can hardcode the device name to end with one of the https://github.com/libsdl-org/SDL/blob/d4f4aa745a9d9c280d5016322a2473c9d2e077a0/src/joystick/SDL_gamepad.c#L2575-L2589[SDL_ShouldIgnoreGamepad] hardcoded strings.
+This will get around the first hurdle and actually recognize the udev created motion sensor as an actual sensor.
+
+The main issue seems to be in linking these 3 devices together: the way SDL2 does this is to match the `uniq` identifier (`EVIOCGUNIQ` https://github.com/libsdl-org/SDL/blob/4189edaeb7ce4da9ab420b98904fa22196fb3dca/src/joystick/linux/SDL_sysjoystick.c#L1508[in this method]) between what is recognised as sensor and what is recognised as joypad.
+Unfortunately, there's no way to set the `uniq` for an uinput device; there's https://lore.kernel.org/linux-bluetooth/20191201145357.ybq5gfty4ulnfasq@pali/t/#u[a proposal] to add this to the Linux kernel but as of March 2024 this has still not being merged.
+So what happens in practice is that SDL ends up discarding that sensor and just using the joypad instead.
+
+== How UHID solves this?
+
+UHID allows us to completely replicate the DualSense controller at a lower level.
+The device that we'll create via UHID will be picked up by `hid-playstation` just like a USB connected DualSense controller would be, which in turn will create the `/dev/input/event` devices and downstream applications will see the 3 devices as they should be.
+
+== What are the requirements to use UHID?
+
+You need additional permission in order to access `/dev/uhid` (normally exposed as `root` only). +
+
+First we'll add our user to the `input` group:
+
+----
+sudo usermod -a -G input $USER
+----
+
+Then we add an udev rule to allow access to `/dev/uhid`:
+
+----
+echo 'KERNEL=="uhid", GROUP="input", MODE="0660"' | sudo tee /etc/udev/rules.d/99-uhid.rules
+----
+
+Finally, we have to make sure that the `uhid` kernel module is loaded at boot:
+
+----
+echo "uhid" | sudo tee /etc/modules-load.d/uhid.conf
+----
+
+=== Useful resources (?)
+
+- https://github.com/nondebug/dualsense
+- https://github.com/torvalds/linux/blob/master/drivers/hid/hid-playstation.c
+- https://gitlab.freedesktop.org/libevdev/hid-tools/

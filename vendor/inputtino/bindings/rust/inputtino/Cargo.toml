@@ -1,0 +1,18 @@
+[package]
+name = "inputtino"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+homepage = "https://github.com/games-on-whales/inputtino"
+authors = ["ABeltramo"]
+description = "Safe wrapper around Rust bindings for inputtino"
+
+[dev-dependencies]
+input = "0.9.0"
+rustix = { version = "0.38.18", features = ["fs"] }
+approx = "0.5.1"
+sdl2 = "0.37.0"
+serial_test = "3.1.1"
+
+[dependencies]
+inputtino-sys = { version = "0.1.0", path = "../inputtino-sys" }

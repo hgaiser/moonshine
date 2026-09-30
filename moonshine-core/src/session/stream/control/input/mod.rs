@@ -282,6 +282,8 @@ impl InputHandler {
 
 /// Per-gamepad slot holding the inputtino wrapper, remap state, and rumble tracking.
 struct GamepadSlot {
+	/// Arrival metadata, used to recreate a slot when the native subtype changes.
+	info: GamepadInfo,
 	/// The underlying inputtino joypad.
 	gamepad: Gamepad,
 
@@ -318,6 +320,7 @@ impl GamepadSlot {
 	) -> Result<Self, ()> {
 		let gamepad = Gamepad::new(info, feedback_tx.clone(), config.emulation).await?;
 		Ok(Self {
+			info: *info,
 			gamepad,
 			remap: HoldToHome::new(config),
 			feedback_tx,
@@ -423,8 +426,14 @@ async fn run_gamepad_handler(
 				}
 
 				let needs_create = {
-					let gamepads = gamepads.lock().await;
-					gamepads[idx].is_none()
+					let mut gamepads = gamepads.lock().await;
+					let changed = gamepads[idx].as_ref().is_none_or(|slot| slot.info != gamepad);
+					if changed {
+						// Destroy the old UHID device before reusing its MAC. This also handles
+						// late arrivals after compatibility creation and single-controller hotplug.
+						gamepads[idx] = None;
+					}
+					changed
 				};
 
 				if needs_create
