@@ -11,6 +11,16 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  changelog:
+    name: Changelog
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test changelog tooling
+        run: python3 -m unittest discover -s scripts -p 'test_changelog.py'
+      - name: Check workspace release notes
+        run: python3 scripts/changelog.py check
+
   ci:
     name: ${{ matrix.name }}
     # Pin to ubuntu-24.04 (glibc 2.39) so CI validates the same baseline the

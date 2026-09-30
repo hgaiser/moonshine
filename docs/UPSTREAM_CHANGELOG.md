@@ -1,11 +1,13 @@
-# Changelog
+# Upstream Moonshine changelog
 
-All notable changes to this project will be documented in this file.
+Historical release notes inherited from Moonshine through v0.16.1. These entries
+refer to upstream versions, behavior, issue numbers, and contributors, rather
+than releases of the Pyroshine fork. Dates have been normalized to YYYY-MM-DD;
+the original release notes and attribution are preserved.
 
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+For Pyroshine releases, see the [fork changelog](CHANGELOG.md).
 
-## [v0.16.1] - 13-09-2026
+## [v0.16.1] - 2026-09-13
 
 ### Added
 
@@ -21,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Fall back to an XCB surface when the Vulkan WSI bypass is unsafe.
 - Fix a crash related to color converter caching.
 
-## [v0.16.0] - 11-09-2026
+## [v0.16.0] - 2026-09-11
 
 ### Added
 
@@ -57,8 +59,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Prefer Heroic's cached cover art over its shortcut icons, so GOG games no longer show a small square store logo as their box art. (#169, @scottjab)
 - Warn when the Heroic store cache cannot be read. (#169, @scottjab)
 
-
-## [v0.15.0] - 05-08-2026
+## [v0.15.0] - 2026-08-05
 
 ### Added
 
@@ -84,7 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preserve SteamOS configuration across updates. (#153, @tdejager)
 - NixOS module installs the moonshine-wsi Vulkan layer into the driver path (`/run/opengl-driver`) instead of leaving it in a store path the Vulkan loader never scans. Games were falling back to XWayland rendering and the healthcheck reported the layer as missing. (#162, @scottjab)
 
-## [v0.14.5] - 30-07-2026
+## [v0.14.5] - 2026-07-30
 
 ### Changed
 
@@ -94,7 +95,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - WSI layer detection in healthcheck now queries the Vulkan loader directly instead of checking hardcoded file paths, making it work regardless of where the layer files are installed.
 
-## [v0.14.4] - 30-07-2026
+## [v0.14.4] - 2026-07-30
 
 ### Fixed
 
@@ -104,19 +105,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Assume default config path in all moonshine commands (`$HOME/.config/moonshine/config.toml`).
 
-## [v0.14.3] - 30-07-2026
+## [v0.14.3] - 2026-07-30
 
 ### Fixed
 
 - Add missing install script.
 
-## [v0.14.2] - 30-07-2026
+## [v0.14.2] - 2026-07-30
 
 ### Added
 
 - Build and release systemd-sysext extension for distributing Moonshine as a portable system extension.
 
-## [v0.14.1] - 28-07-2026
+## [v0.14.1] - 2026-07-28
 
 ### Added
 
@@ -131,7 +132,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Drop nonexistent `security.polkit.extraPolicies` from NixOS module that caused evaluation failures (#141, @scottjab).
 - Include polkit and sysusers rule files in the binary release package.
 
-## [v0.14.0] - 27-07-2026
+## [v0.14.0] - 2026-07-27
 
 ### Added
 
@@ -144,37 +145,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Log errors when failing to open the pairing PIN URL.
 
-## [v0.13.5] - 23-07-2026
+## [v0.13.5] - 2026-07-23
 
 ### Changed
 
 - Remove unnecessary linking to libunwind.so.1.
 
-## [v0.13.4] - 23-07-2026
+## [v0.13.4] - 2026-07-23
 
 ### Fixed
 
 - Fix duplication in nfpm.yaml.
 
-## [v0.13.3] - 23-07-2026
+## [v0.13.3] - 2026-07-23
 
 ### Fixed
 
 - Fix export of VERSION environment variable.
 
-## [v0.13.2] - 23-07-2026
+## [v0.13.2] - 2026-07-23
 
 ### Added
 
 - Add missing nfpm.yaml file.
 
-## [v0.13.1] - 23-07-2026
+## [v0.13.1] - 2026-07-23
 
 ### Added
 
 - Manual trigger for release action workflow.
 
-## [v0.13.0] - 23-07-2026
+## [v0.13.0] - 2026-07-23
 
 ### Added
 
@@ -193,7 +194,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Subscribe to systemd signals before waiting on job/unit events to prevent launch/stop timeouts on headless, linger-only hosts (#124, @scottjab).
 - Fall back to PulseAudio when PipeWire is available to fix audio compatibility.
 
-## [v0.12.0] - 20-07-2026
+## [v0.12.0] - 2026-07-20
 
 ### Added
 
@@ -503,7 +504,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replaced CUDA from ffmpeg binding with [cudarc](https://github.com/coreylowman/cudarc).
 - Replaced [cpal](https://github.com/RustAudio/cpal/) with [libpulse_binding](https://github.com/jnqnfe/pulse-binding-rust). Because of this change, Moonshine will automatically pick up the right pulseaudio monitor for capturing desktop audio.
 - Replaced custom Reed Solomon encoding with [reed-solomon-erasure](https://github.com/rust-rse/reed-solomon-erasure).
-
 
 ## [v0.1.0] - 2024-01-25
 

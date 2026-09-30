@@ -1,13 +1,13 @@
 # Pyroshine on NixOS
 
-This directory contains a [Nix flake](https://wiki.nixos.org/wiki/Flakes) that
+This repository contains a [Nix flake](https://wiki.nixos.org/wiki/Flakes) that
 builds Pyroshine and provides a NixOS module for running it as a service. The
 package, executable, and module retain the upstream `moonshine` names.
 
 ## What you get
 
 - **A package**: the `moonshine` binary, the moonshine-wsi Vulkan layer, and the udev rules, built from this repository.
-- **A NixOS module**: a `services.moonshine` service that takes care of everything from the [installation steps](../README.md#installation): lingering, kernel modules, device permissions, and the systemd service.
+- **A NixOS module**: a `services.moonshine` service that takes care of lingering, kernel modules, device permissions, and the systemd service described in the [installation guide](INSTALLATION.md).
 - **A dev shell**: the full build environment for working on Pyroshine.
 
 ## Building
@@ -42,12 +42,14 @@ Then import the module and enable the service in your configuration:
     uid = 1000;
 
     # Opens the GameStream ports. Only do this on a LAN or VPN-facing
-    # firewall. See Security in the main README.
+    # firewall. See the network guidance in docs/INSTALLATION.md.
     openFirewall = true;
 
-    # Everything from the Configuration section of the main README goes
+    # Settings from docs/CONFIGURATION.md go
     # here, written as nix instead of TOML.
     settings = {
+      # Disable the default scanner, whose command points at /usr/bin/steam.
+      application_scanner = [];
       application = [
         {
           title = "Steam";
@@ -87,4 +89,8 @@ The shell contains the full build environment, plus `clippy` and `rustfmt` as us
 
 ## Maintenance
 
-There is nothing here to keep up to date when dependencies change: the nix build derives everything from `Cargo.lock`. The one exception is a pinned hash for `ash` in [package.nix](package.nix). See the comment there.
+The Rust dependency set comes from `Cargo.lock`. When updating dependencies,
+also check Git dependency hashes in [package.nix](../nix/package.nix) and the
+separate PyroWave pins in [pyrowave.nix](../nix/pyrowave.nix). See the
+[PyroWave dependency guide](PYROWAVE.md#pinned-dependency) for the matching
+build-script and runtime API requirements.

@@ -2,7 +2,7 @@
 
 Practical recipes for getting the most out of Pyroshine.
 Each tip shows a real-world use of `pre_command` / `post_command` (or other configuration) to solve a common problem.
-See the [Configuration](../README.md#configuration) section of the README for the full schema of these fields.
+See the [configuration reference](CONFIGURATION.md) for the full schema of these fields.
 
 ## Table of Contents
 
@@ -42,8 +42,9 @@ Note that this closes your desktop Steam session when a stream starts.
 
 ### How to
 
-Make sure your user is in the `pyroshine` group: `sudo usermod -aG pyroshine $USER`.
-Pyroshine then blocks sleep automatically for the duration of every stream — nothing else is required.
+The packaged service grants the `pyroshine` group and blocks sleep automatically
+for the duration of every stream. If you launch the binary directly, join the
+group with `sudo usermod -aG pyroshine "$USER"`, then log out and back in.
 If you want to disable this, set `inhibit_sleep = false` at the top of your configuration:
 
 ```toml
@@ -56,7 +57,10 @@ inhibit_sleep = false
 Pyroshine asks logind (over D-Bus) to inhibit sleep when a session starts and releases it when the session ends.
 This is the same thing `systemd-inhibit` does, but handled by Pyroshine itself, so you do not have to wrap each application's `command` with it.
 It requires the polkit rule shipped with Pyroshine (`/usr/share/polkit-1/rules.d/50-pyroshine-inhibit-sleep.rules`) and membership in the `pyroshine` group it is scoped to.
-When installed from a package, both are set up for you (via the sysusers.d drop-in and the package's post-install step); if you installed Pyroshine manually, create the group with `sudo groupadd --system pyroshine` and copy that polkit rule file into place yourself.
+The package creates the group via its sysusers.d drop-in, and the packaged
+service grants it through `SupplementaryGroups=pyroshine`. Manual installations
+must also install the policy and create the group; follow the
+[manual installation guide](../CONTRIBUTING.md#manual-installation-and-upgrade).
 If the user is not in the `pyroshine` group (and has no active session), Pyroshine logs a warning and streaming still works, but the host may suspend mid-stream.
 
 ## Run games in high-performance mode

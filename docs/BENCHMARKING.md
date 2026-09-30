@@ -1,10 +1,11 @@
-# moonshine-tools
+# Benchmarking Pyroshine
 
-Utilities for testing and benchmarking Moonshine.
+The `moonshine-tools` crate provides utilities for testing and benchmarking
+Pyroshine. The crate and binary names retain their upstream spelling.
 
 ## moonshine-bench
 
-Benchmarks Moonshine's video encoding pipeline by spawning an application inside a headless compositor, running the full encode path, and collecting per-frame timing statistics.
+Benchmarks Pyroshine's video encoding pipeline by spawning an application inside a headless compositor, running the full encode path, and collecting per-frame timing statistics.
 
 ### Building
 
@@ -13,6 +14,9 @@ cargo build -p moonshine-tools --release
 ```
 
 The binary will be at `target/release/moonshine-bench`.
+See the [contributor guide](../CONTRIBUTING.md#manually-building-the-app) for
+build dependencies and the pinned PyroWave library. Streaming benchmarks also
+need the installed Vulkan layer and device rules.
 
 ### Usage
 
@@ -27,16 +31,27 @@ moonshine-bench [OPTIONS] <COMMAND>
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--matrix` | off | Run the built-in 4K, 1440p, and 1080p matrix across 60/120/360 FPS and `hevc`, `h264`, and `av1` |
+| `--pyrowave-matrix` | off | Run the PyroWave 1080p/1440p/4K matrix across 60/120/144 FPS |
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
 | `--fps <N>` | `60` | Target frame rate |
 | `--bitrate <N>` | `20000000` | Target bitrate in bits per second |
-| `--codec <codec>` | `h264` | Video codec: `h264`, `hevc`, or `av1` |
+| `--codec <codec>` | `h264` | Video codec: `h264`, `hevc`, `av1`, or `pyrowave` |
+| `--chroma <mode>` | `420` | Chroma sampling: `420` or `444`, subject to codec support |
+| `--bit-depth <N>` | `8` (SDR), `10` (HDR) | Select `8` or `10` bits; incompatible formats are rejected |
+| `--full-range` | off | Use full-range YCbCr; PyroWave always uses full range |
 | `--duration <N>` | `0` | Seconds to run before stopping (`0` = run until Ctrl+C) |
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
 
 ### Examples
+
+Run a PyroWave benchmark with the locally built backend:
+
+```sh
+MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.0 \
+  target/release/moonshine-bench --codec pyrowave --chroma 444 --duration 30 /usr/bin/vkcube
+```
 
 Run a quick H.264 benchmark at 1080p60 for 30 seconds:
 

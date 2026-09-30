@@ -3,5 +3,3 @@ __pycache__/
 /result
 /analysis_*
 *.bak
-docs/reconnect-validation.md
-docs/COMPOSITOR.md

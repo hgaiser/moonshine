@@ -2,202 +2,81 @@
 
 # Pyroshine
 
-Pyroshine is a maintained Linux game-streaming server based on
-[Moonshine](https://github.com/hgaiser/moonshine). It preserves Moonshine's
-isolated, headless streaming architecture and conventional H.264, HEVC, and AV1
-support while adding native PyroWave streaming.
-
-Pyroshine speaks the Moonlight/GameStream protocol. Standard Moonlight clients
-can use its conventional codecs; PyroWave requires
-[Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave) or
-another client implementing the same versioned extension.
-
-## Why this fork exists
-
-Moonshine provides a compact Rust host with a per-stream compositor. Pyroshine
-maintains the additional codec negotiation, zero-copy PyroWave encode path,
-transport handling, packaging, and diagnostics needed for this project's use
-cases. It is an independent community fork, not an official Moonshine or
-Moonlight release.
-
-Release packages install the public command and service as `pyroshine`. Internal
-crate, configuration, state, environment-variable, and Vulkan protocol names
-remain aligned with upstream Moonshine so upstream changes can be merged with
-minimal conflict.
-
-## Features
+Pyroshine is a Linux game-streaming server based on
+[Moonshine](https://github.com/hgaiser/moonshine). It runs applications in isolated,
+headless sessions and streams them to Moonlight-compatible clients.
 
 - Native PyroWave 4:2:0 and 4:4:4 streaming in SDR and HDR10.
-- Hardware Vulkan encode with DMA-BUF import and no CPU pixel conversion.
-- H.264, HEVC, and AV1 through Moonshine's existing Vulkan Video pipeline.
-- Isolated headless sessions that do not take over the host desktop.
-- Low-latency stale-frame handling, multi-block FEC, encryption, and UDP GSO.
-- Mouse, keyboard, touch, pen, controller, motion, haptics, and surround audio.
-- Focused health checks and `moonshine-bench` latency/throughput reporting.
+- H.264, HEVC, and AV1 through Vulkan Video.
+- Hardware encoding with DMA-BUF import, low-latency transport, and forward error correction.
+- Keyboard, mouse, touch, pen, controller, haptics, and surround audio support.
+
+Use [Moonlight Qt PyroWave](https://github.com/karsyboy/moonlight-qt-pyrowave)
+for PyroWave streaming. Standard Moonlight clients can use the conventional codecs.
 
 ## Requirements
 
-- Linux with systemd and a working Wayland/Vulkan stack.
-- A GPU and driver supported by Moonshine/Pixelforge for conventional hardware
-  encoding.
-- For PyroWave: a hardware Vulkan GPU with the required compute, timeline
-  semaphore, external-memory, and DMA-BUF interoperability features. Software
-  Vulkan devices are intentionally rejected.
-- A Moonlight-compatible client. Use Moonlight Qt PyroWave for the PyroWave
-  codec; upstream Moonlight clients remain usable with conventional codecs.
+A Linux host with systemd, a working Wayland/Vulkan stack, and a supported GPU
+and driver. PyroWave requires hardware Vulkan with compute, timeline semaphore,
+external-memory, and DMA-BUF support; software Vulkan devices are rejected.
+Run `pyroshine healthcheck` after installation to check your host.
 
-Run `pyroshine healthcheck` after installation to see the exact capabilities
-available on the selected GPU.
+## Quick start
 
-## Installation
+Download a package from the [releases page](https://github.com/karsyboy/pyroshine/releases)
+and install it with your distribution's package manager:
 
-Tagged builds are published on the
-[Pyroshine releases page](https://github.com/karsyboy/pyroshine/releases) as
-Debian, RPM, and Arch packages plus a portable x86_64 archive.
+| Distribution | Install or upgrade |
+| --- | --- |
+| Arch Linux / CachyOS | `sudo pacman -U ./pyroshine-*.pkg.tar.zst` |
+| Debian / Ubuntu | `sudo apt install ./pyroshine_*.deb` |
+| Fedora / RHEL | `sudo dnf install ./pyroshine-*.rpm` |
 
-### Arch Linux or CachyOS
-
-Download the `.pkg.tar.zst` asset from the latest release, then install or
-upgrade it with pacman:
+Then start Pyroshine for your user:
 
 ```sh
-sudo pacman -U ./pyroshine-*.pkg.tar.zst
-sudo systemctl enable --now pyroshine@$USER
+sudo systemctl enable --now "pyroshine@$USER"
 ```
 
-### Debian or Ubuntu
+For SteamOS or a portable installation, see the [installation guide](docs/INSTALLATION.md).
+NixOS users should use the [NixOS module](docs/NIXOS.md).
 
-```sh
-sudo apt install ./pyroshine_*.deb
-sudo systemctl enable --now pyroshine@$USER
-```
-
-### Fedora or RHEL
-
-```sh
-sudo dnf install ./pyroshine-*.rpm
-sudo systemctl enable --now pyroshine@$USER
-```
-
-### SteamOS and other supported x86_64 systems
-
-```sh
-curl -fsSL https://github.com/karsyboy/pyroshine/releases/latest/download/pyroshine-install.sh | bash
-```
-
-The installer places the portable build under `/opt/pyroshine` and installs the
-required systemd, udev, modules-load, Vulkan-layer, and polkit files.
-
-For unattended headless use, enable lingering first:
-
-```sh
-sudo loginctl enable-linger "$USER"
-```
-
-For headless gamepad access, add the streaming user to `input`, then log out and
-back in:
-
-```sh
-sudo usermod -aG input "$USER"
-```
-
-### NixOS
-
-The flake currently retains the upstream-compatible `services.moonshine`
-module. See
-[nix/README.md](nix/README.md) for a complete configuration.
-
-### Build from source
-
-Install Rust plus the project's C/C++ and Linux development dependencies, then
-build the pinned PyroWave library and the Rust workspace:
-
-```sh
-./scripts/build-pyrowave.sh /tmp/pyrowave-src /tmp/pyrowave-install
-export LD_LIBRARY_PATH="/tmp/pyrowave-install/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-cargo build --release --workspace
-```
-
-The release and Nix builds pin
-[`karsyboy/pyrowave`](https://github.com/karsyboy/pyrowave) at the revision
-documented in [docs/PYROWAVE.md](docs/PYROWAVE.md). Pyroshine checks the exact C
-API version at runtime and leaves conventional codecs available when the
-optional library cannot be loaded.
-
-The upstream-compatible workspace produces `target/release/moonshine` and
-`target/release/libmoonshine_wsi.so`; release packaging exposes the server as
-`pyroshine`. Use the packaged files under `dist/` when installing system-wide.
-
-### Publishing a release
-
-Pushing a semantic version tag builds and publishes all release assets using
-GitHub Actions:
-
-```sh
-git tag -a v0.16.3 -m "Pyroshine v0.16.3"
-git push origin v0.16.3
-```
-
-The workflow creates the GitHub Release automatically and attaches the portable
-archive, installer, native packages, and `SHA256SUMS`.
-
-## Configuration and use
-
-For straightforward upstream synchronization and upgrades from Moonshine,
-Pyroshine retains `~/.config/moonshine/config.toml` and
-`~/.local/share/moonshine` for configuration, certificates, and pairing state.
-
-Add a normal application with:
+Pyroshine creates `~/.config/moonshine/config.toml` on first start, with Steam
+and a Steam library scanner enabled by default. To configure another application,
+add an entry to that file:
 
 ```toml
 [[application]]
-title = "Steam"
-command = ["/usr/bin/steam", "steam://open/bigpicture"]
+title = "My game"
+command = ["/absolute/path/to/game"]
 ```
 
-Plasma can be launched like any other application when no local Plasma session
-is active:
+Restart the service after editing, add the host in Moonlight, and enter the
+client's pairing PIN at `http://localhost:47989/pin` on the host:
 
-```toml
-[[application]]
-title = "Plasma Desktop"
-command = ["/usr/bin/startplasma-wayland"]
+```sh
+sudo systemctl restart "pyroshine@$USER"
 ```
 
-This is a normal application entry, not a managed desktop feature. See
-[TIPS.md](TIPS.md#run-a-desktop-environment-for-a-full-remote-desktop) for the
-known session and login-screen limitations.
-
-Start the service, add the host in Moonlight, and enter the displayed pairing
-PIN at `http://localhost:47989/pin`. PyroWave clients negotiate the codec only
-when both sides advertise wire version 1; conventional clients are unaffected.
-
-Do not expose Pyroshine directly to the public internet. Use it on a trusted LAN
-or through a VPN and restrict the GameStream ports with a firewall.
+Use a trusted LAN or VPN and restrict the GameStream ports with a firewall.
+Do not expose Pyroshine directly to the public internet.
 
 ## Documentation
 
-- [PyroWave architecture, negotiation, dependency pin, and validation](docs/PYROWAVE.md)
-- [NixOS package and module](nix/README.md)
-- [Tips and troubleshooting](TIPS.md)
+- [Installation, upgrades, and headless setup](docs/INSTALLATION.md)
+- [Complete config.toml reference](docs/CONFIGURATION.md)
+- [Tips and troubleshooting](docs/TIPS.md)
+- [All documentation](docs/README.md)
+- [Contributing, manual builds and installation, and releases](CONTRIBUTING.md)
+- [Changelog](docs/CHANGELOG.md)
 
-Advanced options such as `MOONSHINE_PYROWAVE_LIBRARY`, packet-size caps,
-benchmarking, and manual GPU validation live in the detailed documents rather
-than the quick-start path.
+## License and credits
 
-## Upstream
+Pyroshine is an independent community fork of
+[Moonshine](https://github.com/hgaiser/moonshine), which builds on the Moonlight
+ecosystem and work pioneered by [Sunshine](https://github.com/LizardByte/Sunshine).
+It retains Moonshine's internal crate names, configuration paths, and protocol
+names to ease upstream synchronization.
 
-Pyroshine is derived from [Moonshine](https://github.com/hgaiser/moonshine) and
-retains its architecture, protocol implementation, and much of its
-documentation. Credit for that work belongs to Moonshine's authors and
-contributors. Pyroshine-specific changes are maintained in this repository;
-they should not be presented as upstream Moonshine features.
-
-Moonshine in turn builds on the Moonlight ecosystem and work pioneered by
-[Sunshine](https://github.com/LizardByte/Sunshine).
-
-## License and acknowledgements
-
-Pyroshine remains licensed under the [BSD 2-Clause License](LICENSE). The
-original Moonshine copyright and license notices are preserved. PyroWave and
-other dependencies retain their own licenses and notices.
+Licensed under the [BSD 2-Clause License](LICENSE). Original copyright notices
+are preserved; dependencies retain their own licenses.
