@@ -37,6 +37,8 @@ stdenv.mkDerivation {
   version = "0.7.0-${builtins.substring 0 8 sourceRevision}";
   inherit src;
 
+  patches = [ ./patches/pyrowave-444-payload.patch ./patches/granite-sdr-normalization.patch ];
+
   nativeBuildInputs = [
     cmake
     pkg-config

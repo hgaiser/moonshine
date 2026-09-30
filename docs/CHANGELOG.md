@@ -20,6 +20,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 - Negotiate driver-supported three-image swapchains on the XWayland Vulkan bypass using per-present-mode capabilities and swapchain maintenance, addressing conservative Wayland image-count limits.
 - Gate WSI maintenance injection on real extension/feature support and restrict dynamic presentation to declared compatible modes.
+- Refactor HDR and YUV 4:4:4 handleing
 
 ### Changed
 

@@ -27,6 +27,16 @@ git -C "${src}" checkout --detach "${SOURCE_REVISION}"
 [[ "$(git -C "${src}/Granite/third_party/volk" rev-parse HEAD)" == "${VOLK_REVISION}" ]]
 [[ "$(git -C "${src}/Granite/third_party/khronos/vulkan-headers" rev-parse HEAD)" == "${VULKAN_HEADERS_REVISION}" ]]
 
+# Apply the audited, wire-compatible fixes to the pinned dependency.
+patch_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")/../nix/patches" && pwd)"
+for patch in "$patch_dir"/*.patch; do
+  if git -C "${src}" apply --check "$patch"; then
+    git -C "${src}" apply "$patch"
+  else
+    git -C "${src}" apply --reverse --check "$patch"
+  fi
+done
+
 cmake -S "${src}" -B "${workdir}/build" \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="${prefix}" \

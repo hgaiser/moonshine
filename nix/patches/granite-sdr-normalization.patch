@@ -1,0 +1,14 @@
+diff --git a/Granite/video/scaler.cpp b/Granite/video/scaler.cpp
+index a9150d81..41110be8 100644
+--- a/Granite/video/scaler.cpp
++++ b/Granite/video/scaler.cpp
+@@ -393,6 +393,9 @@ void VideoScaler::rescale(CommandBuffer &cmd, const RescaleInfo &info)
+ 
+ 		if (info.output_color_space == VK_COLOR_SPACE_EXTENDED_SRGB_LINEAR_EXT)
+ 			sdr_scale /= 80.0f;
++		else if (info.output_color_space == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
++			// PQ is in nits; SDR linear RGB is relative to 200-nit white.
++			sdr_scale /= 200.0f;
+ 
+ 		ubo->primary_transform[0] = vec4(sdr_scale * conv[0], 0.0f);
+ 		ubo->primary_transform[1] = vec4(sdr_scale * conv[1], 0.0f);

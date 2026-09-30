@@ -191,7 +191,8 @@ impl MasteringMetadata {
 	///
 	/// Gamescope: `gamescope_swapchain_set_hdr_metadata()`
 	fn is_plausible(self) -> bool {
-		self.max_cll != 0 && self.max_fall != 0 && (self.white_point.0 != 0 || self.white_point.1 != 0)
+		// Zero CLL/FALL mean unknown content light levels, not invalid mastering data.
+		self.mastering_luminance.1 != 0 && (self.white_point.0 != 0 || self.white_point.1 != 0)
 	}
 
 	fn apply_to(self, desc: &mut ImageDescription) {
@@ -367,6 +368,25 @@ impl ColorManagementState {
 		}
 	}
 
+	/// Resolve only the surface whose pixels are being exported. Other live
+	/// (including hidden) HDR surfaces cannot describe this DMA-BUF.
+	pub fn surface_color_space(&self, surface: &WlSurface) -> FrameColorSpace {
+		self.surface_description(surface)
+			.map(ImageDescription::to_frame_color_space)
+			.unwrap_or(FrameColorSpace::Srgb)
+	}
+
+	fn surface_description(&self, surface: &WlSurface) -> Option<ImageDescription> {
+		self.gamescope_current
+			.get(surface)
+			.and_then(|color| color.to_image_description())
+			.or_else(|| self.current.get(surface).copied())
+	}
+
+	pub fn surface_hdr_metadata(&self, surface: &WlSurface) -> Option<HdrMetadata> {
+		Self::description_hdr_metadata(self.surface_description(surface)?)
+	}
+
 	/// Get the frame color space for the current fullscreen surface.
 	///
 	/// When multiple HDR surfaces are declared, already-encoded BT.2020+PQ is
@@ -414,6 +434,15 @@ impl ColorManagementState {
 			.chain(self.current.values().copied())
 			.filter(|desc| desc.to_frame_color_space() != FrameColorSpace::Srgb)
 			.find(|desc| desc.max_cll.is_some() || desc.max_fall.is_some() || desc.mastering_luminance.is_some())?;
+		Self::description_hdr_metadata(desc)
+	}
+
+	fn description_hdr_metadata(desc: ImageDescription) -> Option<HdrMetadata> {
+		if desc.to_frame_color_space() == FrameColorSpace::Srgb
+			|| (desc.max_cll.is_none() && desc.max_fall.is_none() && desc.mastering_luminance.is_none())
+		{
+			return None;
+		}
 		// Clamp u32 protocol values to u16 range for the Moonlight HDR metadata.
 		// Well-behaved clients stay within range; clamp rather than truncate.
 		let sat = |v: u32| -> u16 { u16::try_from(v).unwrap_or(u16::MAX) };
@@ -1012,7 +1041,10 @@ impl Dispatch<wp_color_representation_surface_v1::WpColorRepresentationSurfaceV1
 
 #[cfg(test)]
 mod tests {
-	use super::{FrameColorSpace, ImageDescription, MasteringMetadata, Primaries, SwapchainColor, TransferFunction};
+	use super::{
+		ColorManagementState, FrameColorSpace, ImageDescription, MasteringMetadata, Primaries, SwapchainColor,
+		TransferFunction,
+	};
 
 	fn mastering_metadata() -> MasteringMetadata {
 		MasteringMetadata {
@@ -1072,6 +1104,76 @@ mod tests {
 	}
 
 	#[test]
+	fn direct_capture_color_is_scoped_to_the_exported_surface() {
+		use smithay::reexports::wayland_server::protocol::wl_surface::{self, WlSurface};
+		use smithay::reexports::wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, Resource};
+		use std::{collections::HashMap, os::unix::net::UnixStream, sync::Arc};
+		struct TestState;
+		impl Dispatch<WlSurface, ()> for TestState {
+			fn request(
+				_: &mut Self,
+				_: &Client,
+				_: &WlSurface,
+				_: wl_surface::Request,
+				_: &(),
+				_: &DisplayHandle,
+				_: &mut DataInit<'_, Self>,
+			) {
+			}
+		}
+		let display = Display::<TestState>::new().unwrap();
+		let mut handle = display.handle();
+		let (server, _peer) = UnixStream::pair().unwrap();
+		let client = handle.insert_client(server, Arc::new(())).unwrap();
+		let captured = client
+			.create_resource::<WlSurface, (), TestState>(&handle, 1, ())
+			.unwrap();
+		let hidden = client
+			.create_resource::<WlSurface, (), TestState>(&handle, 1, ())
+			.unwrap();
+		assert!(captured.is_alive());
+		let mut cm = ColorManagementState {
+			pending: HashMap::new(),
+			current: HashMap::new(),
+			gamescope_current: HashMap::new(),
+			hdr: true,
+		};
+		cm.current.insert(hidden, ImageDescription::bt2020_pq());
+		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::Srgb);
+		cm.current.insert(captured.clone(), ImageDescription::scrgb_linear());
+		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::ScrgbLinear);
+		cm.gamescope_current.insert(
+			captured.clone(),
+			SwapchainColor {
+				colorspace: Some((TransferFunction::St2084Pq, Primaries::Bt2020)),
+				metadata: Some(mastering_metadata()),
+			},
+		);
+		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::Bt2020Pq);
+		assert_eq!(cm.surface_hdr_metadata(&captured).unwrap().max_cll, 2000);
+		cm.clear_gamescope_current(&captured);
+		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::ScrgbLinear);
+		assert!(cm.surface_hdr_metadata(&captured).is_none());
+		cm.current.remove(&captured);
+		assert_eq!(cm.surface_color_space(&captured), FrameColorSpace::Srgb);
+	}
+
+	#[test]
+	fn hdr_metadata_stays_with_its_declared_pixels() {
+		let mut desc = ImageDescription::bt2020_pq();
+		desc.max_cll = Some(1200);
+		desc.max_fall = Some(400);
+		desc.mastering_luminance = Some((10, 10_000_000));
+		let metadata = ColorManagementState::description_hdr_metadata(desc).unwrap();
+		assert_eq!(metadata.max_cll, 1200);
+		assert_eq!(metadata.max_luminance, 10_000_000);
+		desc.transfer_function = TransferFunction::Gamma22;
+		desc.primaries = Primaries::Srgb;
+		assert!(ColorManagementState::description_hdr_metadata(desc).is_none());
+		assert!(ColorManagementState::description_hdr_metadata(ImageDescription::bt2020_pq()).is_none());
+	}
+
+	#[test]
 	fn implausible_mastering_metadata_is_rejected() {
 		assert!(mastering_metadata().is_plausible());
 
@@ -1088,8 +1190,8 @@ mod tests {
 			..mastering_metadata()
 		};
 
-		assert!(!zero_cll.is_plausible());
-		assert!(!zero_fall.is_plausible());
+		assert!(zero_cll.is_plausible());
+		assert!(zero_fall.is_plausible());
 		assert!(!zero_white_point.is_plausible());
 	}
 

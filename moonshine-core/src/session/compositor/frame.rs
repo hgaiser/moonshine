@@ -78,9 +78,9 @@ impl HdrMetadata {
 		Self {
 			// BT.2020 display primaries in 0.00002 units.
 			display_primaries: [
-				(34000, 16000), // Red:   0.680, 0.320
-				(13250, 34500), // Green: 0.265, 0.690
-				(7500, 3000),   // Blue:  0.150, 0.060
+				(35400, 14600), // Red:   0.708, 0.292
+				(8500, 39850),  // Green: 0.170, 0.797
+				(6550, 2300),   // Blue:  0.131, 0.046
 			],
 			// D65 white point in 0.00002 units.
 			white_point: (15635, 16450), // 0.3127, 0.3290
@@ -139,4 +139,16 @@ pub(crate) struct ExportedPlane {
 	pub offset: u32,
 	/// Row stride in bytes.
 	pub stride: u32,
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn fallback_mastering_gamut_is_bt2020() {
+		let m = HdrMetadata::fallback();
+		assert_eq!(m.display_primaries, [(35400, 14600), (8500, 39850), (6550, 2300)]);
+		assert_eq!(m.white_point, (15635, 16450));
+		assert_eq!(m.max_luminance, 1000 * 10000);
+	}
 }

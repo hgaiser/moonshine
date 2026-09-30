@@ -376,27 +376,12 @@ impl RtspServer {
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 		}
 
-		let dynamic_range: u32 =
-			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].dynamicRangeMode").unwrap_or_default();
-		let dynamic_range = VideoDynamicRange::try_from(dynamic_range).unwrap_or_default();
-
-		let chroma_sampling_type: u32 =
-			get_optional_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
-		let chroma_sampling_type = VideoChromaSampling::try_from(chroma_sampling_type).unwrap_or_default();
-
-		// New clients state bit depth explicitly.  Legacy Moonlight clients do
-		// not, so retain the established HDR10=10-bit / SDR=8-bit default only at
-		// this protocol compatibility boundary.
-		let bit_depth = match get_optional_sdp_attribute::<u32>(&sdp_session, "x-moonshine-video[0].bitDepth") {
-			Some(value) => match BitDepth::try_from(value) {
-				Ok(depth) => depth,
-				Err(()) => {
-					tracing::warn!(value, "Client requested an unsupported video bit depth");
-					return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-				},
+		let (dynamic_range, chroma_sampling_type, bit_depth) = match negotiated_video_axes(&sdp_session) {
+			Ok(axes) => axes,
+			Err(()) => {
+				tracing::warn!("Client requested malformed or unsupported video profile attributes");
+				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
-			None if dynamic_range == VideoDynamicRange::Hdr => BitDepth::Ten,
-			None => BitDepth::Eight,
 		};
 
 		let max_reference_frames: u32 =
@@ -690,6 +675,28 @@ fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attr
 		.and_then(|s| s.parse().ok())
 }
 
+// Missing legacy attributes have defaults; malformed or unknown values do not.
+fn negotiated_video_axes(
+	session: &sdp_types::Session,
+) -> Result<(VideoDynamicRange, VideoChromaSampling, BitDepth), ()> {
+	fn optional_u32(session: &sdp_types::Session, name: &str) -> Result<Option<u32>, ()> {
+		match session.get_first_attribute_value(name) {
+			Err(_) => Ok(None),  // AttributeNotFoundError: absent legacy attribute.
+			Ok(None) => Err(()), // Present without a value is malformed.
+			Ok(Some(value)) => value.trim().parse().map(Some).map_err(|_| ()),
+		}
+	}
+	let dynamic = VideoDynamicRange::try_from(optional_u32(session, "x-nv-video[0].dynamicRangeMode")?.unwrap_or(0))?;
+	let chroma =
+		VideoChromaSampling::try_from(optional_u32(session, "x-ss-video[0].chromaSamplingType")?.unwrap_or(0))?;
+	let depth = match optional_u32(session, "x-moonshine-video[0].bitDepth")? {
+		Some(value) => BitDepth::try_from(value)?,
+		None if dynamic == VideoDynamicRange::Hdr => BitDepth::Ten,
+		None => BitDepth::Eight,
+	};
+	Ok((dynamic, chroma, depth))
+}
+
 fn bitrate_bps_from_kbps(bitrate_kbps: u64) -> Option<usize> {
 	bitrate_kbps
 		.checked_mul(1000)
@@ -709,6 +716,51 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 #[cfg(test)]
 mod tests {
 	use super::bitrate_bps_from_kbps;
+
+	#[test]
+	fn profile_axes_preserve_hdr_chroma_and_explicit_sdr_depth() {
+		use super::*;
+		for hdr in [0, 1] {
+			for chroma in [0, 1] {
+				for depth in [8, 10] {
+					let data = format!(
+						"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\na=x-nv-video[0].dynamicRangeMode:{hdr}\r\na=x-ss-video[0].chromaSamplingType:{chroma}\r\na=x-moonshine-video[0].bitDepth:{depth}\r\n"
+					);
+					let session = sdp_types::Session::parse(data.as_bytes()).unwrap();
+					assert_eq!(
+						negotiated_video_axes(&session).unwrap(),
+						(
+							VideoDynamicRange::try_from(hdr).unwrap(),
+							VideoChromaSampling::try_from(chroma).unwrap(),
+							BitDepth::try_from(depth).unwrap()
+						)
+					);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn invalid_profile_attributes_are_rejected_and_absence_defaults() {
+		use super::*;
+		let base = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n";
+		let session = sdp_types::Session::parse(base.as_bytes()).unwrap();
+		assert_eq!(
+			negotiated_video_axes(&session).unwrap(),
+			(VideoDynamicRange::Sdr, VideoChromaSampling::Yuv420, BitDepth::Eight)
+		);
+		for (attribute, value) in [
+			("x-nv-video[0].dynamicRangeMode", "2"),
+			("x-ss-video[0].chromaSamplingType", "2"),
+			("x-moonshine-video[0].bitDepth", "12"),
+			("x-nv-video[0].dynamicRangeMode", "hdr"),
+			("x-ss-video[0].chromaSamplingType", "444"),
+			("x-moonshine-video[0].bitDepth", "ten"),
+		] {
+			let data = format!("{base}a={attribute}:{value}\r\n");
+			assert!(negotiated_video_axes(&sdp_types::Session::parse(data.as_bytes()).unwrap()).is_err());
+		}
+	}
 
 	#[test]
 	fn bitrate_conversion_is_wide_and_checked() {

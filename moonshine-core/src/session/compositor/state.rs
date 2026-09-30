@@ -1674,9 +1674,12 @@ impl MoonshineCompositor {
 		let color_space = self
 			.color_management
 			.as_ref()
-			.map(|cm| cm.frame_color_space())
+			.map(|cm| cm.surface_color_space(&wl_surface))
 			.unwrap_or(FrameColorSpace::Srgb);
-		let hdr_metadata = self.color_management.as_ref().and_then(|cm| cm.hdr_metadata());
+		let hdr_metadata = self
+			.color_management
+			.as_ref()
+			.and_then(|cm| cm.surface_hdr_metadata(&wl_surface));
 
 		let planes: Vec<ExportedPlane> = client_dmabuf
 			.handles()
@@ -1838,9 +1841,12 @@ impl MoonshineCompositor {
 		let color_space = self
 			.color_management
 			.as_ref()
-			.map(|cm| cm.frame_color_space())
+			.map(|cm| cm.surface_color_space(&override_surface))
 			.unwrap_or(FrameColorSpace::Srgb);
-		let hdr_metadata = self.color_management.as_ref().and_then(|cm| cm.hdr_metadata());
+		let hdr_metadata = self
+			.color_management
+			.as_ref()
+			.and_then(|cm| cm.surface_hdr_metadata(&override_surface));
 
 		let planes: Vec<ExportedPlane> = client_dmabuf
 			.handles()
