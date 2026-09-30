@@ -56,15 +56,42 @@ impl Default for HomeButtonConfig {
 pub struct GamepadConfig {
 	/// Configuration for the hold-to-Home button remap.
 	pub home_button: HomeButtonConfig,
+	/// Virtual controller family; auto preserves native client features.
+	pub emulation: GamepadEmulation,
 }
 
-#[derive(Debug, FromRepr)]
+#[derive(Default, Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GamepadEmulation {
+	#[default]
+	Auto,
+	Xbox,
+	Playstation,
+	Nintendo,
+}
+
+impl GamepadEmulation {
+	fn target(self, incoming: GamepadKind) -> GamepadKind {
+		match self {
+			Self::Auto => match incoming {
+				GamepadKind::Unknown | GamepadKind::Steam => GamepadKind::Xbox,
+				kind => kind,
+			},
+			Self::Xbox => GamepadKind::Xbox,
+			Self::Playstation => GamepadKind::PlayStation,
+			Self::Nintendo => GamepadKind::Nintendo,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, FromRepr)]
 #[repr(u8)]
 pub(crate) enum GamepadKind {
 	Unknown = 0x00,
 	Xbox = 0x01,
 	PlayStation = 0x02,
 	Nintendo = 0x03,
+	Steam = 0x04,
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -122,8 +149,10 @@ impl GamepadInfo {
 
 		Ok(Self {
 			index: buffer[0],
-			kind: GamepadKind::from_repr(buffer[1])
-				.ok_or_else(|| tracing::warn!("Unknown gamepad kind: {}", buffer[1]))?,
+			kind: GamepadKind::from_repr(buffer[1]).unwrap_or_else(|| {
+				tracing::warn!("Unknown gamepad kind: {}; using compatibility device", buffer[1]);
+				GamepadKind::Unknown
+			}),
 			capabilities: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			_supported_buttons: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 		})
@@ -347,10 +376,16 @@ pub(crate) struct Gamepad {
 }
 
 impl Gamepad {
-	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
+	pub async fn new(
+		info: &GamepadInfo,
+		feedback_tx: mpsc::Sender<FeedbackCommand>,
+		policy: GamepadEmulation,
+	) -> Result<Self, ()> {
+		let kind = policy.target(info.kind);
+		tracing::debug!(index = info.index, incoming = ?info.kind, ?policy, virtual_kind = ?kind, "Creating virtual controller");
 		let id = format!("00:11:22:33:{:02x}", info.index);
-		let definition = match info.kind {
-			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
+		let definition = match kind {
+			GamepadKind::Unknown | GamepadKind::Steam | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
 				0x045e,
 				0x02dd,
@@ -376,8 +411,8 @@ impl Gamepad {
 			),
 		};
 
-		let mut gamepad = match info.kind {
-			GamepadKind::Unknown | GamepadKind::Xbox => Joypad::XboxOne(
+		let mut gamepad = match kind {
+			GamepadKind::Unknown | GamepadKind::Steam | GamepadKind::Xbox => Joypad::XboxOne(
 				XboxOneJoypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?,
 			),
 			GamepadKind::PlayStation => {
@@ -522,5 +557,57 @@ impl Gamepad {
 
 			gamepad.set_battery(state, gamepad_battery.battery_percentage);
 		}
+	}
+}
+
+#[cfg(test)]
+mod compatibility_tests {
+	use super::*;
+	#[test]
+	fn all_moonlight_controller_kinds_and_future_values_are_accepted() {
+		for raw in [0, 1, 2, 3, 4, 255] {
+			let info = GamepadInfo::from_bytes(&[15, raw, 0x7f, 0, 0, 0, 0, 0]).unwrap();
+			assert_eq!(info.index, 15);
+			if raw == 4 {
+				assert_eq!(info.kind, GamepadKind::Steam);
+			}
+			if raw == 255 {
+				assert_eq!(info.kind, GamepadKind::Unknown);
+			}
+		}
+		assert!(GamepadInfo::from_bytes(&[0, 4]).is_err());
+	}
+	#[test]
+	fn auto_preserves_native_families_and_forced_policy_overrides_every_kind() {
+		for kind in [
+			GamepadKind::Unknown,
+			GamepadKind::Xbox,
+			GamepadKind::PlayStation,
+			GamepadKind::Nintendo,
+			GamepadKind::Steam,
+		] {
+			assert_eq!(GamepadEmulation::Xbox.target(kind), GamepadKind::Xbox);
+			assert_eq!(GamepadEmulation::Playstation.target(kind), GamepadKind::PlayStation);
+			assert_eq!(GamepadEmulation::Nintendo.target(kind), GamepadKind::Nintendo);
+		}
+		assert_eq!(
+			GamepadEmulation::Auto.target(GamepadKind::PlayStation),
+			GamepadKind::PlayStation
+		);
+		assert_eq!(
+			GamepadEmulation::Auto.target(GamepadKind::Nintendo),
+			GamepadKind::Nintendo
+		);
+		assert_eq!(GamepadEmulation::Auto.target(GamepadKind::Steam), GamepadKind::Xbox);
+		assert_eq!(GamepadEmulation::Auto.target(GamepadKind::Unknown), GamepadKind::Xbox);
+	}
+	#[test]
+	fn configuration_defaults_and_invalid_policies() {
+		let config: GamepadConfig = toml::from_str("").unwrap();
+		assert!(matches!(config.emulation, GamepadEmulation::Auto));
+		for value in ["auto", "xbox", "playstation", "nintendo"] {
+			assert!(toml::from_str::<GamepadConfig>(&format!("emulation = \"{value}\"")).is_ok());
+		}
+		assert!(toml::from_str::<GamepadConfig>("emulation = \"invalid\"").is_err());
 	}
 }

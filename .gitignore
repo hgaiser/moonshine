@@ -4,3 +4,4 @@ __pycache__/
 /analysis_*
 *.bak
 docs/reconnect-validation.md
+docs/COMPOSITOR.md

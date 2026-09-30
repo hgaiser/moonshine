@@ -18,6 +18,7 @@ use smithay::input::tablet::tool::{
 use smithay::input::touch::{DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, UpEvent as TouchUpEvent};
 use smithay::utils::{Logical, Point, SERIAL_COUNTER};
 use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
+use smithay::wayland::seat::WaylandFocus;
 
 use crate::session::compositor::state::MoonshineCompositor;
 
@@ -107,7 +108,7 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 	let serial = SERIAL_COUNTER.next_serial();
 	let time = InputTime::from_millis(state.clock.now().as_millis());
 
-	// specific pointer events (non-keyboard) should reset the cursor inactivity timer
+	// Pointer use activates the fallback cursor; it never overrides an app hide.
 	match event {
 		CompositorInputEvent::KeyDown { .. }
 		| CompositorInputEvent::KeyUp { .. }
@@ -116,7 +117,10 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 		| CompositorInputEvent::TouchMove { .. }
 		| CompositorInputEvent::TouchUp { .. }
 		| CompositorInputEvent::TouchCancelAll => {},
-		_ => state.last_pointer_activity = Some(std::time::Instant::now()),
+		_ => {
+			state.cursor.activate_pointer();
+			state.screen_dirty = true;
+		},
 	}
 
 	match event {
@@ -780,62 +784,66 @@ fn find_surface_at(
 	<MoonshineCompositor as smithay::input::SeatHandler>::PointerFocus,
 	Point<f64, Logical>,
 )> {
-	// Priority 1: Override window (dropdown) is active — route to it.
-	// Only do this when the WSI bypass surface is NOT active.  When
-	// override_surface is active the renderer replaces the entire space
-	// with the bypass surface, so dropdown windows are not rendered —
-	// routing to them would make invisible windows intercept clicks.
-	if state.override_window.is_some()
-		&& !state.is_override_active()
-		&& let Some(ref override_win) = state.override_window
+	// Input state is independent of which buffer supplies the video frame.
+	// Interactive Steam focus takes precedence over WSI and dropdown routing.
+	for (window, focus_fallback) in [
+		(state.input_focus_window.as_ref(), true),
+		(state.override_window.as_ref(), false),
+	]
+	.into_iter()
+	.filter_map(|(window, fallback)| window.map(|window| (window, fallback)))
 	{
-		let override_loc = state.space.element_geometry(override_win)?.loc;
-		let pos_within_override = position - override_loc.to_f64();
-		if let Some((surface, surface_offset)) = override_win.surface_under(pos_within_override, WindowSurfaceType::ALL)
+		if state
+			.window_metadata
+			.get(window)
+			.is_some_and(|m| !m.accepts_pointer_input())
 		{
-			return Some((surface, surface_offset.to_f64() + override_loc.to_f64()));
+			continue;
+		}
+		let Some(geometry) = state.space.element_geometry(window) else {
+			continue;
+		};
+		let location = geometry.loc.to_f64();
+		if let Some((surface, offset)) = window.surface_under(position - location, WindowSurfaceType::ALL) {
+			return Some((surface, offset.to_f64() + location));
+		}
+		if focus_fallback && let Some(surface) = window.wl_surface() {
+			return Some((surface.into_owned(), location));
 		}
 	}
-
-	// Priority 2: WSI override surface active — route to the focused game window.
 	if state.is_override_active() {
-		if let Some(wid) = state.focused_x11_window {
-			// XWayland path: find the focused X11 window and route events there.
-			for window in state.space.elements() {
-				if let Some(x11) = window.x11_surface()
-					&& x11.window_id() == wid
-				{
-					let window_loc = state.space.element_geometry(window)?.loc;
-					let pos_within_window = position - window_loc.to_f64();
-					// Try finding a sub-surface under the cursor first.
-					if let Some((surface, surface_offset)) =
-						window.surface_under(pos_within_window, WindowSurfaceType::ALL)
-					{
-						return Some((surface, surface_offset.to_f64() + window_loc.to_f64()));
-					}
-					// If the X11 window has no buffer (ICD renders to the
-					// bypass surface), use the toplevel wl_surface directly
-					// so pointer events still reach XWayland.
-					if let Some(wl_surface) = x11.wl_surface() {
-						return Some((wl_surface, window_loc.to_f64()));
-					}
-					return None;
-				}
+		if let Some(window) = state.pointer_focus_window.as_ref().or(state.focused_window.as_ref()) {
+			let location = state.space.element_geometry(window)?.loc.to_f64();
+			if let Some((surface, offset)) = window.surface_under(position - location, WindowSurfaceType::ALL) {
+				return Some((surface, offset.to_f64() + location));
 			}
-			return None;
-		} else {
-			// Native Wayland path (x11_win == 0): the override surface is a
-			// fullscreen bypass surface at the output origin.  Route pointer
-			// events directly to it so the application receives input.
-			if let Some((ref override_surface, _)) = state.override_surface {
-				return Some((override_surface.clone(), Point::from((0.0, 0.0))));
+			if let Some(surface) = window.wl_surface() {
+				return Some((surface.into_owned(), location));
 			}
 		}
+		if let Some((surface, 0)) = &state.override_surface {
+			return Some((surface.clone(), Point::from((0.0, 0.0))));
+		}
 	}
-
-	// Priority 3: Normal cursor-based surface finding.
-	let (window, window_loc) = state.space.element_under(position)?;
-	let pos_within_window = position - window_loc.to_f64();
-	let (surface, surface_offset) = window.surface_under(pos_within_window, WindowSurfaceType::ALL)?;
-	Some((surface, surface_offset.to_f64() + window_loc.to_f64()))
+	// Passive notifications are render-only, including over their own pixels.
+	for window in state.space.elements().rev() {
+		if state
+			.window_metadata
+			.get(window)
+			.is_some_and(|m| !m.accepts_pointer_input())
+		{
+			continue;
+		}
+		let Some(geometry) = state.space.element_geometry(window) else {
+			continue;
+		};
+		if !geometry.to_f64().contains(position) {
+			continue;
+		}
+		let location = geometry.loc.to_f64();
+		if let Some((surface, offset)) = window.surface_under(position - location, WindowSurfaceType::ALL) {
+			return Some((surface, offset.to_f64() + location));
+		}
+	}
+	None
 }

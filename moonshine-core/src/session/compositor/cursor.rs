@@ -194,3 +194,143 @@ where
 		}
 	}
 }
+
+/// Cursor visibility has no clock and receives no controller events.
+/// Smithay's default Named callbacks are fallback resets on focus leave or
+/// replacement. This compositor does not advertise wp_cursor_shape_manager;
+/// client wl_pointer.set_cursor requests arrive as Surface or Hidden.
+pub(crate) struct CursorState {
+	pub image: CursorImageStatus,
+	active: bool,
+}
+
+impl Default for CursorState {
+	fn default() -> Self {
+		Self {
+			image: CursorImageStatus::default_named(),
+			active: false,
+		}
+	}
+}
+
+impl CursorState {
+	pub fn activate_pointer(&mut self) {
+		let was_visible = self.visible();
+		self.active = true;
+		if !was_visible && self.visible() {
+			tracing::debug!("Cursor hidden -> visible: pointer activated fallback");
+		}
+	}
+	pub fn set_image(&mut self, image: CursorImageStatus) {
+		if !matches!(&image, CursorImageStatus::Named(icon) if *icon == smithay::input::pointer::CursorIcon::Default) {
+			self.active = true;
+		}
+		self.image = image;
+	}
+	pub fn surface_destroyed(
+		&mut self,
+		surface: &smithay::reexports::wayland_server::protocol::wl_surface::WlSurface,
+	) -> bool {
+		if matches!(&self.image, CursorImageStatus::Surface(current) if current == surface) {
+			self.set_image(CursorImageStatus::default_named());
+			return true;
+		}
+		false
+	}
+	pub fn reset_dead_surface(&mut self) -> bool {
+		use smithay::utils::IsAlive;
+		if matches!(&self.image, CursorImageStatus::Surface(surface) if !surface.alive()) {
+			self.set_image(CursorImageStatus::default_named());
+			return true;
+		}
+		false
+	}
+	pub fn visible(&self) -> bool {
+		self.active && !matches!(self.image, CursorImageStatus::Hidden)
+	}
+}
+
+#[cfg(test)]
+mod visibility_tests {
+	use super::*;
+	use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
+	use smithay::reexports::wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, Resource};
+	use std::os::unix::net::UnixStream;
+	struct TestState;
+	impl Dispatch<WlSurface, ()> for TestState {
+		fn request(
+			_: &mut Self,
+			_: &Client,
+			_: &WlSurface,
+			_: <WlSurface as Resource>::Request,
+			_: &(),
+			_: &DisplayHandle,
+			_: &mut DataInit<'_, Self>,
+		) {
+		}
+	}
+	#[test]
+	fn custom_cursor_surface_death_and_replacement_respect_last_request() {
+		let display = Display::<TestState>::new().unwrap();
+		let mut handle = display.handle();
+		let (server, _peer) = UnixStream::pair().unwrap();
+		let client = handle.insert_client(server, std::sync::Arc::new(())).unwrap();
+		let old = client
+			.create_resource::<WlSurface, (), TestState>(&handle, 6, ())
+			.unwrap();
+		let new = client
+			.create_resource::<WlSurface, (), TestState>(&handle, 6, ())
+			.unwrap();
+		let mut cursor = CursorState::default();
+		cursor.set_image(CursorImageStatus::Surface(old.clone()));
+		assert!(cursor.visible());
+		cursor.set_image(CursorImageStatus::Surface(new.clone()));
+		handle.backend_handle().destroy_object::<TestState>(&old.id()).unwrap();
+		assert!(
+			!cursor.surface_destroyed(&old),
+			"old surface death cannot replace the current cursor"
+		);
+		assert_eq!(cursor.image, CursorImageStatus::Surface(new.clone()));
+		handle.backend_handle().destroy_object::<TestState>(&new.id()).unwrap();
+		assert!(!new.is_alive());
+		assert!(cursor.surface_destroyed(&new));
+		assert!(cursor.visible());
+		assert_eq!(cursor.image, CursorImageStatus::default_named());
+		cursor.set_image(CursorImageStatus::Hidden);
+		assert!(!cursor.reset_dead_surface());
+		assert!(!cursor.visible());
+	}
+
+	#[test]
+	fn startup_and_framework_reset_do_not_expose_fallback() {
+		let mut cursor = CursorState::default();
+		assert!(!cursor.visible());
+		cursor.set_image(CursorImageStatus::default_named());
+		assert!(!cursor.visible());
+	}
+	#[test]
+	fn mouse_idle_and_controller_updates_cannot_expire_cursor() {
+		let mut cursor = CursorState::default();
+		cursor.activate_pointer();
+		let last_mouse_event = std::time::Instant::now() - std::time::Duration::from_secs(10);
+		assert!(last_mouse_event.elapsed() > std::time::Duration::from_secs(3));
+		// No cursor API is called by controller updates or advancing time.
+		for _controller_update in 0..100 {
+			assert!(cursor.visible());
+		}
+		cursor.set_image(CursorImageStatus::Hidden);
+		assert!(!cursor.visible());
+		cursor.activate_pointer();
+		assert!(!cursor.visible(), "mouse motion must not undo an app hide");
+	}
+	#[test]
+	fn image_replacement_and_active_surface_fallback_preserve_visibility() {
+		let mut cursor = CursorState::default();
+		cursor.set_image(CursorImageStatus::Named(smithay::input::pointer::CursorIcon::Crosshair));
+		assert!(cursor.visible());
+		cursor.set_image(CursorImageStatus::default_named());
+		assert!(cursor.visible());
+		cursor.set_image(CursorImageStatus::Hidden);
+		assert!(!cursor.visible());
+	}
+}

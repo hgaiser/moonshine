@@ -201,6 +201,33 @@ pub(crate) struct WindowMetadata {
 }
 
 impl WindowMetadata {
+	pub fn accepts_pointer_input(&self) -> bool {
+		self.opacity != 0 && !self.flags.contains(WindowFlags::NOTIFICATION)
+	}
+
+	pub fn excluded_from_primary_focus(&self) -> bool {
+		self.flags.intersects(
+			WindowFlags::OVERLAY
+				| WindowFlags::NOTIFICATION
+				| WindowFlags::EXTERNAL_OVERLAY
+				| WindowFlags::SYS_TRAY_ICON,
+		)
+	}
+
+	pub fn classify_steam_surface(&mut self, output_width: i32) {
+		let old_flags = self.flags;
+		let interactive = self.is_overlay && (self.geometry.size.w >= output_width || self.input_focus_mode != 0);
+		self.flags.set(WindowFlags::OVERLAY, interactive);
+		self.flags
+			.set(WindowFlags::NOTIFICATION, self.is_overlay && !interactive);
+		if self.flags != old_flags {
+			tracing::debug!(xid = ?self.x11_window_id, geometry = ?self.geometry,
+                steam_overlay = self.is_overlay, steam_input_focus = self.input_focus_mode,
+                opacity = self.opacity, old_class = ?old_flags, new_class = ?self.flags,
+                "Steam surface classification changed");
+		}
+	}
+
 	/// An opaque Steam focus identifier, not necessarily an X11 resource.
 	pub fn steam_window_id(&self) -> u32 {
 		self.x11_window_id
@@ -332,9 +359,9 @@ bitflags! {
 	/// Each flag corresponds to a gamescope `steamcompmgr_win_t` boolean field.
 	#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 	pub struct WindowFlags: u8 {
-		/// Steam overlay (STEAM_OVERLAY != 0 AND width > 1200).
+		/// Interactive Steam overlay (full output width or STEAM_INPUT_FOCUS != 0).
 		const OVERLAY = 1 << 0;
-		/// Steam notification (STEAM_OVERLAY != 0 AND width <= 1200).
+		/// Passive Steam overlay, with no interactive input request.
 		const NOTIFICATION = 1 << 1;
 		/// External overlay (GAMESCOPE_EXTERNAL_OVERLAY property).
 		const EXTERNAL_OVERLAY = 1 << 2;
@@ -455,6 +482,9 @@ pub(crate) fn is_same_app_override_decoration(candidate: &WindowMetadata, focus:
 
 /// Returns `true` if `override` is a valid override slot for `focus`.
 pub(crate) fn is_good_override_candidate(override_meta: &WindowMetadata, focus: &WindowMetadata) -> bool {
+	if override_meta.excluded_from_primary_focus() {
+		return false;
+	}
 	let rect = override_meta.geometry;
 	if is_same_app_override_decoration(override_meta, focus) {
 		return false;
@@ -512,6 +542,64 @@ impl FocusState {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn steam_notification_becomes_interactive_and_returns_to_render_only() {
+		let mut meta = WindowMetadata {
+			is_overlay: true,
+			geometry: smithay::utils::Rectangle::from_size((300, 100).into()),
+			..Default::default()
+		};
+		meta.classify_steam_surface(1920);
+		assert!(meta.flags.contains(WindowFlags::NOTIFICATION));
+		assert!(!meta.flags.contains(WindowFlags::OVERLAY));
+		meta.input_focus_mode = 2;
+		meta.classify_steam_surface(1920);
+		assert!(meta.flags.contains(WindowFlags::OVERLAY));
+		assert!(!meta.flags.contains(WindowFlags::NOTIFICATION));
+		meta.input_focus_mode = 0;
+		meta.classify_steam_surface(1920);
+		assert!(meta.flags.contains(WindowFlags::NOTIFICATION));
+		meta.is_overlay = false;
+		meta.classify_steam_surface(1920);
+		assert!(!meta.flags.intersects(WindowFlags::OVERLAY | WindowFlags::NOTIFICATION));
+	}
+	#[test]
+	fn steam_full_width_classification_tracks_virtual_output_not_magic_pixels() {
+		let mut meta = WindowMetadata {
+			is_overlay: true,
+			geometry: smithay::utils::Rectangle::from_size((800, 100).into()),
+			..Default::default()
+		};
+		meta.classify_steam_surface(800);
+		assert!(meta.flags.contains(WindowFlags::OVERLAY));
+		meta.classify_steam_surface(1920);
+		assert!(meta.flags.contains(WindowFlags::NOTIFICATION));
+	}
+
+	#[test]
+	fn passive_notification_never_becomes_game_focus_or_dropdown() {
+		let game = WindowMetadata {
+			app_id: 12345,
+			pid: 42,
+			x11_window_id: Some(10),
+			..Default::default()
+		};
+		let mut notification = WindowMetadata {
+			app_id: 12345,
+			pid: 42,
+			x11_window_id: Some(11),
+			is_overlay: true,
+			opacity: 255,
+			geometry: smithay::utils::Rectangle::from_size((300, 100).into()),
+			..Default::default()
+		};
+		notification.classify_steam_surface(1920);
+		assert!(notification.excluded_from_primary_focus());
+		assert!(!notification.accepts_pointer_input());
+		assert!(!game.excluded_from_primary_focus());
+		assert!(!is_good_override_candidate(&notification, &game));
+	}
 
 	fn make_meta(fields: &[(&str, &str)]) -> WindowMetadata {
 		let mut m = WindowMetadata::default();

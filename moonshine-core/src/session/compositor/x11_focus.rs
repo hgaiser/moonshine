@@ -410,7 +410,28 @@ pub(crate) struct FocusControl {
 /// properties to determine Steam's focus control preferences. Also
 /// provides per-window property access for app_id detection and
 /// input focus mode detection.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum RootProperty {
+	Cardinals(Vec<u32>),
+	Text(String),
+	Deleted,
+}
+
+#[derive(Default)]
+struct RootProperties(std::cell::RefCell<std::collections::HashMap<Atom, RootProperty>>);
+impl RootProperties {
+	fn changed(&self, atom: Atom, desired: RootProperty) -> bool {
+		let mut cached = self.0.borrow_mut();
+		if cached.get(&atom) == Some(&desired) {
+			return false;
+		}
+		cached.insert(atom, desired);
+		true
+	}
+}
+
 pub(crate) struct X11Focus {
+	root_properties: RootProperties,
 	dpy: *mut XDisplay,
 	/// Root window of the default screen — obtained once via XDefaultRootWindow.
 	root: Window,
@@ -528,6 +549,7 @@ impl X11Focus {
 		}
 
 		let x11_focus = Self {
+			root_properties: Default::default(),
 			dpy,
 			root,
 			atoms,
@@ -1017,11 +1039,18 @@ impl X11Focus {
 		self.read_cardinal_prop_by_atom(window_id as Window, self.atoms.steam_overlay, 0)
 	}
 
+	pub fn is_app_id_property(&self, atom: u32) -> bool {
+		[self.atoms.steam_game, self.atoms.steam_legacy_big_picture].contains(&(atom as Atom))
+	}
+	pub fn is_external_overlay_property(&self, atom: u32) -> bool {
+		self.atoms.gamescope_external_overlay == atom as Atom
+	}
 	pub fn is_overlay_property(&self, atom: u32) -> bool {
 		[
 			self.atoms.steam_overlay,
 			self.atoms.steam_input_focus,
 			self.atoms.net_wm_window_opacity,
+			self.atoms.gamescope_external_overlay,
 		]
 		.contains(&(atom as Atom))
 	}
@@ -1160,6 +1189,9 @@ impl X11Focus {
 	/// and GAMESCOPE_FOCUSABLE_WINDOWS to the root window so Steam knows
 	/// which window/app is focused and which are focusable (controller routing).
 	fn write_cardinal_prop(&self, window_id: Window, atom: Atom, value: u32) {
+		if !self.root_property_changed(window_id, atom, RootProperty::Cardinals(vec![value])) {
+			return;
+		}
 		if self.dpy.is_null() {
 			return;
 		}
@@ -1192,6 +1224,9 @@ impl X11Focus {
 
 	/// Write a UTF-8 string property to a window (format 8).
 	fn write_utf8_prop(&self, window_id: Window, atom: Atom, value: &str) {
+		if !self.root_property_changed(window_id, atom, RootProperty::Text(value.to_owned())) {
+			return;
+		}
 		if self.dpy.is_null() {
 			return;
 		}
@@ -1219,6 +1254,9 @@ impl X11Focus {
 
 	/// Write an array of CARDINAL (format-32) values to a window property.
 	fn write_cardinal_array(&self, window_id: Window, atom: Atom, values: &[u32]) {
+		if !self.root_property_changed(window_id, atom, RootProperty::Cardinals(values.to_vec())) {
+			return;
+		}
 		if self.dpy.is_null() || values.is_empty() {
 			return;
 		}
@@ -1251,6 +1289,9 @@ impl X11Focus {
 
 	/// Delete a window property.
 	fn delete_property(&self, window_id: Window, atom: Atom) {
+		if !self.root_property_changed(window_id, atom, RootProperty::Deleted) {
+			return;
+		}
 		if self.dpy.is_null() {
 			return;
 		}
@@ -1291,14 +1332,8 @@ impl X11Focus {
 
 	/// Write the gamescope focus contract (FOCUSED_APP/GFX/WINDOW + displays)
 	/// so Steam's controller routing targets the focused window.
-	pub fn set_focused_window_contract(&self, app_id: u32, window_id: u32) {
-		if app_id != 0 {
-			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app, app_id);
-			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_app_gfx, app_id);
-		} else {
-			self.delete_property(self.root, self.atoms.gamescope_focused_app);
-			self.delete_property(self.root, self.atoms.gamescope_focused_app_gfx);
-		}
+	pub fn set_focus_contract(&self, input_app_id: u32, gfx_app_id: u32, window_id: u32) {
+		self.set_focused_app_split(input_app_id, gfx_app_id);
 		if window_id != 0 {
 			self.write_cardinal_prop(self.root, self.atoms.gamescope_focused_window, window_id);
 		} else {
@@ -1311,6 +1346,13 @@ impl X11Focus {
 			self.atoms.gamescope_keyboard_focus_display,
 			&self.display_name,
 		);
+	}
+
+	fn root_property_changed(&self, window: Window, atom: Atom, desired: RootProperty) -> bool {
+		if window != self.root {
+			return true;
+		}
+		self.root_properties.changed(atom, desired)
 	}
 
 	/// Write GAMESCOPE_FOCUSED_APP and FOCUSED_APP_GFX with potentially
@@ -1459,5 +1501,37 @@ impl Drop for X11Focus {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod property_diff_tests {
+	use super::*;
+	#[test]
+	fn notification_lifecycle_does_not_rewrite_unchanged_focus_contract() {
+		let cache = RootProperties::default();
+		// App, gfx app, window, focusable apps, and focusable window triplets.
+		let contract = [
+			RootProperty::Cardinals(vec![12345]),
+			RootProperty::Cardinals(vec![12345]),
+			RootProperty::Cardinals(vec![10]),
+			RootProperty::Cardinals(vec![12345]),
+			RootProperty::Cardinals(vec![10, 12345, 42]),
+		];
+		for (i, desired) in contract.iter().enumerate() {
+			assert!(cache.changed(i as Atom, desired.clone()));
+		}
+		for _notification_phase in ["map", "update", "unmap"] {
+			for (i, desired) in contract.iter().enumerate() {
+				assert!(!cache.changed(i as Atom, desired.clone()));
+			}
+		}
+		// Interactive overlay changes only input app; closing restores the game.
+		assert!(cache.changed(0, RootProperty::Cardinals(vec![769])));
+		assert!(!cache.changed(1, contract[1].clone()));
+		assert!(cache.changed(0, contract[0].clone()));
+		assert!(cache.changed(3, RootProperty::Deleted));
+		assert!(!cache.changed(3, RootProperty::Deleted));
+		assert!(cache.changed(3, contract[3].clone()));
 	}
 }

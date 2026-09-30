@@ -65,6 +65,12 @@ use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColor
 /// `sync_channel(2)` and one is being processed by the encoder.
 const BUFFER_POOL_SIZE: usize = 3;
 
+/// Visual layers in back-to-front order; independent of input targets.
+struct SceneLayers<'a> {
+	decorations: &'a [smithay::desktop::Window],
+	upper: [Option<&'a smithay::desktop::Window>; 5],
+}
+
 /// A pre-allocated GBM buffer slot in the compositor's buffer pool.
 pub(crate) struct GbmBufferSlot {
 	/// The exported DMA-BUF kept alive for the lifetime of the pool.
@@ -78,48 +84,50 @@ pub(crate) struct GbmBufferSlot {
 // We use GlesRenderer concretely (no generics) to avoid complex trait bound issues.
 pub(crate) enum OutputRenderElements {
 	Space(SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>),
+	/// A root swapchain that explicitly declared VK_COMPOSITE_ALPHA_OPAQUE.
+	OpaqueSpace(SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>),
 	Pointer(PointerRenderElement<GlesRenderer>),
 }
 
 impl Element for OutputRenderElements {
 	fn id(&self) -> &Id {
 		match self {
-			Self::Space(e) => e.id(),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.id(),
 			Self::Pointer(e) => e.id(),
 		}
 	}
 
 	fn current_commit(&self) -> CommitCounter {
 		match self {
-			Self::Space(e) => e.current_commit(),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.current_commit(),
 			Self::Pointer(e) => e.current_commit(),
 		}
 	}
 
 	fn geometry(&self, scale: smithay::utils::Scale<f64>) -> smithay::utils::Rectangle<i32, smithay::utils::Physical> {
 		match self {
-			Self::Space(e) => e.geometry(scale),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.geometry(scale),
 			Self::Pointer(e) => e.geometry(scale),
 		}
 	}
 
 	fn src(&self) -> smithay::utils::Rectangle<f64, smithay::utils::Buffer> {
 		match self {
-			Self::Space(e) => e.src(),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.src(),
 			Self::Pointer(e) => e.src(),
 		}
 	}
 
 	fn location(&self, scale: smithay::utils::Scale<f64>) -> smithay::utils::Point<i32, smithay::utils::Physical> {
 		match self {
-			Self::Space(e) => e.location(scale),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.location(scale),
 			Self::Pointer(e) => e.location(scale),
 		}
 	}
 
 	fn transform(&self) -> smithay::utils::Transform {
 		match self {
-			Self::Space(e) => e.transform(),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.transform(),
 			Self::Pointer(e) => e.transform(),
 		}
 	}
@@ -130,28 +138,31 @@ impl Element for OutputRenderElements {
 		commit: Option<CommitCounter>,
 	) -> DamageSet<i32, smithay::utils::Physical> {
 		match self {
-			Self::Space(e) => e.damage_since(scale, commit),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.damage_since(scale, commit),
 			Self::Pointer(e) => e.damage_since(scale, commit),
 		}
 	}
 
 	fn opaque_regions(&self, scale: smithay::utils::Scale<f64>) -> OpaqueRegions<i32, smithay::utils::Physical> {
 		match self {
-			Self::Space(e) => e.opaque_regions(scale),
+			Self::OpaqueSpace(e) if e.alpha() == 1.0 => {
+				std::iter::once(smithay::utils::Rectangle::from_size(e.geometry(scale).size)).collect()
+			},
+			Self::Space(e) | Self::OpaqueSpace(e) => e.opaque_regions(scale),
 			Self::Pointer(e) => e.opaque_regions(scale),
 		}
 	}
 
 	fn alpha(&self) -> f32 {
 		match self {
-			Self::Space(e) => e.alpha(),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.alpha(),
 			Self::Pointer(e) => e.alpha(),
 		}
 	}
 
 	fn kind(&self) -> smithay::backend::renderer::element::Kind {
 		match self {
-			Self::Space(e) => e.kind(),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.kind(),
 			Self::Pointer(e) => e.kind(),
 		}
 	}
@@ -168,7 +179,7 @@ impl RenderElement<GlesRenderer> for OutputRenderElements {
 		cache: Option<&smithay::utils::user_data::UserDataMap>,
 	) -> Result<(), GlesError> {
 		match self {
-			Self::Space(e) => e.draw(frame, src, dst, damage, opaque_regions, cache),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.draw(frame, src, dst, damage, opaque_regions, cache),
 			Self::Pointer(e) => e.draw(frame, src, dst, damage, opaque_regions, cache),
 		}
 	}
@@ -178,7 +189,7 @@ impl RenderElement<GlesRenderer> for OutputRenderElements {
 		renderer: &mut GlesRenderer,
 	) -> Option<smithay::backend::renderer::element::UnderlyingStorage<'_>> {
 		match self {
-			Self::Space(e) => e.underlying_storage(renderer),
+			Self::Space(e) | Self::OpaqueSpace(e) => e.underlying_storage(renderer),
 			Self::Pointer(e) => e.underlying_storage(renderer),
 		}
 	}
@@ -241,15 +252,17 @@ pub(crate) struct MoonshineCompositor {
 
 	// -- Cursor --
 	pub cursor_position: Point<f64, Logical>,
-	pub cursor_status: CursorImageStatus,
+	pub cursor: super::cursor::CursorState,
 	pub pointer_element: PointerElement,
-	pub last_pointer_activity: Option<std::time::Instant>,
+    pub capture_mode: super::CaptureMode,
+    capture_path: Option<&'static str>,
 	pub pen_tablet_descriptor: TabletDescriptor,
 	pub active_pen_tool_kind: Option<u8>,
 	pub pen_buttons: u8,
 
 	// -- Desktop --
 	pub space: Space<smithay::desktop::Window>,
+    pub popups: smithay::desktop::PopupManager,
 	pub clock: Clock<Monotonic>,
 
 	// -- Lifecycle --
@@ -292,10 +305,8 @@ pub(crate) struct MoonshineCompositor {
 	pub last_cursor_position: Point<f64, Logical>,
 
 	// -- Steam overlay z-order --
-	/// True while the Steam overlay window is raised above the game.
-	pub overlay_raised: bool,
-	/// X11 window ID of the raised overlay window (to lower it on close).
-	pub overlay_z_x11_window: Option<u32>,
+	/// True while Steam requests interactive overlay input.
+	pub steam_overlay_input_active: bool,
 
 	// -- Extended protocols --
 	pub viewporter_state: smithay::wayland::viewporter::ViewporterState,
@@ -383,11 +394,11 @@ pub(crate) struct MoonshineCompositor {
 	/// Gamescope: `focus_t::decorationWindows`.
 	pub decoration_windows: Vec<smithay::desktop::Window>,
 
-	/// Currently active Steam overlay window (width > 1200 + STEAM_OVERLAY).
+	/// Currently classified interactive Steam overlay window.
 	/// Gamescope: `focus_t::overlayWindow` — the main Steam overlay window.
 	pub overlay_window: Option<smithay::desktop::Window>,
 
-	/// Currently active Steam notification window (width <= 1200 + STEAM_OVERLAY).
+	/// Currently classified passive Steam notification window.
 	/// Gamescope: `focus_t::notificationWindow` — small Steam notification popups.
 	pub notification_window: Option<smithay::desktop::Window>,
 
@@ -578,6 +589,7 @@ impl MoonshineCompositor {
 		steam_mode: bool,
 		virtual_connector_strategy: super::VirtualConnectorStrategy,
 		keyboard_config: KeyboardConfig,
+		capture_mode: super::CaptureMode,
 	) -> (Self, Display<Self>) {
 		let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
 		let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -743,13 +755,15 @@ impl MoonshineCompositor {
 				seat,
 				pending_text: String::new(),
 				cursor_position: initial_cursor_position,
-				cursor_status: CursorImageStatus::default_named(),
+				cursor: Default::default(),
 				pointer_element,
-				last_pointer_activity: None,
+				capture_mode,
+				capture_path: None,
 				pen_tablet_descriptor,
 				active_pen_tool_kind: None,
 				pen_buttons: 0,
 				space,
+				popups: Default::default(),
 				clock,
 				handle,
 				width,
@@ -767,8 +781,7 @@ impl MoonshineCompositor {
 				last_frame_sent_at: std::time::Instant::now(),
 				overlay_dirty: true,
 				last_cursor_position: initial_cursor_position,
-				overlay_raised: false,
-				overlay_z_x11_window: None,
+				steam_overlay_input_active: false,
 				viewporter_state,
 				color_management,
 				deferred_info_done: Vec::new(),
@@ -827,66 +840,99 @@ impl MoonshineCompositor {
 		space: &Space<smithay::desktop::Window>,
 		output: &Output,
 		override_surface: Option<(&WlSurface, u32)>,
-		decoration_windows: &[smithay::desktop::Window],
-		override_underlay_window: Option<&smithay::desktop::Window>,
-	) -> Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>> {
+		layers: SceneLayers<'_>,
+		opacity: impl Fn(&smithay::desktop::Window) -> f32,
+	) -> Vec<OutputRenderElements> {
 		let output_scale = output.current_scale().fractional_scale();
 		let scale = smithay::utils::Scale::from(output_scale);
 		let Some(output_geo) = space.output_geometry(output) else {
 			return Vec::new();
 		};
 
-		let mut render_window =
-			|elements: &mut Vec<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>,
-			 window: &smithay::desktop::Window| {
-				let location = (window.geometry().loc - output_geo.loc).to_physical_precise_round(scale);
+		let mut render_window = |elements: &mut Vec<OutputRenderElements>, window: &smithay::desktop::Window| {
+			let alpha = opacity(window);
+			if alpha == 0.0 {
+				return;
+			}
+			let location = (window.geometry().loc - output_geo.loc).to_physical_precise_round(scale);
 
-				let overridden = override_surface.and_then(|(surface, xid)| {
-					window
-						.x11_surface()
-						.is_some_and(|x| x.window_id() == xid)
-						.then_some(surface)
-				});
+			let overridden = override_surface.and_then(|(surface, xid)| {
+				window
+					.x11_surface()
+					.is_some_and(|x| x.window_id() == xid)
+					.then_some(surface)
+			});
 
-				if let Some(surface) = overridden {
-					elements.extend(render_elements_from_surface_tree(
-						renderer,
-						surface,
-						location,
-						scale,
-						1.0,
-						Kind::Unspecified,
-					));
+			let root = overridden
+				.cloned()
+				.or_else(|| window.wl_surface().map(|s| s.into_owned()));
+			let opaque_id = root
+				.as_ref()
+				.filter(|surface| super::gamescope_swapchain::surface_is_opaque(surface))
+				.map(Id::from_wayland_resource);
+			let wrap = |element: SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>| {
+				if opaque_id.as_ref() == Some(element.id()) {
+					OutputRenderElements::OpaqueSpace(element)
 				} else {
-					elements.extend(
-						window
-							.render_elements::<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>(
-								renderer, location, scale, 1.0,
-							),
-					);
+					OutputRenderElements::Space(element)
 				}
 			};
+			if let Some(surface) = overridden {
+				elements.extend(
+					render_elements_from_surface_tree::<
+						_,
+						SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+					>(renderer, surface, location, scale, alpha, Kind::Unspecified)
+					.into_iter()
+					.map(wrap),
+				);
+			} else {
+				elements.extend(
+					window
+						.render_elements::<SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>>(
+							renderer, location, scale, alpha,
+						)
+						.into_iter()
+						.map(wrap),
+				);
+			}
+		};
 
-		// Paint order, back to front. `Space::elements()` is back to front.
+		// Preserve space order for ordinary windows, then paint classified
+		// layers. Dropdowns and Steam surfaces must remain above decorations.
 		let mut paint_order: Vec<&smithay::desktop::Window> = space
 			.elements()
-			// Decorations and the carried override underlay are painted on top.
-			.filter(|window| !decoration_windows.contains(window) && override_underlay_window != Some(*window))
+			.filter(|window| !layers.decorations.contains(window) && !layers.upper.contains(&Some(*window)))
 			.collect();
-
-		// Same-app decorations ride above the focus window; the underlay sits
-		// between them and the override.
-		paint_order.extend(
-			decoration_windows
-				.iter()
-				.chain(override_underlay_window.iter().copied())
-				.filter(|window| space.elements().any(|e| e == *window)),
-		);
+		for window in layers.decorations.iter().chain(layers.upper.into_iter().flatten()) {
+			if space.elements().any(|w| w == window) && !paint_order.contains(&window) {
+				paint_order.push(window);
+			}
+		}
 
 		// Render elements are front to back (the topmost comes first).
 		let mut elements = Vec::new();
 		for window in paint_order.into_iter().rev() {
 			render_window(&mut elements, window);
+		}
+
+		if let Some((surface, 0)) = override_surface {
+			let opaque = super::gamescope_swapchain::surface_is_opaque(surface);
+			let root_id = Id::from_wayland_resource(surface);
+			elements.extend(
+				render_elements_from_surface_tree::<
+					_,
+					SpaceRenderElements<GlesRenderer, WaylandSurfaceRenderElement<GlesRenderer>>,
+				>(renderer, surface, (0, 0), scale, 1.0, Kind::Unspecified)
+				.into_iter()
+				.map(|element| {
+					if opaque && element.id() == &root_id {
+						OutputRenderElements::OpaqueSpace(element)
+					} else {
+						OutputRenderElements::Space(element)
+					}
+				}),
+			);
 		}
 
 		elements
@@ -1020,123 +1066,150 @@ impl MoonshineCompositor {
 		.flatten()
 	}
 
-	/// Raise/lower the Steam overlay above/below the game when `STEAM_OVERLAY`
-	/// changes.
-	///
-	/// Event-driven: smithay forwards the `STEAM_OVERLAY` property change to
-	/// `property_notify` as `WmWindowProperty::Other`, which sets
-	/// `overlay_dirty`. We scan (limited to wide X11 windows, gamescope's
-	/// `isOverlay` rule) only on that event, so gameplay never pays a blocking
-	/// X11 roundtrip.
+	/// Visual stacking consumes classified state and never changes input focus.
 	fn update_overlay_z_order(&mut self) {
 		if !self.overlay_dirty {
 			return;
 		}
 		self.overlay_dirty = false;
-		let Some(xf) = self.x11_focus.as_ref() else { return };
+		// Restore the primary scene below all classified compositor overlays.
+		if let Some(window) = &self.focused_window {
+			self.space.raise_element(window, false);
+		}
+		for window in [
+			self.overlay_window.clone(),
+			self.notification_window.clone(),
+			self.external_overlay_window.clone(),
+		]
+		.into_iter()
+		.flatten()
+		{
+			if self.space.elements().any(|w| w == &window) {
+				self.space.raise_element(&window, false);
+			}
+		}
+		self.screen_dirty = true;
+	}
 
-		// A wide X11 window Steam currently flags as overlay (STEAM_OVERLAY).
-		let active_overlay = self
+	pub(crate) fn set_cursor_image(&mut self, image: CursorImageStatus) {
+		let changed = self.cursor.image != image;
+		let was_visible = self.cursor.visible();
+		self.cursor.set_image(image);
+		if changed || was_visible != self.cursor.visible() {
+			tracing::debug!(image = ?self.cursor.image, was_visible, visible = self.cursor.visible(), "Cursor state changed");
+		}
+		self.screen_dirty = true;
+	}
+
+	fn cursor_visible(&self) -> bool {
+		self.cursor.visible()
+	}
+
+	fn record_capture_path(&mut self, path: &'static str) {
+		if self.capture_path != Some(path) {
+			tracing::debug!(capture_path = path, "Capture path changed");
+			self.capture_path = Some(path);
+		}
+	}
+
+	/// One buffer must reproduce the complete scene, independently of focus.
+	fn can_direct_scanout_scene(&self) -> bool {
+		let extras = super::capture::SceneExtras {
+			cursor: self.cursor_visible(),
+			steam_overlay: self.overlay_window.is_some(),
+			steam_notification: self.notification_window.is_some(),
+			external_overlay: self.external_overlay_window.is_some(),
+			dropdown: self.override_window.is_some(),
+			decoration: !self.decoration_windows.is_empty() || self.override_underlay_window.is_some(),
+			scaling: self.compute_output_scale().is_some() || self.output.current_scale().fractional_scale() != 1.0,
+		};
+		if extras.requires_composition(self.capture_mode) {
+			return false;
+		}
+		// A standalone native override has no X11 scene window.
+		if self.space.elements().next().is_none() {
+			return self.override_surface.as_ref().is_some_and(|(surface, xid)| {
+				*xid == 0 && surface.alive() && self.surface_is_complete_output(surface)
+			});
+		}
+		let Some(window) = self
 			.space
 			.elements()
-			.filter(|w| w.geometry().size.w > 1200 && w.x11_surface().is_some())
-			.find(|w| {
-				w.x11_surface()
-					.map(|x| xf.get_steam_overlay_value(x.window_id()) != 0)
-					.unwrap_or(false)
-			})
-			.cloned();
-
-		let Some(overlay) = active_overlay else {
-			// Overlay closed (or not open): restore the game above it.
-			if self.overlay_raised {
-				let raised_xid = self.overlay_z_x11_window;
-				tracing::debug!(
-					xid = ?raised_xid,
-					"overlay-lower: STEAM_OVERLAY cleared — restoring game above overlay"
-				);
-				self.overlay_raised = false;
-				self.overlay_z_x11_window = None;
-				// Re-raise the game window (app_id != 0) above the overlay.
-				let game = self
-					.space
-					.elements()
-					.filter(|w| w.x11_surface().is_none_or(|x| Some(x.window_id()) != raised_xid))
-					.find(|w| {
-						self.window_metadata
-							.get(w)
-							.is_some_and(|m| m.app_id != 0 && m.app_id != super::x11_focus::STEAM_BIG_PICTURE_APPID)
-					})
-					.cloned();
-				if let Some(game) = game {
-					self.space.raise_element(&game, false);
-					// Restore the focus contract to the game.
-					if let Some(xf) = self.x11_focus.as_ref() {
-						let app_id = self.window_metadata.get(&game).map(|m| m.app_id).unwrap_or(0);
-						let window_id = self
-							.window_metadata
-							.get(&game)
-							.map(|m| m.steam_window_id())
-							.unwrap_or(0);
-						xf.set_focused_window_contract(app_id, window_id);
-					}
-					// Reverse the activation handoff: deactivate the overlay,
-					// reactivate the game.
-					if let Some(overlay) = self
-						.space
-						.elements()
-						.find(|w| w.x11_surface().is_some_and(|x| Some(x.window_id()) == raised_xid))
-						.cloned()
-					{
-						overlay.set_activated(false);
-					}
-					game.set_activated(true);
-				}
-				self.screen_dirty = true;
-				// Rebuild the focusable lists: the overlay is no longer raised,
-				// so BPM (769) is focusable again (gamescope restores it).
-				self.reevaluate_focus();
-			}
-			return;
+			.rfind(|w| self.window_metadata.get(*w).is_none_or(|m| m.opacity != 0))
+		else {
+			return false;
 		};
-
-		let xid = overlay.x11_surface().map(|x| x.window_id()).unwrap_or(u32::MAX);
-		if self.overlay_z_x11_window != Some(xid) {
-			tracing::debug!(xid, "overlay-raise: STEAM_OVERLAY=1 — raising overlay above game");
-			self.space.raise_element(&overlay, false);
-			self.overlay_raised = true;
-			self.overlay_z_x11_window = Some(xid);
-			// Find the game window (non-overlay window with a valid app_id).
-			let game = self
-				.space
-				.elements()
-				.filter(|w| w.x11_surface().is_none_or(|x| x.window_id() != xid))
-				.find(|w| {
-					self.window_metadata
-						.get(w)
-						.is_some_and(|m| m.app_id != 0 && m.app_id != super::x11_focus::STEAM_BIG_PICTURE_APPID)
-				})
-				.cloned();
-			let game_app_id = game
-				.as_ref()
-				.and_then(|g| self.window_metadata.get(g))
-				.map(|m| m.app_id)
-				.unwrap_or(0);
-			// Split: input goes to the overlay (769), rendering stays on the game.
-			if let Some(xf) = self.x11_focus.as_ref() {
-				xf.set_focused_app_split(super::x11_focus::STEAM_BIG_PICTURE_APPID, game_app_id);
-			}
-			// Activation handoff: deactivate the game, activate the overlay.
-			if let Some(ref game) = game {
-				game.set_activated(false);
-			}
-			overlay.set_activated(true);
-			self.screen_dirty = true;
-			// Rebuild the focusable lists: while the overlay is raised, BPM (769)
-			// is excluded so Steam routes the gamepad to the overlay, not to BPM.
-			// Native gamescope writes focusable_apps=[game] during the overlay.
-			self.reevaluate_focus();
+		if self
+			.space
+			.element_geometry(window)
+			.is_none_or(|geo| geo.loc != Point::from((0, 0)))
+		{
+			return false;
 		}
+		if self.window_metadata.get(window).is_some_and(|m| m.opacity != 255) {
+			return false;
+		}
+		let source = if self.is_override_active() {
+			let Some((surface, xid)) = &self.override_surface else {
+				return false;
+			};
+			if window.x11_surface().is_none_or(|x| x.window_id() != *xid) {
+				return false;
+			}
+			surface.clone()
+		} else {
+			let Some(surface) = window.wl_surface() else {
+				return false;
+			};
+			surface.into_owned()
+		};
+		if smithay::desktop::PopupManager::popups_for_surface(&source)
+			.next()
+			.is_some()
+		{
+			return false;
+		}
+		self.surface_is_complete_output(&source)
+	}
+
+	/// A transformed/cropped tree cannot be represented by its root DMA-BUF.
+	fn surface_is_complete_output(&self, surface: &WlSurface) -> bool {
+		let output = self.output_rect();
+		let declared_opaque = super::gamescope_swapchain::surface_is_opaque(surface);
+		let root_valid = with_renderer_surface_state(surface, |state| {
+			let Some(view) = state.view() else {
+				return false;
+			};
+			super::capture::surface_view_is_direct(view, state.buffer_scale(), state.buffer_transform(), output.size)
+				&& (declared_opaque
+					|| state
+						.opaque_regions()
+						.is_some_and(|regions| regions.iter().any(|r| r.contains_rect(output))))
+		})
+		.unwrap_or(false);
+		if !root_valid {
+			return false;
+		}
+		let mut extra_content = false;
+		compositor::with_surface_tree_downward(
+			surface,
+			(),
+			|_, _, &()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+			|child, states, &()| {
+				// Tree callbacks already hold the surface-state lock. Read
+				// renderer data directly instead of re-entering with_states.
+				if child != surface
+					&& states
+						.data_map
+						.get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+						.is_some_and(|state| state.lock().unwrap().buffer().is_some())
+				{
+					extra_content = true;
+				}
+			},
+			|_, _, &()| true,
+		);
+		!extra_content
 	}
 
 	/// Render the current scene and export the frame to the encoder.
@@ -1147,6 +1220,14 @@ impl MoonshineCompositor {
 		// Must run before the static-screen early return so the raise/lower
 		// is detected as soon as the overlay window commits a frame.
 		self.update_overlay_z_order();
+
+		if self.cursor.reset_dead_surface() {
+			tracing::debug!(
+				visible = self.cursor.visible(),
+				"Cursor surface destroyed; using active fallback"
+			);
+			self.screen_dirty = true;
+		}
 
 		// Detect cursor-only movement as a screen change.
 		if self.cursor_position != self.last_cursor_position {
@@ -1185,22 +1266,14 @@ impl MoonshineCompositor {
 		//
 		// Direct scanout bypasses GLES, so skip it while an actually-drawn
 		// cursor (not client-hidden) needs compositing.
-		let pointer_active = self
-			.last_pointer_activity
-			.is_some_and(|t| t.elapsed() <= std::time::Duration::from_secs(3));
-		let cursor_visible = pointer_active && !matches!(self.cursor_status, CursorImageStatus::Hidden);
-		// While a Steam overlay is raised we must composite it together with the
-		// game (gamescope's `paint_all`), so direct scanout — which bypasses the
-		// space — is disabled.
-		let overlay_raised = self.overlay_raised;
-		if !cursor_visible && !overlay_raised {
+		if self.can_direct_scanout_scene() {
 			if self.is_override_active() {
 				if self.try_direct_scanout_override() {
-					tracing::trace!("Frame via direct scanout (override path)");
+					self.record_capture_path("direct_override");
 					return;
 				}
 			} else if self.try_direct_scanout() {
-				tracing::trace!("Frame via direct scanout (not override path)");
+				self.record_capture_path("direct");
 				return;
 			}
 		}
@@ -1214,6 +1287,8 @@ impl MoonshineCompositor {
 			tracing::trace!("Buffer {idx} still in use by encoder, skipping frame");
 			return;
 		}
+
+		self.record_capture_path("composited");
 
 		// Mark the buffer as in-use before rendering.
 		self.buffer_pool[idx].consumed.store(false, Ordering::Release);
@@ -1256,6 +1331,13 @@ impl MoonshineCompositor {
 			tracing::debug!("Failed to set downscale filter: {e}");
 		}
 
+		// Cursor lifetime is handled before scanout/static-screen decisions.
+		let cursor_status = if self.cursor_visible() {
+			self.cursor.image.clone()
+		} else {
+			CursorImageStatus::Hidden
+		};
+
 		// Bind the pre-allocated Dmabuf as a render target.
 		let bind_result = self.renderer.bind(&mut self.buffer_pool[idx].dmabuf);
 		let mut framebuffer = match bind_result {
@@ -1268,26 +1350,6 @@ impl MoonshineCompositor {
 		};
 
 		let num_space_elements = self.space.elements().count();
-
-		// Build cursor render elements.
-		// Reset to the default named cursor if the client cursor surface is dead.
-		let mut reset = false;
-		if let CursorImageStatus::Surface(ref surface) = self.cursor_status {
-			reset = !surface.alive();
-		}
-		if reset {
-			self.cursor_status = CursorImageStatus::default_named();
-		}
-
-		// Hide cursor if no pointer activity yet or inactive for 3 seconds.
-		let cursor_status = if self
-			.last_pointer_activity
-			.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(3))
-		{
-			CursorImageStatus::Hidden
-		} else {
-			self.cursor_status.clone()
-		};
 
 		self.pointer_element.set_status(cursor_status.clone());
 
@@ -1337,10 +1399,24 @@ impl MoonshineCompositor {
 			&self.space,
 			&self.output,
 			override_target.as_ref().map(|(s, w)| (s, *w)),
-			&self.decoration_windows,
-			self.override_underlay_window.as_ref(),
+			SceneLayers {
+				decorations: &self.decoration_windows,
+				upper: [
+					self.override_underlay_window.as_ref(),
+					self.override_window.as_ref(),
+					self.overlay_window.as_ref(),
+					self.notification_window.as_ref(),
+					self.external_overlay_window.as_ref(),
+				],
+			},
+			|window| {
+				self.window_metadata
+					.get(window)
+					.map(|m| m.opacity as f32 / 255.0)
+					.unwrap_or(1.0)
+			},
 		);
-		elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
+		elements.extend(space_elements);
 
 		tracing::trace!(
 			num_space_elements,
@@ -1524,34 +1600,30 @@ impl MoonshineCompositor {
 	/// reduces GPU usage and latency.
 	///
 	/// Conditions for direct scanout:
-	/// - Exactly one window in the compositor space
+	/// - An opaque root exactly covers the output, with no extra visible content
 	/// - The window's committed buffer is a DMA-BUF (not SHM)
 	fn try_direct_scanout(&mut self) -> bool {
-		// Must have exactly one window, no overlapping surfaces.
-		let windows: Vec<_> = self.space.elements().cloned().collect();
-		if windows.len() != 1 {
-			tracing::trace!("Direct scanout: {} windows (need 1)", windows.len());
+		// Scene eligibility has proved that this opaque top window covers all
+		// other windows. Clone just the candidate, without a per-frame Vec.
+		let Some(window) = self
+			.space
+			.elements()
+			.rfind(|w| self.window_metadata.get(*w).is_none_or(|m| m.opacity != 0))
+			.cloned()
+		else {
 			return false;
-		}
-
-		let window = &windows[0];
-		let toplevel = match window.toplevel() {
-			Some(t) => t,
-			None => {
-				tracing::trace!("Direct scanout: window has no toplevel");
-				return false;
-			},
 		};
-
-		// The window must be positioned at the origin to avoid an offset frame.
-		if let Some(geo) = self.space.element_geometry(window)
-			&& geo.loc != Point::from((0, 0))
+		// Retain the origin safeguard inside the technical export path too.
+		if self
+			.space
+			.element_geometry(&window)
+			.is_none_or(|geo| geo.loc != Point::from((0, 0)))
 		{
-			tracing::trace!("Direct scanout: window not at origin ({:?})", geo.loc);
 			return false;
 		}
-
-		let wl_surface = toplevel.wl_surface().clone();
+		let Some(wl_surface) = window.wl_surface().map(|s| s.into_owned()) else {
+			return false;
+		};
 
 		// Get the committed buffer and check if it's a DMA-BUF.
 		let scanout_buffer = with_renderer_surface_state(&wl_surface, |state| {
@@ -1991,7 +2063,13 @@ impl MoonshineCompositor {
 	pub fn notify_dropdown(&mut self, window: smithay::desktop::Window, x: i32, y: i32) -> bool {
 		// Don't register dropdown if it conflicts with notification or
 		// external overlay windows. Gamescope keeps these separate.
-		if self.notification_window.as_ref() == Some(&window) {
+		if self.window_metadata.get(&window).is_some_and(|m| {
+			m.flags.intersects(
+				super::focus::WindowFlags::NOTIFICATION
+					| super::focus::WindowFlags::OVERLAY
+					| super::focus::WindowFlags::EXTERNAL_OVERLAY,
+			)
+		}) {
 			tracing::debug!(
 				target: "focus",
 				window_id = window.x11_surface().map(|x| x.window_id()),

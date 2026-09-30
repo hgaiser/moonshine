@@ -4,6 +4,7 @@
 //! with an in-process Smithay compositor. Frames are rendered to GBM-backed
 //! DMA-BUFs and exported directly to the video encoder.
 
+mod capture;
 mod color_management;
 mod cursor;
 mod focus;
@@ -82,12 +83,23 @@ impl VirtualConnectorStrategy {
 	}
 }
 
+/// Select complete-scene capture; auto preserves the zero-copy fast path.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CaptureMode {
+	#[default]
+	Auto,
+	Composited,
+}
+
 /// Configuration for the embedded headless compositor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CompositorConfig {
 	/// Optional GPU device identifier for compositor rendering.
 	pub gpu: Option<String>,
+	/// Automatic direct export, or forced composition for compatibility diagnosis.
+	pub capture_mode: CaptureMode,
 
 	/// Whether to enable HDR mode in the compositor if the client supports it.
 	pub hdr: bool,
@@ -110,6 +122,7 @@ impl Default for CompositorConfig {
 	fn default() -> Self {
 		Self {
 			gpu: None,
+			capture_mode: CaptureMode::Auto,
 			hdr: true,
 			steam_mode: true,
 			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
@@ -472,6 +485,7 @@ fn run_compositor(
 		config.steam_mode,
 		config.virtual_connector_strategy,
 		config.keyboard.clone(),
+		config.capture_mode,
 	);
 
 	// Insert the Wayland display as a calloop event source so client

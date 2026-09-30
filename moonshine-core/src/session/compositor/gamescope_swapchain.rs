@@ -19,6 +19,34 @@ use crate::session::compositor::protocols::moonshine_swapchain::MoonshineSwapcha
 use crate::session::compositor::protocols::moonshine_swapchain_factory_v2::MoonshineSwapchainFactoryV2;
 use crate::session::compositor::state::MoonshineCompositor;
 
+/// Vulkan OPAQUE ignores buffer alpha even when the driver exports an A-format.
+/// Store the declaration on the surface; no property query is needed per frame.
+#[derive(Default)]
+struct CompositeAlpha(std::sync::atomic::AtomicBool);
+
+pub(super) fn surface_is_opaque(surface: &WlSurface) -> bool {
+	smithay::wayland::compositor::with_states(surface, |states| {
+		states
+			.data_map
+			.get::<CompositeAlpha>()
+			.is_some_and(|alpha| alpha.0.load(std::sync::atomic::Ordering::Relaxed))
+	})
+}
+
+fn set_composite_alpha(surface: &WlSurface, vk_composite_alpha: u32) -> bool {
+	smithay::wayland::compositor::with_states(surface, |states| {
+		states.data_map.insert_if_missing(CompositeAlpha::default);
+		let opaque = vk_composite_alpha == 1;
+		states
+			.data_map
+			.get::<CompositeAlpha>()
+			.unwrap()
+			.0
+			.swap(opaque, std::sync::atomic::Ordering::Relaxed)
+			!= opaque
+	})
+}
+
 // ---------------------------------------------------------------------------
 // User data
 // ---------------------------------------------------------------------------
@@ -215,8 +243,16 @@ macro_rules! dispatch_swapchain {
 			req_mod::Request::SwapchainFeedback {
 				vk_colorspace,
 				vk_format,
+				vk_composite_alpha,
 				..
 			} => {
+				if set_composite_alpha(&$data.surface, vk_composite_alpha) {
+					// The same buffer now blends differently; invalidate the
+					// damage history once, without adding a frame-time policy.
+					$state.damage_tracker =
+						smithay::backend::renderer::damage::OutputDamageTracker::from_output(&$state.output);
+					$state.screen_dirty = true;
+				}
 				let (hi, lo) = handle_swapchain_feedback($state, &$data.surface, vk_colorspace, vk_format);
 				$resource.refresh_cycle(hi, lo);
 			},

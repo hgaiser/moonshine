@@ -447,6 +447,14 @@ impl CompositorHandler for MoonshineCompositor {
 
 	fn destroyed(&mut self, surface: &WlSurface) {
 		tracing::debug!(surface_id = ?surface.id(), "surface destroyed");
+		self.popups.cleanup();
+		self.screen_dirty = true;
+		if self.cursor.surface_destroyed(surface) {
+			tracing::debug!(
+				visible = self.cursor.visible(),
+				"Cursor surface destroyed; using active fallback"
+			);
+		}
 		if let Some(cm) = &mut self.color_management {
 			cm.surface_destroyed(surface);
 		}
@@ -454,8 +462,13 @@ impl CompositorHandler for MoonshineCompositor {
 }
 
 impl MoonshineCompositor {
-	fn popups_commit(&mut self, _surface: &WlSurface) {
-		// Popup handling can be added later.
+	fn popups_commit(&mut self, surface: &WlSurface) {
+		self.popups.commit(surface);
+		if let Some(smithay::desktop::PopupKind::Xdg(popup)) = self.popups.find_popup(surface)
+			&& !popup.is_initial_configure_sent()
+		{
+			let _ = popup.send_configure();
+		}
 	}
 
 	/// Find a `Window` by its Wayland surface.
@@ -561,8 +574,8 @@ impl MoonshineCompositor {
 			return;
 		}
 
-		// `refresh_metadata` never re-reads this, so map time is otherwise the
-		// only point it is set. `skip_and_not_fullscreen()` ranks focus on it.
+		// Keep fullscreen metadata current for focus ranking without polling.
+		// `skip_and_not_fullscreen()` reads this cached state.
 		if let Some(elem) = self.find_window_by_x11_surface(window)
 			&& let Some(meta) = self.window_metadata.get_mut(&elem)
 		{
@@ -626,18 +639,7 @@ impl MoonshineCompositor {
 		// interactive overlay (full root-window width or asking for input) and
 		// notifications (everything else) at focus time.
 		let is_overlay = self.with_x11_focus(|xf| xf.get_steam_overlay_value(window.window_id())) != 0;
-		let interactive_overlay = window.geometry().size.w >= self.output_rect().size.w || input_focus_mode != 0;
-
-		// Build WindowFlags: overlay/tray/streaming/VR classification.
-		// Packed into a single u8 instead of 7 separate bool fields.
 		let mut flags = WindowFlags::empty();
-		if is_overlay {
-			if interactive_overlay {
-				flags.insert(WindowFlags::OVERLAY);
-			} else {
-				flags.insert(WindowFlags::NOTIFICATION);
-			}
-		}
 
 		// External overlays, streaming clients, VR targets.
 		let is_external_overlay = self.with_x11_focus(|xf| {
@@ -718,7 +720,7 @@ impl MoonshineCompositor {
 		let skip_taskbar = skip_taskbar || (window.is_override_redirect() && has_transient_parent);
 		let skip_pager = skip_pager || (window.is_override_redirect() && has_transient_parent);
 
-		WindowMetadata {
+		let mut metadata = WindowMetadata {
 			app_id,
 			steam_app_id,
 			steam_legacy_big_picture,
@@ -754,61 +756,9 @@ impl MoonshineCompositor {
 			input_focus_mode,
 			flags,
 			damage_sequence: 0, // assigned by caller for game windows
-		}
-	}
-
-	/// Re-read live X11 properties for all tracked windows.
-	///
-	/// Updates STEAM_INPUT_FOCUS on overlay windows and refreshes app_id
-	/// for X11 windows that still have app_id=0 (Steam sets _NET_WM_PID
-	/// asynchronously after window creation).
-	fn refresh_metadata(&mut self) {
-		if let Some(x11_focus) = &self.x11_focus {
-			// Re-read STEAM_INPUT_FOCUS for all Steam overlay windows.
-			// Steam changes this property dynamically when the overlay is toggled.
-			for (window, meta) in self.window_metadata.iter_mut() {
-				if meta.is_overlay
-					&& let Some(x11) = window.x11_surface()
-				{
-					let new_mode = x11_focus.get_input_focus_mode(x11.window_id());
-					if new_mode != meta.input_focus_mode {
-						tracing::debug!(
-							target: "focus",
-							window_id = x11.window_id(),
-							old_mode = meta.input_focus_mode,
-							new_mode,
-							"STEAM_INPUT_FOCUS changed on overlay"
-						);
-						meta.input_focus_mode = new_mode;
-					}
-				}
-			}
-
-			// Refresh app_id for X11 windows that still have app_id=0.
-			// _NET_WM_PID may not be set at map time — Steam sets it
-			// asynchronously after the window is created.
-			for (window, meta) in self.window_metadata.iter_mut() {
-				if meta.app_id == 0
-					&& let Some(x11) = window.x11_surface()
-				{
-					let pid = x11_focus.get_window_pid(x11.window_id());
-					tracing::debug!(target: "focus", window_id = x11.window_id(), pid, "refresh_app_id: re-read _NET_WM_PID");
-					if pid != 0 {
-						let new_app_id = get_appid_from_pid(pid);
-						if new_app_id != 0 {
-							tracing::debug!(
-								target: "focus",
-								window_id = x11.window_id(),
-								pid,
-								app_id = new_app_id,
-								"Refreshed app_id from _NET_WM_PID"
-							);
-							meta.app_id = new_app_id;
-						}
-					}
-				}
-			}
-		}
+		};
+		metadata.classify_steam_surface(self.output_rect().size.w);
+		metadata
 	}
 
 	/// Classify overlay, notification, external overlay, and input-focus
@@ -826,13 +776,17 @@ impl MoonshineCompositor {
 		let mut max_overlay_opacity = 0u32;
 		let mut max_external_overlay_opacity = 0u32;
 
+		let output_width = self.output_rect().size.w;
 		for window in windows {
-			let Some(meta) = self.window_metadata.get(window) else {
+			let Some(meta) = self.window_metadata.get_mut(window) else {
 				continue;
 			};
 
-			if meta.is_overlay {
-				let interactive = meta.geometry.size.w >= self.output_rect().size.w || meta.input_focus_mode != 0;
+			// Output resize/reconnection can change the full-width boundary,
+			// even when Steam's own window properties did not change.
+			meta.classify_steam_surface(output_width);
+			if meta.is_overlay && meta.opacity != 0 {
+				let interactive = meta.flags.contains(WindowFlags::OVERLAY);
 				if interactive && meta.opacity >= max_overlay_opacity {
 					best_overlay = Some(window.clone());
 					max_overlay_opacity = meta.opacity;
@@ -859,11 +813,15 @@ impl MoonshineCompositor {
 		self.notification_window = best_notification;
 		self.external_overlay_window = best_external_overlay;
 		self.input_focus_window = input_focus;
+		self.steam_overlay_input_active = self.input_focus_window.is_some();
 		if old_overlay != self.overlay_window
 			|| old_notification != self.notification_window
 			|| old_external_overlay != self.external_overlay_window
-			|| old_input_focus != self.input_focus_window
 		{
+			self.overlay_dirty = true;
+			self.screen_dirty = true;
+		}
+		if old_input_focus != self.input_focus_window {
 			self.focus_state.mark_dirty();
 		}
 	}
@@ -914,13 +872,7 @@ impl MoonshineCompositor {
 				continue;
 			};
 
-			// Always skip system tray icons, overlays, and external overlays.
-			if meta.flags.intersects(
-				WindowFlags::OVERLAY
-					| WindowFlags::NOTIFICATION
-					| WindowFlags::EXTERNAL_OVERLAY
-					| WindowFlags::SYS_TRAY_ICON,
-			) {
+			if meta.excluded_from_primary_focus() {
 				continue;
 			}
 
@@ -1373,17 +1325,16 @@ impl MoonshineCompositor {
 		}
 		self.focused_window = Some(best.clone());
 
-		// Write the gamescope focus contract (FOCUSED_APP/GFX/WINDOW + displays).
-		if let Some(ref x11_focus) = self.x11_focus {
-			let focused_app_id = self.window_metadata.get(best).map(|m| m.app_id).unwrap_or(0);
-			let focused_window_id = self.window_metadata.get(best).map(|m| m.steam_window_id()).unwrap_or(0);
-			x11_focus.set_focused_window_contract(focused_app_id, focused_window_id);
-			// When the overlay is raised, input routes to the overlay while
-			// rendering stays on the game (matches gamescope's
-			// inputFocusWindow / focusWindow split).
-			if self.overlay_raised {
-				x11_focus.set_focused_app_split(super::x11_focus::STEAM_BIG_PICTURE_APPID, focused_app_id);
-			}
+		if let Some(xf) = &self.x11_focus {
+			let gfx_app = self.window_metadata.get(best).map(|m| m.app_id).unwrap_or(0);
+			let input_app = self
+				.input_focus_window
+				.as_ref()
+				.and_then(|w| self.window_metadata.get(w))
+				.map(|m| m.app_id)
+				.unwrap_or(gfx_app);
+			let window_id = self.window_metadata.get(best).map(|m| m.steam_window_id()).unwrap_or(0);
+			xf.set_focus_contract(input_app, gfx_app, window_id);
 		}
 
 		// Focus changed if either the X11 window ID or the actual window changed.
@@ -1410,6 +1361,10 @@ impl MoonshineCompositor {
 
 		// Pointer focus follows inputFocus — the overlay when it asks for input.
 		let pointer_target: Option<Window> = Some(input_focus.clone());
+		if !focus_changed && self.pointer_focus_window == pointer_target && self.input_focus_mode == input_focus_mode {
+			self.focus_state.apply();
+			return;
+		}
 		self.pointer_focus_window = pointer_target.clone();
 
 		// Raise the input focus window. Gamescope does this on every focus pass
@@ -1429,21 +1384,13 @@ impl MoonshineCompositor {
 			);
 		}
 
-		// Activation state: call set_activated on old and new XDG toplevels.
-		// Deactivate the old window whether it was X11 or Wayland.
-		// When the overlay is raised, skip activation — the overlay is already
-		// activated by update_overlay_z_order, and activating the game would
-		// clobber _NET_ACTIVE_WINDOW back to the game window.
-		if !self.overlay_raised {
-			if let Some(ref old_win) = old_focused_window
-				&& old_win.toplevel().is_some()
-				&& old_win != best
-			{
-				old_win.set_activated(false);
-			}
-			if best.toplevel().is_some() {
-				best.set_activated(true);
-			}
+		if let Some(old_target) = self.seat.get_keyboard().and_then(|k| k.current_focus())
+			&& keyboard_target.as_ref() != Some(old_target.window())
+		{
+			old_target.window().set_activated(false);
+		}
+		if let Some(target) = &keyboard_target {
+			target.set_activated(true);
 		}
 
 		// Keyboard focus persistence.
@@ -1579,7 +1526,7 @@ impl MoonshineCompositor {
 	/// window from the candidate list and sets keyboard focus.
 	///
 	/// Decomposed into steps for clarity:
-	/// 1. `refresh_metadata()` — re-read live X11 properties
+	/// 1. Use metadata cached by map/property/configure events
 	/// 2. `classify_special_windows()` — overlay/notification/etc. classification
 	/// 3. `build_candidates()` — filter and collect candidate windows
 	/// 4. Steam control override + priority sort
@@ -1602,8 +1549,7 @@ impl MoonshineCompositor {
 		// changed. Cheap when the current mapping is already rendered.
 		self.resolve_override_window();
 
-		// Step 1: Re-read live X11 properties.
-		self.refresh_metadata();
+		// Step 1: Metadata is cached by map/property/configure events.
 
 		// Step 2: Classify overlay/notification/external overlay windows.
 		let windows: Vec<_> = self.space.elements().cloned().collect();
@@ -1620,9 +1566,10 @@ impl MoonshineCompositor {
 		// When the overlay is raised, BPM (769) is excluded — it's the active
 		// overlay, not a focusable target.
 		if let Some(ref x11_focus) = self.x11_focus {
-			let overlay_raised = self.overlay_raised;
-			let is_focusable =
-				|aid: u32| aid != 0 && (!overlay_raised || aid != super::x11_focus::STEAM_BIG_PICTURE_APPID);
+			let steam_overlay_input_active = self.steam_overlay_input_active;
+			let is_focusable = |aid: u32| {
+				aid != 0 && (!steam_overlay_input_active || aid != super::x11_focus::STEAM_BIG_PICTURE_APPID)
+			};
 			let focusable_app_ids: Vec<u32> = candidates
 				.iter()
 				.filter_map(|w| self.window_metadata.get(w).map(|m| m.app_id))
@@ -1637,21 +1584,7 @@ impl MoonshineCompositor {
 					if !is_focusable(app_id) {
 						return None;
 					}
-					// Read PID from the cached metadata or fall back to 0.
-					let pid = meta
-						.x11_window_id
-						.map(|_| {
-							// We don't have PID stored in metadata; read it from X11.
-							x11_focus.get_window_pid(window_id)
-						})
-						.or_else(|| {
-							w.wl_surface()?
-								.client()?
-								.get_credentials(&self.display_handle)
-								.ok()
-								.map(|c| c.pid as u32)
-						})
-						.unwrap_or(0);
+					let pid = meta.pid;
 					Some([window_id, app_id, pid])
 				})
 				.collect();
@@ -1940,16 +1873,25 @@ impl XdgShellHandler for MoonshineCompositor {
 		self.reevaluate_focus();
 	}
 
-	fn new_popup(&mut self, _surface: PopupSurface, _positioner: PositionerState) {
-		// Popup handling can be added later.
+	fn new_popup(&mut self, surface: PopupSurface, positioner: PositionerState) {
+		surface.with_pending_state(|state| state.geometry = positioner.get_geometry());
+		if let Err(error) = self.popups.track_popup(smithay::desktop::PopupKind::Xdg(surface)) {
+			tracing::debug!(?error, "Unable to track popup");
+		}
+		self.screen_dirty = true;
 	}
 
 	fn grab(&mut self, _surface: PopupSurface, _seat: WlSeat, _serial: Serial) {
 		// Popup grabs can be added later.
 	}
 
-	fn reposition_request(&mut self, _surface: PopupSurface, _positioner: PositionerState, _token: u32) {
-		// Repositioning can be added later.
+	fn reposition_request(&mut self, surface: PopupSurface, positioner: PositionerState, token: u32) {
+		surface.with_pending_state(|state| {
+			state.geometry = positioner.get_geometry();
+			state.positioner = positioner;
+		});
+		surface.send_repositioned(token);
+		self.screen_dirty = true;
 	}
 }
 
@@ -1966,7 +1908,7 @@ impl SeatHandler for MoonshineCompositor {
 
 	fn cursor_image(&mut self, _seat: &Seat<Self>, image: CursorImageStatus) {
 		tracing::trace!(?image, "Cursor image changed");
-		self.cursor_status = image;
+		self.set_cursor_image(image);
 	}
 
 	fn focus_changed(&mut self, _seat: &Seat<Self>, focused: Option<&KeyboardFocusTarget>) {
@@ -1981,7 +1923,7 @@ impl TabletSeatHandler for MoonshineCompositor {
 	type ToolFocus = WlSurface;
 
 	fn tablet_tool_image(&mut self, _tool: &TabletToolDescriptor, image: CursorImageStatus) {
-		self.cursor_status = image;
+		self.set_cursor_image(image);
 	}
 }
 
@@ -2233,6 +2175,20 @@ impl XwmHandler for MoonshineCompositor {
 	}
 
 	fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: smithay::xwayland::xwm::WmWindowProperty) {
+		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property
+			&& self.x11_focus.as_ref().is_some_and(|xf| xf.is_app_id_property(atom))
+		{
+			if let Some(elem) = self.find_window_by_x11_surface(&window) {
+				let refreshed = self.x11_surface_metadata(&window);
+				if let Some(meta) = self.window_metadata.get_mut(&elem) {
+					meta.app_id = refreshed.app_id;
+					meta.steam_app_id = refreshed.steam_app_id;
+					meta.steam_legacy_big_picture = refreshed.steam_legacy_big_picture;
+				}
+			}
+			self.reevaluate_focus();
+			return;
+		}
 		// STEAM_OVERLAY (forwarded as Other) drives overlay z-order: mark it
 		// dirty so update_overlay_z_order runs this frame instead of polling.
 		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property
@@ -2249,13 +2205,34 @@ impl XwmHandler for MoonshineCompositor {
 						xf.get_input_focus_mode(window_id),
 					)
 				});
-				let interactive = window.geometry().size.w >= self.output_rect().size.w || input_focus_mode != 0;
+				let external = self
+					.x11_focus
+					.as_ref()
+					.filter(|xf| xf.is_external_overlay_property(atom))
+					.map(|xf| xf.is_gamescope_external_overlay(window_id));
+				let restored_app_id = external
+					.filter(|enabled| !enabled)
+					.map(|_| self.x11_surface_metadata(&window).app_id);
+				let output_width = self.output_rect().size.w;
 				if let Some(meta) = self.window_metadata.get_mut(&elem) {
 					meta.is_overlay = is_overlay;
+					meta.geometry = window.geometry();
 					meta.opacity = opacity;
 					meta.input_focus_mode = input_focus_mode;
-					meta.flags.set(WindowFlags::OVERLAY, is_overlay && interactive);
-					meta.flags.set(WindowFlags::NOTIFICATION, is_overlay && !interactive);
+					if let Some(external) = external {
+						let old_flags = meta.flags;
+						meta.flags.set(WindowFlags::EXTERNAL_OVERLAY, external);
+						meta.app_id = if external {
+							0
+						} else {
+							restored_app_id.unwrap_or(meta.app_id)
+						};
+						if old_flags != meta.flags {
+							tracing::debug!(xid = window_id, geometry = ?meta.geometry, opacity = meta.opacity,
+                                old_class = ?old_flags, new_class = ?meta.flags, "External overlay classification changed");
+						}
+					}
+					meta.classify_steam_surface(output_width);
 				}
 			}
 			self.overlay_dirty = true;
@@ -2292,9 +2269,8 @@ impl XwmHandler for MoonshineCompositor {
 		);
 
 		// Re-read metadata fields that are derived from the changed property
-		// and update the stored metadata. reevaluate_focus() only refreshes
-		// STEAM_INPUT_FOCUS and app_id; stale Hints/TransientFor/WindowType
-		// derived fields must be explicitly refreshed here.
+		// and update the cached metadata. PID, hints, and window-type changes
+		// are handled here, so notification events never poll application IDs.
 		let win_elem = self
 			.space
 			.elements()
@@ -2340,7 +2316,13 @@ impl XwmHandler for MoonshineCompositor {
 						meta.is_dialog = new_meta.is_dialog;
 						meta.maybe_a_dropdown = new_meta.maybe_a_dropdown;
 					},
-					_ => {}, // Pid handled by refresh_metadata() in reevaluate_focus
+					smithay::xwayland::xwm::WmWindowProperty::Pid => {
+						meta.pid = new_meta.pid;
+						meta.app_id = new_meta.app_id;
+						meta.steam_app_id = new_meta.steam_app_id;
+						meta.steam_legacy_big_picture = new_meta.steam_legacy_big_picture;
+					},
+					_ => {},
 				}
 			}
 		}
@@ -2359,6 +2341,13 @@ impl XwmHandler for MoonshineCompositor {
 		// own selection (`pick_best_candidate`).
 		let window_id = window.window_id();
 		if let Some(w) = self.find_window_by_x11_surface(&window) {
+			if self
+				.window_metadata
+				.get(&w)
+				.is_some_and(|m| m.flags.contains(WindowFlags::NOTIFICATION))
+			{
+				return;
+			}
 			self.space.raise_element(&w, false);
 		}
 		tracing::debug!(target: "focus", window_id, "_NET_ACTIVE_WINDOW: raised window");
@@ -2652,43 +2641,14 @@ impl XwmHandler for MoonshineCompositor {
 		};
 		self.space.map_element(elem.clone(), geometry.loc, false);
 
-		// A Steam overlay that resizes across the interactive/notification
-		// boundary must switch flags; stale flags route input to the wrong
-		// Steam window.
-		let window_id = window.window_id();
-		let root_width = self.output_rect().size.w;
-		let needs_reclassify = self.window_metadata.get(&elem).is_some_and(|m| m.is_overlay);
-
-		// Read steam_overlay_value BEFORE the mutable borrow to avoid conflict.
-		let steam_overlay_value = if needs_reclassify {
-			Some(self.with_x11_focus(|xf| xf.get_steam_overlay_value(window_id)))
-		} else {
-			None
-		};
-
+		let output_width = self.output_rect().size.w;
 		if let Some(meta) = self.window_metadata.get_mut(&elem) {
-			let old_flags = meta.flags;
 			meta.geometry = geometry;
-
-			// Only reclassify if the window has the STEAM_OVERLAY property.
-			if let Some(sov) = steam_overlay_value
-				&& sov != 0
-			{
-				let interactive = geometry.size.w >= root_width || meta.input_focus_mode != 0;
-				if interactive {
-					meta.flags.remove(WindowFlags::NOTIFICATION);
-					meta.flags.insert(WindowFlags::OVERLAY);
-				} else {
-					meta.flags.remove(WindowFlags::OVERLAY);
-					meta.flags.insert(WindowFlags::NOTIFICATION);
-				}
-			}
-
-			// If classification changed, mark focus dirty so routing is updated.
-			if meta.flags != old_flags {
-				self.focus_state.mark_dirty();
-			}
+			meta.classify_steam_surface(output_width);
 		}
+		self.overlay_dirty = true;
+		self.screen_dirty = true;
+		self.reevaluate_focus();
 	}
 
 	fn fullscreen_request(&mut self, _xwm: XwmId, window: X11Surface) {
