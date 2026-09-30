@@ -4,6 +4,7 @@ use std::{
 	net::{IpAddr, SocketAddr, ToSocketAddrs},
 	path::PathBuf,
 	str::FromStr,
+	sync::{Arc, PoisonError, RwLock},
 };
 
 use async_shutdown::ShutdownManager;
@@ -25,6 +26,7 @@ use tokio::net::TcpListener;
 
 use crate::{
 	ShutdownReason,
+	app_scanner::{self, ApplicationScannerConfig},
 	clients::ClientManager,
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys, application::ApplicationConfig,
@@ -84,7 +86,10 @@ pub struct Webserver {
 	name: String,
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
-	applications: Vec<ApplicationConfig>,
+	configured_applications: Vec<ApplicationConfig>,
+	application_scanners: Vec<ApplicationScannerConfig>,
+	/// Configured and scanned applications, refreshed on every app list request.
+	applications: Arc<RwLock<Vec<ApplicationConfig>>>,
 	unique_id: String,
 	client_manager: ClientManager,
 	session_manager: SessionManager,
@@ -103,6 +108,7 @@ impl Webserver {
 		rtsp_port: u16,
 		webserver_config: WebserverConfig,
 		applications: Vec<ApplicationConfig>,
+		application_scanners: Vec<ApplicationScannerConfig>,
 		supported_codecs: u32,
 		hdr_supported: bool,
 		unique_id: String,
@@ -116,7 +122,12 @@ impl Webserver {
 			name,
 			rtsp_port,
 			webserver_config,
-			applications,
+			applications: Arc::new(RwLock::new(app_scanner::load_applications(
+				&applications,
+				&application_scanners,
+			))),
+			configured_applications: applications,
+			application_scanners,
 			unique_id,
 			client_manager,
 			session_manager,
@@ -336,7 +347,7 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
-					self.app_list()
+					self.app_list().await
 				},
 				(&Method::GET, "/appasset") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
@@ -426,9 +437,27 @@ impl Webserver {
 		Ok(response)
 	}
 
-	fn app_list(&self) -> Response<Full<Bytes>> {
+	/// Find an application by ID in the most recently scanned list.
+	fn find_application(&self, application_id: i32) -> Option<ApplicationConfig> {
+		let applications = self.applications.read().unwrap_or_else(PoisonError::into_inner);
+		applications.iter().find(|a| a.id() == application_id).cloned()
+	}
+
+	async fn app_list(&self) -> Response<Full<Bytes>> {
+		// Rescan so newly installed games show up without restarting moonshine.
+		let configured_applications = self.configured_applications.clone();
+		let application_scanners = self.application_scanners.clone();
+		match tokio::task::spawn_blocking(move || {
+			app_scanner::load_applications(&configured_applications, &application_scanners)
+		})
+		.await
+		{
+			Ok(applications) => *self.applications.write().unwrap_or_else(PoisonError::into_inner) = applications,
+			Err(e) => tracing::warn!("Failed to rescan applications: {e}"),
+		}
+
 		let mut response = "<root status_code=\"200\">".to_string();
-		for application in self.applications.iter() {
+		for application in self.applications.read().unwrap_or_else(PoisonError::into_inner).iter() {
 			response += "<App>";
 
 			let hdr_supported = u8::from(self.hdr_supported);
@@ -466,7 +495,7 @@ impl Webserver {
 			},
 		};
 
-		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
+		let application = match self.find_application(application_id) {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
@@ -792,7 +821,7 @@ impl Webserver {
 		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);
 		let hdr = hdr_mode != 0;
 
-		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
+		let application = match self.find_application(application_id) {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
@@ -804,7 +833,7 @@ impl Webserver {
 		let initialize_result = self
 			.session_manager
 			.initialize_session(SessionContext {
-				application: application.clone(),
+				application,
 				application_id,
 				resolution: (width, height),
 				refresh_rate,
