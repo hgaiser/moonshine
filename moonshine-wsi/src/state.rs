@@ -276,6 +276,10 @@ pub struct InstanceData {
 	/// Whether the application opted into frame-limiter awareness (via env var
 	/// or engine auto-detection of DXVK ≥ 2.3 / vkd3d ≥ 2.12).
 	pub frame_limiter_aware: bool,
+	/// Required instance extensions were enabled downstream.
+	pub surface_maintenance1: bool,
+	pub app_extensions: Vec<std::ffi::CString>,
+	pub downstream_extensions: Vec<std::ffi::CString>,
 }
 
 /// Capabilities negotiated with the compositor at connection time.
@@ -344,6 +348,7 @@ pub struct DeviceData {
 	pub instance_key: InstanceKey,
 	/// Whether `VK_EXT_swapchain_maintenance1` was successfully enabled.
 	pub has_maintenance1: bool,
+	pub physical_device: ash::vk::PhysicalDevice,
 }
 
 // ---------------------------------------------------------------------------
@@ -401,11 +406,16 @@ pub struct PastPresentTiming {
 pub struct SwapchainData {
 	/// Dispatch key of the owning VkDevice.
 	pub device_key: DeviceKey,
+	/// Baseline mode (after compatibility fallback), restored when FIFO forcing ends.
 	pub present_mode: ash::vk::PresentModeKHR,
+	/// Last mode actually submitted to the ICD, including application mode changes.
+	pub icd_present_mode: ash::vk::PresentModeKHR,
+	/// Modes actually declared to the ICD at creation. Empty means no declaration.
+	pub declared_present_modes: Vec<ash::vk::PresentModeKHR>,
 	// Stored at creation time for diagnostics; not yet read at runtime.
 	pub _format: ash::vk::Format,
 	pub _color_space: ash::vk::ColorSpaceKHR,
-	pub _image_count: u32,
+	pub _image_count: Option<u32>,
 	pub _extent: ash::vk::Extent2D,
 	pub _surface: VkSurface,
 	/// The `moonshine_swapchain` protocol object.
@@ -523,4 +533,18 @@ pub fn with_swapchain<R>(key: SwapchainKey, f: impl FnOnce(&SwapchainData) -> R)
 
 pub fn with_swapchain_mut<R>(key: SwapchainKey, f: impl FnOnce(&mut SwapchainData) -> R) -> Option<R> {
 	swapchain_map().force_write().get_mut(&key).map(f)
+}
+
+/// Capability relaxation needs an already created device whose feature is enabled.
+/// Before device creation (or if any matching device opted out), stay conservative.
+pub fn maintenance_enabled_for_physical_device(physical_device: ash::vk::PhysicalDevice) -> bool {
+	let devices = device_map().force_read();
+	let mut found = false;
+	for d in devices.values().filter(|d| d.physical_device == physical_device) {
+		found = true;
+		if !d.has_maintenance1 {
+			return false;
+		}
+	}
+	found
 }

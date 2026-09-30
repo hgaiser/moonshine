@@ -3,6 +3,14 @@
 use crate::dispatch::*;
 use crate::state::{DeviceData, insert_device};
 
+/// Preserve an application's existing feature choice; inject only when absent.
+fn maintenance_plan(supported: bool, app_feature: Option<bool>) -> (bool, bool) {
+	(
+		supported && app_feature.is_none(),
+		supported && app_feature.unwrap_or(true),
+	)
+}
+
 pub unsafe extern "C" fn create_device(
 	physical_device: VkPhysicalDevice,
 	p_create_info: *const VkDeviceCreateInfo,
@@ -21,69 +29,71 @@ pub unsafe extern "C" fn create_device(
 
 		let link = (*chain_info).p_layer_info;
 		let next_get_device_proc_addr = (*link).pfn_next_get_device_proc_addr;
-		let next_get_instance_proc_addr = (*link).pfn_next_get_instance_proc_addr;
 		// Advance the chain for the next layer.
-		(*chain_info).p_layer_info = (*link).p_next;
+		let next_layer_info = (*link).p_next;
+		(*chain_info).p_layer_info = next_layer_info;
 
-		// Inject VK_EXT_swapchain_maintenance1 if not already enabled.
 		let create_info = &*p_create_info;
-		let mut exts: Vec<*const std::ffi::c_char> = std::slice::from_raw_parts(
+		let mut exts = extension_names(
 			create_info.pp_enabled_extension_names,
-			create_info.enabled_extension_count as usize,
-		)
-		.to_vec();
-
+			create_info.enabled_extension_count,
+		);
 		let maintenance1_ext = ash::vk::EXT_SWAPCHAIN_MAINTENANCE1_NAME;
-		let has_maintenance1_ext = has_extension(&exts, maintenance1_ext);
-		if !has_maintenance1_ext {
-			exts.push(maintenance1_ext.as_ptr());
-		}
-
-		// Force-enable the swapchainMaintenance1 feature via pNext chain, but only
-		// if the application hasn't already included the struct; injecting a
-		// duplicate would create a cycle and trigger undefined behaviour in drivers
-		// that walk the chain.
-		let app_has_maintenance1_features = find_in_chain::<ash::vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT>(
+		let app_features = find_in_chain::<ash::vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT>(
 			create_info.p_next,
 			ash::vk::StructureType::PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_EXT,
-		)
-		.is_some();
-
+		);
+		let supported = has_extension(&exts, c"VK_KHR_swapchain")
+			&& crate::image_count::device_supports_maintenance(physical_device);
+		let (inject_feature, has_maintenance1) = maintenance_plan(
+			supported,
+			app_features.map(|p| (*p).swapchain_maintenance1 == ash::vk::TRUE),
+		);
+		if has_maintenance1 && !has_extension(&exts, maintenance1_ext) {
+			exts.push(maintenance1_ext.as_ptr());
+		}
 		let mut maintenance1_features =
 			ash::vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default().swapchain_maintenance1(true);
 		maintenance1_features.p_next = create_info.p_next as *mut std::ffi::c_void;
-
 		let mut modified_create_info = *create_info;
 		modified_create_info.enabled_extension_count = exts.len() as u32;
 		modified_create_info.pp_enabled_extension_names = exts.as_ptr();
-		if !app_has_maintenance1_features {
+		if inject_feature {
 			modified_create_info.p_next = &maintenance1_features as *const _ as *const std::ffi::c_void;
 		}
 
 		// Call through to the next layer/ICD.
-		let next_create_device: unsafe extern "C" fn(
-			VkPhysicalDevice,
-			*const VkDeviceCreateInfo,
-			*const VkAllocationCallbacks,
-			*mut VkDevice,
-		) -> VkResult = {
-			let name = c"vkCreateDevice";
-			let pfn = next_get_instance_proc_addr(VkInstance::null(), name.as_ptr());
-			std::mem::transmute(pfn.expect("next layer must provide vkCreateDevice"))
+		let Some(next_create_device) =
+			crate::state::with_instance(instance_key_of(physical_device), |d| d.dispatch.create_device)
+		else {
+			return VK_ERROR_INITIALIZATION_FAILED;
 		};
 
 		let result = next_create_device(physical_device, &modified_create_info, p_allocator, p_device);
 
-		// If device creation fails (e.g. extension or feature bit unsupported), retry
-		// with the app's original unmodified create info, removing both our extension
-		// injection and the forced feature struct.
-		let (result, has_maintenance1) = if result != VK_SUCCESS {
-			crate::log_warn!("VK_EXT_swapchain_maintenance1 not supported, retrying without");
-			let result = next_create_device(physical_device, p_create_info, p_allocator, p_device);
-			(result, false)
-		} else {
-			(result, true)
-		};
+		// Do not retry arbitrary device errors or mask application feature errors.
+		// Only extension/feature rejection of our own injection may be retried.
+		let injected = inject_feature
+			|| (has_maintenance1
+				&& !has_extension(
+					&extension_names(
+						create_info.pp_enabled_extension_names,
+						create_info.enabled_extension_count,
+					),
+					maintenance1_ext,
+				));
+		let (result, has_maintenance1) =
+			if injected && (result == VK_ERROR_EXTENSION_NOT_PRESENT || result == VK_ERROR_FEATURE_NOT_PRESENT) {
+				crate::log_warn!("swapchain maintenance injection rejected; retrying original device create-info");
+				// Downstream layers advance this same loader link on each call.
+				(*chain_info).p_layer_info = next_layer_info;
+				(
+					next_create_device(physical_device, p_create_info, p_allocator, p_device),
+					false,
+				)
+			} else {
+				(result, has_maintenance1)
+			};
 
 		if result != VK_SUCCESS {
 			return result;
@@ -105,6 +115,7 @@ pub unsafe extern "C" fn create_device(
 				dispatch,
 				instance_key,
 				has_maintenance1,
+				physical_device,
 			},
 		);
 
@@ -146,6 +157,7 @@ unsafe fn build_device_dispatch(
 			get_device_proc_addr: next_get_device_proc_addr,
 			destroy_device: load!("vkDestroyDevice"),
 			create_swapchain: load!(opt: "vkCreateSwapchainKHR"),
+			get_swapchain_images: load!(opt: "vkGetSwapchainImagesKHR"),
 			destroy_swapchain: load!(opt: "vkDestroySwapchainKHR"),
 			queue_present: load!(opt: "vkQueuePresentKHR"),
 			acquire_next_image: load!(opt: "vkAcquireNextImageKHR"),
@@ -163,5 +175,18 @@ unsafe fn build_device_dispatch(
 		}
 
 		dispatch
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	#[test]
+	fn maintenance_injection_respects_support_and_explicit_features() {
+		assert_eq!(maintenance_plan(false, None), (false, false));
+		assert_eq!(maintenance_plan(false, Some(true)), (false, false));
+		assert_eq!(maintenance_plan(true, None), (true, true));
+		assert_eq!(maintenance_plan(true, Some(false)), (false, false));
+		assert_eq!(maintenance_plan(true, Some(true)), (false, true));
 	}
 }

@@ -256,6 +256,24 @@ pub unsafe extern "C" fn create_xlib_surface(
 	unsafe {
 		let create_info = &*p_create_info;
 
+		let instance_key = instance_key_of(instance);
+		// Conversion to XCB is private to the layer and requires that extension
+		// to have been enabled downstream, even when an ICD returns a pointer.
+		let can_convert = with_instance(instance_key, |d| {
+			d.downstream_extensions
+				.iter()
+				.any(|name| name.as_c_str() == c"VK_KHR_xcb_surface")
+		})
+		.unwrap_or(false);
+		if !can_convert {
+			return with_instance(instance_key, |d| {
+				d.dispatch
+					.create_xlib_surface
+					.map(|f| f(instance, p_create_info, p_allocator, p_surface))
+			})
+			.flatten()
+			.unwrap_or(VK_ERROR_EXTENSION_NOT_PRESENT);
+		}
 		let xcb_connection = xlib_to_xcb_connection(create_info.dpy);
 		if xcb_connection.is_null() {
 			return VK_ERROR_FEATURE_NOT_PRESENT;
@@ -304,17 +322,49 @@ pub unsafe extern "C" fn destroy_surface(
 // Surface format/capabilities hooks
 // ---------------------------------------------------------------------------
 
-/// Minimum image count the layer enforces (default 3 for smooth pipelining).
-/// Can be overridden via `MOONSHINE_WSI_MIN_IMAGE_COUNT`.
-fn min_image_count() -> u32 {
-	use std::sync::OnceLock;
-	static MIN_COUNT: OnceLock<u32> = OnceLock::new();
-	*MIN_COUNT.get_or_init(|| {
-		std::env::var("MOONSHINE_WSI_MIN_IMAGE_COUNT")
-			.ok()
-			.and_then(|v| v.parse().ok())
-			.unwrap_or(3)
-	})
+/// Only replacement Wayland surfaces participate in legacy compatibility.
+/// Native Wayland and the dynamically selected XCB fallback retain ICD limits.
+pub(crate) fn is_bypass_surface(surface: VkSurface) -> bool {
+	with_surface(SurfaceKey::from_raw(surface.as_raw()), |s| s.xcb_window.is_some()).unwrap_or(false)
+}
+
+unsafe fn adjust_image_count(
+	physical_device: VkPhysicalDevice,
+	surface: VkSurface,
+	caps: &mut VkSurfaceCapabilitiesKHR,
+	mode_specific: bool,
+) {
+	unsafe {
+		static MINIMUM_WARNING: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+		MINIMUM_WARNING.get_or_init(|| {
+			if std::env::var_os("MOONSHINE_WSI_MIN_IMAGE_COUNT").is_some() {
+				crate::log_warn!(
+					"MOONSHINE_WSI_MIN_IMAGE_COUNT is deprecated and ignored: image-count capabilities now follow the driver"
+				);
+			}
+		});
+		let legacy_min = caps.min_image_count;
+		let legacy_max = caps.max_image_count;
+		let eligible = !mode_specific
+			&& is_bypass_surface(surface)
+			&& crate::state::maintenance_enabled_for_physical_device(physical_device);
+		let fifo = if eligible && legacy_min > 3 {
+			crate::image_count::query_mode(physical_device, surface, VkPresentModeKHR::FIFO)
+		} else {
+			None
+		};
+		let applied = !mode_specific && crate::image_count::compatibility_range(caps, fifo.as_ref().map(|m| &m.caps));
+		crate::log_debug!(
+			"surface capabilities: mode_specific={} driver minImageCount={} maxImageCount={} advertised minImageCount={} maxImageCount={} compatibility_applied={} maintenance_device={}",
+			mode_specific,
+			legacy_min,
+			legacy_max,
+			caps.min_image_count,
+			caps.max_image_count,
+			applied,
+			eligible
+		);
+	}
 }
 
 /// For XWayland bypass surfaces the ICD returns extent=0xFFFFFFFF (undefined)
@@ -357,7 +407,7 @@ pub unsafe extern "C" fn get_physical_device_surface_capabilities(
 		}
 
 		let caps = &mut *p_surface_capabilities;
-		caps.min_image_count = caps.min_image_count.max(min_image_count());
+		adjust_image_count(physical_device, icd_surface, caps, false);
 		// The ICD reports the real extent for the XCB fallback surface; only the
 		// bypass surface (which has no role yet) needs the window size substituted.
 		if fallback.is_none() {
@@ -396,7 +446,12 @@ pub unsafe extern "C" fn get_physical_device_surface_capabilities2(
 		}
 
 		let caps = &mut (*p_surface_capabilities).surface_capabilities;
-		caps.min_image_count = caps.min_image_count.max(min_image_count());
+		let mode_specific = find_in_chain::<ash::vk::SurfacePresentModeEXT>(
+			(*p_surface_info).p_next,
+			ash::vk::StructureType::SURFACE_PRESENT_MODE_EXT,
+		)
+		.is_some();
+		adjust_image_count(physical_device, icd_surface_info.surface, caps, mode_specific);
 		if fallback.is_none() {
 			override_extent_from_xcb(SurfaceKey::from_raw((*p_surface_info).surface.as_raw()), caps);
 		}
@@ -457,7 +512,14 @@ pub unsafe extern "C" fn get_physical_device_xcb_presentation_support(
 		let instance_key = instance_key_of(physical_device);
 
 		// Active mode: redirect to Wayland presentation support using Moonshine's display.
-		if let Some(arc) = get_wayland_connection(instance_key) {
+		if with_instance(instance_key, |d| {
+			d.downstream_extensions
+				.iter()
+				.any(|name| name.as_c_str() == c"VK_KHR_wayland_surface")
+		})
+		.unwrap_or(false)
+			&& let Some(arc) = get_wayland_connection(instance_key)
+		{
 			let display_ptr = arc.force_lock().connection.backend().display_ptr() as *mut std::ffi::c_void;
 			return with_instance(instance_key, |data| {
 				if let Some(next) = data.dispatch.get_physical_device_wayland_presentation_support {
@@ -795,7 +857,14 @@ unsafe fn try_xwayland_bypass(
 ) -> Option<WlSurface> {
 	unsafe {
 		// Early exit if layer is degraded (no compositor connection).
-		if !is_layer_active(instance_key) {
+		if !is_layer_active(instance_key)
+			|| !with_instance(instance_key, |d| {
+				[c"VK_KHR_surface", c"VK_KHR_wayland_surface", c"VK_KHR_xcb_surface"]
+					.iter()
+					.all(|ext| d.downstream_extensions.iter().any(|name| name.as_c_str() == *ext))
+			})
+			.unwrap_or(false)
+		{
 			return None;
 		}
 

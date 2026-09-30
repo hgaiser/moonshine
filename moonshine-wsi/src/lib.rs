@@ -33,6 +33,7 @@
 
 mod device;
 mod dispatch;
+mod image_count;
 mod instance;
 mod log;
 mod state;
@@ -150,6 +151,37 @@ pub unsafe extern "C" fn moonshine_vk_get_instance_proc_addr(
 			&& let Some(pfn) =
 				state::with_instance(instance_key_of(instance), |data| data.dispatch.get_instance_proc_addr)
 		{
+			let required_extension = match name.to_bytes() {
+				b"vkCreateWaylandSurfaceKHR" | b"vkGetPhysicalDeviceWaylandPresentationSupportKHR" => {
+					Some(c"VK_KHR_wayland_surface")
+				},
+				b"vkCreateXcbSurfaceKHR" | b"vkGetPhysicalDeviceXcbPresentationSupportKHR" => {
+					Some(c"VK_KHR_xcb_surface")
+				},
+				b"vkCreateXlibSurfaceKHR" | b"vkGetPhysicalDeviceXlibPresentationSupportKHR" => {
+					Some(c"VK_KHR_xlib_surface")
+				},
+				b"vkGetPhysicalDeviceFeatures2KHR" | b"vkGetPhysicalDeviceProperties2KHR" => {
+					Some(c"VK_KHR_get_physical_device_properties2")
+				},
+				b"vkGetPhysicalDeviceSurfaceCapabilities2KHR" | b"vkGetPhysicalDeviceSurfaceFormats2KHR" => {
+					Some(c"VK_KHR_get_surface_capabilities2")
+				},
+				b"vkDestroySurfaceKHR"
+				| b"vkGetPhysicalDeviceSurfaceCapabilitiesKHR"
+				| b"vkGetPhysicalDeviceSurfaceFormatsKHR"
+				| b"vkGetPhysicalDeviceSurfacePresentModesKHR" => Some(c"VK_KHR_surface"),
+				_ => None,
+			};
+			if let Some(ext) = required_extension {
+				let enabled = state::with_instance(instance_key_of(instance), |d| {
+					d.app_extensions.iter().any(|name| name.as_c_str() == ext)
+				})
+				.unwrap_or(false);
+				if !enabled {
+					return None;
+				}
+			}
 			let intercepted = get_instance_intercept(name);
 			if intercepted.is_some() {
 				return intercepted;

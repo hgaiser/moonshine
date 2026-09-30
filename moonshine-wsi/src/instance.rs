@@ -48,7 +48,8 @@ pub unsafe extern "C" fn create_instance(
 
 		let link = (*chain_info).p_layer_info;
 		let next_get_proc_addr = (*link).pfn_next_get_instance_proc_addr;
-		(*chain_info).p_layer_info = (*link).p_next;
+		let next_layer_info = (*link).p_next;
+		(*chain_info).p_layer_info = next_layer_info;
 
 		// Check whether the layer should operate in active or degraded mode.
 		// Even when degraded we must insert InstanceData so that intercepted entry
@@ -63,27 +64,52 @@ pub unsafe extern "C" fn create_instance(
 		// Only inject the extra WSI extensions when active.  In the degraded path
 		// the application's original create-info is passed through unchanged.
 		let create_info = &*p_create_info;
-		let mut exts: Vec<*const std::ffi::c_char> = std::slice::from_raw_parts(
+		let mut exts = extension_names(
 			create_info.pp_enabled_extension_names,
-			create_info.enabled_extension_count as usize,
-		)
-		.to_vec();
+			create_info.enabled_extension_count,
+		);
+		let app_extensions = exts.iter().map(|&name| CStr::from_ptr(name).to_owned()).collect();
 		let mut modified_create_info = *create_info;
+		let api_version = if create_info.p_application_info.is_null() {
+			0
+		} else {
+			(*create_info.p_application_info).api_version
+		};
+		let core_features2 = api_version >= ash::vk::API_VERSION_1_1;
+		let mut surface_maintenance1 = false;
 		if is_active {
-			let wayland_ext = c"VK_KHR_wayland_surface";
-			let xcb_ext = c"VK_KHR_xcb_surface";
-			let surface_ext = c"VK_KHR_surface";
-
-			if !has_extension(&exts, wayland_ext) {
-				exts.push(wayland_ext.as_ptr());
+			// Optional functionality must be discovered before it is enabled.
+			let enumerate = next_get_proc_addr(VkInstance::null(), c"vkEnumerateInstanceExtensionProperties".as_ptr())
+				.map(|f| {
+					std::mem::transmute::<unsafe extern "C" fn(), ash::vk::PFN_vkEnumerateInstanceExtensionProperties>(
+						f,
+					)
+				});
+			let supported = enumerate
+				.map(|f| enumerate_extensions(|count, props| f(std::ptr::null(), count, props)))
+				.unwrap_or_default();
+			let supports = |name: &CStr| {
+				supported
+					.iter()
+					.any(|p| CStr::from_ptr(p.extension_name.as_ptr()) == name)
+			};
+			let mut enable = |name: &'static CStr| {
+				if supports(name) && !has_extension(&exts, name) {
+					exts.push(name.as_ptr());
+				}
+			};
+			enable(c"VK_KHR_surface");
+			enable(c"VK_KHR_wayland_surface");
+			enable(c"VK_KHR_xcb_surface");
+			enable(c"VK_KHR_get_surface_capabilities2");
+			enable(c"VK_KHR_get_physical_device_properties2");
+			if supports(c"VK_KHR_surface")
+				&& supports(c"VK_KHR_get_surface_capabilities2")
+				&& (core_features2 || supports(c"VK_KHR_get_physical_device_properties2"))
+			{
+				enable(c"VK_EXT_surface_maintenance1");
+				surface_maintenance1 = has_extension(&exts, c"VK_EXT_surface_maintenance1");
 			}
-			if !has_extension(&exts, xcb_ext) {
-				exts.push(xcb_ext.as_ptr());
-			}
-			if !has_extension(&exts, surface_ext) {
-				exts.push(surface_ext.as_ptr());
-			}
-
 			modified_create_info.enabled_extension_count = exts.len() as u32;
 			modified_create_info.pp_enabled_extension_names = exts.as_ptr();
 		}
@@ -100,6 +126,7 @@ pub unsafe extern "C" fn create_instance(
 				"vkCreateInstance failed (VK_ERROR_EXTENSION_NOT_PRESENT); retrying without \
 			 WSI extension injection — layer will run in degraded mode"
 			);
+			(*chain_info).p_layer_info = next_layer_info;
 			result = next_create_instance(p_create_info, p_allocator, p_instance);
 			true
 		} else {
@@ -115,7 +142,14 @@ pub unsafe extern "C" fn create_instance(
 
 		// Build our dispatch table from the next layer (needed even when degraded
 		// so we can forward calls without a dispatch table lookup failure).
-		let dispatch = build_instance_dispatch(instance, next_get_proc_addr);
+		let dispatch = build_instance_dispatch(
+			instance,
+			next_get_proc_addr,
+			core_features2,
+			!fell_back && has_extension(&exts, c"VK_KHR_get_physical_device_properties2"),
+		);
+		surface_maintenance1 &= !fell_back;
+		crate::log_debug!("instance extensions: surface_maintenance1={}", surface_maintenance1);
 
 		let (status, wayland, frame_limiter_aware) = if fell_back {
 			// Extension injection failed; the instance was created without our WSI
@@ -152,9 +186,23 @@ pub unsafe extern "C" fn create_instance(
 			(LayerStatus::Degraded, None, false)
 		};
 
+		let downstream_extensions = if fell_back {
+			extension_names(
+				create_info.pp_enabled_extension_names,
+				create_info.enabled_extension_count,
+			)
+		} else {
+			exts
+		}
+		.iter()
+		.map(|&name| CStr::from_ptr(name).to_owned())
+		.collect();
 		insert_instance(
 			key,
 			InstanceData {
+				surface_maintenance1,
+				app_extensions,
+				downstream_extensions,
 				dispatch,
 				status,
 				wayland,
@@ -230,6 +278,8 @@ unsafe fn detect_frame_limiter_aware(p_application_info: *const ash::vk::Applica
 unsafe fn build_instance_dispatch(
 	instance: VkInstance,
 	next_get_proc_addr: PFN_vkGetInstanceProcAddr,
+	core_features2: bool,
+	khr_features2: bool,
 ) -> InstanceDispatch {
 	unsafe {
 		macro_rules! load {
@@ -245,9 +295,17 @@ unsafe fn build_instance_dispatch(
 
 		InstanceDispatch {
 			get_instance_proc_addr: next_get_proc_addr,
+			get_physical_device_features2: if core_features2 {
+				load!(opt: "vkGetPhysicalDeviceFeatures2")
+			} else if khr_features2 {
+				load!(opt: "vkGetPhysicalDeviceFeatures2KHR")
+			} else {
+				None
+			},
 			destroy_instance: load!("vkDestroyInstance"),
 			create_device: load!("vkCreateDevice"),
 			create_wayland_surface: load!(opt: "vkCreateWaylandSurfaceKHR"),
+			create_xlib_surface: load!(opt: "vkCreateXlibSurfaceKHR"),
 			create_xcb_surface: load!(opt: "vkCreateXcbSurfaceKHR"),
 			destroy_surface: load!(opt: "vkDestroySurfaceKHR"),
 			get_physical_device_surface_formats: load!(opt: "vkGetPhysicalDeviceSurfaceFormatsKHR"),

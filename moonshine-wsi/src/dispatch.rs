@@ -133,6 +133,7 @@ pub struct VkNegotiateLayerInterface {
 /// operations.
 pub struct InstanceDispatch {
 	pub get_instance_proc_addr: PFN_vkGetInstanceProcAddr,
+	pub get_physical_device_features2: Option<ash::vk::PFN_vkGetPhysicalDeviceFeatures2>,
 	pub destroy_instance: unsafe extern "C" fn(VkInstance, *const VkAllocationCallbacks),
 	pub create_device: unsafe extern "C" fn(
 		VkPhysicalDevice,
@@ -144,6 +145,14 @@ pub struct InstanceDispatch {
 		unsafe extern "C" fn(
 			VkInstance,
 			*const VkWaylandSurfaceCreateInfoKHR,
+			*const VkAllocationCallbacks,
+			*mut VkSurface,
+		) -> VkResult,
+	>,
+	pub create_xlib_surface: Option<
+		unsafe extern "C" fn(
+			VkInstance,
+			*const VkXlibSurfaceCreateInfoKHR,
 			*const VkAllocationCallbacks,
 			*mut VkSurface,
 		) -> VkResult,
@@ -209,6 +218,7 @@ pub struct DeviceDispatch {
 			*mut VkSwapchain,
 		) -> VkResult,
 	>,
+	pub get_swapchain_images: Option<ash::vk::PFN_vkGetSwapchainImagesKHR>,
 	pub destroy_swapchain: Option<unsafe extern "C" fn(VkDevice, VkSwapchain, *const VkAllocationCallbacks)>,
 	pub queue_present: Option<unsafe extern "C" fn(VkQueue, *const VkPresentInfoKHR) -> VkResult>,
 	pub acquire_next_image: Option<
@@ -322,3 +332,28 @@ pub unsafe fn find_in_chain<T>(p_next: *const std::ffi::c_void, s_type: Structur
 pub const VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO: StructureType = StructureType::from_raw(47);
 /// `VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO` (loader-private value `48` from `vk_layer.h`).
 pub const VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO: StructureType = StructureType::from_raw(48);
+
+/// Vulkan permits a null extension-name array when its count is zero.
+pub unsafe fn extension_names(ptr: *const *const std::ffi::c_char, count: u32) -> Vec<*const std::ffi::c_char> {
+	if count == 0 {
+		Vec::new()
+	} else {
+		unsafe { std::slice::from_raw_parts(ptr, count as usize).to_vec() }
+	}
+}
+
+/// Enumerate downstream extensions, treating enumeration races/errors conservatively.
+pub unsafe fn enumerate_extensions(
+	call: impl Fn(*mut u32, *mut ash::vk::ExtensionProperties) -> VkResult,
+) -> Vec<ash::vk::ExtensionProperties> {
+	let mut count = 0;
+	if call(&mut count, std::ptr::null_mut()) != VK_SUCCESS {
+		return Vec::new();
+	}
+	let mut props = vec![ash::vk::ExtensionProperties::default(); count as usize];
+	if call(&mut count, props.as_mut_ptr()) != VK_SUCCESS {
+		return Vec::new();
+	}
+	props.truncate(count as usize);
+	props
+}

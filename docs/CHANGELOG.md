@@ -14,6 +14,17 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.16.9] - 2026-09-30
+
+### Fixed
+
+- Negotiate driver-supported three-image swapchains on the XWayland Vulkan bypass using per-present-mode capabilities and swapchain maintenance, addressing conservative Wayland image-count limits.
+- Gate WSI maintenance injection on real extension/feature support and restrict dynamic presentation to declared compatible modes.
+
+### Changed
+
+- Deprecate and ignore `MOONSHINE_WSI_MIN_IMAGE_COUNT`; preserve ordinary driver image-count capabilities and report actual allocated swapchain counts.
+
 ## [v0.16.8] - 2026-09-30
 
 ### Added

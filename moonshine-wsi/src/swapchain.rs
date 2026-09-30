@@ -69,19 +69,70 @@ pub unsafe extern "C" fn create_swapchain(
 		let icd_surface = fallback_surface.unwrap_or(create_info.surface);
 		let need_surface_patch = icd_surface.as_raw() != create_info.surface.as_raw();
 
-		let mut patched_create_info;
-		let p_create_info_for_icd = if need_remap || need_surface_patch {
-			patched_create_info = *create_info;
-			if need_surface_patch {
-				patched_create_info.surface = icd_surface;
+		let device_info = with_device(device_key, |d| (d.physical_device, d.has_maintenance1));
+		let mut effective_mode = create_info.present_mode;
+		let app_modes = find_in_chain::<ash::vk::SwapchainPresentModesCreateInfoEXT>(
+			create_info.p_next,
+			ash::vk::StructureType::SWAPCHAIN_PRESENT_MODES_CREATE_INFO_EXT,
+		);
+		let mut declared_present_modes = if let Some(p) = app_modes {
+			if (*p).present_mode_count == 0 {
+				Vec::new()
+			} else {
+				std::slice::from_raw_parts((*p).p_present_modes, (*p).present_mode_count as usize).to_vec()
 			}
-			if need_remap {
-				patched_create_info.image_color_space = ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
-			}
-			&patched_create_info as *const VkSwapchainCreateInfoKHR
 		} else {
-			p_create_info
+			Vec::new()
 		};
+		if app_modes.is_none()
+			&& let Some((physical_device, true)) = device_info
+		{
+			let managed = with_surface(surface_key, |_| ()).is_some();
+			if managed {
+				let mut legacy = VkSurfaceCapabilitiesKHR::default();
+				let legacy_result = crate::state::with_instance(instance_key_of(physical_device), |d| {
+					d.dispatch.get_physical_device_surface_capabilities
+				})
+				.flatten()
+				.map(|f| f(physical_device, icd_surface, &mut legacy));
+				let requested = crate::image_count::query_mode(physical_device, icd_surface, create_info.present_mode);
+				let fifo = crate::image_count::query_mode(physical_device, icd_surface, VkPresentModeKHR::FIFO);
+				if legacy_result == Some(VK_SUCCESS)
+					&& let Some((mode, modes)) = crate::image_count::swapchain_modes(
+						create_info.min_image_count,
+						create_info.present_mode,
+						&legacy,
+						requested.as_ref(),
+						fifo.as_ref(),
+						!need_surface_patch && crate::surface::is_bypass_surface(create_info.surface),
+						is_forcing_fifo(),
+					) {
+					effective_mode = mode;
+					declared_present_modes = modes;
+				}
+			}
+		}
+		let mut mode_info =
+			ash::vk::SwapchainPresentModesCreateInfoEXT::default().present_modes(&declared_present_modes);
+		mode_info.p_next = create_info.p_next;
+		let mut patched_create_info = *create_info;
+		patched_create_info.surface = icd_surface;
+		patched_create_info.present_mode = effective_mode;
+		if need_remap {
+			patched_create_info.image_color_space = ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
+		}
+		if app_modes.is_none() && !declared_present_modes.is_empty() {
+			patched_create_info.p_next = (&mode_info as *const ash::vk::SwapchainPresentModesCreateInfoEXT).cast();
+		}
+		let p_create_info_for_icd = &patched_create_info;
+		crate::log_debug!(
+			"swapchain negotiation: requested minImageCount={} requested_mode={} effective_mode={} declared_modes={} mode_changed={}",
+			create_info.min_image_count,
+			create_info.present_mode.as_raw(),
+			effective_mode.as_raw(),
+			declared_present_modes.len(),
+			effective_mode != create_info.present_mode
+		);
 
 		// Call the next layer/ICD first.
 		let result = with_device(device_key, |data| data.dispatch.create_swapchain)
@@ -89,6 +140,12 @@ pub unsafe extern "C" fn create_swapchain(
 			.unwrap_or(VK_ERROR_INITIALIZATION_FAILED);
 
 		if result != VK_SUCCESS {
+			crate::log_debug!(
+				"vkCreateSwapchainKHR failed: result={} requested minImageCount={} effective_mode={}",
+				result.as_raw(),
+				create_info.min_image_count,
+				effective_mode.as_raw()
+			);
 			return result;
 		}
 
@@ -96,14 +153,29 @@ pub unsafe extern "C" fn create_swapchain(
 		let swapchain_key = SwapchainKey::from_raw(swapchain.as_raw());
 		// The requested minimum; the driver may allocate more images than this.
 		let min_image_count = create_info.min_image_count;
+		let image_count = with_device(device_key, |d| d.dispatch.get_swapchain_images)
+			.flatten()
+			.and_then(|f| {
+				let mut count = 0;
+				if f(device, swapchain, &mut count, std::ptr::null_mut()) == VK_SUCCESS {
+					Some(count)
+				} else {
+					None
+				}
+			});
+		crate::log_debug!(
+			"swapchain allocation: requested minImageCount={} actual allocated image count={}",
+			min_image_count,
+			image_count.map(|n| n.to_string()).unwrap_or_else(|| "unknown".into())
+		);
 
 		crate::log_info!(
-			"vkCreateSwapchainKHR: {}x{} format={} colorspace={} mode={} images={}",
+			"vkCreateSwapchainKHR: {}x{} format={} colorspace={} effective_mode={} requested_minImageCount={}",
 			create_info.image_extent.width,
 			create_info.image_extent.height,
 			create_info.image_format.as_raw(),
 			app_color_space.as_raw(),
-			create_info.present_mode.as_raw(),
+			effective_mode.as_raw(),
 			min_image_count,
 		);
 
@@ -116,10 +188,12 @@ pub unsafe extern "C" fn create_swapchain(
 					swapchain_key,
 					SwapchainData {
 						device_key,
-						present_mode: create_info.present_mode,
+						present_mode: effective_mode,
+						icd_present_mode: effective_mode,
+						declared_present_modes,
 						_format: create_info.image_format,
 						_color_space: create_info.image_color_space,
-						_image_count: min_image_count,
+						_image_count: image_count,
 						_extent: create_info.image_extent,
 						_surface: create_info.surface,
 						ms_swapchain: None,
@@ -152,14 +226,14 @@ pub unsafe extern "C" fn create_swapchain(
 					.create_swapchain(&native.wl_surface, &wl.qh, swapchain_key.raw());
 
 				ms.swapchain_feedback(
-					min_image_count,
+					image_count.unwrap_or(0),
 					create_info.image_format.as_raw() as u32,
 					app_color_space.as_raw() as u32,
 					create_info.composite_alpha.as_raw(),
 					create_info.pre_transform.as_raw(),
 					create_info.clipped,
 				);
-				ms.set_present_mode(create_info.present_mode.as_raw() as u32);
+				ms.set_present_mode(effective_mode.as_raw() as u32);
 				wl.flush();
 				Some(ms)
 			}
@@ -182,7 +256,7 @@ pub unsafe extern "C" fn create_swapchain(
 				// compositor is PQ-encoded, matching the app's requested
 				// color space.
 				ms.swapchain_feedback(
-					min_image_count,
+					image_count.unwrap_or(0),
 					create_info.image_format.as_raw() as u32,
 					app_color_space.as_raw() as u32,
 					create_info.composite_alpha.as_raw(),
@@ -191,7 +265,7 @@ pub unsafe extern "C" fn create_swapchain(
 				);
 
 				// Tell the compositor the present mode.
-				ms.set_present_mode(create_info.present_mode.as_raw() as u32);
+				ms.set_present_mode(effective_mode.as_raw() as u32);
 
 				// Map the bypass wl_surface to the X11 window so the
 				// compositor renders it in place of the XWayland surface.
@@ -209,10 +283,12 @@ pub unsafe extern "C" fn create_swapchain(
 			swapchain_key,
 			SwapchainData {
 				device_key,
-				present_mode: create_info.present_mode,
+				present_mode: effective_mode,
+				icd_present_mode: effective_mode,
+				declared_present_modes,
 				_format: create_info.image_format,
 				_color_space: create_info.image_color_space,
-				_image_count: min_image_count,
+				_image_count: image_count,
 				_extent: create_info.image_extent,
 				_surface: create_info.surface,
 				ms_swapchain,
@@ -262,25 +338,56 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 
 		let force_fifo = is_forcing_fifo();
 
-		// Compute effective present mode for each swapchain once.
-		// Use a stack buffer for the common case.
-		// Most apps use 1-2 swapchains; 4 covers typical edge cases.
+		// Respect an application's mode chain and never prepend a duplicate.
+		let app_mode_info = find_in_chain::<ash::vk::SwapchainPresentModeInfoEXT>(
+			present_info.p_next,
+			ash::vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT,
+		);
+		let app_modes = app_mode_info.map(|p| {
+			if (*p).swapchain_count == 0 {
+				&[][..]
+			} else {
+				std::slice::from_raw_parts((*p).p_present_modes, (*p).swapchain_count as usize)
+			}
+		});
+		let has_maintenance1 = with_device(queue_key, |d| d.has_maintenance1).unwrap_or(false);
+		// A batch can be patched only if every swapchain declared modes.
+		let can_inject_modes = has_maintenance1
+			&& app_mode_info.is_none()
+			&& !swapchains.is_empty()
+			&& swapchains.iter().all(|sw| {
+				with_swapchain(SwapchainKey::from_raw(sw.as_raw()), |sd| {
+					!sd.declared_present_modes.is_empty()
+				})
+				.unwrap_or(false)
+			});
+		// Keep the common one/two-swapchain presentation path allocation-free.
 		const MAX_SWAPCHAINS_ON_STACK: usize = 4;
-		let mut modes_stack = [ash::vk::PresentModeKHR::FIFO; MAX_SWAPCHAINS_ON_STACK];
+		let mut modes_stack = [VkPresentModeKHR::FIFO; MAX_SWAPCHAINS_ON_STACK];
 		let mut modes_heap;
-		let present_modes: &[ash::vk::PresentModeKHR] = {
+		let present_modes: &[VkPresentModeKHR] = {
 			let buf = if swapchains.len() <= modes_stack.len() {
 				&mut modes_stack[..swapchains.len()]
 			} else {
-				modes_heap = vec![ash::vk::PresentModeKHR::FIFO; swapchains.len()];
+				modes_heap = vec![VkPresentModeKHR::FIFO; swapchains.len()];
 				&mut modes_heap[..]
 			};
-			for (mode, sw) in buf.iter_mut().zip(swapchains.iter()) {
-				*mode = if force_fifo {
-					ash::vk::PresentModeKHR::FIFO
+			for (i, (mode, sw)) in buf.iter_mut().zip(swapchains.iter()).enumerate() {
+				let key = SwapchainKey::from_raw(sw.as_raw());
+				*mode = if let Some(mode) = app_modes.and_then(|m| m.get(i)).copied() {
+					mode
 				} else {
-					with_swapchain(SwapchainKey::from_raw(sw.as_raw()), |sd| sd.present_mode)
-						.unwrap_or(ash::vk::PresentModeKHR::FIFO)
+					with_swapchain(key, |sd| {
+						if can_inject_modes && force_fifo && sd.declared_present_modes.contains(&VkPresentModeKHR::FIFO)
+						{
+							VkPresentModeKHR::FIFO
+						} else if can_inject_modes {
+							sd.present_mode
+						} else {
+							sd.icd_present_mode
+						}
+					})
+					.unwrap_or(VkPresentModeKHR::FIFO)
 				};
 			}
 			buf
@@ -346,10 +453,9 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 		}
 
 		// Build per-present mode info if maintenance1 is available.
-		let has_maintenance1 = with_device(queue_key, |d| d.has_maintenance1).unwrap_or(false);
 		let mut present_mode_info;
 
-		let effective_present_info = if has_maintenance1 && !swapchains.is_empty() {
+		let effective_present_info = if can_inject_modes {
 			present_mode_info = ash::vk::SwapchainPresentModeInfoEXT::default().present_modes(present_modes);
 			present_mode_info.p_next = present_info.p_next as *mut std::ffi::c_void;
 
@@ -377,10 +483,26 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 					})
 			})
 			.unwrap_or(VK_ERROR_DEVICE_LOST);
+		// Track successful mode changes so a later unpatched batch retains the
+		// same ICD/compositor semantics. The ICD keeps its last submitted mode.
+		if result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR {
+			for (i, sw) in swapchains.iter().enumerate() {
+				let succeeded = present_info.p_results.is_null()
+					|| *present_info.p_results.add(i) == VK_SUCCESS
+					|| *present_info.p_results.add(i) == VK_SUBOPTIMAL_KHR;
+				if succeeded {
+					with_swapchain_mut(SwapchainKey::from_raw(sw.as_raw()), |sd| {
+						sd.icd_present_mode = present_modes[i];
+						if app_modes.is_some() {
+							sd.present_mode = present_modes[i];
+						}
+					});
+				}
+			}
+		}
 
-		// If the limiter state changed since swapchain creation and the app is
-		// frame-limiter-aware, force swapchain recreation so it re-queries the
-		// restricted present mode list.
+		// Recreate for limiter changes when the engine re-queries mode lists,
+		// or when the ICD cannot safely switch the declared modes dynamically.
 		let frame_limiter_aware = swapchains
 			.first()
 			.and_then(|sw| with_swapchain(SwapchainKey::from_raw(sw.as_raw()), |d| d.device_key))
@@ -388,7 +510,15 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 			.map(is_frame_limiter_aware)
 			.unwrap_or(false);
 
-		if frame_limiter_aware {
+		if frame_limiter_aware
+			|| !can_inject_modes
+			|| swapchains.iter().any(|sw| {
+				with_swapchain(SwapchainKey::from_raw(sw.as_raw()), |sd| {
+					!sd.declared_present_modes.contains(&VkPresentModeKHR::FIFO)
+						|| sd.present_mode == VkPresentModeKHR::FIFO
+				})
+				.unwrap_or(false)
+			}) {
 			for (i, sw) in swapchains.iter().enumerate() {
 				let fifo_changed = with_swapchain(SwapchainKey::from_raw(sw.as_raw()), |sd| {
 					sd.force_fifo_at_creation != force_fifo

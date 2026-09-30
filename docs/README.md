@@ -16,6 +16,7 @@ Start with the [project README](../README.md) for requirements and a quick start
 
 - [Contributor guide](../CONTRIBUTING.md): manual build, install/upgrade, validation, and release publishing.
 - [PyroWave architecture](PYROWAVE.md): dependency pins, codec negotiation, transport, and GPU validation.
+- [Vulkan image counts](VULKAN_IMAGE_COUNTS.md): bypass capability negotiation, extension gates, and PoE acceptance checks.
 - [Compositor architecture](COMPOSITOR.md): scene capture, cursor lifetime, and Steam input.
 - [Benchmarking](BENCHMARKING.md): encoding pipeline measurements with `moonshine-bench`.
 - [Reconnect validation](reconnect-validation.md): manual stream reconfiguration checks.
