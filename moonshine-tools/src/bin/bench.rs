@@ -737,10 +737,8 @@ async fn run_benchmark(
 	}
 
 	let video_ctx = VideoStreamContext {
-		pyrowave_dialect: Some(
-			moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1,
-		)
-		.filter(|_| negotiated_format.codec == VideoCodec::PyroWave),
+		pyrowave_dialect: (negotiated_format.codec == VideoCodec::PyroWave)
+			.then_some(moonshine_core::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1),
 		width,
 		height,
 		fps: target_fps,
