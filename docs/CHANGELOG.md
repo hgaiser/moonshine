@@ -14,6 +14,16 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.16.12] - 2026-09-30
+
+### Fixed
+
+- Release completed direct-scanout buffers and flush Wayland release events before static-screen skipping, preventing swapchain image starvation under encoder load.
+
+### Added
+
+- Report scanout buffer releases and allocated swapchain image counts to diagnose capture stalls and image-count negotiation.
+
 ## [v0.16.11] - 2026-09-30
 
 ### Fixed

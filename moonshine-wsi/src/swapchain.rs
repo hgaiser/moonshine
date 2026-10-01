@@ -170,13 +170,16 @@ pub unsafe extern "C" fn create_swapchain(
 		);
 
 		crate::log_info!(
-			"vkCreateSwapchainKHR: {}x{} format={} colorspace={} effective_mode={} requested_minImageCount={}",
+			"vkCreateSwapchainKHR: {}x{} format={} colorspace={} requested_mode={} effective_mode={} requested_minImageCount={} allocated_images={:?} bypass={}",
 			create_info.image_extent.width,
 			create_info.image_extent.height,
 			create_info.image_format.as_raw(),
 			app_color_space.as_raw(),
+			create_info.present_mode.as_raw(),
 			effective_mode.as_raw(),
 			min_image_count,
+			image_count,
+			bypass_allowed,
 		);
 
 		// Look up the VkInstance key from the device (reuse the already-cached value).

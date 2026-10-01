@@ -1,5 +1,47 @@
-//! Complete-scene eligibility, independent of application input focus.
+//! Capture lifecycle and complete-scene eligibility, independent of input focus.
 use super::CaptureMode;
+use std::collections::HashMap;
+use std::hash::Hash;
+use std::sync::{
+	Arc,
+	atomic::{AtomicBool, Ordering},
+};
+use std::time::Duration;
+
+pub(super) struct CaptureTick {
+	pub render: bool,
+	pub released: usize,
+}
+
+/// Release completed scanout holds and flush client events before the static
+/// screen gate. A client waiting for a reusable image cannot commit damage
+/// until its buffer release arrives, even when no new capture is needed.
+/// Only the encoder's acquire/release consumption flag permits dropping a hold.
+pub(super) fn prepare_capture<K: Eq + Hash, B>(
+	held: &mut Vec<(Arc<AtomicBool>, K, B)>,
+	indices: &mut HashMap<K, usize>,
+	screen_dirty: bool,
+	capture_age: Duration,
+	flush_releases: impl FnOnce(),
+) -> CaptureTick {
+	let previous = held.len();
+	held.retain(|(consumed, buffer_id, _)| {
+		if consumed.load(Ordering::Acquire) {
+			indices.remove(buffer_id);
+			false
+		} else {
+			true
+		}
+	});
+	let released = previous - held.len();
+	if released != 0 {
+		flush_releases();
+	}
+	CaptureTick {
+		render: screen_dirty || capture_age >= Duration::from_secs(1),
+		released,
+	}
+}
 
 #[derive(Default)]
 pub(super) struct SceneExtras {
@@ -44,6 +86,77 @@ mod tests {
 	use super::*;
 	use crate::session::compositor::cursor::CursorState;
 	use smithay::input::pointer::CursorImageStatus;
+	use std::cell::Cell;
+	use std::rc::Rc;
+
+	struct BufferHold(Rc<Cell<usize>>);
+	impl Drop for BufferHold {
+		fn drop(&mut self) {
+			self.0.set(self.0.get() + 1);
+		}
+	}
+
+	#[test]
+	fn static_ticks_release_and_flush_completed_three_image_swapchain() {
+		let released = Rc::new(Cell::new(0));
+		let flags: Vec<_> = (0..3).map(|_| Arc::new(AtomicBool::new(false))).collect();
+		let mut held: Vec<_> = flags
+			.iter()
+			.enumerate()
+			.map(|(id, flag)| (flag.clone(), id, BufferHold(released.clone())))
+			.collect();
+		let mut indices: HashMap<_, _> = (0..3).map(|id| (id, id)).collect();
+		// The game has no free image and cannot dirty the screen. Completion
+		// occurs asynchronously after capture; no wall-clock wait is needed.
+		for (id, flag) in flags.iter().enumerate() {
+			flag.store(true, Ordering::Release);
+			let tick = prepare_capture(&mut held, &mut indices, false, Duration::from_millis(7), || {
+				// Flush must happen AFTER dropping the hold queues wl_buffer.release.
+				assert_eq!(released.get(), id + 1);
+			});
+			assert!(!tick.render);
+			assert_eq!(tick.released, 1);
+			assert_eq!(held.len(), 2 - id);
+			assert!(!indices.contains_key(&id));
+			assert_eq!(indices.len(), held.len());
+		}
+		assert_eq!(released.get(), 3);
+	}
+
+	#[test]
+	fn static_ticks_preserve_buffers_still_read_by_encoder() {
+		let released = Rc::new(Cell::new(0));
+		let flag = Arc::new(AtomicBool::new(false));
+		let mut held = vec![(flag.clone(), 0, BufferHold(released.clone()))];
+		let mut indices = HashMap::from([(0, 0)]);
+		for _ in 0..10_000 {
+			let tick = prepare_capture(&mut held, &mut indices, false, Duration::from_millis(7), || {
+				panic!("unconsumed buffers must not be released or flushed");
+			});
+			assert!(!tick.render);
+			assert_eq!(tick.released, 0);
+		}
+		assert_eq!(held.len(), 1);
+		assert_eq!(indices.len(), 1);
+		assert_eq!(released.get(), 0);
+	}
+
+	#[test]
+	fn dirty_and_keepalive_ticks_still_render_and_release() {
+		for (dirty, age) in [(true, Duration::ZERO), (false, Duration::from_secs(1))] {
+			let released = Rc::new(Cell::new(0));
+			let mut held = vec![(Arc::new(AtomicBool::new(true)), 0, BufferHold(released.clone()))];
+			let mut indices = HashMap::from([(0, 0)]);
+			let flushed = Cell::new(false);
+			let tick = prepare_capture(&mut held, &mut indices, dirty, age, || flushed.set(true));
+			assert!(tick.render);
+			assert_eq!(tick.released, 1);
+			assert_eq!(released.get(), 1);
+			assert!(flushed.get());
+			assert!(held.is_empty() && indices.is_empty());
+		}
+	}
+
 	#[test]
 	fn cropping_scaling_offsets_and_rotation_require_composition() {
 		use smithay::backend::renderer::utils::SurfaceView;

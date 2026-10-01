@@ -257,6 +257,7 @@ pub(crate) struct MoonshineCompositor {
     pub capture_mode: super::CaptureMode,
     capture_path: Option<&'static str>,
 	last_resource_summary: std::time::Instant,
+	released_scanout_buffers: u64,
 	pub pen_tablet_descriptor: TabletDescriptor,
 	pub active_pen_tool_kind: Option<u8>,
 	pub pen_buttons: u8,
@@ -761,6 +762,7 @@ impl MoonshineCompositor {
 				capture_mode,
 				capture_path: None,
 				last_resource_summary: std::time::Instant::now(),
+				released_scanout_buffers: 0,
 				pen_tablet_descriptor,
 				active_pen_tool_kind: None,
 				pen_buttons: 0,
@@ -1218,28 +1220,6 @@ impl MoonshineCompositor {
 	pub fn render_and_export(&mut self) {
 		self.retired_buffer_pools
 			.retain(|pool| !pool.iter().all(|slot| slot.consumed.load(Ordering::Acquire)));
-		if self.last_resource_summary.elapsed() >= std::time::Duration::from_secs(5) {
-			let busy_pool_buffers = self
-				.buffer_pool
-				.iter()
-				.filter(|slot| !slot.consumed.load(Ordering::Acquire))
-				.count();
-			let busy_scanout_buffers = self
-				.held_scanout_buffers
-				.iter()
-				.filter(|(consumed, _, _)| !consumed.load(Ordering::Acquire))
-				.count();
-			tracing::info!(
-				capture_path = ?self.capture_path, busy_pool_buffers, busy_scanout_buffers,
-				screen_dirty = self.screen_dirty,
-				last_capture_age_ms = self.last_frame_sent_at.elapsed().as_millis() as u64,
-				held_scanout_buffers = self.held_scanout_buffers.len(),
-				scanout_buffer_map = self.scanout_buffer_map.len(),
-				retired_buffer_pools = self.retired_buffer_pools.len(),
-				"Video capture resources"
-			);
-			self.last_resource_summary = std::time::Instant::now();
-		}
 		// Keep the Steam overlay z-ordered above the game while it is open.
 		// Must run before the static-screen early return so the raise/lower
 		// is detected as soon as the overlay window commits a frame.
@@ -1259,23 +1239,48 @@ impl MoonshineCompositor {
 			self.last_cursor_position = self.cursor_position;
 		}
 
-		// Skip rendering when the screen is static and we already sent a
-		// keepalive frame within the last second.
-		if !self.screen_dirty && self.last_frame_sent_at.elapsed() < std::time::Duration::from_secs(1) {
+		// A static scene can mean the producer is waiting for wl_buffer.release.
+		// Release completed holds and flush them before deciding to skip capture.
+		let tick = super::capture::prepare_capture(
+			&mut self.held_scanout_buffers,
+			&mut self.scanout_buffer_map,
+			self.screen_dirty,
+			self.last_frame_sent_at.elapsed(),
+			|| {
+				if let Err(e) = self.display_handle.flush_clients() {
+					tracing::error!("Failed to flush scanout buffer releases: {e}");
+				}
+			},
+		);
+		self.released_scanout_buffers += tick.released as u64;
+		if self.last_resource_summary.elapsed() >= std::time::Duration::from_secs(5) {
+			let busy_pool_buffers = self
+				.buffer_pool
+				.iter()
+				.filter(|slot| !slot.consumed.load(Ordering::Acquire))
+				.count();
+			let busy_scanout_buffers = self
+				.held_scanout_buffers
+				.iter()
+				.filter(|(consumed, _, _)| !consumed.load(Ordering::Acquire))
+				.count();
+			tracing::info!(
+				capture_path = ?self.capture_path, busy_pool_buffers, busy_scanout_buffers,
+				screen_dirty = self.screen_dirty,
+				last_capture_age_ms = self.last_frame_sent_at.elapsed().as_millis() as u64,
+				held_scanout_buffers = self.held_scanout_buffers.len(),
+				scanout_buffer_map = self.scanout_buffer_map.len(),
+				retired_buffer_pools = self.retired_buffer_pools.len(),
+				released_scanout_buffers = self.released_scanout_buffers,
+				"Video capture resources"
+			);
+			self.last_resource_summary = std::time::Instant::now();
+			self.released_scanout_buffers = 0;
+		}
+		// Preserve the one-second keepalive for an actually static screen.
+		if !tick.render {
 			return;
 		}
-
-		// Release held scanout buffers that the encoder has finished reading.
-		// Drop their entries from the buffer→index map; if the same wl_buffer
-		// is re-attached later it'll get a fresh index.
-		self.held_scanout_buffers.retain(|(consumed, buffer_id, _)| {
-			if consumed.load(Ordering::Acquire) {
-				self.scanout_buffer_map.remove(buffer_id);
-				false
-			} else {
-				true
-			}
-		});
 
 		// Try direct scanout: bypass compositor rendering when a single
 		// fullscreen DMA-BUF surface covers the entire output. This avoids
