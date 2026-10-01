@@ -1,0 +1,8 @@
+v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=PyroWave fixture
+t=0 0
+a=x-nv-vqos[0].bitStreamFormat:3
+a=x-ss-video[0].pyrowaveAdaptiveFec:0
+a=x-ss-video[0].pyrowaveAdaptiveBitrate:0
+a=x-ss-video[0].pyrowaveFeatures:1

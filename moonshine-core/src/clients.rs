@@ -60,6 +60,16 @@ pub struct ClientManager {
 }
 
 impl ClientManager {
+	#[cfg(test)]
+	pub(crate) fn isolated(path: std::path::PathBuf) -> Self {
+		Self {
+			pending_clients: Default::default(),
+			state: PersistentState::isolated(path),
+			server_cert_pem: String::new(),
+			server_private_key_pem: String::new(),
+		}
+	}
+
 	pub fn new(server_cert_pem: String, server_private_key_pem: String) -> Result<Self, ()> {
 		Ok(Self {
 			pending_clients: Arc::new(RwLock::new(BTreeMap::new())),

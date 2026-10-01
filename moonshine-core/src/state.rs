@@ -30,6 +30,14 @@ pub struct PersistentState {
 }
 
 impl PersistentState {
+	#[cfg(test)]
+	pub(crate) fn isolated(path: PathBuf) -> Self {
+		Self {
+			data: Arc::new(RwLock::new(StateData::new())),
+			path,
+		}
+	}
+
 	pub(crate) fn new() -> Result<Self, ()> {
 		let path = dirs::data_dir()
 			.ok_or_else(|| tracing::error!("Failed to get data directory."))?

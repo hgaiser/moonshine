@@ -1,3 +1,4 @@
+use crate::session::stream::video::pyrowave_protocol::{BITSTREAM_ID, PyroWaveDialect};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
 
@@ -11,7 +12,9 @@ use tokio::net::TcpListener;
 use tokio::net::TcpStream;
 
 use crate::ShutdownReason;
-use crate::healthcheck::{CODEC_PYROWAVE_MASK, supports_video_format};
+use crate::healthcheck::{
+	CODEC_PYROWAVE, CODEC_PYROWAVE_444, CODEC_PYROWAVE_HDR, CODEC_PYROWAVE_MASK, supports_video_format,
+};
 use crate::session::manager::SessionManager;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::audio::AudioChannels;
@@ -152,7 +155,8 @@ impl RtspServer {
 		result.push_str("a=rtpmap:98 AV1/90000\r\n");
 		result.push_str("a=fmtp:96 packetization-mode=1\r\n");
 		if self.supported_codecs & CODEC_PYROWAVE_MASK != 0 {
-			result.push_str("a=x-ss-pyrowave.version:1\r\n");
+			result.push_str("a=x-ss-pyrowave.version:1\r\na=rtpmap:99 PYROWAVE/90000\r\n");
+			result.push_str(&format!("a=x-ss-pyrowave.bitstream:{BITSTREAM_ID}\r\na=x-ss-pyrowave.dialects:native-wire-v1 record-framed\r\na=x-ss-pyrowave.profiles:{}\r\n", pyrowave_profiles(self.supported_codecs)));
 		}
 
 		// Emit surround-params for each Opus configuration.
@@ -369,12 +373,16 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
-		if video_format == VideoCodec::PyroWave
-			&& get_optional_sdp_attribute::<String>(&sdp_session, "x-ss-pyrowave.version").as_deref() != Some("1")
-		{
-			tracing::warn!("Client requested PyroWave without the supported wire version 1");
-			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
-		}
+		let pyrowave_dialect = match negotiated_pyrowave_dialect(video_format, &sdp_session) {
+			Ok(dialect) => dialect,
+			Err(reason) => {
+				tracing::warn!(reason, "PyroWave ANNOUNCE rejected");
+				return rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::BadRequest)
+					.header(headers::CSEQ, cseq.to_string())
+					.header(headers::CONTENT_TYPE, "text/plain")
+					.build(format!("PyroWave ANNOUNCE rejected: {reason}").into_bytes());
+			},
+		};
 
 		let (dynamic_range, chroma_sampling_type, bit_depth) = match negotiated_video_axes(&sdp_session) {
 			Ok(axes) => axes,
@@ -458,10 +466,14 @@ impl RtspServer {
 			width,
 			height,
 			fps,
+			pyrowave_dialect = ?pyrowave_dialect,
+			pyrowave_bitstream = BITSTREAM_ID,
+			packet_size,
 			"Selected video mode"
 		);
 
 		let video_stream_context = VideoStreamContext {
+			pyrowave_dialect,
 			width,
 			height,
 			fps,
@@ -666,6 +678,51 @@ fn rtsp_response(
 		.build(Vec::new())
 }
 
+fn pyrowave_profiles(capabilities: u32) -> String {
+	let mut profiles = Vec::new();
+	for (bit, sdr, hdr) in [
+		(CODEC_PYROWAVE, "420-sdr8", "420-hdr10"),
+		(CODEC_PYROWAVE_444, "444-sdr8", "444-hdr10"),
+	] {
+		if capabilities & bit != 0 {
+			profiles.push(sdr);
+			if capabilities & CODEC_PYROWAVE_HDR != 0 {
+				profiles.push(hdr);
+			}
+		}
+	}
+	profiles.join(" ")
+}
+
+fn unique_sdp_attribute<'a>(session: &'a sdp_types::Session, name: &str) -> Result<Option<&'a str>, &'static str> {
+	let mut attributes = session.attributes.iter().filter(|a| a.attribute == name);
+	let Some(attribute) = attributes.next() else {
+		return Ok(None);
+	};
+	if attributes.next().is_some() {
+		return Err("Duplicate protocol attribute");
+	}
+	let value = attribute.value.as_deref().map(str::trim).filter(|v| !v.is_empty());
+	value.map(Some).ok_or("Empty protocol attribute")
+}
+
+fn negotiated_pyrowave_dialect(
+	codec: VideoCodec,
+	session: &sdp_types::Session,
+) -> Result<Option<PyroWaveDialect>, &'static str> {
+	if codec != VideoCodec::PyroWave {
+		return Ok(None);
+	}
+	PyroWaveDialect::negotiate(
+		unique_sdp_attribute(session, "x-ss-pyrowave.version")?,
+		unique_sdp_attribute(session, "x-ss-pyrowave.dialect")?,
+		unique_sdp_attribute(session, "x-ss-pyrowave.bitstream")?,
+		unique_sdp_attribute(session, "x-ss-video[0].pyrowaveFeatures")?,
+		unique_sdp_attribute(session, "x-ss-video[0].pyrowaveAdaptiveFec")?,
+	)
+	.map(Some)
+}
+
 fn get_optional_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &str) -> Option<F> {
 	sdp_session
 		.get_first_attribute_value(attribute)
@@ -680,11 +737,10 @@ fn negotiated_video_axes(
 	session: &sdp_types::Session,
 ) -> Result<(VideoDynamicRange, VideoChromaSampling, BitDepth), ()> {
 	fn optional_u32(session: &sdp_types::Session, name: &str) -> Result<Option<u32>, ()> {
-		match session.get_first_attribute_value(name) {
-			Err(_) => Ok(None),  // AttributeNotFoundError: absent legacy attribute.
-			Ok(None) => Err(()), // Present without a value is malformed.
-			Ok(Some(value)) => value.trim().parse().map(Some).map_err(|_| ()),
-		}
+		unique_sdp_attribute(session, name)
+			.map_err(|_| ())?
+			.map(|value| value.parse().map_err(|_| ()))
+			.transpose()
 	}
 	let dynamic = VideoDynamicRange::try_from(optional_u32(session, "x-nv-video[0].dynamicRangeMode")?.unwrap_or(0))?;
 	let chroma =
@@ -716,6 +772,48 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 #[cfg(test)]
 mod tests {
 	use super::bitrate_bps_from_kbps;
+
+	#[test]
+	fn negotiation_fixtures_and_conventional_isolation() {
+		use super::*;
+		let base = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=fixture\r\nt=0 0\r\n";
+		for (attributes, expected) in [
+			(
+				include_str!("../tests/protocol/native-announce.sdp"),
+				PyroWaveDialect::NativeWireV1,
+			),
+			(
+				include_str!("../tests/protocol/nonary-announce.sdp"),
+				PyroWaveDialect::RecordFramed,
+			),
+		] {
+			let session = sdp_types::Session::parse(attributes.as_bytes()).unwrap();
+			assert_eq!(
+				negotiated_pyrowave_dialect(VideoCodec::PyroWave, &session),
+				Ok(Some(expected))
+			);
+		}
+		for attributes in [
+			"",
+			"a=x-ss-pyrowave.dialect:native-wire-v1\r\n",
+			"a=x-ss-pyrowave.version:2\r\n",
+			"a=x-ss-pyrowave.version:1\r\na=x-ss-pyrowave.version:1\r\n",
+			"a=x-ss-pyrowave.version:1\r\na=x-ss-pyrowave.dialect:unknown\r\n",
+			"a=x-ss-pyrowave.version:1\r\na=x-ss-pyrowave.bitstream:unknown\r\n",
+			"a=x-ss-pyrowave.version\r\n",
+		] {
+			let session = sdp_types::Session::parse(format!("{base}{attributes}").as_bytes()).unwrap();
+			assert!(negotiated_pyrowave_dialect(VideoCodec::PyroWave, &session).is_err());
+			for codec in [VideoCodec::H264, VideoCodec::Hevc, VideoCodec::Av1] {
+				assert_eq!(negotiated_pyrowave_dialect(codec, &session), Ok(None));
+			}
+		}
+		assert_eq!(pyrowave_profiles(CODEC_PYROWAVE), "420-sdr8");
+		assert_eq!(
+			pyrowave_profiles(CODEC_PYROWAVE_444 | CODEC_PYROWAVE_HDR),
+			"444-sdr8 444-hdr10"
+		);
+	}
 
 	#[test]
 	fn profile_axes_preserve_hdr_chroma_and_explicit_sdr_depth() {

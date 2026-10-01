@@ -1,3 +1,4 @@
+pub mod pyrowave_protocol;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
@@ -161,6 +162,8 @@ pub struct FrameStats {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct VideoStreamContext {
+	/// Explicit setup-time PyroWave dialect; conventional codecs use None.
+	pub pyrowave_dialect: Option<pyrowave_protocol::PyroWaveDialect>,
 	/// Width of the video stream in pixels.
 	pub width: u32,
 
@@ -206,6 +209,7 @@ impl VideoStreamContext {
 				}
 			};
 		}
+		changed!(pyrowave_dialect, "PyroWave dialect");
 		changed!(width, "width");
 		changed!(height, "height");
 		changed!(fps, "fps");
@@ -629,6 +633,22 @@ fn spawn_handle_video_packets(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn dialect_changes_require_a_new_stream_epoch() {
+		use pyrowave_protocol::PyroWaveDialect;
+		let active = VideoStreamContext {
+			pyrowave_dialect: Some(PyroWaveDialect::NativeWireV1),
+			..Default::default()
+		};
+		assert!(active.changed_fields(&active).is_empty());
+		let records = VideoStreamContext {
+			pyrowave_dialect: Some(PyroWaveDialect::RecordFramed),
+			..active.clone()
+		};
+		assert_eq!(active.changed_fields(&records), vec!["PyroWave dialect"]);
+		assert_eq!(records.changed_fields(&active), vec!["PyroWave dialect"]);
+	}
 
 	#[test]
 	fn stats_logging_defaults_on_and_roundtrips_explicit_choice() {

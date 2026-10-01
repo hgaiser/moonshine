@@ -781,6 +781,7 @@ impl VideoPipelineInner {
 		);
 		tracing::info!(
 			codec = "PyroWave",
+			dialect = ?ctx.pyrowave_dialect,
 			gpu = encoder.device_name(),
 			visible_width = ctx.width,
 			visible_height = ctx.height,
@@ -818,6 +819,7 @@ impl VideoPipelineInner {
 		}
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
+		packetizer.set_pyrowave_dialect(ctx.pyrowave_dialect);
 		let mut fec_feedback_rx = self.fec_feedback_rx.clone();
 		packetizer.warm_up(
 			fec_controller.percentage(),
@@ -1069,6 +1071,7 @@ impl VideoPipelineInner {
 		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
+		packetizer.set_pyrowave_dialect(ctx.pyrowave_dialect);
 		packetizer.warm_up(
 			self.config.fec_percentage,
 			if self.config.fec_mode == crate::session::stream::video::FecMode::Off {

@@ -68,9 +68,12 @@ PyroWave encoding requires a hardware Vulkan device. Software Vulkan devices
 are rejected explicitly, and the selected GPU is logged when the encoder starts;
 there is no CPU encoder or fallback to a conventional codec.
 
-The DESCRIBE response contains `a=x-ss-pyrowave.version:1`, and a PyroWave
-ANNOUNCE must echo the same attribute. This prevents a client and server with
-different private framing rules from accidentally selecting the codec.
+The DESCRIBE response advertises native version 1, the verified `186f0393`
+block-format family, the `native-wire-v1 record-framed` dialect list, and only
+profiles that passed startup probes. Native ANNOUNCE echoes version 1.
+Nonary-compatible record ANNOUNCE instead declares record feature bit 1 or its
+adaptive-FEC capability attribute. Missing, contradictory, duplicate, and unknown
+markers are rejected. See [compatibility and calibration](PYROWAVE_COMPATIBILITY.md).
 
 A compatible client selects the following ANNOUNCE SDP attributes:
 

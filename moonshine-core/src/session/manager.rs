@@ -692,6 +692,7 @@ mod tests {
 
 	fn video(codec: VideoCodec) -> VideoStreamContext {
 		VideoStreamContext {
+			pyrowave_dialect: None,
 			width: 1920,
 			height: 1080,
 			fps: 60,

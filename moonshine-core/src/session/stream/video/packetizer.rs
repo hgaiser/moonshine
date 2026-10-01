@@ -1,3 +1,4 @@
+use super::pyrowave_protocol::{PyroWaveDialect, record_boundaries};
 use aes_gcm::{
 	Aes128Gcm, Key, Nonce,
 	aead::{AeadInPlace, KeyInit},
@@ -113,6 +114,7 @@ fn copy_header_and_data(
 }
 
 pub(crate) struct Packetizer {
+	pyrowave_dialect: Option<PyroWaveDialect>,
 	fec_encoders: HashMap<(usize, usize), ReedSolomon>,
 	/// Watch channel for encryption keys — read eagerly per `packetize()` call.
 	keys_rx: SessionKeysReceiver,
@@ -131,6 +133,7 @@ pub(crate) struct Packetizer {
 impl Packetizer {
 	pub fn new(encrypt: bool, keys_rx: SessionKeysReceiver) -> Self {
 		Self {
+			pyrowave_dialect: None,
 			fec_encoders: HashMap::new(),
 			keys_rx,
 			encrypt,
@@ -139,6 +142,10 @@ impl Packetizer {
 			gcm_iv_counter: 0,
 			last_fec_warning: None,
 		}
+	}
+
+	pub fn set_pyrowave_dialect(&mut self, dialect: Option<PyroWaveDialect>) {
+		self.pyrowave_dialect = dialect;
 	}
 
 	/// Update the cipher if the encryption key has rotated.
@@ -236,6 +243,14 @@ impl Packetizer {
 
 		let mut header_bytes = [0u8; VIDEO_FRAME_HEADER_SIZE];
 		video_frame_header.serialize(&mut header_bytes);
+		let record_mode = self.pyrowave_dialect == Some(PyroWaveDialect::RecordFramed);
+		let record_starts = if record_mode {
+			let (starts, critical_packets) = record_boundaries(encoded_data, requested_shard_payload_size)?;
+			header_bytes[6..8].copy_from_slice(&critical_packets.to_le_bytes());
+			starts
+		} else {
+			Vec::new()
+		};
 
 		// The total size of a shard (RTP + padding + NvVideoPacket + payload).
 		let requested_shard_size = PAYLOAD_OFFSET + requested_shard_payload_size;
@@ -360,6 +375,14 @@ impl Packetizer {
 					(block_shard_index << 12 | nr_data_shards << 22 | usize::from(fec_percentage) << 4) as u32,
 				);
 
+				// This exact record-start metadata is included in plaintext FEC
+				// and encryption. Native and conventional shard bytes stay intact.
+				if record_mode
+					&& (payload_start == 0
+						|| payload_start >= 8 && record_starts.binary_search(&(payload_start - 8)).is_ok())
+				{
+					shard[NV_PACKET_OFFSET + 9] |= 0x80;
+				}
 				// Copy payload from [header ++ encoded_data].
 				copy_header_and_data(
 					&mut shard[PAYLOAD_OFFSET..],
@@ -581,6 +604,88 @@ fn packet_layout(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn native_wire_v1_uses_the_ordinary_packetizer_byte_for_byte() {
+		// Opaque bytes deliberately lack a codec header: the native packetizer
+		// must not inspect them, add record metadata, or choose another framing.
+		for encrypt in [false, true] {
+			for fec in [0, 20] {
+				let data: Vec<u8> = (0..32768).map(|i| (i * 131) as u8).collect();
+				let mut ordinary = packetizer();
+				ordinary.encrypt = encrypt;
+				let mut native = packetizer();
+				native.encrypt = encrypt;
+				native.set_pyrowave_dialect(Some(PyroWaveDialect::NativeWireV1));
+				let a = ordinary.packetize(&data, true, 1392, 0, fec, 1, &mut 0, 42, 3).unwrap();
+				let b = native.packetize(&data, true, 1392, 0, fec, 1, &mut 0, 42, 3).unwrap();
+				assert_eq!(a.as_bytes(), b.as_bytes());
+				let mut records = packetizer();
+				records.set_pyrowave_dialect(Some(PyroWaveDialect::RecordFramed));
+				assert!(records.packetize(&data, true, 1392, 0, fec, 1, &mut 0, 42, 3).is_err());
+			}
+		}
+	}
+
+	#[test]
+	fn record_metadata_survives_encryption_and_fec_loss() {
+		let mut frame = Vec::new();
+		frame.extend_from_slice(&(0x80000000u32 | 127 | (127 << 14)).to_le_bytes());
+		frame.extend_from_slice(&32u32.to_le_bytes());
+		for block in 0..32u32 {
+			frame.extend_from_slice(&(2u32 << 16).to_le_bytes());
+			frame.extend_from_slice(&(block << 8).to_le_bytes());
+		}
+		for encrypt in [false, true] {
+			let mut p = packetizer();
+			p.encrypt = encrypt;
+			p.set_pyrowave_dialect(Some(PyroWaveDialect::RecordFramed));
+			let batch = p.packetize(&frame, true, 80, 0, 20, 1, &mut 0, 0, 0).unwrap();
+			let prefix = if encrypt { ENC_PREFIX_SIZE } else { 0 };
+			let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(&[0; 16]));
+			let mut plain: Vec<Vec<u8>> = batch
+				.as_bytes()
+				.chunks_exact(batch.shard_size())
+				.map(|shard| {
+					let mut data = shard[prefix..].to_vec();
+					if encrypt {
+						cipher
+							.decrypt_in_place_detached(
+								Nonce::from_slice(&shard[..12]),
+								b"",
+								&mut data,
+								aes_gcm::Tag::from_slice(&shard[16..32]),
+							)
+							.unwrap();
+					}
+					data
+				})
+				.collect();
+			assert_eq!(
+				u16::from_le_bytes(plain[0][PAYLOAD_OFFSET + 6..PAYLOAD_OFFSET + 8].try_into().unwrap()),
+				2
+			);
+			for data in &plain[..batch.data_shards()] {
+				assert_ne!(data[NV_PACKET_OFFSET + 9] & 0x80, 0);
+			}
+			// Parity headers are patched on wire; reconstruct only the payload
+			// region so header patching cannot invalidate the RS equation.
+			let original: Vec<Vec<u8>> = plain.iter().map(|s| s[PAYLOAD_OFFSET..].to_vec()).collect();
+			let mut missing: Vec<Option<Vec<u8>>> =
+				plain.drain(..).map(|s| Some(s[PAYLOAD_OFFSET..].to_vec())).collect();
+			missing[0] = None;
+			ReedSolomon::new(batch.data_shards(), batch.parity_shards())
+				.unwrap()
+				.reconstruct(&mut missing)
+				.unwrap();
+			assert_eq!(missing[0].as_ref().unwrap(), &original[0]);
+			let rebuilt: Vec<u8> = missing[..batch.data_shards()]
+				.iter()
+				.flat_map(|s| s.as_ref().unwrap().iter().copied())
+				.collect();
+			assert_eq!(&rebuilt[8..8 + frame.len()], &frame);
+		}
+	}
 
 	#[test]
 	fn ordinary_frames_keep_fec() {

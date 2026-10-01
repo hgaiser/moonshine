@@ -1,0 +1,8 @@
+v=0
+o=- 0 0 IN IP4 127.0.0.1
+s=PyroWave fixture
+t=0 0
+a=x-nv-vqos[0].bitStreamFormat:3
+a=x-ss-pyrowave.version:1
+a=x-ss-pyrowave.dialect:native-wire-v1
+a=x-ss-pyrowave.bitstream:186f0393

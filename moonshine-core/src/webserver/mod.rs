@@ -37,6 +37,9 @@ use self::pairing::handle_pair_request;
 
 use super::session::stream::audio::AudioChannels;
 
+mod bandwidth;
+#[cfg(test)]
+mod bandwidth_tests;
 mod pairing;
 
 /// Configuration for the embedded webserver.
@@ -81,6 +84,7 @@ const SERVERINFO_GFE_VERSION: &str = "3.23.0.74";
 
 #[derive(Clone)]
 pub struct Webserver {
+	probe_slots: std::sync::Arc<tokio::sync::Semaphore>,
 	name: String,
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
@@ -113,6 +117,7 @@ impl Webserver {
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		let server = Self {
+			probe_slots: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
 			name,
 			rtsp_port,
 			webserver_config,
@@ -165,6 +170,7 @@ impl Webserver {
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
 								tracing::trace!("Accepted connection from {address}.");
 
+								let peer_address = unmap_v4_mapped(address);
 								let address = connection.local_addr().ok().map(unmap_v4_mapped);
 								let mac_address = if let Some(address) = address {
 									get_mac_address(address.ip()).unwrap_or(None)
@@ -187,6 +193,7 @@ impl Webserver {
 															server.serve(
 																request,
 																address,
+																peer_address,
 																mac_address.clone(),
 																false,
 																None,
@@ -251,6 +258,7 @@ impl Webserver {
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
 								tracing::trace!("Accepted TLS connection from {address}.");
 
+								let peer_address = unmap_v4_mapped(address);
 								let address = connection.local_addr().ok().map(unmap_v4_mapped);
 								let mac_address = if let Some(address) = address {
 									get_mac_address(address.ip()).unwrap_or(None)
@@ -286,6 +294,7 @@ impl Webserver {
 															server.serve(
 																request,
 																address,
+																peer_address,
 																mac_address.clone(),
 																true,
 																peer_cert_fingerprint.clone(),
@@ -317,10 +326,11 @@ impl Webserver {
 		&self,
 		request: Request<hyper::body::Incoming>,
 		local_address: Option<SocketAddr>,
+		peer_address: SocketAddr,
 		mac_address: Option<String>,
 		https: bool,
 		peer_cert_fingerprint: Option<String>,
-	) -> Result<Response<Full<Bytes>>, Infallible> {
+	) -> Result<Response<bandwidth::ResponseBody>, Infallible> {
 		let params = request
 			.uri()
 			.query()
@@ -331,23 +341,60 @@ impl Webserver {
 
 		let response = if https {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => {
+					self.server_info(
+						params,
+						local_address,
+						peer_address,
+						mac_address,
+						https,
+						peer_cert_fingerprint.as_ref(),
+					)
+					.await
+				},
+				(&Method::GET, "/pyrowave-bandwidth-probe") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
+						return Ok(resp.map(BodyExt::boxed_unsync));
+					}
+					if self.supported_codecs & 0x01800000 == 0 {
+						return Ok(not_found().map(BodyExt::boxed_unsync));
+					}
+					// Explicit calibration is unavailable during a session so a
+					// bulk download never competes with interactive streaming.
+					if !matches!(self.session_manager.get_session_context().await, Ok(None)) {
+						return Ok(Response::builder()
+							.status(StatusCode::CONFLICT)
+							.body(Full::new(Bytes::from_static(
+								b"End the stream before bandwidth calibration",
+							)))
+							.unwrap()
+							.map(BodyExt::boxed_unsync));
+					}
+					let Ok(permit) = self.probe_slots.clone().try_acquire_owned() else {
+						return Ok(Response::builder()
+							.status(StatusCode::TOO_MANY_REQUESTS)
+							.body(Full::new(Bytes::new()))
+							.unwrap()
+							.map(BodyExt::boxed_unsync));
+					};
+					return Ok(bandwidth::response(permit));
+				},
 				(&Method::GET, "/applist") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
-						return Ok(resp);
+						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.app_list()
 				},
 				(&Method::GET, "/appasset") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
-						return Ok(resp);
+						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.app_asset(params)
 				},
 				(&Method::GET, "/pair") => {
 					if !self.webserver_config.enable_pairing {
 						tracing::warn!("Pairing is disabled in configuration.");
-						return Ok(bad_request("Pairing is disabled.".to_string()));
+						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
 					}
 					handle_pair_request(
 						request,
@@ -363,19 +410,19 @@ impl Webserver {
 				(&Method::GET, "/unpair") => self.unpair(params).await,
 				(&Method::GET, "/launch") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
-						return Ok(resp);
+						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.launch(params, local_address).await
 				},
 				(&Method::GET, "/resume") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
-						return Ok(resp);
+						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.resume(params, local_address).await
 				},
 				(&Method::GET, "/cancel") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
-						return Ok(resp);
+						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
 					self.cancel().await
 				},
@@ -386,11 +433,21 @@ impl Webserver {
 			}
 		} else {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => {
+					self.server_info(
+						params,
+						local_address,
+						peer_address,
+						mac_address,
+						https,
+						peer_cert_fingerprint.as_ref(),
+					)
+					.await
+				},
 				(&Method::GET, "/pair") => {
 					if !self.webserver_config.enable_pairing {
 						tracing::warn!("Pairing is disabled in configuration.");
-						return Ok(bad_request("Pairing is disabled.".to_string()));
+						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
 					}
 					handle_pair_request(
 						request,
@@ -405,13 +462,13 @@ impl Webserver {
 				},
 				(&Method::GET, "/pin") => {
 					if !self.webserver_config.enable_pairing {
-						return Ok(bad_request("Pairing is disabled.".to_string()));
+						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
 					}
 					self.pin(params)
 				},
 				(&Method::POST, "/submit-pin") => {
 					if !self.webserver_config.enable_pairing {
-						return Ok(bad_request("Pairing is disabled.".to_string()));
+						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
 					}
 					self.submit_pin(request).await
 				},
@@ -423,7 +480,7 @@ impl Webserver {
 			}
 		};
 
-		Ok(response)
+		Ok(response.map(BodyExt::boxed_unsync))
 	}
 
 	fn app_list(&self) -> Response<Full<Bytes>> {
@@ -542,8 +599,10 @@ impl Webserver {
 		&self,
 		params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
+		peer_address: SocketAddr,
 		mac_address: Option<String>,
 		https: bool,
+		peer_cert_fingerprint: Option<&String>,
 	) -> Response<Full<Bytes>> {
 		let session_context = match self.session_manager.get_session_context().await {
 			Ok(session_context) => session_context,
@@ -577,11 +636,29 @@ impl Webserver {
 		response += &format!("<mac>{}</mac>", mac_address.unwrap_or("".to_string()));
 		response += "<MaxLumaPixelsHEVC>1869449984</MaxLumaPixelsHEVC>"; // TODO: Check if HEVC is supported, set this to 0 if it is not.
 		response += &format!("<LocalIP>{}</LocalIP>", escape_xml(local_ip));
-		let server_codec_mode_support = self.supported_codecs;
+		// HDR444 alias for record clients; native orthogonal HDR bit remains.
+		let server_codec_mode_support = self.supported_codecs
+			| if self.supported_codecs & 0x03000000 == 0x03000000 {
+				0x04000000
+			} else {
+				0
+			};
 		response += &format!(
 			"<ServerCodecModeSupport>{}</ServerCodecModeSupport>",
 			server_codec_mode_support
 		);
+		if https
+			&& peer_cert_fingerprint.is_some_and(|fp| self.verify_paired_client(&Some(fp.clone())).is_none())
+			&& self.supported_codecs & 0x01800000 != 0
+		{
+			let speed = local_address
+				.map(|a| bandwidth::routed_link_mbps(a.ip(), peer_address.ip()))
+				.unwrap_or(0);
+			response += &format!(
+				"<PyroWaveHostLinkMbps>{speed}</PyroWaveHostLinkMbps><PyroWaveBandwidthProbeBytes>{}</PyroWaveBandwidthProbeBytes>",
+				bandwidth::PROBE_BYTES
+			);
+		}
 		response += "<SupportedDisplayMode></SupportedDisplayMode>";
 		response += &format!("<PairStatus>{paired}</PairStatus>");
 		response += &format!(
