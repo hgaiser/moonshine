@@ -37,6 +37,36 @@ const CACHE_TTL: Duration = Duration::from_secs(2);
 /// Sweep for stale entries every N `import_or_reuse` calls.
 const SWEEP_INTERVAL_CALLS: u32 = 60;
 
+/// Own partially-created resources until the import has completely succeeded.
+/// Every setup/driver error must release the image and any allocated memory.
+struct ImportResources<'a> {
+	device: &'a ash::Device,
+	image: vk::Image,
+	memory: vk::DeviceMemory,
+}
+
+impl ImportResources<'_> {
+	fn into_handles(mut self) -> (vk::Image, vk::DeviceMemory) {
+		let handles = (self.image, self.memory);
+		self.image = vk::Image::null();
+		self.memory = vk::DeviceMemory::null();
+		handles
+	}
+}
+
+impl Drop for ImportResources<'_> {
+	fn drop(&mut self) {
+		unsafe {
+			if self.image != vk::Image::null() {
+				self.device.destroy_image(self.image, None);
+			}
+			if self.memory != vk::DeviceMemory::null() {
+				self.device.free_memory(self.memory, None);
+			}
+		}
+	}
+}
+
 /// A single DMA-BUF plane descriptor.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DmaBufPlane {
@@ -172,6 +202,7 @@ pub(crate) struct DmaBufImporter {
 	retired: Vec<Arc<CachedImport>>,
 	/// Calls since the last stale-entry sweep.
 	calls_since_sweep: u32,
+	last_resource_summary: Instant,
 }
 
 impl DmaBufImporter {
@@ -185,6 +216,7 @@ impl DmaBufImporter {
 			cache: HashMap::new(),
 			retired: Vec::new(),
 			calls_since_sweep: 0,
+			last_resource_summary: Instant::now(),
 		})
 	}
 
@@ -272,6 +304,14 @@ impl DmaBufImporter {
 		let before = self.retired.len();
 		self.retired.retain(|v| v.last_used() >= cutoff);
 		let dropped = before - self.retired.len();
+		if now.duration_since(self.last_resource_summary) >= Duration::from_secs(5) {
+			tracing::info!(
+				import_cache = self.cache.len(),
+				retired_imports = self.retired.len(),
+				"Video DMA-BUF resources"
+			);
+			self.last_resource_summary = now;
+		}
 
 		if moved > 0 || dropped > 0 {
 			trace!(
@@ -336,6 +376,11 @@ impl DmaBufImporter {
 
 		let image = unsafe { device.create_image(&image_create_info, None) }
 			.map_err(|e| format!("DMA-BUF image creation: {e}"))?;
+		let mut resources = ImportResources {
+			device,
+			image,
+			memory: vk::DeviceMemory::null(),
+		};
 
 		// Memory requirements.
 		let mem_requirements = unsafe { device.get_image_memory_requirements(image) };
@@ -354,12 +399,11 @@ impl DmaBufImporter {
 		// Duplicate the FD — vkAllocateMemory consumes it.
 		let fd = unsafe { BorrowedFd::borrow_raw(planes[0].fd) }
 			.try_clone_to_owned()
-			.map_err(|e| format!("Failed to duplicate DMA-BUF FD: {e}"))?
-			.into_raw_fd();
+			.map_err(|e| format!("Failed to duplicate DMA-BUF FD: {e}"))?;
 
 		let mut import_memory_fd_info = vk::ImportMemoryFdInfoKHR::default()
 			.handle_type(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT)
-			.fd(fd);
+			.fd(fd.as_raw_fd());
 
 		let memory_type_bits = mem_requirements.memory_type_bits & memory_fd_properties.memory_type_bits;
 
@@ -385,20 +429,18 @@ impl DmaBufImporter {
 			.memory_type_index(memory_type_index);
 		alloc_info.p_next = &mut import_memory_fd_info as *mut vk::ImportMemoryFdInfoKHR as *mut _;
 
-		let memory = unsafe { device.allocate_memory(&alloc_info, None) }.map_err(|e| {
-			unsafe { device.destroy_image(image, None) };
-			format!("DMA-BUF memory import: {e}")
-		})?;
+		let memory =
+			unsafe { device.allocate_memory(&alloc_info, None) }.map_err(|e| format!("DMA-BUF memory import: {e}"))?;
+		// Vulkan takes fd ownership only after a successful allocation. Until
+		// then OwnedFd closes it on every error, including memory-type lookup.
+		let _ = fd.into_raw_fd();
+		resources.memory = memory;
 
 		if let Err(e) = unsafe { device.bind_image_memory(image, memory, 0) } {
-			unsafe {
-				device.free_memory(memory, None);
-				device.destroy_image(image, None);
-			}
 			return Err(format!("DMA-BUF memory bind: {e}"));
 		}
 
-		Ok((image, memory))
+		Ok(resources.into_handles())
 	}
 }
 
@@ -412,7 +454,7 @@ impl Drop for DmaBufImporter {
 
 #[cfg(test)]
 mod tests {
-	use super::{DmaBufPlane, ImportParams, same_open_file};
+	use super::{DmaBufPlane, ImportParams, ImportResources, same_open_file};
 	use ash::vk;
 	use std::os::fd::AsRawFd;
 
@@ -423,6 +465,54 @@ mod tests {
 			stride,
 			modifier: 0xdead,
 		}
+	}
+
+	#[test]
+	fn incomplete_imports_release_resources_but_success_transfers_ownership() {
+		use ash::vk::Handle;
+		use std::cell::RefCell;
+		thread_local! { static RELEASED: RefCell<Vec<&'static str>> = const { RefCell::new(Vec::new()) }; }
+		unsafe extern "system" fn destroy(_: vk::Device, _: vk::Image, _: *const vk::AllocationCallbacks) {
+			RELEASED.with_borrow_mut(|released| released.push("image"));
+		}
+		unsafe extern "system" fn free(_: vk::Device, _: vk::DeviceMemory, _: *const vk::AllocationCallbacks) {
+			RELEASED.with_borrow_mut(|released| released.push("memory"));
+		}
+		// Fake Vulkan dispatch exercises ownership without requiring a GPU.
+		let device = unsafe {
+			ash::Device::load_with(
+				|name| match name.to_bytes() {
+					b"vkDestroyImage" => destroy as *const () as *const std::ffi::c_void,
+					b"vkFreeMemory" => free as *const () as *const std::ffi::c_void,
+					_ => std::ptr::null(),
+				},
+				vk::Device::null(),
+			)
+		};
+		let image = vk::Image::from_raw(1);
+		let memory = vk::DeviceMemory::from_raw(2);
+		// Properties/dup/type/allocation failures have an image but no memory.
+		for _ in 0..4 {
+			drop(ImportResources {
+				device: &device,
+				image,
+				memory: vk::DeviceMemory::null(),
+			});
+		}
+		// Bind failure releases the image before its backing allocation.
+		drop(ImportResources {
+			device: &device,
+			image,
+			memory,
+		});
+		let handles = ImportResources {
+			device: &device,
+			image,
+			memory,
+		}
+		.into_handles();
+		assert_eq!(handles, (image, memory));
+		RELEASED.with_borrow(|released| assert_eq!(released, &["image", "image", "image", "image", "image", "memory"]));
 	}
 
 	#[test]

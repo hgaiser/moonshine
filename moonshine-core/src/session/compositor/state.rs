@@ -256,6 +256,7 @@ pub(crate) struct MoonshineCompositor {
 	pub pointer_element: PointerElement,
     pub capture_mode: super::CaptureMode,
     capture_path: Option<&'static str>,
+	last_resource_summary: std::time::Instant,
 	pub pen_tablet_descriptor: TabletDescriptor,
 	pub active_pen_tool_kind: Option<u8>,
 	pub pen_buttons: u8,
@@ -759,6 +760,7 @@ impl MoonshineCompositor {
 				pointer_element,
 				capture_mode,
 				capture_path: None,
+				last_resource_summary: std::time::Instant::now(),
 				pen_tablet_descriptor,
 				active_pen_tool_kind: None,
 				pen_buttons: 0,
@@ -1216,6 +1218,28 @@ impl MoonshineCompositor {
 	pub fn render_and_export(&mut self) {
 		self.retired_buffer_pools
 			.retain(|pool| !pool.iter().all(|slot| slot.consumed.load(Ordering::Acquire)));
+		if self.last_resource_summary.elapsed() >= std::time::Duration::from_secs(5) {
+			let busy_pool_buffers = self
+				.buffer_pool
+				.iter()
+				.filter(|slot| !slot.consumed.load(Ordering::Acquire))
+				.count();
+			let busy_scanout_buffers = self
+				.held_scanout_buffers
+				.iter()
+				.filter(|(consumed, _, _)| !consumed.load(Ordering::Acquire))
+				.count();
+			tracing::info!(
+				capture_path = ?self.capture_path, busy_pool_buffers, busy_scanout_buffers,
+				screen_dirty = self.screen_dirty,
+				last_capture_age_ms = self.last_frame_sent_at.elapsed().as_millis() as u64,
+				held_scanout_buffers = self.held_scanout_buffers.len(),
+				scanout_buffer_map = self.scanout_buffer_map.len(),
+				retired_buffer_pools = self.retired_buffer_pools.len(),
+				"Video capture resources"
+			);
+			self.last_resource_summary = std::time::Instant::now();
+		}
 		// Keep the Steam overlay z-ordered above the game while it is open.
 		// Must run before the static-screen early return so the raise/lower
 		// is detected as soon as the overlay window commits a frame.

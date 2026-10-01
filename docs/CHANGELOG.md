@@ -14,6 +14,17 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.16.11] - 2026-09-30
+
+### Fixed
+
+- Clear Tokio writable readiness after raw GSO sends encounter socket backpressure, preventing a retry loop from starving video transmission.
+- Expire unused PyroWave DMA-BUF imports and release partial Vulkan import resources on setup errors.
+
+### Added
+
+- Five-second streaming diagnostics for capture resources, pipeline stages, transport backpressure, runtime delay, CPU usage, memory, and open file descriptors.
+
 ## [v0.16.10] - 2026-09-30
 
 ### Fixed

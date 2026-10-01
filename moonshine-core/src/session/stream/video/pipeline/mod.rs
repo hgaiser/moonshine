@@ -18,6 +18,7 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
+use crate::session::stream::video::diagnostics::PipelineWindow;
 use crate::session::stream::video::fec::{FecController, FrameFecStatus};
 use crate::session::stream::video::gso_socket::duration_micros_u64;
 use crate::session::stream::video::packetizer::Packetizer;
@@ -291,6 +292,7 @@ async fn run_packet_consumer(
 	let mut sequence_number = 0u32;
 	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
 	let mut last_summary_time = std::time::Instant::now();
+	let mut diagnostics = PipelineWindow::new();
 	let frame_interval_us = 1_000_000 / ctx.fps as u128;
 	let mut fec_controller = FecController::new(
 		config.fec_mode,
@@ -443,7 +445,7 @@ async fn run_packet_consumer(
 			is_key_frame,
 		});
 
-		let _ = stats_tx.send(FrameStats {
+		let stats = FrameStats {
 			channel_wait: frame_context.channel_wait,
 			import: frame_context.import,
 			convert: frame_context.convert,
@@ -458,7 +460,14 @@ async fn run_packet_consumer(
 			packet_count,
 			stale_frames_dropped: 0,
 			is_key_frame,
-		});
+		};
+		diagnostics.record(
+			&stats,
+			in_flight.load(Ordering::Relaxed),
+			packet_tx.max_capacity() - packet_tx.capacity(),
+			None,
+		);
+		let _ = stats_tx.send(stats);
 
 		// Periodic summary every 5 seconds.
 		if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
@@ -804,6 +813,7 @@ impl VideoPipelineInner {
 		let mut last_frame_time = std::time::Instant::now();
 		let mut consecutive_slow_sends = 0u32;
 		let mut last_slow_send_warning: Option<std::time::Instant> = None;
+		let mut diagnostics = PipelineWindow::new();
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			if let Ok(command) = reconfigure_rx.try_recv() {
@@ -988,6 +998,12 @@ impl VideoPipelineInner {
 				socket_send_us = duration_micros_u64(sent.duration_since(queued)),
 				total_us = duration_micros_u64(stats.total),
 				"Sent PyroWave frame"
+			);
+			diagnostics.record(
+				&stats,
+				0,
+				packet_tx.max_capacity() - packet_tx.capacity(),
+				Some(encoder.import_cache_len()),
 			);
 			let _ = stats_tx.send(stats);
 			last_encoded = Some(encoded);
@@ -1258,6 +1274,8 @@ impl VideoPipelineInner {
 				if in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT {
 					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 						tracing::warn!(
+							encoder_in_flight = in_flight.load(Ordering::Relaxed),
+							consumer_queue = frame_ctx_tx.max_capacity() - frame_ctx_tx.capacity(),
 							"Video encode backpressure: packet consumer is behind; dropping captured \
 							 frames before encode to stay realtime."
 						);

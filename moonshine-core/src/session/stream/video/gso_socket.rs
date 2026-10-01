@@ -2,6 +2,7 @@ use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
+use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
 use super::shard_batch::ShardBatch;
@@ -10,6 +11,30 @@ use super::shard_batch::ShardBatch;
 const MAX_UDP_PAYLOAD: usize = 65507;
 /// Use the common 64-segment GSO cadence for pacing even when GSO is off.
 const MAX_PACING_SEGMENTS: usize = 64;
+
+/// Keep the uncontended raw-send path, but let Tokio observe every failed
+/// retry. Quinn uses sendmsg directly and cannot clear Tokio's cached readiness.
+async fn send_with_readiness(
+	socket: &UdpSocket,
+	would_block_events: &mut u32,
+	mut send: impl FnMut() -> std::io::Result<()>,
+) -> std::io::Result<()> {
+	let mut send = || {
+		let result = send();
+		if matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock) {
+			*would_block_events = would_block_events.saturating_add(1);
+		}
+		result
+	};
+	match send() {
+		Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+			// The closure must use raw I/O only. On another WouldBlock,
+			// async_io clears readiness before awaiting a fresh writable event.
+			socket.async_io(Interest::WRITABLE, send).await
+		},
+		result => result,
+	}
+}
 
 fn gso_segments_per_send(max_gso_segments: usize, shard_size: usize) -> usize {
 	max_gso_segments
@@ -226,18 +251,12 @@ impl UdpGsoSocket {
 					segment_size: Some(shard_size),
 					src_ip: None,
 				};
-				let result = loop {
-					match self.udp_state.try_send(UdpSockRef::from(&self.socket), &transmit) {
-						Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-							stats.would_block_events = stats.would_block_events.saturating_add(1);
-							chunk_would_block = true;
-							if let Err(wait_error) = self.socket.writable().await {
-								break Err(wait_error);
-							}
-						},
-						other => break other,
-					}
-				};
+				let result = send_with_readiness(&self.socket, &mut stats.would_block_events, || {
+					let result = self.udp_state.try_send(UdpSockRef::from(&self.socket), &transmit);
+					chunk_would_block |= matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
+					result
+				})
+				.await;
 				if let Err(e) = result {
 					gso_active = false;
 					stats.fallback_chunks = stats.fallback_chunks.saturating_add(1);
@@ -315,6 +334,123 @@ mod tests {
 		let mut batch = ShardBuf::new(shards, shard_size, 0).into_batch();
 		batch.set_frame_metadata(1, encoded_size, shards, 0, 1);
 		batch
+	}
+
+	#[tokio::test]
+	async fn raw_would_block_clears_stale_readiness_and_waits_until_success() {
+		use std::cell::Cell;
+		use std::future::Future;
+		use std::os::fd::OwnedFd;
+		use std::os::unix::net::UnixDatagram;
+		use std::task::{Context, Poll, Waker};
+
+		// UDP loopback normally drops packets instead of filling the send queue.
+		// A Unix datagram pair supplies deterministic kernel backpressure; Tokio's
+		// fd readiness tracking is the same. Use only raw I/O on this test fd.
+		let (sender, receiver) = UnixDatagram::pair().unwrap();
+		sender.set_nonblocking(true).unwrap();
+		receiver.set_nonblocking(true).unwrap();
+		let socket =
+			UdpSocket::from_std(std::net::UdpSocket::from(OwnedFd::from(sender.try_clone().unwrap()))).unwrap();
+		let fill = || loop {
+			match sender.send(&[0; 1024]) {
+				Ok(_) => {},
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+				Err(e) => panic!("filling datagram queue: {e}"),
+			}
+		};
+		let drain = || loop {
+			match receiver.recv(&mut [0; 1024]) {
+				Ok(_) => {},
+				Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+				Err(e) => panic!("draining datagram queue: {e}"),
+			}
+		};
+		socket.writable().await.unwrap();
+		fill();
+		let attempts = Cell::new(0);
+		let mut would_block = 0;
+		let mut send = Box::pin(send_with_readiness(&socket, &mut would_block, || {
+			attempts.set(attempts.get() + 1);
+			// Fail promptly if a regression starts spinning inside a single poll.
+			assert!(attempts.get() <= 16, "raw send spun on stale readiness");
+			sender.send(&[1]).map(|_| ())
+		}));
+		let mut cx = Context::from_waker(Waker::noop());
+		for expected_attempts in 2..=4 {
+			assert!(send.as_mut().poll(&mut cx).is_pending());
+			assert_eq!(attempts.get(), expected_attempts);
+			for _ in 0..1000 {
+				assert!(send.as_mut().poll(&mut cx).is_pending());
+			}
+			assert_eq!(
+				attempts.get(),
+				expected_attempts,
+				"retry must await a new readiness event"
+			);
+			// The failed raw retry cleared Tokio's readiness, not just yielded
+			// through cooperative task budgeting.
+			let mut invoked = false;
+			assert_eq!(
+				socket
+					.try_io(Interest::WRITABLE, || {
+						invoked = true;
+						Ok(())
+					})
+					.unwrap_err()
+					.kind(),
+				std::io::ErrorKind::WouldBlock
+			);
+			assert!(!invoked);
+			drain();
+			socket.writable().await.unwrap();
+			if expected_attempts < 4 {
+				fill();
+			}
+		}
+		assert!(matches!(send.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
+		drop(send);
+		assert_eq!(attempts.get(), 5);
+		assert_eq!(would_block, 4);
+	}
+
+	#[tokio::test]
+	async fn cancelling_a_blocked_raw_send_leaves_the_socket_usable() {
+		use std::future::Future;
+		use std::task::{Context, Waker};
+
+		let (socket, receiver, destination) = loopback_socket(false).await;
+		socket.socket.writable().await.unwrap();
+		let mut would_block = 0;
+		let mut send = Box::pin(send_with_readiness(&socket.socket, &mut would_block, || {
+			// Inject a false-positive writable event without depending on UDP
+			// buffer sizes. The kernel-backpressure test above covers real I/O.
+			Err(std::io::ErrorKind::WouldBlock.into())
+		}));
+		assert!(send.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
+		drop(send);
+		assert_eq!(would_block, 2);
+		let stats = socket.send_batch(&test_batch(1, 64, 64), destination, None).await;
+		assert_eq!(stats.gso_sends + stats.per_shard_sends, 1);
+		let mut buf = [1; 64];
+		receiver.recv_from(&mut buf).await.unwrap();
+		assert_eq!(buf, [0; 64]);
+	}
+
+	#[tokio::test]
+	async fn raw_send_fast_path_and_errors_do_not_wait_for_readiness() {
+		let (socket, _, _) = loopback_socket(false).await;
+		let mut would_block = 0;
+		send_with_readiness(&socket.socket, &mut would_block, || Ok(()))
+			.await
+			.unwrap();
+		let error = send_with_readiness(&socket.socket, &mut would_block, || {
+			Err(std::io::ErrorKind::InvalidInput.into())
+		})
+		.await
+		.unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+		assert_eq!(would_block, 0);
 	}
 
 	#[test]
@@ -473,6 +609,26 @@ mod tests {
 				.await
 				.unwrap()
 				.unwrap();
+		}
+	}
+
+	#[tokio::test]
+	async fn repeated_frame_sends_preserve_every_shard() {
+		let (socket, receiver, destination) = loopback_socket(false).await;
+		let batch = test_batch(47, 1408, 47 * 1376 - 8);
+		let mut buffer = [0u8; 2048];
+		// Drain each frame so UDP receive-buffer overflow cannot make the test
+		// depend on scheduling speed. Exercise repeated use of one GSO socket.
+		for _ in 0..1024 {
+			let stats = socket.send_batch(&batch, destination, None).await;
+			assert!(stats.gso_sends > 0 || stats.per_shard_sends > 0);
+			for _ in 0..47 {
+				let (size, _) = tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer))
+					.await
+					.unwrap()
+					.unwrap();
+				assert_eq!(size, 1408);
+			}
 		}
 	}
 

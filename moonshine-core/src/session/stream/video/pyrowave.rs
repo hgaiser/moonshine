@@ -10,6 +10,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
 use std::ptr;
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use ash::vk;
 use libloading::Library;
@@ -353,6 +354,43 @@ impl Drop for ImportedImage {
 	}
 }
 
+/// PyroWave waits for each encode before the next import, so expired images
+/// can be released immediately. Keep active swapchain buffers warm, but do not
+/// pin every fd ever seen across buffer churn or swapchain recreation.
+struct ImageCache<T> {
+	entries: HashMap<RawFd, (T, Instant)>,
+	calls_since_sweep: u32,
+}
+
+impl<T> ImageCache<T> {
+	const TTL: Duration = Duration::from_secs(2);
+	const SWEEP_INTERVAL: u32 = 60;
+
+	fn new() -> Self {
+		Self {
+			entries: HashMap::new(),
+			calls_since_sweep: 0,
+		}
+	}
+
+	fn get(&mut self, fd: RawFd, now: Instant) -> Option<&T> {
+		self.calls_since_sweep += 1;
+		if self.calls_since_sweep >= Self::SWEEP_INTERVAL {
+			self.calls_since_sweep = 0;
+			self.entries
+				.retain(|_, (_, used)| now.saturating_duration_since(*used) <= Self::TTL);
+		}
+		self.entries.get_mut(&fd).map(|(image, used)| {
+			*used = now;
+			&*image
+		})
+	}
+
+	fn insert(&mut self, fd: RawFd, image: T, now: Instant) {
+		self.entries.insert(fd, (image, now));
+	}
+}
+
 pub(crate) struct EncodedFrame {
 	pub data: Vec<u8>,
 	pub data_size: usize,
@@ -368,7 +406,7 @@ pub(crate) struct PyroWaveEncoder {
 	visible_width: u32,
 	visible_height: u32,
 	maximum_frame_bytes: usize,
-	images: HashMap<RawFd, ImportedImage>,
+	images: ImageCache<ImportedImage>,
 	consecutive_near_limit_frames: u32,
 	last_limit_warning: Option<std::time::Instant>,
 	scaling_logged: bool,
@@ -483,7 +521,7 @@ impl PyroWaveEncoder {
 			visible_width: width,
 			visible_height: height,
 			maximum_frame_bytes,
-			images: HashMap::new(),
+			images: ImageCache::new(),
 			consecutive_near_limit_frames: 0,
 			last_limit_warning: None,
 			scaling_logged: false,
@@ -503,9 +541,13 @@ impl PyroWaveEncoder {
 		}
 		let format = drm_fourcc_to_vk(frame.format)?;
 		let fd = frame.planes[0].fd;
-		let reuse = self.images.get(&fd).is_some_and(|image| image.matches(frame, format));
+		let now = Instant::now();
+		let reuse = self
+			.images
+			.get(fd, now)
+			.is_some_and(|image| image.matches(frame, format));
 		if !reuse {
-			self.images.remove(&fd);
+			self.images.entries.remove(&fd);
 			let identity_fd = unsafe { BorrowedFd::borrow_raw(fd) }
 				.try_clone_to_owned()
 				.map_err(|e| format!("duplicating DMA-BUF identity fd: {e}"))?;
@@ -575,9 +617,10 @@ impl PyroWaveEncoder {
 					modifier: frame.modifier,
 					layouts: frame.planes.iter().map(|p| (p.offset, p.stride)).collect(),
 				},
+				now,
 			);
 		}
-		let image = self.images.get(&fd).expect("inserted or reused PyroWave image");
+		let (image, _) = self.images.entries.get(&fd).expect("inserted or reused PyroWave image");
 		let mut view = ImageView::default();
 		// SAFETY: the cached image and output pointer are valid. SAMPLED usage
 		// matches the imported VkImageCreateInfo.
@@ -722,6 +765,10 @@ impl PyroWaveEncoder {
 		self.maximum_frame_bytes
 	}
 
+	pub(crate) fn import_cache_len(&self) -> usize {
+		self.images.entries.len()
+	}
+
 	pub(crate) fn device_name(&self) -> &str {
 		&self.device.name
 	}
@@ -731,7 +778,7 @@ impl Drop for PyroWaveEncoder {
 	fn drop(&mut self) {
 		// Images must be destroyed before their device, and the encoder before
 		// the device. Clear imports first because C Drop order is explicit here.
-		self.images.clear();
+		self.images.entries.clear();
 		// SAFETY: this wrapper owns the encoder and packetization waited for the
 		// last queued frame before returning it.
 		unsafe { (self.device.api.destroy_encoder)(self.handle) };
@@ -752,6 +799,42 @@ fn drm_fourcc_to_vk(fourcc: u32) -> Result<vk::Format, String> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn import_cache_soak_releases_old_resources_and_preserves_active_buffers() {
+		use std::cell::Cell;
+		struct Resource(Rc<Cell<usize>>, std::os::fd::OwnedFd);
+		impl Drop for Resource {
+			fn drop(&mut self) {
+				self.0.set(self.0.get() - 1);
+			}
+		}
+		let live = Rc::new(Cell::new(0));
+		let resource = || {
+			live.set(live.get() + 1);
+			Resource(Rc::clone(&live), std::fs::File::open("/dev/null").unwrap().into())
+		};
+		let mut cache = ImageCache::new();
+		let started = Instant::now();
+		cache.insert(-1, resource(), started);
+		let active_fd = cache.entries[&-1].0.1.as_raw_fd();
+		// Simulate minutes of 120 FPS buffer churn without any wall-clock wait.
+		for frame in 0..30_000 {
+			let now = started + Duration::from_nanos(frame as u64 * 1_000_000_000 / 120);
+			assert!(cache.get(-1, now).is_some());
+			assert!(cache.get(frame, now).is_none());
+			cache.insert(frame, resource(), now);
+			assert!(cache.entries.len() <= 272, "cache grew with session duration");
+			assert_eq!(live.get(), cache.entries.len());
+			assert_eq!(cache.entries[&-1].0.1.as_raw_fd(), active_fd);
+		}
+		let now = started + Duration::from_secs(300);
+		for _ in 0..ImageCache::<Resource>::SWEEP_INTERVAL {
+			cache.get(-2, now);
+		}
+		assert!(cache.entries.is_empty());
+		assert_eq!(live.get(), 0);
+	}
 
 	#[test]
 	fn authoritative_source_is_pinned() {

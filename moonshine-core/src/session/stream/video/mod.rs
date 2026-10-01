@@ -8,6 +8,7 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
+mod diagnostics;
 pub(crate) mod fec;
 mod format;
 mod gso_socket;
@@ -426,6 +427,7 @@ impl VideoStream {
 
 		// Packet channel.
 		let (packet_tx, packet_rx) = mpsc::channel::<VideoPacketMessage>(128);
+		diagnostics::spawn_watchdog(stop.clone(), packet_tx.downgrade());
 		let (reconfigure_tx, reconfigure_rx) = std::sync::mpsc::channel();
 		let pacing_bitrate =
 			(context.format.codec == VideoCodec::PyroWave).then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
@@ -487,6 +489,7 @@ fn spawn_handle_video_packets(
 		let mut client_address = None;
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
+		let mut transport_window = diagnostics::TransportWindow::new();
 
 		// Trigger session shutdown if we exit unexpectedly.
 		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
@@ -521,6 +524,7 @@ fn spawn_handle_video_packets(
 									.await
 								{
 									Ok(send_stats) => {
+										transport_window.record(&send_stats, packet_rx.len());
 										if send_stats.fallback_chunks > 0
 											&& last_send_warn
 												.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
