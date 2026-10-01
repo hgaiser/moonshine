@@ -14,10 +14,23 @@ Start with the [project README](../README.md) for requirements and a quick start
 
 ## Development and architecture
 
-- [Contributor guide](../CONTRIBUTING.md): manual build, install/upgrade, validation, and release publishing.
-- [PyroWave architecture](PYROWAVE.md): dependency pins, codec negotiation, transport, and GPU validation.
-- [Vulkan image counts](VULKAN_IMAGE_COUNTS.md): bypass capability negotiation, extension gates, and PoE acceptance checks.
-- [Compositor architecture](COMPOSITOR.md): scene capture, cursor lifetime, and Steam input.
-- [Benchmarking](BENCHMARKING.md): encoding pipeline measurements with `moonshine-bench`.
-- [Long-session performance](LONG_SESSION_PERFORMANCE.md): readiness fix, lifetime audit, and periodic streaming diagnostics.
-- [Reconnect validation](reconnect-validation.md): manual stream reconfiguration checks.
+Start with [Architecture overview](ARCHITECTURE.md) for component ownership,
+startup, session negotiation and resource lifetimes. Then choose the guide for
+the area being changed:
+
+| Area | Guide |
+| --- | --- |
+| Build, install, CI and releases | [Contributor guide](../CONTRIBUTING.md) |
+| Scene capture, cursor, focus and Steam input | [Compositor](COMPOSITOR.md) |
+| Capture demand, GPU completion and bounded encoding | [Capture pipeline](PIPELINE_OPTIMIZATION.md) |
+| PyroWave dependency, negotiation, color, FEC and transport | [PyroWave](PYROWAVE.md) |
+| Vulkan bypass, extension gates and swapchain counts | [Vulkan WSI](VULKAN_IMAGE_COUNTS.md) |
+| Native controller identity/report mapping | [DualSense Edge](DUALSENSE_EDGE.md) |
+| Repeatable pipeline measurements | [Benchmarking](BENCHMARKING.md) |
+| Runtime stalls, resource bounds and long-run checks | [Streaming diagnostics](LONG_SESSION_PERFORMANCE.md) |
+| Mode changes, epochs and teardown | [Reconnect validation](reconnect-validation.md) |
+
+[Historical reports](reports/README.md) preserve dated investigations and measured
+results. They may describe older designs or local artifacts; use current guides
+and code for engineering contracts, and repeat relevant hardware acceptance for
+new changes. Keep new evidence separate from current instructions.

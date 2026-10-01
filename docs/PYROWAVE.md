@@ -6,6 +6,12 @@ The conventional H.264, HEVC, and AV1 paths continue to use Pixelforge and
 Vulkan Video; PyroWave is a separate codec backend and never impersonates one
 of those codecs.
 
+For system/session ownership see [ARCHITECTURE.md](ARCHITECTURE.md); for capture
+admission see [the pipeline guide](PIPELINE_OPTIMIZATION.md). Implementation lives
+in `moonshine-core/src/session/stream/video/{format,pyrowave,packetizer,fec}.rs`,
+`session/stream/video/pipeline/`, `rtsp.rs` and `healthcheck.rs` under
+`moonshine-core/src/`.
+
 ## Pinned dependency
 
 The only supported PyroWave source is:
@@ -34,11 +40,11 @@ developers may set `MOONSHINE_PYROWAVE_LIBRARY` to one explicit library path
 for packaging tests or diagnostics. When set, no fallback path is attempted;
 the library must expose exactly C API 0.7.0.
 
-Two inherited video options are particularly useful on unusual networks:
-`stream.video.max_packet_size` caps a client's requested packet size, and
-`stream.video.log_frame_spikes = true` emits warnings for frames that exceed
-their time budget. Leave both at their defaults unless troubleshooting a known
-MTU or latency problem.
+Both build paths apply the maintained patches in `nix/patches/`. When updating
+pins, review whether each patch remains needed, keep the script/Nix patch sets
+aligned, and run packet validation plus the explicit C API load test documented
+in [CONTRIBUTING.md](../CONTRIBUTING.md#validation). A library load test does not
+exercise GPU encoding.
 
 ## Capability and negotiation extension
 
@@ -95,45 +101,20 @@ intermediate planes; HDR10 always uses the R16 path with BT.2020/PQ metadata.
 
 Pyroshine passes the client's requested bitrate to conventional encoders. For
 PyroWave, whose current API exposes a per-frame maximum rather than a CBR
-target, Pyroshine derives that maximum from `bitrate / frame_rate`, aligned
+target, Pyroshine derives that maximum in bytes from `bitrate / (frame_rate * 8)`, aligned
 down to a 32-bit word exactly as wire-v1 clients do. Valid budgets range from
 1 KiB to just under 3 MiB. The value is logged when the encoder starts. There
 is no separate low bitrate cap for 4:4:4 or HDR.
 
-Moonlight's conventional default is intentionally sublinear above 60 FPS
-because predictive codecs amortize detail through time. That model made
-PyroWave's bytes per frame decrease at high refresh rates. The PyroWave fork
-therefore uses a separate bytes-per-frame model, starting at 400,000 bytes for
-3840x2160 4:2:0 SDR and scaling with pixel count. The codec repository's
-objective/subjective evaluation found roughly a 15-20% 4:4:4 bitrate penalty
-at equal luminance quality and uses a preliminary ~20% HDR allowance, so this
-model conservatively applies 20% for each axis rather than scaling by raw sample
-count.
-Those constants are quality-oriented tuning seeds and should be calibrated with
-objective and subjective codec measurements. FPS is applied only afterward:
-`bitrate = frame_bytes * fps * 8`. A manual bitrate disables Moonlight's
-default-tracking behavior and remains authoritative.
+Client default-bitrate heuristics are owned by Moonlight Qt PyroWave, not a host
+congestion controller. The negotiated manual bitrate remains authoritative;
+FEC feedback adjusts parity, not PyroWave codec bitrate. Live bitrate adaptation
+would need an end-to-end capacity estimator.
 
-Moonlight's `autoAdjustBitrate` preference is settings UX, not a live
-congestion controller: it recalculates the default after resolution, FPS,
-codec, chroma, or HDR changes. PyroWave codec bitrate is not reduced in response
-to FEC feedback. Adaptive FEC is the first response to changing loss; an
-end-to-end capacity estimator would be required before safely adding live
-PyroWave bitrate reduction.
-
-Actual bandwidth is content- and codec-dependent, so resolution alone does not
-produce an honest fixed estimate. At the same quality target, 4:4:4 generally
-needs more data than 4:2:0, HDR/R16 can need more than SDR/R8, 120 Hz allows
-twice as many frames as 60 Hz, and 4K contains four times as many pixels as
-1080p (1440p contains about 1.78 times as many). Size the requested bitrate and
-network headroom accordingly, then measure the real workload. GameStream adds
-FEC parity, RTP/NvVideoPacket headers, and optional encryption. Diagnostics and
-the benchmark distinguish encoded payload bitrate from approximate wire
-bitrate. For a frame that cannot fit the requested protection into four
-Reed-Solomon blocks, Pyroshine selects the largest lower integer percentage
-that Moonlight can decode exactly. A request for 20% can therefore become
-roughly 8-9% rather than abruptly becoming unprotected. Zero FEC is used only
-when no protected layout is representable.
+Actual throughput depends on content and format. Measure encoded payload, UDP
+bytes (including FEC/protocol/encryption) and estimated Ethernet bytes separately;
+see [benchmarking](BENCHMARKING.md#gpu-cost-and-admission-diagnostics). Resolution
+or the requested bitrate alone does not establish physical-link headroom.
 
 ## Transport pacing and diagnostics
 
@@ -145,17 +126,13 @@ being added to it. The sender distributes chunks across the remaining time
 without reordering or interleaving frames. If the whole window elapsed during
 encode, or socket backpressure consumes scheduled slots, it rebases the
 remaining schedule instead of emitting an unbounded catch-up burst. The
-PyroWave pipeline still waits for the complete
-frame submission and discards stale
-captured frames, so transport pacing cannot grow an unbounded video queue.
+pipeline holds capture admission until actual send completion, so paced sending
+cannot accumulate a backlog of rendered scenes. See [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
 
-With Moonlight's usual 1392-byte request, packetization produces a 1376-byte
-frame payload in a 1408-byte UDP shard. The IPv4 datagram limit permits 46 such
-segments per GSO submission. Seven submissions hold 322 shards, or 443064
-encoded bytes after the frame header; at 120 FPS that is 425341440 bps. The
-next shard previously changed a frame from seven immediate GSO submissions to
-eight. These values explain the observed boundary, but are inputs to the
-general packetization and pacing model rather than transport limits.
+Packet size and GSO limits are derived from negotiated shard layout, not a fixed
+number of submissions per frame. `stream.video.max_packet_size` can cap client
+requests for an MTU-constrained path; its on-wire meaning is documented in the
+[configuration reference](CONFIGURATION.md#streamvideo).
 
 Trace logging emits one `Video frame transport` event per frame with encoded
 and wire bytes, data/parity shard counts, FEC blocks, GSO chunks, final partial
@@ -185,6 +162,10 @@ blocks), and decays slowly after sustained clean windows. Changes are clamped
 to the configured range and take effect only at a subsequent frame boundary.
 The PyroWave policy decays clean-link protection sooner because every frame is
 independently decodable.
+
+Large frames must fit representable Reed-Solomon blocks. If requested protection
+does not fit, choose the largest lower integer percentage Moonlight can recover
+exactly; use zero only when no protected layout is representable.
 
 Sender parity uses the same rule as Moonlight's receiver:
 `ceil(data_shards * fec_percentage / 100)`. The emitted integer percentage is
@@ -219,15 +200,18 @@ copy the compressed bitstream to host memory to send it over UDP. Imported
 images are cached by DMA-BUF open-file description plus dimensions, modifier,
 format, offsets, and strides. File descriptors are duplicated because the C API
 takes ownership. The compositor buffer is released only after PyroWave's
-packetization call has waited for the GPU encode. If synchronous encode falls
-behind, the integration releases stale queued compositor frames and encodes the
-newest one instead of emitting a catch-up burst. Encoded output storage is
-reused, and the send stage applies backpressure until the batch has been handed
-to the UDP socket rather than accumulating frames in the packet channel.
+packetization call has waited for the GPU encode.
 
-`pyrowave.rs` is the only unsafe boundary. It loads a narrow handwritten set of
-C symbols, validates the exact ABI, owns every device/encoder/image handle, and
-destroys child resources before the library/device can unload.
+Capture is receiver-driven: one credit covers encode through socket-send
+completion, while GPU consumption releases the source independently. Epoch
+changes invalidate queued/racing captures. Encoded output storage is reused;
+see [the pipeline contract](PIPELINE_OPTIMIZATION.md). Unused imports expire;
+keep identity/layout validation and child-before-parent cleanup intact.
+
+`pyrowave.rs` owns the PyroWave C API unsafe boundary. It loads a narrow handwritten
+set of symbols, validates the exact ABI, owns device/encoder/image handles, and
+destroys child resources before the library/device can unload. Other Vulkan and
+native unsafe boundaries exist elsewhere in Pyroshine.
 
 ## Transport extension
 
@@ -272,22 +256,11 @@ latency. PyroWave's
 GPU scaler is included in its submit/wait measurements; it does not use the
 separate Pixelforge conversion stage.
 
-On Moonlight Qt PyroWave, `frames dropped by client frame queue`
-means a complete reassembled encoded frame arrived while the client's single
-pending-frame mailbox was still occupied; it is counted before decode. The
-mailbox intentionally retains the newest frame to bound latency. PyroWave uses
-Moonlight direct submit to avoid an additional 15-frame decode-unit queue. The
-render thread takes the newest complete frame, submits decode, and then waits
-for presentation capacity so GPU decode can overlap the swapchain wait.
-
-V-Sync remains a normal Moonlight user preference. If a high-refresh PyroWave
-stream is unexpectedly presentation-limited, test with Moonlight V-Sync
-disabled; this selects the lowest-latency present mode supported by the Vulkan
-driver. This is a troubleshooting step, not a universal requirement. At 120 fps
-the decode-and-present path still has only 8.33 ms per frame, and a 60 Hz
-display cannot present 120 unique frames. Failure to initialize the decoder, an
-invalid decode result, or Vulkan device loss indicates a compatibility problem
-rather than a pacing preference.
+For client diagnosis, a complete frame dropped before decode can indicate a busy
+client frame mailbox, not server packet loss. Compare host transport evidence
+with client decode/presentation statistics. V-Sync and refresh rate can limit
+presentation; decoder initialization failures or device loss require compatibility
+investigation. Use [reconnect checks](reconnect-validation.md) for mode changes.
 
 Do not describe a mode as runtime-validated merely because its unit tests or
-build passed.
+build passed. Record the host/client revisions, GPU/driver, modes and duration.

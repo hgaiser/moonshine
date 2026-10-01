@@ -13,7 +13,13 @@ uses mode-specific limits and declares the host swapchain mode to avoid Mesa's
 legacy allocation policy. Pyroshine applies that mechanism to bypass surfaces
 without executable-name or engine-name matching.
 
+Implementation is in `moonshine-wsi/src/{instance,device,surface,swapchain,image_count}.rs`;
+compositor feedback is in `moonshine-core/src/session/compositor/gamescope_swapchain.rs`.
+See [architecture](ARCHITECTURE.md) for presentation/capture ownership.
+
 ## Negotiation
+
+### Instance and device gates
 
 - Instance creation uses the loader's global extension enumeration before privately enabling
   `VK_KHR_get_surface_capabilities2`, `VK_EXT_surface_maintenance1`, and
@@ -31,6 +37,9 @@ without executable-name or engine-name matching.
   application feature struct is preserved, including an explicit false value.
   Failed extension/feature injection can retry the original create-info; other
   device errors propagate without a retry.
+
+### Capability queries
+
 - Legacy capabilities and Capabilities2 without a present-mode input share the
   same adjustment. Only a bypass surface, with successfully enabled maintenance
   on every existing device for the queried physical device, can be relaxed. A
@@ -45,6 +54,9 @@ without executable-name or engine-name matching.
 - Capabilities2 with `VkSurfacePresentModeEXT` input retains that mode's actual
   range, including a legitimate mailbox minimum of four. Other output pNext
   structures remain the application's and are filled by the ICD.
+
+### Creation and presentation
+
 - Creation queries the requested mode using `VkPhysicalDeviceSurfaceInfo2KHR`,
   `VkSurfacePresentModeEXT`, and `VkSurfaceCapabilities2KHR`. If the requested
   minimum fits, the requested mode is retained. FIFO compatibility fallback is
@@ -85,59 +97,16 @@ cargo test --locked --workspace --all-features
 cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 ```
 
-The WSI suite includes the seven image-count cases, creation-mode consistency,
+The WSI suite covers image-count policy cases, creation-mode consistency,
 compatible FIFO switching, limiter fallback, and mocked ICD tests checking
 extension/feature gates and the synchronous lifetime and structure types of
 capability query chains. Workspace loopback socket tests require permission to
 bind UDP sockets.
 
-## 0.16.10 dispatch regression verification
+## Recorded validation
 
-The 0.16.9 extension gate withheld properties2/features2 KHR pointers when the
-layer privately enabled their extension. The loader could then route a core
-query to a null pointer, crashing Steam's GPU process and forcing software
-compositing in Big Picture. These aliases now follow downstream enablement.
-Instance extension discovery also uses the loader's global enumeration entry
-point, avoiding a null-instance dispatch lookup in Mesa device-select.
-
-Regression tests call both formerly missing aliases, cover active and degraded
-instances with and without application enablement, and verify that private
-surface-capabilities enablement still leaves its application entry point gated.
-The private-properties test fails with the original 0.16.9 gate.
-
-On the RX 9070 XT with RADV/Mesa 26.2.3, an isolated Vulkan 1.0 instance with no
-application extensions reproduced a SIGSEGV with 0.16.9. The 0.16.10 release
-library completed both core queries with Mesa device-select enabled and disabled.
-This probe enabled extension injection but used an unavailable compositor socket;
-it validates loader initialization and dispatch, not frame presentation.
-
-All 237 workspace Rust tests, eight changelog tests, formatting, all-targets
-Clippy, documentation with warnings denied, and the workspace release build
-passed. The candidate server's host healthcheck passed with ephemeral ports in
-a temporary config, including H.264, HEVC, AV1, PyroWave SDR/HDR profiles and
-DMA-BUF support. The installed PyroWave C API load test also passed.
-An end-to-end Big Picture FPS comparison remains unperformed; the installed
-service and Steam session were not replaced during validation.
-
-## Validation recorded on 2026-09-30
-
-- Release WSI build, formatting, workspace clippy (all targets/features,
-  warnings denied), and workspace documentation (warnings denied) passed.
-- All 230 Rust unit tests passed: 195 core tests and 35 WSI tests. The first
-  sandboxed run denied UDP binds for four core tests; the full rerun with
-  loopback sockets permitted passed. Eight changelog tests and release-note
-  consistency checks also passed.
-- A separate non-presenting Wayland probe on RADV/Mesa 26.2.3 (RX 9070 XT)
-  measured desktop legacy minimum 3, mailbox minimum 4, and FIFO/immediate
-  minimum 3, all with unbounded maxima. Explicit three-image FIFO and immediate
-  swapchains each allocated three images. The same probe passed through the
-  release layer in degraded mode using a temporary manifest, without installing
-  it or changing Steam.
-- The recorded Steam/Pyroshine `wayland-1` socket was absent. The affected active
-  bypass surface and PoE were therefore not exercised. Desktop probe values do
-  not establish the affected surface's legacy minimum or successful game launch.
-  Overlay, HDR/SDR, direct presentation, cursor, limiter, and reconnect acceptance
-  checks below remain pending.
+Dated results are preserved in the [historical report](reports/VULKAN_IMAGE_COUNTS.md).
+They are evidence for those revisions, not a substitute for current acceptance.
 
 ## Path of Exile acceptance
 

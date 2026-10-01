@@ -70,6 +70,18 @@ Do not expose Pyroshine directly to the public internet.
 - [Contributing, manual builds and installation, and releases](CONTRIBUTING.md)
 - [Changelog](docs/CHANGELOG.md)
 
+## AI-assisted development
+
+Pyroshine is developed with substantial assistance from AI coding tools,
+including Codex, for implementation, refactoring, testing, documentation,
+debugging, and code review. The maintainer intentionally guides architectural
+direction and project decisions.
+
+AI-generated or AI-modified code is not assumed correct because it came from AI.
+All changes are expected to meet the same review, testing, validation,
+maintainability, security, and compatibility standards, whether written by a
+human or with AI assistance.
+
 ## License and credits
 
 Pyroshine is an independent community fork of

@@ -32,27 +32,18 @@ Bluetooth framing and CRC are retained, along with touch, motion, battery,
 rumble, LED and adaptive-trigger handling. See the precise local dependency
 changes and authoritative sources in [inputtino notes](../vendor/inputtino/LOCAL_CHANGES.md).
 
-## SDL requirements
+## Client and dependency boundary
 
-Native SDL2 2.28.0 contains Edge identification and extra-button handling;
-2.26.0 does not. The Linux AppImage workflow uses SDL3 at
-`ddba673cddfa79ce798eca5ba402e0f1a2a2a243` with sdl2-compat `release-2.32.70`;
-that mapping has the same normalized order. Linux system builds use pkg-config's
-SDL2. The validation environment reports sdl2-compat 2.32.72.
+Client-side SDL/HIDAPI must expose the four normalized paddle slots. Custom
+controller mappings or disabling HIDAPI can omit them; the client warns when a
+slot is unavailable. Verify the actual SDL version and USB/Bluetooth report
+handling in the client build. Host tests cannot establish Windows/macOS client
+support. Historical dependency versions are in the [recorded report](reports/DUALSENSE_EDGE.md#client-dependency-snapshot).
 
-The controller database is pinned at
-`8d9fefd7b810f2541f78cc7a8ccbd185bc84c7a5`; it has no Edge-specific entry.
-SDL's built-in HIDAPI mapping supplies the controls, so no database mapping is
-added. Prefer that driver and grant the client access to the physical hidraw
-node. Custom mappings or disabling HIDAPI can omit controls; the client emits
-an arrival warning when any of the four paddle slots is unavailable.
-
-SDL's enhanced report parser handles both physical USB and Bluetooth. The client
-already enables PS5 enhanced Bluetooth reports via its rumble hint, and its
-adaptive-trigger output accepts the PS5 SDL type used for Edge. Windows/macOS
-prebuilt dependencies come from `moonlight-qt-deps` v18.1, rather than source in
-this checkout; their installed SDL versions must be checked during platform
-validation. Do not claim those platforms tested from a Linux build.
+Pyroshine retains the pinned upstream Rust Inputtino API and patches only its
+native `inputtino-sys` backend. See [local patch maintenance](../vendor/inputtino/LOCAL_CHANGES.md)
+before changing identity/report layouts. Client normalization, wire flags, host
+routing, virtual HID identity and Steam Input must agree end to end.
 
 ## Automated checks
 
@@ -102,14 +93,14 @@ packet decoding, and preservation/release of Edge bits through hold-to-Home time
 
 1. Install the new client and host with the protocol header update. Keep the
    host's existing uinput/UHID/hidraw permissions and modules configured. Set
-   `[gamepad] emulation = "auto"`. Ensure Steam can open the virtual hidraw node;
-   the shipped `60-pyroshine.rules` covers UHID devices.
+   `[stream.control.gamepad] emulation = "auto"`. Ensure Steam can open the virtual
+   hidraw node; the shipped `60-pyroshine.rules` covers UHID devices.
 2. Connect the physical Edge over USB, preferably using its default hardware
    profile for isolation checks. On the client run `lsusb -d 054c:0df2` and an SDL
    controller test utility. Confirm all four normalized paddle events match the
    table and return to released. Repeat later over Bluetooth; `lsusb` does not
    list Bluetooth devices, so use SDL's reported VID/PID or `udevadm info`.
-3. Start Pyroshine with DEBUG logging (`RUST_LOG=moonshine_core=debug`), connect the
+3. Start Pyroshine with DEBUG logging (`MOONSHINE_LOG=moonshine_core=debug`), connect the
    stream, and inspect arrival/creation diagnostics. They must show PS, Edge=true,
    the supported-button mask containing `0x000f0000`, capability `0x0200`, and
    virtual `054c:0df2`. Enable SDL application DEBUG logging in a diagnostic client
@@ -154,25 +145,12 @@ packet decoding, and preservation/release of Edge bits through hold-to-Home time
 
 ## Validation boundary
 
-The development environment has no `/dev/input` or `/dev/uhid`, physical Edge,
-or interactive host Steam session. Automated tests and builds cannot establish
-Steam's actual identification, hardware report delivery, feedback behavior, or
-reconnect lifecycle. Those acceptance checks remain required before declaring
-native end-to-end support validated. Nix packaging is updated but must be built
-in a Nix environment.
+Automated tests/builds cannot establish physical USB/Bluetooth delivery, Steam's
+identification, feedback or reconnect behavior. Perform the acceptance checks on
+a host with uinput/UHID/hidraw access and Steam. Build Nix packaging separately
+in a Nix environment. Record revisions, platforms and checks not performed.
 
-## Results in this workspace
+## Recorded validation
 
-- Full Linux client qmake/make build passed; `moonlight --version` reports 6.1.0.
-  Missing SDL2_ttf, Qt5 Quick modules and Vulkan headers were supplied in `/tmp`;
-  installed system packages and repository renderer code were not changed.
-- `cargo build --locked --offline --workspace` passed; host version is 0.16.7.
-- All 14 host input tests passed, including the new Edge and remap cases.
-- Client SDL normalization CTest passed with sdl2-compat 2.32.72.
-- Controller protocol CTest passed in both the standalone repository and the
-  exact client submodule checkout.
-- Native inputtino report CTest passed; it also compiled the complete C/C++ backend.
-- `cargo clippy --locked --offline -p moonshine-core -- -D warnings`, formatting,
-  and tracked-diff whitespace checks passed.
-
-Physical USB/Bluetooth, Steam Input and Nix build checks remain unperformed.
+Dated results are preserved in the [historical report](reports/DUALSENSE_EDGE.md).
+They are evidence for those revisions, not a substitute for current acceptance.

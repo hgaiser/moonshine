@@ -5,6 +5,15 @@ keyboard, pointer, and Steam controller input targets. Virtual controller
 emulation selects the device family; Steam Input routing and compositor focus
 determine how applications receive that input.
 
+## Ownership and frame handoff
+
+The embedded Smithay compositor owns the visible scene and input focus, not
+codec negotiation or packet transport. `frame.rs` carries the exported DMA-BUF,
+color/HDR metadata and consumption signal to the video pipeline. Capture demand
+is separately generation-tagged; see [capture admission](PIPELINE_OPTIMIZATION.md#capture-admission-and-presentation).
+Service buffer releases and input even when capture is blocked or the scene is
+clean. [Architecture](ARCHITECTURE.md) explains session and stream ownership.
+
 ## Configuration
 
 Both additions are optional and preserve automatic defaults:
@@ -64,11 +73,15 @@ existing DMA-BUF checks still apply. Eligibility performs no X11 queries and
 allocates no window list. Current color management passes through pixel data and
 metadata; no new color conversion or SDR intermediate is introduced.
 
-Both swapchain protocols already convey Vulkan composite-alpha intent. The
+### WSI and transparency
+
+Both swapchain protocols convey Vulkan composite-alpha intent. The
 compositor now honors `VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR` for the declared root
 image in direct eligibility and GLES blending, including alpha-capable HDR
 buffers. Child surfaces retain their own transparency. See the
 [Vulkan definition](https://github.khronos.org/Vulkan-Site/spec/latest/chapters/VK_KHR_surface/wsi.html).
+
+### Steam classification and input
 
 Steam classification has one rule: `STEAM_OVERLAY != 0` is interactive when it
 spans the virtual output width or requests `STEAM_INPUT_FOCUS`; otherwise it is a
@@ -88,6 +101,17 @@ focused-app contract. These match the inspected
 DEBUG logs report classification, cursor, virtual-device creation, and capture
 path transitions (`direct`, `direct_override`, `composited`); rendering itself
 does not emit per-frame INFO messages.
+
+## Color and output changes
+
+Direct and composited paths must preserve the source format and color metadata.
+`sRGB`, BT.2020/PQ and scRGB linear frames are distinct: scRGB requires gamut/PQ
+conversion in the encoder, while PQ input is already transfer-encoded. Do not
+replace them with a generic HDR boolean or insert an SDR intermediate.
+Output-mode changes retire pools until their buffers are consumed; coordinate
+resolution/refresh/HDR changes with the session epoch rather than resizing only
+the scene. See [PyroWave ownership](PYROWAVE.md#gpu-path-and-ownership) and
+[reconnect validation](reconnect-validation.md).
 
 ## Validation and runtime checks
 

@@ -61,35 +61,26 @@ Run a quick H.264 benchmark at 1080p60 for 30 seconds:
 moonshine-bench --duration 30 --codec h264 /usr/bin/vkcube
 ```
 
-Compare AV1 encoding at 4K:
+Run the conventional resolution/FPS/codec matrix:
 
-```bash
-moonshine-bench --resolution 3840x2160 --codec av1 --bitrate 50000000 --duration 60 /usr/bin/vkcube
-```
-
-Run the full 4K/1440p/1080p x 60/120/360 FPS x HEVC/H.264/AV1 matrix:
-
-```bash
+```sh
 cargo run --release -p moonshine-tools --bin moonshine-bench -- --matrix --duration 30 --warmup 4 /usr/bin/vkcube
 ```
 
-Run indefinitely until you press Ctrl+C:
+Use `--pyrowave-matrix` for PyroWave's matrix, `--composited` to force GLES,
+and `--pyrowave-queue graphics` or `compute` for queue comparisons. Omitting
+`--duration` runs a single mode until Ctrl+C. `--verbose` adds per-frame output;
+`MOONSHINE_LOG=debug` enables diagnostic logging.
 
-```bash
-moonshine-bench /usr/bin/vkcube
-```
+### Comparing runs
 
-Per-frame output (useful for latency analysis):
-
-```bash
-moonshine-bench --verbose /usr/bin/vkcube
-```
-
-Filter logs via `MOONSHINE_LOG`:
-
-```bash
-MOONSHINE_LOG=debug moonshine-bench --duration 10 /usr/bin/vkcube
-```
+Record the checkout/backend revisions, GPU/driver, source application/scene,
+resolution/FPS, codec/chroma/depth/HDR, bitrate/FEC, capture path, queue preference,
+duration and warmup. Use matching workloads and multiple steady windows.
+Avoid concurrent compilation or other GPU work unless contention is the subject.
+A low-entropy cube cannot establish game quality or maximum-link throughput.
+The benchmark exercises server encoding/loopback sending, not Moonlight decode,
+display latency or physical network congestion.
 
 ### Output
 
@@ -109,13 +100,10 @@ With `--matrix`, each combination prints the same per-run summaries and the comm
 
 ### How It Works
 
-1. Spawns a `SessionManager` with a headless Smithay compositor
-2. Launches the provided command as a child application
-3. Sets up video/audio stream contexts with the specified codec, resolution, and bitrate
-4. Starts the encoding pipeline and begins capturing frames
-5. Collects `FrameStats` from each encoded frame via a broadcast channel
-6. After the warmup period, accumulates and reports statistics
-7. Stops after the specified duration or on Ctrl+C
+The tool launches the application through `SessionManager`, negotiates stream
+contexts, triggers stream gates and collects broadcast `FrameStats` after warmup.
+It reuses the production compositor/encode/packet path; see
+[architecture](ARCHITECTURE.md) and [capture admission](PIPELINE_OPTIMIZATION.md).
 
 ### GPU cost and admission diagnostics
 
@@ -145,5 +133,5 @@ traffic are additional. Do not treat the UDP payload as physical wire bitrate.
 The benchmark's latency starts at direct export or composition completion;
 it does not include game rendering, client decode/display, or the compositor
 CPU fence wait. Measure those separately when evaluating end-to-end latency.
-See [the optimization report](PIPELINE_OPTIMIZATION.md) for measured results,
+See [the historical optimization report](reports/PIPELINE_OPTIMIZATION.md) for measured results,
 validation gaps, and changes deliberately deferred.
