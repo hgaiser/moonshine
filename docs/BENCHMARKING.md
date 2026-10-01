@@ -32,7 +32,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 |--------|---------|-------------|
 | `--matrix` | off | Run the built-in 4K, 1440p, and 1080p matrix across 60/120/360 FPS and `hevc`, `h264`, and `av1` |
 | `--composited` | off | Force the GLES fallback, independent of fullscreen direct-export eligibility |
-| `--pyrowave-queue <mode>` | `auto` | Compare PyroWave `auto`, `graphics`, or `compute` at normal queue priority |
+| `--pyrowave-queue <mode>` | `auto` | Compare PyroWave `auto` (graphics), `graphics`, or explicit `compute` at normal queue priority |
 | `--pyrowave-matrix` | off | Run the PyroWave 1080p/1440p/4K matrix across 60/120/144 FPS |
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
 | `--fps <N>` | `60` | Target frame rate |

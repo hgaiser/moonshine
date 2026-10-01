@@ -77,8 +77,8 @@ A recycled numeric fd or reused compositor index is insufficient identity.
 Unused imports expire; conventional consumers can separately pin imports while
 GPU work remains active. See [resource bounds](LONG_SESSION_PERFORMANCE.md#resource-lifetimes).
 
-`[stream.video] pyrowave_queue = "auto"` prefers a compute-only family when
-available, otherwise graphics. Explicit `graphics`/`compute` modes support A/B
+`[stream.video] pyrowave_queue = "auto"` prefers graphics, even when a
+compute-only family is available. Explicit `graphics`/`compute` modes support A/B
 measurement. Optional selection failure retains a graphics fallback. The logged
 value is a preference, not proof of the native library's final queue choice.
 Normal queue priority and external-memory synchronization remain in place.

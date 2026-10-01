@@ -127,7 +127,7 @@ listeners accessible only over a trusted LAN or VPN.
 | `fec_mode` | string, `"fixed"` | `off` disables parity, including client-requested minimums; `fixed` uses the configured percentage; `auto` adjusts from client FEC status feedback. Without feedback, auto retains its initial value. |
 | `fec_min_percentage` | integer (0–255), `0` | Lower bound for auto FEC. |
 | `fec_max_percentage` | integer (0–255), `25` | Upper bound for auto FEC. Use a value at least as large as the minimum; the controller raises a smaller maximum to the minimum. |
-| `pyrowave_queue` | string, `"auto"` | Prefer a compute-only queue family for PyroWave when available. `"graphics"` selects graphics; `"compute"` requests compute with library fallback. All modes retain normal Vulkan queue priority. Graphics is available for driver-specific comparison. |
+| `pyrowave_queue` | string, `"auto"` | Prefer graphics for PyroWave. `"auto"` and `"graphics"` select graphics; `"compute"` explicitly requests compute with library fallback to graphics. All modes retain normal Vulkan queue priority. |
 | `encrypt` | boolean, `false` | Enable AES-128-GCM video encryption when supported by client negotiation. |
 | `log_stats` | boolean, `true` | Emit five-second capture, pipeline, transport, DMA-BUF, runtime/CPU/memory/fd summaries and swapchain feedback. `false` skips diagnostic accumulation and process sampling; benchmark statistics, operational warnings/errors, and separately enabled frame-spike logs remain available. |
 | `log_frame_spikes` | boolean, `false` | Warn when a frame's encoding and packetization exceeds the frame budget. Useful for latency diagnostics. |

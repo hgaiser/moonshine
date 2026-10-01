@@ -14,6 +14,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Fixed
+
+
+
 ## [v0.16.14] - 2026-10-01
 
 ### Added
@@ -27,6 +31,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 - Accept Nonary's PyroWave record ANNOUNCE capabilities instead of requiring its client to claim native wire-v1. Reject unknown revisions and contradictory protocol/profile attributes with a compatibility reason.
 - Preserve real Select holds with Back+Start shortcuts, extended controller flags, and held inputs during activation-rumble timer completion.
 - Reject unsafe Wine/Proton XWayland bypass before top-level acceptance, cache safety behind X11 events, repair XCB child-query layout, and retire stale compositor overrides when falling back to XCB.
+- Restore graphics as the automatic PyroWave queue preference; compute remains an explicit option.
 
 ## [v0.16.13] - 2026-10-01
 

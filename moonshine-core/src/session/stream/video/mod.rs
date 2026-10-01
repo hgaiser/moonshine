@@ -61,7 +61,7 @@ pub struct VideoStreamConfig {
 	/// Disabling this also skips diagnostic accumulation and process sampling;
 	/// benchmark frame statistics and operational warnings remain available.
 	pub log_stats: bool,
-	/// GPU scheduling preference for cross-process PyroWave encoding.
+	/// GPU scheduling preference for cross-process PyroWave encoding; auto prefers graphics.
 	pub pyrowave_queue: pyrowave::PyroWaveQueueMode,
 
 	/// Upper bound for the client-requested video packet size, in bytes.

@@ -138,7 +138,7 @@ struct ColorMetadata {
 	chroma_siting: u32,
 }
 
-/// Auto uses a compute-only queue family when present, at normal priority.
+/// Auto prefers graphics at normal priority; compute is an explicit opt-in.
 #[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum PyroWaveQueueMode {
@@ -148,8 +148,8 @@ pub enum PyroWaveQueueMode {
 	Compute,
 }
 impl PyroWaveQueueMode {
-	fn flags(self, dedicated: bool) -> vk::QueueFlags {
-		if self == Self::Compute || (self == Self::Auto && dedicated) {
+	fn flags(self) -> vk::QueueFlags {
+		if self == Self::Compute {
 			vk::QueueFlags::COMPUTE
 		} else {
 			vk::QueueFlags::GRAPHICS
@@ -160,10 +160,9 @@ impl PyroWaveQueueMode {
 // preference leaves that safe default usable, including fallback API failure.
 fn select_queue(
 	mode: PyroWaveQueueMode,
-	dedicated: bool,
 	mut select: impl FnMut(vk::QueueFlags) -> ResultCode,
 ) -> (vk::QueueFlags, ResultCode) {
-	let requested = mode.flags(dedicated);
+	let requested = mode.flags();
 	let result = select(requested);
 	if result == SUCCESS {
 		(requested, result)
@@ -396,21 +395,22 @@ impl Device {
 			unsafe { (api.destroy_device)(handle) };
 			return Err("PyroWave device does not support DMA-BUF interoperability".to_string());
 		}
-		// Granite's compatibility-device builder selects a compute-only family
-		// first, then another compute queue, then graphics. No queue ownership is
-		// moved inside our process; the entire PyroWave pipeline uses one queue.
-		let families = unsafe {
-			context
-				.instance()
-				.get_physical_device_queue_family_properties(context.physical_device())
-		};
-		let dedicated = families.iter().any(|q| {
-			q.queue_count != 0
-				&& q.queue_flags.contains(vk::QueueFlags::COMPUTE)
-				&& !q.queue_flags.contains(vk::QueueFlags::GRAPHICS)
-		});
-		let (selected, result) = select_queue(mode, dedicated, |flags| unsafe { (api.set_queue_type)(handle, flags) });
+		// Keep automatic selection on graphics to avoid observed compute-queue
+		// overhead and instability under game load. Explicit compute requests let
+		// Granite select a compute family, with library fallback to graphics.
+		// The entire PyroWave pipeline uses one queue.
+		let (selected, result) = select_queue(mode, |flags| unsafe { (api.set_queue_type)(handle, flags) });
 		if log_selection {
+			let families = unsafe {
+				context
+					.instance()
+					.get_physical_device_queue_family_properties(context.physical_device())
+			};
+			let dedicated = families.iter().any(|q| {
+				q.queue_count != 0
+					&& q.queue_flags.contains(vk::QueueFlags::COMPUTE)
+					&& !q.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+			});
 			tracing::info!(requested_mode = ?mode, queue_preference = ?selected, dedicated_compute_available = dedicated, selection_result = result, global_priority = "medium", "PyroWave queue selection (library falls back to graphics when compute is unavailable)");
 		}
 		Ok(Rc::new(Self {
@@ -1039,11 +1039,18 @@ mod tests {
 		}
 	}
 	#[test]
-	fn queue_selection_auto_falls_back_and_overrides_are_explicit() {
-		assert_eq!(PyroWaveQueueMode::Auto.flags(false), vk::QueueFlags::GRAPHICS);
-		assert_eq!(PyroWaveQueueMode::Auto.flags(true), vk::QueueFlags::COMPUTE);
-		assert_eq!(PyroWaveQueueMode::Graphics.flags(true), vk::QueueFlags::GRAPHICS);
-		assert_eq!(PyroWaveQueueMode::Compute.flags(false), vk::QueueFlags::COMPUTE);
+	fn queue_config_defaults_to_graphics_and_compute_is_explicit() {
+		let default_config = toml::from_str::<super::super::VideoStreamConfig>("").unwrap();
+		assert_eq!(default_config.pyrowave_queue.flags(), vk::QueueFlags::GRAPHICS);
+		for (mode, expected) in [
+			("auto", vk::QueueFlags::GRAPHICS),
+			("graphics", vk::QueueFlags::GRAPHICS),
+			("compute", vk::QueueFlags::COMPUTE),
+		] {
+			let config =
+				toml::from_str::<super::super::VideoStreamConfig>(&format!("pyrowave_queue = '{mode}'")).unwrap();
+			assert_eq!(config.pyrowave_queue.flags(), expected);
+		}
 		assert!(toml::from_str::<super::super::VideoStreamConfig>("pyrowave_queue = 'high'").is_err());
 	}
 	#[test]
@@ -1071,19 +1078,19 @@ mod queue_fallback_tests {
 	#[test]
 	fn compute_selection_failure_uses_safe_graphics_default() {
 		let mut attempts = Vec::new();
-		let (flags, result) = select_queue(PyroWaveQueueMode::Auto, true, |flags| {
+		let (flags, result) = select_queue(PyroWaveQueueMode::Compute, |flags| {
 			attempts.push(flags);
 			if flags == vk::QueueFlags::COMPUTE { -1 } else { SUCCESS }
 		});
 		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
 		assert_eq!(result, -1);
 		assert_eq!(attempts, [vk::QueueFlags::COMPUTE, vk::QueueFlags::GRAPHICS]);
-		let (flags, _) = select_queue(PyroWaveQueueMode::Compute, true, |_| -1);
+		let (flags, _) = select_queue(PyroWaveQueueMode::Compute, |_| -1);
 		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
 	}
 	#[test]
-	fn auto_without_dedicated_family_never_requests_compute() {
-		let (flags, _) = select_queue(PyroWaveQueueMode::Auto, false, |flags| {
+	fn auto_never_requests_compute() {
+		let (flags, _) = select_queue(PyroWaveQueueMode::Auto, |flags| {
 			assert_eq!(flags, vk::QueueFlags::GRAPHICS);
 			SUCCESS
 		});

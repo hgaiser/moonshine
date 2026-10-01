@@ -28,7 +28,7 @@ struct Args {
 	/// Force composition to measure the fallback independently of fullscreen eligibility.
 	#[arg(long)]
 	composited: bool,
-	/// PyroWave queue preference at normal priority.
+	/// PyroWave queue preference at normal priority; auto prefers graphics.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	pyrowave_queue: String,
 	/// Command to run (application to spawn).
