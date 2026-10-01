@@ -318,7 +318,8 @@ impl SessionManager {
 						"HTTP resume parameters differ from authoritative RTSP negotiation"
 					);
 				}
-				let pause_video = (!changed.is_empty()).then(|| active.video_handle());
+				// Every reconnect needs a barrier, including identical-mode resume.
+				let pause_video = Some(active.video_handle());
 				let pause_audio = audio_changed.then(|| active.audio_handle());
 				guard.pending_video_stream_context = Some(video_stream_context);
 				guard.pending_audio_stream_context = Some(audio_stream_context);
@@ -481,17 +482,16 @@ impl SessionManager {
 					Err(())
 				},
 				ReconnectDecision::FastResume => {
-					active.reset_video_stream();
+					let result = active.reset_video_stream().await;
 					tracing::info!("Reconnect stream configuration unchanged; using fast resume path");
-					Ok(())
+					result
 				},
 				ReconnectDecision::Reconfigure {
 					video_changed_fields,
 					audio_changed,
 				} => {
 					let video_result = if video_changed_fields.is_empty() {
-						active.reset_video_stream();
-						Ok(())
+						active.reset_video_stream().await
 					} else {
 						tracing::info!(changed_fields = ?video_changed_fields, "Recreating video pipeline for changed reconnect configuration");
 						active.reconfigure_video(video).await

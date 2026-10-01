@@ -363,8 +363,8 @@ impl ActiveSession {
 	}
 
 	/// Reset the video stream's frame counters and force an IDR for a resuming client.
-	pub(crate) fn reset_video_stream(&self) {
-		self.video_handle.request_reset();
+	pub(crate) async fn reset_video_stream(&self) -> Result<(), ()> {
+		self.video_handle.request_reset().await
 	}
 
 	pub(crate) fn video_context(&self) -> &VideoStreamContext {

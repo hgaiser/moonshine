@@ -269,7 +269,7 @@ pub(crate) struct VideoStreamHandle {
 	/// Reference frame invalidation requests, carrying the inclusive
 	/// `[first, last]` client frame-index range the client could not decode.
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
-	reset_tx: broadcast::Sender<()>,
+	reset_tx: std::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), ()>>>,
 	fec_feedback_tx: watch::Sender<FrameFecStatus>,
 	packet_tx: mpsc::Sender<VideoPacketMessage>,
 	reconfigure_tx: std::sync::mpsc::Sender<VideoReconfigureCommand>,
@@ -322,11 +322,13 @@ impl VideoStreamHandle {
 	/// Moonlight session expects frame numbers to start at 1; without a reset it counts
 	/// the jump as massive frame loss and reports a poor connection. This also forces an
 	/// IDR so the resumed client has a decodable starting frame.
-	pub fn request_reset(&self) {
-		let _ = self.reset_tx.send(());
+	pub async fn request_reset(&self) -> Result<(), ()> {
+		let (applied, waiting) = tokio::sync::oneshot::channel();
+		self.reset_tx.send(applied).map_err(|_| ())?;
+		waiting.await.map_err(|_| ())?
 	}
 
-	/// Stop delivering packets while a changed reconnect is negotiated.
+	/// Stop delivering packets until the encoder activates the next client epoch.
 	pub async fn pause_for_reconfigure(&self) -> Result<(), ()> {
 		let (ready, waiting) = tokio::sync::oneshot::channel();
 		self.packet_tx
@@ -437,7 +439,7 @@ impl VideoStream {
 		let (invalidate_tx, _invalidate_rx) = broadcast::channel(16);
 
 		// Stream-reset broadcast channel (client reconnect/resume).
-		let (reset_tx, _reset_rx) = broadcast::channel(1);
+		let (reset_tx, reset_rx) = std::sync::mpsc::channel();
 		let (fec_feedback_tx, fec_feedback_rx) = watch::channel(FrameFecStatus::default());
 
 		// Packet channel.
@@ -470,7 +472,7 @@ impl VideoStream {
 			idr_tx.clone(),
 			idr_tx.subscribe(),
 			invalidate_tx.subscribe(),
-			reset_tx.subscribe(),
+			reset_rx,
 			stop.clone(),
 			hdr_metadata_tx,
 			start_notify.clone(),
@@ -506,6 +508,7 @@ fn spawn_handle_video_packets(
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
+		let mut paused = false;
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
 		let mut transport_window = diagnostics::TransportWindow::new(log_stats);
@@ -519,19 +522,25 @@ fn spawn_handle_video_packets(
 				message = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match message {
 						Ok(Some(VideoPacketMessage::Pause(ready))) => {
-							client_address = None;
+							if !paused {
+								client_address = None;
+							}
+							// PING may discover the next endpoint, but only an ordered
+							// BeginEpoch from the producer can enable delivery again.
+							paused = true;
 							let _ = ready.send(());
 						},
 						Ok(Some(VideoPacketMessage::BeginEpoch { context, ready })) => {
 							pacing_bitrate = (context.format.codec == VideoCodec::PyroWave)
 								.then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
 							fps = context.fps;
+							paused = false;
 							let tos = if context.qos { 160 } else { 0 };
 							let _ = socket.set_tos_v4(tos);
 							let _ = ready.send(());
 						},
 						Ok(Some(VideoPacketMessage::Batch(mut batch))) => {
-							if let Some(addr) = client_address {
+							if let Some(addr) = client_address.filter(|_| !paused) {
 								if batch.shard_count() == 0 {
 									continue;
 								}
@@ -633,6 +642,70 @@ fn spawn_handle_video_packets(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn reconnect_ping_cannot_deliver_old_batches_before_epoch_activation() {
+		use std::time::Duration;
+		use tokio::net::UdpSocket;
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let server = socket.local_addr().unwrap();
+		let stop = ShutdownManager::new();
+		let start = Arc::new(Notify::new());
+		let (tx, rx) = mpsc::channel(16);
+		spawn_handle_video_packets(rx, socket, start.clone(), stop.clone(), Some(650_000_000), 120, false);
+		start.notify_one();
+		let mut buf = [0u8; 64];
+		for codec in [VideoCodec::PyroWave, VideoCodec::Hevc, VideoCodec::PyroWave] {
+			let (ready, waiting) = tokio::sync::oneshot::channel();
+			tx.send(VideoPacketMessage::Pause(ready)).await.unwrap();
+			waiting.await.unwrap();
+			let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+			client.send_to(b"PING", server).await.unwrap();
+			// Let the endpoint discovery arrive while negotiation is paused.
+			tokio::time::sleep(Duration::from_millis(10)).await;
+			let (ready, waiting) = tokio::sync::oneshot::channel();
+			tx.send(VideoPacketMessage::Pause(ready)).await.unwrap();
+			waiting.await.unwrap(); // Duplicate disconnect/ANNOUNCE pauses retain the new PING.
+			let mut old = shard_batch::ShardBuf::new(1, 64, 0);
+			old.shard_mut(0).fill(0xee);
+			let mut old = old.into_batch();
+			let (sent, completed) = std::sync::mpsc::sync_channel(1);
+			old.set_send_completion(sent);
+			tx.send(VideoPacketMessage::Batch(old)).await.unwrap();
+			let (ready, waiting) = tokio::sync::oneshot::channel();
+			tx.send(VideoPacketMessage::BeginEpoch {
+				context: VideoStreamContext {
+					fps: 120,
+					bitrate: 650_000_000,
+					format: NegotiatedVideoFormat {
+						codec,
+						..Default::default()
+					},
+					..Default::default()
+				},
+				ready,
+			})
+			.await
+			.unwrap();
+			waiting.await.unwrap();
+			// Dropped old PyroWave batches still release their synchronous producer.
+			assert!(completed.try_recv().is_ok());
+			let mut fresh = shard_batch::ShardBuf::new(1, 64, 0);
+			fresh.shard_mut(0).fill(0x11);
+			tx.send(VideoPacketMessage::Batch(fresh.into_batch())).await.unwrap();
+			let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+				.await
+				.unwrap()
+				.unwrap();
+			assert_eq!(&buf[..len], &[0x11; 64]);
+			assert!(
+				tokio::time::timeout(Duration::from_millis(10), client.recv_from(&mut buf))
+					.await
+					.is_err()
+			);
+		}
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+	}
 
 	#[test]
 	fn dialect_changes_require_a_new_stream_epoch() {

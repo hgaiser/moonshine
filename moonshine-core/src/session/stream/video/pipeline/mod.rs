@@ -249,7 +249,7 @@ enum ConsumerMessage {
 	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
 	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
 	/// effect before any frame submitted after the reset.
-	ResetCounters,
+	ResetCounters(tokio::sync::oneshot::Sender<Result<(), ()>>),
 }
 
 /// Decrements the in-flight frame counter when dropped, on every exit path of a
@@ -313,9 +313,27 @@ async fn run_packet_consumer(
 			fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 		}
 		let (frame_context, future) = match msg {
-			ConsumerMessage::ResetCounters => {
+			ConsumerMessage::ResetCounters(applied) => {
 				frame_number = 0;
 				sequence_number = 0;
+				let (ready, waiting) = tokio::sync::oneshot::channel();
+				if packet_tx
+					.send(VideoPacketMessage::BeginEpoch {
+						context: ctx.clone(),
+						ready,
+					})
+					.await
+					.is_err()
+				{
+					let _ = applied.send(Err(()));
+					break;
+				}
+				let result = waiting.await.map_err(|_| ());
+				let failed = result.is_err();
+				let _ = applied.send(result);
+				if failed {
+					break;
+				}
 				continue;
 			},
 			ConsumerMessage::Frame(frame_context, future) => (frame_context, future),
@@ -498,7 +516,7 @@ impl VideoPipeline {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: broadcast::Receiver<()>,
+		reset_request_rx: std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
@@ -585,7 +603,7 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		mut reset_request_rx: broadcast::Receiver<()>,
+		mut reset_request_rx: std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
@@ -746,7 +764,7 @@ impl VideoPipelineInner {
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
 		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: &mut broadcast::Receiver<()>,
+		reset_request_rx: &mut std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
 		reconfigure_rx: &std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -846,12 +864,12 @@ impl VideoPipelineInner {
 				fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 			}
 			let mut resend_last = false;
-			while matches!(
-				reset_request_rx.try_recv(),
-				Ok(()) | Err(broadcast::error::TryRecvError::Lagged(_))
-			) {
+			while let Ok(applied) = reset_request_rx.try_recv() {
+				frame_rx.reset();
 				frame_number = 0;
 				sequence_number = 0;
+				self.activate_reconfigured_epoch(runtime, &packet_tx, Some(applied))?;
+				tracing::info!("Reset PyroWave counters and activated resumed video epoch");
 				resend_last = true;
 			}
 			while matches!(
@@ -1059,7 +1077,7 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
 		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: &mut broadcast::Receiver<()>,
+		reset_request_rx: &mut std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
 		reconfigure_rx: &std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -1197,20 +1215,13 @@ impl VideoPipelineInner {
 			// ("Your network connection isn't performing well"). Reset the frame and RTP
 			// sequence counters and force an IDR so the resumed client sees a clean stream
 			// starting from frame 1.
-			let mut pending_reset = false;
-			loop {
-				match reset_request_rx.try_recv() {
-					Ok(()) => pending_reset = true,
-					Err(broadcast::error::TryRecvError::Lagged(_)) => pending_reset = true,
-					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
-				}
-			}
-			if pending_reset {
+			while let Ok(applied) = reset_request_rx.try_recv() {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
-				// Counters live on the consumer task; reset them in order.
-				let _ = frame_ctx_tx.blocking_send(ConsumerMessage::ResetCounters);
-				// The next submitted frame becomes the consumer's frame 1 of the
-				// new epoch; anchor the invalidation index mapping to it.
+				frame_rx.reset();
+				// The consumer orders activation after every old encoder future/batch.
+				frame_ctx_tx
+					.blocking_send(ConsumerMessage::ResetCounters(applied))
+					.map_err(|_| "video consumer stopped during resume".to_string())?;
 				frame_number_base = submitted_count;
 				encoder.request_idr();
 				pending_idr = true;
@@ -1599,6 +1610,59 @@ mod tests {
 	};
 	use ash::vk;
 	use pixelforge::{InputFormat, PixelForgeError};
+
+	#[tokio::test]
+	async fn resume_ack_waits_for_transport_epoch_and_reports_activation_failure() {
+		use super::*;
+		for succeeds in [true, false] {
+			let (_keys, keys_rx) = watch::channel(crate::session::SessionKeyData {
+				remote_input_key: vec![0; 16],
+				remote_input_key_id: 0,
+			});
+			let (consumer_tx, consumer_rx) = mpsc::channel(2);
+			let (packet_tx, mut packet_rx) = mpsc::channel(2);
+			let (stats_tx, _) = broadcast::channel(1);
+			let (idr_tx, _) = broadcast::channel(1);
+			let (_fec_tx, fec_rx) = watch::channel(FrameFecStatus::default());
+			let context = VideoStreamContext {
+				fps: 120,
+				..Default::default()
+			};
+			let consumer = tokio::spawn(run_packet_consumer(
+				consumer_rx,
+				packet_tx,
+				stats_tx,
+				Arc::new(AtomicUsize::new(0)),
+				idr_tx,
+				Packetizer::new(false, keys_rx),
+				context.clone(),
+				VideoStreamConfig::default(),
+				fec_rx,
+			));
+			let (applied, mut waiting) = tokio::sync::oneshot::channel();
+			consumer_tx.send(ConsumerMessage::ResetCounters(applied)).await.unwrap();
+			let Some(VideoPacketMessage::BeginEpoch {
+				context: activated,
+				ready,
+			}) = packet_rx.recv().await
+			else {
+				panic!("reset must order transport activation before acknowledging PLAY");
+			};
+			assert_eq!(activated, context);
+			assert!(matches!(
+				waiting.try_recv(),
+				Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+			));
+			if succeeds {
+				ready.send(()).unwrap();
+			} else {
+				drop(ready);
+			}
+			assert_eq!(waiting.await.unwrap(), if succeeds { Ok(()) } else { Err(()) });
+			drop(consumer_tx);
+			consumer.await.unwrap();
+		}
+	}
 
 	// DRM fourccs — kept in the test module to document the byte ordering
 	// explicitly and guard against accidental typos in the production match.

@@ -468,7 +468,7 @@ fn run_compositor(
 	let damage_tracker = OutputDamageTracker::from_output(&output);
 
 	// Build the compositor state.
-	let (state, display) = MoonshineCompositor::new(
+	let (mut state, display) = MoonshineCompositor::new(
 		display,
 		display_handle.clone(),
 		event_loop.handle(),
@@ -565,8 +565,11 @@ fn run_compositor(
 	// actual period and producing ~58 Hz instead of 60 Hz.
 	let frame_nanos: u64 = 1_000_000_000u64 / u64::from(context.refresh_rate.max(1));
 	let frame_interval = std::time::Duration::from_nanos(frame_nanos);
-	let mut next_frame = std::time::Instant::now() + frame_interval;
-	let timer = smithay::reexports::calloop::timer::Timer::from_duration(frame_interval);
+	// Both timers use the same grid. Demand and a temporary paced-send stall
+	// must not create a persistent phase offset from application callbacks.
+	state.next_refresh_at = std::time::Instant::now() + frame_interval;
+	state.next_capture_at = state.next_refresh_at;
+	let timer = smithay::reexports::calloop::timer::Timer::from_deadline(state.next_refresh_at);
 	event_loop
 		.handle()
 		.insert_source(timer, move |_event, _metadata, state: &mut MoonshineCompositor| {
@@ -579,13 +582,9 @@ fn run_compositor(
 			let interval = std::time::Duration::from_nanos(
 				1_000_000_000u64 / u64::from(refresh_rate.load(Ordering::Acquire).max(1)),
 			);
-			next_frame += interval;
-			let now = std::time::Instant::now();
-			if next_frame <= now {
-				// We fell behind — snap forward instead of bursting.
-				next_frame = now + interval;
-			}
-			smithay::reexports::calloop::timer::TimeoutAction::ToInstant(next_frame)
+			state.next_refresh_at =
+				capture::next_capture_deadline(state.next_refresh_at, std::time::Instant::now(), interval);
+			smithay::reexports::calloop::timer::TimeoutAction::ToInstant(state.next_refresh_at)
 		})
 		.map_err(|e| format!("Failed to insert frame timer: {e}"))?;
 
@@ -630,7 +629,6 @@ fn run_compositor(
 	// Use `None` as timeout so dispatch blocks until the next calloop
 	// source fires (frame timer, input channel, or Wayland client event).
 	// A hard timeout like 16ms would compete with the frame timer cadence.
-	let mut state = state;
 	state.start_xwayland();
 
 	tracing::debug!(

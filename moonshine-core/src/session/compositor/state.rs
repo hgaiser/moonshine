@@ -246,6 +246,10 @@ pub(crate) struct MoonshineCompositor {
 	pub frame_tx: super::admission::CaptureSender,
 	pub(super) capture_failed: bool,
 	pub(super) next_capture_at: std::time::Instant,
+	/// Shared refresh grid for callbacks and receiver-driven capture.
+	pub(super) next_refresh_at: std::time::Instant,
+	max_capture_lateness_us: u64,
+	missed_capture_slots: u64,
 
 	// -- Input --
 	pub seat: Seat<Self>,
@@ -574,7 +578,7 @@ impl MoonshineCompositor {
 		self.output.set_preferred(mode);
 		self.damage_tracker = OutputDamageTracker::from_output(&self.output);
 		self.screen_dirty = true;
-		self.next_capture_at = std::time::Instant::now();
+		self.next_capture_at = self.next_refresh_at;
 		tracing::info!(width, height, refresh_rate, hdr, "Reconfigured live compositor output");
 		Ok(())
 	}
@@ -769,6 +773,9 @@ impl MoonshineCompositor {
 				frame_tx,
 				capture_failed: false,
 				next_capture_at: std::time::Instant::now(),
+				next_refresh_at: std::time::Instant::now(),
+				max_capture_lateness_us: 0,
+				missed_capture_slots: 0,
 				seat,
 				pending_text: String::new(),
 				cursor_position: initial_cursor_position,
@@ -1371,6 +1378,8 @@ impl MoonshineCompositor {
 				scanout_buffer_map = self.scanout_buffer_map.len(),
 				retired_buffer_pools = self.retired_buffer_pools.len(),
 				released_scanout_buffers = self.released_scanout_buffers,
+				max_capture_lateness_us = self.max_capture_lateness_us,
+				missed_capture_slots = self.missed_capture_slots,
 				"Video capture resources"
 			);
 			let r = self.direct_rejections;
@@ -1404,6 +1413,8 @@ impl MoonshineCompositor {
 			self.direct_rejections = [0; DirectReject::COUNT];
 			self.last_resource_summary = std::time::Instant::now();
 			self.released_scanout_buffers = 0;
+			self.max_capture_lateness_us = 0;
+			self.missed_capture_slots = 0;
 		}
 		// Preserve the one-second keepalive for an actually static screen.
 		if !tick.render {
@@ -1426,8 +1437,13 @@ impl MoonshineCompositor {
 		let interval = std::time::Duration::from_nanos(
 			1_000_000_000_000 / self.output.current_mode().map_or(60_000, |mode| mode.refresh.max(1)) as u64,
 		);
-		self.next_capture_at =
-			super::capture::next_capture_deadline(self.next_capture_at, std::time::Instant::now(), interval);
+		let now = std::time::Instant::now();
+		if self.log_stats {
+			let lateness = now.saturating_duration_since(self.next_capture_at);
+			self.max_capture_lateness_us = self.max_capture_lateness_us.max(lateness.as_micros() as u64);
+			self.missed_capture_slots += (lateness.as_nanos() / interval.as_nanos()) as u64;
+		}
+		self.next_capture_at = super::capture::next_capture_deadline(self.next_capture_at, now, interval);
 		let mut credit = Some(credit);
 
 		// Try direct scanout: bypass compositor rendering when a single

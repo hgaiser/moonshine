@@ -489,6 +489,7 @@ async fn run_control_loop(
 	let mut audio_triggered = false;
 	// Track which peer slot the client is connected to.
 	let mut connected_peer: Option<tokio_enet::PeerId> = None;
+	let mut connected_key_id = None;
 
 	while !stop_session_manager.is_shutdown_triggered() {
 		// Check if the timeout has passed.
@@ -518,10 +519,21 @@ async fn run_control_loop(
 		{
 			Ok(Some(Event::Connect { peer_id, .. })) => {
 				connected_peer = Some(peer_id);
+				connected_key_id = Some(context.keys_rx.borrow().remote_input_key_id);
 			},
 			Ok(Some(Event::Disconnect { peer_id, .. })) => {
 				if connected_peer == Some(peer_id) {
 					connected_peer = None;
+					// Retain the application, but stop high-bitrate traffic to the old
+					// UDP endpoint. ANNOUNCE/PLAY activates the next video epoch.
+					// An old peer can disconnect after HTTP resume has already
+					// replaced its keys. It must not pause the new client's epoch.
+					if connected_key_id == Some(context.keys_rx.borrow().remote_input_key_id) {
+						if video_handle.pause_for_reconfigure().await.is_err() {
+							break;
+						}
+						tracing::info!("Control peer disconnected; paused video delivery for resume");
+					}
 				}
 			},
 			Ok(Some(Event::Receive { ref packet, .. })) => {

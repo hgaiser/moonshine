@@ -27,7 +27,11 @@ credit's completion cannot replenish the new generation. Receiver disconnect is
 terminal. The capacity-one handoff slot is not another admission credit.
 
 Demand wakes calloop through a coalesced ping and preallocated timer. Absolute
-capture deadlines skip missed slots without catch-up. The regular refresh timer
+capture deadlines and application refresh callbacks share one clock grid. Both
+skip whole missed slots without rebasing their phase or sending catch-up bursts;
+codec changes reuse that refresh grid. Capture summaries include maximum capture
+lateness and missed slots to distinguish pacing stalls from encoder stage cost.
+Missed slots include static/no-demand gaps; they are not client frame-loss counts. The regular refresh timer
 still dispatches Wayland, services input, releases buffers and sends frame
 callbacks even while capture is blocked. Demand wakeups do not increase callback
 cadence; skipped presentation feedback is discarded, not reported as presented.

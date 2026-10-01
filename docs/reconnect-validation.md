@@ -45,6 +45,17 @@ A client disconnect without cancellation is intentionally allowed to retain the
 host application/session for resume. Check retained-session behavior separately
 from final teardown; disconnect alone does not imply every host task must exit.
 
+During disconnect, verify `Control peer disconnected; paused video delivery for
+resume` when ENet reports the active peer disconnect. A UDP PING discovers an
+endpoint but cannot bypass a paused epoch. RTSP ANNOUNCE pauses video for every
+reconnect; PLAY waits for ordered encoder-counter reset and transport activation
+before completing, including identical-mode resumes. Dropped paused batches must
+still release PyroWave's send completion/capture credit.
+
+Repeat PyroWave → PyroWave, PyroWave → HEVC, HEVC → HEVC and HEVC →
+PyroWave → PyroWave while the same game remains running. Inspect client frame
+loss, presentation cadence and visible micro-stutter, as well as average host FPS.
+
 For the identical-mode reconnect, verify that logs contain
 `Reconnect stream configuration unchanged; using fast resume path`, frame and
 RTP counters restart at the client-visible epoch, and the first frame is an IDR

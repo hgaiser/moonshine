@@ -376,19 +376,54 @@ mod tests {
 	}
 }
 
-/// Preserve nominal cadence after small jitter and never catch up missed slots.
+/// Preserve the refresh phase even after missed slots, without catch-up bursts.
+/// Rebasing to `now + interval` creates a second clock: a paced encoder overrun
+/// can leave capture between the game's frame callbacks for the entire session.
 pub(super) fn next_capture_deadline(
 	previous: std::time::Instant,
 	now: std::time::Instant,
 	interval: std::time::Duration,
 ) -> std::time::Instant {
 	let ideal = previous + interval;
-	if ideal <= now { now + interval } else { ideal }
+	if ideal > now {
+		return ideal;
+	}
+	// Only jump whole slots. The remainder is less than the refresh interval
+	// (at most one second), so conversion to u64 nanoseconds is bounded.
+	let remainder = now.duration_since(previous).as_nanos() % interval.as_nanos();
+	now + interval - std::time::Duration::from_nanos(remainder as u64)
 }
 
 #[cfg(test)]
 mod cadence_tests {
 	use super::*;
+	#[test]
+	fn capture_overrun_keeps_the_refresh_phase_after_reconnect() {
+		let start = std::time::Instant::now();
+		let interval = std::time::Duration::from_nanos(8_333_333);
+		let late_capture = start + interval + interval / 2;
+		// Skipping a slot must not move capture half a refresh behind callbacks
+		// for the rest of the retained game session.
+		let mut next = next_capture_deadline(start, late_capture, interval);
+		assert_eq!(next, start + interval * 2);
+		for index in 2..1000 {
+			let due = start + interval * index;
+			next = next_capture_deadline(next, due + std::time::Duration::from_micros(50), interval);
+			assert_eq!(next, start + interval * (index + 1));
+		}
+	}
+
+	#[test]
+	fn long_pause_skips_slots_without_rebasing_or_catchup() {
+		let start = std::time::Instant::now();
+		let interval = std::time::Duration::from_millis(8);
+		let now = start + std::time::Duration::from_secs(37) + std::time::Duration::from_millis(3);
+		let next = next_capture_deadline(start, now, interval);
+		assert!(next > now);
+		assert!(next <= now + interval);
+		assert_eq!(next.duration_since(start).as_nanos() % interval.as_nanos(), 0);
+	}
+
 	#[test]
 	fn jitter_preserves_cadence_but_missed_slots_do_not_burst() {
 		let start = std::time::Instant::now();

@@ -64,7 +64,7 @@ while resetting or replacing the encoders and transport state.
 | RTSP PLAY | Constructs initial streams, or commits a reconnect transition |
 | Control `StartB` | Opens the audio/video start gates; tools can trigger them through manager notifications |
 | HTTP resume | Updates session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
-| Unchanged reconnect | Resets client-visible video sequencing and requests an independently decodable first frame |
+| Unchanged reconnect | Pauses delivery, resets client-visible video sequencing, requests an independently decodable first frame and acknowledges ordered transport activation before PLAY completes |
 | Changed reconnect | Pauses affected epochs, updates compositor output when needed, and recreates affected video/audio resources |
 | Cancel, application exit or session failure | Session shutdown releases application, stream tasks and native resources; the manager can accept a later launch |
 
