@@ -164,7 +164,7 @@ impl CaptureReceiver {
 		// Only the receiver changes epochs. A producer that raced reset fails
 		// its send; already queued frames are released without touching the GPU.
 		self.state
-			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |old| {
+			.try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
 				(old & STATE_MASK != CLOSED).then_some((old & !STATE_MASK).wrapping_add(4))
 			})
 			.ok();
