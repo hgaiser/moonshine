@@ -396,6 +396,16 @@ impl GamepadSlot {
 	}
 }
 
+impl Drop for GamepadSlot {
+	fn drop(&mut self) {
+		// Release input and the shortcut pulse before destroying/reusing a slot.
+		self.gamepad.set_pressed(0);
+		if self.home_rumble_off_at.is_some() {
+			self.send_rumble(0, 0);
+		}
+	}
+}
+
 async fn run_gamepad_handler(
 	mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
@@ -410,7 +420,7 @@ async fn run_gamepad_handler(
 	// Spawn a timer task that advances gamepads with pending deadlines.
 	let gamepads_timer = gamepads.clone();
 	let timer_wake_for_timer = timer_wake.clone();
-	tokio::task::spawn_local(run_timer_task(gamepads_timer, timer_wake_for_timer));
+	let timer_task = tokio::task::spawn_local(run_timer_task(gamepads_timer, timer_wake_for_timer));
 
 	while let Ok(Some((command, feedback_tx))) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 		match command {
@@ -574,6 +584,12 @@ async fn run_gamepad_handler(
 		}
 	}
 
+	// The timer owns an Arc to every slot; explicitly stop it and drop devices
+	// on session shutdown so reconnect cannot inherit pending input or pulses.
+	timer_task.abort();
+	for slot in gamepads.lock().await.iter_mut() {
+		*slot = None;
+	}
 	tracing::debug!("Input handler stopped.");
 }
 

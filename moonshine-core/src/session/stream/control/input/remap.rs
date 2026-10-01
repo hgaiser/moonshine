@@ -1,183 +1,252 @@
-//! Hold-to-Home button remapping for gamepads.
-//!
-//! When enabled, holding the Back/Select button for a given duration emits the
-//! Home/Guide button instead of Back. A short tap (released before the
-//! threshold) still emits Back.
-//! NOTE: since Back is withheld until either released or the threshold is
-//! reached, you can't hold the Back button.
-//!
-//! The state machine is driven by two paths: `apply()` on every input event,
-//! and `advance()` on a timer when deadlines fire. `source_pressed` is tracked
-//! internally so `advance()` can resolve transitions without stale flags.
+//! Intentional Guide shortcuts, driven by input packets and one-shot deadlines.
+//! Back+Start passes single buttons immediately. Once both are observed, it
+//! releases/consumes both until both are up, even on cancellation. This avoids
+//! synthetic taps and prevents the remaining chord member leaking into gameplay.
+//! A single member already sent before chord recognition cannot be retracted.
 
 use std::time::{Duration, Instant};
 
-use super::gamepad::GamepadConfig;
+use super::gamepad::{GamepadConfig, HomeTrigger};
 
-/// Transition that occurred during the last [`HoldToHome::apply`] or
-/// [`HoldToHome::advance`] call. Used by the caller to react to state changes
-/// (e.g. fire a rumble pulse).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HoldTransition {
-	/// No notable transition.
 	None,
-	/// Home/Guide was just activated (Pending -> HomeHeld).
 	HomeActivated,
 }
 
-/// Moonlight button flags relevant to the remap.
 pub const BACK_FLAG: u32 = 0x0020;
+pub const START_FLAG: u32 = 0x0010;
 pub const SPECIAL_FLAG: u32 = 0x0400;
-
-/// How long the synthesised source-button tap is held when the button is
-/// released before the hold threshold, so games reliably register it.
 const TAP_DURATION: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-	/// Source button not active; nothing pending.
 	Inactive,
-	/// Source button held, waiting to see if it becomes a hold. Source bit is withheld.
-	Pending { deadline: Instant },
-	/// Threshold reached; Home/Guide is being emitted until the source is released.
+	Pending {
+		deadline: Instant,
+	},
 	HomeHeld,
-	/// Source released early; emitting a brief source tap until `release_at`.
-	Tapping { release_at: Instant },
+	/// Chord cancelled/released: consume members until both are up.
+	Draining,
+	/// Legacy short Back tap.
+	Tapping {
+		release_at: Instant,
+	},
 }
 
-/// Per-gamepad remap state machine.
 pub struct HoldToHome {
-	/// Back button mask, or `None` when the remap is disabled.
-	source_mask: Option<u32>,
+	trigger: HomeTrigger,
 	hold: Duration,
 	state: State,
-	/// Whether the source button was last seen pressed. Updated on every `apply()`.
-	source_pressed: bool,
-	/// Whether to drop the physical Home/Guide button from passthrough.
 	suppress_home: bool,
-	/// The last passthrough flags (all buttons except source and optionally Home).
-	/// Stored so `advance()` can reuse them when the timer fires, preserving
-	/// other button state that might not be re-sent by the client.
-	last_passthrough: u32,
+	/// Raw state is retained so *every* timer call preserves all held buttons,
+	/// including calls made only to stop an activation rumble pulse.
+	last_flags: u32,
 }
 
 impl HoldToHome {
 	pub fn new(config: &GamepadConfig) -> Self {
-		// The remap always targets the Back/Select button; a zero hold disables it.
-		let source_mask = (config.home_button.hold_ms != 0).then_some(BACK_FLAG);
-
 		Self {
-			source_mask,
+			trigger: config.home_button.trigger(),
 			hold: Duration::from_millis(config.home_button.hold_ms),
 			state: State::Inactive,
-			source_pressed: false,
 			suppress_home: config.home_button.suppress_home,
-			last_passthrough: 0,
+			last_flags: 0,
 		}
 	}
 
-	/// Process incoming button flags at time `now`, returning the flags that
-	/// should actually be applied to the gamepad and any transition that occurred.
 	pub fn apply(&mut self, flags: u32, now: Instant) -> (u32, HoldTransition) {
-		let source_mask = match self.source_mask {
-			Some(mask) => mask,
-			// Disabled: pass through untouched.
-			None => return (flags, HoldTransition::None),
-		};
-
-		let source_pressed = flags & source_mask != 0;
-		self.source_pressed = source_pressed;
-		// We manage the source bit ourselves; never pass the raw source bit through.
-		// Optionally suppress the physical Home/Guide button too.
-		let passthrough = if self.suppress_home {
-			flags & !source_mask & !SPECIAL_FLAG
+		self.last_flags = flags;
+		let flags = if self.suppress_home {
+			flags & !SPECIAL_FLAG
 		} else {
-			flags & !source_mask
+			flags
 		};
-		self.last_passthrough = passthrough;
-
+		let mask = match self.trigger {
+			HomeTrigger::Disabled => return (flags, HoldTransition::None),
+			HomeTrigger::HoldBack => BACK_FLAG,
+			HomeTrigger::BackStart => BACK_FLAG | START_FLAG,
+		};
+		let pressed = flags & mask == mask;
+		let passthrough = flags & !mask;
+		let mut transition = HoldTransition::None;
 		match self.state {
-			State::Inactive => {
-				if source_pressed {
+			State::Inactive if pressed => {
+				self.state = State::Pending {
+					deadline: now + self.hold,
+				};
+			},
+			State::Pending { deadline } => {
+				if !pressed {
+					self.state = if self.trigger == HomeTrigger::HoldBack {
+						State::Tapping {
+							release_at: now + TAP_DURATION,
+						}
+					} else {
+						State::Draining
+					};
+				} else if now >= deadline {
+					self.state = State::HomeHeld;
+					transition = HoldTransition::HomeActivated;
+				}
+			},
+			State::HomeHeld if !pressed => {
+				self.state = State::Draining;
+			},
+			State::Tapping { release_at } => {
+				if pressed {
+					// A new press starts a new hold, rather than getting lost in a tap.
 					self.state = State::Pending {
 						deadline: now + self.hold,
 					};
-				}
-				(passthrough, HoldTransition::None)
-			},
-			State::Pending { deadline } => {
-				if !source_pressed {
-					// Released before the threshold: emit a brief source tap.
-					self.state = State::Tapping {
-						release_at: now + TAP_DURATION,
-					};
-					(passthrough | source_mask, HoldTransition::None)
-				} else if now >= deadline {
-					// Home stays pressed as long as Back is held.
-					self.state = State::HomeHeld;
-					(passthrough | SPECIAL_FLAG, HoldTransition::HomeActivated)
-				} else {
-					(passthrough, HoldTransition::None)
-				}
-			},
-			State::HomeHeld => {
-				if source_pressed {
-					(passthrough | SPECIAL_FLAG, HoldTransition::None)
-				} else {
+				} else if now >= release_at {
 					self.state = State::Inactive;
-					(passthrough, HoldTransition::None)
 				}
 			},
-			State::Tapping { release_at } => {
-				if now >= release_at {
-					self.state = State::Inactive;
-					(passthrough, HoldTransition::None)
-				} else {
-					// Keep the tap held until release_at, regardless of further input.
-					(passthrough | source_mask, HoldTransition::None)
-				}
-			},
+			_ => {},
 		}
-	}
-
-	/// Advance the state machine using internally tracked button state. Called
-	/// by the timer task when a deadline fires. Returns the flags to apply and
-	/// any transition that occurred.
-	pub fn advance(&mut self, now: Instant) -> (u32, HoldTransition) {
-		let source_mask = match self.source_mask {
-			Some(mask) => mask,
-			None => return (0, HoldTransition::None),
+		if self.state == State::Draining && flags & mask == 0 {
+			self.state = State::Inactive;
+		}
+		let output = match self.state {
+			State::Inactive if self.trigger == HomeTrigger::BackStart => flags,
+			State::HomeHeld => passthrough | SPECIAL_FLAG,
+			State::Tapping { .. } => passthrough | BACK_FLAG,
+			_ => passthrough,
 		};
-
-		let passthrough = self.last_passthrough;
-		match self.state {
-			State::Pending { deadline } => {
-				if now >= deadline && self.source_pressed {
-					self.state = State::HomeHeld;
-					(passthrough | SPECIAL_FLAG, HoldTransition::HomeActivated)
-				} else {
-					(0, HoldTransition::None)
-				}
-			},
-			State::Tapping { release_at } => {
-				if now >= release_at {
-					self.state = State::Inactive;
-					(passthrough, HoldTransition::None)
-				} else {
-					(passthrough | source_mask, HoldTransition::None)
-				}
-			},
-			_ => (0, HoldTransition::None),
-		}
+		(output, transition)
 	}
 
-	/// The next time at which `advance()` should be called, or `None` if
-	/// nothing is pending.
+	pub fn advance(&mut self, now: Instant) -> (u32, HoldTransition) {
+		self.apply(self.last_flags, now)
+	}
+
 	pub fn next_deadline(&self) -> Option<Instant> {
 		match self.state {
 			State::Pending { deadline } => Some(deadline),
 			State::Tapping { release_at } => Some(release_at),
-			State::Inactive | State::HomeHeld => None,
+			_ => None,
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn config(trigger: HomeTrigger) -> GamepadConfig {
+		let mut config = GamepadConfig::default();
+		config.home_button.trigger = Some(trigger);
+		config.home_button.hold_ms = 750;
+		config
+	}
+
+	#[test]
+	fn plain_buttons_are_immediate_and_stay_held_on_timers() {
+		let now = Instant::now();
+		for trigger in [HomeTrigger::Disabled, HomeTrigger::BackStart] {
+			for button in [BACK_FLAG, START_FLAG] {
+				let mut remap = HoldToHome::new(&config(trigger));
+				assert_eq!(remap.apply(button, now).0, button);
+				assert!(remap.next_deadline().is_none());
+				assert_eq!(remap.advance(now + Duration::from_secs(10)).0, button);
+				assert_eq!(remap.apply(0, now).0, 0);
+				assert_eq!(remap.advance(now).0, 0);
+			}
+		}
+	}
+
+	#[test]
+	fn chord_activation_release_and_cancellation_preserve_other_buttons() {
+		let now = Instant::now();
+		let deadline = now + Duration::from_millis(750);
+		for extra in [0, 0x1000, 0x10000, 0x20000, 0x40000, 0x80000, 0x3f1000] {
+			for first in [0, BACK_FLAG, START_FLAG] {
+				for release in [0, BACK_FLAG, START_FLAG] {
+					for activate_on_timer in [false, true] {
+						let mut r = HoldToHome::new(&config(HomeTrigger::BackStart));
+						assert_eq!(r.apply(first | extra, now).0, first | extra);
+						assert_eq!(r.apply(BACK_FLAG | START_FLAG | extra, now).0, extra);
+						let output = if activate_on_timer {
+							r.advance(deadline)
+						} else {
+							r.apply(BACK_FLAG | START_FLAG | extra, deadline)
+						};
+						assert_eq!(output, (extra | SPECIAL_FLAG, HoldTransition::HomeActivated));
+						assert_eq!(
+							r.advance(deadline + TAP_DURATION),
+							(extra | SPECIAL_FLAG, HoldTransition::None)
+						);
+						assert_eq!(r.apply(release | extra, deadline).0, extra);
+						assert!(r.next_deadline().is_none());
+						assert_eq!(r.apply(0, deadline).0, 0);
+						assert_eq!(r.apply(BACK_FLAG, deadline).0, BACK_FLAG);
+					}
+					let mut r = HoldToHome::new(&config(HomeTrigger::BackStart));
+					r.apply(BACK_FLAG | START_FLAG | extra, now);
+					assert_eq!(r.apply(release | extra, now + TAP_DURATION).0, extra);
+					assert_eq!(r.advance(deadline).0, extra);
+					assert!(r.next_deadline().is_none());
+					assert_eq!(r.apply(0, deadline).0, 0);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn physical_guide_suppression_is_independent_of_synthetic_policy() {
+		let now = Instant::now();
+		for trigger in [HomeTrigger::Disabled, HomeTrigger::HoldBack, HomeTrigger::BackStart] {
+			for suppress in [false, true] {
+				let mut c = config(trigger);
+				c.home_button.suppress_home = suppress;
+				let mut r = HoldToHome::new(&c);
+				let physical = if suppress { 0 } else { SPECIAL_FLAG };
+				assert_eq!(r.apply(SPECIAL_FLAG, now).0, physical);
+				assert_eq!(r.advance(now).0, physical);
+				assert_eq!(r.apply(0, now).0, 0);
+			}
+		}
+	}
+
+	#[test]
+	fn legacy_tap_and_hold_keep_deadlines_and_held_flags() {
+		let now = Instant::now();
+		let mut r = HoldToHome::new(&config(HomeTrigger::HoldBack));
+		assert_eq!(r.apply(BACK_FLAG | 0x1000, now).0, 0x1000);
+		assert_eq!(r.apply(0x1000, now + TAP_DURATION).0, BACK_FLAG | 0x1000);
+		assert_eq!(r.advance(now + TAP_DURATION * 2).0, 0x1000);
+		r.apply(BACK_FLAG | 0x1000, now);
+		assert_eq!(
+			r.advance(now + Duration::from_millis(750)).1,
+			HoldTransition::HomeActivated
+		);
+		assert_eq!(r.advance(now + Duration::from_secs(1)).0, SPECIAL_FLAG | 0x1000);
+		assert_eq!(r.apply(0, now).0, 0);
+	}
+
+	#[test]
+	fn independent_slots_drop_pending_and_active_state_on_reconnect() {
+		let now = Instant::now();
+		let c = config(HomeTrigger::BackStart);
+		let mut slots: [Option<HoldToHome>; 16] = std::array::from_fn(|_| None);
+		for idx in [0, 15] {
+			slots[idx] = Some(HoldToHome::new(&c));
+		}
+		slots[0].as_mut().unwrap().apply(BACK_FLAG | START_FLAG, now);
+		assert_eq!(slots[15].as_mut().unwrap().apply(BACK_FLAG, now).0, BACK_FLAG);
+		// Active-mask removal drops the slot, as does handler teardown.
+		slots[0] = None;
+		slots[0] = Some(HoldToHome::new(&c));
+		assert!(slots[0].as_ref().unwrap().next_deadline().is_none());
+		assert_eq!(slots[0].as_mut().unwrap().advance(now).0, 0);
+		slots[0].as_mut().unwrap().apply(BACK_FLAG | START_FLAG, now);
+		slots[0].as_mut().unwrap().advance(now + Duration::from_secs(1));
+		slots[0] = Some(HoldToHome::new(&c));
+		assert_eq!(slots[0].as_mut().unwrap().apply(BACK_FLAG, now).0, BACK_FLAG);
+		assert_eq!(
+			slots[15].as_mut().unwrap().advance(now + Duration::from_secs(1)).0,
+			BACK_FLAG
+		);
 	}
 }

@@ -119,6 +119,7 @@ pub unsafe extern "C" fn create_wayland_surface(
 					xcb_window: None,
 					xcb_connection: std::ptr::null_mut(),
 					fallback_surface: VkSurface::null(),
+					bypass_watch: None,
 					native: Some(native),
 				},
 			);
@@ -168,6 +169,26 @@ pub unsafe extern "C" fn create_xcb_surface(
 			// (launchers, Wine offscreen/GDI-blit windows, child windows, ...).
 			let fallback_surface = create_plain_xcb_surface(instance_key, instance, p_create_info, p_allocator);
 
+			if fallback_surface.is_null() {
+				// A managed bypass must always have a usable fallback. Never hand
+				// out a replacement that can become an unmapped black surface.
+				with_instance(instance_key, |data| {
+					if let Some(destroy) = data.dispatch.destroy_surface {
+						destroy(instance, *p_surface, p_allocator);
+					}
+				});
+				wl_surface.destroy();
+				*p_surface = VkSurface::null();
+				return VK_ERROR_INITIALIZATION_FAILED;
+			}
+			let bypass_watch = crate::xcb::BypassWatch::new(create_info.connection, create_info.window)
+				.map(|w| std::sync::Arc::new(std::sync::Mutex::new(w)));
+			if bypass_watch.is_none() {
+				crate::log_debug!(
+					"XWayland bypass rejected: X11 topology/event monitoring unavailable (window={})",
+					create_info.window
+				);
+			}
 			insert_surface(
 				SurfaceKey::from_raw((*p_surface).as_raw()),
 				SurfaceData {
@@ -175,6 +196,7 @@ pub unsafe extern "C" fn create_xcb_surface(
 					xcb_window: Some(create_info.window),
 					xcb_connection: create_info.connection,
 					fallback_surface,
+					bypass_watch,
 					native: None,
 				},
 			);
@@ -237,12 +259,12 @@ pub(crate) unsafe fn icd_fallback_surface(surface: VkSurface) -> Option<VkSurfac
 	unsafe {
 		let key = SurfaceKey::from_raw(surface.as_raw());
 		let fallback = with_surface(key, |sd| sd.fallback_surface)?;
-		if fallback.is_null() || can_bypass_xwayland(key) {
-			None
-		} else {
-			Some(fallback)
-		}
+		fallback_for_policy(fallback, can_bypass_xwayland(key))
 	}
+}
+
+fn fallback_for_policy(fallback: VkSurface, bypass_safe: bool) -> Option<VkSurface> {
+	(!fallback.is_null() && !bypass_safe).then_some(fallback)
 }
 
 /// Convert a libX11 `Display*` to an `xcb_connection_t*` using
@@ -922,6 +944,16 @@ unsafe fn try_xwayland_bypass(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn unsafe_policy_selects_plain_xcb_surface() {
+		let xcb = VkSurface::from_raw(0x1234);
+		assert_eq!(fallback_for_policy(xcb, false), Some(xcb));
+		assert_eq!(fallback_for_policy(xcb, true), None);
+		// Native/unmanaged surfaces have no replacement to select.
+		assert_eq!(fallback_for_policy(VkSurface::null(), true), None);
+		assert_eq!(fallback_for_policy(VkSurface::null(), false), None);
+	}
 
 	#[test]
 	fn ext_name_roundtrip() {

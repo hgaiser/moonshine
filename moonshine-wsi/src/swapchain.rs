@@ -23,8 +23,8 @@ use crate::state::{
 };
 use crate::surface::icd_fallback_surface;
 use crate::xcb::{
-	XCB_ATOM_WM_CLASS, xcb_get_largest_obscuring_child, xcb_get_toplevel_window, xcb_get_window_attributes,
-	xcb_get_window_property_u32, xcb_get_window_rect, xcb_query_tree_window, xcb_window_has_property,
+	XCB_ATOM_WM_CLASS, xcb_get_largest_obscuring_child, xcb_get_window_attributes, xcb_get_window_property_u32,
+	xcb_get_window_rect, xcb_query_tree_window, xcb_window_has_property,
 };
 
 pub unsafe extern "C" fn create_swapchain(
@@ -56,7 +56,6 @@ pub unsafe extern "C" fn create_swapchain(
 			.and_then(get_wayland_connection)
 			.map(|arc| arc.force_lock().caps.hdr_supported)
 			.unwrap_or(false);
-		let need_remap = layer_hdr_active && app_color_space != ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
 
 		// Compute surface_key early for bypass checks.
 		let surface_key = SurfaceKey::from_raw(create_info.surface.as_raw());
@@ -65,7 +64,9 @@ pub unsafe extern "C" fn create_swapchain(
 		// is not, present through the plain XCB fallback surface rather than the
 		// un-mapped Wayland bypass surface.
 		let fallback_surface = icd_fallback_surface(create_info.surface);
-		let bypass_allowed = fallback_surface.is_none() && can_bypass_xwayland(surface_key);
+		let bypass_allowed = fallback_surface.is_none() && with_surface(surface_key, |_| ()).is_some();
+		let need_remap =
+			layer_hdr_active && bypass_allowed && app_color_space != ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
 		let icd_surface = fallback_surface.unwrap_or(create_info.surface);
 		let need_surface_patch = icd_surface.as_raw() != create_info.surface.as_raw();
 
@@ -117,6 +118,17 @@ pub unsafe extern "C" fn create_swapchain(
 		mode_info.p_next = create_info.p_next;
 		let mut patched_create_info = *create_info;
 		patched_create_info.surface = icd_surface;
+		if !create_info.old_swapchain.is_null()
+			&& with_swapchain(SwapchainKey::from_raw(create_info.old_swapchain.as_raw()), |s| {
+				s.is_bypassing_xwayland
+			})
+			.is_some_and(|old_bypass| old_bypass != bypass_allowed)
+		{
+			// oldSwapchain must belong to the same ICD surface. The application
+			// still owns/destroys its old handle after this independent creation.
+			retire_swapchain(SwapchainKey::from_raw(create_info.old_swapchain.as_raw()));
+			patched_create_info.old_swapchain = VkSwapchain::null();
+		}
 		patched_create_info.present_mode = effective_mode;
 		if need_remap {
 			patched_create_info.image_color_space = ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
@@ -307,6 +319,24 @@ pub unsafe extern "C" fn create_swapchain(
 	}
 }
 
+/// Permanently invalidate an unsafe chain and unmap its replacement. Even if
+/// topology becomes safe again before recreation, its override is now gone.
+fn retire_swapchain(key: SwapchainKey) {
+	let retired = with_swapchain_mut(key, |sd| {
+		sd.retired = true;
+		(sd.ms_swapchain.take(), sd.device_key, sd._surface)
+	});
+	if let Some((Some(ms), device_key, surface)) = retired {
+		ms.destroy();
+		let native = with_surface(SurfaceKey::from_raw(surface.as_raw()), |s| s.native.clone()).flatten();
+		if let Some(native) = native {
+			native.connection.force_lock().flush();
+		} else if let Some(arc) = with_device(device_key, |d| d.instance_key).and_then(get_wayland_connection) {
+			arc.force_lock().flush();
+		}
+	}
+}
+
 pub unsafe extern "C" fn destroy_swapchain(
 	device: VkDevice,
 	swapchain: VkSwapchain,
@@ -315,9 +345,20 @@ pub unsafe extern "C" fn destroy_swapchain(
 	unsafe {
 		crate::log_debug!("vkDestroySwapchainKHR");
 
-		// Drop the SwapchainData first; this Drops the MoonshineSwapchain proxy
-		// which sends the destructor to the compositor.
-		remove_swapchain(SwapchainKey::from_raw(swapchain.as_raw()));
+		// Send the protocol destructor explicitly; dropping a client proxy alone
+		// does not remove the compositor's replacement binding.
+		if let Some(data) = remove_swapchain(SwapchainKey::from_raw(swapchain.as_raw())) {
+			if let Some(ms) = data.ms_swapchain {
+				ms.destroy();
+			}
+			let native = with_surface(SurfaceKey::from_raw(data._surface.as_raw()), |s| s.native.clone()).flatten();
+			if let Some(native) = native {
+				native.connection.force_lock().flush();
+			} else if let Some(arc) = with_device(data.device_key, |d| d.instance_key).and_then(get_wayland_connection)
+			{
+				arc.force_lock().flush();
+			}
+		}
 
 		let device_key = device_key_of(device);
 		with_device(device_key, |data| {
@@ -548,34 +589,32 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 		// bypass is no longer safe, SUBOPTIMAL when it becomes safe again.
 		for (i, sw) in swapchains.iter().enumerate() {
 			let sw_key = SwapchainKey::from_raw(sw.as_raw());
-			let was_bypassing = with_swapchain(sw_key, |sd| sd.is_bypassing_xwayland).unwrap_or(false);
+			let (was_bypassing, retired) =
+				with_swapchain(sw_key, |sd| (sd.is_bypassing_xwayland, sd.retired)).unwrap_or((false, false));
 
 			let Some(surface) = with_swapchain(sw_key, |sd| sd._surface) else {
 				continue;
 			};
 
 			let now_allowed = can_bypass_xwayland(SurfaceKey::from_raw(surface.as_raw()));
-			if now_allowed == was_bypassing {
+			let Some(transition) = bypass_transition(was_bypassing, now_allowed, retired) else {
 				continue;
+			};
+			if transition == VK_ERROR_OUT_OF_DATE_KHR {
+				retire_swapchain(sw_key);
 			}
-
-			with_swapchain_mut(sw_key, |sd| sd.is_bypassing_xwayland = now_allowed);
+			// Do not replace an ICD failure with a policy hint.
+			if result < ash::vk::Result::SUCCESS {
+				return result;
+			}
 			if !present_info.p_results.is_null() {
 				let results =
 					std::slice::from_raw_parts_mut(present_info.p_results, present_info.swapchain_count as usize);
 				if results[i] >= ash::vk::Result::SUCCESS {
-					results[i] = if now_allowed {
-						VK_SUBOPTIMAL_KHR
-					} else {
-						VK_ERROR_OUT_OF_DATE_KHR
-					};
+					results[i] = transition;
 				}
 			}
-			return if now_allowed {
-				VK_SUBOPTIMAL_KHR
-			} else {
-				VK_ERROR_OUT_OF_DATE_KHR
-			};
+			return transition;
 		}
 
 		result
@@ -586,89 +625,137 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 // XWayland bypass safety checks
 // ---------------------------------------------------------------------------
 
-/// Check whether it is safe to bypass XWayland for the given surface.
-///
-/// Returns `true` only when the X11 child window is the toplevel, its geometry
-/// matches the toplevel, and no obscuring child covers the window.
-pub(crate) unsafe fn can_bypass_xwayland(surface_key: SurfaceKey) -> bool {
+/// A rejection reason is cached with the surface and logged on policy changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BypassReject {
+	WineNoFlip,
+	WineOffscreen,
+	Size,
+	Position,
+	Obscuring,
+	Unavailable,
+}
+
+impl BypassReject {
+	pub(crate) fn message(self) -> &'static str {
+		match self {
+			Self::WineNoFlip => "_WINE_ALLOW_FLIP=0",
+			Self::WineOffscreen => "Wine offscreen presentation parent",
+			Self::Size => "geometry size mismatch",
+			Self::Position => "geometry position mismatch",
+			Self::Obscuring => "obscuring child",
+			Self::Unavailable => "X11 topology/event monitoring unavailable",
+		}
+	}
+}
+
+type WindowRect = (i32, i32, u32, u32);
+
+/// All negative safety conditions precede the positive top-level shortcut.
+fn bypass_policy(
+	allow_flip: Option<u32>,
+	offscreen_parent: bool,
+	is_toplevel: bool,
+	child: WindowRect,
+	top: WindowRect,
+	obscuring: bool,
+) -> Result<(), BypassReject> {
+	if allow_flip == Some(0) {
+		return Err(BypassReject::WineNoFlip);
+	}
+	if offscreen_parent {
+		return Err(BypassReject::WineOffscreen);
+	}
+	if obscuring {
+		return Err(BypassReject::Obscuring);
+	}
+	if is_toplevel {
+		return Ok(());
+	}
+	if child.2.abs_diff(top.2) > 2 || child.3.abs_diff(top.3) > 2 {
+		return Err(BypassReject::Size);
+	}
+	if child.0.abs_diff(top.0) > 1 || child.1.abs_diff(top.1) > 1 {
+		return Err(BypassReject::Position);
+	}
+	Ok(())
+}
+
+/// Queries run only at surface setup or after an X11 change event, never on
+/// every frame. Wine flags and dummy topology apply even to a top-level XID.
+pub(crate) unsafe fn query_bypass_policy(connection: *mut libc::c_void, window: u32) -> Result<(), BypassReject> {
 	unsafe {
-		// Native Wayland surfaces always present through the compositor.
-		if with_surface(surface_key, |s| s.native.is_some()).unwrap_or(false) {
-			return true;
+		let allow_flip = xcb_get_window_property_u32(connection, window, "_WINE_ALLOW_FLIP");
+		if allow_flip == Some(0) {
+			return Err(BypassReject::WineNoFlip);
 		}
-
-		let (xcb_connection, xcb_window) = match with_surface(surface_key, |s| (s.xcb_connection, s.xcb_window)) {
-			Some(v) => v,
-			None => return false,
+		let (root, parent, _) = xcb_query_tree_window(connection, window).ok_or(BypassReject::Unavailable)?;
+		let offscreen_parent = if parent != root && parent != 0 {
+			let rect = xcb_get_window_rect(connection, parent).ok_or(BypassReject::Unavailable)?;
+			let (_, redirect) = xcb_get_window_attributes(connection, parent).ok_or(BypassReject::Unavailable)?;
+			rect.2 == 1 && rect.3 == 1 && redirect && !xcb_window_has_property(connection, parent, XCB_ATOM_WM_CLASS)
+		} else {
+			false
 		};
-		if xcb_connection.is_null() {
-			return false;
+		if offscreen_parent {
+			return Err(BypassReject::WineOffscreen);
 		}
-		let xcb_window = match xcb_window {
-			Some(w) => w,
-			None => return false,
-		};
-
-		let (child_x, child_y, child_w, child_h) = match xcb_get_window_rect(xcb_connection, xcb_window) {
-			Some(v) => v,
-			None => return false,
-		};
-
-		let toplevel = match xcb_get_toplevel_window(xcb_connection, xcb_window) {
-			Some(v) => v,
-			None => return false,
-		};
-
-		if xcb_window == toplevel {
-			return true;
-		}
-
-		let (top_x, top_y, top_w, top_h) = match xcb_get_window_rect(xcb_connection, toplevel) {
-			Some(v) => v,
-			None => return false,
-		};
-
-		// Size mismatch > 2px means the child is not filling the toplevel.
-		if (child_w as i32 - top_w as i32).abs() > 2 || (child_h as i32 - top_h as i32).abs() > 2 {
-			return false;
-		}
-
-		// Position mismatch > 1px means the child is offset from the toplevel.
-		if (child_x as i32 - top_x as i32).abs() > 1 || (child_y as i32 - top_y as i32).abs() > 1 {
-			return false;
-		}
-
-		// If a viewable child covers more than 1×1, skip bypass.
-		if let Some(Some((ow, oh))) = xcb_get_largest_obscuring_child(xcb_connection, toplevel)
-			&& ow > 1 && oh > 1
-		{
-			return false;
-		}
-
-		// Never bypass windows Wine presents offscreen to GDI-blit onto the
-		// real toplevel: marked with `_WINE_ALLOW_FLIP=0`, or parked under
-		// Wine's unnamed 1×1 override-redirect dummy window.  Those blits can
-		// only carry SDR, and the bypass `wl_surface` is never mapped, so the
-		// window would stay blank.
-		if let Some(allow_flip) = xcb_get_window_property_u32(xcb_connection, xcb_window, "_WINE_ALLOW_FLIP") {
-			if allow_flip == 0 {
-				return false;
+		let (_, _, width, height) = xcb_get_window_rect(connection, window).ok_or(BypassReject::Unavailable)?;
+		let mut offset = (0i32, 0i32);
+		let mut current = window;
+		let mut content_child = None;
+		let mut visited = std::collections::HashSet::new();
+		let (toplevel, top_width, top_height) = loop {
+			if !visited.insert(current) {
+				return Err(BypassReject::Unavailable);
 			}
-		} else if let Some((root, parent, _children)) = xcb_query_tree_window(xcb_connection, xcb_window)
-			&& parent != root
-		{
-			let parent_rect = xcb_get_window_rect(xcb_connection, parent);
-			let parent_attrs = xcb_get_window_attributes(xcb_connection, parent);
-			if let (Some((_, _, pw, ph)), Some((_, override_redirect))) = (parent_rect, parent_attrs)
-				&& pw == 1 && ph == 1
-				&& override_redirect
-				&& !xcb_window_has_property(xcb_connection, parent, XCB_ATOM_WM_CLASS)
-			{
-				return false;
+			let (x, y, w, h) = xcb_get_window_rect(connection, current).ok_or(BypassReject::Unavailable)?;
+			let obscuring = xcb_get_largest_obscuring_child(connection, current, content_child)
+				.ok_or(BypassReject::Unavailable)?
+				.is_some_and(|(w, h)| w > 1 && h > 1);
+			if obscuring {
+				return Err(BypassReject::Obscuring);
 			}
-		}
+			let (root, parent, _) = xcb_query_tree_window(connection, current).ok_or(BypassReject::Unavailable)?;
+			if parent == root || parent == 0 {
+				break (current, w, h);
+			}
+			// Sum child-relative offsets up to (but not including) the top-level.
+			offset.0 += i32::from(x);
+			offset.1 += i32::from(y);
+			content_child = Some(current);
+			current = parent;
+		};
+		bypass_policy(
+			allow_flip,
+			offscreen_parent,
+			window == toplevel,
+			(offset.0, offset.1, width, height),
+			(0, 0, top_width, top_height),
+			false,
+		)
+	}
+}
 
-		true
+pub(crate) unsafe fn can_bypass_xwayland(surface_key: SurfaceKey) -> bool {
+	let data = with_surface(surface_key, |s| (s.native.is_some(), s.bypass_watch.clone()));
+	match data {
+		Some((true, _)) => true,
+		Some((false, Some(watch))) => watch.force_lock().allowed(),
+		_ => false,
+	}
+}
+
+/// Actual presentation path is immutable for a swapchain. Unsafe bypass keeps
+/// reporting OUT_OF_DATE until replaced; never mark a Wayland chain as XCB.
+fn bypass_transition(was_bypassing: bool, now_allowed: bool, retired: bool) -> Option<VkResult> {
+	if retired {
+		return Some(VK_ERROR_OUT_OF_DATE_KHR);
+	}
+	match (was_bypassing, now_allowed) {
+		(true, false) => Some(VK_ERROR_OUT_OF_DATE_KHR),
+		(false, true) => Some(VK_SUBOPTIMAL_KHR),
+		_ => None,
 	}
 }
 
@@ -888,6 +975,65 @@ pub unsafe extern "C" fn get_past_presentation_timing(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn wine_safety_precedes_top_level_acceptance() {
+		let rect = (0, 0, 1920, 1080);
+		assert_eq!(
+			bypass_policy(Some(0), false, true, rect, rect, false),
+			Err(BypassReject::WineNoFlip)
+		);
+		assert_eq!(bypass_policy(Some(1), false, true, rect, rect, false), Ok(()));
+		assert_eq!(bypass_policy(None, false, true, rect, rect, false), Ok(()));
+		for flag in [None, Some(0), Some(1)] {
+			assert!(bypass_policy(flag, true, true, rect, rect, false).is_err());
+		}
+		assert_eq!(
+			bypass_policy(None, false, true, rect, rect, true),
+			Err(BypassReject::Obscuring)
+		);
+	}
+
+	#[test]
+	fn child_geometry_tolerances_and_obscuring_are_preserved() {
+		let top = (0, 0, 1920, 1080);
+		assert_eq!(
+			bypass_policy(None, false, false, (1, -1, 1918, 1082), top, false),
+			Ok(())
+		);
+		assert_eq!(
+			bypass_policy(None, false, false, (0, 0, 1917, 1080), top, false),
+			Err(BypassReject::Size)
+		);
+		assert_eq!(
+			bypass_policy(None, false, false, (0, 0, 1920, 1083), top, false),
+			Err(BypassReject::Size)
+		);
+		assert_eq!(
+			bypass_policy(None, false, false, (2, 0, 1920, 1080), top, false),
+			Err(BypassReject::Position)
+		);
+		assert_eq!(
+			bypass_policy(None, false, false, (0, -2, 1920, 1080), top, false),
+			Err(BypassReject::Position)
+		);
+		assert_eq!(
+			bypass_policy(None, false, false, top, top, true),
+			Err(BypassReject::Obscuring)
+		);
+	}
+
+	#[test]
+	fn actual_swapchain_path_remains_fixed_until_recreation() {
+		assert_eq!(bypass_transition(true, true, false), None);
+		assert_eq!(bypass_transition(false, false, false), None);
+		assert_eq!(bypass_transition(true, true, true), Some(VK_ERROR_OUT_OF_DATE_KHR));
+		// Repeated presents cannot "convert" the old ICD swapchain by changing a flag.
+		for _ in 0..3 {
+			assert_eq!(bypass_transition(true, false, false), Some(VK_ERROR_OUT_OF_DATE_KHR));
+			assert_eq!(bypass_transition(false, true, false), Some(VK_SUBOPTIMAL_KHR));
+		}
+	}
 
 	#[test]
 	fn color_xy_zero() {

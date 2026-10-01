@@ -120,10 +120,61 @@ fn handle_swapchain_feedback(
 	(refresh_hi, refresh_lo)
 }
 
-/// Common override_window_content handling.
-fn handle_override_window_content(state: &mut MoonshineCompositor, surface: &WlSurface, x11_window: u32) {
+/// The latest protocol object to claim a surface replacement.
+#[derive(Default)]
+struct OverrideOwner(std::sync::Mutex<Option<smithay::reexports::wayland_server::backend::ObjectId>>);
+
+impl OverrideOwner {
+	fn claim(&self, owner: smithay::reexports::wayland_server::backend::ObjectId) {
+		*self.0.lock().unwrap() = Some(owner);
+	}
+	fn release(&self, owner: &smithay::reexports::wayland_server::backend::ObjectId) -> bool {
+		let mut stored = self.0.lock().unwrap();
+		if stored.as_ref() != Some(owner) {
+			return false;
+		}
+		*stored = None;
+		true
+	}
+}
+
+fn handle_override_window_content(
+	state: &mut MoonshineCompositor,
+	surface: &WlSurface,
+	x11_window: u32,
+	owner: smithay::reexports::wayland_server::backend::ObjectId,
+) {
+	smithay::wayland::compositor::with_states(surface, |states| {
+		states.data_map.insert_if_missing(OverrideOwner::default);
+		states.data_map.get::<OverrideOwner>().unwrap().claim(owner);
+	});
 	tracing::debug!(x11_window, "override_window_content");
 	state.override_window_surface(x11_window, surface.clone());
+}
+
+/// A Vulkan surface survives swapchain recreation. Destroying the old protocol
+/// object must remove its override, but cannot remove a newer chain's mapping.
+fn release_override(
+	state: &mut MoonshineCompositor,
+	surface: &WlSurface,
+	owner: smithay::reexports::wayland_server::backend::ObjectId,
+) {
+	let owns_override = smithay::wayland::compositor::with_states(surface, |states| {
+		let Some(stored) = states.data_map.get::<OverrideOwner>() else {
+			return false;
+		};
+		stored.release(&owner)
+	});
+	if owns_override && state.override_surface.as_ref().is_some_and(|(s, _)| s == surface) {
+		tracing::debug!("swapchain override released; restoring XWayland scene");
+		state.override_surface = None;
+		state.override_reported_window = 0;
+		if let Some(cm) = &mut state.color_management {
+			cm.clear_gamescope_current(surface);
+		}
+		state.damage_tracker = smithay::backend::renderer::damage::OutputDamageTracker::from_output(&state.output);
+		state.screen_dirty = true;
+	}
 }
 
 /// Common set_hdr_metadata handling.
@@ -268,7 +319,7 @@ macro_rules! dispatch_swapchain {
 				$xwayland_field: _,
 				x11_window,
 			} => {
-				handle_override_window_content($state, &$data.surface, x11_window);
+				handle_override_window_content($state, &$data.surface, x11_window, $resource.id());
 			},
 			req_mod::Request::SetHdrMetadata {
 				display_primary_red_x,
@@ -301,9 +352,8 @@ macro_rules! dispatch_swapchain {
 					max_fall,
 				);
 			},
-			req_mod::Request::SetPresentMode { .. }
-			| req_mod::Request::SetPresentTime { .. }
-			| req_mod::Request::Destroy => {},
+			req_mod::Request::Destroy => release_override($state, &$data.surface, $resource.id()),
+			req_mod::Request::SetPresentMode { .. } | req_mod::Request::SetPresentTime { .. } => {},
 		}
 	}};
 }
@@ -414,4 +464,46 @@ pub(crate) fn register_moonshine_globals(display: &DisplayHandle) {
 /// this global and we must not advertise it on SDR sessions.
 pub(crate) fn register_gamescope_globals(display: &DisplayHandle) {
 	display.create_global::<MoonshineCompositor, GamescopeSwapchainFactoryV2, _>(1, ());
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use smithay::reexports::wayland_server::Display;
+	use std::os::unix::net::UnixStream;
+
+	struct TestState;
+	impl Dispatch<WlSurface, ()> for TestState {
+		fn request(
+			_: &mut Self,
+			_: &Client,
+			_: &WlSurface,
+			_: <WlSurface as Resource>::Request,
+			_: &(),
+			_: &DisplayHandle,
+			_: &mut DataInit<'_, Self>,
+		) {
+		}
+	}
+
+	#[test]
+	fn old_swapchain_destruction_cannot_clear_new_override() {
+		// Resource identities exercise protocol ownership without a GPU compositor.
+		let display = Display::<TestState>::new().unwrap();
+		let mut handle = display.handle();
+		let (server, _peer) = UnixStream::pair().unwrap();
+		let client = handle.insert_client(server, std::sync::Arc::new(())).unwrap();
+		let old = client
+			.create_resource::<WlSurface, (), TestState>(&handle, 6, ())
+			.unwrap();
+		let new = client
+			.create_resource::<WlSurface, (), TestState>(&handle, 6, ())
+			.unwrap();
+		let owner = OverrideOwner::default();
+		owner.claim(old.id());
+		owner.claim(new.id());
+		assert!(!owner.release(&old.id()));
+		assert!(owner.release(&new.id()));
+		assert!(!owner.release(&new.id()));
+	}
 }

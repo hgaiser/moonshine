@@ -169,7 +169,8 @@ struct XcbQueryTreeReply {
 	length: u32,
 	root: u32,
 	parent: u32,
-	children_len: u32,
+	children_len: u16,
+	pad: [u8; 14],
 }
 
 type FnXcbQueryTree = unsafe extern "C" fn(*mut libc::c_void, u32) -> XcbQueryTreeCookie;
@@ -337,24 +338,10 @@ pub(crate) unsafe fn xcb_query_tree_window(connection: *mut libc::c_void, window
 
 		let root = (*reply).root;
 		let parent = (*reply).parent;
-		let children_len = (*reply).children_len;
+		let children_len = u32::from((*reply).children_len);
 		libc::free(reply as *mut libc::c_void);
 
 		Some((root, parent, children_len))
-	}
-}
-
-/// Walk up the X11 parent chain via `xcb_query_tree` until we reach the root.
-pub(crate) unsafe fn xcb_get_toplevel_window(connection: *mut libc::c_void, window: u32) -> Option<u32> {
-	unsafe {
-		let mut current = window;
-		loop {
-			let (root, parent, _children_len) = xcb_query_tree_window(connection, current)?;
-			if parent == root || parent == 0 {
-				return Some(current);
-			}
-			current = parent;
-		}
 	}
 }
 
@@ -382,10 +369,12 @@ pub(crate) unsafe fn xcb_get_window_attributes(connection: *mut libc::c_void, wi
 	}
 }
 
-/// Check if any child window of `window` is VIEWABLE and larger than 1×1.
+/// Find visible obstructions, excluding the rendering branch. Child coordinates
+/// are parent-relative; clip to the parent before assessing coverage.
 pub(crate) unsafe fn xcb_get_largest_obscuring_child(
 	connection: *mut libc::c_void,
 	window: u32,
+	content_child: Option<u32>,
 ) -> Option<Option<(u32, u32)>> {
 	unsafe {
 		use std::sync::OnceLock;
@@ -419,13 +408,13 @@ pub(crate) unsafe fn xcb_get_largest_obscuring_child(
 			return None;
 		}
 
-		let children_len = (*reply).children_len;
+		let children_len = u32::from((*reply).children_len);
 		let parent_rect = xcb_get_window_rect(connection, window);
 		if parent_rect.is_none() {
 			libc::free(reply as *mut libc::c_void);
 			return None;
 		}
-		let (px, py, pw, ph) = parent_rect.unwrap();
+		let (_, _, pw, ph) = parent_rect.unwrap();
 
 		let mut max_w: u32 = 0;
 		let mut max_h: u32 = 0;
@@ -434,17 +423,18 @@ pub(crate) unsafe fn xcb_get_largest_obscuring_child(
 			let children = (reply as *const u32).add(std::mem::size_of::<XcbQueryTreeReply>() / 4);
 			for i in 0..children_len as isize {
 				let child = *children.add(i as usize);
+				// The rendering window's ancestor is content, not an obstruction.
+				if Some(child) == content_child {
+					continue;
+				}
 				if let Some((map_state, override_redirect)) = xcb_get_window_attributes(connection, child)
 					&& map_state == XCB_MAP_STATE_VIEWABLE
 					&& !override_redirect
 					&& let Some((cx, cy, cw, ch)) = xcb_get_window_rect(connection, child)
 				{
-					let rel_x = cx as i32 - px as i32;
-					let rel_y = cy as i32 - py as i32;
-					let clipped_w = (pw as i32 - rel_x).max(0) as u32;
-					let clipped_h = (ph as i32 - rel_y).max(0) as u32;
-					let final_w = cw.min(clipped_w);
-					let final_h = ch.min(clipped_h);
+					// XCB child geometry is relative to its parent, not root space.
+					let final_w = clipped_child_span(cx, cw, pw);
+					let final_h = clipped_child_span(cy, ch, ph);
 					if final_w > max_w {
 						max_w = final_w;
 					}
@@ -463,6 +453,12 @@ pub(crate) unsafe fn xcb_get_largest_obscuring_child(
 			Some(Some((max_w, max_h)))
 		}
 	}
+}
+
+fn clipped_child_span(position: i16, size: u32, parent_size: u32) -> u32 {
+	let start = i64::from(position).max(0);
+	let end = (i64::from(position) + i64::from(size)).min(i64::from(parent_size));
+	(end - start).max(0) as u32
 }
 
 // ---------------------------------------------------------------------------
@@ -636,9 +632,304 @@ pub(crate) unsafe fn xcb_window_has_property(connection: *mut libc::c_void, wind
 	}
 }
 
+/// Separate event connection: never select masks or consume events on the
+/// application's connection. Nonblocking dispatch performs no X11 round trips
+/// unless a topology/property event invalidates the cached bypass decision.
+pub(crate) struct BypassWatch {
+	connection: *mut libc::c_void,
+	fns: &'static EventFns,
+	window: u32,
+	watched: std::collections::HashSet<u32>,
+	decision: Result<(), crate::swapchain::BypassReject>,
+	allow_flip_atom: u32,
+	initialized: bool,
+}
+
+// SAFETY: only accessed behind the surface's mutex; owns its XCB connection.
+unsafe impl Send for BypassWatch {}
+
+/// PropertyNotify wire prefix; atom is at byte 8 (byte 16 is its state).
+#[repr(C)]
+struct XcbPropertyNotifyEvent {
+	response_type: u8,
+	pad0: u8,
+	sequence: u16,
+	window: u32,
+	atom: u32,
+	time: u32,
+	state: u8,
+	pad1: [u8; 15],
+}
+
+type FnConnect = unsafe extern "C" fn(*const libc::c_char, *mut i32) -> *mut libc::c_void;
+type FnDisconnect = unsafe extern "C" fn(*mut libc::c_void);
+type FnPollEvent = unsafe extern "C" fn(*mut libc::c_void) -> *mut u8;
+type FnChangeAttributes = unsafe extern "C" fn(*mut libc::c_void, u32, u32, *const u32) -> XcbCookie;
+type FnRequestCheck = unsafe extern "C" fn(*mut libc::c_void, XcbCookie) -> *mut libc::c_void;
+type FnConnectionError = unsafe extern "C" fn(*mut libc::c_void) -> i32;
+
+struct EventFns {
+	connect: FnConnect,
+	disconnect: FnDisconnect,
+	poll_event: FnPollEvent,
+	change_attributes: FnChangeAttributes,
+	request_check: FnRequestCheck,
+	connection_error: FnConnectionError,
+}
+
+fn event_fns() -> Option<&'static EventFns> {
+	use std::sync::OnceLock;
+	static FNS: OnceLock<Option<EventFns>> = OnceLock::new();
+	FNS.get_or_init(|| unsafe {
+		let lib = libc::dlopen(c"libxcb.so.1".as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL);
+		if lib.is_null() {
+			return None;
+		}
+		macro_rules! symbol {
+			($name:expr, $ty:ty) => {{
+				let ptr = libc::dlsym(lib, $name.as_ptr());
+				if ptr.is_null() {
+					return None;
+				}
+				std::mem::transmute::<*mut libc::c_void, $ty>(ptr)
+			}};
+		}
+		Some(EventFns {
+			connect: symbol!(c"xcb_connect", FnConnect),
+			disconnect: symbol!(c"xcb_disconnect", FnDisconnect),
+			poll_event: symbol!(c"xcb_poll_for_event", FnPollEvent),
+			change_attributes: symbol!(c"xcb_change_window_attributes_checked", FnChangeAttributes),
+			request_check: symbol!(c"xcb_request_check", FnRequestCheck),
+			connection_error: symbol!(c"xcb_connection_has_error", FnConnectionError),
+		})
+	})
+	.as_ref()
+}
+
+impl BypassWatch {
+	pub(crate) unsafe fn new(app_connection: *mut libc::c_void, window: u32) -> Option<Self> {
+		unsafe {
+			let fns = event_fns()?;
+			let connection = (fns.connect)(std::ptr::null(), std::ptr::null_mut());
+			if connection.is_null() {
+				return None;
+			}
+			let mut watch = Self {
+				connection,
+				fns,
+				window,
+				watched: Default::default(),
+				decision: Err(crate::swapchain::BypassReject::Unavailable),
+				allow_flip_atom: 0,
+				initialized: false,
+			};
+			// DISPLAY must refer to the application's server. Validate the XID and
+			// root before trusting this connection; otherwise retain plain XCB.
+			let app_root = xcb_query_tree_window(app_connection, window).map(|t| t.0);
+			let own_root = xcb_query_tree_window(connection, window).map(|t| t.0);
+			if app_root.is_none() || own_root != app_root || (fns.connection_error)(connection) != 0 {
+				return None;
+			}
+			watch.allow_flip_atom = xcb_intern_atom(connection, "_WINE_ALLOW_FLIP")?;
+			watch.refresh();
+			Some(watch)
+		}
+	}
+
+	unsafe fn subscribe(&mut self, window: u32) -> Option<()> {
+		unsafe {
+			if self.watched.contains(&window) {
+				return Some(());
+			}
+			// StructureNotify, SubstructureNotify, PropertyChange (nonexclusive).
+			let mask = (1u32 << 17) | (1 << 19) | (1 << 22);
+			let cookie = (self.fns.change_attributes)(self.connection, window, 1 << 11, &mask);
+			let error = (self.fns.request_check)(self.connection, cookie);
+			if !error.is_null() {
+				libc::free(error);
+				return None;
+			}
+			self.watched.insert(window);
+			Some(())
+		}
+	}
+
+	unsafe fn subscribe_tree(&mut self) -> Option<()> {
+		unsafe {
+			let mut current = self.window;
+			let mut ancestors = std::collections::HashSet::new();
+			loop {
+				if !ancestors.insert(current) {
+					return None;
+				}
+				self.subscribe(current)?;
+				let (root, parent, _) = xcb_query_tree_window(self.connection, current)?;
+				if parent == root || parent == 0 {
+					break;
+				}
+				current = parent;
+			}
+			// Child properties/map/geometry changes can affect obscuring policy.
+			let (query, reply_fn, _, _) = load_xcb_query_tree_fns()?;
+			let reply = reply_fn(self.connection, query(self.connection, current), std::ptr::null_mut());
+			if reply.is_null() {
+				return None;
+			}
+			let children = std::slice::from_raw_parts(
+				(reply as *const u8).add(32).cast::<u32>(),
+				(*reply).children_len as usize,
+			)
+			.to_vec();
+			libc::free(reply.cast());
+			for child in children {
+				self.subscribe(child)?;
+			}
+			Some(())
+		}
+	}
+
+	unsafe fn refresh(&mut self) {
+		unsafe {
+			let previous = self.decision;
+			self.decision = if self.subscribe_tree().is_some() {
+				crate::swapchain::query_bypass_policy(self.connection, self.window)
+			} else {
+				Err(crate::swapchain::BypassReject::Unavailable)
+			};
+			if !self.initialized || self.decision != previous {
+				self.initialized = true;
+				match self.decision {
+					Ok(()) => crate::log_debug!("XWayland bypass allowed: window={}", self.window),
+					Err(reason) => crate::log_debug!(
+						"XWayland bypass rejected: {} (window={})",
+						reason.message(),
+						self.window
+					),
+				}
+			}
+		}
+	}
+
+	pub(crate) fn allowed(&mut self) -> bool {
+		unsafe {
+			let mut changed = false;
+			// Bound dispatch work under event storms; remaining events are handled
+			// on the next dispatch. This reads events, not window-query replies.
+			for _ in 0..256 {
+				let event = (self.fns.poll_event)(self.connection);
+				if event.is_null() {
+					break;
+				}
+				let kind = *event & 0x7f;
+				if kind == 17 {
+					// DestroyNotify's window field: allow a reused XID to subscribe again.
+					self.watched
+						.remove(&std::ptr::read_unaligned(event.add(8).cast::<u32>()));
+				}
+				let relevant_property = kind == 28
+					&& matches!(
+						(*event.cast::<XcbPropertyNotifyEvent>()).atom,
+						atom if atom == self.allow_flip_atom || atom == XCB_ATOM_WM_CLASS
+					);
+				changed |= kind == 0 || (16..=22).contains(&kind) || relevant_property;
+				libc::free(event.cast());
+			}
+			if (self.fns.connection_error)(self.connection) != 0 {
+				if self.decision != Err(crate::swapchain::BypassReject::Unavailable) {
+					crate::log_debug!(
+						"XWayland bypass rejected: X11 event connection lost (window={})",
+						self.window
+					);
+				}
+				self.decision = Err(crate::swapchain::BypassReject::Unavailable);
+			} else if changed {
+				self.refresh();
+			}
+		}
+		self.decision.is_ok()
+	}
+}
+
+impl Drop for BypassWatch {
+	fn drop(&mut self) {
+		// SAFETY: owns this connection; no other reader or pending worker exists.
+		unsafe {
+			(self.fns.disconnect)(self.connection);
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn property_notify_layout_reads_the_atom_not_the_state() {
+		assert_eq!(std::mem::size_of::<XcbPropertyNotifyEvent>(), 32);
+		assert_eq!(std::mem::offset_of!(XcbPropertyNotifyEvent, atom), 8);
+		assert_eq!(std::mem::offset_of!(XcbPropertyNotifyEvent, state), 16);
+	}
+
+	#[test]
+	fn child_clipping_uses_parent_relative_coordinates() {
+		assert_eq!(clipped_child_span(0, 1920, 1920), 1920);
+		assert_eq!(clipped_child_span(1919, 10, 1920), 1);
+		assert_eq!(clipped_child_span(-10, 20, 1920), 10);
+		assert_eq!(clipped_child_span(-20, 10, 1920), 0);
+		assert_eq!(clipped_child_span(1920, 10, 1920), 0);
+	}
+
+	#[test]
+	fn unchanged_presentations_reuse_policy_without_x11_requests() {
+		use std::sync::atomic::{AtomicUsize, Ordering};
+		static REQUESTS: AtomicUsize = AtomicUsize::new(0);
+		unsafe extern "C" fn connect(_: *const libc::c_char, _: *mut i32) -> *mut libc::c_void {
+			std::ptr::null_mut()
+		}
+		unsafe extern "C" fn disconnect(_: *mut libc::c_void) {}
+		unsafe extern "C" fn poll_event(_: *mut libc::c_void) -> *mut u8 {
+			std::ptr::null_mut()
+		}
+		unsafe extern "C" fn attributes(_: *mut libc::c_void, _: u32, _: u32, _: *const u32) -> XcbCookie {
+			REQUESTS.fetch_add(1, Ordering::Relaxed);
+			XcbCookie { sequence: 0 }
+		}
+		unsafe extern "C" fn check(_: *mut libc::c_void, _: XcbCookie) -> *mut libc::c_void {
+			std::ptr::null_mut()
+		}
+		unsafe extern "C" fn error(_: *mut libc::c_void) -> i32 {
+			0
+		}
+		static FNS: EventFns = EventFns {
+			connect,
+			disconnect,
+			poll_event,
+			change_attributes: attributes,
+			request_check: check,
+			connection_error: error,
+		};
+		for decision in [Ok(()), Err(crate::swapchain::BypassReject::WineNoFlip)] {
+			let mut watch = BypassWatch {
+				connection: std::ptr::null_mut(),
+				fns: &FNS,
+				window: 1,
+				watched: Default::default(),
+				decision,
+				allow_flip_atom: 100,
+				initialized: true,
+			};
+			for _ in 0..100 {
+				assert_eq!(watch.allowed(), decision.is_ok());
+			}
+		}
+		assert_eq!(REQUESTS.load(Ordering::Relaxed), 0);
+	}
+
+	#[test]
+	fn query_tree_reply_layout_matches_xcb() {
+		assert_eq!(std::mem::size_of::<XcbQueryTreeReply>(), 32);
+		assert_eq!(std::mem::offset_of!(XcbQueryTreeReply, children_len), 16);
+	}
 
 	#[test]
 	fn get_property_reply_layout_matches_xcb() {

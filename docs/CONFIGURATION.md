@@ -180,24 +180,53 @@ negotiated with the client; they are not additional `config.toml` settings.
 | Setting | Type / default | Effect |
 | --- | --- | --- |
 | `emulation` | string, `"auto"` | Virtual controller family: `auto`, `xbox`, `playstation`, or `nintendo`. Auto preserves recognized client families and uses Xbox for Steam/unknown kinds. Advanced motion, touch, and feedback features depend on the selected family. |
-| `home_button` | table | Hold-to-Home remapping below. |
+| `home_button` | table | Intentional Home/Guide shortcut below. |
 
 ### `[stream.control.gamepad.home_button]`
 
 | Setting | Type / default | Effect |
 | --- | --- | --- |
-| `hold_ms` | nonnegative integer, `0` | Hold Back/Select this many milliseconds to emit Home/Guide. `0` disables remapping. With remapping enabled, a short tap emits Back on release. |
+| `trigger` | optional string, unset | `disabled`, `hold_back` (legacy), or `back_start` (recommended). Unset preserves old configurations: nonzero `hold_ms` selects `hold_back`; zero disables mapping. |
+| `hold_ms` | nonnegative integer, `0` | Hold the selected trigger this many milliseconds before emitting Guide. `0` disables synthetic mapping for every trigger. |
 | `rumble_duration_ms` | nonnegative integer, `50` | Duration of the activation rumble pulse; `0` disables it. |
 | `rumble_intensity` | number, `0.5` | Activation pulse strength from `0.0` to `1.0`. |
 | `suppress_home` | boolean, `false` | Drop the client's physical Home/Guide button; remapped Home presses remain available. |
 
-Example:
+The global default remains disabled, so Select/Back can be held for any duration.
+Physical Guide is already supported by Moonlight's controller button flags;
+use it directly when available. `suppress_home` filters only physical Guide,
+including when synthetic mapping is disabled, and never filters synthetic Guide.
+
+With `back_start`, lone Back and Start presses pass through immediately. When a
+packet first contains both, both are released/consumed and a one-shot hold timer
+starts. Holding the complete chord through the threshold sends Guide and the
+configured rumble pulse. Releasing either member releases Guide. Both members
+remain consumed until both are released, including when cancelled before the
+threshold; no synthetic Back/Start taps are replayed. Other buttons, including
+DualSense Edge extended buttons, pass through unchanged. Each controller has
+independent state, discarded on disconnect or session teardown.
+
+This deliberately prioritizes immediate ordinary input: if Back or Start was
+sent before its partner arrived, the game can see that earlier single-button
+press. It cannot be retroactively erased. An intentional chord is consumed as
+soon as both members are observed; it does not send the combination to gameplay.
+Games using Back+Start themselves should use `disabled` or physical Guide.
+
+**Migration:** existing configurations specifying only `hold_ms = 750` remain
+legacy `hold_back`: Back is withheld, short release emits a 100 ms Back tap,
+and a long hold emits Guide. To restore real Select holds while retaining a
+shortcut, add `trigger = "back_start"` to that table. `trigger = "disabled"`
+disables synthesis regardless of a retained nonzero threshold. Unknown trigger
+names fail configuration parsing. Explicit policies are preserved on serialization.
+
+Recommended example:
 
 ```toml
 [stream.control.gamepad]
 emulation = "auto"
 
 [stream.control.gamepad.home_button]
+trigger = "back_start"
 hold_ms = 750
 rumble_duration_ms = 50
 rumble_intensity = 0.5

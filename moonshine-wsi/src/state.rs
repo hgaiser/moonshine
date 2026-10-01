@@ -381,6 +381,8 @@ pub struct SurfaceData {
 	/// Plain XCB surface for the same window, used when the bypass safety
 	/// checks refuse (e.g. Wine windows presented offscreen to GDI-blit).
 	pub fallback_surface: VkSurface,
+	/// Private X11 event connection and cached presentation policy.
+	pub bypass_watch: Option<Arc<Mutex<crate::xcb::BypassWatch>>>,
 	/// Set for native Wayland surfaces (bound on the app's own display);
 	/// `None` for XCB/XWayland surfaces.
 	pub native: Option<NativeWaylandSurface>,
@@ -523,8 +525,8 @@ pub fn insert_swapchain(key: SwapchainKey, data: SwapchainData) {
 	swapchain_map().force_write().insert(key, data);
 }
 
-pub fn remove_swapchain(key: SwapchainKey) {
-	swapchain_map().force_write().remove(&key);
+pub fn remove_swapchain(key: SwapchainKey) -> Option<SwapchainData> {
+	swapchain_map().force_write().remove(&key)
 }
 
 pub fn with_swapchain<R>(key: SwapchainKey, f: impl FnOnce(&SwapchainData) -> R) -> Option<R> {

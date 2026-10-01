@@ -81,6 +81,24 @@ image in direct eligibility and GLES blending, including alpha-capable HDR
 buffers. Child surfaces retain their own transparency. See the
 [Vulkan definition](https://github.khronos.org/Vulkan-Site/spec/latest/chapters/VK_KHR_surface/wsi.html).
 
+### Unsafe XWayland replacement cleanup
+
+Wine presentation safety is checked before accepting any top-level bypass.
+Unsafe windows present via the retained XCB surface without a replacement binding.
+When safety changes, the WSI layer destroys its protocol override before requesting
+swapchain recreation. The compositor clears only the owning swapchain's override,
+invalidates damage, and restores the XWayland scene even though the Vulkan/Wayland
+surface itself may remain alive. A newer override on that surface survives old
+swapchain destruction. Capture eligibility, focus classification, and GPU export
+rules remain independent of this presentation decision. See
+[presentation topology and fullscreen diagnosis](VULKAN_IMAGE_COUNTS.md#presentation-topology-and-fallback).
+
+Controller Guide shortcuts are described in
+[configuration](CONFIGURATION.md#streamcontrolgamepadhome_button). Prefer physical
+Guide or the explicit Back+Start policy so games receive real Select holds.
+Activation rumble deadlines preserve every held button; disconnect drops all
+per-controller shortcut state.
+
 ### Steam classification and input
 
 Steam classification has one rule: `STEAM_OVERLAY != 0` is interactive when it

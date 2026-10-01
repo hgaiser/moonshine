@@ -15,37 +15,48 @@ const SONY_VENDOR: u16 = 0x054c;
 const DUALSENSE_PRODUCT: u16 = 0x0ce6;
 const DUALSENSE_EDGE_PRODUCT: u16 = 0x0df2;
 
-/// Configuration for the hold-to-Home gamepad button remap.
-///
-/// When enabled, holding the Back/Select button for `hold_ms` emits the
-/// Home/Guide button instead. A short tap (released early) still sends Back.
+/// Intentional synthetic Guide shortcut. Physical Guide is already carried by
+/// Moonlight's SPECIAL flag; no shortcut is needed for clients that send it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeTrigger {
+	Disabled,
+	HoldBack,
+	BackStart,
+}
+
+/// Home/Guide policy. An omitted trigger retains legacy `hold_ms` semantics;
+/// the default zero threshold leaves ordinary controller input untouched.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct HomeButtonConfig {
-	/// How long (in milliseconds) the Back button must be held before the
-	/// Home/Guide button is emitted instead. While held, the Back button is
-	/// withheld; a short tap (released before this duration) still emits Back.
-	/// Set to 0 to disable the remap entirely (the default).
+	/// None means legacy: nonzero hold_ms selects HoldBack, zero disables it.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub trigger: Option<HomeTrigger>,
+	/// Hold threshold; zero disables synthetic remapping for every policy.
 	pub hold_ms: u64,
-
-	/// Duration (in milliseconds) of the tactile rumble pulse fired when
-	/// hold-to-Home activates. Set to 0 to disable the rumble pulse.
+	/// Activation rumble duration; zero disables the pulse.
 	pub rumble_duration_ms: u64,
-
-	/// Rumble intensity for the hold-to-Home activation pulse (0.0-1.0).
-	/// 0.0 means no rumble; 1.0 is maximum intensity.
+	/// Activation rumble intensity (0.0-1.0).
 	pub rumble_intensity: f64,
-
-	/// Suppress the physical Home/Guide button from the client gamepad.
-	/// When enabled, an actual Home press from the client is dropped so it
-	/// doesn't trigger the host's overlay (Steam, desktop, etc.). The
-	/// hold-to-Home remap-generated Home is unaffected.
+	/// Drop physical Guide, independently of synthetic shortcut activation.
 	pub suppress_home: bool,
+}
+
+impl HomeButtonConfig {
+	pub fn trigger(&self) -> HomeTrigger {
+		if self.hold_ms == 0 {
+			HomeTrigger::Disabled
+		} else {
+			self.trigger.unwrap_or(HomeTrigger::HoldBack)
+		}
+	}
 }
 
 impl Default for HomeButtonConfig {
 	fn default() -> Self {
 		Self {
+			trigger: None,
 			hold_ms: 0,
 			rumble_duration_ms: 50,
 			rumble_intensity: 0.5,
@@ -58,7 +69,7 @@ impl Default for HomeButtonConfig {
 #[derive(Default, Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GamepadConfig {
-	/// Configuration for the hold-to-Home button remap.
+	/// Configuration for the intentional Home shortcut.
 	pub home_button: HomeButtonConfig,
 	/// Virtual controller family; auto preserves native client features.
 	pub emulation: GamepadEmulation,
@@ -691,6 +702,27 @@ mod compatibility_tests {
 			assert_eq!(remap.advance(deadline).0, SPECIAL_FLAG);
 			assert_eq!(remap.apply(0, deadline).0, 0);
 		}
+	}
+
+	#[test]
+	fn home_policy_migration_is_explicit_and_round_trips() {
+		for (text, expected) in [
+			("", HomeTrigger::Disabled),
+			("hold_ms = 750", HomeTrigger::HoldBack),
+			("hold_ms = 0", HomeTrigger::Disabled),
+			("trigger = \"disabled\"\nhold_ms = 750", HomeTrigger::Disabled),
+			("trigger = \"hold_back\"\nhold_ms = 750", HomeTrigger::HoldBack),
+			("trigger = \"back_start\"\nhold_ms = 750", HomeTrigger::BackStart),
+		] {
+			let config: HomeButtonConfig = toml::from_str(text).unwrap();
+			assert_eq!(config.trigger(), expected);
+			let encoded = toml::to_string(&config).unwrap();
+			assert_eq!(
+				toml::from_str::<HomeButtonConfig>(&encoded).unwrap().trigger(),
+				expected
+			);
+		}
+		assert!(toml::from_str::<HomeButtonConfig>("trigger = \"invalid\"").is_err());
 	}
 
 	#[test]

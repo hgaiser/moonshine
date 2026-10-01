@@ -86,6 +86,103 @@ not increased. Actual image counts are obtained with `vkGetSwapchainImagesKHR`
 and used for diagnostics and swapchain feedback. No images are hidden and no
 acquired image indices are remapped.
 
+## Presentation topology and fallback
+
+Bypass safety is evaluated before any positive top-level shortcut. In particular,
+`_WINE_ALLOW_FLIP=0` always rejects bypass, even when the Vulkan XID is itself the
+toplevel. An unnamed 1×1 override-redirect parent also rejects bypass, independently
+of the flip property. Wine can render offscreen and GDI-blit onto a different
+visible window; replacing that presentation surface can leave the stream black.
+The rule uses presentation topology, never game/executable names. Ordinary safe
+fullscreen windows retain bypass and automatic direct DMA-BUF export eligibility.
+
+Size tolerance (2 pixels), position tolerance (1 pixel), and obscuring child
+checks remain enforced. Child offsets accumulate in top-level coordinates;
+XCB geometry is parent-relative. The rendering branch itself is excluded from
+obstructions, while other visible children along the ancestry (and children of
+the rendering window itself) are checked. Obscuring checks also apply to top-level windows. XCB
+query-tree replies use the protocol's 32-byte header and 16-bit child count.
+Missing topology or unavailable event monitoring conservatively selects XCB.
+
+Each managed replacement retains a real XCB fallback surface. Capability,
+format, and present-mode queries and swapchain creation select the same policy
+path; fallback capabilities are not relaxed using Wayland image-count rules.
+Fallback swapchains do not bind a compositor swapchain or call
+`override_window_content`. The ICD's HDR color-space handling and existing
+XWayland limitations still apply on fallback; this does not add HDR to Wine GDI.
+
+A private XCB connection subscribes to structure/substructure and relevant
+property events on the window ancestry and children. It never changes the
+application's event mask or consumes its events. Presentation dispatches queued
+events without blocking; policy queries occur at setup or after relevant changes,
+not on unchanged frames. No timer polls, CPU readback, GPU copy, forced composition,
+or extra frame queue is introduced. If `DISPLAY` cannot provide a usable event
+connection for the application XID, bypass is conservatively rejected.
+
+The ICD surface chosen at swapchain creation is immutable. An unsafe transition
+removes the old protocol override and reports `VK_ERROR_OUT_OF_DATE_KHR` until
+recreation, even if safety recovers in between; image acquisition also rejects
+that retired chain. A now-safe XCB chain reports `VK_SUBOPTIMAL_KHR`. Recreating on another
+ICD surface omits `oldSwapchain` from the downstream create-info; the application
+still owns and destroys its old handle. Destroying an older protocol object
+cannot clear a newer object's override on the same Wayland surface. ICD failures
+are preserved. A stable policy produces no recreation requests.
+
+DEBUG diagnostics log policy changes with reasons: `_WINE_ALLOW_FLIP=0`,
+`Wine offscreen presentation parent`, `geometry size mismatch`,
+`geometry position mismatch`, `obscuring child`, or
+`X11 topology/event monitoring unavailable`. Surface creation's
+`XWayland bypass active` means a replacement was allocated; verify swapchain
+`bypass=true/false` and `override_window_content` to identify actual presentation.
+
+## Proton fullscreen acceptance (Dave the Diver test case)
+
+Install the rebuilt layer and restart the game process. Compare fullscreen and
+borderless at the same stream settings. Use Steam launch options:
+
+```sh
+MOONSHINE_WSI_LOG=debug \
+MOONSHINE_WSI_LOG_FILE=/tmp/dave-wsi.log \
+%command%
+```
+
+Inspect the log:
+
+```sh
+rg 'XWayland bypass|vkCreateSwapchainKHR|override_window_content|swapchain negotiation|surface capabilities' /tmp/dave-wsi.log
+```
+
+An unsafe topology should show its rejection reason, `bypass=false`, plain XCB
+capabilities/creation, and no override for that fallback chain. A safe fullscreen
+window should retain `bypass=true` and its override. Switch between fullscreen,
+borderless, and windowed repeatedly; verify recreation settles, video and input
+continue, and no stale replacement covers the real window.
+
+Run a separate A/B diagnostic with:
+
+```text
+MOONSHINE_WSI_DISABLE_BYPASS=1 %command%
+```
+
+Fullscreen broken normally but working with bypass disabled strongly implicates
+WSI substitution. Also run with this server configuration:
+
+```toml
+[compositor]
+capture_mode = "composited"
+```
+
+Composited still black while bypass-disabled works points to WSI/window
+substitution. Composited working while automatic capture fails points instead to
+direct-export eligibility; inspect compositor DEBUG capture-path transitions.
+Restore `auto` after diagnosis. This diagnostic is not a permanent global fix.
+
+Repeat with Steam overlay/notifications, controller focus and Steam Input,
+DualSense/Edge and Nintendo emulation, active-mask hotplug and reconnect (indices
+0 and 15), SDR/HDR, YUV 4:4:4, H.264/HEVC/AV1/PyroWave, and Path of Exile triple
+buffering. These require an actual GPU, streaming client, and game installation;
+unit tests do not establish game acceptance or performance.
+
 ## Build and automated checks
 
 From the repository root:
