@@ -31,6 +31,8 @@ moonshine-bench [OPTIONS] <COMMAND>
 | Option | Default | Description |
 |--------|---------|-------------|
 | `--matrix` | off | Run the built-in 4K, 1440p, and 1080p matrix across 60/120/360 FPS and `hevc`, `h264`, and `av1` |
+| `--composited` | off | Force the GLES fallback, independent of fullscreen direct-export eligibility |
+| `--pyrowave-queue <mode>` | `auto` | Compare PyroWave `auto`, `graphics`, or `compute` at normal queue priority |
 | `--pyrowave-matrix` | off | Run the PyroWave 1080p/1440p/4K matrix across 60/120/144 FPS |
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
 | `--fps <N>` | `60` | Target frame rate |
@@ -114,3 +116,34 @@ With `--matrix`, each combination prints the same per-run summaries and the comm
 5. Collects `FrameStats` from each encoded frame via a broadcast channel
 6. After the warmup period, accumulates and reports statistics
 7. Stops after the specified duration or on Ctrl+C
+
+### GPU cost and admission diagnostics
+
+With `[stream.video] log_stats = true`, five-second summaries distinguish
+`queue_to_readback_us` (wall-clock latency) from the PyroWave GPU timestamp
+stages. `pyrowave_stage_gpu_ms_per_delivered_frame` accounts for packet-only
+replays; the exclusive stage sum excludes transfers and CPU work. GPU intervals
+can include contention/preemption during a stage, and are not a measurement of
+active shader cycles. The reports lag by Granite's bounded timestamp contexts.
+
+Capture summaries include direct/composited captures, pre-render rejection
+attempts, stale-after-render drops, demand/busy state and optional GLES query
+measurements. `compositor_gpu_ms_per_captured_frame` divides measured composition
+GPU time by all accepted captures, including the zero-render direct path.
+Composited timer samples may cross a five-second reporting boundary; compare
+multiple windows. Unsupported or disjoint timer measurements are omitted.
+
+Import hit/miss/recreate/evict counters preserve the existing FD identity and
+complete import-layout checks. Direct rejection counters identify the first
+blocking condition per attempted capture, rather than every possible condition.
+
+Transport summaries show encoded Mbps, UDP payload Mbps including FEC and
+protocol/encryption bytes, and estimated Ethernet Mbps including IPv6/UDP,
+Ethernet header/FCS, preamble and inter-frame gap. VLAN/tunnel overhead and other
+traffic are additional. Do not treat the UDP payload as physical wire bitrate.
+
+The benchmark's latency starts at direct export or composition completion;
+it does not include game rendering, client decode/display, or the compositor
+CPU fence wait. Measure those separately when evaluating end-to-end latency.
+See [the optimization report](PIPELINE_OPTIMIZATION.md) for measured results,
+validation gaps, and changes deliberately deferred.

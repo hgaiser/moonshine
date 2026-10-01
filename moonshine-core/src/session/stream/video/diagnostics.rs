@@ -83,6 +83,9 @@ pub(super) struct PipelineWindow {
 	started: Instant,
 	frames: u64,
 	stale: u64,
+	encoded_bytes: u64,
+	wire_bytes: u64,
+	packets: u64,
 	sums: [u64; 9],
 	maxima: [u64; 9],
 }
@@ -94,6 +97,9 @@ impl PipelineWindow {
 			started: Instant::now(),
 			frames: 0,
 			stale: 0,
+			encoded_bytes: 0,
+			wire_bytes: 0,
+			packets: 0,
 			sums: [0; 9],
 			maxima: [0; 9],
 		}
@@ -105,6 +111,9 @@ impl PipelineWindow {
 		}
 		self.frames += 1;
 		self.stale += u64::from(stats.stale_frames_dropped);
+		self.encoded_bytes += stats.encoded_bytes as u64;
+		self.wire_bytes += stats.wire_bytes as u64;
+		self.packets += stats.packet_count as u64;
 		for (i, duration) in [
 			stats.channel_wait,
 			stats.import,
@@ -127,7 +136,11 @@ impl PipelineWindow {
 		if elapsed >= INTERVAL {
 			let avg = self.sums.map(|us| us / self.frames);
 			tracing::info!(
-				frames = self.frames, fps = self.frames as f64 / elapsed.as_secs_f64(),
+				delivered_frames = self.frames, fps = self.frames as f64 / elapsed.as_secs_f64(),
+				encoded_mbps = self.encoded_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1e6,
+				udp_payload_mbps_including_fec = self.wire_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1e6,
+				// IPv6 + UDP + Ethernet header/FCS + preamble + inter-frame gap.
+				estimated_ethernet_mbps_ipv6 = (self.wire_bytes + self.packets * 86) as f64 * 8.0 / elapsed.as_secs_f64() / 1e6,
 				stale_frames_dropped = self.stale, encoder_in_flight = in_flight,
 				packet_queue, import_cache = ?imports,
 				channel_wait_us = avg[0], max_channel_wait_us = self.maxima[0],
@@ -135,7 +148,7 @@ impl PipelineWindow {
 				convert_us = avg[2], max_convert_us = self.maxima[2],
 				submit_us = avg[3], max_submit_us = self.maxima[3],
 				consumer_queue_us = avg[4], max_consumer_queue_us = self.maxima[4],
-				encode_wait_us = avg[5], max_encode_wait_us = self.maxima[5],
+				queue_to_readback_us = avg[5], max_queue_to_readback_us = self.maxima[5],
 				packetize_us = avg[6], max_packetize_us = self.maxima[6],
 				channel_send_us = avg[7], max_channel_send_us = self.maxima[7],
 				total_us = avg[8], max_total_us = self.maxima[8],

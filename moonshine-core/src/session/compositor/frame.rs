@@ -101,10 +101,12 @@ impl HdrMetadata {
 /// pre-allocated GBM buffer pool.  The pool lives for the entire streaming
 /// session, so the fds remain valid.  The `consumed` flag prevents the
 /// compositor from recycling a buffer before the encoder finishes reading.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(crate) struct ExportedFrame {
 	/// Per-plane DMA-BUF metadata.
 	pub planes: Vec<ExportedPlane>,
+	/// Admission remains occupied until downstream is ready for another frame.
+	pub capture_credit: Option<super::admission::CaptureCredit>,
 	/// DRM format (e.g. Argb8888, Abgr2101010).
 	pub format: u32,
 	/// DRM modifier (e.g. Linear, tiled).

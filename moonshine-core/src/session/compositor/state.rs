@@ -57,12 +57,13 @@ use smithay::wayland::xwayland_shell::XWaylandShellState;
 use smithay::xwayland::X11Wm;
 
 use super::KeyboardConfig;
+use super::capture::DirectReject;
 use crate::session::compositor::cursor::{self, PointerElement, PointerRenderElement};
 use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
 
-/// Number of pre-allocated GBM buffers. Three allows the compositor to
-/// always have a free buffer: at most two frames are queued in the
-/// `sync_channel(2)` and one is being processed by the encoder.
+/// Number of pre-allocated GBM buffers. Conventional encoders may retain
+/// multiple submitted buffers; PyroWave admits only one capture at a time.
+/// This pool is buffer lifetime storage, not a frame delivery queue.
 const BUFFER_POOL_SIZE: usize = 3;
 
 /// Visual layers in back-to-front order; independent of input targets.
@@ -242,7 +243,9 @@ pub(crate) struct MoonshineCompositor {
 	pub dmabuf_global: DmabufGlobal,
 
 	// -- Frame relay to encoder --
-	pub frame_tx: mpsc::SyncSender<ExportedFrame>,
+	pub frame_tx: super::admission::CaptureSender,
+	pub(super) capture_failed: bool,
+	pub(super) next_capture_at: std::time::Instant,
 
 	// -- Input --
 	pub seat: Seat<Self>,
@@ -259,6 +262,13 @@ pub(crate) struct MoonshineCompositor {
 	last_resource_summary: std::time::Instant,
 	pub(super) log_stats: bool,
 	released_scanout_buffers: u64,
+	captured_frames: u64,
+	pre_render_rejected: u64,
+	stale_after_render: u64,
+	direct_frames: u64,
+	composited_frames: u64,
+	direct_rejections: [u64; DirectReject::COUNT],
+	gpu_timer: super::gpu_timing::GpuTimer,
 	pub pen_tablet_descriptor: TabletDescriptor,
 	pub active_pen_tool_kind: Option<u8>,
 	pub pen_buttons: u8,
@@ -564,6 +574,7 @@ impl MoonshineCompositor {
 		self.output.set_preferred(mode);
 		self.damage_tracker = OutputDamageTracker::from_output(&self.output);
 		self.screen_dirty = true;
+		self.next_capture_at = std::time::Instant::now();
 		tracing::info!(width, height, refresh_rate, hdr, "Reconfigured live compositor output");
 		Ok(())
 	}
@@ -578,7 +589,7 @@ impl MoonshineCompositor {
 		damage_tracker: OutputDamageTracker,
 		mut allocator: GbmAllocator<std::fs::File>,
 		renderer: GlesRenderer,
-		frame_tx: mpsc::SyncSender<ExportedFrame>,
+		frame_tx: super::admission::CaptureSender,
 		width: u32,
 		height: u32,
 		render_fourcc: Fourcc,
@@ -756,6 +767,8 @@ impl MoonshineCompositor {
 				dmabuf_state,
 				dmabuf_global,
 				frame_tx,
+				capture_failed: false,
+				next_capture_at: std::time::Instant::now(),
 				seat,
 				pending_text: String::new(),
 				cursor_position: initial_cursor_position,
@@ -766,6 +779,13 @@ impl MoonshineCompositor {
 				last_resource_summary: std::time::Instant::now(),
 				log_stats,
 				released_scanout_buffers: 0,
+				captured_frames: 0,
+				pre_render_rejected: 0,
+				stale_after_render: 0,
+				direct_frames: 0,
+				composited_frames: 0,
+				direct_rejections: [0; DirectReject::COUNT],
+				gpu_timer: super::gpu_timing::GpuTimer::default(),
 				pen_tablet_descriptor,
 				active_pen_tool_kind: None,
 				pen_buttons: 0,
@@ -1120,7 +1140,7 @@ impl MoonshineCompositor {
 	}
 
 	/// One buffer must reproduce the complete scene, independently of focus.
-	fn can_direct_scanout_scene(&self) -> bool {
+	fn can_direct_scanout_scene(&self) -> Result<(), DirectReject> {
 		let extras = super::capture::SceneExtras {
 			cursor: self.cursor_visible(),
 			steam_overlay: self.overlay_window.is_some(),
@@ -1128,45 +1148,47 @@ impl MoonshineCompositor {
 			external_overlay: self.external_overlay_window.is_some(),
 			dropdown: self.override_window.is_some(),
 			decoration: !self.decoration_windows.is_empty() || self.override_underlay_window.is_some(),
-			scaling: self.compute_output_scale().is_some() || self.output.current_scale().fractional_scale() != 1.0,
+			scaling: self.compute_output_scale().is_some(),
+			fractional_scale: self.output.current_scale().fractional_scale() != 1.0,
 		};
-		if extras.requires_composition(self.capture_mode) {
-			return false;
+		if let Some(reason) = extras.rejection(self.capture_mode) {
+			return Err(reason);
 		}
 		// A standalone native override has no X11 scene window.
 		if self.space.elements().next().is_none() {
-			return self.override_surface.as_ref().is_some_and(|(surface, xid)| {
-				*xid == 0 && surface.alive() && self.surface_is_complete_output(surface)
-			});
+			return match self.override_surface.as_ref() {
+				Some((surface, 0)) if surface.alive() => self.surface_is_complete_output(surface),
+				_ => Err(DirectReject::NoSurface),
+			};
 		}
 		let Some(window) = self
 			.space
 			.elements()
 			.rfind(|w| self.window_metadata.get(*w).is_none_or(|m| m.opacity != 0))
 		else {
-			return false;
+			return Err(DirectReject::NoSurface);
 		};
 		if self
 			.space
 			.element_geometry(window)
 			.is_none_or(|geo| geo.loc != Point::from((0, 0)))
 		{
-			return false;
+			return Err(DirectReject::OutputOrigin);
 		}
 		if self.window_metadata.get(window).is_some_and(|m| m.opacity != 255) {
-			return false;
+			return Err(DirectReject::NotOpaque);
 		}
 		let source = if self.is_override_active() {
 			let Some((surface, xid)) = &self.override_surface else {
-				return false;
+				return Err(DirectReject::NoSurface);
 			};
 			if window.x11_surface().is_none_or(|x| x.window_id() != *xid) {
-				return false;
+				return Err(DirectReject::Other);
 			}
 			surface.clone()
 		} else {
 			let Some(surface) = window.wl_surface() else {
-				return false;
+				return Err(DirectReject::NoSurface);
 			};
 			surface.into_owned()
 		};
@@ -1174,29 +1196,35 @@ impl MoonshineCompositor {
 			.next()
 			.is_some()
 		{
-			return false;
+			return Err(DirectReject::SurfaceTree);
 		}
 		self.surface_is_complete_output(&source)
 	}
 
 	/// A transformed/cropped tree cannot be represented by its root DMA-BUF.
-	fn surface_is_complete_output(&self, surface: &WlSurface) -> bool {
+	fn surface_is_complete_output(&self, surface: &WlSurface) -> Result<(), DirectReject> {
 		let output = self.output_rect();
 		let declared_opaque = super::gamescope_swapchain::surface_is_opaque(surface);
-		let root_valid = with_renderer_surface_state(surface, |state| {
-			let Some(view) = state.view() else {
-				return false;
-			};
-			super::capture::surface_view_is_direct(view, state.buffer_scale(), state.buffer_transform(), output.size)
-				&& (declared_opaque
-					|| state
-						.opaque_regions()
-						.is_some_and(|regions| regions.iter().any(|r| r.contains_rect(output))))
+		with_renderer_surface_state(surface, |state| {
+			let view = state.view().ok_or(DirectReject::NoSurface)?;
+			if let Some(reason) = super::capture::surface_view_rejection(
+				view,
+				state.buffer_scale(),
+				state.buffer_transform(),
+				output.size,
+			) {
+				return Err(reason);
+			}
+			if !declared_opaque
+				&& !state
+					.opaque_regions()
+					.is_some_and(|regions| regions.iter().any(|r| r.contains_rect(output)))
+			{
+				return Err(DirectReject::NotOpaque);
+			}
+			Ok(())
 		})
-		.unwrap_or(false);
-		if !root_valid {
-			return false;
-		}
+		.unwrap_or(Err(DirectReject::NoSurface))?;
 		let mut extra_content = false;
 		compositor::with_surface_tree_downward(
 			surface,
@@ -1216,11 +1244,69 @@ impl MoonshineCompositor {
 			},
 			|_, _, &()| true,
 		);
-		!extra_content
+		if extra_content {
+			Err(DirectReject::SurfaceTree)
+		} else {
+			Ok(())
+		}
 	}
 
-	/// Render the current scene and export the frame to the encoder.
-	pub fn render_and_export(&mut self) {
+	/// Service producer lifecycle even when downstream cannot use a capture.
+	/// Frame callbacks allow the game to commit its newest buffer. Presentation
+	/// feedback for skipped commits is discarded, never reported as displayed.
+	fn service_uncaptured_frame(&mut self, send_callbacks: bool) {
+		let mut feedback = OutputPresentationFeedback::new(&self.output);
+		for window in self.space.elements() {
+			if send_callbacks {
+				window.send_frame(
+					&self.output,
+					self.clock.now(),
+					Some(std::time::Duration::ZERO),
+					|_, _| Some(self.output.clone()),
+				);
+			}
+			window.take_presentation_feedback(
+				&mut feedback,
+				|_, _| Some(self.output.clone()),
+				|_, _| {
+					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+				},
+			);
+		}
+		if let Some((surface, _)) = &self.override_surface
+			&& surface.alive()
+		{
+			if send_callbacks {
+				send_frames_surface_tree(
+					surface,
+					&self.output,
+					self.clock.now(),
+					Some(std::time::Duration::ZERO),
+					|_, _| Some(self.output.clone()),
+				);
+			}
+			take_presentation_feedback_surface_tree(
+				surface,
+				&mut feedback,
+				|_, _| Some(self.output.clone()),
+				|_, _| {
+					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+				},
+			);
+		}
+		// Dropping feedback sends wp_presentation_feedback.discarded.
+		drop(feedback);
+		if let Err(error) = self.display_handle.flush_clients() {
+			tracing::error!(%error, "Failed to flush uncaptured frame callbacks");
+		}
+	}
+
+	/// Render on demand; only the refresh timer emits frame callbacks. This
+	/// prevents demand wakeups from increasing the client's render cadence.
+	pub fn render_and_export(&mut self, send_callbacks: bool) {
+		if self.log_stats && self.gpu_timer.has_pending() {
+			self.gpu_timer.poll(&mut self.renderer);
+		}
 		self.retired_buffer_pools
 			.retain(|pool| !pool.iter().all(|slot| slot.consumed.load(Ordering::Acquire)));
 		// Keep the Steam overlay z-ordered above the game while it is open.
@@ -1271,6 +1357,14 @@ impl MoonshineCompositor {
 				.count();
 			tracing::info!(
 				capture_path = ?self.capture_path, busy_pool_buffers, busy_scanout_buffers,
+				compositor_gpu_timer_supported = self.gpu_timer.supported(),
+				compositor_gpu_samples = self.gpu_timer.samples, compositor_gpu_disjoint_events = self.gpu_timer.disjoint,
+				compositor_gpu_ms_per_composited_capture = (self.gpu_timer.samples != 0).then(|| self.gpu_timer.nanoseconds as f64 / self.gpu_timer.samples as f64 / 1e6),
+				compositor_gpu_ms_per_captured_frame = (self.captured_frames != 0 && (self.composited_frames == 0 || self.gpu_timer.samples != 0)).then(|| self.gpu_timer.nanoseconds as f64 / self.captured_frames as f64 / 1e6),
+				compositor_gpu_ms_per_second = (self.captured_frames != 0 && (self.composited_frames == 0 || self.gpu_timer.samples != 0)).then(|| self.gpu_timer.nanoseconds as f64 / self.last_resource_summary.elapsed().as_secs_f64() / 1e6),
+				captured_frames = self.captured_frames, pre_render_rejected = self.pre_render_rejected,
+				stale_after_render = self.stale_after_render, direct_export_frames = self.direct_frames,
+				composited_frames = self.composited_frames, capture_requested = self.frame_tx.requested(), capture_occupied = self.frame_tx.occupied(),
 				screen_dirty = self.screen_dirty,
 				last_capture_age_ms = self.last_frame_sent_at.elapsed().as_millis() as u64,
 				held_scanout_buffers = self.held_scanout_buffers.len(),
@@ -1279,13 +1373,62 @@ impl MoonshineCompositor {
 				released_scanout_buffers = self.released_scanout_buffers,
 				"Video capture resources"
 			);
+			let r = self.direct_rejections;
+			tracing::info!(
+				direct_reject_forced_composition = r[0],
+				direct_reject_cursor = r[1],
+				direct_reject_overlay = r[2],
+				direct_reject_notification = r[3],
+				direct_reject_external_overlay = r[4],
+				direct_reject_dropdown = r[5],
+				direct_reject_decoration = r[6],
+				direct_reject_scaling = r[7],
+				direct_reject_fractional_scale = r[8],
+				direct_reject_output_origin = r[9],
+				direct_reject_not_opaque = r[10],
+				direct_reject_surface_tree = r[11],
+				direct_reject_transform = r[12],
+				direct_reject_crop = r[13],
+				direct_reject_size = r[14],
+				direct_reject_no_surface = r[15],
+				direct_reject_not_dmabuf = r[16],
+				direct_reject_other = r[17],
+				"Video direct-export rejections"
+			);
+			self.gpu_timer.reset_window();
+			self.captured_frames = 0;
+			self.pre_render_rejected = 0;
+			self.stale_after_render = 0;
+			self.direct_frames = 0;
+			self.composited_frames = 0;
+			self.direct_rejections = [0; DirectReject::COUNT];
 			self.last_resource_summary = std::time::Instant::now();
 			self.released_scanout_buffers = 0;
 		}
 		// Preserve the one-second keepalive for an actually static screen.
 		if !tick.render {
+			self.service_uncaptured_frame(send_callbacks);
 			return;
 		}
+
+		if std::time::Instant::now() < self.next_capture_at {
+			self.service_uncaptured_frame(send_callbacks);
+			return;
+		}
+		let Some(credit) = self.frame_tx.try_acquire() else {
+			if self.log_stats {
+				self.pre_render_rejected += 1;
+			}
+			self.service_uncaptured_frame(send_callbacks);
+			return;
+		};
+		// Keep the ideal cadence, skipping missed intervals without a catch-up burst.
+		let interval = std::time::Duration::from_nanos(
+			1_000_000_000_000 / self.output.current_mode().map_or(60_000, |mode| mode.refresh.max(1)) as u64,
+		);
+		self.next_capture_at =
+			super::capture::next_capture_deadline(self.next_capture_at, std::time::Instant::now(), interval);
+		let mut credit = Some(credit);
 
 		// Try direct scanout: bypass compositor rendering when a single
 		// fullscreen DMA-BUF surface covers the entire output. This avoids
@@ -1300,13 +1443,17 @@ impl MoonshineCompositor {
 		//
 		// Direct scanout bypasses GLES, so skip it while an actually-drawn
 		// cursor (not client-hidden) needs compositing.
-		if self.can_direct_scanout_scene() {
+		if let Err(reason) = self.can_direct_scanout_scene() {
+			if self.log_stats {
+				self.direct_rejections[reason as usize] += 1;
+			}
+		} else {
 			if self.is_override_active() {
-				if self.try_direct_scanout_override() {
+				if self.try_direct_scanout_override(&mut credit, send_callbacks) {
 					self.record_capture_path("direct_override");
 					return;
 				}
-			} else if self.try_direct_scanout() {
+			} else if self.try_direct_scanout(&mut credit, send_callbacks) {
 				self.record_capture_path("direct");
 				return;
 			}
@@ -1372,11 +1519,15 @@ impl MoonshineCompositor {
 			CursorImageStatus::Hidden
 		};
 
+		if self.log_stats {
+			self.gpu_timer.begin(&mut self.renderer);
+		}
 		// Bind the pre-allocated Dmabuf as a render target.
 		let bind_result = self.renderer.bind(&mut self.buffer_pool[idx].dmabuf);
 		let mut framebuffer = match bind_result {
 			Ok(fb) => fb,
 			Err(e) => {
+				self.gpu_timer.end(&mut self.renderer);
 				tracing::error!("Failed to bind Dmabuf for rendering: {e}");
 				consumed.store(true, Ordering::Release);
 				return;
@@ -1507,19 +1658,27 @@ impl MoonshineCompositor {
 				smithay::backend::renderer::sync::SyncPoint::signaled()
 			},
 			Err(e) => {
-				tracing::error!("Failed to render output: {e}");
+				drop(framebuffer);
+				self.gpu_timer.end(&mut self.renderer);
+				tracing::error!("Failed to render output: {e}; stopping capture");
+				// A partial submission may still write this buffer.
+				self.capture_failed = true;
 				return;
 			},
 		};
 
 		// Drop framebuffer before sending, to release the mutable borrow on dmabuf.
 		drop(framebuffer);
+		self.gpu_timer.end(&mut self.renderer);
 
 		// Block until the render has actually completed. `finish()` only flushes
 		// the GL blit, so without waiting the encoder can read a stale buffer
 		// from the round-robin pool (frames arrive out of order).
 		if let Err(e) = sync.wait() {
-			tracing::warn!("Failed to wait for render fence: {e}");
+			tracing::error!("Failed to wait for render fence: {e}; stopping capture");
+			// Never publish or recycle a buffer whose GPU completion is unknown.
+			self.capture_failed = true;
+			return;
 		}
 
 		// Update created_at to reflect the actual render completion time.
@@ -1532,16 +1691,27 @@ impl MoonshineCompositor {
 		// The rendering happened after export_dmabuf duplicated the fds,
 		// but the fds reference the same DMA-BUF — the encoder will see
 		// the freshly rendered content.
-		match self.frame_tx.try_send(exported_frame) {
-			Err(mpsc::TrySendError::Disconnected(_)) => {
+		match self
+			.frame_tx
+			.try_send(exported_frame, credit.take().expect("capture credit"))
+		{
+			Err(super::admission::CaptureSendError::Disconnected) => {
+				consumed.store(true, Ordering::Release);
 				tracing::debug!("Frame channel disconnected, compositor stopping.");
 			},
-			Err(mpsc::TrySendError::Full(_)) => {
-				// Channel full — release the buffer back to the pool.
+			Err(super::admission::CaptureSendError::Full) => {
+				// Channel full (only possible during epoch reset) — release the buffer.
+				if self.log_stats {
+					self.stale_after_render += 1;
+				}
 				consumed.store(true, Ordering::Release);
 			},
 			Ok(()) => {
 				// Frame accepted — reset dirty tracking.
+				if self.log_stats {
+					self.captured_frames += 1;
+					self.composited_frames += 1;
+				}
 				self.screen_dirty = false;
 				self.last_frame_sent_at = std::time::Instant::now();
 			},
@@ -1550,12 +1720,14 @@ impl MoonshineCompositor {
 		// Send frame callbacks to clients so they know to submit the
 		// next buffer.
 		self.space.elements().for_each(|window| {
-			window.send_frame(
-				&self.output,
-				self.clock.now(),
-				Some(std::time::Duration::ZERO),
-				|_, _| Some(self.output.clone()),
-			);
+			if send_callbacks {
+				window.send_frame(
+					&self.output,
+					self.clock.now(),
+					Some(std::time::Duration::ZERO),
+					|_, _| Some(self.output.clone()),
+				);
+			}
 		});
 
 		// Native Wayland clients can wait for presentation feedback before
@@ -1584,13 +1756,15 @@ impl MoonshineCompositor {
 		if let Some((ref override_surface, _)) = self.override_surface
 			&& override_surface.alive()
 		{
-			send_frames_surface_tree(
-				override_surface,
-				&self.output,
-				self.clock.now(),
-				Some(std::time::Duration::ZERO),
-				|_, _| Some(self.output.clone()),
-			);
+			if send_callbacks {
+				send_frames_surface_tree(
+					override_surface,
+					&self.output,
+					self.clock.now(),
+					Some(std::time::Duration::ZERO),
+					|_, _| Some(self.output.clone()),
+				);
+			}
 
 			// Drain and respond to wp_presentation_feedback callbacks
 			// so the NVIDIA driver's WaitForPresentKHR can return.
@@ -1636,7 +1810,11 @@ impl MoonshineCompositor {
 	/// Conditions for direct scanout:
 	/// - An opaque root exactly covers the output, with no extra visible content
 	/// - The window's committed buffer is a DMA-BUF (not SHM)
-	fn try_direct_scanout(&mut self) -> bool {
+	fn try_direct_scanout(
+		&mut self,
+		credit: &mut Option<super::admission::CaptureCredit>,
+		send_callbacks: bool,
+	) -> bool {
 		// Scene eligibility has proved that this opaque top window covers all
 		// other windows. Clone just the candidate, without a per-frame Vec.
 		let Some(window) = self
@@ -1663,17 +1841,22 @@ impl MoonshineCompositor {
 		let scanout_buffer = with_renderer_surface_state(&wl_surface, |state| {
 			let buffer = state.buffer()?;
 			if !matches!(smithay::backend::renderer::buffer_type(buffer), Some(BufferType::Dma)) {
-				tracing::trace!("Direct scanout: buffer is not DMA-BUF");
 				return None;
 			}
 			Some(buffer.clone())
 		});
 
 		let Some(Some(buffer)) = scanout_buffer else {
+			if self.log_stats {
+				self.direct_rejections[DirectReject::NotDmabuf as usize] += 1;
+			}
 			tracing::trace!("Direct scanout: no committed buffer");
 			return false;
 		};
 		let Ok(client_dmabuf) = dmabuf::get_dmabuf(&buffer) else {
+			if self.log_stats {
+				self.direct_rejections[DirectReject::NotDmabuf as usize] += 1;
+			}
 			tracing::trace!("Direct scanout: failed to get DMA-BUF from buffer");
 			return false;
 		};
@@ -1683,6 +1866,9 @@ impl MoonshineCompositor {
 		// no scaling or offset, otherwise the encoder would receive a
 		// partial or stretched frame.
 		if client_dmabuf.width() != self.width || client_dmabuf.height() != self.height {
+			if self.log_stats {
+				self.direct_rejections[DirectReject::Size as usize] += 1;
+			}
 			tracing::trace!(
 				"Direct scanout: size mismatch (client {}x{} vs output {}x{})",
 				client_dmabuf.width(),
@@ -1729,6 +1915,7 @@ impl MoonshineCompositor {
 			.collect();
 
 		let exported_frame = ExportedFrame {
+			capture_credit: None,
 			planes,
 			format: client_dmabuf.format().code as u32,
 			modifier: Into::<u64>::into(client_dmabuf.format().modifier),
@@ -1744,26 +1931,36 @@ impl MoonshineCompositor {
 		// Hold the client Buffer alive until the encoder finishes reading.
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
 
-		match self.frame_tx.try_send(exported_frame) {
-			Err(mpsc::TrySendError::Disconnected(_)) => {
+		match self
+			.frame_tx
+			.try_send(exported_frame, credit.take().expect("capture credit"))
+		{
+			Err(super::admission::CaptureSendError::Disconnected) => {
+				consumed.store(true, Ordering::Release);
 				tracing::debug!("Frame channel disconnected, compositor stopping.");
 			},
-			Err(mpsc::TrySendError::Full(_)) => {
+			Err(super::admission::CaptureSendError::Full) => {
 				consumed.store(true, Ordering::Release);
 			},
 			Ok(()) => {
+				if self.log_stats {
+					self.captured_frames += 1;
+					self.direct_frames += 1;
+				}
 				self.screen_dirty = false;
 				self.last_frame_sent_at = std::time::Instant::now();
 			},
 		}
 
 		// Send frame callbacks to the client.
-		window.send_frame(
-			&self.output,
-			self.clock.now(),
-			Some(std::time::Duration::ZERO),
-			|_, _| Some(self.output.clone()),
-		);
+		if send_callbacks {
+			window.send_frame(
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
+		}
 
 		// Drain and respond to wp_presentation_feedback callbacks.
 		let mut feedback = OutputPresentationFeedback::new(&self.output);
@@ -1805,7 +2002,11 @@ impl MoonshineCompositor {
 	/// latency. This sends the override surface's committed DMA-BUF straight
 	/// to the encoder and delivers frame callbacks to the override surface so
 	/// the WSI layer's `vkQueuePresentKHR` can unblock for the next frame.
-	fn try_direct_scanout_override(&mut self) -> bool {
+	fn try_direct_scanout_override(
+		&mut self,
+		credit: &mut Option<super::admission::CaptureCredit>,
+		send_callbacks: bool,
+	) -> bool {
 		let override_surface = match self.override_surface.as_ref() {
 			Some((s, _)) if s.alive() => s.clone(),
 			_ => return false,
@@ -1814,22 +2015,30 @@ impl MoonshineCompositor {
 		let scanout_buffer = with_renderer_surface_state(&override_surface, |state| {
 			let buffer = state.buffer()?;
 			if !matches!(smithay::backend::renderer::buffer_type(buffer), Some(BufferType::Dma)) {
-				tracing::trace!("Override scanout: buffer is not DMA-BUF");
 				return None;
 			}
 			Some(buffer.clone())
 		});
 		let Some(Some(buffer)) = scanout_buffer else {
+			if self.log_stats {
+				self.direct_rejections[DirectReject::NotDmabuf as usize] += 1;
+			}
 			tracing::trace!("Override scanout: no committed buffer");
 			return false;
 		};
 		let Ok(client_dmabuf) = dmabuf::get_dmabuf(&buffer) else {
+			if self.log_stats {
+				self.direct_rejections[DirectReject::NotDmabuf as usize] += 1;
+			}
 			tracing::trace!("Override scanout: failed to get DMA-BUF from buffer");
 			return false;
 		};
 		let client_dmabuf = client_dmabuf.clone();
 
 		if client_dmabuf.width() != self.width || client_dmabuf.height() != self.height {
+			if self.log_stats {
+				self.direct_rejections[DirectReject::Size as usize] += 1;
+			}
 			tracing::trace!(
 				"Override scanout: size mismatch (client {}x{} vs output {}x{})",
 				client_dmabuf.width(),
@@ -1896,6 +2105,7 @@ impl MoonshineCompositor {
 			.collect();
 
 		let exported_frame = ExportedFrame {
+			capture_credit: None,
 			planes,
 			format: client_dmabuf.format().code as u32,
 			modifier: Into::<u64>::into(client_dmabuf.format().modifier),
@@ -1910,14 +2120,22 @@ impl MoonshineCompositor {
 
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
 
-		match self.frame_tx.try_send(exported_frame) {
-			Err(mpsc::TrySendError::Disconnected(_)) => {
+		match self
+			.frame_tx
+			.try_send(exported_frame, credit.take().expect("capture credit"))
+		{
+			Err(super::admission::CaptureSendError::Disconnected) => {
+				consumed.store(true, Ordering::Release);
 				tracing::debug!("Frame channel disconnected, compositor stopping.");
 			},
-			Err(mpsc::TrySendError::Full(_)) => {
+			Err(super::admission::CaptureSendError::Full) => {
 				consumed.store(true, Ordering::Release);
 			},
 			Ok(()) => {
+				if self.log_stats {
+					self.captured_frames += 1;
+					self.direct_frames += 1;
+				}
 				self.screen_dirty = false;
 				self.last_frame_sent_at = std::time::Instant::now();
 			},
@@ -1926,13 +2144,15 @@ impl MoonshineCompositor {
 		// Frame callbacks must go to the override surface (the game's WSI
 		// layer is waiting on these to unblock vkQueuePresentKHR). Without
 		// this the game would block forever after the first frame.
-		send_frames_surface_tree(
-			&override_surface,
-			&self.output,
-			self.clock.now(),
-			Some(std::time::Duration::ZERO),
-			|_, _| Some(self.output.clone()),
-		);
+		if send_callbacks {
+			send_frames_surface_tree(
+				&override_surface,
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
+		}
 
 		let mut feedback = OutputPresentationFeedback::new(&self.output);
 		take_presentation_feedback_surface_tree(
@@ -2320,6 +2540,7 @@ impl MoonshineCompositor {
 	/// connections and exits. The application's systemd scope is stopped by
 	/// `Application::Drop` after the compositor thread has exited.
 	pub fn shutdown_session_processes(&mut self) {
+		self.gpu_timer.destroy(&mut self.renderer);
 		if let Some(token) = self.wayland_socket_token.take() {
 			self.handle.remove(token);
 			tracing::debug!(wayland_display = %self.wayland_display, "Removed Wayland listening socket source");
@@ -2377,6 +2598,7 @@ fn export_dmabuf(
 		.collect();
 
 	Ok(ExportedFrame {
+		capture_credit: None,
 		planes,
 		format: dmabuf.format().code as u32,
 		modifier: Into::<u64>::into(dmabuf.format().modifier),

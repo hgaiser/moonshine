@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
+use crate::session::compositor::frame::HdrModeState;
 use crate::session::manager::SessionShutdownReason;
 
 mod diagnostics;
@@ -15,6 +15,7 @@ mod gso_socket;
 mod packetizer;
 mod pipeline;
 pub(crate) mod pyrowave;
+pub use pyrowave::PyroWaveQueueMode;
 mod shard_batch;
 pub use fec::FecMode;
 use fec::FrameFecStatus;
@@ -58,6 +59,8 @@ pub struct VideoStreamConfig {
 	/// Disabling this also skips diagnostic accumulation and process sampling;
 	/// benchmark frame statistics and operational warnings remain available.
 	pub log_stats: bool,
+	/// GPU scheduling preference for cross-process PyroWave encoding.
+	pub pyrowave_queue: pyrowave::PyroWaveQueueMode,
 
 	/// Upper bound for the client-requested video packet size, in bytes.
 	///
@@ -112,6 +115,7 @@ impl Default for VideoStreamConfig {
 			encrypt: false,
 			log_frame_spikes: false,
 			log_stats: true,
+			pyrowave_queue: pyrowave::PyroWaveQueueMode::Auto,
 			max_packet_size: 0,
 		}
 	}
@@ -364,7 +368,7 @@ impl VideoStreamHandle {
 
 pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
-	frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+	frame_rx: crate::session::compositor::admission::CaptureReceiver,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 }
@@ -373,7 +377,7 @@ impl VideoStream {
 	pub async fn new(
 		config: VideoStreamConfig,
 		address: String,
-		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		frame_rx: crate::session::compositor::admission::CaptureReceiver,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,

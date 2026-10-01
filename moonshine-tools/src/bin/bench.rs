@@ -8,23 +8,29 @@ use moonshine_core::config::ApplicationConfig;
 use moonshine_core::session::SessionContext;
 use moonshine_core::session::SessionKeyData;
 use moonshine_core::session::SessionKeys;
-use moonshine_core::session::compositor::CompositorConfig;
+use moonshine_core::session::compositor::{CaptureMode, CompositorConfig};
 use moonshine_core::session::manager::SessionManager;
 use moonshine_core::session::stream::audio::AudioChannels;
 use moonshine_core::session::stream::audio::AudioConfig;
 use moonshine_core::session::stream::audio::AudioStreamConfig;
 use moonshine_core::session::stream::audio::AudioStreamContext;
 use moonshine_core::session::stream::control::ControlStreamConfig;
-use moonshine_core::session::stream::video::FrameStats;
 use moonshine_core::session::stream::video::VideoStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamContext;
 use moonshine_core::session::stream::video::{BitDepth, ChromaFormat, ColorRange, NegotiatedVideoFormat, VideoCodec};
+use moonshine_core::session::stream::video::{FrameStats, PyroWaveQueueMode};
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 #[derive(Parser, Debug)]
 #[command(name = "moonshine-bench", about = "Benchmark Moonshine's encoding pipeline")]
 struct Args {
+	/// Force composition to measure the fallback independently of fullscreen eligibility.
+	#[arg(long)]
+	composited: bool,
+	/// PyroWave queue preference at normal priority.
+	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
+	pyrowave_queue: String,
 	/// Command to run (application to spawn).
 	command: Vec<String>,
 
@@ -668,8 +674,22 @@ async fn run_benchmark(
 
 	let shutdown = ShutdownManager::<ShutdownReason>::new();
 	let session_manager = SessionManager::new(
-		CompositorConfig::default(),
-		VideoStreamConfig::default(),
+		CompositorConfig {
+			capture_mode: if args.composited {
+				CaptureMode::Composited
+			} else {
+				CaptureMode::Auto
+			},
+			..Default::default()
+		},
+		VideoStreamConfig {
+			pyrowave_queue: match args.pyrowave_queue.as_str() {
+				"graphics" => PyroWaveQueueMode::Graphics,
+				"compute" => PyroWaveQueueMode::Compute,
+				_ => PyroWaveQueueMode::Auto,
+			},
+			..VideoStreamConfig::default()
+		},
 		AudioStreamConfig { port: 0 },
 		ControlStreamConfig {
 			port: 0,

@@ -30,6 +30,15 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 
+/// Window counters shared by both importers, reported only every five seconds.
+#[derive(Default, Debug, Clone, Copy)]
+pub(crate) struct ImportCacheStats {
+	pub hit: u64,
+	pub miss: u64,
+	pub recreate: u64,
+	pub evict: u64,
+}
+
 /// TTL before a cached import is evicted. 2s covers in-flight GPU work
 /// (~16ms depth-2 at 120fps) while keeping VRAM under control.
 const CACHE_TTL: Duration = Duration::from_secs(2);
@@ -204,6 +213,7 @@ pub(crate) struct DmaBufImporter {
 	calls_since_sweep: u32,
 	last_resource_summary: Instant,
 	log_stats: bool,
+	stats: ImportCacheStats,
 }
 
 impl DmaBufImporter {
@@ -219,6 +229,7 @@ impl DmaBufImporter {
 			calls_since_sweep: 0,
 			last_resource_summary: Instant::now(),
 			log_stats,
+			stats: ImportCacheStats::default(),
 		})
 	}
 
@@ -246,11 +257,20 @@ impl DmaBufImporter {
 			&& cached.is_same_buffer(fd)
 		{
 			cached.touch(now);
+			if self.log_stats {
+				self.stats.hit += 1;
+			}
 			return Ok((Arc::clone(cached), false));
 		}
 
+		if self.log_stats {
+			self.stats.miss += 1;
+		}
 		// Miss: retire the stale entry for TTL-deferred release.
 		if let Some(stale) = self.cache.remove(&fd) {
+			if self.log_stats {
+				self.stats.recreate += 1;
+			}
 			debug!(
 				"fd {fd} now refers to a different buffer (params {:?} -> {:?}); retiring stale import",
 				stale.params, params
@@ -306,13 +326,21 @@ impl DmaBufImporter {
 		let before = self.retired.len();
 		self.retired.retain(|v| v.last_used() >= cutoff);
 		let dropped = before - self.retired.len();
+		if self.log_stats {
+			self.stats.evict += moved as u64;
+		}
 		if self.log_stats && now.duration_since(self.last_resource_summary) >= Duration::from_secs(5) {
 			tracing::info!(
 				import_cache = self.cache.len(),
+				import_cache_hit = self.stats.hit,
+				import_cache_miss = self.stats.miss,
+				import_cache_recreate = self.stats.recreate,
+				import_cache_evict = self.stats.evict,
 				retired_imports = self.retired.len(),
 				"Video DMA-BUF resources"
 			);
 			self.last_resource_summary = now;
+			self.stats = ImportCacheStats::default();
 		}
 
 		if moved > 0 || dropped > 0 {

@@ -15,7 +15,7 @@ use async_shutdown::ShutdownManager;
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, HdrMetadata, HdrModeState};
+use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeState};
 use crate::session::manager::SessionShutdownReason;
 
 use crate::session::stream::video::diagnostics::PipelineWindow;
@@ -490,7 +490,7 @@ async fn run_packet_consumer(
 impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
-		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		frame_rx: crate::session::compositor::admission::CaptureReceiver,
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
@@ -580,7 +580,7 @@ impl VideoPipelineInner {
 	fn run(
 		mut self,
 		runtime: tokio::runtime::Handle,
-		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		frame_rx: crate::session::compositor::admission::CaptureReceiver,
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
@@ -620,6 +620,7 @@ impl VideoPipelineInner {
 				}
 				break;
 			}
+			frame_rx.reset();
 			let result = if self.context.format.codec == VideoCodec::PyroWave {
 				self.run_pyrowave_encoding_loop(
 					&frame_rx,
@@ -741,7 +742,7 @@ impl VideoPipelineInner {
 	#[allow(clippy::too_many_arguments)]
 	fn run_pyrowave_encoding_loop(
 		&self,
-		frame_rx: &std::sync::mpsc::Receiver<ExportedFrame>,
+		frame_rx: &crate::session::compositor::admission::CaptureReceiver,
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
 		idr_frame_request_rx: &mut broadcast::Receiver<()>,
 		invalidate_request_rx: &mut broadcast::Receiver<(u32, u32)>,
@@ -758,8 +759,15 @@ impl VideoPipelineInner {
 		let video_context = VideoContextBuilder::new()
 			.build()
 			.map_err(|e| format!("Failed to create Vulkan context for PyroWave adapter matching: {e}"))?;
-		let mut encoder =
-			PyroWaveEncoder::new(&video_context, ctx.format, ctx.width, ctx.height, ctx.bitrate, ctx.fps)?;
+		let mut encoder = PyroWaveEncoder::new(
+			&video_context,
+			ctx.format,
+			ctx.width,
+			ctx.height,
+			ctx.bitrate,
+			ctx.fps,
+			self.config.pyrowave_queue,
+		)?;
 		let _ = hdr_metadata_tx.send(HdrModeState::new(ctx.format.hdr));
 		self.activate_reconfigured_epoch(runtime, &packet_tx, applied)?;
 		let quality_reference_bytes =
@@ -823,9 +831,13 @@ impl VideoPipelineInner {
 		let mut consecutive_slow_sends = 0u32;
 		let mut last_slow_send_warning: Option<std::time::Instant> = None;
 		let mut diagnostics = PipelineWindow::new(self.config.log_stats);
+		let mut gpu_report_started = std::time::Instant::now();
+		let mut gpu_window_frames = 0u64;
+		let mut gpu_window_encodes = 0u64;
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			if let Ok(command) = reconfigure_rx.try_recv() {
+				frame_rx.reset();
 				return Ok(Some(command));
 			}
 			if fec_feedback_rx.has_changed().unwrap_or(false) {
@@ -850,21 +862,18 @@ impl VideoPipelineInner {
 			// encoder-state invalidation. Drain the channel so it cannot lag.
 			while invalidate_request_rx.try_recv().is_ok() {}
 
-			let received = match frame_rx.recv_timeout(frame_interval) {
+			let mut received = match frame_rx.recv_timeout(frame_interval) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => None,
 				Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
 			};
 
-			let mut stale_frames_dropped = 0u32;
-			let (encoded, created_at, buffer_index, channel_wait) = if let Some(mut frame) = received {
-				// The encoder is synchronous. If it fell behind, consume only the
-				// newest queued compositor frame instead of encoding a stale burst.
-				while let Ok(newer) = frame_rx.try_recv() {
-					frame.consumed.store(true, Ordering::Release);
-					frame = newer;
-					stale_frames_dropped = stale_frames_dropped.saturating_add(1);
-				}
+			// Keep admission occupied through packetization and actual socket send,
+			// independently of the source buffer's earlier GPU-consumed lifecycle.
+			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
+			let stale_frames_dropped = 0u32;
+			let (encoded, created_at, buffer_index, channel_wait) = if let Some(frame) = received {
+				gpu_window_encodes += 1;
 				let received_at = std::time::Instant::now();
 				let created_at = frame.created_at;
 				let buffer_index = frame.buffer_index;
@@ -952,9 +961,12 @@ impl VideoPipelineInner {
 			let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
 			let mut shards = shards;
 			shards.set_send_completion(completion_tx);
-			packet_tx
-				.blocking_send(VideoPacketMessage::Batch(shards))
-				.map_err(|_| "video packet channel closed".to_string())?;
+			if packet_tx.blocking_send(VideoPacketMessage::Batch(shards)).is_err() {
+				if stop_session_manager.is_shutdown_triggered() {
+					return Ok(None);
+				}
+				return Err("video packet channel closed".to_string());
+			}
 			let queued = std::time::Instant::now();
 			let sent = loop {
 				match completion_rx.recv_timeout(frame_interval) {
@@ -963,6 +975,9 @@ impl VideoPipelineInner {
 						if !stop_session_manager.is_shutdown_triggered() => {},
 					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
 					Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+						if stop_session_manager.is_shutdown_triggered() {
+							return Ok(None);
+						}
 						return Err("video packet sender stopped before sending PyroWave frame".to_string());
 					},
 				}
@@ -1015,6 +1030,14 @@ impl VideoPipelineInner {
 				Some(encoder.import_cache_len()),
 			);
 			let _ = stats_tx.send(stats);
+			gpu_window_frames += 1;
+			if self.config.log_stats && gpu_report_started.elapsed() >= std::time::Duration::from_secs(5) {
+				let seconds = gpu_report_started.elapsed().as_secs_f64();
+				encoder.report_gpu_timings(gpu_window_encodes as f64 / seconds, gpu_window_frames as f64 / seconds);
+				gpu_window_frames = 0;
+				gpu_window_encodes = 0;
+				gpu_report_started = std::time::Instant::now();
+			}
 			last_encoded = Some(encoded);
 		}
 		Ok(None)
@@ -1024,7 +1047,7 @@ impl VideoPipelineInner {
 	fn run_encoding_loop(
 		&self,
 		runtime: &tokio::runtime::Handle,
-		frame_rx: &std::sync::mpsc::Receiver<ExportedFrame>,
+		frame_rx: &crate::session::compositor::admission::CaptureReceiver,
 		context: VideoContext,
 		mut encoder: Encoder,
 		packet_tx: mpsc::Sender<VideoPacketMessage>,
@@ -1144,6 +1167,7 @@ impl VideoPipelineInner {
 		while !stop_session_manager.is_shutdown_triggered() {
 			let reconfigure = reconfigure_rx.try_recv().ok();
 			if reconfigure.is_some() {
+				frame_rx.reset();
 				// Exit through the flush/drain barrier below. It guarantees every
 				// packet from the old encoder epoch is consumed before activation.
 				if let Err(e) = encoder.flush() {
@@ -1227,7 +1251,9 @@ impl VideoPipelineInner {
 			}
 
 			// Try to receive a frame from compositor (with timeout).
-			let received_frame = match frame_rx.recv_timeout(frame_interval) {
+			let received_frame = match frame_rx
+				.recv_timeout_if(frame_interval, in_flight.load(Ordering::Relaxed) < MAX_FRAMES_IN_FLIGHT)
+			{
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.

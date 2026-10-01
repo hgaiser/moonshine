@@ -19,8 +19,9 @@ use pixelforge::VideoContext;
 use super::format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 };
-use super::pipeline::dmabuf::same_open_file;
+use super::pipeline::dmabuf::{ImportCacheStats, same_open_file};
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
+use serde::{Deserialize, Serialize};
 
 pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
 pub(crate) const SOURCE_REVISION: &str = "e344479d6c0439e346c788a918ad5645713f7573";
@@ -137,6 +138,87 @@ struct ColorMetadata {
 	chroma_siting: u32,
 }
 
+/// Auto uses a compute-only queue family when present, at normal priority.
+#[derive(Debug, Default, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PyroWaveQueueMode {
+	#[default]
+	Auto,
+	Graphics,
+	Compute,
+}
+impl PyroWaveQueueMode {
+	fn flags(self, dedicated: bool) -> vk::QueueFlags {
+		if self == Self::Compute || (self == Self::Auto && dedicated) {
+			vk::QueueFlags::COMPUTE
+		} else {
+			vk::QueueFlags::GRAPHICS
+		}
+	}
+}
+// Compatibility creation starts on graphics. Failure of an optional queue
+// preference leaves that safe default usable, including fallback API failure.
+fn select_queue(
+	mode: PyroWaveQueueMode,
+	dedicated: bool,
+	mut select: impl FnMut(vk::QueueFlags) -> ResultCode,
+) -> (vk::QueueFlags, ResultCode) {
+	let requested = mode.flags(dedicated);
+	let result = select(requested);
+	if result == SUCCESS {
+		(requested, result)
+	} else {
+		let _ = select(vk::QueueFlags::GRAPHICS);
+		(vk::QueueFlags::GRAPHICS, result)
+	}
+}
+type SetQueueType = unsafe extern "C" fn(DeviceHandle, vk::QueueFlags) -> ResultCode;
+type ReportPerformance =
+	unsafe extern "C" fn(DeviceHandle, unsafe extern "C" fn(*mut c_void, *const std::ffi::c_char), *mut c_void, bool);
+
+/// Exclusive codec stages reported by the pinned C API. Unknown/CPU/heap
+/// records are ignored. Timestamp values describe execution intervals, while
+/// encode_wait measures submission-to-readback latency, including queue wait.
+#[derive(Default, Debug)]
+struct GpuTimings {
+	stages: [Option<f64>; 6],
+}
+impl GpuTimings {
+	fn record(&mut self, message: &str) {
+		let Some((tag, value)) = message.split_once(": ") else {
+			return;
+		};
+		let Some(index) = ["DWT", "Quant", "Analyze", "Resolve", "Packing", "scale"]
+			.iter()
+			.position(|t| *t == tag)
+		else {
+			return;
+		};
+		let Some(ms) = value
+			.strip_suffix(" ms per frame")
+			.and_then(|v| v.parse::<f64>().ok())
+			.filter(|v| v.is_finite() && *v >= 0.0)
+		else {
+			return;
+		};
+		self.stages[index] = Some(ms);
+	}
+	fn total(&self) -> Option<f64> {
+		self.stages.iter().copied().sum()
+	}
+}
+unsafe extern "C" fn performance_callback(userdata: *mut c_void, message: *const std::ffi::c_char) {
+	// SAFETY: report_performance_stats invokes this callback synchronously with
+	// our stack-owned GpuTimings and a NUL-terminated temporary C string.
+	if userdata.is_null() || message.is_null() {
+		return;
+	}
+	let stats = unsafe { &mut *userdata.cast::<GpuTimings>() };
+	if let Ok(message) = unsafe { CStr::from_ptr(message) }.to_str() {
+		stats.record(message);
+	}
+}
+
 type GetApiVersion = unsafe extern "C" fn(*mut u32, *mut u32, *mut u32);
 type CreateDeviceByCompat =
 	unsafe extern "C" fn(u32, u32, *const Uuid, *const Uuid, *const c_void, *mut DeviceHandle) -> ResultCode;
@@ -164,6 +246,8 @@ struct Api {
 	_library: Library,
 	create_device_by_compat: CreateDeviceByCompat,
 	confirm_interop: ConfirmInterop,
+	set_queue_type: SetQueueType,
+	report_performance: ReportPerformance,
 	destroy_device: DestroyDevice,
 	create_encoder: CreateEncoder,
 	destroy_encoder: DestroyEncoder,
@@ -223,6 +307,8 @@ impl Api {
 				let api = Self {
 					create_device_by_compat: symbol!("pyrowave_create_device_by_compat", CreateDeviceByCompat),
 					confirm_interop: symbol!("pyrowave_device_confirm_interop_support", ConfirmInterop),
+					set_queue_type: symbol!("pyrowave_device_set_queue_type", SetQueueType),
+					report_performance: symbol!("pyrowave_device_report_performance_stats", ReportPerformance),
 					destroy_device: symbol!("pyrowave_device_destroy", DestroyDevice),
 					create_encoder: symbol!("pyrowave_encoder_create", CreateEncoder),
 					destroy_encoder: symbol!("pyrowave_encoder_destroy", DestroyEncoder),
@@ -257,7 +343,12 @@ struct Device {
 }
 
 impl Device {
-	fn for_video_context(api: Rc<Api>, context: &VideoContext) -> Result<Rc<Self>, String> {
+	fn for_video_context(
+		api: Rc<Api>,
+		context: &VideoContext,
+		mode: PyroWaveQueueMode,
+		log_selection: bool,
+	) -> Result<Rc<Self>, String> {
 		let mut ids = vk::PhysicalDeviceIDProperties::default();
 		let mut properties = vk::PhysicalDeviceProperties2 {
 			p_next: (&mut ids as *mut vk::PhysicalDeviceIDProperties<'_>).cast(),
@@ -304,6 +395,23 @@ impl Device {
 			// SAFETY: no child objects exist yet.
 			unsafe { (api.destroy_device)(handle) };
 			return Err("PyroWave device does not support DMA-BUF interoperability".to_string());
+		}
+		// Granite's compatibility-device builder selects a compute-only family
+		// first, then another compute queue, then graphics. No queue ownership is
+		// moved inside our process; the entire PyroWave pipeline uses one queue.
+		let families = unsafe {
+			context
+				.instance()
+				.get_physical_device_queue_family_properties(context.physical_device())
+		};
+		let dedicated = families.iter().any(|q| {
+			q.queue_count != 0
+				&& q.queue_flags.contains(vk::QueueFlags::COMPUTE)
+				&& !q.queue_flags.contains(vk::QueueFlags::GRAPHICS)
+		});
+		let (selected, result) = select_queue(mode, dedicated, |flags| unsafe { (api.set_queue_type)(handle, flags) });
+		if log_selection {
+			tracing::info!(requested_mode = ?mode, queue_preference = ?selected, dedicated_compute_available = dedicated, selection_result = result, global_priority = "medium", "PyroWave queue selection (library falls back to graphics when compute is unavailable)");
 		}
 		Ok(Rc::new(Self {
 			api,
@@ -360,6 +468,7 @@ impl Drop for ImportedImage {
 struct ImageCache<T> {
 	entries: HashMap<RawFd, (T, Instant)>,
 	calls_since_sweep: u32,
+	stats: ImportCacheStats,
 }
 
 impl<T> ImageCache<T> {
@@ -370,6 +479,7 @@ impl<T> ImageCache<T> {
 		Self {
 			entries: HashMap::new(),
 			calls_since_sweep: 0,
+			stats: ImportCacheStats::default(),
 		}
 	}
 
@@ -377,8 +487,10 @@ impl<T> ImageCache<T> {
 		self.calls_since_sweep += 1;
 		if self.calls_since_sweep >= Self::SWEEP_INTERVAL {
 			self.calls_since_sweep = 0;
+			let before = self.entries.len();
 			self.entries
 				.retain(|_, (_, used)| now.saturating_duration_since(*used) <= Self::TTL);
+			self.stats.evict += (before - self.entries.len()) as u64;
 		}
 		self.entries.get_mut(&fd).map(|(image, used)| {
 			*used = now;
@@ -435,7 +547,7 @@ impl PyroWaveEncoder {
 			));
 		}
 		let api = Api::load()?;
-		let device = Device::for_video_context(api, context)?;
+		let device = Device::for_video_context(api, context, PyroWaveQueueMode::Auto, false)?;
 		let info = EncoderCreateInfo {
 			device: device.handle,
 			width: 128,
@@ -466,6 +578,7 @@ impl PyroWaveEncoder {
 		height: u32,
 		bitrate: usize,
 		fps: u32,
+		queue_mode: PyroWaveQueueMode,
 	) -> Result<Self, String> {
 		if format.range != ColorRange::Full {
 			return Err("PyroWave's scaled RGB path currently supports full-range output only".to_string());
@@ -478,7 +591,7 @@ impl PyroWaveEncoder {
 			format!("PyroWave frame budget {bytes} is outside the wire-v1 range (1 KiB to 3 MiB)")
 		})?;
 		let api = Api::load()?;
-		let device = Device::for_video_context(api, context)?;
+		let device = Device::for_video_context(api, context, queue_mode, true)?;
 		let info = EncoderCreateInfo {
 			device: device.handle,
 			width: i32::try_from(width).map_err(|_| "PyroWave width exceeds i32")?,
@@ -546,8 +659,13 @@ impl PyroWaveEncoder {
 			.images
 			.get(fd, now)
 			.is_some_and(|image| image.matches(frame, format));
-		if !reuse {
-			self.images.entries.remove(&fd);
+		if reuse {
+			self.images.stats.hit += 1;
+		} else {
+			self.images.stats.miss += 1;
+			if self.images.entries.remove(&fd).is_some() {
+				self.images.stats.recreate += 1;
+			}
 			let identity_fd = unsafe { BorrowedFd::borrow_raw(fd) }
 				.try_clone_to_owned()
 				.map_err(|e| format!("duplicating DMA-BUF identity fd: {e}"))?;
@@ -761,6 +879,36 @@ impl PyroWaveEncoder {
 		})
 	}
 
+	/// Call only at a diagnostic boundary, after packetization completed GPU
+	/// work. Granite resolves timestamps when recycling frame contexts; reports
+	/// lag by that bounded depth and are averages over resolved contexts.
+	pub(crate) fn report_gpu_timings(&mut self, encoded_fps: f64, delivered_fps: f64) {
+		let mut stats = GpuTimings::default();
+		unsafe {
+			(self.device.api.report_performance)(
+				self.device.handle,
+				performance_callback,
+				(&mut stats as *mut GpuTimings).cast(),
+				true,
+			);
+		}
+		let c = std::mem::take(&mut self.images.stats);
+		tracing::info!(
+			import_cache_hit = c.hit,
+			import_cache_miss = c.miss,
+			import_cache_recreate = c.recreate,
+			import_cache_evict = c.evict,
+			import_cache = self.images.entries.len(),
+			"PyroWave DMA-BUF import summary"
+		);
+		let s = stats.stages;
+		tracing::info!(dwt_gpu_ms = ?s[0], quant_gpu_ms = ?s[1], analyze_gpu_ms = ?s[2], resolve_gpu_ms = ?s[3], packing_gpu_ms = ?s[4], scaler_conversion_gpu_ms = ?s[5],
+			pyrowave_stage_gpu_ms_per_encoded_frame = ?stats.total(),
+            pyrowave_stage_gpu_ms_per_delivered_frame = ?stats.total().filter(|_| delivered_fps > 0.0).map(|ms| ms * encoded_fps / delivered_fps),
+            estimated_stage_gpu_ms_per_delivered_second = ?stats.total().map(|ms| ms * encoded_fps),
+			"PyroWave GPU timestamps (exclusive stage sum, excludes transfers; encode_wait is wall-clock latency)");
+	}
+
 	pub(crate) fn maximum_frame_bytes(&self) -> usize {
 		self.maximum_frame_bytes
 	}
@@ -889,5 +1037,56 @@ mod tests {
 		if std::env::var_os("MOONSHINE_TEST_PYROWAVE").is_some() {
 			Api::load().expect("the packaged authoritative PyroWave library must expose the pinned ABI");
 		}
+	}
+	#[test]
+	fn queue_selection_auto_falls_back_and_overrides_are_explicit() {
+		assert_eq!(PyroWaveQueueMode::Auto.flags(false), vk::QueueFlags::GRAPHICS);
+		assert_eq!(PyroWaveQueueMode::Auto.flags(true), vk::QueueFlags::COMPUTE);
+		assert_eq!(PyroWaveQueueMode::Graphics.flags(true), vk::QueueFlags::GRAPHICS);
+		assert_eq!(PyroWaveQueueMode::Compute.flags(false), vk::QueueFlags::COMPUTE);
+		assert!(toml::from_str::<super::super::VideoStreamConfig>("pyrowave_queue = 'high'").is_err());
+	}
+	#[test]
+	fn gpu_report_ignores_cpu_and_memory_and_requires_all_stages() {
+		let mut timings = GpuTimings::default();
+		for msg in [
+			"submit: 100.000 ms per frame",
+			"Memory Heap 0 (DEVICE): MaxSize 12.0 MiB",
+			"DWT: NaN ms per frame",
+			"DWT: -1 ms per frame",
+		] {
+			timings.record(msg);
+		}
+		assert!(timings.total().is_none());
+		for tag in ["DWT", "Quant", "Analyze", "Resolve", "Packing", "scale"] {
+			timings.record(&format!("{tag}: 0.100 ms per frame"));
+		}
+		assert!((timings.total().unwrap() - 0.6).abs() < 1e-9);
+	}
+}
+
+#[cfg(test)]
+mod queue_fallback_tests {
+	use super::*;
+	#[test]
+	fn compute_selection_failure_uses_safe_graphics_default() {
+		let mut attempts = Vec::new();
+		let (flags, result) = select_queue(PyroWaveQueueMode::Auto, true, |flags| {
+			attempts.push(flags);
+			if flags == vk::QueueFlags::COMPUTE { -1 } else { SUCCESS }
+		});
+		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
+		assert_eq!(result, -1);
+		assert_eq!(attempts, [vk::QueueFlags::COMPUTE, vk::QueueFlags::GRAPHICS]);
+		let (flags, _) = select_queue(PyroWaveQueueMode::Compute, true, |_| -1);
+		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
+	}
+	#[test]
+	fn auto_without_dedicated_family_never_requests_compute() {
+		let (flags, _) = select_queue(PyroWaveQueueMode::Auto, false, |flags| {
+			assert_eq!(flags, vk::QueueFlags::GRAPHICS);
+			SUCCESS
+		});
+		assert_eq!(flags, vk::QueueFlags::GRAPHICS);
 	}
 }

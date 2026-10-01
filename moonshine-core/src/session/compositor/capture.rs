@@ -52,33 +52,91 @@ pub(super) struct SceneExtras {
 	pub dropdown: bool,
 	pub decoration: bool,
 	pub scaling: bool,
+	pub fractional_scale: bool,
+}
+
+/// First blocking reason in deterministic scene order. One counter increment
+/// per attempted capture; no strings, allocations, or atomics in classification.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(usize)]
+pub(super) enum DirectReject {
+	ForcedComposition,
+	Cursor,
+	Overlay,
+	Notification,
+	ExternalOverlay,
+	Dropdown,
+	Decoration,
+	Scaling,
+	FractionalScale,
+	OutputOrigin,
+	NotOpaque,
+	SurfaceTree,
+	Transform,
+	Crop,
+	Size,
+	NoSurface,
+	NotDmabuf,
+	Other,
+}
+impl DirectReject {
+	pub const COUNT: usize = 18;
 }
 
 impl SceneExtras {
+	pub fn rejection(&self, mode: CaptureMode) -> Option<DirectReject> {
+		use DirectReject::*;
+		[
+			(mode == CaptureMode::Composited, ForcedComposition),
+			(self.cursor, Cursor),
+			(self.steam_overlay, Overlay),
+			(self.steam_notification, Notification),
+			(self.external_overlay, ExternalOverlay),
+			(self.dropdown, Dropdown),
+			(self.decoration, Decoration),
+			(self.scaling, Scaling),
+			(self.fractional_scale, FractionalScale),
+		]
+		.into_iter()
+		.find_map(|(yes, reason)| yes.then_some(reason))
+	}
+	#[cfg(test)]
 	pub fn requires_composition(&self, mode: CaptureMode) -> bool {
-		mode == CaptureMode::Composited
-			|| self.cursor
-			|| self.steam_overlay
-			|| self.steam_notification
-			|| self.external_overlay
-			|| self.dropdown
-			|| self.decoration
-			|| self.scaling
+		self.rejection(mode).is_some()
 	}
 }
 
-pub(super) fn surface_view_is_direct(
+pub(super) fn surface_view_rejection(
+	view: smithay::backend::renderer::utils::SurfaceView,
+	buffer_scale: i32,
+	transform: smithay::utils::Transform,
+	output: smithay::utils::Size<i32, smithay::utils::Logical>,
+) -> Option<DirectReject> {
+	use DirectReject::*;
+	if transform != smithay::utils::Transform::Normal {
+		Some(Transform)
+	} else if buffer_scale != 1 {
+		Some(Scaling)
+	} else if view.offset != (0, 0).into() {
+		Some(OutputOrigin)
+	} else if view.src.loc != (0.0, 0.0).into() {
+		Some(Crop)
+	} else if view.dst != output {
+		Some(Size)
+	} else if view.src.size != output.to_f64() {
+		Some(Scaling)
+	} else {
+		None
+	}
+}
+#[cfg(test)]
+fn surface_view_is_direct(
 	view: smithay::backend::renderer::utils::SurfaceView,
 	buffer_scale: i32,
 	transform: smithay::utils::Transform,
 	output: smithay::utils::Size<i32, smithay::utils::Logical>,
 ) -> bool {
-	buffer_scale == 1
-		&& transform == smithay::utils::Transform::Normal
-		&& view.offset == (0, 0).into()
-		&& view.dst == output
-		&& view.src.loc == (0.0, 0.0).into()
-		&& view.src.size == output.to_f64()
+	surface_view_rejection(view, buffer_scale, transform, output).is_none()
 }
 
 #[cfg(test)]
@@ -253,6 +311,95 @@ mod tests {
 				..Default::default()
 			}
 			.requires_composition(CaptureMode::Auto)
+		);
+	}
+	#[test]
+	fn direct_rejections_classify_scene_and_surface_requirements() {
+		let scene = SceneExtras {
+			cursor: true,
+			steam_overlay: true,
+			..Default::default()
+		};
+		assert_eq!(scene.rejection(CaptureMode::Auto), Some(DirectReject::Cursor));
+		assert_eq!(
+			scene.rejection(CaptureMode::Composited),
+			Some(DirectReject::ForcedComposition)
+		);
+		assert_eq!(
+			SceneExtras {
+				fractional_scale: true,
+				..Default::default()
+			}
+			.rejection(CaptureMode::Auto),
+			Some(DirectReject::FractionalScale)
+		);
+		use smithay::backend::renderer::utils::SurfaceView;
+		use smithay::utils::{Rectangle, Transform};
+		let output = (1920, 1080).into();
+		let view = SurfaceView {
+			src: Rectangle::from_size((1920.0, 1080.0).into()),
+			dst: output,
+			offset: (0, 0).into(),
+		};
+		assert_eq!(
+			surface_view_rejection(view, 1, Transform::_90, output),
+			Some(DirectReject::Transform)
+		);
+		assert_eq!(
+			surface_view_rejection(view, 2, Transform::Normal, output),
+			Some(DirectReject::Scaling)
+		);
+		assert_eq!(
+			surface_view_rejection(
+				SurfaceView {
+					offset: (1, 0).into(),
+					..view
+				},
+				1,
+				Transform::Normal,
+				output
+			),
+			Some(DirectReject::OutputOrigin)
+		);
+		assert_eq!(
+			surface_view_rejection(
+				SurfaceView {
+					src: Rectangle::new((1.0, 0.0).into(), (1919.0, 1080.0).into()),
+					..view
+				},
+				1,
+				Transform::Normal,
+				output
+			),
+			Some(DirectReject::Crop)
+		);
+	}
+}
+
+/// Preserve nominal cadence after small jitter and never catch up missed slots.
+pub(super) fn next_capture_deadline(
+	previous: std::time::Instant,
+	now: std::time::Instant,
+	interval: std::time::Duration,
+) -> std::time::Instant {
+	let ideal = previous + interval;
+	if ideal <= now { now + interval } else { ideal }
+}
+
+#[cfg(test)]
+mod cadence_tests {
+	use super::*;
+	#[test]
+	fn jitter_preserves_cadence_but_missed_slots_do_not_burst() {
+		let start = std::time::Instant::now();
+		let interval = std::time::Duration::from_millis(8);
+		assert_eq!(
+			next_capture_deadline(start, start + std::time::Duration::from_millis(1), interval),
+			start + interval
+		);
+		assert_eq!(
+			next_capture_deadline(start, start + interval * 5, interval),
+			start + interval * 6
 		);
 	}
 }

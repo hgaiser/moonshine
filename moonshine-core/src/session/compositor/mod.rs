@@ -4,12 +4,14 @@
 //! with an in-process Smithay compositor. Frames are rendered to GBM-backed
 //! DMA-BUFs and exported directly to the video encoder.
 
+pub(crate) mod admission;
 mod capture;
 mod color_management;
 mod cursor;
 mod focus;
 pub(crate) mod frame;
 mod gamescope_swapchain;
+mod gpu_timing;
 mod handlers;
 pub(crate) mod input;
 mod protocols;
@@ -35,7 +37,7 @@ use smithay::utils::Transform;
 use crate::session::SessionContext;
 use crate::session::manager::SessionShutdownReason;
 
-use self::frame::ExportedFrame;
+use self::admission::{CaptureReceiver, CaptureSender, capture_channel};
 use self::input::CompositorInputEvent;
 use self::state::MoonshineCompositor;
 
@@ -161,7 +163,7 @@ struct CompositorReconfigure {
 
 /// Handles returned by `Compositor::new()` for wiring into streams.
 pub(crate) struct CompositorHandles {
-	pub frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+	pub frame_rx: CaptureReceiver,
 	pub input_tx: calloop::channel::Sender<CompositorInputEvent>,
 }
 
@@ -170,7 +172,7 @@ pub(crate) struct Compositor {
 	config: CompositorConfig,
 	context: CompositorContext,
 	stop: ShutdownManager<SessionShutdownReason>,
-	frame_tx: std::sync::mpsc::SyncSender<ExportedFrame>,
+	frame_tx: CaptureSender,
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
 	ready_tx: std::sync::mpsc::SyncSender<CompositorReady>,
 	ready_rx: std::sync::mpsc::Receiver<CompositorReady>,
@@ -217,7 +219,7 @@ impl Compositor {
 		context: CompositorContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> (Self, CompositorHandles) {
-		let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(2);
+		let (frame_tx, frame_rx) = capture_channel();
 		let (input_tx, input_rx) = calloop::channel::channel();
 		let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
 		let (reconfigure_tx, reconfigure_rx) = calloop::channel::channel();
@@ -296,12 +298,13 @@ impl LaunchedCompositor {
 fn run_compositor(
 	config: CompositorConfig,
 	context: CompositorContext,
-	frame_tx: mpsc::SyncSender<ExportedFrame>,
+	mut frame_tx: CaptureSender,
 	input_rx: calloop::channel::Channel<CompositorInputEvent>,
 	reconfigure_rx: calloop::channel::Channel<CompositorReconfigure>,
 	ready_tx: mpsc::SyncSender<CompositorReady>,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) -> Result<(), String> {
+	let capture_demand = frame_tx.take_demand_source();
 	// Trigger session shutdown if the compositor exits unexpectedly.
 	let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::CompositorStopped);
 	let _delay_stop = stop.delay_shutdown_token();
@@ -569,7 +572,7 @@ fn run_compositor(
 		.insert_source(timer, move |_event, _metadata, state: &mut MoonshineCompositor| {
 			// Type a bounded batch of any clipboard text queued since the last tick.
 			input::drain_pending_text(state);
-			state.render_and_export();
+			state.render_and_export(true);
 			// Schedule the next frame relative to the ideal wall-clock
 			// target, not relative to "now". This absorbs render-time
 			// jitter and keeps a steady cadence.
@@ -585,6 +588,35 @@ fn run_compositor(
 			smithay::reexports::calloop::timer::TimeoutAction::ToInstant(next_frame)
 		})
 		.map_err(|e| format!("Failed to insert frame timer: {e}"))?;
+
+	if let Some(demand) = capture_demand {
+		// One preallocated timer, rearmed by coalesced consumer demand. Keep the
+		// lifecycle timer above so blocked capture never blocks Wayland clients.
+		let capture_timer = calloop::Dispatcher::new(
+			calloop::timer::Timer::from_duration(std::time::Duration::from_secs(86400)),
+			|_, _, state: &mut MoonshineCompositor| {
+				state.render_and_export(false);
+				calloop::timer::TimeoutAction::ToDuration(std::time::Duration::from_secs(86400))
+			},
+		);
+		let handle = event_loop.handle();
+		let token = handle
+			.register_dispatcher(capture_timer.clone())
+			.map_err(|e| format!("Failed to register capture demand timer: {e}"))?;
+		event_loop
+			.handle()
+			.insert_source(demand, move |_, _, state: &mut MoonshineCompositor| {
+				if state.frame_tx.requested() {
+					capture_timer
+						.as_source_mut()
+						.set_deadline(state.next_capture_at.max(std::time::Instant::now()));
+					if let Err(error) = handle.update(&token) {
+						tracing::warn!(%error, "Failed to rearm capture demand timer");
+					}
+				}
+			})
+			.map_err(|e| format!("Failed to register capture demand wakeup: {e}"))?;
+	}
 
 	tracing::info!(
 		"Compositor started: {}x{} @ {}Hz, output scale {}",
@@ -610,6 +642,9 @@ fn run_compositor(
 		event_loop
 			.dispatch(None, &mut state)
 			.map_err(|e| format!("Event loop dispatch error: {e}"))?;
+		if state.capture_failed {
+			let _ = stop.trigger_shutdown(SessionShutdownReason::CompositorStopped);
+		}
 	}
 
 	// Stop the application first so X11 clients disconnect from
