@@ -290,9 +290,13 @@ async fn run_packet_consumer(
 ) {
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
-	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
+	let mut latency_samples: Vec<LatencySample> = if config.log_stats {
+		Vec::with_capacity(512)
+	} else {
+		Vec::new()
+	};
 	let mut last_summary_time = std::time::Instant::now();
-	let mut diagnostics = PipelineWindow::new();
+	let mut diagnostics = PipelineWindow::new(config.log_stats);
 	let frame_interval_us = 1_000_000 / ctx.fps as u128;
 	let mut fec_controller = FecController::new(
 		config.fec_mode,
@@ -429,21 +433,23 @@ async fn run_packet_consumer(
 			);
 		}
 
-		latency_samples.push(LatencySample {
-			channel_wait: frame_context.channel_wait,
-			import: frame_context.import,
-			convert: frame_context.convert,
-			submit: frame_context.submit,
-			consumer_queue: consumer_queue_dur,
-			encode_wait: encode_wait_dur,
-			packetize: packetize_dur,
-			send: send_dur,
-			total,
-			encoded_bytes,
-			wire_bytes,
-			packet_count,
-			is_key_frame,
-		});
+		if config.log_stats {
+			latency_samples.push(LatencySample {
+				channel_wait: frame_context.channel_wait,
+				import: frame_context.import,
+				convert: frame_context.convert,
+				submit: frame_context.submit,
+				consumer_queue: consumer_queue_dur,
+				encode_wait: encode_wait_dur,
+				packetize: packetize_dur,
+				send: send_dur,
+				total,
+				encoded_bytes,
+				wire_bytes,
+				packet_count,
+				is_key_frame,
+			});
+		}
 
 		let stats = FrameStats {
 			channel_wait: frame_context.channel_wait,
@@ -470,7 +476,10 @@ async fn run_packet_consumer(
 		let _ = stats_tx.send(stats);
 
 		// Periodic summary every 5 seconds.
-		if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
+		if config.log_stats
+			&& last_summary_time.elapsed() >= std::time::Duration::from_secs(5)
+			&& !latency_samples.is_empty()
+		{
 			log_latency_summary(&latency_samples, last_summary_time.elapsed());
 			latency_samples.clear();
 			last_summary_time = std::time::Instant::now();
@@ -813,7 +822,7 @@ impl VideoPipelineInner {
 		let mut last_frame_time = std::time::Instant::now();
 		let mut consecutive_slow_sends = 0u32;
 		let mut last_slow_send_warning: Option<std::time::Instant> = None;
-		let mut diagnostics = PipelineWindow::new();
+		let mut diagnostics = PipelineWindow::new(self.config.log_stats);
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			if let Ok(command) = reconfigure_rx.try_recv() {
@@ -1298,7 +1307,7 @@ impl VideoPipelineInner {
 
 				let importer = match &mut dmabuf_importer {
 					Some(imp) => imp,
-					None => match DmaBufImporter::new(context.clone()) {
+					None => match DmaBufImporter::new(context.clone(), self.config.log_stats) {
 						Ok(imp) => {
 							dmabuf_importer = Some(imp);
 							dmabuf_importer.as_mut().unwrap()

@@ -129,8 +129,14 @@ resource counts together before changing lifetime rules.
 
 ## Default logging
 
-With the normal INFO log filter, each active session emits five-second samples
-and swapchain creation events:
+With the normal INFO log filter and `[stream.video] log_stats = true` (the
+default), each active session emits five-second samples and swapchain creation
+events. Set `log_stats = false` and restart the server to disable these, along
+with legacy DEBUG latency summaries, accumulation, and watchdog process scans.
+Benchmarks still receive `FrameStats`; warnings/errors and the separate
+`log_frame_spikes` setting are unaffected. See [configuration](CONFIGURATION.md#streamvideo).
+
+Available samples:
 
 | Message | Fields and interpretation |
 | --- | --- |
@@ -174,6 +180,42 @@ Use these stage signatures to narrow the investigation:
 - Packetizer: growing packetization time, especially during FEC changes.
 - Socket: rising `WouldBlock`, send duration, rebases, or packet occupancy.
 - Runtime: CPU near a full core with delayed ticks and several stages stalling.
+
+## GPU usage interpretation
+
+The scanout-release fix adds no render or shader passes. Restored frame
+throughput can increase GPU work because more frames reach the encoder.
+Compare GPU time per completed frame at the same resolution, format, game
+scene, and delivered frame rate, rather than utilization percentage alone.
+`encode_wait_us` includes GPU completion and scheduling behind other work;
+it is not an isolated measurement of PyroWave's shader execution time.
+
+The September 30 post-fix logs alternate between `direct_override` and
+`composited` capture. Composition renders into a GBM buffer and waits for its
+GLES fence before encoding. Direct capture avoids this extra render. Some
+composited windows also report approximately 100–126 stale frames dropped per
+five seconds, after that capture work has already occurred. These observations
+identify profiling targets; they do not quantify the savings of a future change.
+
+Potential optimizations, preserving stream formats and cadence:
+
+- Record why direct capture is ineligible, then reduce unnecessary composition.
+  Visible cursors, overlays, scaling, and transparency still need correct scene
+  output. Combining small overlay/cursor work with the existing GPU conversion
+  could avoid an extra full-frame composition pass, but needs visual validation.
+- Reserve capture queue capacity before rendering frames that cannot be handed
+  off. Preserve client frame callbacks, buffer releases, and progress when the
+  encoder is busy; queue backpressure must not recreate swapchain starvation.
+- Profile the pinned PyroWave RGB-to-YCbCr intermediate-plane pass and its
+  wavelet/quantization/coding passes. Fusing conversion with the first wavelet
+  stage could reduce intermediate writes/reads. Preserve HDR transfer functions,
+  gamut mapping, chroma precision, dithering, bitstream compatibility, and quality.
+
+Use [Vulkan GPU timestamps](https://docs.vulkan.org/samples/latest/samples/api/timestamp_queries/README.html)
+for stage costs, and [DRM engine counters](https://docs.kernel.org/gpu/drm-usage-stats.html)
+for process-level activity. Sample asynchronously so profiling does not add a
+per-frame blocking wait. No GPU optimization above is implemented by the
+logging switch; switching statistics off primarily saves CPU/logging work.
 
 ## Validation limits
 
@@ -241,7 +283,7 @@ Steam overlay/input, and client reconnect coverage remains manual.
 Validation on this checkout:
 
 - `cargo fmt --all -- --check`
-- `cargo test --locked --workspace --all-features`: 210 core and 37 WSI tests
+- `cargo test --locked --workspace --all-features`: 214 core and 37 WSI tests
 - `cargo clippy --locked --workspace --all-targets --all-features -- -D warnings`
 - `cargo build --locked --release` and `cargo build --locked --release --workspace`
 - `RUSTDOCFLAGS="-D warnings" cargo doc --locked --no-deps --workspace --all-features`

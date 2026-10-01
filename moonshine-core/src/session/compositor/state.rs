@@ -257,6 +257,7 @@ pub(crate) struct MoonshineCompositor {
     pub capture_mode: super::CaptureMode,
     capture_path: Option<&'static str>,
 	last_resource_summary: std::time::Instant,
+	pub(super) log_stats: bool,
 	released_scanout_buffers: u64,
 	pub pen_tablet_descriptor: TabletDescriptor,
 	pub active_pen_tool_kind: Option<u8>,
@@ -592,6 +593,7 @@ impl MoonshineCompositor {
 		virtual_connector_strategy: super::VirtualConnectorStrategy,
 		keyboard_config: KeyboardConfig,
 		capture_mode: super::CaptureMode,
+		log_stats: bool,
 	) -> (Self, Display<Self>) {
 		let compositor_state = CompositorState::new_v6::<Self>(&display_handle);
 		let shm_state = ShmState::new::<Self>(&display_handle, vec![]);
@@ -762,6 +764,7 @@ impl MoonshineCompositor {
 				capture_mode,
 				capture_path: None,
 				last_resource_summary: std::time::Instant::now(),
+				log_stats,
 				released_scanout_buffers: 0,
 				pen_tablet_descriptor,
 				active_pen_tool_kind: None,
@@ -1252,8 +1255,10 @@ impl MoonshineCompositor {
 				}
 			},
 		);
-		self.released_scanout_buffers += tick.released as u64;
-		if self.last_resource_summary.elapsed() >= std::time::Duration::from_secs(5) {
+		if self.log_stats {
+			self.released_scanout_buffers += tick.released as u64;
+		}
+		if self.log_stats && self.last_resource_summary.elapsed() >= std::time::Duration::from_secs(5) {
 			let busy_pool_buffers = self
 				.buffer_pool
 				.iter()

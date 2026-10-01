@@ -167,7 +167,11 @@ impl InitializedSession {
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
 
 		// Create compositor, audio stream, video stream, and control stream.
-		let (compositor, handles) = Compositor::new(compositor_config, (&context).into(), stop.clone());
+		let (compositor, handles) = Compositor::new(
+			compositor_config,
+			compositor::CompositorContext::from_session(&context, video_config.log_stats),
+			stop.clone(),
+		);
 		let audio = AudioStream::new(audio_config, address.clone(), stop.clone()).await?;
 		let video_stream = VideoStream::new(
 			video_config.clone(),

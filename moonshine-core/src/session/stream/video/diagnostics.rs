@@ -12,6 +12,7 @@ use crate::session::manager::SessionShutdownReason;
 const INTERVAL: Duration = Duration::from_secs(5);
 
 pub(super) struct TransportWindow {
+	enabled: bool,
 	started: Instant,
 	frames: u64,
 	would_block: u64,
@@ -26,8 +27,9 @@ pub(super) struct TransportWindow {
 }
 
 impl TransportWindow {
-	pub fn new() -> Self {
+	pub fn new(enabled: bool) -> Self {
 		Self {
+			enabled,
 			started: Instant::now(),
 			frames: 0,
 			would_block: 0,
@@ -43,6 +45,9 @@ impl TransportWindow {
 	}
 
 	pub fn record(&mut self, stats: &SendStats, queue: usize) {
+		if !self.enabled {
+			return;
+		}
 		self.frames += 1;
 		self.would_block += u64::from(stats.would_block_events);
 		self.fallback += u64::from(stats.fallback_chunks);
@@ -68,12 +73,13 @@ impl TransportWindow {
 				packet_queue = queue,
 				"Video transport summary"
 			);
-			*self = Self::new();
+			*self = Self::new(self.enabled);
 		}
 	}
 }
 
 pub(super) struct PipelineWindow {
+	enabled: bool,
 	started: Instant,
 	frames: u64,
 	stale: u64,
@@ -82,8 +88,9 @@ pub(super) struct PipelineWindow {
 }
 
 impl PipelineWindow {
-	pub fn new() -> Self {
+	pub fn new(enabled: bool) -> Self {
 		Self {
+			enabled,
 			started: Instant::now(),
 			frames: 0,
 			stale: 0,
@@ -93,6 +100,9 @@ impl PipelineWindow {
 	}
 
 	pub fn record(&mut self, stats: &FrameStats, in_flight: usize, packet_queue: usize, imports: Option<usize>) {
+		if !self.enabled {
+			return;
+		}
 		self.frames += 1;
 		self.stale += u64::from(stats.stale_frames_dropped);
 		for (i, duration) in [
@@ -131,7 +141,7 @@ impl PipelineWindow {
 				total_us = avg[8], max_total_us = self.maxima[8],
 				"Video pipeline summary"
 			);
-			*self = Self::new();
+			*self = Self::new(self.enabled);
 		}
 	}
 }
@@ -193,6 +203,72 @@ fn process_cpu_ticks(stat: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn enabled_stats_resume_accumulation_after_summary_reset() {
+		let mut window = TransportWindow::new(true);
+		window.started = Instant::now() - INTERVAL;
+		window.record(&SendStats::default(), 0);
+		assert_eq!(window.frames, 0);
+		assert!(window.enabled);
+		window.record(&SendStats::default(), 1);
+		assert_eq!(window.frames, 1);
+		assert_eq!(window.max_queue, 1);
+	}
+
+	#[test]
+	fn disabled_transport_stats_do_not_accumulate_or_emit() {
+		let mut window = TransportWindow::new(false);
+		window.started = Instant::now() - INTERVAL;
+		let original_start = window.started;
+		let stats = SendStats {
+			would_block_events: 3,
+			fallback_chunks: 2,
+			elapsed: Duration::from_millis(1),
+			..Default::default()
+		};
+		for _ in 0..10_000 {
+			window.record(&stats, 128);
+		}
+		assert_eq!(window.frames, 0);
+		assert_eq!(window.would_block, 0);
+		assert_eq!(window.max_queue, 0);
+		// A summary would reset the window's start time.
+		assert_eq!(window.started, original_start);
+	}
+
+	#[test]
+	fn disabled_pipeline_stats_leave_benchmark_samples_unchanged() {
+		let mut window = PipelineWindow::new(false);
+		window.started = Instant::now() - INTERVAL;
+		let original_start = window.started;
+		let stats = FrameStats {
+			channel_wait: Duration::from_micros(1),
+			import: Duration::from_micros(2),
+			convert: Duration::from_micros(3),
+			submit: Duration::from_micros(4),
+			consumer_queue: Duration::from_micros(5),
+			encode_wait: Duration::from_micros(6),
+			packetize: Duration::from_micros(7),
+			send: Duration::from_micros(8),
+			total: Duration::from_micros(36),
+			encoded_bytes: 100,
+			wire_bytes: 120,
+			packet_count: 10,
+			stale_frames_dropped: 2,
+			is_key_frame: true,
+		};
+		for _ in 0..10_000 {
+			window.record(&stats, 3, 128, Some(3));
+		}
+		assert_eq!(window.frames, 0);
+		assert_eq!(window.stale, 0);
+		assert_eq!(window.sums, [0; 9]);
+		assert_eq!(window.maxima, [0; 9]);
+		assert_eq!(window.started, original_start);
+		assert_eq!(stats.encoded_bytes, 100);
+		assert_eq!(stats.total, Duration::from_micros(36));
+	}
 
 	#[test]
 	fn process_cpu_parser_handles_spaces_and_parentheses_in_comm() {

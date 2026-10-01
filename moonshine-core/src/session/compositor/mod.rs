@@ -138,6 +138,7 @@ pub(crate) struct CompositorContext {
 	pub refresh_rate: u32,
 	pub hdr: bool,
 	pub output_scale: f64,
+	pub log_stats: bool,
 }
 
 /// Information sent from the compositor thread once XWayland is ready.
@@ -183,8 +184,8 @@ pub(crate) struct LaunchedCompositor {
 	reconfigure_tx: calloop::channel::Sender<CompositorReconfigure>,
 }
 
-impl From<&SessionContext> for CompositorContext {
-	fn from(ctx: &SessionContext) -> Self {
+impl CompositorContext {
+	pub fn from_session(ctx: &SessionContext, log_stats: bool) -> Self {
 		let output_scale = sanitize_output_scale(ctx.application.output_scale);
 		if ctx.application.output_scale.is_some_and(|scale| scale != output_scale) {
 			tracing::warn!(
@@ -198,6 +199,7 @@ impl From<&SessionContext> for CompositorContext {
 			refresh_rate: ctx.refresh_rate,
 			hdr: ctx.hdr,
 			output_scale,
+			log_stats,
 		}
 	}
 }
@@ -486,6 +488,7 @@ fn run_compositor(
 		config.virtual_connector_strategy,
 		config.keyboard.clone(),
 		config.capture_mode,
+		context.log_stats,
 	);
 
 	// Insert the Wayland display as a calloop event source so client

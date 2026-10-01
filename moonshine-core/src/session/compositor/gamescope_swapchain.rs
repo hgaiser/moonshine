@@ -247,10 +247,13 @@ macro_rules! dispatch_swapchain {
 				vk_composite_alpha,
 				..
 			} => {
+				if $state.log_stats {
 				tracing::info!(
 					surface = ?$data.surface.id(), image_count, vk_format, vk_colorspace,
 					"Video swapchain feedback"
 				);
+				}
+
 				if set_composite_alpha(&$data.surface, vk_composite_alpha) {
 					// The same buffer now blends differently; invalidate the
 					// damage history once, without adding a frame-time policy.

@@ -128,8 +128,21 @@ listeners accessible only over a trusted LAN or VPN.
 | `fec_min_percentage` | integer (0–255), `0` | Lower bound for auto FEC. |
 | `fec_max_percentage` | integer (0–255), `25` | Upper bound for auto FEC. Use a value at least as large as the minimum; the controller raises a smaller maximum to the minimum. |
 | `encrypt` | boolean, `false` | Enable AES-128-GCM video encryption when supported by client negotiation. |
+| `log_stats` | boolean, `true` | Emit five-second capture, pipeline, transport, DMA-BUF, runtime/CPU/memory/fd summaries and swapchain feedback. `false` skips diagnostic accumulation and process sampling; benchmark statistics, operational warnings/errors, and separately enabled frame-spike logs remain available. |
 | `log_frame_spikes` | boolean, `false` | Warn when a frame's encoding and packetization exceeds the frame budget. Useful for latency diagnostics. |
 | `max_packet_size` | nonnegative integer, `0` | Cap the client-requested stream packet size in bytes. `0` disables the cap; caps below `200` are ignored with a warning. Smaller client requests are honored. |
+
+To silence periodic streaming statistics, add this to the existing video table
+and restart Pyroshine (set it to `true` to enable them again):
+
+```toml
+[stream.video]
+log_stats = false
+```
+
+This setting controls diagnostic output and collection. It does not alter GPU
+encoding, capture cadence, bitrate, FEC, or transport behavior. The optional WSI
+layer's `MOONSHINE_WSI_LOG` filter and per-call TRACE logging remain separate.
 
 Auto FEC clamps its initial `fec_percentage` to the configured minimum/maximum.
 FEC adds bandwidth overhead; it does not replace a reliable network connection.

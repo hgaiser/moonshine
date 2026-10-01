@@ -203,11 +203,12 @@ pub(crate) struct DmaBufImporter {
 	/// Calls since the last stale-entry sweep.
 	calls_since_sweep: u32,
 	last_resource_summary: Instant,
+	log_stats: bool,
 }
 
 impl DmaBufImporter {
 	/// Create a new DMA-BUF importer.
-	pub fn new(context: VideoContext) -> Result<Self, String> {
+	pub fn new(context: VideoContext, log_stats: bool) -> Result<Self, String> {
 		let external_memory_fd = ash::khr::external_memory_fd::Device::load(context.instance(), context.device());
 
 		Ok(Self {
@@ -217,6 +218,7 @@ impl DmaBufImporter {
 			retired: Vec::new(),
 			calls_since_sweep: 0,
 			last_resource_summary: Instant::now(),
+			log_stats,
 		})
 	}
 
@@ -304,7 +306,7 @@ impl DmaBufImporter {
 		let before = self.retired.len();
 		self.retired.retain(|v| v.last_used() >= cutoff);
 		let dropped = before - self.retired.len();
-		if now.duration_since(self.last_resource_summary) >= Duration::from_secs(5) {
+		if self.log_stats && now.duration_since(self.last_resource_summary) >= Duration::from_secs(5) {
 			tracing::info!(
 				import_cache = self.cache.len(),
 				retired_imports = self.retired.len(),

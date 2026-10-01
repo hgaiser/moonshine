@@ -54,6 +54,11 @@ pub struct VideoStreamConfig {
 	#[serde(default)]
 	pub log_frame_spikes: bool,
 
+	/// Emit periodic capture, pipeline, transport, and runtime statistics.
+	/// Disabling this also skips diagnostic accumulation and process sampling;
+	/// benchmark frame statistics and operational warnings remain available.
+	pub log_stats: bool,
+
 	/// Upper bound for the client-requested video packet size, in bytes.
 	///
 	/// Moonlight's default packet size (1392 bytes) can exceed the path MTU
@@ -106,6 +111,7 @@ impl Default for VideoStreamConfig {
 			fec_max_percentage: 25,
 			encrypt: false,
 			log_frame_spikes: false,
+			log_stats: true,
 			max_packet_size: 0,
 		}
 	}
@@ -427,7 +433,9 @@ impl VideoStream {
 
 		// Packet channel.
 		let (packet_tx, packet_rx) = mpsc::channel::<VideoPacketMessage>(128);
-		diagnostics::spawn_watchdog(stop.clone(), packet_tx.downgrade());
+		if config.log_stats {
+			diagnostics::spawn_watchdog(stop.clone(), packet_tx.downgrade());
+		}
 		let (reconfigure_tx, reconfigure_rx) = std::sync::mpsc::channel();
 		let pacing_bitrate =
 			(context.format.codec == VideoCodec::PyroWave).then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
@@ -440,6 +448,7 @@ impl VideoStream {
 			stop.clone(),
 			pacing_bitrate,
 			context.fps,
+			config.log_stats,
 		);
 
 		// Spawn pipeline thread — gated behind start_notify.
@@ -481,6 +490,7 @@ fn spawn_handle_video_packets(
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	mut pacing_bitrate: Option<u64>,
 	mut fps: u32,
+	log_stats: bool,
 ) {
 	tokio::spawn(async move {
 		start.notified().await;
@@ -489,7 +499,7 @@ fn spawn_handle_video_packets(
 		let mut client_address = None;
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
-		let mut transport_window = diagnostics::TransportWindow::new();
+		let mut transport_window = diagnostics::TransportWindow::new(log_stats);
 
 		// Trigger session shutdown if we exit unexpectedly.
 		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
@@ -614,6 +624,20 @@ fn spawn_handle_video_packets(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn stats_logging_defaults_on_and_roundtrips_explicit_choice() {
+		let config: VideoStreamConfig = toml::from_str("").unwrap();
+		assert!(config.log_stats);
+		for enabled in [false, true] {
+			let root: crate::config::Config =
+				toml::from_str(&format!("[stream.video]\nlog_stats = {enabled}")).unwrap();
+			let config = root.stream.video;
+			assert_eq!(config.log_stats, enabled);
+			let roundtrip: VideoStreamConfig = toml::from_str(&toml::to_string(&config).unwrap()).unwrap();
+			assert_eq!(roundtrip.log_stats, enabled);
+		}
+	}
 
 	fn config(max_packet_size: usize) -> VideoStreamConfig {
 		VideoStreamConfig {
