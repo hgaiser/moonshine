@@ -278,11 +278,22 @@ mod tests {
 			width: 1920,
 			height: 1080,
 			created_at: Instant::now(),
+			composition_started_at: None,
 			buffer_index: 0,
 			consumed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
 			color_space: super::super::frame::FrameColorSpace::Srgb,
 			hdr_metadata: None,
 		}
+	}
+	#[test]
+	fn composition_fence_completion_does_not_restart_pacing_window() {
+		let mut frame = frame();
+		let start = frame.created_at;
+		assert_eq!(frame.pacing_origin(), start);
+		frame.composition_started_at = Some(start);
+		frame.created_at = start + Duration::from_millis(2);
+		assert_eq!(frame.pacing_origin(), start);
+		assert_eq!(frame.created_at, start + Duration::from_millis(2));
 	}
 	#[test]
 	fn processing_and_network_hold_credit_after_buffer_consumption() {

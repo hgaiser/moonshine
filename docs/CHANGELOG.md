@@ -16,6 +16,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [v0.16.13] - 2026-10-01
 
+### Fixed
+
+- Include compositor work in PyroWave's frame pacing budget and use reusable Linux high-resolution packet timers, restoring the measured saturated composited 4K120 cadence without adding capture credits or frame queues.
+
 ### Added
 
 - Add `[stream.video] log_stats` to enable or disable streaming diagnostic summaries and process sampling while preserving benchmark statistics and operational warnings.

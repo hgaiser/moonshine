@@ -12,6 +12,7 @@ mod diagnostics;
 pub(crate) mod fec;
 mod format;
 mod gso_socket;
+mod pacing_timer;
 mod packetizer;
 mod pipeline;
 pub(crate) mod pyrowave;
@@ -489,7 +490,7 @@ impl VideoStream {
 
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<VideoPacketMessage>,
-	socket: UdpGsoSocket,
+	mut socket: UdpGsoSocket,
 	start: Arc<Notify>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	mut pacing_bitrate: Option<u64>,

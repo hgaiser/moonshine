@@ -117,6 +117,9 @@ pub(crate) struct ExportedFrame {
 	pub height: u32,
 	/// Timestamp when the frame was produced by the compositor.
 	pub created_at: Instant,
+	/// GLES preparation/submission start, retained across the fence wait.
+	/// Direct exports have no compositor render and use `created_at` for pacing.
+	pub composition_started_at: Option<Instant>,
 	/// Index of the pre-allocated GBM buffer in the compositor's pool.
 	pub buffer_index: usize,
 	/// Shared flag set to `true` by the encoder after color conversion
@@ -141,6 +144,14 @@ pub(crate) struct ExportedPlane {
 	pub offset: u32,
 	/// Row stride in bytes.
 	pub stride: u32,
+}
+
+impl ExportedFrame {
+	/// Charge composition to the same frame pacing window as encoding.
+	/// Keep created_at's existing completion-based latency semantics separate.
+	pub(crate) fn pacing_origin(&self) -> Instant {
+		self.composition_started_at.unwrap_or(self.created_at)
+	}
 }
 
 #[cfg(test)]

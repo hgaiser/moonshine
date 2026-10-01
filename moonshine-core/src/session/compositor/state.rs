@@ -1484,7 +1484,7 @@ impl MoonshineCompositor {
 		// conflict: the framebuffer holds a mutable ref to the dmabuf,
 		// and export_dmabuf would need an immutable ref to the same dmabuf.
 		let frame_cs = self.color_management.as_ref().map(|cm| cm.frame_color_space());
-		let exported_frame = match export_dmabuf(
+		let mut exported_frame = match export_dmabuf(
 			&self.buffer_pool[idx].dmabuf,
 			idx,
 			consumed.clone(),
@@ -1498,6 +1498,10 @@ impl MoonshineCompositor {
 				return;
 			},
 		};
+
+		// Composition must consume part of the capture-to-send pacing window.
+		// Preserve this origin when created_at is updated after the fence wait.
+		exported_frame.composition_started_at = Some(std::time::Instant::now());
 
 		// Compute the output scaling before binding the framebuffer, which
 		// borrows `self` mutably.
@@ -1922,6 +1926,7 @@ impl MoonshineCompositor {
 			width: client_dmabuf.width(),
 			height: client_dmabuf.height(),
 			created_at: std::time::Instant::now(),
+			composition_started_at: None,
 			buffer_index,
 			consumed: consumed.clone(),
 			color_space,
@@ -2112,6 +2117,7 @@ impl MoonshineCompositor {
 			width: client_dmabuf.width(),
 			height: client_dmabuf.height(),
 			created_at: std::time::Instant::now(),
+			composition_started_at: None,
 			buffer_index,
 			consumed: consumed.clone(),
 			color_space,
@@ -2605,6 +2611,7 @@ fn export_dmabuf(
 		width: dmabuf.width(),
 		height: dmabuf.height(),
 		created_at: std::time::Instant::now(),
+		composition_started_at: None,
 		buffer_index,
 		consumed,
 		color_space: surface_color_space.unwrap_or(FrameColorSpace::Srgb),

@@ -44,7 +44,9 @@ scaling and other scene content can require GLES composition. Rejection diagnost
 record the first blocking condition with fixed counters, avoiding per-frame strings.
 
 Composition submits GLES, waits for its SyncPoint, then exports the image to the
-Vulkan consumer. Failed rendering/completion stops capture rather than publishing
+Vulkan consumer. PyroWave packet pacing starts before compositor preparation and
+rendering; the GLES fence wait and encoding consume the same frame budget rather
+than extending it. Completion-based pipeline latency remains measured separately. Failed rendering/completion stops capture rather than publishing
 or recycling a buffer with uncertain GPU ownership.
 
 Do not relax direct eligibility just because PyroWave has a scaler: compositor
@@ -59,6 +61,16 @@ chains; discarding encoded reference frames can break decoding until an IDR.
 PyroWave completes one encode and send before requesting the next capture.
 This bounds latency but can limit FPS when capture + encode + paced send consumes
 a refresh interval; enlarging queues is not a free throughput improvement.
+PyroWave uses a lazily allocated, reusable CLOCK_MONOTONIC timerfd through Tokio
+AsyncFd for precise packet deadlines. A mutable send borrow enforces one wait
+per timer; cancellation and rearming cannot leak a prior frame's expiry. There
+is no spin loop or pacing thread. Timer initialization/wait failure falls back
+to Tokio's ordinary timer without failing startup. Unpaced conventional sends
+do not allocate or use this timer. Late-frame rebasing, packet spacing, FEC and
+rate-control budgets remain unchanged.
+
+See the [pacing follow-up](reports/PACING_CADENCE.md) for the correction to the
+initial composited 4K120 result.
 
 Both importers retain DMA-BUF open-file identity and full layout validation.
 A recycled numeric fd or reused compositor index is insufficient identity.

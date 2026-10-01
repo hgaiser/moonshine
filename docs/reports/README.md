@@ -5,6 +5,8 @@ September 30 / October 1, 2026 development. They are not current architecture
 contracts or proof that a later checkout passed validation. Test counts, versions
 and local workspace paths describe the original runs.
 
+- [Pacing cadence correction](PACING_CADENCE.md): composition timing and precise
+  packet deadlines restore the measured saturated 4K120 case with one credit.
 - [Capture optimization](PIPELINE_OPTIMIZATION.md): admission changes, measured
   tradeoffs, rejected conversion/DWT fusion and deferred synchronization work.
 - [Long-session investigation](LONG_SESSION_PERFORMANCE.md): UDP readiness,

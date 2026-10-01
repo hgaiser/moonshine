@@ -5,6 +5,7 @@ use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
+use super::pacing_timer::PacingTimer;
 use super::shard_batch::ShardBatch;
 
 /// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
@@ -146,6 +147,8 @@ pub(crate) struct UdpGsoSocket {
 	socket: UdpSocket,
 	udp_state: UdpSocketState,
 	disable_gso: bool,
+	pacing_timer: Option<PacingTimer>,
+	pacing_timer_initialized: bool,
 }
 
 impl UdpGsoSocket {
@@ -168,6 +171,8 @@ impl UdpGsoSocket {
 			socket,
 			udp_state,
 			disable_gso,
+			pacing_timer: None,
+			pacing_timer_initialized: false,
 		})
 	}
 
@@ -185,7 +190,7 @@ impl UdpGsoSocket {
 
 	/// `bitrate_bps` is set for the intra-only PyroWave path. Conventional
 	/// inter-frame codecs retain their established immediate-send behavior.
-	pub async fn send_batch(&self, batch: &ShardBatch, addr: SocketAddr, bitrate_bps: Option<u64>) -> SendStats {
+	pub async fn send_batch(&mut self, batch: &ShardBatch, addr: SocketAddr, bitrate_bps: Option<u64>) -> SendStats {
 		let started = Instant::now();
 		let shard_size = batch.shard_size();
 		let shard_count = batch.shard_count();
@@ -209,12 +214,19 @@ impl UdpGsoSocket {
 		let pacing_duration = bitrate_bps
 			.map(|rate| frame_pacing_duration(batch.encoded_size(), rate))
 			.unwrap_or_default();
+		if !pacing_duration.is_zero() && !self.pacing_timer_initialized {
+			self.pacing_timer_initialized = true;
+			match PacingTimer::new() {
+				Ok(timer) => self.pacing_timer = Some(timer),
+				Err(error) => tracing::warn!(%error, "High-resolution video pacing unavailable; using Tokio timer"),
+			}
+		}
 		stats.pacing_duration = pacing_duration;
 		let requested_pacing_origin = batch.pacing_origin().unwrap_or(started);
 		// A frame whose entire pacing window elapsed during encode is already
 		// late. Rebase it instead of releasing every overdue GSO chunk as one
-		// catch-up burst. The synchronous PyroWave producer then drops stale
-		// captures while this complete frame is sent, bounding queue growth.
+		// catch-up burst. PyroWave capture admission remains occupied until
+		// this complete frame is sent, so no rendered backlog can accumulate.
 		let (mut pacing_origin, scheduled_pacing_duration, pacing_rebased, initial_lateness) =
 			pacing_schedule(requested_pacing_origin, pacing_duration, started);
 		stats.pacing_rebased = pacing_rebased;
@@ -229,14 +241,25 @@ impl UdpGsoSocket {
 					pacing_origin + scaled_duration(scheduled_pacing_duration, preceding_wire_bytes, stats.wire_bytes);
 				let now = Instant::now();
 				if now < deadline {
-					tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+					if let Some(timer) = &mut self.pacing_timer {
+						if let Err(error) = timer.sleep_until(deadline).await {
+							tracing::warn!(%error, "High-resolution video pacing failed; using Tokio timer");
+							self.pacing_timer = None;
+							tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+						}
+					} else {
+						tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+					}
 				} else {
 					let lateness = now.saturating_duration_since(deadline);
 					if preceding_wire_bytes == 0 && !stats.pacing_rebased {
 						stats.initial_pacing_lateness = lateness;
 					}
-					stats.max_pacing_lateness = stats.max_pacing_lateness.max(lateness);
 				}
+				// Include timer wakeup overshoot, not only arrival after a deadline.
+				stats.max_pacing_lateness = stats
+					.max_pacing_lateness
+					.max(Instant::now().saturating_duration_since(deadline));
 			}
 
 			let chunk_segments = chunk.len().div_ceil(shard_size);
@@ -324,6 +347,8 @@ mod tests {
 				socket: raw_socket,
 				udp_state,
 				disable_gso,
+				pacing_timer: None,
+				pacing_timer_initialized: false,
 			},
 			receiver,
 			destination,
@@ -419,7 +444,7 @@ mod tests {
 		use std::future::Future;
 		use std::task::{Context, Waker};
 
-		let (socket, receiver, destination) = loopback_socket(false).await;
+		let (mut socket, receiver, destination) = loopback_socket(false).await;
 		socket.socket.writable().await.unwrap();
 		let mut would_block = 0;
 		let mut send = Box::pin(send_with_readiness(&socket.socket, &mut would_block, || {
@@ -573,7 +598,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn gso_bypass_sends_every_shard_individually() {
-		let (socket, receiver, destination) = loopback_socket(true).await;
+		let (mut socket, receiver, destination) = loopback_socket(true).await;
 		let batch = test_batch(47, 1408, 47 * 1376 - 8);
 		let stats = socket.send_batch(&batch, destination, None).await;
 		assert_eq!(stats.gso_sends, 0);
@@ -593,7 +618,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn available_gso_segments_a_real_loopback_batch() {
-		let (socket, receiver, destination) = loopback_socket(false).await;
+		let (mut socket, receiver, destination) = loopback_socket(false).await;
 		let gso_available = socket.udp_state.max_gso_segments() > 1;
 		let batch = test_batch(47, 1408, 47 * 1376 - 8);
 		let stats = socket.send_batch(&batch, destination, None).await;
@@ -614,7 +639,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn repeated_frame_sends_preserve_every_shard() {
-		let (socket, receiver, destination) = loopback_socket(false).await;
+		let (mut socket, receiver, destination) = loopback_socket(false).await;
 		let batch = test_batch(47, 1408, 47 * 1376 - 8);
 		let mut buffer = [0u8; 2048];
 		// Drain each frame so UDP receive-buffer overflow cannot make the test
@@ -634,7 +659,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn runtime_gso_rejection_enters_fallback_path() {
-		let (socket, _receiver, destination) = loopback_socket(false).await;
+		let (mut socket, _receiver, destination) = loopback_socket(false).await;
 		if socket.udp_state.max_gso_segments() <= 1 {
 			return;
 		}
@@ -649,7 +674,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn paced_send_is_cancellation_safe() {
-		let (socket, _receiver, destination) = loopback_socket(true).await;
+		let (mut socket, _receiver, destination) = loopback_socket(true).await;
 		let mut batch = test_batch(47, 1408, 125_000_000);
 		batch.set_pacing_origin(Instant::now());
 		let result = tokio::time::timeout(

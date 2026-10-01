@@ -1,5 +1,8 @@
 # Capture and encode optimization report
 
+Follow-up: [pacing cadence correction](PACING_CADENCE.md) addresses the 113.8 FPS
+composited SDR result below without additional buffering.
+
 > Historical snapshot from September 30 / October 1, 2026. Results and test
 > counts describe those runs, not current validation. Workspace evidence paths
 > are local artifacts and may not exist in a fresh checkout. For current design

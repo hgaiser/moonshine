@@ -872,10 +872,11 @@ impl VideoPipelineInner {
 			// independently of the source buffer's earlier GPU-consumed lifecycle.
 			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
 			let stale_frames_dropped = 0u32;
-			let (encoded, created_at, buffer_index, channel_wait) = if let Some(frame) = received {
+			let (encoded, created_at, pacing_origin, buffer_index, channel_wait) = if let Some(frame) = received {
 				gpu_window_encodes += 1;
 				let received_at = std::time::Instant::now();
 				let created_at = frame.created_at;
+				let pacing_origin = frame.pacing_origin();
 				let buffer_index = frame.buffer_index;
 				let reusable = last_encoded
 					.take()
@@ -910,6 +911,7 @@ impl VideoPipelineInner {
 				(
 					encoded,
 					created_at,
+					pacing_origin,
 					buffer_index,
 					received_at.saturating_duration_since(created_at),
 				)
@@ -919,6 +921,7 @@ impl VideoPipelineInner {
 				};
 				(
 					encoded,
+					std::time::Instant::now(),
 					std::time::Instant::now(),
 					usize::MAX,
 					std::time::Duration::ZERO,
@@ -951,10 +954,10 @@ impl VideoPipelineInner {
 					latency,
 				)
 				.map_err(|()| "failed to packetize PyroWave frame".to_string())?;
-			// Anchor transport pacing to capture time. Encoding time therefore
-			// consumes part of this frame's pacing window instead of being added
+			// Anchor transport pacing before composition, when present. GLES fence
+			// waiting and encoding consume this frame's pacing window instead of being added
 			// on top of it, preserving the negotiated frame cadence.
-			shards.set_pacing_origin(created_at);
+			shards.set_pacing_origin(pacing_origin);
 			let wire_bytes = shards.as_bytes().len();
 			let packet_count = shards.shard_count();
 			let packetized = std::time::Instant::now();
