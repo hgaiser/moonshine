@@ -14,6 +14,17 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-5] - 2026-10-01
+
+### Security
+
+- Generate private TLS identities with owner-only files, durable publication and interruption recovery; keep existing administrator-managed identities stable.
+- Commit pairing ID/certificate trust atomically and implement durable host-authorized and HTTPS self-revocation, including active-session teardown. Preserve legacy trust and UUIDs without guessing certificate ownership.
+
+### Fixed
+
+- Bound pending pairing transactions, expire abandoned approvals and handshakes, clean up completed requests, and coalesce desktop notifications.
+
 ## [v0.17.0-beta-4] - 2026-10-01
 
 ### Fixed

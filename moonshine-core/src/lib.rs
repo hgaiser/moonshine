@@ -6,6 +6,7 @@ pub mod clients;
 pub mod config;
 pub(crate) mod crypto;
 pub mod discovery;
+pub(crate) mod durable;
 pub mod healthcheck;
 pub(crate) mod ingress;
 pub mod rtsp;

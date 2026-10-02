@@ -5,6 +5,7 @@ Start with the [project README](../README.md) for requirements and a quick start
 ## Using Pyroshine
 
 - [Installation and upgrades](INSTALLATION.md): native packages, portable builds, headless setup, and service diagnostics.
+- [Security administration](SECURITY_ADMINISTRATION.md): pairing approval, durable state recovery, TLS identity permissions and revocation.
 - [Configuration reference](CONFIGURATION.md): every supported `config.toml` setting, defaults, and examples.
 - [DualSense Edge](DUALSENSE_EDGE.md): native controller mapping, dependency patch, and Steam acceptance checks.
 - [Tips and troubleshooting](TIPS.md): Steam, Flatpak, Gamescope, desktop sessions, and application logs.

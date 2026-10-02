@@ -16,13 +16,20 @@ use aws_lc_rs::signature::RSA_PKCS1_SHA256;
 use aws_lc_rs::signature::RsaKeyPair;
 use sha2::Digest;
 use sha2::Sha256;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use tokio::sync::Notify;
+use tokio::time::Instant;
 use x509_parser::prelude::*;
 
 use crate::state::PersistentState;
 
+/// Bound retained certificates, challenge state and human approvals.
+pub(crate) const MAX_PENDING_PAIRINGS: usize = 32;
+
 /// A client that is not yet paired, but in the pairing process.
 pub(crate) struct PendingClient {
+	pub(crate) deadline: Instant,
 	/// Unique id of the client.
 	pub(crate) id: String,
 
@@ -80,6 +87,8 @@ pub(crate) fn new_approval_token() -> Result<String, ()> {
 pub struct ClientManager {
 	pending_clients: Arc<RwLock<BTreeMap<String, PendingClient>>>,
 	state: PersistentState,
+	cleanup_started: Arc<AtomicBool>,
+	pub(crate) authorization_gate: Arc<tokio::sync::RwLock<()>>,
 	server_cert_pem: String,
 	server_private_key_pem: String,
 }
@@ -98,15 +107,30 @@ impl ClientManager {
 	) -> Self {
 		Self {
 			pending_clients: Default::default(),
+			cleanup_started: Default::default(),
+			authorization_gate: Default::default(),
 			state: PersistentState::isolated(path),
 			server_cert_pem,
 			server_private_key_pem,
 		}
 	}
 
+	#[cfg(test)]
+	pub(crate) fn restarted(&self, path: std::path::PathBuf) -> Self {
+		Self {
+			state: PersistentState::load(path).unwrap(),
+			pending_clients: Default::default(),
+			cleanup_started: Default::default(),
+			authorization_gate: Default::default(),
+			..self.clone()
+		}
+	}
+
 	pub fn new(server_cert_pem: String, server_private_key_pem: String) -> Result<Self, ()> {
 		Ok(Self {
 			pending_clients: Arc::new(RwLock::new(BTreeMap::new())),
+			cleanup_started: Default::default(),
+			authorization_gate: Default::default(),
 			state: PersistentState::new()?,
 			server_cert_pem,
 			server_private_key_pem,
@@ -129,8 +153,91 @@ impl ClientManager {
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		inner.insert(pending_client.id.clone(), pending_client);
+		Self::expire(&mut inner);
+		if pending_client.id.is_empty()
+			|| pending_client.id.len() > 256
+			|| pending_client.pem.len() > 16 * 1024
+			|| cert_pem_fingerprint(&pending_client.pem).is_none()
+		{
+			return Err(());
+		}
+		if !inner.contains_key(&pending_client.id) && inner.len() >= MAX_PENDING_PAIRINGS {
+			return Err(());
+		}
+		if let Some(old) = inner.insert(pending_client.id.clone(), pending_client) {
+			old.pin_notify.notify_one();
+		}
 		Ok(())
+	}
+
+	fn expire(inner: &mut BTreeMap<String, PendingClient>) {
+		inner.retain(|_, client| {
+			if client.deadline <= Instant::now() {
+				client.pin_notify.notify_one();
+				false
+			} else {
+				true
+			}
+		});
+	}
+
+	/// One sweeper per manager, no per-transaction timer/task accumulation.
+	pub(crate) fn ensure_cleanup(&self, shutdown: async_shutdown::ShutdownManager<crate::ShutdownReason>) {
+		if self.cleanup_started.swap(true, Ordering::AcqRel) {
+			return;
+		}
+		let Ok(delay) = shutdown.delay_shutdown_token() else {
+			return;
+		};
+		let pending = Arc::downgrade(&self.pending_clients);
+		tokio::spawn(async move {
+			// Global shutdown completion includes clearing all pending state.
+			let _delay = delay;
+			loop {
+				let stopping = tokio::select! {
+					_ = shutdown.wait_shutdown_triggered() => true,
+					_ = tokio::time::sleep(Duration::from_secs(1)) => false,
+				};
+				let Some(pending) = pending.upgrade() else {
+					break;
+				};
+				if let Ok(mut inner) = pending.write() {
+					if stopping {
+						for client in inner.values() {
+							client.pin_notify.notify_one();
+						}
+						inner.clear();
+					} else {
+						Self::expire(&mut inner);
+					}
+				}
+				if stopping {
+					break;
+				}
+			}
+		});
+	}
+
+	pub(crate) fn approved(&self, id: &str, approval: &str) -> bool {
+		self.pending_clients.read().ok().is_some_and(|inner| {
+			inner.get(id).is_some_and(|client| {
+				client.approval == approval && client.key.is_some() && client.deadline > Instant::now()
+			})
+		})
+	}
+
+	pub(crate) fn revoke(&self, id: Option<&str>, fingerprint: Option<&str>) -> Result<bool, ()> {
+		// Serializes against completion: an already-approved transaction cannot
+		// restore the credential just revoked. New requests need new approval.
+		let mut inner = self.pending_clients.write().map_err(|_| ())?;
+		let changed = self.state.revoke(id, fingerprint)?;
+		if changed {
+			for client in inner.values() {
+				client.pin_notify.notify_one();
+			}
+			inner.clear();
+		}
+		Ok(changed)
 	}
 
 	/// Describe the pending request for `id` to the operator.
@@ -141,6 +248,9 @@ impl ClientManager {
 			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))
 			.ok()?;
 		let client = inner.get(id)?;
+		if client.deadline <= Instant::now() {
+			return None;
+		}
 		Some(PendingApproval {
 			approval: client.approval.clone(),
 			requester: client.requester,
@@ -153,8 +263,9 @@ impl ClientManager {
 	pub(crate) fn cancel_pairing(&self, id: &str, approval: &str) {
 		if let Ok(mut inner) = self.pending_clients.write()
 			&& inner.get(id).is_some_and(|client| client.approval == approval)
+			&& let Some(client) = inner.remove(id)
 		{
-			inner.remove(id);
+			client.pin_notify.notify_one();
 		}
 	}
 
@@ -167,6 +278,7 @@ impl ClientManager {
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
+		Self::expire(&mut inner);
 		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
@@ -180,17 +292,36 @@ impl ClientManager {
 		}
 		let key = create_key(&client.salt, pin).map_err(|e| tracing::warn!("Failed to create client key: {e}"))?;
 		client.key = Some(key);
-		client.pin_notify.notify_waiters();
+		client.pin_notify.notify_one();
 		Ok(())
 	}
 
-	pub(crate) fn client_challenge(&self, id: &str, challenge: Vec<u8>) -> Result<Vec<u8>, ()> {
+	pub(crate) fn client_challenge(
+		&self,
+		id: &str,
+		generation: Option<&str>,
+		challenge: Vec<u8>,
+	) -> Result<Vec<u8>, ()> {
+		if challenge.len() != 16 {
+			return Err(());
+		}
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
+		Self::expire(&mut inner);
+		if inner
+			.get(id)
+			.is_none_or(|client| generation != Some(client.approval.as_str()))
+		{
+			return Err(());
+		}
 		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
+
+		if client.server_challenge.is_some() {
+			return Err(());
+		}
 
 		let key = match &client.key {
 			Some(key) => key,
@@ -231,13 +362,32 @@ impl ClientManager {
 			.map_err(|e| tracing::warn!("Failed to encrypt client challenge response: {e}"))
 	}
 
-	pub(crate) fn server_challenge_response(&self, id: &str, challenge_response: Vec<u8>) -> Result<Vec<u8>, ()> {
+	pub(crate) fn server_challenge_response(
+		&self,
+		id: &str,
+		generation: Option<&str>,
+		challenge_response: Vec<u8>,
+	) -> Result<Vec<u8>, ()> {
+		if challenge_response.len() != 32 {
+			return Err(());
+		}
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
+		Self::expire(&mut inner);
+		if inner
+			.get(id)
+			.is_none_or(|client| generation != Some(client.approval.as_str()))
+		{
+			return Err(());
+		}
 		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
+
+		if client.client_hash.is_some() || client.server_challenge.is_none() {
+			return Err(());
+		}
 
 		let key = match &client.key {
 			Some(key) => key,
@@ -263,32 +413,31 @@ impl ClientManager {
 		Ok(pairing_secret)
 	}
 
-	pub(crate) fn check_client_pairing_secret(&self, id: &str, client_secret: Vec<u8>) -> Result<(), ()> {
+	pub(crate) fn check_client_pairing_secret(
+		&self,
+		id: &str,
+		generation: Option<&str>,
+		client_secret: Vec<u8>,
+	) -> Result<(), ()> {
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
-		let client = inner.get_mut(id).ok_or_else(|| {
-			tracing::warn!("No known client with id {id}");
-		})?;
-		verify_pairing_secret(client, client_secret)
+		Self::expire(&mut inner);
+		if inner
+			.get(id)
+			.is_none_or(|client| generation != Some(client.approval.as_str()))
+		{
+			return Err(());
+		}
+		// Remove on both cryptographic failure and successful durable completion.
+		if inner.get(id).is_none_or(|client| client.key.is_none()) {
+			return Err(());
+		}
+		let mut client = inner.remove(id).ok_or(())?;
+		verify_pairing_secret(&mut client, client_secret)
 			.map_err(|e| tracing::warn!("Failed to verify client pairing secret: {e}"))?;
-
-		let fingerprint = cert_pem_fingerprint(&client.pem);
-		if let Some(fp) = &fingerprint {
-			self.state
-				.add_paired_cert(fp.clone())
-				.map_err(|_| tracing::warn!("Failed to persist paired certificate: {fp}"))?;
-		}
-
-		let has_client = self
-			.state
-			.has_client(id.to_string())
-			.map_err(|_| tracing::warn!("Failed to check client paired status"))?;
-		if !has_client {
-			self.state
-				.add_client(id.to_string())
-				.map_err(|_| tracing::warn!("Failed to persist client '{id}'"))?;
-		}
+		let fingerprint = cert_pem_fingerprint(&client.pem).ok_or(())?;
+		self.state.pair(id.to_string(), fingerprint)?;
 
 		Ok(())
 	}
@@ -425,4 +574,121 @@ pub(crate) fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, St
 fn cert_pem_fingerprint(pem: &str) -> Option<String> {
 	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).ok()?;
 	Some(hex::encode(Sha256::digest(&pem_obj.contents)))
+}
+
+#[cfg(test)]
+mod pairing_lifecycle_tests {
+	use super::*;
+
+	fn request(id: &str, pem: &str, seconds: u64) -> PendingClient {
+		PendingClient {
+			id: id.into(),
+			pem: pem.into(),
+			salt: [1; 16],
+			pin_notify: Arc::new(Notify::new()),
+			approval: new_approval_token().unwrap(),
+			requester: "192.0.2.1".parse().unwrap(),
+			deadline: Instant::now() + Duration::from_secs(seconds),
+			key: None,
+			server_secret: None,
+			server_challenge: None,
+			client_hash: None,
+		}
+	}
+
+	fn certificate() -> String {
+		rcgen::generate_simple_self_signed(vec!["test".into()])
+			.unwrap()
+			.cert
+			.pem()
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn thousands_of_abandoned_requests_are_bounded_and_expire() {
+		let dir = tempfile::tempdir().unwrap();
+		let manager = ClientManager::isolated(dir.path().join("state.toml"));
+		let shutdown = async_shutdown::ShutdownManager::new();
+		manager.ensure_cleanup(shutdown.clone());
+		manager.ensure_cleanup(shutdown.clone());
+		let pem = certificate();
+		let mut admitted = 0;
+		for index in 0..5000 {
+			if manager
+				.start_pairing(request(&format!("client-{index}"), &pem, 360))
+				.is_ok()
+			{
+				admitted += 1;
+			}
+		}
+		assert_eq!(admitted, MAX_PENDING_PAIRINGS);
+		assert_eq!(manager.pending_clients.read().unwrap().len(), MAX_PENDING_PAIRINGS);
+		assert!(manager.pending_approval("client-0").is_some());
+		tokio::task::yield_now().await;
+		tokio::time::advance(Duration::from_secs(361)).await;
+		tokio::task::yield_now().await;
+		assert!(manager.pending_clients.read().unwrap().is_empty());
+		assert!(manager.start_pairing(request("after-expiry", &pem, 360)).is_ok());
+		shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		tokio::task::yield_now().await;
+		assert!(manager.pending_clients.read().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn early_pin_and_duplicate_generation_cleanup_are_race_free() {
+		let dir = tempfile::tempdir().unwrap();
+		let manager = ClientManager::isolated(dir.path().join("state.toml"));
+		let pem = certificate();
+		let original = request("duplicate", &pem, 360);
+		let token = original.approval.clone();
+		let notify = original.pin_notify.clone();
+		manager.start_pairing(original).unwrap();
+		manager.register_pin("duplicate", "1234", &token).unwrap();
+		// Notify::notify_one retains a permit even before waiter registration.
+		tokio::time::timeout(Duration::from_secs(1), notify.notified())
+			.await
+			.unwrap();
+		assert!(manager.approved("duplicate", &token));
+		let replacement = request("duplicate", &pem, 360);
+		let replacement_token = replacement.approval.clone();
+		manager.start_pairing(replacement).unwrap();
+		tokio::time::timeout(Duration::from_secs(1), notify.notified())
+			.await
+			.unwrap();
+		assert!(!manager.approved("duplicate", &token));
+		manager.register_pin("duplicate", "9999", &replacement_token).unwrap();
+		assert!(
+			manager
+				.client_challenge("duplicate", Some(&token), vec![0; 16])
+				.is_err()
+		);
+		assert!(
+			manager
+				.server_challenge_response("duplicate", Some(&token), vec![0; 32])
+				.is_err()
+		);
+		assert!(
+			manager
+				.check_client_pairing_secret("duplicate", Some(&token), vec![0; 272])
+				.is_err()
+		);
+		manager.cancel_pairing("duplicate", &token);
+		assert_eq!(
+			manager.pending_approval("duplicate").unwrap().approval,
+			replacement_token
+		);
+		assert!(manager.register_pin("duplicate", "1234", &token).is_err());
+		manager.cancel_pairing("duplicate", &replacement_token);
+		assert!(manager.pending_clients.read().unwrap().is_empty());
+	}
+
+	#[test]
+	fn repeated_replacements_do_not_accumulate_transactions() {
+		let dir = tempfile::tempdir().unwrap();
+		let manager = ClientManager::isolated(dir.path().join("state.toml"));
+		let pem = certificate();
+		for _ in 0..5000 {
+			manager.start_pairing(request("duplicate", &pem, 360)).unwrap();
+		}
+		assert_eq!(manager.pending_clients.read().unwrap().len(), 1);
+	}
 }

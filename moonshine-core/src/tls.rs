@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs::File;
-use std::io::{BufReader, ErrorKind, Write};
+use std::io::{BufReader, ErrorKind};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -371,47 +372,257 @@ pub(crate) fn create_certificate() -> Result<(String, String), Box<dyn std::erro
 
 /// Load existing TLS certificate and private key from disk, or create new ones if they don't exist.
 pub fn load_or_create_certificate(config: &Config) -> Result<(String, String), ()> {
-	let cert_path = &config.webserver.certificate;
-	let key_path = &config.webserver.private_key;
+	let identity = initialize_identity(&config.webserver.certificate, &config.webserver.private_key)
+		.map_err(|e| tracing::error!("Failed to load or provision TLS identity: {e}"))?;
+	if std::fs::metadata(&config.webserver.private_key).is_ok_and(|m| m.permissions().mode() & 0o077 != 0) {
+		tracing::warn!(
+			"Existing TLS private key permits group/other access; ask its administrator to restrict permissions to 0600"
+		);
+	}
+	Ok(identity)
+}
 
-	if !cert_path.exists() && !key_path.exists() {
-		tracing::info!("No certificate found, creating a new one.");
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IdentityJournal {
+	certificate: String,
+	private_key: String,
+}
 
-		let (cert, pkey) = create_certificate().map_err(|e| tracing::error!("Failed to create certificate: {e}"))?;
+fn identity_sidecar(key: &Path, suffix: &str) -> std::path::PathBuf {
+	let mut name = key.as_os_str().to_os_string();
+	name.push(suffix);
+	name.into()
+}
 
-		// Write certificate to file.
-		let cert_dir = cert_path
-			.parent()
-			.ok_or_else(|| tracing::error!("Failed to find parent directory for certificate file."))?;
-		std::fs::create_dir_all(cert_dir)
-			.map_err(|e| tracing::error!("Failed to create certificate directory: {e}"))?;
-		let mut certfile =
-			std::fs::File::create(cert_path).map_err(|e| tracing::error!("Failed to create certificate file: {e}"))?;
-		certfile
-			.write(cert.as_bytes())
-			.map_err(|e| tracing::error!("Failed to write PEM to file: {e}"))?;
-
-		// Write private key to file.
-		let key_dir = key_path
-			.parent()
-			.ok_or_else(|| tracing::error!("Failed to find parent directory for private key file."))?;
-		std::fs::create_dir_all(key_dir).map_err(|e| tracing::error!("Failed to create private key directory: {e}"))?;
-		let mut keyfile =
-			std::fs::File::create(key_path).map_err(|e| tracing::error!("Failed to create private key file: {e}"))?;
-		keyfile
-			.write(pkey.as_bytes())
-			.map_err(|e| tracing::error!("Failed to write private key to file: {e}"))?;
-
-		tracing::debug!("Saved certificate to {}", cert_path.display());
-		tracing::debug!("Saved private key to {}", key_path.display());
-
-		Ok((cert, pkey))
+fn initialize_identity(cert: &Path, key: &Path) -> Result<(String, String), Box<dyn std::error::Error>> {
+	if cert == key {
+		return Err("Certificate and key paths must differ".into());
+	}
+	let journal_path = identity_sidecar(key, ".creation.toml");
+	if cert.exists() && key.exists() && !journal_path.exists() {
+		load_tls_files(cert, key).map_err(|_| "Invalid existing identity")?;
+		return Ok((std::fs::read_to_string(cert)?, std::fs::read_to_string(key)?));
+	}
+	crate::durable::create_directories(crate::durable::directory(key))?;
+	// Kernel lock survives thread races and releases automatically on process death.
+	// Do not unlink this file: replacing its inode would split the lock domain.
+	let lock_path = identity_sidecar(key, ".creation.lock");
+	let lock = std::fs::OpenOptions::new()
+		.read(true)
+		.write(true)
+		.create(true)
+		.truncate(false)
+		.mode(0o600)
+		.custom_flags(libc::O_NOFOLLOW)
+		.open(lock_path)?;
+	lock.lock()?;
+	let exists = |path: &Path| -> std::io::Result<bool> {
+		match std::fs::symlink_metadata(path) {
+			Ok(_) => Ok(true),
+			Err(e) if e.kind() == ErrorKind::NotFound => Ok(false),
+			Err(e) => Err(e),
+		}
+	};
+	if exists(cert)? && exists(key)? {
+		// Validate the pair without changing externally managed permissions/content.
+		load_tls_files(cert, key).map_err(|_| "Invalid existing identity")?;
+		let certificate = std::fs::read_to_string(cert)?;
+		let private_key = std::fs::read_to_string(key)?;
+		if exists(&journal_path)? && !std::fs::symlink_metadata(&journal_path)?.file_type().is_symlink() {
+			let journal: IdentityJournal = toml::from_str(&std::fs::read_to_string(&journal_path)?)
+				.map_err(|_| "Invalid identity recovery journal")?;
+			if journal.certificate == certificate && journal.private_key == private_key {
+				crate::durable::sync_parent(key)?;
+				crate::durable::sync_parent(cert)?;
+				std::fs::remove_file(&journal_path)?;
+				crate::durable::sync_parent(&journal_path)?;
+			}
+		}
+		return Ok((certificate, private_key));
+	}
+	let journal: IdentityJournal = if exists(&journal_path)? {
+		// Never follow a symlink containing an administrator's unrelated secret.
+		if std::fs::symlink_metadata(&journal_path)?.file_type().is_symlink() {
+			return Err("Identity recovery journal is a symlink".into());
+		}
+		toml::from_str(&std::fs::read_to_string(&journal_path)?).map_err(|_| "Invalid identity recovery journal")?
 	} else {
-		let cert = std::fs::read_to_string(cert_path)
-			.map_err(|e| tracing::error!("Failed to read server certificate: {e}"))?;
+		if exists(cert)? || exists(key)? {
+			return Err("Incomplete existing TLS identity; restore its matching file (no recovery journal)".into());
+		}
+		let (certificate, private_key) = create_certificate()?;
+		let journal = IdentityJournal {
+			certificate,
+			private_key,
+		};
+		crate::durable::create(&journal_path, toml::to_string(&journal)?.as_bytes())?;
+		journal
+	};
+	// Both files come from a durable journal. Recovery may complete missing files,
+	// but cannot overwrite any existing file, including symlinks or partial files.
+	for (path, content) in [(key, &journal.private_key), (cert, &journal.certificate)] {
+		if exists(path)? {
+			if std::fs::read_to_string(path)? != *content {
+				return Err("Existing identity conflicts with recovery journal; restore manually".into());
+			}
+		} else {
+			crate::durable::create(path, content.as_bytes())?;
+		}
+	}
+	load_tls_files(cert, key).map_err(|_| "Invalid provisioned identity")?;
+	std::fs::remove_file(&journal_path)?;
+	crate::durable::sync_parent(&journal_path)?;
+	Ok((journal.certificate, journal.private_key))
+}
 
-		let pkey = std::fs::read_to_string(key_path).map_err(|e| tracing::error!("Failed to read private key: {e}"))?;
+#[cfg(test)]
+mod identity_tests {
+	use super::*;
 
-		Ok((cert, pkey))
+	#[test]
+	fn interrupted_creation_child_probe() {
+		let Some(directory) = std::env::var_os("PYROSHINE_IDENTITY_CRASH_DIR") else {
+			return;
+		};
+		let directory = std::path::PathBuf::from(directory);
+		let count = std::env::var("PYROSHINE_IDENTITY_CRASH_AFTER")
+			.unwrap()
+			.parse()
+			.unwrap();
+		crate::durable::fail_after("create", count, 0);
+		let _ = initialize_identity(&directory.join("server.pem"), &directory.join("server.key"));
+		panic!("child did not reach interruption point");
+	}
+
+	#[test]
+	fn process_exit_during_creation_recovers_and_releases_writer_lock() {
+		for count in [0, 1, 2] {
+			let directory = tempfile::tempdir().unwrap();
+			let result = std::process::Command::new(std::env::current_exe().unwrap())
+				.args(["--exact", "tls::identity_tests::interrupted_creation_child_probe"])
+				.env("PYROSHINE_IDENTITY_CRASH_DIR", directory.path())
+				.env("PYROSHINE_IDENTITY_CRASH_AFTER", count.to_string())
+				.output()
+				.unwrap();
+			assert_eq!(result.status.code(), Some(91));
+			let key = directory.path().join("server.key");
+			let before = std::fs::read(&key).ok();
+			assert!(initialize_identity(&directory.path().join("server.pem"), &key).is_ok());
+			if let Some(before) = before {
+				assert!(std::fs::read(&key).unwrap() == before);
+			}
+			for entry in std::fs::read_dir(directory.path()).unwrap() {
+				assert_eq!(entry.unwrap().metadata().unwrap().permissions().mode() & 0o777, 0o600);
+			}
+		}
+	}
+
+	#[test]
+	fn umask_child_probe() {
+		let Some(directory) = std::env::var_os("PYROSHINE_KEY_TEST_DIR") else {
+			return;
+		};
+		let mask = u32::from_str_radix(&std::env::var("PYROSHINE_KEY_TEST_UMASK").unwrap(), 8).unwrap();
+		// This test runs alone in a child process; umask cannot race other tests.
+		unsafe {
+			libc::umask(mask);
+		}
+		let directory = std::path::PathBuf::from(directory);
+		let cert = directory.join("custom-cert/identity.pem");
+		let key = directory.join("custom-key/identity.key");
+		assert!(initialize_identity(&cert, &key).is_ok());
+		assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o600);
+		let before = std::fs::read(&key).unwrap();
+		assert!(initialize_identity(&cert, &key).is_ok());
+		assert!(std::fs::read(&key).unwrap() == before);
+	}
+
+	#[test]
+	fn private_keys_ignore_permissive_umask() {
+		for mask in ["022", "000", "077"] {
+			let directory = tempfile::tempdir().unwrap();
+			let result = std::process::Command::new(std::env::current_exe().unwrap())
+				.args(["--exact", "tls::identity_tests::umask_child_probe"])
+				.env("PYROSHINE_KEY_TEST_DIR", directory.path())
+				.env("PYROSHINE_KEY_TEST_UMASK", mask)
+				.output()
+				.unwrap();
+			assert!(result.status.success(), "isolated umask test failed for {mask}");
+		}
+	}
+
+	#[test]
+	fn concurrent_creators_preserve_one_valid_identity() {
+		let directory = tempfile::tempdir().unwrap();
+		let cert = directory.path().join("server.pem");
+		let key = directory.path().join("server.key");
+		std::thread::scope(|scope| {
+			let mut threads = Vec::new();
+			for _ in 0..8 {
+				let (cert, key) = (&cert, &key);
+				threads.push(scope.spawn(move || initialize_identity(cert, key).is_ok()));
+			}
+			for thread in threads {
+				assert!(thread.join().unwrap());
+			}
+		});
+		let original = std::fs::read(&key).unwrap();
+		assert!(initialize_identity(&cert, &key).is_ok());
+		assert!(std::fs::read(&key).unwrap() == original);
+		assert!(load_tls_files(&cert, &key).is_ok());
+		assert!(!identity_sidecar(&key, ".creation.toml").exists());
+	}
+
+	#[test]
+	fn interruption_and_filesystem_failures_recover_without_rotating_keys() {
+		let (certificate, private_key) = create_certificate().unwrap();
+		for (operation, count, errno) in [
+			("write", 0, libc::ENOSPC),
+			("file_sync", 0, libc::EIO),
+			("create", 0, libc::EACCES),
+			("create", 1, libc::EACCES),
+			("dir_sync", 1, libc::EIO),
+			("dir_sync", 2, libc::EIO),
+		] {
+			let directory = tempfile::tempdir().unwrap();
+			let cert = directory.path().join("server.pem");
+			let key = directory.path().join("server.key");
+			let journal = IdentityJournal {
+				certificate: certificate.clone(),
+				private_key: private_key.clone(),
+			};
+			// An interruption after the durable intent, before either publication.
+			crate::durable::create(
+				&identity_sidecar(&key, ".creation.toml"),
+				toml::to_string(&journal).unwrap().as_bytes(),
+			)
+			.unwrap();
+			crate::durable::fail_after(operation, count, errno);
+			assert!(initialize_identity(&cert, &key).is_err());
+			assert!(initialize_identity(&cert, &key).is_ok());
+			assert!(std::fs::read_to_string(&key).unwrap() == private_key);
+			assert!(std::fs::read_to_string(&cert).unwrap() == certificate);
+			assert!(!identity_sidecar(&key, ".creation.toml").exists());
+		}
+	}
+
+	#[test]
+	fn incomplete_external_identity_and_symlinks_are_not_overwritten() {
+		let directory = tempfile::tempdir().unwrap();
+		let cert = directory.path().join("server.pem");
+		let key = directory.path().join("server.key");
+		let (certificate, private_key) = create_certificate().unwrap();
+		std::fs::write(&key, &private_key).unwrap();
+		std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o640)).unwrap();
+		assert!(initialize_identity(&cert, &key).is_err());
+		assert!(std::fs::read_to_string(&key).unwrap() == private_key);
+		std::fs::write(&cert, certificate).unwrap();
+		assert!(initialize_identity(&cert, &key).is_ok());
+		assert_eq!(std::fs::metadata(&key).unwrap().permissions().mode() & 0o777, 0o640);
+		std::fs::remove_file(&key).unwrap();
+		std::fs::remove_file(&cert).unwrap();
+		std::os::unix::fs::symlink(directory.path().join("missing"), &key).unwrap();
+		assert!(initialize_identity(&cert, &key).is_err());
+		assert!(std::fs::symlink_metadata(&key).unwrap().file_type().is_symlink());
 	}
 }

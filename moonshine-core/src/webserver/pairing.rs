@@ -8,13 +8,62 @@ use hyper::{
 	header::{self, HeaderValue},
 };
 use notify_rust::Notification;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Notify;
+use tokio::time::Instant;
 
 use crate::ShutdownReason;
 use crate::clients::ClientManager;
 use crate::clients::PendingClient;
 use crate::clients::new_approval_token;
 use crate::webserver::bad_request;
+
+// Notifications never wait for user interaction. One worker and a global
+// cooldown bound D-Bus work even when clients repeatedly replace one ID.
+static NOTIFICATION_BUSY: AtomicBool = AtomicBool::new(false);
+static LAST_NOTIFICATION: Mutex<Option<Instant>> = Mutex::new(None);
+
+struct PairingWaitGuard<'a> {
+	manager: &'a ClientManager,
+	id: &'a str,
+	approval: &'a str,
+	approved: bool,
+}
+impl Drop for PairingWaitGuard<'_> {
+	fn drop(&mut self) {
+		if !self.approved {
+			self.manager.cancel_pairing(self.id, self.approval);
+		}
+	}
+}
+
+fn notify_operator(pin_url: String) {
+	let Ok(mut last) = LAST_NOTIFICATION.lock() else {
+		return;
+	};
+	if last.is_some_and(|time| time.elapsed() < Duration::from_secs(30))
+		|| NOTIFICATION_BUSY.swap(true, Ordering::AcqRel)
+	{
+		return;
+	}
+	*last = Some(Instant::now());
+	if std::thread::Builder::new()
+		.name("pin-notification".into())
+		.spawn(move || {
+			let _ = Notification::new()
+				.appname("Moonshine")
+				.summary("Received pairing request")
+				.body(&format!("Open {pin_url} on the host to enter the PIN."))
+				.timeout(30_000)
+				.show();
+			NOTIFICATION_BUSY.store(false, Ordering::Release);
+		})
+		.is_err()
+	{
+		NOTIFICATION_BUSY.store(false, Ordering::Release);
+	}
+}
 
 /// Extract a required query parameter, or return a 400 bad-request response.
 macro_rules! require_param {
@@ -69,7 +118,23 @@ pub async fn handle_pair_request(
 	approval_timeout: Duration,
 	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
-	if params.contains_key("phrase") {
+	// Snapshot the generation before a protocol step. Failure cleanup cannot
+	// remove a request that replaced it while the step was being handled.
+	// Unapproved requests reject premature steps without consuming approval.
+	let cleanup = if params.get("phrase").is_some_and(|phrase| phrase == "getservercert") {
+		None
+	} else {
+		params.get("uniqueid").and_then(|id| {
+			client_manager
+				.pending_approval(id)
+				.map(|pending| (id.clone(), pending.approval))
+		})
+	};
+	let was_approved = cleanup
+		.as_ref()
+		.is_some_and(|(id, approval)| client_manager.approved(id, approval));
+	let generation = cleanup.as_ref().map(|(_, approval)| approval.as_str());
+	let response = if params.contains_key("phrase") {
 		match params.remove("phrase").unwrap().as_str() {
 			"getservercert" => {
 				get_server_cert(
@@ -93,16 +158,23 @@ pub async fn handle_pair_request(
 			},
 		}
 	} else if params.contains_key("clientchallenge") {
-		client_challenge(params, client_manager)
+		client_challenge(params, client_manager, generation)
 	} else if params.contains_key("serverchallengeresp") {
-		server_challenge_response(params, client_manager)
+		server_challenge_response(params, client_manager, generation)
 	} else if params.contains_key("clientpairingsecret") {
-		client_pairing_secret(params, client_manager)
+		client_pairing_secret(params, client_manager, generation)
 	} else {
-		let message = format!("Unknown pair command with params: {:?}", params);
+		let message = format!("Unknown pair command with parameter names: {:?}", params.keys());
 		tracing::warn!("{message}");
 		bad_request(message)
+	};
+	if !response.status().is_success()
+		&& was_approved
+		&& let Some((id, approval)) = cleanup
+	{
+		client_manager.cancel_pairing(&id, &approval);
 	}
+	response
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -167,7 +239,9 @@ async fn get_server_cert(
 	tokio::pin!(pin_notified);
 	pin_notified.as_mut().enable();
 
+	client_manager.ensure_cleanup(shutdown.clone());
 	let pending_client = PendingClient {
+		deadline: Instant::now() + approval_timeout + Duration::from_secs(60),
 		id: unique_id.clone(),
 		pem: client_pem,
 		salt,
@@ -185,6 +259,13 @@ async fn get_server_cert(
 		return bad_request(message);
 	}
 
+	let mut guard = PairingWaitGuard {
+		manager: client_manager,
+		id: &unique_id,
+		approval: &approval,
+		approved: false,
+	};
+
 	// Emit a notification, allowing the user to automatically open the PIN page.
 	// Approval is only accepted from the host itself, so link to loopback rather
 	// than to the address the client used.
@@ -193,29 +274,7 @@ async fn get_server_cert(
 		let pin_url = format!("http://localhost:{http_port}/pin?uniqueid={encoded_id}");
 		tracing::info!(requester = %peer_address, "Waiting for the host operator to enter the PIN at {pin_url}");
 
-		let _ = std::thread::Builder::new()
-			.name("pin-notification".to_string())
-			.spawn(move || {
-				Notification::new()
-					.appname("Moonshine")
-					.summary("Received pairing request.")
-					.body(&format!("Open {pin_url} to enter the PIN."))
-					.action("default", "default")
-					.action("open", "Enter PIN")
-					.show()
-					.map_err(|e| tracing::warn!("Failed to show PIN notification: {e}"))?
-					.wait_for_action(|action| {
-						if action != "__closed"
-							&& let Err(e) = open::that(&pin_url)
-						{
-							tracing::warn!(
-								"Couldn't open the PIN page automatically ({e}). Open it manually: {pin_url}"
-							);
-						}
-					});
-
-				Ok::<(), ()>(())
-			});
+		notify_operator(pin_url);
 	}
 
 	tokio::select! {
@@ -232,10 +291,19 @@ async fn get_server_cert(
 		},
 	}
 
+	if !client_manager.approved(&unique_id, &approval) {
+		return bad_request("Pairing request expired or was replaced.".to_string());
+	}
+	guard.approved = true;
+
 	paired_xml_response(format!("<plaincert>{}</plaincert>", hex::encode(server_pem_str)))
 }
 
-fn client_challenge(mut params: HashMap<String, String>, client_manager: &ClientManager) -> Response<Full<Bytes>> {
+fn client_challenge(
+	mut params: HashMap<String, String>,
+	client_manager: &ClientManager,
+	generation: Option<&str>,
+) -> Response<Full<Bytes>> {
 	let unique_id = require_param!(params, "uniqueid");
 	let challenge = require_param!(params, "clientchallenge");
 	let challenge = match hex::decode(challenge) {
@@ -247,7 +315,7 @@ fn client_challenge(mut params: HashMap<String, String>, client_manager: &Client
 		},
 	};
 
-	let challenge_response = match client_manager.client_challenge(&unique_id, challenge) {
+	let challenge_response = match client_manager.client_challenge(&unique_id, generation, challenge) {
 		Ok(challenge_response) => challenge_response,
 		Err(()) => {
 			return bad_request("Failed to process client challenge".to_string());
@@ -263,6 +331,7 @@ fn client_challenge(mut params: HashMap<String, String>, client_manager: &Client
 fn server_challenge_response(
 	mut params: HashMap<String, String>,
 	client_manager: &ClientManager,
+	generation: Option<&str>,
 ) -> Response<Full<Bytes>> {
 	let server_challenge_response = require_param!(params, "serverchallengeresp");
 	let server_challenge_response = match hex::decode(server_challenge_response) {
@@ -276,12 +345,13 @@ fn server_challenge_response(
 
 	let unique_id = require_param!(params, "uniqueid");
 
-	let pairing_secret = match client_manager.server_challenge_response(&unique_id, server_challenge_response) {
-		Ok(pairing_secret) => pairing_secret,
-		Err(()) => {
-			return bad_request("Failed to process server challenge response".to_string());
-		},
-	};
+	let pairing_secret =
+		match client_manager.server_challenge_response(&unique_id, generation, server_challenge_response) {
+			Ok(pairing_secret) => pairing_secret,
+			Err(()) => {
+				return bad_request("Failed to process server challenge response".to_string());
+			},
+		};
 
 	paired_xml_response(format!(
 		"<pairingsecret>{}</pairingsecret>",
@@ -301,7 +371,11 @@ fn pair_challenge(params: HashMap<String, String>) -> Response<Full<Bytes>> {
 	paired_xml_response("")
 }
 
-fn client_pairing_secret(mut params: HashMap<String, String>, client_manager: &ClientManager) -> Response<Full<Bytes>> {
+fn client_pairing_secret(
+	mut params: HashMap<String, String>,
+	client_manager: &ClientManager,
+	generation: Option<&str>,
+) -> Response<Full<Bytes>> {
 	let client_pairing_secret = require_param!(params, "clientpairingsecret");
 	let client_pairing_secret = match hex::decode(client_pairing_secret) {
 		Ok(client_pairing_secret) => client_pairing_secret,
@@ -315,7 +389,7 @@ fn client_pairing_secret(mut params: HashMap<String, String>, client_manager: &C
 	let unique_id = require_param!(params, "uniqueid");
 
 	if client_manager
-		.check_client_pairing_secret(&unique_id, client_pairing_secret)
+		.check_client_pairing_secret(&unique_id, generation, client_pairing_secret)
 		.is_err()
 	{
 		return bad_request("Failed to check client pairing secret".to_string());

@@ -208,6 +208,7 @@ in
         DBUS_SESSION_BUS_ADDRESS = "unix:path=${runtimeDir}/bus";
       };
       serviceConfig = {
+        UMask = "0077";
         User = cfg.user;
         # /dev/dri render nodes are video-group on NixOS. The `input` group is
         # deliberately NOT granted here: it only helps moonshine's own access

@@ -366,6 +366,13 @@ impl Webserver {
 
 		tracing::debug!("Received {} request for {}.", request.method(), request.uri().path());
 
+		// Drain in-flight launch/resume/cancel operations before revoking trust
+		// and stopping sessions. Requests starting afterward recheck durable trust.
+		let _authorization = if https && matches!(request.uri().path(), "/launch" | "/resume" | "/cancel") {
+			Some(self.client_manager.authorization_gate.read().await)
+		} else {
+			None
+		};
 		let response = if https {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => {
@@ -436,7 +443,14 @@ impl Webserver {
 					)
 					.await
 				},
-				(&Method::GET, "/unpair") => self.unpair(params).await,
+				(&Method::GET, "/unpair") => {
+					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
+						return Ok(resp.map(BodyExt::boxed_unsync));
+					}
+					// TLS self-revocation targets the authenticated credential, never a
+					// caller-supplied uniqueid or fingerprint.
+					self.unpair(None, peer_cert_fingerprint.as_deref()).await
+				},
 				(&Method::GET, "/launch") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
@@ -509,7 +523,16 @@ impl Webserver {
 					}
 					self.submit_pin(request).await
 				},
-				(&Method::GET, "/unpair") => self.unpair(params).await,
+				(&Method::POST, "/unpair") => {
+					if let Some(resp) = self.verify_operator(&request, peer_address) {
+						return Ok(resp.map(BodyExt::boxed_unsync));
+					}
+					self.unpair(
+						params.get("uniqueid").map(String::as_str),
+						params.get("fingerprint").map(String::as_str),
+					)
+					.await
+				},
 				(method, uri) => {
 					tracing::warn!("Unhandled {method} request with URI '{uri}'");
 					not_found()
@@ -718,23 +741,15 @@ impl Webserver {
 	}
 
 	fn pin(&self, params: HashMap<String, String>) -> Response<Full<Bytes>> {
-		let unique_id = params
-			.get("uniqueid")
-			.cloned()
-			.map(|id| {
-				id.chars()
-					.filter(|c| c.is_ascii_hexdigit())
-					.take(16)
-					.collect::<String>()
-			})
-			.filter(|id| !id.is_empty())
-			.unwrap_or_else(|| "0123456789ABCDEF".to_string());
+		let Some(unique_id) = params.get("uniqueid").filter(|id| !id.is_empty() && id.len() <= 256) else {
+			return bad_request("A valid pending client ID is required.".to_string());
+		};
 
 		// The page approves one specific pending request: its approval token is
 		// required on submission, so a request that replaces it (same client ID)
 		// cannot inherit the operator's PIN. Show the requester so the operator
 		// can recognize it.
-		let Some(pending) = self.client_manager.pending_approval(&unique_id) else {
+		let Some(pending) = self.client_manager.pending_approval(unique_id) else {
 			return Response::builder()
 				.status(StatusCode::NOT_FOUND)
 				.header(header::CACHE_CONTROL, "no-store")
@@ -744,13 +759,13 @@ impl Webserver {
 		let content = include_bytes!("../../../assets/pin.html");
 		let html = String::from_utf8_lossy(content);
 		let html = html
-			.replace("{{UNIQUE_ID}}", &unique_id)
 			.replace("{{REQUEST}}", &pending.approval)
 			.replace("{{REQUESTER}}", &escape_xml(pending.requester.to_string()))
 			.replace(
 				"{{FINGERPRINT}}",
 				&escape_xml(pending.fingerprint.as_deref().unwrap_or("unknown")),
-			);
+			)
+			.replace("{{UNIQUE_ID}}", &escape_xml(unique_id));
 		let mut response = Response::new(Full::new(Bytes::from(html)));
 		let headers = response.headers_mut();
 		headers.insert(
@@ -800,7 +815,19 @@ impl Webserver {
 		}
 	}
 
-	async fn unpair(&self, _params: HashMap<String, String>) -> Response<Full<Bytes>> {
+	async fn unpair(&self, id: Option<&str>, fingerprint: Option<&str>) -> Response<Full<Bytes>> {
+		let _authorization = self.client_manager.authorization_gate.write().await;
+		if matches!(self.client_manager.revoke(id, fingerprint), Ok(true)) {
+			// Session state does not record the TLS credential owner. Conservatively
+			// stop the active stream on any revocation instead of leaving stale keys.
+			if self.session_manager.stop_session().await.is_err() {
+				return bad_request("Trust revoked, but session shutdown failed.".to_string());
+			}
+		} else {
+			return bad_request(
+				"Revocation failed or credential not found; legacy clients require fingerprint.".to_string(),
+			);
+		}
 		let xml = r#"<root status_code="200"/>"#;
 		let mut response = Response::new(Full::new(Bytes::from(xml)));
 		response

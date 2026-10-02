@@ -373,6 +373,7 @@ async fn pairing_requires_loopback_operator_approval() {
 
 	assert!(client.complete(&server).await);
 	assert!(client_manager.is_cert_paired(&client.fingerprint()).unwrap());
+	assert!(client_manager.pending_approval(&client.unique_id).is_none());
 }
 
 /// A wrong operator PIN cannot complete pairing.
@@ -460,6 +461,10 @@ async fn disabled_pairing_rejects_every_pairing_route() {
 }
 
 fn tls_client() -> tokio_rustls::TlsConnector {
+	tls_client_with_identity(None)
+}
+
+fn tls_client_with_identity(identity: Option<&PairingClient>) -> tokio_rustls::TlsConnector {
 	#[derive(Debug)]
 	struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
 	impl rustls::client::danger::ServerCertVerifier for AcceptAny {
@@ -494,12 +499,22 @@ fn tls_client() -> tokio_rustls::TlsConnector {
 		}
 	}
 	let provider = Arc::new(rustls::crypto::aws_lc_rs::default_provider());
-	let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+	let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
 		.with_safe_default_protocol_versions()
 		.unwrap()
 		.dangerous()
-		.with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
-		.with_no_client_auth();
+		.with_custom_certificate_verifier(Arc::new(AcceptAny(provider)));
+	let config = if let Some(client) = identity {
+		let certs = rustls_pemfile::certs(&mut std::io::Cursor::new(&client.cert_pem))
+			.collect::<Result<Vec<_>, _>>()
+			.unwrap();
+		let key = rustls_pemfile::private_key(&mut std::io::Cursor::new(&client.key_pem))
+			.unwrap()
+			.unwrap();
+		builder.with_client_auth_cert(certs, key).unwrap()
+	} else {
+		builder.with_no_client_auth()
+	};
 	tokio_rustls::TlsConnector::from(Arc::new(config))
 }
 
@@ -748,4 +763,199 @@ async fn malformed_launch_and_resume_values_change_nothing() {
 		Some(grant),
 		"rejected requests did not rotate the authorization generation"
 	);
+}
+
+/// Administrative revocation is local and survives restart; another client's
+/// certificate continues to authorize requests on existing TLS connections.
+#[tokio::test]
+async fn authorized_revocation_survives_restart_and_blocks_https() {
+	let Fixture {
+		server,
+		client_manager,
+		_directory,
+	} = fixture(true, WebLimits::default());
+	client_manager
+		.persistent_state()
+		.pair("A".into(), "cert-A".into())
+		.unwrap();
+	client_manager
+		.persistent_state()
+		.pair("B".into(), "cert-B".into())
+		.unwrap();
+	let uuid = client_manager.persistent_state().get_uuid().unwrap();
+	for (peer, extra) in [
+		(REMOTE, ""),
+		(
+			LOCAL,
+			"Origin: https://attacker.example\r\nSec-Fetch-Site: cross-site\r\n",
+		),
+	] {
+		let (status, _) = http(&server, peer, post("/unpair?uniqueid=A", "localhost:47989", extra, "")).await;
+		assert_eq!(status, 403);
+	}
+	let (status, _) = http(&server, REMOTE, get("/unpair?uniqueid=A", "192.168.1.10:47989")).await;
+	assert_eq!(status, 404);
+	assert!(client_manager.is_cert_paired("cert-A").unwrap());
+	let (status, _) = http(&server, LOCAL, post("/unpair?uniqueid=A", "localhost:47989", "", "")).await;
+	assert_eq!(status, 200);
+	let restarted = crate::state::PersistentState::load(_directory.path().join("state.toml")).unwrap();
+	assert_eq!(restarted.get_uuid().unwrap(), uuid);
+	assert!(!restarted.has_paired_cert("cert-A".into()).unwrap());
+	assert!(restarted.has_paired_cert("cert-B".into()).unwrap());
+	assert!(server.verify_paired_client(&Some("cert-A".into())).is_some());
+	assert!(server.verify_paired_client(&Some("cert-B".into())).is_none());
+	let (status, _) = http(&server, LOCAL, post("/unpair?uniqueid=A", "localhost:47989", "", "")).await;
+	assert_eq!(status, 400, "absent credentials must not report revocation success");
+}
+
+#[tokio::test]
+async fn disconnect_cleans_unapproved_request() {
+	let Fixture {
+		server,
+		client_manager,
+		_directory,
+	} = fixture(true, WebLimits::default());
+	let client = PairingClient::new("disconnected", "1234");
+	let waiting = client.request_server_cert(&server);
+	client.wait_pending(&client_manager).await;
+	waiting.abort();
+	let _ = waiting.await;
+	let deadline = Instant::now() + Duration::from_secs(2);
+	while client_manager.pending_approval(&client.unique_id).is_some() {
+		assert!(Instant::now() < deadline, "disconnected pairing was retained");
+		tokio::task::yield_now().await;
+	}
+}
+
+async fn credential_request(address: SocketAddr, client: &PairingClient, path: &str) -> u16 {
+	let socket = tokio::net::TcpStream::connect(address).await.unwrap();
+	let mut stream = tls_client_with_identity(Some(client))
+		.connect(ServerName::try_from("localhost").unwrap(), socket)
+		.await
+		.unwrap();
+	stream.write_all(get(path, "localhost").as_bytes()).await.unwrap();
+	let mut response = Vec::new();
+	stream.read_to_end(&mut response).await.unwrap();
+	String::from_utf8(response).unwrap()[9..12].parse().unwrap()
+}
+
+#[tokio::test]
+async fn tls_self_revocation_ignores_other_client_id_and_survives_restart() {
+	let Fixture {
+		mut server,
+		client_manager,
+		_directory,
+	} = fixture(true, WebLimits::default());
+	let a = PairingClient::new("A", "1234");
+	let b = PairingClient::new("B", "1234");
+	client_manager
+		.persistent_state()
+		.pair(a.unique_id.clone(), a.fingerprint())
+		.unwrap();
+	client_manager
+		.persistent_state()
+		.pair(b.unique_id.clone(), b.fingerprint())
+		.unwrap();
+	let address = serve_https(&server).await;
+	assert_eq!(credential_request(address, &a, "/applist").await, 200);
+	assert_eq!(credential_request(address, &a, "/unpair?uniqueid=B").await, 200);
+	assert_eq!(credential_request(address, &a, "/launch").await, 401);
+	assert_eq!(credential_request(address, &b, "/applist").await, 200);
+	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
+	server.shutdown.wait_shutdown_complete().await;
+	server.client_manager = client_manager.restarted(_directory.path().join("state.toml"));
+	server.shutdown = ShutdownManager::new();
+	server.session_manager = SessionManager::for_test(server.shutdown.clone());
+	let address = serve_https(&server).await;
+	assert_eq!(credential_request(address, &a, "/launch").await, 401);
+	assert_eq!(credential_request(address, &a, "/unpair?uniqueid=B").await, 401);
+	assert_eq!(credential_request(address, &b, "/applist").await, 200);
+	server.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
+}
+
+#[tokio::test]
+async fn failed_pairing_persistence_never_authorizes_and_cleans_pending() {
+	let Fixture {
+		server,
+		client_manager,
+		_directory,
+	} = fixture(true, WebLimits::default());
+	client_manager.persistent_state().save().unwrap();
+	let client = PairingClient::new("d6fbb8e9-35b8-4c82-9f2d-ea68c2ef8d12", "1234");
+	let waiting = client.request_server_cert(&server);
+	client.wait_pending(&client_manager).await;
+	let token = operator_page_token(&server, &client.unique_id).await;
+	let (status, _) = http(
+		&server,
+		LOCAL,
+		post(
+			"/submit-pin",
+			"localhost:47989",
+			"",
+			&submission(&client.unique_id, &token, &client.pin),
+		),
+	)
+	.await;
+	assert_eq!(status, 200);
+	assert_eq!(waiting.await.unwrap().0, 200);
+	crate::durable::fail_next("rename", libc::ENOSPC);
+	assert!(!client.complete(&server).await);
+	assert!(client_manager.pending_approval(&client.unique_id).is_none());
+	assert!(client_manager.is_cert_paired(&client.fingerprint()).is_err());
+	let restarted = client_manager.restarted(_directory.path().join("state.toml"));
+	assert!(!restarted.is_cert_paired(&client.fingerprint()).unwrap());
+	assert!(!restarted.is_paired(client.unique_id).unwrap());
+}
+
+#[tokio::test]
+async fn approved_protocol_failure_cleans_transaction() {
+	let Fixture {
+		server,
+		client_manager,
+		_directory,
+	} = fixture(true, WebLimits::default());
+	let client = PairingClient::new("malformed-pairing", "1234");
+	let waiting = client.request_server_cert(&server);
+	client.wait_pending(&client_manager).await;
+	let token = operator_page_token(&server, &client.unique_id).await;
+	client_manager
+		.register_pin(&client.unique_id, &client.pin, &token)
+		.unwrap();
+	assert_eq!(waiting.await.unwrap().0, 200);
+	let (status, _) = http(
+		&server,
+		REMOTE,
+		get(
+			"/pair?uniqueid=malformed-pairing&clientchallenge=nothex",
+			"192.168.1.10:47989",
+		),
+	)
+	.await;
+	assert_eq!(status, 400);
+	assert!(client_manager.pending_approval(&client.unique_id).is_none());
+}
+
+#[tokio::test]
+async fn revocation_drains_in_flight_session_authorization() {
+	let Fixture {
+		server,
+		client_manager,
+		_directory,
+	} = fixture(true, WebLimits::default());
+	client_manager
+		.persistent_state()
+		.pair("A".into(), "cert-A".into())
+		.unwrap();
+	let in_flight = client_manager.authorization_gate.read().await;
+	let server = server.clone();
+	let revoking =
+		tokio::spawn(async move { http(&server, LOCAL, post("/unpair?uniqueid=A", "localhost:47989", "", "")).await });
+	for _ in 0..10 {
+		tokio::task::yield_now().await;
+	}
+	assert!(!revoking.is_finished());
+	assert!(client_manager.is_cert_paired("cert-A").unwrap());
+	drop(in_flight);
+	assert_eq!(revoking.await.unwrap().0, 200);
+	assert!(!client_manager.is_cert_paired("cert-A").unwrap());
 }

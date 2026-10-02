@@ -109,6 +109,12 @@ Accepted HTTP, HTTPS and RTSP connections run in bounded, cancellable tasks
 (`ingress.rs`) that hold a global shutdown delay token, with TLS handshake,
 request-header and RTSP framing deadlines. Pairing approval is a loopback-only
 operator action; first pairing cannot rely on a paired client certificate.
+Pairing trust changes serialize under the persistent state owner and publish only
+after atomic replacement and sync. Pending transactions have finite capacity and
+a deadline, with generation-scoped waiter cleanup. Revocation drains HTTPS
+launch/resume/cancel operations and tears down the active session; see
+[Security administration](SECURITY_ADMINISTRATION.md) for legacy associations and
+recovery policy.
 
 Launch, resume and ANNOUNCE values are validated against shared numeric
 domains (`session/negotiation.rs`, `VideoStreamContext::validate`) before the

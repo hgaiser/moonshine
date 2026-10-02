@@ -104,6 +104,7 @@
 		</div>
 
 		<form autocomplete="off" id="pin-form" action="pin" method="post">
+			<input type="hidden" name="uniqueid" id="uniqueid-input" value="{{UNIQUE_ID}}">
 			<input type="hidden" name="request" id="request-value" value="{{REQUEST}}">
 			<div id="pin-fields">
 				<input name="pin1" type="text" oninput="this.value=this.value.replace(/[^0-9]/g, '');" maxlength="1" class="pin-field" autofocus>
@@ -115,7 +116,7 @@
 		</form>
 
 		<div id="error-message">Error submitting PIN. Please try again or check the server logs.</div>
-		<div id="success-message">Successfully paired.</div>
+		<div id="success-message">PIN accepted. Waiting for the client to finish pairing.</div>
 	</div>
 
 	<script>
@@ -135,7 +136,7 @@
 			}
 
 			const body = new URLSearchParams({
-				uniqueid: document.getElementById("uniqueid-value").textContent.trim(),
+				uniqueid: document.getElementById("uniqueid-input").value,
 				request: document.getElementById("request-value").value,
 				pin: pin,
 			});

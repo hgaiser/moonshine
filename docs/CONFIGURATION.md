@@ -121,6 +121,9 @@ ssh -L 47989:localhost:47989 user@host
 # then open http://localhost:47989/pin on this machine
 ```
 
+See [Security administration](SECURITY_ADMINISTRATION.md) for pending limits,
+identity recovery, state migration and authorized revocation.
+
 ## `[stream]`
 
 [Source](../moonshine-core/src/session/stream/mod.rs).

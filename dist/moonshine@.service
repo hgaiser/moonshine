@@ -2,6 +2,7 @@
 Description=Streaming server using the NVIDIA GameStream / Moonlight protocol.
 
 [Service]
+UMask=0077
 User=%i
 Group=%i
 SupplementaryGroups=moonshine
