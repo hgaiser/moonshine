@@ -16,6 +16,7 @@ use crate::session::compositor::{
 	input::CompositorInputEvent,
 };
 use crate::session::keys::ActiveKeys;
+use crate::session::lifecycle::WorkerGuard;
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::audio::AudioStartHandle;
 use crate::session::stream::video::VideoStreamHandle;
@@ -394,7 +395,14 @@ impl ControlStream {
 			host,
 		} = self;
 
+		// Registered before spawning so a stop that races the first poll still
+		// waits for the ENet host to be released.
+		let Ok(worker) = WorkerGuard::register(&stop_session_manager, SessionShutdownReason::ControlStreamStopped)
+		else {
+			return;
+		};
 		tokio::spawn(async move {
+			let _worker = worker;
 			run_control_loop(
 				stream_timeout,
 				host,
@@ -533,10 +541,8 @@ async fn run_control_loop(
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	mut hdr_metadata_rx: watch::Receiver<HdrModeState>,
 ) {
-	// Trigger session shutdown when the control stream stops.
-	let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::ControlStreamStopped);
-	let _delay_stop = stop_session_manager.delay_shutdown_token();
-
+	// The caller's `WorkerGuard` stops the session when this loop exits and
+	// holds completion until the ENet host has been dropped.
 	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 
 	// Create a channel over which we can receive feedback messages to send to the connected client.

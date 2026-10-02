@@ -1,28 +1,61 @@
+//! Session ownership: lifecycle, transitions, cancellation and teardown.
+//!
+//! The manager owns at most one session. Its lifecycle is explicit:
+//!
+//! - `Idle`: no session and no resources. Only this state accepts a new launch.
+//! - `Live`: a session record plus either the owned state (`Initialized`,
+//!   `Launched`, `Active`) or a transition that has checked the state out.
+//!   Absence of state therefore always means "a transition owns it", never idle.
+//! - `Stopping`: a single teardown task owns everything. Replacement waits for
+//!   it, so new sessions never race the previous session's ports, Pulse socket,
+//!   application unit or GPU objects.
+//!
+//! Slow work (systemd, compositor start, worker spawn, pause/reconfigure) runs
+//! in manager-owned transition tasks outside the mutex. A transition holds a
+//! completion token of its session, so a stop cancels it and waits for it to
+//! hand any state back; a transition commits only if its session epoch and
+//! transition id are still current and the session is not stopping. See
+//! `docs/ARCHITECTURE.md` ("Session ownership and shutdown").
+
+use std::future::Future;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
-use async_shutdown::ShutdownManager;
-use tokio::sync::{Mutex, broadcast, watch};
+use async_shutdown::{DelayShutdownToken, ShutdownManager};
+use tokio::sync::{Mutex, MutexGuard, broadcast, watch};
 
 use crate::ShutdownReason;
+use crate::session::APPLICATION_UNIT_NAME;
+use crate::session::AuthorizationReceiver;
 use crate::session::FrameStats;
-use crate::session::InitializedSession;
 use crate::session::ResumeRequest;
 use crate::session::SessionContext;
 use crate::session::SessionKeyData;
 use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
-use crate::session::SessionState;
+use crate::session::SystemSession;
 use crate::session::authorization::StreamAuthorization;
 use crate::session::compositor::CompositorConfig;
 use crate::session::keys::KeyLedger;
+use crate::session::lifecycle::StartLatch;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 
-const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+/// Bound for stopping the application unit (bus connection, stop job and
+/// unit removal, each internally bounded).
+const APPLICATION_STOP_TIMEOUT: Duration = Duration::from_secs(6);
+/// Bound for every session worker to exit and release its resources.
+const WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+/// End-to-end teardown deadline, from the stop request through application
+/// cleanup and every worker's exit. Exceeding it is a terminal failure: the
+/// session stays `Stopping` (it may still own resources) and the service
+/// shuts down so its supervisor can restart it.
+pub(crate) const SESSION_TEARDOWN_DEADLINE: Duration =
+	Duration::from_secs(APPLICATION_STOP_TIMEOUT.as_secs() + WORKER_SHUTDOWN_TIMEOUT.as_secs());
 
 #[derive(Debug, PartialEq, Eq)]
 enum ReconnectDecision {
@@ -80,35 +113,180 @@ pub enum SessionShutdownReason {
 	InputHandlerStopped,
 	/// Compositor stopped unexpectedly.
 	CompositorStopped,
+	/// A launch, start or reconfiguration failed after changing resources.
+	TransitionFailed,
 }
 
-struct SessionManagerInner {
-	/// Configuration for the compositor.
-	compositor_config: CompositorConfig,
+/// Inputs for spawning the stream workers of a launched session.
+pub(crate) struct StartRequest {
+	pub video: VideoStreamContext,
+	pub audio: AudioStreamContext,
+	pub authorization_rx: AuthorizationReceiver,
+	pub stop: ShutdownManager<SessionShutdownReason>,
+}
 
-	/// Configuration for the video stream.
-	video_config: VideoStreamConfig,
+/// What a reconnect PLAY changes. `None` keeps that stream's epoch; video is
+/// then only reset (counters + IDR) for the resuming client.
+#[derive(Debug)]
+pub(crate) struct ResumePlan {
+	pub video: Option<VideoStreamContext>,
+	pub audio: Option<AudioStreamContext>,
+}
 
-	/// Configuration for the audio stream.
-	audio_config: AudioStreamConfig,
+/// The resource-owning work behind each manager transition.
+///
+/// The manager decides *whether* and *when* a transition may run and owns its
+/// result; implementations only create, change or release resources. Each
+/// future may be cancelled at any await by a session stop: implementations
+/// must leave anything they created either inside a returned value or owned by
+/// a registered session worker. The application unit is the exception: the
+/// manager records it before `launch` and always stops it during teardown.
+pub(crate) trait SessionBackend: Send + Sync + 'static {
+	type Initialized: Send + 'static;
+	type Launched: Send + 'static;
+	type Active: Send + 'static;
 
-	/// Configuration for the control stream.
-	control_config: ControlStreamConfig,
+	fn initialize(
+		&self,
+		context: SessionContext,
+		stop: ShutdownManager<SessionShutdownReason>,
+	) -> impl Future<Output = Result<Self::Initialized, ()>> + Send;
 
-	/// Address to bind streams to.
-	address: String,
+	fn launch(&self, session: Self::Initialized) -> impl Future<Output = Result<Self::Launched, ()>> + Send;
 
-	/// Time in seconds since last ping after which the stream closes.
-	stream_timeout: u64,
+	fn start(
+		&self,
+		session: Self::Launched,
+		request: StartRequest,
+	) -> impl Future<Output = Result<(Self::Active, Vec<StartLatch>), ()>> + Send;
 
-	/// Whether to inhibit system sleep while a session is active.
-	inhibit_sleep: bool,
+	/// Barrier for a reconnect: stop delivering the current epoch. The future
+	/// must not borrow the session so the manager can await it unlocked.
+	fn pause(
+		&self,
+		session: &Self::Active,
+		video: bool,
+		audio: bool,
+	) -> impl Future<Output = Result<(), ()>> + Send + 'static;
 
-	/// The currently active session, if any.
-	session: Option<SessionState>,
+	fn resume(&self, session: &mut Self::Active, plan: ResumePlan) -> impl Future<Output = Result<(), ()>> + Send;
 
-	/// Shutdown manager for the active session, used to trigger session shutdown upon request.
+	/// Stop the application unit. Must be idempotent.
+	fn stop_application(&self, unit_name: &str) -> impl Future<Output = Result<(), ()>> + Send;
+}
+
+enum SessionState<B: SessionBackend> {
+	/// Session initialized; compositor and app not yet started.
+	Initialized(B::Initialized),
+	/// Compositor and app launched; waiting for RTSP PLAY.
+	Launched(B::Launched),
+	/// Streams active.
+	Active(B::Active),
+}
+
+impl<B: SessionBackend> SessionState<B> {
+	fn name(&self) -> &'static str {
+		match self {
+			Self::Initialized(_) => "initialized",
+			Self::Launched(_) => "launched",
+			Self::Active(_) => "active",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TransitionKind {
+	Initialize,
+	Launch,
+	Start,
+	Announce,
+	Resume,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Transition {
+	id: u64,
+	kind: TransitionKind,
+}
+
+/// Everything the manager knows about the current session, independent of
+/// which state object currently exists.
+struct SessionRecord {
+	/// Session lifetime number, distinct from authorization generations.
+	epoch: u64,
+	/// Cancellation and completion boundary of this session.
 	stop: ShutdownManager<SessionShutdownReason>,
+	/// Authoritative context reported to HTTP/RTSP.
+	context: SessionContext,
+	/// Contexts used by the live encoders, once streaming.
+	streams: Option<(VideoStreamContext, AudioStreamContext)>,
+	/// Application unit this session may own. Recorded before the launch is
+	/// attempted so teardown stops it even when the launch was cancelled.
+	application_unit: Option<&'static str>,
+	/// Start latches of the live stream workers.
+	start_latches: Vec<StartLatch>,
+}
+
+struct LiveSession<B: SessionBackend> {
+	record: SessionRecord,
+	/// `None` only while `transition` has checked the state out.
+	state: Option<SessionState<B>>,
+	transition: Option<Transition>,
+}
+
+enum Lifecycle<B: SessionBackend> {
+	Idle,
+	Live(Box<LiveSession<B>>),
+	Stopping(TeardownWaiter),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TeardownStatus {
+	Running,
+	Completed,
+	Failed,
+}
+
+/// Completion of one session teardown.
+#[derive(Clone)]
+struct TeardownWaiter(watch::Receiver<TeardownStatus>);
+
+impl TeardownWaiter {
+	async fn wait(mut self) -> Result<(), ()> {
+		match self.0.wait_for(|status| *status != TeardownStatus::Running).await {
+			Ok(status) if *status == TeardownStatus::Completed => Ok(()),
+			_ => Err(()),
+		}
+	}
+}
+
+/// Ownership of one in-flight transition. It holds its session's completion
+/// open: teardown cannot finish until the transition has handed back (or
+/// dropped) everything it checked out.
+struct TransitionTicket {
+	epoch: u64,
+	id: u64,
+	stop: ShutdownManager<SessionShutdownReason>,
+	_completion: DelayShutdownToken<SessionShutdownReason>,
+}
+
+struct PendingStreams {
+	video: VideoStreamContext,
+	audio: AudioStreamContext,
+	/// Generation that announced them. PLAY commits them only if no later
+	/// launch/resume replaced that generation.
+	generation: u64,
+}
+
+struct SessionManagerInner<B: SessionBackend> {
+	lifecycle: Lifecycle<B>,
+
+	/// State handed back by transitions that were cancelled or superseded.
+	/// Drained by the teardown of their epoch after all workers completed.
+	orphans: Vec<(u64, SessionState<B>)>,
+
+	next_epoch: u64,
+	next_transition: u64,
 
 	/// Sender for session keys, used to update keys from the webserver in different subsystems.
 	///
@@ -119,14 +297,11 @@ struct SessionManagerInner {
 	/// resume, reconfigure or new launch continues its nonce sequences.
 	key_ledger: KeyLedger,
 
-	/// Pending stream contexts received via RTSP ANNOUNCE. For an active
-	/// session these belong to the reconnecting client and are not the contexts
-	/// currently used by the live encoders until PLAY commits the new epoch.
-	pending_video_stream_context: Option<VideoStreamContext>,
-	pending_audio_stream_context: Option<AudioStreamContext>,
-	/// Generation that produced the pending stream contexts. PLAY commits them
-	/// only if no later launch/resume replaced that generation.
-	pending_generation: Option<u64>,
+	/// Stream contexts received via RTSP ANNOUNCE. For an active session these
+	/// belong to the reconnecting client; they are published only after the
+	/// live epoch has been paused, and PLAY commits them.
+	pending: Option<PendingStreams>,
+
 	/// Authenticated session-level settings from the most recent `/resume`.
 	resume_request: Option<ResumeRequest>,
 
@@ -137,34 +312,24 @@ struct SessionManagerInner {
 	/// Next authorization generation. Never reset, so a stale grant from an
 	/// earlier session cannot match a later one.
 	next_generation: u64,
-
-	/// Broadcast sender for per-frame encoding statistics.
-	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
-
-	/// Watchdog task for monitoring unexpected session shutdowns.
-	stop_watcher: Option<tokio::task::JoinHandle<()>>,
-
-	/// Notify to trigger the video pipeline start (used by bench / external callers).
-	video_start_notify: Option<Arc<tokio::sync::Notify>>,
-
-	/// Notify to trigger the audio pipeline start (used by bench / external callers).
-	audio_start_notify: Option<Arc<tokio::sync::Notify>>,
-
-	/// Shutdown manager for the entire application.
-	shutdown: ShutdownManager<ShutdownReason>,
-
-	/// Trigger token for the session manager's own shutdown trigger.
-	///
-	/// Used to trigger an application shutdown if the session manager stops unexpectedly.
-	_trigger_token: async_shutdown::TriggerShutdownToken<ShutdownReason>,
-
-	/// Delay token for the session manager's own shutdown trigger.
-	///
-	/// Used to delay shutdown until the session manager has cleaned up.
-	_delay_token: async_shutdown::DelayShutdownToken<ShutdownReason>,
 }
 
-impl SessionManagerInner {
+impl<B: SessionBackend> SessionManagerInner<B> {
+	fn new() -> Self {
+		Self {
+			lifecycle: Lifecycle::Idle,
+			orphans: Vec::new(),
+			next_epoch: 1,
+			next_transition: 1,
+			keys_tx: None,
+			key_ledger: KeyLedger::default(),
+			pending: None,
+			resume_request: None,
+			authorization_tx: None,
+			next_generation: 1,
+		}
+	}
+
 	/// Start a new authorization generation for `client_ip`, replacing every
 	/// identifier the previous generation handed out.
 	fn rotate_authorization(&mut self, client_ip: IpAddr) -> Result<(), ()> {
@@ -186,140 +351,521 @@ impl SessionManagerInner {
 			.is_some_and(|tx| tx.borrow().generation() == grant.generation())
 	}
 
-	fn reset_session(&mut self) {
-		if let Some(handle) = self.stop_watcher.take() {
-			handle.abort();
+	fn live(&mut self) -> Option<&mut LiveSession<B>> {
+		match &mut self.lifecycle {
+			Lifecycle::Live(live) => Some(live),
+			_ => None,
 		}
-		self.session = None;
-		self.keys_tx = None;
-		self.pending_video_stream_context = None;
-		self.pending_audio_stream_context = None;
-		self.pending_generation = None;
-		self.resume_request = None;
-		self.authorization_tx = None;
-		self.video_start_notify = None;
-		self.audio_start_notify = None;
-		self.stop = ShutdownManager::new();
+	}
+
+	/// The live session if `ticket`'s transition may still commit into it.
+	fn committable(&mut self, ticket: &TransitionTicket) -> Option<&mut LiveSession<B>> {
+		self.live().filter(|live| {
+			live.record.epoch == ticket.epoch
+				&& live.transition.is_some_and(|t| t.id == ticket.id)
+				&& !live.record.stop.is_shutdown_triggered()
+		})
+	}
+
+	/// Issue a ticket and mark `kind` in progress. Fails if the session is
+	/// stopping or another transition owns it.
+	fn begin_transition(&mut self, kind: TransitionKind) -> Result<TransitionTicket, ()> {
+		let id = self.next_transition;
+		let Some(live) = self.live() else {
+			tracing::warn!(?kind, "Rejecting session transition: no live session");
+			return Err(());
+		};
+		if let Some(current) = live.transition {
+			tracing::warn!(?kind, in_progress = ?current.kind, "Rejecting session transition: another transition is in progress");
+			return Err(());
+		}
+		if live.record.stop.is_shutdown_triggered() {
+			tracing::warn!(?kind, "Rejecting session transition: session is stopping");
+			return Err(());
+		}
+		let completion = live.record.stop.delay_shutdown_token().map_err(|_| ())?;
+		live.transition = Some(Transition { id, kind });
+		let ticket = TransitionTicket {
+			epoch: live.record.epoch,
+			id,
+			stop: live.record.stop.clone(),
+			_completion: completion,
+		};
+		self.next_transition += 1;
+		Ok(ticket)
+	}
+
+	/// Release `ticket`'s claim without committing state.
+	fn end_transition(&mut self, ticket: &TransitionTicket) {
+		if let Some(live) = self.live()
+			&& live.record.epoch == ticket.epoch
+			&& live.transition.is_some_and(|t| t.id == ticket.id)
+		{
+			live.transition = None;
+		}
+	}
+
+	/// Hand state that can no longer be committed to its epoch's teardown.
+	fn orphan(&mut self, ticket: &TransitionTicket, state: SessionState<B>) {
+		tracing::debug!(
+			epoch = ticket.epoch,
+			state = state.name(),
+			"Transition result superseded; handing it to session teardown"
+		);
+		self.orphans.push((ticket.epoch, state));
 	}
 }
 
-impl Drop for SessionManagerInner {
+impl<B: SessionBackend> Drop for SessionManagerInner<B> {
 	fn drop(&mut self) {
-		if let Some(handle) = self.stop_watcher.take() {
-			handle.abort();
-		}
-		if self.session.is_some() {
-			tracing::debug!("Stopping active session before shutdown.");
-			let _ = self.stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown);
-			// Wait until shutdown completed.
-			if let Ok(handle) = tokio::runtime::Handle::try_current() {
-				handle.block_on(self.stop.wait_shutdown_complete());
-			}
+		// Narrow fallback only; the shutdown supervisor normally tears the
+		// session down. Never block here.
+		if let Lifecycle::Live(live) = &self.lifecycle {
+			let _ = live
+				.record
+				.stop
+				.trigger_shutdown(SessionShutdownReason::ManagerShutdown);
 		}
 	}
 }
 
-#[derive(Clone)]
-pub struct SessionManager {
-	inner: Arc<Mutex<SessionManagerInner>>,
-	stats_tx: broadcast::Sender<FrameStats>,
+/// Session manager over a [`SessionBackend`]; [`SessionManager`] is the
+/// production instance. Generic so lifecycle tests can substitute subsystems.
+pub(crate) struct SessionCore<B: SessionBackend> {
+	inner: Arc<Mutex<SessionManagerInner<B>>>,
+	backend: Arc<B>,
+	/// Shutdown manager for the entire application.
+	shutdown: ShutdownManager<ShutdownReason>,
 }
 
-impl SessionManager {
-	#[allow(clippy::too_many_arguments)]
-	pub fn new(
-		compositor_config: CompositorConfig,
-		video_config: VideoStreamConfig,
-		audio_config: AudioStreamConfig,
-		control_config: ControlStreamConfig,
-		address: String,
-		stream_timeout: u64,
-		inhibit_sleep: bool,
-		shutdown: ShutdownManager<ShutdownReason>,
-	) -> Result<Self, ()> {
-		let trigger_token = shutdown.trigger_shutdown_token(ShutdownReason::SessionManagerShutdown);
-		let delay_token = shutdown.delay_shutdown_token().map_err(|e| {
+impl<B: SessionBackend> Clone for SessionCore<B> {
+	fn clone(&self) -> Self {
+		Self {
+			inner: self.inner.clone(),
+			backend: self.backend.clone(),
+			shutdown: self.shutdown.clone(),
+		}
+	}
+}
+
+impl<B: SessionBackend> SessionCore<B> {
+	pub(crate) fn new(backend: B, shutdown: ShutdownManager<ShutdownReason>) -> Result<Self, ()> {
+		let delay = shutdown.delay_shutdown_token().map_err(|e| {
 			tracing::error!("Failed to create delay shutdown token: {e:?}");
 		})?;
-
-		let inner = SessionManagerInner {
-			compositor_config,
-			video_config,
-			audio_config,
-			control_config,
-			address,
-			stream_timeout,
-			inhibit_sleep,
-			session: None,
-			stop: ShutdownManager::new(),
-			keys_tx: None,
-			key_ledger: KeyLedger::default(),
-			pending_video_stream_context: None,
-			pending_audio_stream_context: None,
-			pending_generation: None,
-			resume_request: None,
-			authorization_tx: None,
-			next_generation: 1,
-			stats_tx: tokio::sync::broadcast::channel(256).0,
-			stop_watcher: None,
-			video_start_notify: None,
-			audio_start_notify: None,
-			shutdown: shutdown.clone(),
-			_trigger_token: trigger_token,
-			_delay_token: delay_token,
+		let trigger = shutdown.trigger_shutdown_token(ShutdownReason::SessionManagerShutdown);
+		let core = Self {
+			inner: Arc::new(Mutex::new(SessionManagerInner::new())),
+			backend: Arc::new(backend),
+			shutdown,
 		};
 
-		let stats_tx = inner.stats_tx.clone();
-		let inner = Arc::new(Mutex::new(inner));
-
-		Ok(Self { inner, stats_tx })
+		// Global shutdown owner: tear the session down (application included)
+		// before releasing the service's shutdown, within the session deadline.
+		let supervisor = core.clone();
+		let runtime = tokio::runtime::Handle::try_current()
+			.map_err(|e| tracing::error!("Session manager requires a Tokio runtime: {e}"))?;
+		runtime.spawn(async move {
+			// If this task ends for any other reason, stop the service.
+			let _trigger = trigger;
+			let _delay = delay;
+			supervisor.shutdown.wait_shutdown_triggered().await;
+			tracing::debug!("Global shutdown triggered, stopping active session.");
+			if supervisor.stop(SessionShutdownReason::ManagerShutdown).await.is_err() {
+				tracing::error!("Session did not stop cleanly during service shutdown");
+			}
+		});
+		Ok(core)
 	}
 
-	/// Returns a receiver for per-frame encoding statistics.
-	///
-	/// Call **before** `initialize_session()` to receive stats from the start.
-	/// Multiple receivers can be created — each receives a copy of every message.
-	pub fn bench_stats_receiver(&self) -> tokio::sync::broadcast::Receiver<FrameStats> {
-		self.stats_tx.subscribe()
-	}
-
-	/// Trigger the video and audio pipelines to start encoding.
-	///
-	/// In the normal flow, this is triggered by the control stream when the
-	/// client sends `StartB`. Call this from external callers (e.g. bench binary)
-	/// that have no Moonlight client. Must be called after `start_session()`.
-	pub async fn trigger_streams_start(&self) {
-		let inner = self.inner.lock().await;
-		if let Some(notify) = inner.video_start_notify.as_ref() {
-			// Call notify_one() twice instead of notify_waiters() because
-			// Notify only wakes tasks already .awaiting; notify_waiters()
-			// is a no-op if no task is waiting yet.  notify_one() stores
-			// a permit so the next notified().await completes immediately.
-			notify.notify_one();
-			notify.notify_one();
-		}
-		if let Some(notify) = inner.audio_start_notify.as_ref() {
-			notify.notify_one();
-			notify.notify_one();
-		}
+	async fn lock(&self) -> MutexGuard<'_, SessionManagerInner<B>> {
+		self.inner.lock().await
 	}
 
 	/// Authorize an RTSP peer for the current launch/resume generation.
-	///
-	/// The returned grant must accompany the ANNOUNCE and PLAY it authorizes;
-	/// they are rejected if a later launch/resume replaced its generation.
-	pub async fn authorize_stream(&self, peer: IpAddr) -> Option<StreamAuthorization> {
-		let guard = self.inner.lock().await;
+	pub(crate) async fn authorize_stream(&self, peer: IpAddr) -> Option<StreamAuthorization> {
+		let guard = self.lock().await;
 		let authorization = guard.authorization_tx.as_ref()?.borrow().clone();
 		authorization.admits_peer(peer).then_some(authorization)
 	}
 
+	/// Context of the live session, including one inside a transition.
+	pub(crate) async fn get_session_context(&self) -> Option<SessionContext> {
+		let mut guard = self.lock().await;
+		guard.live().map(|live| live.record.context.clone())
+	}
+
+	/// Open every stream start latch of the live session (bench/external start).
+	pub(crate) async fn trigger_streams_start(&self) {
+		let mut guard = self.lock().await;
+		if let Some(live) = guard.live() {
+			for latch in &live.record.start_latches {
+				latch.open();
+			}
+		}
+	}
+
+	/// Begin tearing down the live session, or join the teardown in progress.
+	/// `epoch` restricts the request to one session (stale watchdogs are no-ops).
+	fn begin_teardown(
+		&self,
+		guard: &mut SessionManagerInner<B>,
+		epoch: Option<u64>,
+		reason: SessionShutdownReason,
+	) -> Option<TeardownWaiter> {
+		match &guard.lifecycle {
+			Lifecycle::Idle => return None,
+			Lifecycle::Stopping(waiter) => return Some(waiter.clone()),
+			Lifecycle::Live(live) if epoch.is_some_and(|epoch| epoch != live.record.epoch) => return None,
+			Lifecycle::Live(_) => {},
+		}
+		let (done, waiter) = watch::channel(TeardownStatus::Running);
+		let waiter = TeardownWaiter(waiter);
+		let Lifecycle::Live(live) = std::mem::replace(&mut guard.lifecycle, Lifecycle::Stopping(waiter.clone())) else {
+			unreachable!("checked above");
+		};
+		// Retire every identifier immediately: nothing may negotiate, discover
+		// endpoints or commit into a session that is being torn down.
+		guard.keys_tx = None;
+		guard.pending = None;
+		guard.resume_request = None;
+		guard.authorization_tx = None;
+		tokio::spawn(self.clone().run_teardown(*live, reason, done));
+		Some(waiter)
+	}
+
+	/// The single asynchronous owner of a session's teardown.
+	async fn run_teardown(
+		self,
+		live: LiveSession<B>,
+		reason: SessionShutdownReason,
+		done: watch::Sender<TeardownStatus>,
+	) {
+		let LiveSession {
+			record,
+			state,
+			transition,
+		} = live;
+		let epoch = record.epoch;
+		tracing::info!(
+			epoch,
+			?reason,
+			state = state.as_ref().map(SessionState::name),
+			transition = ?transition.map(|t| t.kind),
+			"Stopping session"
+		);
+		let deadline = tokio::time::Instant::now() + SESSION_TEARDOWN_DEADLINE;
+		let result = tokio::time::timeout_at(deadline, async {
+			let mut application = record.application_unit;
+			// Stop the application while the compositor and audio server still
+			// serve it, so it can exit cleanly. A transition in flight is cancelled
+			// first instead; its application is stopped after it handed back.
+			if transition.is_none()
+				&& let Some(unit) = application.take()
+			{
+				self.stop_application(unit).await;
+			}
+			let _ = record.stop.trigger_shutdown(reason);
+			drop(state);
+			// Every worker and transition holds this open until its sockets,
+			// threads, GPU objects and checked-out state are released.
+			record.stop.wait_shutdown_complete().await;
+			let orphans: Vec<_> = {
+				let mut guard = self.lock().await;
+				let (orphans, rest) = std::mem::take(&mut guard.orphans)
+					.into_iter()
+					.partition(|(orphan_epoch, _)| *orphan_epoch <= epoch);
+				guard.orphans = rest;
+				orphans
+			};
+			drop(orphans);
+			if let Some(unit) = application {
+				self.stop_application(unit).await;
+			}
+		})
+		.await;
+
+		let mut guard = self.lock().await;
+		match result {
+			Ok(()) => {
+				guard.lifecycle = Lifecycle::Idle;
+				drop(guard);
+				tracing::info!(epoch, "Session stopped; ready for a new session.");
+				done.send_replace(TeardownStatus::Completed);
+			},
+			Err(_) => {
+				// Workers may still own ports, the Pulse socket or GPU objects: never
+				// report idle. Restarting the service is the only safe recovery.
+				drop(guard);
+				tracing::error!(
+					epoch,
+					deadline_secs = SESSION_TEARDOWN_DEADLINE.as_secs(),
+					"Session teardown exceeded its deadline; refusing new sessions and stopping the service"
+				);
+				let _ = self.shutdown.trigger_shutdown(ShutdownReason::SessionManagerShutdown);
+				done.send_replace(TeardownStatus::Failed);
+			},
+		}
+	}
+
+	async fn stop_application(&self, unit: &'static str) {
+		match tokio::time::timeout(APPLICATION_STOP_TIMEOUT, self.backend.stop_application(unit)).await {
+			Ok(Ok(())) => {},
+			// The unit name is fixed; the next launch also replaces a leftover
+			// unit, so a failed stop is reported but does not wedge the manager.
+			Ok(Err(())) => tracing::error!(unit, "Failed to stop the application unit"),
+			Err(_) => tracing::error!(
+				unit,
+				timeout_secs = APPLICATION_STOP_TIMEOUT.as_secs(),
+				"Timed out stopping the application unit"
+			),
+		}
+	}
+
+	/// Watch a session for a stop from any worker and give it to teardown.
+	fn spawn_watchdog(&self, epoch: u64, stop: ShutdownManager<SessionShutdownReason>) {
+		let core = self.clone();
+		tokio::spawn(async move {
+			let reason = stop.wait_shutdown_triggered().await;
+			// This task owns nothing that teardown cancels; it only hands over.
+			let mut guard = core.lock().await;
+			let requested = matches!(
+				reason,
+				SessionShutdownReason::UserStopped | SessionShutdownReason::ManagerShutdown
+			);
+			// An application exiting because teardown stopped it is expected.
+			if requested || matches!(guard.lifecycle, Lifecycle::Stopping(_)) {
+				tracing::debug!(?reason, "Session stop observed.");
+			} else {
+				tracing::warn!(?reason, "Session stopped unexpectedly.");
+			}
+			core.begin_teardown(&mut guard, Some(epoch), reason);
+		});
+	}
+
+	/// Stop the session (if any) and wait until its teardown has completed.
+	async fn stop(&self, reason: SessionShutdownReason) -> Result<(), ()> {
+		let waiter = {
+			let mut guard = self.lock().await;
+			self.begin_teardown(&mut guard, None, reason)
+		};
+		match waiter {
+			Some(waiter) => waiter.wait().await,
+			None => Ok(()),
+		}
+	}
+
+	/// Stop the session and return to `Idle`. Returns only after every owned
+	/// worker, socket and the application unit have been released.
+	pub(crate) async fn stop_session(&self) -> Result<(), ()> {
+		self.stop(SessionShutdownReason::UserStopped).await
+	}
+
+	/// End a failed transition: the session cannot be left half-changed, so it
+	/// is torn down deterministically. `state` is whatever the transition still
+	/// owns; teardown stops its application before its workers.
+	fn fail_transition(
+		&self,
+		guard: &mut SessionManagerInner<B>,
+		ticket: &TransitionTicket,
+		state: Option<SessionState<B>>,
+	) {
+		match guard.committable(ticket) {
+			Some(live) => {
+				live.transition = None;
+				live.state = state;
+				tracing::error!(epoch = ticket.epoch, "Session transition failed; stopping the session");
+				self.begin_teardown(guard, Some(ticket.epoch), SessionShutdownReason::TransitionFailed);
+			},
+			None => {
+				if let Some(state) = state {
+					guard.orphan(ticket, state);
+				}
+				guard.end_transition(ticket);
+			},
+		}
+	}
+
+	/// Initialize a new session with the provided context.
+	///
+	/// The session is not launched until `launch_session` is called. A
+	/// previous session that is still stopping is awaited first.
+	pub(crate) async fn initialize_session(&self, mut context: SessionContext) -> Result<(), ()> {
+		let (ticket, keys_tx) = loop {
+			let mut guard = self.lock().await;
+			if self.shutdown.is_shutdown_triggered() {
+				tracing::warn!("Service is shutting down; rejecting InitializeSession command.");
+				return Err(());
+			}
+			match &guard.lifecycle {
+				Lifecycle::Idle => {},
+				Lifecycle::Live(_) => {
+					tracing::warn!("Session already initialized, rejecting InitializeSession command.");
+					return Err(());
+				},
+				Lifecycle::Stopping(waiter) => {
+					let waiter = waiter.clone();
+					drop(guard);
+					tracing::info!("Waiting for the previous session to finish stopping.");
+					if !matches!(
+						tokio::time::timeout(SESSION_TEARDOWN_DEADLINE, waiter.wait()).await,
+						Ok(Ok(()))
+					) {
+						tracing::warn!("Previous session did not stop; rejecting InitializeSession command.");
+						return Err(());
+					}
+					continue;
+				},
+			}
+
+			// Extract the raw keys from context and create the watch channel.
+			let session_keys = match context.keys {
+				SessionKeys::Keys(data) => data,
+				SessionKeys::Rx(_) => {
+					tracing::error!("Session keys already initialized as a watch receiver");
+					return Err(());
+				},
+			};
+			let (tx, rx) = watch::channel(guard.key_ledger.publish(session_keys));
+			context.keys = SessionKeys::Rx(rx);
+
+			let epoch = guard.next_epoch;
+			guard.next_epoch += 1;
+			let stop = ShutdownManager::new();
+			guard.lifecycle = Lifecycle::Live(Box::new(LiveSession {
+				record: SessionRecord {
+					epoch,
+					stop: stop.clone(),
+					context: context.clone(),
+					streams: None,
+					application_unit: None,
+					start_latches: Vec::new(),
+				},
+				state: None,
+				transition: None,
+			}));
+			let ticket = guard.begin_transition(TransitionKind::Initialize)?;
+			self.spawn_watchdog(epoch, stop);
+			break (ticket, tx);
+		};
+
+		let client_ip = context.client_ip;
+		let core = self.clone();
+		let task = tokio::spawn(async move {
+			let result = ticket
+				.stop
+				.wrap_cancel(core.backend.initialize(context, ticket.stop.clone()))
+				.await;
+			let mut guard = core.lock().await;
+			let outcome = match result {
+				Ok(Ok(session)) => {
+					let state = SessionState::Initialized(session);
+					if guard.committable(&ticket).is_none() {
+						guard.orphan(&ticket, state);
+						Err(())
+					} else if guard.rotate_authorization(client_ip).is_err() {
+						core.fail_transition(&mut guard, &ticket, Some(state));
+						Err(())
+					} else {
+						// Set here so keys exist only for an initialized session.
+						guard.keys_tx = Some(keys_tx);
+						let live = guard.committable(&ticket).expect("checked above");
+						live.state = Some(state);
+						live.transition = None;
+						tracing::info!(
+							epoch = ticket.epoch,
+							"Session initialized successfully, waiting to be launched."
+						);
+						Ok(())
+					}
+				},
+				Ok(Err(())) => {
+					core.fail_transition(&mut guard, &ticket, None);
+					Err(())
+				},
+				Err(_) => Err(()),
+			};
+			drop(guard);
+			drop(ticket);
+			outcome
+		});
+		task.await
+			.map_err(|e| tracing::error!("Session initialization task failed: {e}"))?
+	}
+
+	/// Launch the session by starting the compositor and application, but don't start streams until RTSP ANNOUNCE is received.
+	///
+	/// The launch is owned by the manager: if the caller stops waiting (e.g.
+	/// an HTTP timeout), it still commits or is cancelled by a session stop.
+	pub(crate) async fn launch_session(&self) -> Result<(), ()> {
+		let (ticket, session) = {
+			let mut guard = self.lock().await;
+			let Some(live) = guard.live() else {
+				tracing::warn!("LaunchSession rejected: no active session");
+				return Err(());
+			};
+			if !matches!(live.state, Some(SessionState::Initialized(_))) || live.transition.is_some() {
+				tracing::warn!(
+					state = live.state.as_ref().map(SessionState::name),
+					transition = ?live.transition.map(|t| t.kind),
+					"LaunchSession rejected: session is not waiting to be launched"
+				);
+				return Err(());
+			}
+			let ticket = guard.begin_transition(TransitionKind::Launch)?;
+			let live = guard.live().expect("checked above");
+			// Recorded before anything can create the unit.
+			live.record.application_unit = Some(APPLICATION_UNIT_NAME);
+			let Some(SessionState::Initialized(session)) = live.state.take() else {
+				unreachable!("checked above");
+			};
+			(ticket, session)
+		};
+
+		tracing::info!("Launching session (starting compositor and app).");
+		let core = self.clone();
+		let task = tokio::spawn(async move {
+			let result = ticket.stop.wrap_cancel(core.backend.launch(session)).await;
+			let mut guard = core.lock().await;
+			let outcome = match result {
+				Ok(Ok(launched)) => {
+					let state = SessionState::Launched(launched);
+					match guard.committable(&ticket) {
+						Some(live) => {
+							live.state = Some(state);
+							live.transition = None;
+							tracing::info!("Session launched successfully, waiting for RTSP ANNOUNCE.");
+							Ok(())
+						},
+						None => {
+							guard.orphan(&ticket, state);
+							Err(())
+						},
+					}
+				},
+				Ok(Err(())) => {
+					tracing::error!("Failed to launch session.");
+					core.fail_transition(&mut guard, &ticket, None);
+					Err(())
+				},
+				Err(_) => {
+					tracing::info!("Session launch cancelled.");
+					Err(())
+				},
+			};
+			drop(guard);
+			drop(ticket);
+			outcome
+		});
+		task.await
+			.map_err(|e| tracing::error!("Session launch task failed: {e}"))?
+	}
+
 	/// Set the video and audio stream contexts after receiving RTSP ANNOUNCE.
 	///
-	/// `session_id_v1` records that the client announced Moonlight's
-	/// `ML_FF_SESSION_ID_V1`, after which media and control discovery require
-	/// the generation's session identifiers.
-	pub async fn set_stream_context(
+	/// For an active session the live epoch is paused first; the contexts are
+	/// published (and may be committed by PLAY) only after that barrier.
+	pub(crate) async fn set_stream_context(
 		&self,
 		grant: &StreamAuthorization,
 		video_stream_context: VideoStreamContext,
@@ -338,369 +884,301 @@ impl SessionManager {
 			);
 			return Err(());
 		}
-		let mut guard = self.inner.lock().await;
-		if !guard.is_current(grant) {
-			tracing::warn!(
-				generation = grant.generation(),
-				"Rejecting RTSP ANNOUNCE from a replaced launch/resume generation"
-			);
-			return Err(());
-		}
-		let resume_request = guard.resume_request.clone();
-		let (pause_video, pause_audio) = match guard.session.as_ref() {
-			Some(SessionState::Launched(_)) => {
-				tracing::debug!("Stream contexts received via RTSP ANNOUNCE.");
-				guard.pending_video_stream_context = Some(video_stream_context);
-				guard.pending_audio_stream_context = Some(audio_stream_context);
-				guard.pending_generation = Some(grant.generation());
-				(None, None)
-			},
-			Some(SessionState::Initialized(_)) => {
-				tracing::warn!("SetStreamContext rejected: session not yet launched (Initialized state)");
-				return Err(());
-			},
-			Some(SessionState::Active(active)) => {
-				let changed = active.video_context().changed_fields(&video_stream_context);
-				let audio_changed = active.audio_context() != &audio_stream_context;
-				tracing::info!(
-					active_width = active.video_context().width,
-					active_height = active.video_context().height,
-					active_fps = active.video_context().fps,
-					active_codec = %active.video_context().format.codec,
-					active_chroma = %active.video_context().format.chroma,
-					active_bit_depth = active.video_context().format.bit_depth.bits(),
-					active_hdr = active.video_context().format.hdr,
-					active_bitrate = active.video_context().bitrate,
-					requested_width = video_stream_context.width,
-					requested_height = video_stream_context.height,
-					requested_fps = video_stream_context.fps,
-					requested_codec = %video_stream_context.format.codec,
-					requested_chroma = %video_stream_context.format.chroma,
-					requested_bit_depth = video_stream_context.format.bit_depth.bits(),
-					requested_hdr = video_stream_context.format.hdr,
-					requested_bitrate = video_stream_context.bitrate,
-					changed_fields = ?changed,
-					audio_changed,
-					"Reconnect negotiation received"
+		let pending = PendingStreams {
+			video: video_stream_context,
+			audio: audio_stream_context,
+			generation: grant.generation(),
+		};
+		let (ticket, pause) = {
+			let mut guard = self.lock().await;
+			if !guard.is_current(grant) {
+				tracing::warn!(
+					generation = grant.generation(),
+					"Rejecting RTSP ANNOUNCE from a replaced launch/resume generation"
 				);
-				if let Some(request) = resume_request
-					&& (request
-						.resolution
-						.is_some_and(|value| value != (video_stream_context.width, video_stream_context.height))
-						|| request
-							.refresh_rate
-							.is_some_and(|value| value != video_stream_context.fps)
-						|| request
-							.hdr
-							.is_some_and(|value| value != video_stream_context.format.hdr))
-				{
-					tracing::warn!(
-						?request,
-						"HTTP resume parameters differ from authoritative RTSP negotiation"
-					);
-				}
-				// Every reconnect needs a barrier, including identical-mode resume.
-				let pause_video = Some(active.video_handle());
-				let pause_audio = audio_changed.then(|| active.audio_handle());
-				guard.pending_video_stream_context = Some(video_stream_context);
-				guard.pending_audio_stream_context = Some(audio_stream_context);
-				guard.pending_generation = Some(grant.generation());
-				(pause_video, pause_audio)
-			},
-			None => {
+				return Err(());
+			}
+			let resume_request = guard.resume_request.clone();
+			let Some(live) = guard.live() else {
 				tracing::warn!("SetStreamContext rejected: no active session");
 				return Err(());
-			},
-		};
-		if session_id_v1 && let Some(tx) = &guard.authorization_tx {
-			tx.send_modify(StreamAuthorization::require_session_id);
-		}
-		drop(guard);
-		if let Some(handle) = pause_video {
-			handle.pause_for_reconfigure().await.map_err(|()| {
-				tracing::warn!("Failed to pause the active video epoch for reconnect reconfiguration");
-			})?;
-		}
-		if let Some(handle) = pause_audio {
-			handle.pause_for_reconfigure().await.map_err(|()| {
-				tracing::warn!("Failed to pause the active audio epoch for reconnect reconfiguration");
-			})?;
-		}
-		Ok(())
-	}
-
-	/// Get the current session context if there is an active session; otherwise return `None`.
-	pub async fn get_session_context(&self) -> Result<Option<SessionContext>, ()> {
-		let guard = self.inner.lock().await;
-		Ok(guard.session.as_ref().map(|s| s.context().clone()))
-	}
-
-	/// Initialize a new session with the provided context.
-	///
-	/// The session is not launched until `launch_session` is called.
-	pub async fn initialize_session(&self, mut context: SessionContext) -> Result<(), ()> {
-		let mut guard = self.inner.lock().await;
-
-		if guard.session.is_some() || guard.keys_tx.is_some() {
-			tracing::warn!("Session already initialized, rejecting InitializeSession command.");
-			return Err(());
-		}
-
-		// Extract the raw keys from context and create the watch channel.
-		let session_keys = match context.keys {
-			SessionKeys::Keys(data) => data,
-			SessionKeys::Rx(_) => {
-				tracing::error!("Session keys already initialized as a watch receiver");
+			};
+			if let Some(transition) = live.transition {
+				tracing::warn!(in_progress = ?transition.kind, "SetStreamContext rejected: a session transition is in progress");
 				return Err(());
-			},
-		};
-		let (tx, rx) = watch::channel(guard.key_ledger.publish(session_keys));
-		context.keys = SessionKeys::Rx(rx);
-		let client_ip = context.client_ip;
-
-		let compositor_config = guard.compositor_config.clone();
-		let video_config = guard.video_config.clone();
-		let audio_config = guard.audio_config.clone();
-		let control_config = guard.control_config.clone();
-		let address = guard.address.clone();
-		let stop = guard.stop.clone();
-		let stats_tx = guard.stats_tx.clone();
-		let session = InitializedSession::new(
-			compositor_config,
-			video_config,
-			audio_config,
-			control_config,
-			address,
-			context,
-			stop,
-			stats_tx,
-		)
-		.await?;
-		guard.rotate_authorization(client_ip)?;
-		guard.session = Some(SessionState::Initialized(session));
-
-		spawn_session_watchdog(&self.inner, &mut guard);
-		tracing::info!("Session initialized successfully, waiting to be launched.");
-
-		// Set the keys sender here so that it is not set if session initialization failed.
-		guard.keys_tx = Some(tx);
-		Ok(())
-	}
-
-	/// Launch the session by starting the compositor and application, but don't start streams until RTSP ANNOUNCE is received.
-	pub async fn launch_session(&self) -> Result<(), ()> {
-		let session = {
-			let mut guard = self.inner.lock().await;
-			match guard.session.take() {
-				Some(SessionState::Initialized(session)) => session,
-				Some(SessionState::Launched(launched)) => {
-					guard.session = Some(SessionState::Launched(launched));
-					tracing::warn!("LaunchSession rejected: session already launched");
-					return Err(());
+			}
+			let (video, audio) = (&pending.video, &pending.audio);
+			let pause = match &live.state {
+				Some(SessionState::Launched(_)) => {
+					tracing::debug!("Stream contexts received via RTSP ANNOUNCE.");
+					None
 				},
 				Some(SessionState::Active(active)) => {
-					guard.session = Some(SessionState::Active(active));
-					tracing::warn!("LaunchSession rejected: session already active");
+					let (active_video, active_audio) = live
+						.record
+						.streams
+						.as_ref()
+						.expect("active sessions record their streams");
+					let changed = active_video.changed_fields(video);
+					let audio_changed = active_audio != audio;
+					tracing::info!(
+						active_width = active_video.width,
+						active_height = active_video.height,
+						active_fps = active_video.fps,
+						active_codec = %active_video.format.codec,
+						active_chroma = %active_video.format.chroma,
+						active_bit_depth = active_video.format.bit_depth.bits(),
+						active_hdr = active_video.format.hdr,
+						active_bitrate = active_video.bitrate,
+						requested_width = video.width,
+						requested_height = video.height,
+						requested_fps = video.fps,
+						requested_codec = %video.format.codec,
+						requested_chroma = %video.format.chroma,
+						requested_bit_depth = video.format.bit_depth.bits(),
+						requested_hdr = video.format.hdr,
+						requested_bitrate = video.bitrate,
+						changed_fields = ?changed,
+						audio_changed,
+						"Reconnect negotiation received"
+					);
+					if let Some(request) = resume_request
+						&& (request
+							.resolution
+							.is_some_and(|value| value != (video.width, video.height))
+							|| request.refresh_rate.is_some_and(|value| value != video.fps)
+							|| request.hdr.is_some_and(|value| value != video.format.hdr))
+					{
+						tracing::warn!(
+							?request,
+							"HTTP resume parameters differ from authoritative RTSP negotiation"
+						);
+					}
+					// Every reconnect needs a barrier, including identical-mode resume.
+					Some(self.backend.pause(active, true, audio_changed))
+				},
+				Some(SessionState::Initialized(_)) => {
+					tracing::warn!("SetStreamContext rejected: session not yet launched (Initialized state)");
 					return Err(());
 				},
+				None => unreachable!("state is checked out only by a transition"),
+			};
+			match pause {
 				None => {
-					tracing::warn!("LaunchSession rejected: no active session");
-					return Err(());
+					publish_pending(&mut guard, pending, session_id_v1);
+					return Ok(());
 				},
+				Some(pause) => (guard.begin_transition(TransitionKind::Announce)?, pause),
 			}
 		};
 
-		tracing::info!("Launching session (starting compositor and app).");
-		match session.launch().await {
-			Ok(launched) => {
-				let mut guard = self.inner.lock().await;
-				guard.session = Some(SessionState::Launched(launched));
-				tracing::info!("Session launched successfully, waiting for RTSP ANNOUNCE.");
-				Ok(())
-			},
-			Err(()) => {
-				let mut guard = self.inner.lock().await;
-				guard.reset_session();
-				tracing::error!("Failed to launch session, waiting for new session.");
-				Err(())
-			},
-		}
+		let core = self.clone();
+		let grant = grant.clone();
+		let task = tokio::spawn(async move {
+			let result = ticket.stop.wrap_cancel(pause).await;
+			let mut guard = core.lock().await;
+			let committable = guard.committable(&ticket).is_some();
+			guard.end_transition(&ticket);
+			let outcome = match result {
+				Ok(Ok(())) if committable && guard.is_current(&grant) => {
+					publish_pending(&mut guard, pending, session_id_v1);
+					Ok(())
+				},
+				Ok(Ok(())) => {
+					tracing::warn!("Discarding ANNOUNCE contexts from a replaced generation or stopping session");
+					Err(())
+				},
+				Ok(Err(())) | Err(_) => Err(()),
+			};
+			drop(guard);
+			drop(ticket);
+			outcome
+		});
+		task.await.map_err(|e| tracing::error!("ANNOUNCE task failed: {e}"))?
 	}
 
-	/// Start the video and audio streams.
-	///
-	/// Returns `Ok(())` only after all three streams (video, audio, control) are
-	/// successfully constructed. Returns `Err(())` if any stream fails to initialize.
+	/// Start the streams of a launched session, or commit a reconnect epoch of
+	/// an active one.
 	///
 	/// `grant` must be the authorization under which the pending contexts were
-	/// announced; PLAY from a replaced generation cannot commit them.
-	pub async fn start_session(&self, grant: &StreamAuthorization) -> Result<(), ()> {
-		// Active sessions take an explicit resume path. Temporarily taking the
-		// state prevents a concurrent PLAY from racing the epoch transition.
-		let resume = {
-			let mut guard = self.inner.lock().await;
-			if !guard.is_current(grant) || guard.pending_generation != Some(grant.generation()) {
+	/// announced; PLAY from a replaced generation cannot commit them. Every
+	/// prerequisite is checked before anything moves, so a duplicate,
+	/// premature or stale PLAY leaves the session (and its application) as is.
+	pub(crate) async fn start_session(&self, grant: &StreamAuthorization) -> Result<(), ()> {
+		enum Work<B: SessionBackend> {
+			Start(B::Launched, StartRequest),
+			Resume(B::Active, ResumePlan),
+		}
+		let (ticket, work, video, audio) = {
+			let mut guard = self.lock().await;
+			let announced = guard.pending.as_ref().map(|pending| pending.generation);
+			if !guard.is_current(grant) || announced != Some(grant.generation()) {
 				tracing::warn!(
 					generation = grant.generation(),
-					pending_generation = ?guard.pending_generation,
+					pending_generation = ?announced,
 					"Rejecting RTSP PLAY without a pending ANNOUNCE from the current generation"
 				);
 				return Err(());
 			}
-			guard.pending_generation = None;
-			if matches!(guard.session, Some(SessionState::Active(_))) {
-				let video = guard.pending_video_stream_context.take();
-				let audio = guard.pending_audio_stream_context.take();
-				let active = match guard.session.take() {
-					Some(SessionState::Active(active)) => active,
-					_ => unreachable!(),
-				};
-				guard.resume_request = None;
-				Some((active, video, audio, guard.stop.clone()))
-			} else {
-				None
-			}
-		};
-
-		if let Some((mut active, video, audio, stop)) = resume {
-			let video =
-				video.ok_or_else(|| tracing::error!("Reconnect PLAY received without a pending video context"))?;
-			let audio =
-				audio.ok_or_else(|| tracing::error!("Reconnect PLAY received without a pending audio context"))?;
-			let decision = reconnect_decision(
-				active.video_context(),
-				&video,
-				active.audio_context(),
-				&audio,
-				stop.is_shutdown_triggered(),
-			);
-
-			let result = match decision {
-				ReconnectDecision::RejectShuttingDown => {
-					tracing::warn!("Session is shutting down; rejecting reconnect PLAY");
-					Err(())
-				},
-				ReconnectDecision::FastResume => {
-					let result = active.reset_video_stream().await;
-					tracing::info!("Reconnect stream configuration unchanged; using fast resume path");
-					result
-				},
-				ReconnectDecision::Reconfigure {
-					video_changed_fields,
-					audio_changed,
-				} => {
-					let video_result = if video_changed_fields.is_empty() {
-						active.reset_video_stream().await
-					} else {
-						tracing::info!(changed_fields = ?video_changed_fields, "Recreating video pipeline for changed reconnect configuration");
-						active.reconfigure_video(video).await
-					};
-					let audio_result = if audio_changed {
-						tracing::info!("Recreating audio epoch for changed reconnect configuration");
-						active.reconfigure_audio(audio).await
-					} else {
-						Ok(())
-					};
-					video_result.and(audio_result)
-				},
+			let authorization_rx = guard
+				.authorization_tx
+				.as_ref()
+				.map(watch::Sender::subscribe)
+				.expect("a current grant implies an authorization channel");
+			let Some(live) = guard.live() else {
+				tracing::warn!("StartSession rejected: no active session");
+				return Err(());
 			};
-
-			let mut guard = self.inner.lock().await;
-			if guard.session.is_none() && !stop.is_shutdown_triggered() && !guard.stop.is_shutdown_triggered() {
-				guard.session = Some(SessionState::Active(active));
-			}
-			return result;
-		}
-
-		let (launched, video_stream_context, audio_stream_context, stop) = {
-			let mut guard = self.inner.lock().await;
-			let video_stream_context = guard.pending_video_stream_context.take();
-			let audio_stream_context = guard.pending_audio_stream_context.take();
-			match guard.session.take() {
-				Some(SessionState::Launched(launched)) => {
-					(launched, video_stream_context, audio_stream_context, guard.stop.clone())
-				},
-				Some(SessionState::Initialized(session)) => {
-					guard.session = Some(SessionState::Initialized(session));
+			match &live.state {
+				Some(SessionState::Launched(_) | SessionState::Active(_)) => {},
+				Some(SessionState::Initialized(_)) => {
 					tracing::warn!("StartSession rejected: session not yet launched");
 					return Err(());
 				},
-				Some(SessionState::Active(active)) => {
-					guard.session = Some(SessionState::Active(active));
-					tracing::warn!("Concurrent reconnect transition already in progress");
-					return Err(());
-				},
 				None => {
-					tracing::warn!("StartSession rejected: no active session");
+					tracing::warn!("StartSession rejected: a session transition is in progress");
 					return Err(());
 				},
 			}
+			let ticket = guard.begin_transition(TransitionKind::Start)?;
+			// Prerequisites hold; consume the announcement and check out the state.
+			let PendingStreams { video, audio, .. } = guard.pending.take().expect("checked above");
+			let resume_request = guard.resume_request.take();
+			let live = guard.live().expect("checked above");
+			let work = match live.state.take().expect("checked above") {
+				SessionState::Launched(launched) => Work::<B>::Start(
+					launched,
+					StartRequest {
+						video: video.clone(),
+						audio: audio.clone(),
+						authorization_rx,
+						stop: live.record.stop.clone(),
+					},
+				),
+				SessionState::Active(active) => {
+					if let Some(transition) = live.transition.as_mut() {
+						transition.kind = TransitionKind::Resume;
+					}
+					let (active_video, active_audio) = live
+						.record
+						.streams
+						.as_ref()
+						.expect("active sessions record their streams");
+					let plan = match reconnect_decision(
+						active_video,
+						&video,
+						active_audio,
+						&audio,
+						live.record.stop.is_shutdown_triggered(),
+					) {
+						ReconnectDecision::RejectShuttingDown => {
+							unreachable!("begin_transition rejects stopping sessions")
+						},
+						ReconnectDecision::FastResume => {
+							tracing::info!("Reconnect stream configuration unchanged; using fast resume path");
+							ResumePlan {
+								video: None,
+								audio: None,
+							}
+						},
+						ReconnectDecision::Reconfigure {
+							video_changed_fields,
+							audio_changed,
+						} => {
+							if !video_changed_fields.is_empty() {
+								tracing::info!(changed_fields = ?video_changed_fields, "Recreating video pipeline for changed reconnect configuration");
+							}
+							if audio_changed {
+								tracing::info!("Recreating audio epoch for changed reconnect configuration");
+							}
+							ResumePlan {
+								video: (!video_changed_fields.is_empty()).then(|| video.clone()),
+								audio: audio_changed.then(|| audio.clone()),
+							}
+						},
+					};
+					tracing::debug!(?resume_request, "Committing reconnect PLAY");
+					Work::Resume(active, plan)
+				},
+				SessionState::Initialized(_) => unreachable!("checked above"),
+			};
+			(ticket, work, video, audio)
 		};
 
-		let video_stream_context = video_stream_context.ok_or_else(|| {
-			tracing::error!("VideoStreamContext not set");
-		})?;
-		let audio_stream_context = audio_stream_context.ok_or_else(|| {
-			tracing::error!("AudioStreamContext not set");
-		})?;
-
-		tracing::info!("Starting session streams.");
-		let mut guard = self.inner.lock().await;
-		let video_config = guard.video_config.clone();
-		let stream_timeout = guard.stream_timeout;
-		let Some(authorization_rx) = guard.authorization_tx.as_ref().map(watch::Sender::subscribe) else {
-			tracing::error!("Session has no stream authorization");
-			guard.reset_session();
-			return Err(());
-		};
-		match launched
-			.start(
-				video_config,
-				stream_timeout,
-				video_stream_context,
-				audio_stream_context,
-				stop,
-				guard.inhibit_sleep,
-				authorization_rx,
-			)
-			.await
-		{
-			Ok((active, video_notify, audio_notify)) => {
-				guard.session = Some(SessionState::Active(active));
-				guard.video_start_notify = Some(video_notify);
-				guard.audio_start_notify = Some(audio_notify);
-				Ok(())
-			},
-			Err(()) => {
-				guard.reset_session();
-				tracing::error!("Failed to start session streams.");
-				Err(())
-			},
-		}
-	}
-
-	/// Stop the session and return to Uninitialized state.
-	pub async fn stop_session(&self) -> Result<(), ()> {
-		let (stop, shutdown) = {
-			let mut guard = self.inner.lock().await;
-			match guard.session {
-				Some(_) => {},
-				None => return Ok(()),
-			}
-			let stop = guard.stop.clone();
-			let shutdown = guard.shutdown.clone();
-
-			// Drop session first, which drops the Application.
-			guard.reset_session();
-			(stop, shutdown)
-		};
-
-		// Then trigger shutdown of the compositor & streams.
-		let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);
-
-		wait_for_session_shutdown(&stop, &shutdown, SESSION_SHUTDOWN_TIMEOUT_SECS).await?;
-		tracing::info!("Session stopped by user, waiting for new session.");
-		Ok(())
+		let core = self.clone();
+		let task = tokio::spawn(async move {
+			let outcome = match work {
+				Work::Start(launched, request) => {
+					tracing::info!("Starting session streams.");
+					let result = ticket.stop.wrap_cancel(core.backend.start(launched, request)).await;
+					let mut guard = core.lock().await;
+					match result {
+						Ok(Ok((active, latches))) => {
+							let state = SessionState::Active(active);
+							match guard.committable(&ticket) {
+								Some(live) => {
+									live.record.streams = Some((video, audio));
+									live.record.start_latches = latches;
+									live.state = Some(state);
+									live.transition = None;
+									Ok(())
+								},
+								None => {
+									guard.orphan(&ticket, state);
+									Err(())
+								},
+							}
+						},
+						Ok(Err(())) => {
+							tracing::error!("Failed to start session streams.");
+							core.fail_transition(&mut guard, &ticket, None);
+							Err(())
+						},
+						Err(_) => Err(()),
+					}
+				},
+				Work::Resume(mut active, plan) => {
+					let result = ticket.stop.wrap_cancel(core.backend.resume(&mut active, plan)).await;
+					let mut guard = core.lock().await;
+					let state = SessionState::Active(active);
+					match result {
+						Ok(Ok(())) => match guard.committable(&ticket) {
+							Some(live) => {
+								let context = &mut live.record.context;
+								context.resolution = (video.width, video.height);
+								context.refresh_rate = video.fps;
+								context.hdr = video.format.hdr;
+								context.audio_channels = audio.audio_config.channels;
+								context.audio_channel_mask = audio.audio_config.channel_mask;
+								live.record.streams = Some((video, audio));
+								live.state = Some(state);
+								live.transition = None;
+								Ok(())
+							},
+							None => {
+								guard.orphan(&ticket, state);
+								Err(())
+							},
+						},
+						// A partially applied reconfiguration cannot be trusted; the
+						// application is stopped cleanly with the rest of the session.
+						Ok(Err(())) => {
+							tracing::error!("Reconnect reconfiguration failed.");
+							core.fail_transition(&mut guard, &ticket, Some(state));
+							Err(())
+						},
+						Err(_) => {
+							guard.orphan(&ticket, state);
+							Err(())
+						},
+					}
+				},
+			};
+			drop(ticket);
+			outcome
+		});
+		task.await
+			.map_err(|e| tracing::error!("Session start task failed: {e}"))?
 	}
 
 	/// Update keys and retain authenticated session-level resume parameters.
@@ -713,18 +1191,19 @@ impl SessionManager {
 		request: ResumeRequest,
 		client_ip: IpAddr,
 	) -> Result<(), ()> {
-		let mut guard = self.inner.lock().await;
-
-		if guard.stop.is_shutdown_triggered() {
-			tracing::warn!("Session is shutting down; rejecting resume key update.");
-			return Err(());
-		}
-
-		if !matches!(guard.session.as_ref(), Some(SessionState::Active(_))) {
+		let mut guard = self.lock().await;
+		let streaming = match guard.live() {
+			Some(live) if live.record.stop.is_shutdown_triggered() => {
+				tracing::warn!("Session is shutting down; rejecting resume key update.");
+				return Err(());
+			},
+			Some(live) => live.record.streams.is_some(),
+			None => false,
+		};
+		if !streaming {
 			tracing::warn!("No active streaming session to update keys for.");
 			return Err(());
 		}
-
 		if guard.keys_tx.is_none() {
 			tracing::warn!("Active streaming session has no key sender; rejecting resume.");
 			return Err(());
@@ -737,12 +1216,144 @@ impl SessionManager {
 			keys_tx.send_replace(keys);
 		}
 		// Contexts announced under the previous generation must not be committed.
-		guard.pending_video_stream_context = None;
-		guard.pending_audio_stream_context = None;
-		guard.pending_generation = None;
+		guard.pending = None;
 		guard.resume_request = Some(request);
 
 		Ok(())
+	}
+}
+
+fn publish_pending<B: SessionBackend>(
+	guard: &mut SessionManagerInner<B>,
+	pending: PendingStreams,
+	session_id_v1: bool,
+) {
+	guard.pending = Some(pending);
+	if session_id_v1 && let Some(tx) = &guard.authorization_tx {
+		tx.send_modify(StreamAuthorization::require_session_id);
+	}
+}
+
+/// The production session manager.
+#[derive(Clone)]
+pub struct SessionManager {
+	core: SessionCore<SystemSession>,
+	stats_tx: broadcast::Sender<FrameStats>,
+}
+
+impl SessionManager {
+	#[allow(clippy::too_many_arguments)]
+	pub fn new(
+		compositor_config: CompositorConfig,
+		video_config: VideoStreamConfig,
+		audio_config: AudioStreamConfig,
+		control_config: ControlStreamConfig,
+		address: String,
+		stream_timeout: u64,
+		inhibit_sleep: bool,
+		shutdown: ShutdownManager<ShutdownReason>,
+	) -> Result<Self, ()> {
+		let stats_tx = broadcast::channel(256).0;
+		let backend = SystemSession {
+			compositor_config,
+			video_config,
+			audio_config,
+			control_config,
+			address,
+			stream_timeout,
+			inhibit_sleep,
+			stats_tx: stats_tx.clone(),
+		};
+		Ok(Self {
+			core: SessionCore::new(backend, shutdown)?,
+			stats_tx,
+		})
+	}
+
+	/// Returns a receiver for per-frame encoding statistics.
+	///
+	/// Call **before** `initialize_session()` to receive stats from the start.
+	/// Multiple receivers can be created — each receives a copy of every message.
+	pub fn bench_stats_receiver(&self) -> broadcast::Receiver<FrameStats> {
+		self.stats_tx.subscribe()
+	}
+
+	/// Trigger the video and audio pipelines to start encoding.
+	///
+	/// In the normal flow, this is triggered by the control stream when the
+	/// client sends `StartB`. Call this from external callers (e.g. bench binary)
+	/// that have no Moonlight client. Must be called after `start_session()`.
+	/// Idempotent, and equivalent to (and compatible with) a client `StartB`.
+	pub async fn trigger_streams_start(&self) {
+		self.core.trigger_streams_start().await;
+	}
+
+	/// Authorize an RTSP peer for the current launch/resume generation.
+	///
+	/// The returned grant must accompany the ANNOUNCE and PLAY it authorizes;
+	/// they are rejected if a later launch/resume replaced its generation.
+	pub async fn authorize_stream(&self, peer: IpAddr) -> Option<StreamAuthorization> {
+		self.core.authorize_stream(peer).await
+	}
+
+	/// Set the video and audio stream contexts after receiving RTSP ANNOUNCE.
+	///
+	/// `session_id_v1` records that the client announced Moonlight's
+	/// `ML_FF_SESSION_ID_V1`, after which media and control discovery require
+	/// the generation's session identifiers.
+	pub async fn set_stream_context(
+		&self,
+		grant: &StreamAuthorization,
+		video_stream_context: VideoStreamContext,
+		audio_stream_context: AudioStreamContext,
+		session_id_v1: bool,
+	) -> Result<(), ()> {
+		self.core
+			.set_stream_context(grant, video_stream_context, audio_stream_context, session_id_v1)
+			.await
+	}
+
+	/// Get the current session context if there is a live session (including
+	/// one in a transition); otherwise return `None`. A session that is
+	/// stopping is not reported.
+	pub async fn get_session_context(&self) -> Result<Option<SessionContext>, ()> {
+		Ok(self.core.get_session_context().await)
+	}
+
+	/// Initialize a new session with the provided context.
+	///
+	/// The session is not launched until `launch_session` is called.
+	pub async fn initialize_session(&self, context: SessionContext) -> Result<(), ()> {
+		self.core.initialize_session(context).await
+	}
+
+	/// Launch the session by starting the compositor and application, but don't start streams until RTSP ANNOUNCE is received.
+	pub async fn launch_session(&self) -> Result<(), ()> {
+		self.core.launch_session().await
+	}
+
+	/// Start the video and audio streams.
+	///
+	/// Returns `Ok(())` only after all three streams (video, audio, control) are
+	/// successfully constructed. Returns `Err(())` if any stream fails to initialize.
+	pub async fn start_session(&self, grant: &StreamAuthorization) -> Result<(), ()> {
+		self.core.start_session(grant).await
+	}
+
+	/// Stop the session and return to the idle state. Completes only after the
+	/// application unit and every session worker have been released.
+	pub async fn stop_session(&self) -> Result<(), ()> {
+		self.core.stop_session().await
+	}
+
+	/// Update keys and retain authenticated session-level resume parameters.
+	pub(crate) async fn resume_session(
+		&self,
+		keys: SessionKeyData,
+		request: ResumeRequest,
+		client_ip: IpAddr,
+	) -> Result<(), ()> {
+		self.core.resume_session(keys, request, client_ip).await
 	}
 }
 
@@ -766,71 +1377,21 @@ impl SessionManager {
 	/// Start an authorization generation without launching a session, as an
 	/// authenticated `/launch` would.
 	pub(crate) async fn authorize_client_for_test(&self, client_ip: IpAddr) -> StreamAuthorization {
-		let mut guard = self.inner.lock().await;
+		self.core.authorize_client_for_test(client_ip).await
+	}
+}
+
+#[cfg(test)]
+impl<B: SessionBackend> SessionCore<B> {
+	pub(crate) async fn authorize_client_for_test(&self, client_ip: IpAddr) -> StreamAuthorization {
+		let mut guard = self.lock().await;
 		guard.rotate_authorization(client_ip).unwrap();
 		guard.authorization_tx.as_ref().unwrap().borrow().clone()
 	}
 }
 
-/// Spawn a watchdog task to monitor the session for unexpected shutdowns.
-fn spawn_session_watchdog(inner: &Arc<Mutex<SessionManagerInner>>, guard: &mut SessionManagerInner) {
-	if guard.stop_watcher.is_some() {
-		tracing::error!("Session watchdog already running, not spawning another.");
-		return;
-	}
-
-	let inner = inner.clone();
-	let stop = guard.stop.clone();
-	let shutdown = guard.shutdown.clone();
-	let handle = tokio::spawn(async move {
-		tokio::select! {
-			reason = stop.wait_shutdown_triggered() => {
-				if reason == SessionShutdownReason::UserStopped {
-					tracing::info!("Session shutdown requested by user.");
-				} else {
-					tracing::warn!("Session stopped unexpectedly (reason: {reason:?}), waiting for new session.");
-				}
-			},
-			_ = shutdown.wait_shutdown_triggered() => {
-				tracing::debug!("Global shutdown triggered, stopping active session.");
-				let _ = stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown);
-			},
-		}
-
-		// First drop the session so that the application exits as soon as possible.
-		{
-			inner.lock().await.reset_session();
-		}
-
-		// Then wait for the session to shut down.
-		stop.wait_shutdown_complete().await;
-	});
-	guard.stop_watcher = Some(handle);
-}
-
-/// Wait for the session to shut down within the given timeout.
-///
-/// If the session does not shut down in time, triggers a global application
-/// shutdown to prevent orphaned tasks and resource leaks.
-async fn wait_for_session_shutdown(
-	stop: &ShutdownManager<SessionShutdownReason>,
-	shutdown: &ShutdownManager<ShutdownReason>,
-	timeout_secs: u64,
-) -> Result<(), ()> {
-	match tokio::time::timeout(
-		std::time::Duration::from_secs(timeout_secs),
-		stop.wait_shutdown_complete(),
-	)
-	.await
-	{
-		Ok(_) => Ok(()),
-		Err(_) => {
-			tracing::error!("Session shutdown timed out after {timeout_secs}s — triggering application shutdown.");
-			let _ = shutdown.trigger_shutdown(ShutdownReason::SessionManagerShutdown);
-			Err(())
-		},
-	}
-}
+#[cfg(test)]
+mod lifecycle_tests;
 
 #[cfg(test)]
 mod tests {
@@ -895,15 +1456,19 @@ mod tests {
 		let second = manager.authorize_client_for_test(client).await;
 		assert!(second.generation() > first.generation());
 		{
-			let mut guard = manager.inner.lock().await;
+			let mut guard = manager.core.inner.lock().await;
 			assert!(!guard.is_current(&first));
 			assert!(guard.is_current(&second));
-			guard.pending_generation = Some(first.generation());
+			guard.pending = Some(PendingStreams {
+				video: video(VideoCodec::H264),
+				audio: audio(),
+				generation: first.generation(),
+			});
 		}
 		assert!(manager.start_session(&first).await.is_err());
 		assert!(manager.start_session(&second).await.is_err());
 		assert_eq!(
-			manager.inner.lock().await.pending_generation,
+			manager.core.inner.lock().await.pending.as_ref().map(|p| p.generation),
 			Some(first.generation()),
 			"rejected PLAY must not consume pending contexts"
 		);

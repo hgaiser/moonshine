@@ -1,11 +1,11 @@
 use async_shutdown::ShutdownManager;
 use fec_rs::ReedSolomon;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::crypto::encrypt_cbc;
 use crate::session::SessionKeysReceiver;
 use crate::session::keys::RemoteInputKeyId;
+use crate::session::lifecycle::{StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::RtpHeader;
 
@@ -41,7 +41,7 @@ impl AudioEncoder {
 		keys_rx: SessionKeysReceiver,
 		packet_tx: mpsc::Sender<AudioPacketMessage>,
 		stop: ShutdownManager<SessionShutdownReason>,
-		start_notify: Arc<tokio::sync::Notify>,
+		start: StartWaiter,
 		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
 	) -> Result<(), ()> {
 		let stream_config = &context.audio_config.stream_config;
@@ -60,9 +60,11 @@ impl AudioEncoder {
 			.map_err(|e| tracing::warn!("Failed to create FEC encoder: {e}"))?;
 
 		let inner = AudioEncoderInner {};
+		let worker = WorkerGuard::register(&stop, SessionShutdownReason::AudioEncoderStopped)?;
 		std::thread::Builder::new()
 			.name("audio-encode".to_string())
 			.spawn(move || {
+				let _worker = worker;
 				inner.run(
 					sample_rate,
 					frame_rx,
@@ -73,7 +75,7 @@ impl AudioEncoder {
 					context.encrypt_audio,
 					packet_tx,
 					stop,
-					start_notify,
+					start,
 					reconfigure_rx,
 				)
 			})
@@ -125,19 +127,15 @@ impl AudioEncoderInner {
 		mut encrypt: bool,
 		packet_tx: mpsc::Sender<AudioPacketMessage>,
 		stop: ShutdownManager<SessionShutdownReason>,
-		start_notify: Arc<tokio::sync::Notify>,
+		start: StartWaiter,
 		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
 	) {
-		// Trigger session shutdown when the audio encoder stops.
-		let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioEncoderStopped);
-		let _delay_stop = stop.delay_shutdown_token();
-
-		// Wait for the start signal before entering the encode loop.
 		let rt = tokio::runtime::Builder::new_current_thread()
 			.enable_all()
 			.build()
 			.expect("Failed to build tokio runtime for audio encoder");
-		if rt.block_on(stop.wrap_cancel(start_notify.notified())).is_err() {
+		// Wait for the start signal before entering the encode loop.
+		if rt.block_on(start.wait(&stop)).is_err() {
 			tracing::debug!("Audio encoder stopped before start signal.");
 			return;
 		}

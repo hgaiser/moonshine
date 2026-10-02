@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::ffi::{CStr, c_void};
-use std::os::fd::{AsRawFd, BorrowedFd, IntoRawFd, RawFd};
+use std::os::fd::{AsRawFd, IntoRawFd, RawFd};
 use std::path::PathBuf;
 use std::ptr;
 use std::rc::Rc;
@@ -20,6 +20,7 @@ use super::format::{
 	BitDepth, ChromaFormat, ColorPrimaries, ColorRange, MatrixCoefficients, NegotiatedVideoFormat, TransferFunction,
 };
 use super::pipeline::dmabuf::{ImportCacheStats, same_open_file};
+use super::pipeline::failure::{EncodeFailure, EncodeStage, Recovery, SourceAccess};
 use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
 use serde::{Deserialize, Serialize};
 
@@ -335,6 +336,47 @@ fn check(code: ResultCode, operation: &str) -> Result<(), String> {
 	}
 }
 
+// Result codes of the pinned `pyrowave.h` used for failure classification.
+const ERROR_GENERIC: ResultCode = -1;
+const ERROR_NO_VULKAN: ResultCode = -5;
+const ERROR_NOT_IMPLEMENTED: ResultCode = -6;
+
+/// Classify a failed PyroWave call made while encoding one frame.
+///
+/// `source` must reflect the pinned C implementation (revision
+/// [`SOURCE_REVISION`]): `encode_scaled` discards its command buffer without
+/// submitting on every error, and `compute_num_packets`/`packetize` wait on the
+/// queued fence before any other failure, so no exit leaves a source read
+/// outstanding. A missing device or API is terminal, as is a broken encoder
+/// after submission; per-frame argument, handle and memory failures drop the
+/// frame and are escalated by the pipeline's policy if they persist.
+fn frame_failure(stage: EncodeStage, code: ResultCode, source: SourceAccess, operation: &str) -> EncodeFailure {
+	let recovery = match (stage, code) {
+		(_, ERROR_NO_VULKAN | ERROR_NOT_IMPLEMENTED) => Recovery::Terminal,
+		(EncodeStage::Wait | EncodeStage::Readback, ERROR_GENERIC) => Recovery::Terminal,
+		_ => Recovery::DropFrame,
+	};
+	EncodeFailure::new(
+		stage,
+		recovery,
+		source,
+		format!("{operation} failed with PyroWave result {code}"),
+	)
+}
+
+fn check_frame(
+	code: ResultCode,
+	stage: EncodeStage,
+	source: SourceAccess,
+	operation: &str,
+) -> Result<(), EncodeFailure> {
+	if code == SUCCESS {
+		Ok(())
+	} else {
+		Err(frame_failure(stage, code, source, operation))
+	}
+}
+
 struct Device {
 	api: Rc<Api>,
 	handle: DeviceHandle,
@@ -449,8 +491,11 @@ impl ImportedImage {
 				.layouts
 				.iter()
 				.copied()
-				.eq(frame.planes.iter().map(|p| (p.offset, p.stride)))
-			&& same_open_file(self.identity_fd.as_raw_fd(), frame.planes[0].fd)
+				.eq(frame.planes().map(|p| (p.offset, p.stride)))
+			&& frame
+				.planes()
+				.next()
+				.is_some_and(|plane| same_open_file(self.identity_fd.as_raw_fd(), plane.fd.as_raw_fd()))
 	}
 }
 
@@ -641,19 +686,30 @@ impl PyroWaveEncoder {
 		})
 	}
 
-	fn import(&mut self, frame: &ExportedFrame) -> Result<ImageView, String> {
-		if frame.planes.is_empty() {
-			return Err("compositor exported a DMA-BUF without planes".to_string());
+	/// Import (or reuse) the frame's source. Nothing reading the source is
+	/// submitted here, so every failure leaves it unreferenced by the GPU.
+	fn import(&mut self, frame: &ExportedFrame) -> Result<ImageView, EncodeFailure> {
+		let rejected = |message: String| {
+			EncodeFailure::new(
+				EncodeStage::Import,
+				Recovery::DropFrame,
+				SourceAccess::NotSubmitted,
+				message,
+			)
+		};
+		// Borrowed from the frame's source lease: open and unrecycled for this call.
+		let mut planes = frame.planes();
+		let Some(first) = planes.next() else {
+			return Err(rejected("compositor exported a DMA-BUF without planes".to_string()));
+		};
+		if planes.any(|plane| !same_open_file(first.fd.as_raw_fd(), plane.fd.as_raw_fd())) {
+			return Err(rejected(
+				"PyroWave cannot import a DMA-BUF whose planes use different file descriptions".to_string(),
+			));
 		}
-		for plane in &frame.planes[1..] {
-			if !same_open_file(frame.planes[0].fd, plane.fd) {
-				return Err(
-					"PyroWave cannot import a DMA-BUF whose planes use different file descriptions".to_string(),
-				);
-			}
-		}
-		let format = drm_fourcc_to_vk(frame.format)?;
-		let fd = frame.planes[0].fd;
+		let source_fd = first.fd;
+		let format = drm_fourcc_to_vk(frame.format).map_err(rejected)?;
+		let fd = source_fd.as_raw_fd();
 		let now = Instant::now();
 		let reuse = self
 			.images
@@ -666,16 +722,15 @@ impl PyroWaveEncoder {
 			if self.images.entries.remove(&fd).is_some() {
 				self.images.stats.recreate += 1;
 			}
-			let identity_fd = unsafe { BorrowedFd::borrow_raw(fd) }
+			let identity_fd = source_fd
 				.try_clone_to_owned()
-				.map_err(|e| format!("duplicating DMA-BUF identity fd: {e}"))?;
-			let imported_fd = unsafe { BorrowedFd::borrow_raw(fd) }
+				.map_err(|e| rejected(format!("duplicating DMA-BUF identity fd: {e}")))?;
+			let imported_fd = source_fd
 				.try_clone_to_owned()
-				.map_err(|e| format!("duplicating DMA-BUF import fd: {e}"))?
+				.map_err(|e| rejected(format!("duplicating DMA-BUF import fd: {e}")))?
 				.into_raw_fd();
 			let plane_layouts: Vec<vk::SubresourceLayout> = frame
-				.planes
-				.iter()
+				.planes()
 				.map(|plane| {
 					vk::SubresourceLayout::default()
 						.offset(plane.offset as u64)
@@ -718,10 +773,15 @@ impl PyroWaveEncoder {
 			if result != SUCCESS {
 				// SAFETY: the API only takes handle ownership on successful import.
 				unsafe { libc::close(imported_fd) };
-				check(result, "importing compositor DMA-BUF into PyroWave")?;
+				check_frame(
+					result,
+					EncodeStage::Import,
+					SourceAccess::NotSubmitted,
+					"importing compositor DMA-BUF into PyroWave",
+				)?;
 			}
 			if handle.is_null() {
-				return Err("PyroWave returned a null imported image".to_string());
+				return Err(rejected("PyroWave returned a null imported image".to_string()));
 			}
 			self.images.insert(
 				fd,
@@ -733,7 +793,7 @@ impl PyroWaveEncoder {
 					height: frame.height,
 					format,
 					modifier: frame.modifier,
-					layouts: frame.planes.iter().map(|p| (p.offset, p.stride)).collect(),
+					layouts: frame.planes().map(|p| (p.offset, p.stride)).collect(),
 				},
 				now,
 			);
@@ -742,7 +802,7 @@ impl PyroWaveEncoder {
 		let mut view = ImageView::default();
 		// SAFETY: the cached image and output pointer are valid. SAMPLED usage
 		// matches the imported VkImageCreateInfo.
-		check(
+		check_frame(
 			unsafe {
 				(self.device.api.get_image_view)(
 					image.handle,
@@ -751,12 +811,18 @@ impl PyroWaveEncoder {
 					&mut view,
 				)
 			},
+			EncodeStage::Import,
+			SourceAccess::NotSubmitted,
 			"creating the PyroWave DMA-BUF image view",
 		)?;
 		Ok(view)
 	}
 
-	pub(crate) fn encode(&mut self, frame: &ExportedFrame, mut data: Vec<u8>) -> Result<EncodedFrame, String> {
+	/// Encode one frame and read back its bitstream.
+	///
+	/// On every return, including errors, no submitted GPU work still reads the
+	/// frame's source (see [`frame_failure`]); the returned failure states so.
+	pub(crate) fn encode(&mut self, frame: &ExportedFrame, mut data: Vec<u8>) -> Result<EncodedFrame, EncodeFailure> {
 		let started = std::time::Instant::now();
 		if !self.scaling_logged {
 			if frame.width == self.visible_width && frame.height == self.visible_height {
@@ -811,21 +877,31 @@ impl PyroWaveEncoder {
 		};
 		// SAFETY: all referenced objects remain alive until packetize waits for
 		// this submission below. External DMA-BUF images are documented GENERAL.
-		check(
+		check_frame(
 			unsafe { (self.device.api.encode_scaled)(self.handle, ptr::null(), ptr::null(), &scaling, &rate) },
+			EncodeStage::Submit,
+			SourceAccess::NotSubmitted,
 			"submitting the PyroWave GPU encode",
 		)?;
 		let submitted = std::time::Instant::now();
 
 		let mut packet_count = 0usize;
 		// SAFETY: packet_count is a valid out pointer; this waits for GPU work.
-		check(
+		check_frame(
 			unsafe { (self.device.api.compute_num_packets)(self.handle, PYROWAVE_MAX_FRAME_BYTES, &mut packet_count) },
+			EncodeStage::Wait,
+			SourceAccess::Completed,
 			"computing PyroWave packet count",
 		)?;
+		// The fence wait above completed every GPU read of the source.
 		if packet_count != 1 {
-			return Err(format!(
-				"PyroWave frame cannot be represented by wire version 1 (produced {packet_count} codec packets)"
+			return Err(EncodeFailure::new(
+				EncodeStage::Readback,
+				Recovery::DropFrame,
+				SourceAccess::Completed,
+				format!(
+					"PyroWave frame cannot be represented by wire version 1 (produced {packet_count} codec packets)"
+				),
 			));
 		}
 		let mut packet = Packet::default();
@@ -836,7 +912,7 @@ impl PyroWaveEncoder {
 		let mut written_packets = packet_count;
 		// SAFETY: output arrays are sized as requested by compute_num_packets;
 		// PyroWave validates the bitstream buffer capacity.
-		check(
+		check_frame(
 			unsafe {
 				(self.device.api.packetize)(
 					self.handle,
@@ -847,10 +923,17 @@ impl PyroWaveEncoder {
 					data.len(),
 				)
 			},
+			EncodeStage::Readback,
+			SourceAccess::Completed,
 			"reading the PyroWave bitstream",
 		)?;
 		if written_packets != 1 || packet.offset != 0 || packet.size < 8 || packet.size > data.len() {
-			return Err("PyroWave returned an invalid wire-v1 frame".to_string());
+			return Err(EncodeFailure::new(
+				EncodeStage::Readback,
+				Recovery::DropFrame,
+				SourceAccess::Completed,
+				"PyroWave returned an invalid wire-v1 frame",
+			));
 		}
 		let ready = std::time::Instant::now();
 		if packet.size.saturating_mul(100) >= self.maximum_frame_bytes.saturating_mul(98) {
@@ -982,6 +1065,53 @@ mod tests {
 		}
 		assert!(cache.entries.is_empty());
 		assert_eq!(live.get(), 0);
+	}
+
+	/// ARCH-001: classification of the pinned C API's result codes. No exit
+	/// leaves a source read outstanding; device/API loss and a broken encoder
+	/// after submission are terminal, per-frame failures drop the frame.
+	#[test]
+	fn frame_failures_follow_the_pinned_completion_contract() {
+		use super::super::pipeline::failure::{EncodeStage, Recovery, SourceAccess};
+		const INVALID_ARGUMENT: ResultCode = -2;
+		const OUT_OF_DEVICE_MEMORY: ResultCode = -4;
+		const UNSUPPORTED_EXTERNAL_HANDLE: ResultCode = -7;
+		const FAILED_EXTERNAL_HANDLE: ResultCode = -8;
+		for code in [
+			INVALID_ARGUMENT,
+			UNSUPPORTED_EXTERNAL_HANDLE,
+			FAILED_EXTERNAL_HANDLE,
+			OUT_OF_DEVICE_MEMORY,
+			ERROR_GENERIC,
+		] {
+			let failure = frame_failure(EncodeStage::Import, code, SourceAccess::NotSubmitted, "import");
+			assert_eq!(failure.recovery, Recovery::DropFrame, "import result {code}");
+			assert!(failure.releases_source());
+		}
+		for stage in [EncodeStage::Import, EncodeStage::Submit, EncodeStage::Wait] {
+			for code in [ERROR_NO_VULKAN, ERROR_NOT_IMPLEMENTED] {
+				assert_eq!(
+					frame_failure(stage, code, SourceAccess::NotSubmitted, "call").recovery,
+					Recovery::Terminal
+				);
+			}
+		}
+		for stage in [EncodeStage::Wait, EncodeStage::Readback] {
+			let failure = frame_failure(stage, ERROR_GENERIC, SourceAccess::Completed, "wait");
+			assert_eq!(failure.recovery, Recovery::Terminal);
+			assert!(failure.releases_source(), "the fence was waited before the failure");
+		}
+		assert_eq!(
+			frame_failure(
+				EncodeStage::Readback,
+				INVALID_ARGUMENT,
+				SourceAccess::Completed,
+				"packetize"
+			)
+			.recovery,
+			Recovery::DropFrame
+		);
+		assert!(check_frame(SUCCESS, EncodeStage::Submit, SourceAccess::NotSubmitted, "ok").is_ok());
 	}
 
 	#[test]

@@ -1,6 +1,6 @@
 [![CI](https://github.com/karsyboy/pyroshine/actions/workflows/ci.yaml/badge.svg)](https://github.com/karsyboy/pyroshine/actions/workflows/ci.yaml)
 
-# Pyroshine
+# Pyroshine 🔥
 
 Pyroshine is a Linux game-streaming server based on
 [Moonshine](https://github.com/hgaiser/moonshine). It runs applications in isolated,

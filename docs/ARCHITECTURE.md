@@ -52,21 +52,22 @@ codec or software encoder. See [PyroWave](PYROWAVE.md#capability-and-negotiation
 
 ## Session lifecycle and negotiation
 
-`session/manager.rs` owns the single optional session; `session/mod.rs` represents
+`session/manager.rs` owns the single optional session; `session/mod.rs` builds
 its `Initialized`, `Launched` and `Active` states. Application/compositor lifetime
 and a client's stream epoch are different: a reconnect can retain the application
-while resetting or replacing the encoders and transport state.
+while resetting or replacing the encoders and transport state. Ownership,
+cancellation and teardown follow [session ownership and shutdown](#session-ownership-and-shutdown).
 
 | Step | Owner and contract |
 | --- | --- |
 | HTTP launch | Authenticated GameStream API initializes and launches the application/compositor |
-| RTSP ANNOUNCE | Validates negotiated formats and numeric domains, then stores pending video/audio contexts |
-| RTSP PLAY | Constructs initial streams, or commits a reconnect transition |
-| Control `StartB` | Opens the audio/video start gates; tools can trigger them through manager notifications |
+| RTSP ANNOUNCE | Validates negotiated formats and numeric domains; for an active session pauses the live epoch, then publishes pending video/audio contexts |
+| RTSP PLAY | After checking every prerequisite, constructs initial streams or commits a reconnect transition |
+| Control `StartB` | Opens the persistent audio/video start latches; tools open the same latches through the manager |
 | HTTP resume | Validates and publishes session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
 | Unchanged reconnect | Pauses delivery, resets client-visible video sequencing, requests an independently decodable first frame and acknowledges ordered transport activation before PLAY completes |
 | Changed reconnect | Pauses affected epochs, updates compositor output when needed, and recreates affected video/audio resources |
-| Cancel, application exit or session failure | Session shutdown releases application, stream tasks and native resources; the manager can accept a later launch |
+| Cancel, application exit or session failure | One teardown stops the application unit and joins every worker; only then can the manager accept a later launch |
 
 RTSP access requires an existing session context established through the
 GameStream lifecycle. Do not move launch authentication into the streaming hot
@@ -112,6 +113,64 @@ or captured frames cannot enter the new stream. Changed audio layout/duration
 can require capture-server reconfiguration as well as a new encoder. Validate
 both directions of mode changes with [reconnect checks](reconnect-validation.md).
 
+## Session ownership and shutdown
+
+The manager's lifecycle is explicit; absence of state never means idle:
+
+| State | Meaning |
+| --- | --- |
+| `Idle` | No session and no owned resources. The only state that accepts `/launch`. |
+| `Live` | A session record (epoch, stop manager, authoritative context, live stream contexts, application unit, start latches) plus either the owned state or one in-flight transition that checked it out. HTTP/RTSP see the context in both cases. |
+| `Stopping` | One teardown task owns everything. The session is not reported, its keys, pending contexts and authorization are retired, and a replacement launch waits (bounded) for completion. |
+
+**Transitions** (initialize, launch, PLAY start/resume, active ANNOUNCE pause)
+validate every prerequisite under the manager mutex before moving anything,
+then run in a manager-owned task with the mutex released. The caller only
+awaits the result: an HTTP timeout or dropped RTSP connection does not drop the
+work. Each transition holds a completion token of its session and is wrapped
+in the session's cancellation, so a stop cancels it at any await and teardown
+waits until it has handed back what it checked out. A result commits only if
+the session epoch and transition id are still current and the session is not
+stopping; otherwise it goes to that epoch's teardown. A failed transition
+cannot leave half-applied state: it starts a deterministic full teardown.
+Duplicate, premature or stale requests (PLAY without a current-generation
+ANNOUNCE, a second PLAY or launch, ANNOUNCE/PLAY during another transition) are
+rejected without touching the retained application or streams.
+
+**Workers** (compositor, video pipeline thread and packet task, audio encoder
+and packet task, PulseAudio server, control stream, gamepad thread) register a
+`lifecycle::WorkerGuard` *before* they are spawned and drop it last, after
+their sockets, threads, GPU objects and frames. The session stop manager's
+completion therefore means every worker exited and released what it owned; a
+failed spawn drops the guard and stops the session. Stream workers wait for
+`StartB` through a persistent `lifecycle::StartLatch`: it may open before,
+during or after workers wait, duplicate opens are no-ops, and a stop before
+`StartB` cancels the wait and releases the worker's socket.
+
+**Teardown** has a single owner per session, started by user cancel, a worker or
+application exit (via a per-session watchdog that only hands over, so nothing
+aborts the cleanup), a failed transition, or service shutdown. In order, it:
+stops the application unit while the compositor and audio still serve it
+(unless a transition was in flight, which is cancelled first); triggers the
+session stop; drops the owned state; waits for every worker and transition;
+drops state handed back by transitions; stops the unit if not already done;
+then reports `Idle`. The unit is recorded before a launch starts, so a launch
+cancelled after systemd accepted the unit is still stopped. `Application` drop
+never blocks; stopping the unit is an awaited, bounded D-Bus job.
+
+**Deadlines.** Application stop is bounded to 6 s and worker exit to the rest
+of a 16 s end-to-end teardown deadline (`SESSION_TEARDOWN_DEADLINE`). An
+unsuccessful unit stop is logged and does not wedge the manager (the next
+launch also replaces a leftover unit). Exceeding the deadline is terminal: the
+session stays `Stopping`, new sessions are refused, and the service shuts down
+for its supervisor to restart it. Service shutdown (SIGTERM/SIGINT) holds its
+completion until the session teardown, application included, has finished or
+failed within that same deadline.
+
+Tests: `session/manager/lifecycle_tests.rs` drives the manager through a fake
+backend with barriers and fault injection at every transition await; stream
+workers have socket-release tests in their modules.
+
 ## Capture and native resource ownership
 
 Two independent signals matter:
@@ -121,6 +180,14 @@ Two independent signals matter:
 
 Releasing a source buffer must not create a second network admission credit.
 Conversely, paced sending must not retain a source buffer after GPU consumption.
+A third property, **descriptor ownership**, is independent of both: every
+`ExportedFrame` holds a `SourceLease` (a strong Smithay `Dmabuf` reference) to
+its pool slot or client buffer, and hands out plane fds only borrowed from
+itself. A frame that is queued, being imported or being read therefore keeps
+its descriptors open and unrecycled even after the compositor retires a pool or
+exits; imports take their own references (duplicated fds, imported memory)
+before the frame is dropped. `consumed` is set only when no GPU work can still
+read the source.
 Epoch invalidation must reject old completions without replenishing new demand.
 See [capture pipeline](PIPELINE_OPTIMIZATION.md) for the precise handoff contract.
 
@@ -146,7 +213,16 @@ readiness clearing. See [PyroWave transport](PYROWAVE.md#transport-pacing-and-di
 and [runtime diagnostics](LONG_SESSION_PERFORMANCE.md).
 
 Native/GPU failures must preserve cleanup and stop unsafe reuse; retrying a lost
-Vulkan device indefinitely cannot restore that device. A successful compile,
+Vulkan device indefinitely cannot restore that device. Both encoder backends
+report frame failures through `pipeline/failure.rs`: the failed stage, a
+recovery (`DropFrame`, `RequestIdr` when the encoder may have referenced a frame
+the client never receives, or `Terminal`) and whether the source's GPU reads are
+not submitted, completed or unknown. Only the first two release the source for
+reuse; a conventional conversion failure first waits for the device to idle to
+establish completion. Device/API loss is terminal; a recoverable failure that
+repeats for 300 frames and 5 s without a success is escalated. A terminal
+failure ends the pipeline, which stops the session. Diagnostics report the first
+failure and at most one summary per 5 s. A successful compile,
 loader probe or loopback benchmark does not prove presentation, client decode,
 Steam behavior or physical-link performance.
 

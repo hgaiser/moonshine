@@ -578,4 +578,95 @@ mod tests {
 		assert!(same_open_file(a.as_raw_fd(), dup.as_raw_fd()));
 		assert!(!same_open_file(a.as_raw_fd(), other.as_raw_fd()));
 	}
+
+	/// STAB-004 on real hardware (opt-in with `MOONSHINE_TEST_GPU=1`; ordinary
+	/// CI has no GPU). A frame exported from a GBM pool whose buffer and
+	/// allocator were dropped — the compositor exiting before the encoder
+	/// imports — still imports into Vulkan, and a new buffer that receives the
+	/// same descriptor number after the frame is gone never aliases the cached
+	/// import.
+	#[test]
+	fn gpu_import_after_source_owner_teardown_and_fd_reuse() {
+		use super::DmaBufImporter;
+		use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
+		use smithay::backend::allocator::gbm::{GbmAllocator, GbmBufferFlags, GbmDevice};
+		use smithay::backend::allocator::{Allocator, Fourcc, Modifier};
+		use std::sync::Arc;
+		use std::sync::atomic::AtomicBool;
+
+		if std::env::var_os("MOONSHINE_TEST_GPU").is_none() {
+			eprintln!("skipped: set MOONSHINE_TEST_GPU=1 to run the GPU import test");
+			return;
+		}
+		const SIZE: u32 = 256;
+		let allocator = || {
+			let node = crate::healthcheck::find_render_node(&None).unwrap();
+			let file = std::fs::OpenOptions::new().read(true).write(true).open(node).unwrap();
+			GbmAllocator::new(GbmDevice::new(file).unwrap(), GbmBufferFlags::RENDERING)
+		};
+		let export = |allocator: &mut GbmAllocator<std::fs::File>| {
+			let buffer = allocator
+				.create_buffer(SIZE, SIZE, Fourcc::Xrgb8888, &[Modifier::Linear])
+				.unwrap();
+			let dmabuf = smithay::backend::allocator::dmabuf::AsDmabuf::export(&buffer).unwrap();
+			let frame = ExportedFrame::from_dmabuf(
+				&dmabuf,
+				0,
+				Arc::new(AtomicBool::new(false)),
+				FrameColorSpace::Srgb,
+				None,
+			);
+			// The compositor's pool slot and GBM buffer go away.
+			drop((dmabuf, buffer));
+			frame
+		};
+		let planes = |frame: &ExportedFrame| -> Vec<DmaBufPlane> {
+			frame
+				.planes()
+				.map(|plane| DmaBufPlane {
+					fd: plane.fd.as_raw_fd(),
+					offset: plane.offset,
+					stride: plane.stride,
+					modifier: frame.modifier,
+				})
+				.collect()
+		};
+		let format = vk::Format::B8G8R8A8_UNORM;
+		let context = pixelforge::VideoContextBuilder::new().build().unwrap();
+		let mut importer = DmaBufImporter::new(context.clone(), false).unwrap();
+
+		let mut first_allocator = allocator();
+		let first = export(&mut first_allocator);
+		// The whole compositor (GBM device included) exits before import.
+		drop(first_allocator);
+		let first_planes = planes(&first);
+		let (import, created) = importer
+			.import_or_reuse(first_planes[0].fd, SIZE, SIZE, format, &first_planes)
+			.expect("a frame must import after its compositor owner is gone");
+		assert!(created);
+		let (again, created) = importer
+			.import_or_reuse(first_planes[0].fd, SIZE, SIZE, format, &first_planes)
+			.unwrap();
+		assert!(!created && Arc::ptr_eq(&import, &again));
+		let reused_number = first_planes[0].fd;
+
+		// A replacement compositor exists before the old frame is released, so
+		// the next export is handed the freed descriptor number.
+		let mut second_allocator = allocator();
+		drop(first);
+		let second = export(&mut second_allocator);
+		let second_planes = planes(&second);
+		assert_eq!(
+			second_planes[0].fd, reused_number,
+			"test setup: the new buffer should reuse the freed descriptor number"
+		);
+		let (second_import, created) = importer
+			.import_or_reuse(second_planes[0].fd, SIZE, SIZE, format, &second_planes)
+			.unwrap();
+		assert!(created, "a different buffer must never reuse a cached import");
+		assert!(!Arc::ptr_eq(&import, &second_import));
+		// SAFETY: plain idle wait on the test's own device.
+		unsafe { context.device().device_wait_idle() }.unwrap();
+		drop((import, again, second_import, importer));
+	}
 }

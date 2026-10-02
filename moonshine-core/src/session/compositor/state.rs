@@ -3,7 +3,6 @@
 //! `MoonshineCompositor` is the central state struct for the headless compositor.
 //! All Smithay `delegate_*!` macros target this struct.
 
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -59,7 +58,7 @@ use smithay::xwayland::X11Wm;
 use super::KeyboardConfig;
 use super::capture::DirectReject;
 use crate::session::compositor::cursor::{self, PointerElement, PointerRenderElement};
-use crate::session::compositor::frame::{ExportedFrame, ExportedPlane, FrameColorSpace, HdrMetadata};
+use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
 
 /// Number of pre-allocated GBM buffers. Conventional encoders may retain
 /// multiple submitted buffers; PyroWave admits only one capture at a time.
@@ -74,7 +73,8 @@ struct SceneLayers<'a> {
 
 /// A pre-allocated GBM buffer slot in the compositor's buffer pool.
 pub(crate) struct GbmBufferSlot {
-	/// The exported DMA-BUF kept alive for the lifetime of the pool.
+	/// The exported DMA-BUF. Frames exported from this slot hold their own
+	/// references, so retiring or dropping the pool never closes their fds.
 	dmabuf: Dmabuf,
 	/// Shared with the encoder — `true` means the encoder is done reading
 	/// and the compositor may render into this buffer again.
@@ -1500,20 +1500,13 @@ impl MoonshineCompositor {
 		// conflict: the framebuffer holds a mutable ref to the dmabuf,
 		// and export_dmabuf would need an immutable ref to the same dmabuf.
 		let frame_cs = self.color_management.as_ref().map(|cm| cm.frame_color_space());
-		let mut exported_frame = match export_dmabuf(
+		let mut exported_frame = ExportedFrame::from_dmabuf(
 			&self.buffer_pool[idx].dmabuf,
 			idx,
 			consumed.clone(),
-			frame_cs,
+			frame_cs.unwrap_or(FrameColorSpace::Srgb),
 			self.color_management.as_ref().and_then(|cm| cm.hdr_metadata()),
-		) {
-			Ok(frame) => frame,
-			Err(e) => {
-				tracing::error!("Failed to export frame: {e}");
-				consumed.store(true, Ordering::Release);
-				return;
-			},
-		};
+		);
 
 		// Composition must consume part of the capture-to-send pacing window.
 		// Preserve this origin when created_at is updated after the fence wait.
@@ -1921,33 +1914,15 @@ impl MoonshineCompositor {
 			.as_ref()
 			.and_then(|cm| cm.surface_hdr_metadata(&wl_surface));
 
-		let planes: Vec<ExportedPlane> = client_dmabuf
-			.handles()
-			.zip(client_dmabuf.offsets())
-			.zip(client_dmabuf.strides())
-			.map(
-				|((handle, offset), stride): ((std::os::unix::io::BorrowedFd<'_>, u32), u32)| ExportedPlane {
-					fd: handle.as_raw_fd(),
-					offset,
-					stride,
-				},
-			)
-			.collect();
-
-		let exported_frame = ExportedFrame {
-			capture_credit: None,
-			planes,
-			format: client_dmabuf.format().code as u32,
-			modifier: Into::<u64>::into(client_dmabuf.format().modifier),
-			width: client_dmabuf.width(),
-			height: client_dmabuf.height(),
-			created_at: std::time::Instant::now(),
-			composition_started_at: None,
+		// The frame takes its own reference to the client's DMA-BUF; the held
+		// wl_buffer below only defers the client's content reuse.
+		let exported_frame = ExportedFrame::from_dmabuf(
+			&client_dmabuf,
 			buffer_index,
-			consumed: consumed.clone(),
+			consumed.clone(),
 			color_space,
 			hdr_metadata,
-		};
+		);
 
 		// Hold the client Buffer alive until the encoder finishes reading.
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
@@ -2112,33 +2087,15 @@ impl MoonshineCompositor {
 			.as_ref()
 			.and_then(|cm| cm.surface_hdr_metadata(&override_surface));
 
-		let planes: Vec<ExportedPlane> = client_dmabuf
-			.handles()
-			.zip(client_dmabuf.offsets())
-			.zip(client_dmabuf.strides())
-			.map(
-				|((handle, offset), stride): ((std::os::unix::io::BorrowedFd<'_>, u32), u32)| ExportedPlane {
-					fd: handle.as_raw_fd(),
-					offset,
-					stride,
-				},
-			)
-			.collect();
-
-		let exported_frame = ExportedFrame {
-			capture_credit: None,
-			planes,
-			format: client_dmabuf.format().code as u32,
-			modifier: Into::<u64>::into(client_dmabuf.format().modifier),
-			width: client_dmabuf.width(),
-			height: client_dmabuf.height(),
-			created_at: std::time::Instant::now(),
-			composition_started_at: None,
+		// The frame takes its own reference to the client's DMA-BUF; the held
+		// wl_buffer below only defers the client's content reuse.
+		let exported_frame = ExportedFrame::from_dmabuf(
+			&client_dmabuf,
 			buffer_index,
-			consumed: consumed.clone(),
+			consumed.clone(),
 			color_space,
 			hdr_metadata,
-		};
+		);
 
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
 
@@ -2592,47 +2549,6 @@ impl MoonshineCompositor {
 
 fn select_surface_source_size(surface_size: Option<(i32, i32)>, buffer_size: Option<(i32, i32)>) -> Option<(i32, i32)> {
 	surface_size.or(buffer_size)
-}
-
-/// Convert a Smithay Dmabuf into our pipeline's ExportedFrame.
-///
-/// Export a DMA-BUF as an `ExportedFrame` for the video encoder.
-///
-/// Plane fds are borrowed (raw fd numbers) from the compositor's buffer pool.
-/// The pool outlives all in-flight frames and the `consumed` flag prevents
-/// buffer recycling before the encoder finishes reading.
-fn export_dmabuf(
-	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
-	buffer_index: usize,
-	consumed: Arc<AtomicBool>,
-	surface_color_space: Option<FrameColorSpace>,
-	hdr_metadata: Option<HdrMetadata>,
-) -> Result<ExportedFrame, String> {
-	let planes: Vec<ExportedPlane> = dmabuf
-		.handles()
-		.zip(dmabuf.offsets())
-		.zip(dmabuf.strides())
-		.map(|((handle, offset), stride)| ExportedPlane {
-			fd: handle.as_raw_fd(),
-			offset,
-			stride,
-		})
-		.collect();
-
-	Ok(ExportedFrame {
-		capture_credit: None,
-		planes,
-		format: dmabuf.format().code as u32,
-		modifier: Into::<u64>::into(dmabuf.format().modifier),
-		width: dmabuf.width(),
-		height: dmabuf.height(),
-		created_at: std::time::Instant::now(),
-		composition_started_at: None,
-		buffer_index,
-		consumed,
-		color_space: surface_color_space.unwrap_or(FrameColorSpace::Srgb),
-		hdr_metadata,
-	})
 }
 
 #[cfg(test)]

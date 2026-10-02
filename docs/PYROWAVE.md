@@ -205,6 +205,15 @@ format, offsets, and strides. File descriptors are duplicated because the C API
 takes ownership. The compositor buffer is released only after PyroWave's
 packetization call has waited for the GPU encode.
 
+Failures keep the same rule ([encoder failure contract](ARCHITECTURE.md#transport-and-failure-boundaries)).
+With the pinned C source, `encode_scaled` discards its command buffer without
+submitting on error, and `compute_num_packets`/`packetize` wait on the queued
+fence before any other failure, so every failed frame can release its source.
+Missing device/API support (`NO_VULKAN`, `NOT_IMPLEMENTED`) and a generic error
+after submission are terminal and end the session; per-frame argument, external
+handle and memory failures drop the frame. PyroWave frames are independent, so a
+dropped frame needs no IDR. Re-check this classification when the pin changes.
+
 Capture is receiver-driven: one credit covers encode through socket-send
 completion, while GPU consumption releases the source independently. Epoch
 changes invalidate queued/racing captures. Encoded output storage is reused;

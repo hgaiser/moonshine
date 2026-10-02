@@ -160,6 +160,11 @@ impl CaptureReceiver {
 			.compare_exchange(requested, requested & !STATE_MASK, Ordering::AcqRel, Ordering::Acquire);
 		result
 	}
+	/// Grant capture demand without waiting, as a blocked `recv_timeout` would.
+	#[cfg(test)]
+	pub(crate) fn request_for_test(&self) {
+		self.state.fetch_or(REQUESTED, Ordering::Release);
+	}
 	pub(crate) fn reset(&self) {
 		// Only the receiver changes epochs. A producer that raced reset fails
 		// its send; already queued frames are released without touching the GPU.
@@ -192,7 +197,7 @@ mod tests {
 		);
 	}
 	fn pending(rx: &CaptureReceiver) {
-		rx.state.fetch_or(REQUESTED, Ordering::Release);
+		rx.request_for_test();
 	}
 	#[test]
 	fn demand_wakeup_is_coalesced_and_only_emitted_when_useful() {
@@ -270,20 +275,7 @@ mod tests {
 		assert!(tx.try_acquire().is_none());
 	}
 	fn frame() -> ExportedFrame {
-		ExportedFrame {
-			planes: vec![],
-			capture_credit: None,
-			format: 0,
-			modifier: 0,
-			width: 1920,
-			height: 1080,
-			created_at: Instant::now(),
-			composition_started_at: None,
-			buffer_index: 0,
-			consumed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-			color_space: super::super::frame::FrameColorSpace::Srgb,
-			hdr_metadata: None,
-		}
+		ExportedFrame::for_test()
 	}
 	#[test]
 	fn composition_fence_completion_does_not_restart_pacing_window() {

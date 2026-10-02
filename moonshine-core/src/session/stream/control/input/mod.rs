@@ -154,21 +154,31 @@ impl InputHandler {
 	) -> Result<Self, ()> {
 		let (gamepad_tx, gamepad_rx) = mpsc::channel(10);
 
-		std::thread::spawn(move || {
-			let rt = tokio::runtime::Builder::new_current_thread()
-				.enable_all()
-				.build()
-				.expect("Failed to create tokio runtime for input handler");
+		// Registered before the thread exists so virtual devices are always
+		// destroyed before the session reports completion.
+		let worker = crate::session::lifecycle::WorkerGuard::register(
+			&stop_session_manager,
+			SessionShutdownReason::InputHandlerStopped,
+		)?;
+		std::thread::Builder::new()
+			.name("gamepad-input".to_string())
+			.spawn(move || {
+				let _worker = worker;
+				let rt = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("Failed to create tokio runtime for input handler");
 
-			rt.block_on(async move {
-				let local = tokio::task::LocalSet::new();
-				local
-					.run_until(async move {
-						run_gamepad_handler(gamepad_rx, stop_session_manager, gamepad_config).await;
-					})
-					.await;
-			});
-		});
+				rt.block_on(async move {
+					let local = tokio::task::LocalSet::new();
+					local
+						.run_until(async move {
+							run_gamepad_handler(gamepad_rx, stop_session_manager, gamepad_config).await;
+						})
+						.await;
+				});
+			})
+			.map_err(|e| tracing::error!("Failed to spawn gamepad input thread: {e}"))?;
 
 		Ok(Self { input_tx, gamepad_tx })
 	}
@@ -417,9 +427,6 @@ async fn run_gamepad_handler(
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	gamepad_config: GamepadConfig,
 ) {
-	let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::InputHandlerStopped);
-	let _delay_stop = stop_session_manager.delay_shutdown_token();
-
 	let gamepads = Arc::new(Mutex::new([const { None }; 16]));
 	let timer_wake = Arc::new(Notify::new());
 

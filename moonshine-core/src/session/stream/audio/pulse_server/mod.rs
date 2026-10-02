@@ -325,15 +325,18 @@ impl PulseServer {
 			epoch: time::Instant::now(),
 		};
 
+		// The server owns the fixed-name Pulse socket; the next session may bind
+		// it only after this worker has exited.
+		let worker = crate::session::lifecycle::WorkerGuard::register(&stop, SessionShutdownReason::PulseServerStopped)
+			.map_err(|()| std::io::Error::other("session stopped before the PulseAudio server started"))?;
 		std::thread::Builder::new()
 			.name("pulse-server".to_string())
 			.spawn(move || {
-				if let Err(e) = server.run(stop.clone()) {
+				let _worker = worker;
+				if let Err(e) = server.run(stop) {
 					tracing::error!("PulseServer error: {e}");
-					let _ = stop.trigger_shutdown(SessionShutdownReason::PulseServerStopped);
 				}
-			})
-			.expect("Failed to spawn pulse server thread");
+			})?;
 
 		Ok(())
 	}

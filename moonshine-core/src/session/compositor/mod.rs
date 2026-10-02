@@ -253,9 +253,13 @@ impl Compositor {
 			reconfigure_rx,
 		} = self;
 
+		// Registered before the thread exists: session completion then implies
+		// the compositor state (buffer pools, client buffers, Xwayland) is gone.
+		let worker = crate::session::lifecycle::WorkerGuard::register(&stop, SessionShutdownReason::CompositorStopped)?;
 		std::thread::Builder::new()
 			.name("compositor".to_string())
 			.spawn(move || {
+				let _worker = worker;
 				if let Err(e) = run_compositor(config, context, frame_tx, input_rx, reconfigure_rx, ready_tx, stop) {
 					tracing::error!("Compositor failed: {e}");
 				}
@@ -305,9 +309,6 @@ fn run_compositor(
 	stop: ShutdownManager<SessionShutdownReason>,
 ) -> Result<(), String> {
 	let capture_demand = frame_tx.take_demand_source();
-	// Trigger session shutdown if the compositor exits unexpectedly.
-	let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::CompositorStopped);
-	let _delay_stop = stop.delay_shutdown_token();
 
 	// Open a render node (no DRM master required for headless operation).
 	let render_node = find_render_node(&config.gpu)?;

@@ -1,12 +1,12 @@
 pub mod pyrowave_protocol;
-use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::authorization::MediaStream;
 use crate::session::compositor::frame::HdrModeState;
+use crate::session::lifecycle::{StartLatch, StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
 use crate::session::{AuthorizationReceiver, SessionKeysReceiver};
 
@@ -306,11 +306,11 @@ impl VideoStreamContext {
 
 /// Handle returned by `VideoStream::start` that gates the pipeline and packet handler.
 ///
-/// The pipeline and packet handler are spawned immediately but block on a `Notify`
-/// until `trigger()` is called on `StartB`.
+/// The pipeline and packet handler are registered with the session and spawned
+/// immediately, then wait on a persistent [`StartLatch`] until `StartB`.
 #[derive(Clone)]
 pub(crate) struct VideoStreamHandle {
-	notify: Arc<Notify>,
+	start: StartLatch,
 	idr_tx: broadcast::Sender<()>,
 	/// Reference frame invalidation requests, carrying the inclusive
 	/// `[first, last]` client frame-index range the client could not decode.
@@ -337,13 +337,11 @@ pub(super) enum VideoPacketMessage {
 
 impl VideoStreamHandle {
 	/// Signal the video pipeline and packet handler to begin processing.
+	/// Idempotent: a duplicate `StartB` has no further effect.
 	pub fn trigger(&self) {
-		// Call notify_one() twice instead of notify_waiters() because
-		// Notify only wakes tasks already .awaiting; notify_waiters()
-		// is a no-op if no task is waiting yet.  notify_one() stores
-		// a permit so the next notified().await completes immediately.
-		self.notify.notify_one();
-		self.notify.notify_one();
+		if !self.start.open() {
+			tracing::debug!("Ignoring duplicate video start signal");
+		}
 	}
 
 	/// Request an IDR (key) frame from the encoder.
@@ -413,9 +411,9 @@ impl VideoStreamHandle {
 		self.fec_feedback_tx.send_replace(status);
 	}
 
-	/// Clone the start notify for external triggering (e.g. bench binary).
-	pub fn clone_start_notify(&self) -> Arc<Notify> {
-		self.notify.clone()
+	/// The stream's start latch, for external triggering (e.g. bench binary).
+	pub(crate) fn start_latch(&self) -> StartLatch {
+		self.start.clone()
 	}
 }
 
@@ -433,7 +431,7 @@ impl VideoStreamHandle {
 		let (idr_tx, idr_rx) = broadcast::channel(16);
 		let (packet_tx, packet_rx) = mpsc::channel(16);
 		let handle = Self {
-			notify: Arc::new(Notify::new()),
+			start: StartLatch::new(),
 			idr_tx,
 			invalidate_tx: broadcast::channel(16).0,
 			reset_tx: std::sync::mpsc::channel().0,
@@ -501,8 +499,8 @@ impl VideoStream {
 			let _ = socket.set_tos_v4(160);
 		}
 
-		// Gate for pipeline + packet handler.
-		let start_notify = Arc::new(Notify::new());
+		// Persistent gate for pipeline + packet handler.
+		let start = StartLatch::new();
 
 		// IDR broadcast channel.
 		let (idr_tx, _idr_rx) = broadcast::channel(1);
@@ -524,19 +522,21 @@ impl VideoStream {
 		let pacing_bitrate =
 			(context.format.codec == VideoCodec::PyroWave).then(|| u64::try_from(context.bitrate).unwrap_or(u64::MAX));
 
-		// Spawn packet handler — gated behind start_notify.
+		// Spawn packet handler — registered now, gated behind the start latch.
+		let worker = WorkerGuard::register(&stop, SessionShutdownReason::VideoPacketHandlerStopped)?;
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
 			authorization_rx,
-			start_notify.clone(),
+			start.waiter(),
 			stop.clone(),
+			worker,
 			pacing_bitrate,
 			context.fps,
 			config.log_stats,
 		);
 
-		// Spawn pipeline thread — gated behind start_notify.
+		// Spawn pipeline thread — registered now, gated behind the start latch.
 		VideoPipeline::new(
 			frame_rx,
 			config,
@@ -549,7 +549,7 @@ impl VideoStream {
 			reset_rx,
 			stop.clone(),
 			hdr_metadata_tx,
-			start_notify.clone(),
+			start.waiter(),
 			stats_tx,
 			fec_feedback_rx,
 			reconfigure_rx,
@@ -557,7 +557,7 @@ impl VideoStream {
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
 		Ok(VideoStreamHandle {
-			notify: start_notify,
+			start,
 			idr_tx,
 			invalidate_tx,
 			reset_tx,
@@ -568,19 +568,29 @@ impl VideoStream {
 	}
 }
 
+/// `worker` was registered by the caller before spawning, so a stop before
+/// `StartB` still waits for this task to drop its socket.
 #[allow(clippy::too_many_arguments)]
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<VideoPacketMessage>,
-	mut socket: UdpGsoSocket,
+	packet_rx: mpsc::Receiver<VideoPacketMessage>,
+	socket: UdpGsoSocket,
 	authorization: AuthorizationReceiver,
-	start: Arc<Notify>,
+	start: StartWaiter,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	worker: WorkerGuard,
 	mut pacing_bitrate: Option<u64>,
 	mut fps: u32,
 	log_stats: bool,
 ) {
 	tokio::spawn(async move {
-		start.notified().await;
+		// Declared first so it is released after the socket and channel below.
+		let _worker = worker;
+		let mut socket = socket;
+		let mut packet_rx = packet_rx;
+		if start.wait(&stop_session_manager).await.is_err() {
+			tracing::debug!("Video packet handler stopped before start signal.");
+			return;
+		}
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
@@ -588,10 +598,6 @@ fn spawn_handle_video_packets(
 		// Rate-limits the GSO-fallback warning.
 		let mut last_send_warn: Option<std::time::Instant> = None;
 		let mut transport_window = diagnostics::TransportWindow::new(log_stats);
-
-		// Trigger session shutdown if we exit unexpectedly.
-		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
-		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			tokio::select! {
@@ -728,20 +734,21 @@ mod tests {
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
 		let server = socket.local_addr().unwrap();
 		let stop = ShutdownManager::new();
-		let start = Arc::new(Notify::new());
+		let start = StartLatch::new();
 		let (tx, rx) = mpsc::channel(16);
 		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
 		spawn_handle_video_packets(
 			rx,
 			socket,
 			authorization_rx,
-			start.clone(),
+			start.waiter(),
 			stop.clone(),
+			worker(&stop),
 			Some(650_000_000),
 			120,
 			false,
 		);
-		start.notify_one();
+		start.open();
 		let mut buf = [0u8; 64];
 		for codec in [VideoCodec::PyroWave, VideoCodec::Hevc, VideoCodec::PyroWave] {
 			let (ready, waiting) = tokio::sync::oneshot::channel();
@@ -795,6 +802,124 @@ mod tests {
 		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
 	}
 
+	fn worker(stop: &ShutdownManager<SessionShutdownReason>) -> WorkerGuard {
+		WorkerGuard::register(stop, SessionShutdownReason::VideoPacketHandlerStopped).unwrap()
+	}
+
+	/// Spawn a packet handler on an ephemeral port and return its address.
+	async fn spawn_unstarted(
+		stop: &ShutdownManager<SessionShutdownReason>,
+		start: &StartLatch,
+	) -> (std::net::SocketAddr, mpsc::Sender<VideoPacketMessage>) {
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let address = socket.local_addr().unwrap();
+		let (tx, rx) = mpsc::channel(16);
+		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
+		spawn_handle_video_packets(
+			rx,
+			socket,
+			authorization_rx,
+			start.waiter(),
+			stop.clone(),
+			worker(stop),
+			None,
+			60,
+			false,
+		);
+		(address, tx)
+	}
+
+	/// STAB-001: a stop before `StartB` completes only after the packet
+	/// handler released its socket, so the next session can bind the port.
+	#[tokio::test]
+	async fn stop_before_start_releases_the_socket_before_completion() {
+		let stop = ShutdownManager::new();
+		let start = StartLatch::new();
+		let (address, _tx) = spawn_unstarted(&stop, &start).await;
+		tokio::task::yield_now().await;
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(std::time::Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+		tokio::net::UdpSocket::bind(address)
+			.await
+			.expect("completed shutdown must imply the video port is free");
+		// A late StartB cannot resurrect the stopped handler.
+		start.open();
+	}
+
+	/// STAB-001: the stop can also arrive before the spawned task is first polled.
+	#[tokio::test(flavor = "current_thread")]
+	async fn stop_before_first_poll_is_still_joined() {
+		let stop = ShutdownManager::new();
+		let start = StartLatch::new();
+		let (address, _tx) = spawn_unstarted(&stop, &start).await;
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(std::time::Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+		tokio::net::UdpSocket::bind(address).await.unwrap();
+	}
+
+	/// STAB-001: `StartB` before the handler polls its gate, and duplicate
+	/// `StartB`, both leave exactly one running handler.
+	#[tokio::test(flavor = "current_thread")]
+	async fn early_and_duplicate_start_signals_start_the_handler() {
+		let stop = ShutdownManager::new();
+		let start = StartLatch::new();
+		let (address, tx) = spawn_unstarted(&stop, &start).await;
+		assert!(start.open());
+		assert!(!start.open());
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		client.send_to(b"PING", address).await.unwrap();
+		let mut delivered = false;
+		for _ in 0..50 {
+			send_frame(&tx, 0x5a).await;
+			if receives(&client, 0x5a).await {
+				delivered = true;
+				break;
+			}
+		}
+		assert!(delivered, "an early StartB must not be lost");
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(std::time::Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+		tokio::net::UdpSocket::bind(address).await.unwrap();
+	}
+
+	/// A port still owned by another session makes stream construction fail
+	/// cleanly (the manager then tears the partial session down); it never
+	/// starts a stream on a different port.
+	#[tokio::test]
+	async fn busy_udp_port_fails_stream_construction() {
+		let occupied = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let port = occupied.local_addr().unwrap().port();
+		let (_capture_tx, capture_rx) = crate::session::compositor::admission::capture_channel();
+		let config = VideoStreamConfig {
+			port,
+			..Default::default()
+		};
+		assert!(
+			VideoStream::new(
+				config,
+				"127.0.0.1".into(),
+				capture_rx,
+				watch::channel(HdrModeState::new(false)).0,
+				ShutdownManager::new(),
+				broadcast::channel(1).0,
+			)
+			.await
+			.is_err()
+		);
+		let audio = crate::session::stream::audio::AudioStreamConfig { port };
+		assert!(
+			crate::session::stream::audio::AudioStream::new(audio, "127.0.0.1".into(), ShutdownManager::new())
+				.await
+				.is_err()
+		);
+	}
+
 	fn test_authorization(
 		client: &str,
 	) -> (
@@ -832,7 +957,7 @@ mod tests {
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
 		let server = socket.local_addr().unwrap();
 		let stop = ShutdownManager::new();
-		let start = Arc::new(Notify::new());
+		let start = StartLatch::new();
 		let (tx, rx) = mpsc::channel(16);
 		let (authorization_tx, authorization_rx) = test_authorization("127.0.0.1");
 		authorization_tx.send_modify(crate::session::authorization::StreamAuthorization::require_session_id);
@@ -840,13 +965,14 @@ mod tests {
 			rx,
 			socket,
 			authorization_rx,
-			start.clone(),
+			start.waiter(),
 			stop.clone(),
+			worker(&stop),
 			None,
 			60,
 			false,
 		);
-		start.notify_one();
+		start.open();
 		let current = authorization_tx.borrow().clone();
 
 		// Another host knowing the payload, and the client with a wrong payload or

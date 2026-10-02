@@ -4,18 +4,21 @@
 //! and packetization for network transmission.
 
 pub(super) mod dmabuf;
+pub(super) mod failure;
 mod hdr_sei;
 
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use ash::vk;
 use async_shutdown::ShutdownManager;
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeState};
+use crate::session::lifecycle::{StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
 
 use crate::session::stream::video::diagnostics::PipelineWindow;
@@ -31,6 +34,7 @@ use crate::session::stream::video::{
 };
 
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
+use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
@@ -98,6 +102,37 @@ fn is_device_lost(e: &PixelForgeError) -> bool {
 		// vk::Result, whose ash display text is "The logical device has been
 		// lost. See <...>".
 		_ => e.to_string().contains("device has been lost"),
+	}
+}
+
+/// Classify a pixelforge error from a step after the source was converted.
+/// Device loss is terminal; any other failure leaves the encoder's reference
+/// state unknown, so recovery forces an IDR.
+fn encoder_failure(stage: EncodeStage, error: &PixelForgeError) -> EncodeFailure {
+	let recovery = if is_device_lost(error) {
+		Recovery::Terminal
+	} else {
+		Recovery::RequestIdr
+	};
+	// The source was released after its (synchronous) conversion completed.
+	EncodeFailure::new(stage, recovery, SourceAccess::Completed, error.to_string())
+}
+
+/// Apply a frame failure: release the source only if no GPU work can still
+/// read it, and return the recovery, or `Err` when the stream must stop.
+fn apply_failure(
+	policy: &mut FailurePolicy,
+	failure: &EncodeFailure,
+	consumed: Option<&std::sync::atomic::AtomicBool>,
+) -> Result<Recovery, String> {
+	if failure.releases_source()
+		&& let Some(consumed) = consumed
+	{
+		consumed.store(true, Ordering::Release);
+	}
+	match policy.record(failure, std::time::Instant::now()) {
+		Recovery::Terminal => Err(failure.to_string()),
+		recovery => Ok(recovery),
 	}
 }
 
@@ -287,7 +322,8 @@ async fn run_packet_consumer(
 	ctx: VideoStreamContext,
 	config: VideoStreamConfig,
 	mut fec_feedback_rx: watch::Receiver<FrameFecStatus>,
-) {
+) -> Result<(), String> {
+	let mut failures = FailurePolicy::default();
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
 	let mut latency_samples: Vec<LatencySample> = if config.log_stats {
@@ -348,18 +384,12 @@ async fn run_packet_consumer(
 		let mut packet = match future.await {
 			Ok(packet) => packet,
 			Err(e) => {
-				// A frame whose bitstream overflowed its destination buffer was
-				// truncated and is not sent. Request an IDR so the next frame is a
-				// keyframe, keeping the client's reference chain decodable.
-				if let PixelForgeError::BufferOverflow { written, capacity } = &e {
-					tracing::warn!(
-						written,
-						capacity,
-						"Encoded frame overflowed bitstream buffer; requesting IDR"
-					);
+				// The encoder consumed this frame (possibly as a reference) but it
+				// is never sent: a truncated/overflowed or unreadable bitstream
+				// needs an IDR to keep the client's reference chain decodable.
+				let failure = encoder_failure(EncodeStage::Readback, &e);
+				if apply_failure(&mut failures, &failure, None)? == Recovery::RequestIdr {
 					let _ = idr_tx.send(());
-				} else {
-					tracing::warn!("Failed to read back encoded frame: {e}");
 				}
 				continue;
 			},
@@ -405,12 +435,20 @@ async fn run_packet_consumer(
 			Ok(shards) => shards,
 			// Drop just this frame rather than tearing down the session: the
 			// client sees a gap (the frame number was already consumed) and
-			// requests an IDR, which recovers the stream.
+			// requests an IDR, which recovers the stream. A persistent failure
+			// (e.g. exhausted key nonces) escalates and stops the stream.
 			Err(()) => {
-				tracing::warn!("Failed to packetize encoded frame");
+				let failure = EncodeFailure::new(
+					EncodeStage::Packetize,
+					Recovery::DropFrame,
+					SourceAccess::Completed,
+					"failed to packetize encoded frame",
+				);
+				apply_failure(&mut failures, &failure, None)?;
 				continue;
 			},
 		};
+		failures.record_success();
 		let wire_bytes = shards.as_bytes().len();
 		let packet_count = shards.shard_count();
 
@@ -503,6 +541,7 @@ async fn run_packet_consumer(
 			last_summary_time = std::time::Instant::now();
 		}
 	}
+	Ok(())
 }
 
 impl VideoPipeline {
@@ -519,7 +558,7 @@ impl VideoPipeline {
 		reset_request_rx: std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		start_notify: Arc<Notify>,
+		start: StartWaiter,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 		fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 		reconfigure_rx: std::sync::mpsc::Receiver<VideoReconfigureCommand>,
@@ -538,9 +577,15 @@ impl VideoPipeline {
 		// is called from within the session runtime, so `current()` is valid here.
 		let runtime = tokio::runtime::Handle::current();
 
+		// Registered before the thread exists: a stop before `StartB`, or a
+		// failed spawn, is still accounted for by the session's completion.
+		let worker = WorkerGuard::register(&stop_session_manager, SessionShutdownReason::VideoEncoderStopped)?;
 		std::thread::Builder::new()
 			.name("video-pipeline".to_string())
 			.spawn(move || {
+				// Dropped after `run` has released the encoder, imports and every
+				// received frame's source lease.
+				let _worker = worker;
 				inner.run(
 					runtime,
 					frame_rx,
@@ -551,7 +596,7 @@ impl VideoPipeline {
 					reset_request_rx,
 					stop_session_manager,
 					hdr_metadata_tx,
-					start_notify,
+					start,
 					stats_tx,
 					reconfigure_rx,
 				);
@@ -606,26 +651,14 @@ impl VideoPipelineInner {
 		mut reset_request_rx: std::sync::mpsc::Receiver<tokio::sync::oneshot::Sender<Result<(), ()>>>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		start_notify: Arc<Notify>,
+		start: StartWaiter,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 		reconfigure_rx: std::sync::mpsc::Receiver<VideoReconfigureCommand>,
 	) {
 		tracing::debug!("Starting video pipeline.");
 
-		// Trigger session shutdown if we exit unexpectedly.
-		let _session_stop_token =
-			stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoEncoderStopped);
-		let _delay_stop = stop_session_manager.delay_shutdown_token();
-
 		// Wait for the start signal before entering the encode loop.
-		let rt = tokio::runtime::Builder::new_current_thread()
-			.enable_all()
-			.build()
-			.expect("Failed to build tokio runtime for video pipeline");
-		if rt
-			.block_on(stop_session_manager.wrap_cancel(start_notify.notified()))
-			.is_err()
-		{
+		if start.wait_blocking(&stop_session_manager).is_err() {
 			tracing::debug!("Video pipeline stopped before start signal.");
 			return;
 		}
@@ -855,6 +888,7 @@ impl VideoPipelineInner {
 		let mut gpu_report_started = std::time::Instant::now();
 		let mut gpu_window_frames = 0u64;
 		let mut gpu_window_encodes = 0u64;
+		let mut failures = FailurePolicy::default();
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			if let Ok(command) = reconfigure_rx.try_recv() {
@@ -905,12 +939,14 @@ impl VideoPipelineInner {
 					.unwrap_or_default();
 				let encoded = match encoder.encode(&frame, reusable) {
 					Ok(encoded) => encoded,
-					Err(error) => {
-						frame.consumed.store(true, Ordering::Release);
-						tracing::warn!(%error, "Failed to encode PyroWave frame");
+					Err(failure) => {
+						// PyroWave has no inter-frame references: a dropped frame
+						// needs no IDR, only the source release the failure allows.
+						apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
 						continue;
 					},
 				};
+				failures.record_success();
 				// compute_num_packets/packetize waited for the GPU read, so the
 				// compositor buffer is no longer referenced by PyroWave.
 				frame.consumed.store(true, Ordering::Release);
@@ -1114,7 +1150,7 @@ impl VideoPipelineInner {
 		// admission is governed by the drop gate, not by the channel filling.
 		let in_flight = Arc::new(AtomicUsize::new(0));
 		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
-		let consumer = {
+		let consumer = ConsumerTask::new(runtime, {
 			let ctx = self.context.clone();
 			let config = self.config.clone();
 			let fec_feedback_rx = self.fec_feedback_rx.clone();
@@ -1136,7 +1172,10 @@ impl VideoPipelineInner {
 				config,
 				fec_feedback_rx,
 			))
-		};
+		});
+
+		// Recovery policy and bounded diagnostics for frame failures.
+		let mut failures = FailurePolicy::default();
 
 		// Rate-limits the drop-to-catch-up warning.
 		let mut last_drop_warn: Option<std::time::Instant> = None;
@@ -1199,9 +1238,7 @@ impl VideoPipelineInner {
 					tracing::warn!("Failed to flush encoder during reconfiguration: {e}");
 				}
 				drop(frame_ctx_tx);
-				if let Err(e) = runtime.block_on(consumer) {
-					tracing::warn!("Packet consumer task panicked: {e:?}");
-				}
+				consumer.join()?;
 				return Ok(reconfigure);
 			}
 			let mut pending_idr = false;
@@ -1302,7 +1339,10 @@ impl VideoPipelineInner {
 								submitted_count += 1;
 								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
 							},
-							Err(e) => tracing::warn!("Failed to re-encode frame for IDR request: {e}"),
+							Err(e) => {
+								// The IDR stays pending and is retried on the next frame.
+								apply_failure(&mut failures, &encoder_failure(EncodeStage::Submit, &e), None)?;
+							},
 						}
 					}
 					if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
@@ -1346,7 +1386,7 @@ impl VideoPipelineInner {
 					frame.modifier,
 					frame.width,
 					frame.height,
-					frame.planes.len()
+					frame.planes().len()
 				);
 
 				let importer = match &mut dmabuf_importer {
@@ -1357,30 +1397,49 @@ impl VideoPipelineInner {
 							dmabuf_importer.as_mut().unwrap()
 						},
 						Err(e) => {
-							tracing::warn!("Failed to create DMA-BUF importer: {e}");
-							frame.consumed.store(true, Ordering::Release);
+							// No importer can be created on this device: nothing will
+							// ever be encoded, so stop instead of failing every frame.
+							let failure = EncodeFailure::new(
+								EncodeStage::Setup,
+								Recovery::Terminal,
+								SourceAccess::NotSubmitted,
+								format!("failed to create DMA-BUF importer: {e}"),
+							);
+							apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
 							continue;
 						},
 					},
 				};
 
-				// Build DmaBufPlane array from ExportedFrame planes.
+				// Build DmaBufPlane array from ExportedFrame planes. The raw fds are
+				// borrowed from the frame's source lease, which `frame` holds for
+				// the rest of this iteration; the importer duplicates what it keeps.
 				let mut planes_buf = [DmaBufPlane {
 					fd: 0,
 					offset: 0,
 					stride: 0,
 					modifier: 0,
 				}; 4];
-				let plane_count = frame.planes.len().min(4);
-				for (i, p) in frame.planes.iter().take(4).enumerate() {
+				let plane_count = frame.planes().len().min(4);
+				for (i, p) in frame.planes().take(4).enumerate() {
 					planes_buf[i] = DmaBufPlane {
-						fd: p.fd,
+						fd: p.fd.as_raw_fd(),
 						offset: p.offset,
 						stride: p.stride,
 						modifier: frame.modifier,
 					};
 				}
 				let planes = &planes_buf[..plane_count];
+				if planes.is_empty() {
+					let failure = EncodeFailure::new(
+						EncodeStage::Import,
+						Recovery::DropFrame,
+						SourceAccess::NotSubmitted,
+						"compositor exported a DMA-BUF without planes",
+					);
+					apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+					continue;
+				}
 
 				// Determine Vulkan format and input format from the frame's DRM fourcc.
 				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(frame.format);
@@ -1391,8 +1450,13 @@ impl VideoPipelineInner {
 					match importer.import_or_reuse(planes[0].fd, frame.width, frame.height, import_vk_format, planes) {
 						Ok(result) => result,
 						Err(e) => {
-							tracing::warn!("Failed to import DMA-BUF: {e}");
-							frame.consumed.store(true, Ordering::Release);
+							let failure = EncodeFailure::new(
+								EncodeStage::Import,
+								Recovery::DropFrame,
+								SourceAccess::NotSubmitted,
+								format!("failed to import DMA-BUF: {e}"),
+							);
+							apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
 							continue;
 						},
 					};
@@ -1430,8 +1494,13 @@ impl VideoPipelineInner {
 								e.insert((conv, None))
 							},
 							Err(e) => {
-								tracing::warn!("Failed to create color converter: {e}");
-								frame.consumed.store(true, Ordering::Release);
+								let failure = EncodeFailure::new(
+									EncodeStage::Setup,
+									Recovery::DropFrame,
+									SourceAccess::NotSubmitted,
+									format!("failed to create color converter: {e}"),
+								);
+								apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
 								continue;
 							},
 						}
@@ -1495,11 +1564,36 @@ impl VideoPipelineInner {
 
 				// Convert to YUV.
 				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					frame.consumed.store(true, Ordering::Release);
-					if is_device_lost(&e) {
-						return Err(format!("GPU color conversion failed: {e}"));
-					}
-					tracing::warn!("GPU color conversion failed: {e}");
+					// pixelforge submits the conversion and waits for its fence; an
+					// error may follow a submission whose reads are still pending.
+					// Establish completion before the compositor may reuse the source.
+					let failure = if is_device_lost(&e) {
+						EncodeFailure::new(
+							EncodeStage::Convert,
+							Recovery::Terminal,
+							SourceAccess::Unknown,
+							format!("GPU color conversion failed: {e}"),
+						)
+					} else {
+						// SAFETY: plain queue-idle wait on this pipeline's own device.
+						match unsafe { context.device().device_wait_idle() } {
+							Ok(()) => EncodeFailure::new(
+								EncodeStage::Convert,
+								Recovery::DropFrame,
+								SourceAccess::Completed,
+								format!("GPU color conversion failed: {e}"),
+							),
+							Err(wait) => EncodeFailure::new(
+								EncodeStage::Wait,
+								Recovery::Terminal,
+								SourceAccess::Unknown,
+								format!(
+									"GPU color conversion failed ({e}) and its completion could not be established: {wait}"
+								),
+							),
+						}
+					};
+					apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
 					continue;
 				}
 
@@ -1545,6 +1639,7 @@ impl VideoPipelineInner {
 
 				match encode_result {
 					Ok(future) => {
+						failures.record_success();
 						// Hand this frame's context plus its packet future to the
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
@@ -1572,10 +1667,14 @@ impl VideoPipelineInner {
 						}
 					},
 					Err(e) => {
-						if is_device_lost(&e) {
-							return Err(format!("Failed to encode frame: {e}"));
+						// The input was converted but never encoded: re-anchor the
+						// reference chain with an IDR on the next frame.
+						if apply_failure(&mut failures, &encoder_failure(EncodeStage::Submit, &e), None)?
+							== Recovery::RequestIdr
+						{
+							encoder.request_idr();
+							pending_idr = true;
 						}
-						tracing::warn!("Failed to encode frame: {e}");
 					},
 				}
 
@@ -1595,11 +1694,48 @@ impl VideoPipelineInner {
 		drop(frame_ctx_tx);
 		// Wait for the consumer task to drain and send the remaining packets. This
 		// runs on a plain OS thread outside the runtime, so block on the task handle.
-		if let Err(e) = runtime.block_on(consumer) {
-			tracing::warn!("Packet consumer task panicked: {e:?}");
-		}
+		// A consumer that stopped on a terminal failure ends the stream.
+		consumer.join()?;
 
 		Ok(None)
+	}
+}
+
+/// The packet consumer task of one encoder epoch.
+///
+/// Normal exits join it so the final packets are delivered and a terminal
+/// failure it stopped on is surfaced. Any other exit (an early terminal error)
+/// aborts it and still waits, so the task never outlives the pipeline thread's
+/// completion guard.
+struct ConsumerTask<'a> {
+	runtime: &'a tokio::runtime::Handle,
+	handle: Option<tokio::task::JoinHandle<Result<(), String>>>,
+}
+
+impl<'a> ConsumerTask<'a> {
+	fn new(runtime: &'a tokio::runtime::Handle, handle: tokio::task::JoinHandle<Result<(), String>>) -> Self {
+		Self {
+			runtime,
+			handle: Some(handle),
+		}
+	}
+
+	fn join(mut self) -> Result<(), String> {
+		let handle = self.handle.take().expect("consumer joined once");
+		match self.runtime.block_on(handle) {
+			Ok(result) => result,
+			Err(e) => Err(format!("packet consumer task failed: {e}")),
+		}
+	}
+}
+
+impl Drop for ConsumerTask<'_> {
+	fn drop(&mut self) {
+		if let Some(handle) = self.handle.take() {
+			// Runs on the pipeline OS thread, never on a runtime worker.
+			handle.abort();
+			let _ = self.runtime.block_on(handle);
+		}
 	}
 }
 
@@ -1658,7 +1794,7 @@ mod tests {
 			}
 			assert_eq!(waiting.await.unwrap(), if succeeds { Ok(()) } else { Err(()) });
 			drop(consumer_tx);
-			consumer.await.unwrap();
+			consumer.await.unwrap().unwrap();
 		}
 	}
 
@@ -1712,6 +1848,58 @@ mod tests {
 		let (fmt, vk) = drm_fourcc_to_input(0xDEADBEEF);
 		assert_eq!(fmt, InputFormat::BGRx);
 		assert_eq!(vk, vk::Format::B8G8R8A8_UNORM);
+	}
+
+	/// ARCH-001: post-conversion failures keep the reference chain valid with
+	/// an IDR, except device loss, which ends the stream.
+	#[test]
+	fn encoder_failures_are_classified_by_recovery() {
+		use super::failure::{EncodeStage, Recovery, SourceAccess};
+		use super::{apply_failure, encoder_failure};
+		let overflow = PixelForgeError::BufferOverflow {
+			written: 10,
+			capacity: 5,
+		};
+		let lost = PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST);
+		let transient = PixelForgeError::CommandBuffer("submit failed".to_string());
+		for (error, recovery) in [
+			(&overflow, Recovery::RequestIdr),
+			(&transient, Recovery::RequestIdr),
+			(&lost, Recovery::Terminal),
+		] {
+			for stage in [EncodeStage::Submit, EncodeStage::Readback] {
+				let failure = encoder_failure(stage, error);
+				assert_eq!(failure.recovery, recovery, "{error}");
+				assert_eq!(failure.source, SourceAccess::Completed);
+			}
+		}
+		let mut policy = super::FailurePolicy::default();
+		assert_eq!(
+			apply_failure(&mut policy, &encoder_failure(EncodeStage::Readback, &overflow), None),
+			Ok(Recovery::RequestIdr)
+		);
+		assert!(apply_failure(&mut policy, &encoder_failure(EncodeStage::Readback, &lost), None).is_err());
+	}
+
+	/// ARCH-001/STAB-004: a failure releases the compositor buffer only when no
+	/// GPU work can still read it.
+	#[test]
+	fn failures_release_the_source_only_after_established_completion() {
+		use super::apply_failure;
+		use super::failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
+		use std::sync::atomic::{AtomicBool, Ordering};
+		for (source, recovery, released, stops) in [
+			(SourceAccess::NotSubmitted, Recovery::DropFrame, true, false),
+			(SourceAccess::Completed, Recovery::DropFrame, true, false),
+			(SourceAccess::Completed, Recovery::Terminal, true, true),
+			(SourceAccess::Unknown, Recovery::Terminal, false, true),
+		] {
+			let consumed = AtomicBool::new(false);
+			let failure = EncodeFailure::new(EncodeStage::Convert, recovery, source, "test");
+			let result = apply_failure(&mut FailurePolicy::default(), &failure, Some(&consumed));
+			assert_eq!(consumed.load(Ordering::Acquire), released, "{source:?}");
+			assert_eq!(result.is_err(), stops, "{source:?}");
+		}
 	}
 
 	#[test]

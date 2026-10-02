@@ -1,6 +1,5 @@
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
@@ -24,6 +23,8 @@ use self::compositor::Compositor;
 use self::compositor::LaunchedCompositor;
 use self::compositor::frame::HdrModeState;
 use self::inhibit::SleepInhibitor;
+use self::lifecycle::StartLatch;
+use self::manager::{ResumePlan, SessionBackend, StartRequest};
 use self::stream::audio::AudioStreamConfig;
 use self::stream::control::ControlStreamConfig;
 use self::stream::video::VideoStreamConfig;
@@ -33,12 +34,22 @@ pub mod authorization;
 pub mod compositor;
 pub mod inhibit;
 pub mod keys;
+pub(crate) mod lifecycle;
 pub mod manager;
 pub(crate) mod negotiation;
 pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.
+///
+/// The launch itself is owned by the session manager, not the HTTP request:
+/// when this expires the handler stops the session, which cancels the launch
+/// and stops any transient unit systemd already created for it.
 pub(crate) const APP_LAUNCH_HTTP_TIMEOUT_SECS: u64 = 60;
+
+/// Fixed name of the application's transient user-systemd unit. Only one
+/// session exists at a time, and a replacement cannot launch until the previous
+/// session's teardown has stopped this unit.
+pub(crate) const APPLICATION_UNIT_NAME: &str = "moonshine-session.service";
 
 pub use self::keys::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
 
@@ -110,27 +121,100 @@ pub(crate) struct ResumeRequest {
 	pub audio_channel_mask: Option<u32>,
 }
 
-/// The state of the session. This enum enforces the session lifecycle:
+/// Configuration and shared channels used to build production sessions.
 ///
-/// 1. `Initialized` — Session created; compositor and app not yet started.
-/// 2. `Launched` — Compositor and app are running; waiting for RTSP negotiation.
-/// 3. `Active` — Streams are active.
-enum SessionState {
-	/// Session initialized; compositor and app not yet started.
-	Initialized(InitializedSession),
-	/// Compositor and app launched; waiting for RTSP PLAY.
-	Launched(LaunchedSession),
-	/// Streams active.
-	Active(ActiveSession),
+/// This is the manager's production [`SessionBackend`]: it owns the slow,
+/// resource-creating work for each transition while the manager owns state,
+/// generations, cancellation and teardown ordering.
+pub(crate) struct SystemSession {
+	pub(crate) compositor_config: CompositorConfig,
+	pub(crate) video_config: VideoStreamConfig,
+	pub(crate) audio_config: AudioStreamConfig,
+	pub(crate) control_config: ControlStreamConfig,
+	pub(crate) address: String,
+	pub(crate) stream_timeout: u64,
+	pub(crate) inhibit_sleep: bool,
+	pub(crate) stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 }
 
-impl SessionState {
-	fn context(&self) -> &SessionContext {
-		match self {
-			Self::Initialized(session) => session.context(),
-			Self::Launched(launched) => launched.context(),
-			Self::Active(active) => active.context(),
+impl SessionBackend for SystemSession {
+	type Initialized = InitializedSession;
+	type Launched = LaunchedSession;
+	type Active = ActiveSession;
+
+	async fn initialize(
+		&self,
+		context: SessionContext,
+		stop: ShutdownManager<SessionShutdownReason>,
+	) -> Result<InitializedSession, ()> {
+		InitializedSession::new(
+			self.compositor_config.clone(),
+			self.video_config.clone(),
+			self.audio_config.clone(),
+			self.control_config.clone(),
+			self.address.clone(),
+			context,
+			stop,
+			self.stats_tx.clone(),
+		)
+		.await
+	}
+
+	async fn launch(&self, session: InitializedSession) -> Result<LaunchedSession, ()> {
+		session.launch().await
+	}
+
+	async fn start(
+		&self,
+		session: LaunchedSession,
+		request: StartRequest,
+	) -> Result<(ActiveSession, Vec<StartLatch>), ()> {
+		// Acquire before consuming the session: nothing is owned yet if this
+		// await is cancelled.
+		let sleep_inhibitor = if self.inhibit_sleep {
+			SleepInhibitor::acquire().await
+		} else {
+			None
+		};
+		session.start(self.video_config.clone(), self.stream_timeout, request, sleep_inhibitor)
+	}
+
+	fn pause(
+		&self,
+		session: &ActiveSession,
+		video: bool,
+		audio: bool,
+	) -> impl Future<Output = Result<(), ()>> + Send + 'static {
+		let video = video.then(|| session.video_handle.clone());
+		let audio = audio.then(|| session.audio_handle.clone());
+		async move {
+			if let Some(handle) = video {
+				handle.pause_for_reconfigure().await.map_err(|()| {
+					tracing::warn!("Failed to pause the active video epoch for reconnect reconfiguration")
+				})?;
+			}
+			if let Some(handle) = audio {
+				handle.pause_for_reconfigure().await.map_err(|()| {
+					tracing::warn!("Failed to pause the active audio epoch for reconnect reconfiguration")
+				})?;
+			}
+			Ok(())
 		}
+	}
+
+	async fn resume(&self, session: &mut ActiveSession, plan: ResumePlan) -> Result<(), ()> {
+		match plan.video {
+			Some(context) => session.reconfigure_video(context).await?,
+			None => session.reset_video_stream().await?,
+		}
+		if let Some(context) = plan.audio {
+			session.reconfigure_audio(context).await?;
+		}
+		Ok(())
+	}
+
+	async fn stop_application(&self, unit_name: &str) -> Result<(), ()> {
+		application::stop_application_unit(unit_name).await
 	}
 }
 
@@ -189,11 +273,10 @@ impl InitializedSession {
 		})
 	}
 
-	pub(crate) fn context(&self) -> &SessionContext {
-		&self.context
-	}
-
 	/// Launch the session — starts the compositor and application, but does not start streams.
+	///
+	/// The manager records the application unit before calling this, so a
+	/// cancellation after systemd accepted the unit is still cleaned up.
 	pub(crate) async fn launch(self) -> Result<LaunchedSession, ()> {
 		let Self {
 			context,
@@ -205,14 +288,19 @@ impl InitializedSession {
 			stop,
 		} = self;
 
-		let launched_compositor = compositor.launch()?;
+		// Waiting for the compositor's readiness blocks; keep it off the runtime
+		// workers. A cancelled launch drops the result, and the compositor thread
+		// exits on the session stop that cancelled it.
+		let launched_compositor = tokio::task::spawn_blocking(move || compositor.launch())
+			.await
+			.map_err(|e| tracing::error!("Compositor launch task failed: {e}"))??;
 		let ready = launched_compositor.ready();
 		let pulse_socket_path = audio.pulse_socket_path.clone();
 
 		let application = Application::spawn(
 			context.application.clone(),
 			ApplicationContext {
-				unit_name: "moonshine-session.service".to_string(),
+				unit_name: APPLICATION_UNIT_NAME.to_string(),
 				pulse_socket_path,
 				xdisplay: ready.xdisplay,
 				wayland_display: ready.wayland_display.clone(),
@@ -257,21 +345,18 @@ pub(crate) struct LaunchedSession {
 }
 
 impl LaunchedSession {
-	pub(crate) fn context(&self) -> &SessionContext {
-		&self.context
-	}
-
-	#[allow(clippy::too_many_arguments)]
-	pub(crate) async fn start(
+	/// Spawn every stream worker. Each worker is registered with the session
+	/// before it is spawned and waits on its stream's start latch.
+	///
+	/// Synchronous by design: once this consumes the session, no await point
+	/// can drop half-started streams.
+	pub(crate) fn start(
 		self,
 		video_config: VideoStreamConfig,
 		stream_timeout: u64,
-		video_ctx: VideoStreamContext,
-		audio_ctx: AudioStreamContext,
-		stop: ShutdownManager<SessionShutdownReason>,
-		inhibit_sleep: bool,
-		authorization_rx: AuthorizationReceiver,
-	) -> Result<(ActiveSession, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>), ()> {
+		request: StartRequest,
+		sleep_inhibitor: Option<SleepInhibitor>,
+	) -> Result<(ActiveSession, Vec<StartLatch>), ()> {
 		let Self {
 			context,
 			launched_compositor,
@@ -281,6 +366,12 @@ impl LaunchedSession {
 			control_stream,
 			hdr_metadata_rx,
 		} = self;
+		let StartRequest {
+			video: video_ctx,
+			audio: audio_ctx,
+			authorization_rx,
+			stop,
+		} = request;
 
 		// Extract the watch receiver for streams.
 		let keys_rx = context.keys.clone_rx().ok_or_else(|| {
@@ -303,9 +394,8 @@ impl LaunchedSession {
 			.start(audio_ctx.clone(), keys_rx, authorization_rx.clone())
 			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
 
-		// Clone the start notifies for external triggering (e.g. bench binary).
-		let video_start_notify = video_handle.clone_start_notify();
-		let audio_start_notify = audio_trigger.clone_start_notify();
+		// Start latches for external triggering (e.g. bench binary).
+		let latches = vec![video_handle.start_latch(), audio_trigger.start_latch()];
 		let audio_handle_for_resume = audio_trigger.clone();
 
 		// Keep a handle to the video stream so a resuming client can reset its
@@ -322,15 +412,8 @@ impl LaunchedSession {
 			hdr_metadata_rx,
 		);
 
-		let sleep_inhibitor = if inhibit_sleep {
-			SleepInhibitor::acquire().await
-		} else {
-			None
-		};
-
 		Ok((
 			ActiveSession {
-				context,
 				_application: application,
 				compositor: launched_compositor,
 				video_handle: video_handle_for_resume,
@@ -339,15 +422,16 @@ impl LaunchedSession {
 				audio_context: audio_ctx,
 				sleep_inhibitor,
 			},
-			video_start_notify,
-			audio_start_notify,
+			latches,
 		))
 	}
 }
 
 /// Active session state — streams are active.
+///
+/// The authoritative session context (as reported to HTTP/RTSP) lives in the
+/// manager's session record; this keeps only what reconfiguration consumes.
 pub(crate) struct ActiveSession {
-	context: SessionContext,
 	_application: Application,
 	compositor: LaunchedCompositor,
 	video_handle: VideoStreamHandle,
@@ -360,29 +444,9 @@ pub(crate) struct ActiveSession {
 }
 
 impl ActiveSession {
-	pub(crate) fn context(&self) -> &SessionContext {
-		&self.context
-	}
-
 	/// Reset the video stream's frame counters and force an IDR for a resuming client.
 	pub(crate) async fn reset_video_stream(&self) -> Result<(), ()> {
 		self.video_handle.request_reset().await
-	}
-
-	pub(crate) fn video_context(&self) -> &VideoStreamContext {
-		&self.video_context
-	}
-
-	pub(crate) fn audio_context(&self) -> &AudioStreamContext {
-		&self.audio_context
-	}
-
-	pub(crate) fn video_handle(&self) -> VideoStreamHandle {
-		self.video_handle.clone()
-	}
-
-	pub(crate) fn audio_handle(&self) -> stream::audio::AudioStartHandle {
-		self.audio_handle.clone()
 	}
 
 	pub(crate) async fn reconfigure_video(&mut self, context: VideoStreamContext) -> Result<(), ()> {
@@ -399,9 +463,6 @@ impl ActiveSession {
 			return Err(());
 		}
 		self.video_handle.reconfigure(context.clone()).await?;
-		self.context.resolution = (context.width, context.height);
-		self.context.refresh_rate = context.fps;
-		self.context.hdr = effective_hdr;
 		self.video_context = context;
 		Ok(())
 	}
@@ -412,8 +473,6 @@ impl ActiveSession {
 		self.audio_handle
 			.reconfigure(context.clone(), reconfigure_capture)
 			.await?;
-		self.context.audio_channels = context.audio_config.channels;
-		self.context.audio_channel_mask = context.audio_config.channel_mask;
 		self.audio_context = context;
 		Ok(())
 	}

@@ -81,6 +81,21 @@ sending. Unsupported negotiations must fail cleanly rather than silently change
 codec/format; confirm the host can recover through the normal lifecycle. Record
 which failure paths were automated, exercised live or left unperformed.
 
+Teardown is ordered and complete ([session ownership](ARCHITECTURE.md#session-ownership-and-shutdown)):
+
+- cancel during application start (including a launch that outlives the HTTP
+  timeout), before `StartB`, during a reconnect and while streaming; each must log
+  `Session stopped; ready for a new session.`, leave
+  `systemctl --user status moonshine-session.service` inactive and free the
+  video/audio/control UDP ports, and an immediate relaunch must succeed;
+- quit the application while cancelling: one teardown, one unit stop;
+- a duplicate or early PLAY is rejected and leaves the retained application running;
+- a reconnect whose reconfiguration fails (for example an HDR mode the
+  compositor cannot apply) ends the session, application included, rather than
+  continuing with partially changed settings;
+- stop the service during streaming: it exits only after the unit stopped, within
+  the 16 s teardown deadline.
+
 Unit tests of reconnect decisions and epoch barriers do not prove remote-client
 resume. Include relevant [compositor checks](COMPOSITOR.md#validation-and-runtime-checks)
 and [GPU matrix](PYROWAVE.md#validation-matrix), reporting hardware/client coverage.

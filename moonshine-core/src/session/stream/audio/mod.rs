@@ -1,15 +1,14 @@
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use strum_macros::Display;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 use crate::session::authorization::MediaStream;
+use crate::session::lifecycle::{StartLatch, StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
 use crate::session::{AuthorizationReceiver, SessionKeysReceiver};
 
@@ -176,12 +175,12 @@ pub struct AudioStreamContext {
 
 /// Handle returned by `AudioStream::start` that gates the encoder and packet handler.
 ///
-/// The encoder and packet handler are spawned immediately but block on a `Notify`
-/// until `trigger()` is called. PulseServer starts immediately (it just mixes audio,
-/// no network impact).
+/// The encoder and packet handler are registered and spawned immediately, then
+/// wait on a persistent [`StartLatch`] until `trigger()`. PulseServer starts
+/// immediately (it just mixes audio, no network impact).
 #[derive(Clone)]
 pub(crate) struct AudioStartHandle {
-	notify: Arc<Notify>,
+	start: StartLatch,
 	packet_tx: mpsc::Sender<AudioPacketMessage>,
 	encoder_reconfigure_tx: crossbeam_channel::Sender<AudioEncoderReconfigure>,
 	pulse_reconfigure_tx: crossbeam_channel::Sender<PulseReconfigure>,
@@ -192,7 +191,7 @@ impl AudioStartHandle {
 	/// A handle not connected to an encoder, for control-stream tests.
 	pub(crate) fn for_test() -> Self {
 		Self {
-			notify: Arc::new(Notify::new()),
+			start: StartLatch::new(),
 			packet_tx: mpsc::channel(1).0,
 			encoder_reconfigure_tx: crossbeam_channel::unbounded().0,
 			pulse_reconfigure_tx: crossbeam_channel::unbounded().0,
@@ -222,18 +221,16 @@ pub(crate) enum AudioPacketMessage {
 
 impl AudioStartHandle {
 	/// Signal the encoder and packet handler to begin processing.
+	/// Idempotent: a duplicate `StartB` has no further effect.
 	pub fn trigger(&self) {
-		// Call notify_one() twice instead of notify_waiters() because
-		// Notify only wakes tasks already .awaiting; notify_waiters()
-		// is a no-op if no task is waiting yet.  notify_one() stores
-		// a permit so the next notified().await completes immediately.
-		self.notify.notify_one();
-		self.notify.notify_one();
+		if !self.start.open() {
+			tracing::debug!("Ignoring duplicate audio start signal");
+		}
 	}
 
-	/// Clone the start notify for external triggering (e.g. bench binary).
-	pub fn clone_start_notify(&self) -> Arc<Notify> {
-		self.notify.clone()
+	/// The stream's start latch, for external triggering (e.g. bench binary).
+	pub(crate) fn start_latch(&self) -> StartLatch {
+		self.start.clone()
 	}
 
 	pub async fn pause_for_reconfigure(&self) -> Result<(), ()> {
@@ -325,17 +322,19 @@ impl AudioStream {
 			let _ = self.udp_socket.set_tos_v4(224);
 		}
 
-		// Create the notify gate for encoder and packet handler.
-		let start_notify = Arc::new(Notify::new());
+		// Persistent gate for encoder and packet handler.
+		let start = StartLatch::new();
 
-		// Create packet channel and spawn handler — gated behind start_notify.
+		// Create packet channel and spawn handler — registered now, gated behind the latch.
 		let (packet_tx, packet_rx) = mpsc::channel::<AudioPacketMessage>(16);
+		let worker = WorkerGuard::register(&self.stop, SessionShutdownReason::AudioPacketHandlerStopped)?;
 		spawn_handle_audio_packets(
 			packet_rx,
 			self.udp_socket,
 			authorization_rx,
-			start_notify.clone(),
+			start.waiter(),
 			self.stop.clone(),
+			worker,
 		);
 
 		// Create frame channels for PulseServer and encoder communication.
@@ -356,7 +355,7 @@ impl AudioStream {
 		)
 		.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?;
 
-		// Spawn audio encoder — gated behind start_notify.
+		// Spawn audio encoder — registered now, gated behind the latch.
 		let (encoder_reconfigure_tx, encoder_reconfigure_rx) = crossbeam_channel::unbounded();
 		AudioEncoder::spawn(
 			CAPTURE_SAMPLE_RATE,
@@ -366,12 +365,12 @@ impl AudioStream {
 			keys_rx,
 			packet_tx.clone(),
 			self.stop.clone(),
-			start_notify.clone(),
+			start.waiter(),
 			encoder_reconfigure_rx,
 		)?;
 
 		Ok(AudioStartHandle {
-			notify: start_notify,
+			start,
 			packet_tx,
 			encoder_reconfigure_tx,
 			pulse_reconfigure_tx,
@@ -379,22 +378,28 @@ impl AudioStream {
 	}
 }
 
+/// `worker` was registered by the caller before spawning, so a stop before
+/// `StartB` still waits for this task to drop its socket.
 fn spawn_handle_audio_packets(
-	mut packet_rx: mpsc::Receiver<AudioPacketMessage>,
+	packet_rx: mpsc::Receiver<AudioPacketMessage>,
 	socket: UdpSocket,
 	authorization: AuthorizationReceiver,
-	start: Arc<Notify>,
+	start: StartWaiter,
 	stop: ShutdownManager<SessionShutdownReason>,
+	worker: WorkerGuard,
 ) {
 	tokio::spawn(async move {
-		start.notified().await;
+		// Declared first so it is released after the socket and channel below.
+		let _worker = worker;
+		let socket = socket;
+		let mut packet_rx = packet_rx;
+		if start.wait(&stop).await.is_err() {
+			tracing::debug!("Audio packet handler stopped before start signal.");
+			return;
+		}
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
-
-		// Trigger session shutdown when the audio packet stream stops.
-		let _stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioPacketHandlerStopped);
-		let _delay_stop = stop.delay_shutdown_token();
 
 		while !stop.is_shutdown_triggered() {
 			tokio::select! {
@@ -464,6 +469,83 @@ mod tests {
 		}
 	}
 
+	fn worker(stop: &ShutdownManager<SessionShutdownReason>) -> WorkerGuard {
+		WorkerGuard::register(stop, SessionShutdownReason::AudioPacketHandlerStopped).unwrap()
+	}
+
+	/// STAB-001: audio has the same pre-start ownership contract as video.
+	#[tokio::test]
+	async fn stop_before_start_releases_the_audio_socket_before_completion() {
+		for flavor_yield in [false, true] {
+			let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+			let address = socket.local_addr().unwrap();
+			let stop = ShutdownManager::new();
+			let start = StartLatch::new();
+			let (_tx, rx) = mpsc::channel(4);
+			let authorization = StreamAuthorization::new(1, "127.0.0.1".parse().unwrap()).unwrap();
+			let (_authorization_tx, authorization_rx) = watch::channel(authorization);
+			spawn_handle_audio_packets(
+				rx,
+				socket,
+				authorization_rx,
+				start.waiter(),
+				stop.clone(),
+				worker(&stop),
+			);
+			if flavor_yield {
+				tokio::task::yield_now().await;
+			}
+			stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+			tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
+				.await
+				.unwrap();
+			UdpSocket::bind(address)
+				.await
+				.expect("completed shutdown must imply the audio port is free");
+			start.open();
+		}
+	}
+
+	/// STAB-001: video and audio share one `StartB`; both observe an opening
+	/// that precedes their first poll.
+	#[tokio::test(flavor = "current_thread")]
+	async fn start_before_first_poll_is_not_lost() {
+		let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let server = socket.local_addr().unwrap();
+		let stop = ShutdownManager::new();
+		let start = StartLatch::new();
+		let (tx, rx) = mpsc::channel(4);
+		let authorization = StreamAuthorization::new(1, "127.0.0.1".parse().unwrap()).unwrap();
+		let (_authorization_tx, authorization_rx) = watch::channel(authorization.clone());
+		spawn_handle_audio_packets(
+			rx,
+			socket,
+			authorization_rx,
+			start.waiter(),
+			stop.clone(),
+			worker(&stop),
+		);
+		start.open();
+		start.open();
+		let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let mut ping = authorization.ping_payload(MediaStream::Audio).as_bytes().to_vec();
+		ping.extend(1u32.to_be_bytes());
+		let mut delivered = false;
+		for _ in 0..20 {
+			client.send_to(&ping, server).await.unwrap();
+			tx.send(AudioPacketMessage::Packet(vec![0xdd; 32])).await.unwrap();
+			if receives(&client, &[0xdd; 32]).await {
+				delivered = true;
+				break;
+			}
+		}
+		assert!(delivered);
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
+			.await
+			.unwrap();
+	}
+
 	/// Audio endpoint discovery accepts only the authorized client: a legacy
 	/// PING from another host cannot redirect the stream.
 	#[tokio::test]
@@ -471,12 +553,19 @@ mod tests {
 		let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 		let server = socket.local_addr().unwrap();
 		let stop = ShutdownManager::new();
-		let start = Arc::new(Notify::new());
+		let start = StartLatch::new();
 		let (tx, rx) = mpsc::channel(4);
 		let authorization = StreamAuthorization::new(1, "127.0.0.1".parse().unwrap()).unwrap();
 		let (_authorization_tx, authorization_rx) = watch::channel(authorization.clone());
-		spawn_handle_audio_packets(rx, socket, authorization_rx, start.clone(), stop.clone());
-		start.notify_one();
+		spawn_handle_audio_packets(
+			rx,
+			socket,
+			authorization_rx,
+			start.waiter(),
+			stop.clone(),
+			worker(&stop),
+		);
+		start.open();
 
 		let attacker = UdpSocket::bind("127.0.0.2:0").await.unwrap();
 		attacker.send_to(b"PING", server).await.unwrap();

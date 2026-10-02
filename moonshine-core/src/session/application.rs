@@ -137,8 +137,13 @@ pub(crate) struct ApplicationContext {
 	pub extra_env: HashMap<String, String>,
 }
 
+/// A launched application unit and its exit monitor.
+///
+/// Dropping this only stops observing the unit. Stopping the unit is an
+/// asynchronous systemd job owned by the session manager's teardown (see
+/// [`stop_application_unit`]), which records the unit before the launch starts
+/// so a cancelled launch is cleaned up as well.
 pub(crate) struct Application {
-	unit_name: String,
 	config: ApplicationConfig,
 	exit_monitor: Option<JoinHandle<()>>,
 }
@@ -191,7 +196,6 @@ impl Application {
 		let exit_monitor = spawn_unit_exit_monitor(conn.clone(), context.unit_name.clone(), unit_path, stop);
 
 		Ok(Self {
-			unit_name: context.unit_name,
 			config,
 			exit_monitor: Some(exit_monitor),
 		})
@@ -200,20 +204,22 @@ impl Application {
 
 impl Drop for Application {
 	fn drop(&mut self) {
-		tracing::info!("Application '{}' is exiting.", self.config.title);
+		// Never block here: this runs on runtime workers. The owning session's
+		// teardown stops the unit before it reports completion.
+		tracing::debug!("Releasing application '{}' handle.", self.config.title);
 		if let Some(handle) = self.exit_monitor.take() {
 			handle.abort();
 		}
-
-		// Unfortunately we have no `drop_async` yet, so we must spawn an async runtime to call stop_unit.
-		let unit_name = self.unit_name.clone();
-		std::thread::spawn(move || {
-			let rt = tokio::runtime::Runtime::new().unwrap();
-			rt.block_on(stop_unit_owned(unit_name)).ok();
-		})
-		.join()
-		.unwrap();
 	}
+}
+
+/// Stop the session's application unit and wait for systemd to unload it.
+///
+/// Idempotent: an absent unit is already stopped. Bounded by the stop-job and
+/// unit-removal timeouts plus the session-bus connection.
+pub(crate) async fn stop_application_unit(unit_name: &str) -> Result<(), ()> {
+	tracing::info!(unit = unit_name, "Stopping application unit.");
+	stop_unit_owned(unit_name.to_string()).await
 }
 
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
@@ -339,17 +345,20 @@ async fn stop_unit(conn: &Connection, unit_name: &str) -> Result<(), ()> {
 			"StopUnit",
 			&(unit_name, "replace"),
 		)
-		.await
-		.map_err(|e| match e {
-			zbus::Error::MethodError(ref err_name, ..)
-				if err_name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
-			{
-				tracing::debug!("Unit was already stopped.");
-			},
-			e => {
-				tracing::error!("Failed to get unit: {e}");
-			},
-		})?;
+		.await;
+	let reply = match reply {
+		Ok(reply) => reply,
+		Err(zbus::Error::MethodError(ref err_name, ..))
+			if err_name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+		{
+			tracing::debug!("Unit was already stopped.");
+			return Ok(());
+		},
+		Err(e) => {
+			tracing::error!("Failed to stop unit {unit_name}: {e}");
+			return Err(());
+		},
+	};
 
 	let job_path = reply
 		.body()

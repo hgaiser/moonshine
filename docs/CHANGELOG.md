@@ -14,6 +14,23 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-3] - 2026-10-01
+
+### Fixed
+
+- Video and audio no longer intermittently fail to start when the client's start signal arrives before both pipelines are waiting; a repeated start signal is harmless.
+- Stopping a session before streaming began now releases its UDP ports, so the next session no longer fails with address-in-use errors.
+- Cancelling a session, an application exit or a stream failure now finishes the whole teardown (application unit, stream workers, sockets and the PulseAudio socket) before the session is reported idle; a new launch waits for it instead of racing the old resources.
+- A launch that times out or is cancelled while systemd is still starting the application no longer leaves the application unit running. Stopping a session also cancels a launch, stream start or reconnect that is still in progress.
+- A duplicate or early RTSP PLAY, or a PLAY racing a reconnect ANNOUNCE, no longer stops the retained application or leaves a resumed stream paused. A reconnect whose reconfiguration fails stops the session cleanly instead of continuing with partially changed capture/encoder settings.
+- Service shutdown (SIGTERM/SIGINT) now waits, within the session teardown deadline, for the application unit to stop.
+- Captured frames now own their DMA-BUF descriptors, so frames still queued or being encoded during shutdown, a resolution change or a client buffer release can no longer import a closed or reused descriptor.
+- A video encoder or GPU device that has stopped working now ends the session instead of logging a failure for every frame indefinitely. Recoverable frame failures drop the frame (requesting an IDR when the reference chain may be affected) with rate-limited warnings, and release the captured buffer only after its GPU reads are known to be complete.
+
+### Changed
+
+- Session teardown has an end-to-end deadline of 16 seconds (6 for stopping the application). If it is exceeded, new sessions are refused and Pyroshine shuts down so its service manager can restart it.
+
 ## [v0.17.0-beta-2] - 2026-10-01
 
 ### Security
