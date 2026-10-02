@@ -19,7 +19,8 @@ use ash::vk::Handle as _;
 use crate::dispatch::*;
 use crate::state::{
 	MutexExt, SurfaceKey, SwapchainData, SwapchainKey, get_wayland_connection, insert_swapchain, is_forcing_fifo,
-	is_frame_limiter_aware, remove_swapchain, with_device, with_surface, with_swapchain, with_swapchain_mut,
+	is_frame_limiter_aware, remove_swapchain, surface_hdr_supported, with_device, with_surface, with_swapchain,
+	with_swapchain_mut,
 };
 use crate::surface::icd_fallback_surface;
 use crate::xcb::{
@@ -44,28 +45,17 @@ pub unsafe extern "C" fn create_swapchain(
 		// the ICD call (the remap must only happen when the layer is active).
 		let instance_key = with_device(device_key, |d| d.instance_key);
 
-		// The layer injects HDR color spaces (e.g. HDR10_ST2084_EXT) that the
-		// ICD may not natively support for Wayland surfaces. Remap to
-		// SRGB_NONLINEAR for the ICD call; the real color space is communicated
-		// to the compositor via the swapchain_feedback protocol instead.
-		//
-		// Only remap when the layer is connected to the compositor AND the
-		// compositor signals HDR support; otherwise pass the app's create-info
-		// through unchanged so the ICD can handle its own color management.
-		let layer_hdr_active = instance_key
-			.and_then(get_wayland_connection)
-			.map(|arc| arc.force_lock().caps.hdr_supported)
-			.unwrap_or(false);
-		let need_remap = layer_hdr_active && app_color_space != ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
-
-		// Compute surface_key early for bypass checks.
 		let surface_key = SurfaceKey::from_raw(create_info.surface.as_raw());
-
 		// Determine whether XWayland bypass is allowed for this surface.  When it
 		// is not, present through the plain XCB fallback surface rather than the
 		// un-mapped Wayland bypass surface.
-		let fallback_surface = icd_fallback_surface(create_info.surface);
-		let bypass_allowed = fallback_surface.is_none() && can_bypass_xwayland(surface_key);
+		let bypass_allowed = can_bypass_xwayland(surface_key);
+		let fallback_surface = icd_fallback_surface(create_info.surface, bypass_allowed);
+		// The ICD may not support the injected HDR color spaces. Give it sRGB
+		// only when this route reports the real color space through feedback.
+		let need_remap = bypass_allowed
+			&& instance_key.is_some_and(|key| surface_hdr_supported(key, surface_key))
+			&& app_color_space != ash::vk::ColorSpaceKHR::SRGB_NONLINEAR;
 		let icd_surface = fallback_surface.unwrap_or(create_info.surface);
 		let need_surface_patch = icd_surface.as_raw() != create_info.surface.as_raw();
 

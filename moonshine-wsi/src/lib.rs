@@ -40,6 +40,9 @@ mod surface;
 mod swapchain;
 mod xcb;
 
+#[cfg(test)]
+mod hdr_tests;
+
 use ash::vk::Handle as _;
 use dispatch::*;
 
