@@ -14,6 +14,25 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-2] - 2026-10-01
+
+### Security
+
+- `/launch` and `/resume` require an exact 16-byte `rikey` (32 hex digits) and a 32-bit `rikeyid` (signed or unsigned decimal). Malformed keys are rejected before any session state, key or authorization changes; an encrypted video epoch can no longer fall back to plaintext or keep using a stale key after a same-ID key change.
+- AES-GCM nonces for video and host control messages are owned by the key rather than by the packetizer or control task. Recreating a packetizer, reconfiguring, reconnecting, changing only the key ID, or reusing a key in a later session continues the key's counters, so no (key, nonce) pair is reused; counter exhaustion stops sending instead of wrapping. The IV wire format is unchanged.
+
+### Fixed
+
+- Launch, resume and RTSP ANNOUNCE validate resolution, refresh rate, packet size (including encryption and UDP limits), bitrate, audio channel count and audio packet duration before pausing or reconfiguring a stream, and reply with the rejected value instead of failing later or panicking. High-end requests (for example 7680×4320, 240 Hz, and 650–900 Mbps) remain accepted.
+- Unsupported audio packet durations and channel counts are rejected instead of silently streaming 5 ms stereo audio.
+- An application connecting to the session's PulseAudio socket with zero/out-of-range channels or sample rate, a mismatched channel map, or extreme buffer attributes receives a PulseAudio error instead of crashing the audio server; buffer attributes are always returned in a consistent order.
+- Audio encryption no longer overflows for key IDs near the 32-bit limit.
+
+### Changed
+
+- With video encryption, `max_packet_size` now also covers the 32-byte encryption prefix, so the datagram stays at `max_packet_size + 16` bytes as documented.
+- Startup rejects configurations whose bind `address` is not an IP address or whose TCP (`webserver.port`, `webserver.port_https`, `stream.port`) or UDP (`stream.video.port`, `stream.audio.port`, `stream.control.port`) listeners share a port.
+
 ## [v0.17.0-beta-1] - 2026-10-01
 
 ### Security

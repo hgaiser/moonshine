@@ -28,8 +28,10 @@ use crate::{
 	clients::ClientManager,
 	ingress::Ingress,
 	session::{
-		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys, application::ApplicationConfig,
+		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys,
+		application::ApplicationConfig,
 		manager::SessionManager,
+		negotiation::{self, DisplayMode},
 	},
 	tls::TlsAcceptor,
 };
@@ -830,6 +832,7 @@ impl Webserver {
 			},
 		};
 
+		// Validate every negotiated value before the session is touched.
 		let mode = match params.remove("mode") {
 			Some(mode) => mode,
 			None => {
@@ -838,67 +841,22 @@ impl Webserver {
 				return xml_error(400, &message);
 			},
 		};
-		let mode_parts: Vec<&str> = mode.split('x').collect();
-		if mode_parts.len() != 3 {
-			let message = format!("Expected mode in format WxHxR, but got '{mode}'.");
-			tracing::warn!("{message}");
-			return xml_error(400, &message);
-		}
-		let width: u32 = match mode_parts[0].parse() {
-			Ok(width) => width,
-			Err(e) => {
-				let message = format!("Failed to parse width: {e}");
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-		let height: u32 = match mode_parts[1].parse() {
-			Ok(height) => height,
-			Err(e) => {
-				let message = format!("Failed to parse height: {e}");
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-		let refresh_rate: u32 = match mode_parts[2].parse() {
-			Ok(refresh_rate) => refresh_rate,
-			Err(e) => {
-				let message = format!("Failed to parse refresh rate: {e}");
+		let DisplayMode {
+			width,
+			height,
+			refresh_rate,
+		} = match DisplayMode::parse(&mode) {
+			Ok(mode) => mode,
+			Err(reason) => {
+				let message = format!("Invalid mode in launch request: {reason}.");
 				tracing::warn!("{message}");
 				return xml_error(400, &message);
 			},
 		};
 
-		let remote_input_key = match params.remove("rikey") {
-			Some(remote_input_key) => remote_input_key,
-			None => {
-				let message = format!("Expected 'rikey' in launch request, got {:?}.", params.keys());
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-		let remote_input_key = match hex::decode(remote_input_key) {
-			Ok(remote_input_key) => remote_input_key,
-			Err(e) => {
-				let message = format!("Failed to decode remote input key: {e}");
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-
-		let remote_input_key_id: String = match params.remove("rikeyid") {
-			Some(remote_input_key_id) => remote_input_key_id,
-			None => {
-				let message = format!("Expected 'rikey_id' in launch request, got {:?}.", params.keys());
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-		let remote_input_key_id: i64 = match remote_input_key_id.parse() {
-			Ok(remote_input_key_id) => remote_input_key_id,
-			Err(e) => {
-				let message =
-					format!("Couldn't parse 'rikey_id' in launch request, got '{remote_input_key_id}' with error: {e}");
+		let keys = match request_keys(&mut params, "launch") {
+			Ok(keys) => keys,
+			Err(message) => {
 				tracing::warn!("{message}");
 				return xml_error(400, &message);
 			},
@@ -907,15 +865,24 @@ impl Webserver {
 		// TODO: localAudioPlayMode (host_audio) is not yet supported with the
 		// per-session PulseServer approach.
 
-		let surround_audio_info: u32 = params
-			.remove("surroundAudioInfo")
-			.and_then(|s| s.parse().ok())
-			.unwrap_or(196610); // Default: stereo (0x30002)
-		let audio_channels = AudioChannels::from((surround_audio_info & 0xFFFF) as u8);
-		let audio_channel_mask = surround_audio_info >> 16;
+		// Default: stereo (0x30002).
+		let (audio_channels, audio_channel_mask) = match params.remove("surroundAudioInfo") {
+			None => (AudioChannels::Stereo, 0x3),
+			Some(value) => match negotiation::surround_audio_info(&value) {
+				Ok(audio) => audio,
+				Err(reason) => {
+					let message = format!("Invalid launch request: {reason}.");
+					tracing::warn!("{message}");
+					return xml_error(400, &message);
+				},
+			},
+		};
 
-		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);
-		let hdr = hdr_mode != 0;
+		let hdr = match params.remove("hdrMode").map(|value| value.parse::<u32>()) {
+			None => false,
+			Some(Ok(value)) => value != 0,
+			Some(Err(error)) => return xml_error(400, &format!("Invalid hdrMode in launch request: {error}.")),
+		};
 
 		let application = match self.applications.iter().find(|&a| a.id() == application_id) {
 			Some(application) => application,
@@ -933,7 +900,7 @@ impl Webserver {
 				application_id,
 				resolution: (width, height),
 				refresh_rate,
-				keys: SessionKeys::new(remote_input_key, remote_input_key_id),
+				keys: SessionKeys::Keys(keys),
 				audio_channels,
 				audio_channel_mask,
 				hdr,
@@ -995,36 +962,11 @@ impl Webserver {
 		local_address: Option<SocketAddr>,
 		peer_address: SocketAddr,
 	) -> Response<Full<Bytes>> {
-		let remote_input_key = match params.remove("rikey") {
-			Some(remote_input_key) => remote_input_key,
-			None => {
-				let message = format!("Expected 'rikey' in resume request, got {:?}.", params.keys());
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-		let remote_input_key = match hex::decode(remote_input_key) {
-			Ok(remote_input_key) => remote_input_key,
-			Err(e) => {
-				let message = format!("Failed to decode remote input key: {e}");
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-
-		let remote_input_key_id: String = match params.remove("rikeyid") {
-			Some(remote_input_key_id) => remote_input_key_id,
-			None => {
-				let message = format!("Expected 'rikey_id' in resume request, got {:?}.", params.keys());
-				tracing::warn!("{message}");
-				return xml_error(400, &message);
-			},
-		};
-		let remote_input_key_id: i64 = match remote_input_key_id.parse() {
-			Ok(remote_input_key_id) => remote_input_key_id,
-			Err(e) => {
-				let message =
-					format!("Couldn't parse 'rikey_id' in resume request, got '{remote_input_key_id}' with error: {e}");
+		// The whole request is validated before the session manager publishes
+		// keys or rotates authorization, so a malformed resume changes nothing.
+		let keys = match request_keys(&mut params, "resume") {
+			Ok(keys) => keys,
+			Err(message) => {
 				tracing::warn!("{message}");
 				return xml_error(400, &message);
 			},
@@ -1032,21 +974,12 @@ impl Webserver {
 
 		let mut resume_request = crate::session::ResumeRequest::default();
 		if let Some(mode) = params.remove("mode") {
-			let parts: Vec<&str> = mode.split('x').collect();
-			if parts.len() != 3 {
-				return xml_error(400, &format!("Expected mode in format WxHxR, but got '{mode}'."));
-			}
-			let parsed = (
-				parts[0].parse::<u32>(),
-				parts[1].parse::<u32>(),
-				parts[2].parse::<u32>(),
-			);
-			match parsed {
-				(Ok(width), Ok(height), Ok(refresh_rate)) if width != 0 && height != 0 && refresh_rate != 0 => {
-					resume_request.resolution = Some((width, height));
-					resume_request.refresh_rate = Some(refresh_rate);
+			match DisplayMode::parse(&mode) {
+				Ok(mode) => {
+					resume_request.resolution = Some((mode.width, mode.height));
+					resume_request.refresh_rate = Some(mode.refresh_rate);
 				},
-				_ => return xml_error(400, &format!("Invalid mode in resume request: '{mode}'.")),
+				Err(reason) => return xml_error(400, &format!("Invalid mode in resume request: {reason}.")),
 			}
 		}
 		if let Some(hdr_mode) = params.remove("hdrMode") {
@@ -1056,27 +989,18 @@ impl Webserver {
 			}
 		}
 		if let Some(surround_audio_info) = params.remove("surroundAudioInfo") {
-			match surround_audio_info.parse::<u32>() {
-				Ok(value) => {
-					resume_request.audio_channels = Some(AudioChannels::from((value & 0xFFFF) as u8));
-					resume_request.audio_channel_mask = Some(value >> 16);
+			match negotiation::surround_audio_info(&surround_audio_info) {
+				Ok((channels, mask)) => {
+					resume_request.audio_channels = Some(channels);
+					resume_request.audio_channel_mask = Some(mask);
 				},
-				Err(error) => {
-					return xml_error(400, &format!("Invalid surroundAudioInfo in resume request: {error}."));
-				},
+				Err(reason) => return xml_error(400, &format!("Invalid resume request: {reason}.")),
 			}
 		}
 
 		match self
 			.session_manager
-			.resume_session(
-				SessionKeyData {
-					remote_input_key,
-					remote_input_key_id,
-				},
-				resume_request,
-				peer_address.ip(),
-			)
+			.resume_session(keys, resume_request, peer_address.ip())
 			.await
 		{
 			Ok(()) => {},
@@ -1286,6 +1210,16 @@ fn bad_request(message: String) -> Response<Full<Bytes>> {
 		.status(StatusCode::BAD_REQUEST)
 		.body(Full::new(Bytes::from(message)))
 		.unwrap()
+}
+
+/// Validate the `rikey`/`rikeyid` pair of a launch/resume request. The error
+/// is a client-facing message that never contains key material.
+fn request_keys(params: &mut HashMap<String, String>, request: &str) -> Result<SessionKeyData, String> {
+	let (Some(key), Some(key_id)) = (params.remove("rikey"), params.remove("rikeyid")) else {
+		return Err(format!("Expected 'rikey' and 'rikeyid' in {request} request."));
+	};
+	SessionKeyData::from_params(&key, &key_id)
+		.map_err(|error| format!("Invalid key parameters in {request} request: {error}."))
 }
 
 fn xml_error(status_code: u16, message: &str) -> Response<Full<Bytes>> {

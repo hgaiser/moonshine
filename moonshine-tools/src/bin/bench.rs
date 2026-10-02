@@ -19,6 +19,7 @@ use moonshine_core::session::stream::video::VideoStreamConfig;
 use moonshine_core::session::stream::video::VideoStreamContext;
 use moonshine_core::session::stream::video::{BitDepth, ChromaFormat, ColorRange, NegotiatedVideoFormat, VideoCodec};
 use moonshine_core::session::stream::video::{FrameStats, PyroWaveQueueMode};
+use moonshine_core::session::{RemoteInputKey, RemoteInputKeyId};
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -715,10 +716,10 @@ async fn run_benchmark(
 		application_id: 1,
 		resolution: (width, height),
 		refresh_rate: target_fps,
-		keys: SessionKeys::Keys(SessionKeyData {
-			remote_input_key: vec![0u8; 16],
-			remote_input_key_id: 0,
-		}),
+		keys: SessionKeys::Keys(SessionKeyData::new(
+			RemoteInputKey::from_bytes([0; 16]),
+			RemoteInputKeyId::new(0),
+		)),
 		audio_channels: AudioChannels::Stereo,
 		audio_channel_mask: 0x3,
 		hdr: args.hdr,
@@ -755,7 +756,9 @@ async fn run_benchmark(
 	};
 
 	let audio_ctx = AudioStreamContext {
-		packet_duration_ms: 20,
+		// Negotiation accepts only the 5/10 ms durations the mixer implements;
+		// 5 ms is what Moonlight requests (and what 20 previously fell back to).
+		packet_duration_ms: 5,
 		qos: false,
 		audio_config: AudioConfig::default(),
 		encrypt_audio: false,

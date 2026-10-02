@@ -87,7 +87,39 @@ impl Config {
 		};
 
 		config.resolve_paths()?;
+		config
+			.validate()
+			.map_err(|reason| tracing::error!("Invalid configuration: {reason}"))?;
 		Ok(config)
+	}
+
+	/// Reject settings that would otherwise fail only once a client connects:
+	/// listeners that cannot bind together, or a bind address the stream
+	/// listeners cannot parse. Values with a documented fallback (for example
+	/// an undersized `max_packet_size`, which is ignored) are left to it.
+	pub fn validate(&self) -> Result<(), String> {
+		self.address
+			.parse::<std::net::IpAddr>()
+			.map_err(|error| format!("address '{}' is not an IP address: {error}", self.address))?;
+		let tcp = [
+			("webserver.port", self.webserver.port),
+			("webserver.port_https", self.webserver.port_https),
+			("stream.port", self.stream.port),
+		];
+		let udp = [
+			("stream.video.port", self.stream.video.port),
+			("stream.audio.port", self.stream.audio.port),
+			("stream.control.port", self.stream.control.port),
+		];
+		for (protocol, ports) in [("TCP", tcp), ("UDP", udp)] {
+			for (index, (name, port)) in ports.iter().enumerate() {
+				// Port 0 asks the OS for distinct ephemeral ports.
+				if let Some((other, _)) = ports[index + 1..].iter().find(|(_, other)| *port != 0 && other == port) {
+					return Err(format!("{name} and {other} both use {protocol} port {port}"));
+				}
+			}
+		}
+		Ok(())
 	}
 
 	fn resolve_paths(&mut self) -> Result<(), ()> {
@@ -135,6 +167,49 @@ impl Default for Config {
 			})],
 			compositor: CompositorConfig::default(),
 			inhibit_sleep: true,
+		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn default_configuration_is_valid() {
+		assert_eq!(Config::default().validate(), Ok(()));
+	}
+
+	#[test]
+	fn conflicting_listeners_and_bad_addresses_are_rejected() {
+		let mut config = Config::default();
+		config.stream.port = config.webserver.port_https;
+		assert!(config.validate().unwrap_err().contains("TCP port"));
+
+		let mut config = Config::default();
+		config.stream.audio.port = config.stream.control.port;
+		assert!(config.validate().unwrap_err().contains("UDP port"));
+
+		// TCP and UDP listeners may share a number; ephemeral ports may repeat.
+		let mut config = Config::default();
+		config.stream.video.port = config.stream.port;
+		config.stream.audio.port = 0;
+		config.stream.control.port = 0;
+		assert_eq!(config.validate(), Ok(()));
+
+		for address in ["", "localhost", "0.0.0.0:47989", "300.1.1.1"] {
+			let config = Config {
+				address: address.to_string(),
+				..Config::default()
+			};
+			assert!(config.validate().is_err(), "{address}");
+		}
+		for address in ["::", "127.0.0.1", "::ffff:192.168.1.2"] {
+			let config = Config {
+				address: address.to_string(),
+				..Config::default()
+			};
+			assert_eq!(config.validate(), Ok(()), "{address}");
 		}
 	}
 }

@@ -15,6 +15,7 @@ use crate::session::SessionKeysSender;
 use crate::session::SessionState;
 use crate::session::authorization::StreamAuthorization;
 use crate::session::compositor::CompositorConfig;
+use crate::session::keys::KeyLedger;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
@@ -113,6 +114,10 @@ struct SessionManagerInner {
 	///
 	/// Subsystems that get updated are: video encoder, audio encoder and input handler.
 	keys_tx: Option<SessionKeysSender>,
+
+	/// Key-scoped nonce owner. Never reset: a key that is reused after a
+	/// resume, reconfigure or new launch continues its nonce sequences.
+	key_ledger: KeyLedger,
 
 	/// Pending stream contexts received via RTSP ANNOUNCE. For an active
 	/// session these belong to the reconnecting client and are not the contexts
@@ -248,6 +253,7 @@ impl SessionManager {
 			session: None,
 			stop: ShutdownManager::new(),
 			keys_tx: None,
+			key_ledger: KeyLedger::default(),
 			pending_video_stream_context: None,
 			pending_audio_stream_context: None,
 			pending_generation: None,
@@ -320,6 +326,18 @@ impl SessionManager {
 		audio_stream_context: AudioStreamContext,
 		session_id_v1: bool,
 	) -> Result<(), ()> {
+		// RTSP validates first to return a precise error; this guard keeps any
+		// other caller from pausing or replacing a working epoch with values
+		// the encoders, timers or transport cannot use.
+		if let Err(reason) = video_stream_context.validate().and_then(|()| {
+			crate::session::negotiation::validate_audio_packet_duration(audio_stream_context.packet_duration_ms)
+		}) {
+			tracing::warn!(
+				reason,
+				"Rejecting invalid stream negotiation before changing the session"
+			);
+			return Err(());
+		}
 		let mut guard = self.inner.lock().await;
 		if !guard.is_current(grant) {
 			tracing::warn!(
@@ -436,7 +454,7 @@ impl SessionManager {
 				return Err(());
 			},
 		};
-		let (tx, rx) = watch::channel(session_keys);
+		let (tx, rx) = watch::channel(guard.key_ledger.publish(session_keys));
 		context.keys = SessionKeys::Rx(rx);
 		let client_ip = context.client_ip;
 
@@ -712,6 +730,9 @@ impl SessionManager {
 			return Err(());
 		}
 		guard.rotate_authorization(client_ip)?;
+		// Keys were validated at the HTTP boundary; the ledger keeps nonce
+		// allocation continuous when the client resumes with the same key.
+		let keys = guard.key_ledger.publish(keys);
 		if let Some(keys_tx) = &guard.keys_tx {
 			keys_tx.send_replace(keys);
 		}

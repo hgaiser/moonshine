@@ -654,3 +654,98 @@ async fn shutdown_releases_stalled_connection_handlers() {
 	assert_eq!((status, body.as_str()), (400, "Server is shutting down."));
 	assert!(client_manager.pending_approval(&pairing.unique_id).is_none());
 }
+
+async fn body_text(response: Response<Full<Bytes>>) -> String {
+	use http_body_util::BodyExt;
+	let body = response.into_body().collect().await.unwrap().to_bytes();
+	String::from_utf8(body.to_vec()).unwrap()
+}
+
+fn launch_params(overrides: &[(&str, Option<&str>)]) -> HashMap<String, String> {
+	let mut params: HashMap<String, String> = [
+		("appid", "1"),
+		("mode", "3840x2160x120"),
+		("rikey", "00112233445566778899aabbccddeeff"),
+		("rikeyid", "-123456"),
+		("surroundAudioInfo", "196610"),
+	]
+	.into_iter()
+	.map(|(name, value)| (name.to_string(), value.to_string()))
+	.collect();
+	for (name, value) in overrides {
+		match value {
+			Some(value) => params.insert(name.to_string(), value.to_string()),
+			None => params.remove(*name),
+		};
+	}
+	params
+}
+
+/// CFG-001/SEC-004: launch and resume reject malformed keys and numeric
+/// domains at the authenticated boundary, before the session manager creates,
+/// rekeys or re-authorizes anything.
+#[tokio::test]
+async fn malformed_launch_and_resume_values_change_nothing() {
+	let fixture = fixture(true, WebLimits::default());
+	let server = &fixture.server;
+	let peer: SocketAddr = "192.168.1.50:50000".parse().unwrap();
+	let grant = server.session_manager.authorize_client_for_test(peer.ip()).await;
+
+	let malformed: [(&str, Option<&str>); 17] = [
+		("rikey", None),
+		("rikeyid", None),
+		("rikey", Some("")),
+		("rikey", Some("00112233445566778899aabbccddee")),
+		("rikey", Some("00112233445566778899aabbccddeeff00")),
+		("rikey", Some("00112233445566778899aabbccddeeg")),
+		("rikey", Some("zz112233445566778899aabbccddeeff")),
+		("rikeyid", Some("4294967296")),
+		("rikeyid", Some("-2147483649")),
+		("rikeyid", Some("-9223372036854775808")),
+		("rikeyid", Some("one")),
+		("mode", Some("3840x2160x0")),
+		("mode", Some("0x2160x120")),
+		("mode", Some("16385x2160x120")),
+		("mode", Some("3840x2160")),
+		("surroundAudioInfo", Some("196611")),
+		("hdrMode", Some("yes")),
+	];
+	for (name, value) in malformed {
+		let launch = body_text(server.launch(launch_params(&[(name, value)]), None, peer).await).await;
+		assert!(launch.contains("status_code=\"400\""), "{name}={value:?}: {launch}");
+		assert!(
+			!launch.contains("application"),
+			"{name}={value:?} reached application lookup: {launch}"
+		);
+		let resume = body_text(server.resume(launch_params(&[(name, value)]), None, peer).await).await;
+		if name != "appid" {
+			assert!(resume.contains("status_code=\"400\""), "{name}={value:?}: {resume}");
+			assert!(
+				!resume.contains("Failed to update session keys"),
+				"{name}={value:?}: {resume}"
+			);
+		}
+		// Key bytes are never echoed.
+		assert!(!launch.contains("8899aabb") && !resume.contains("8899aabb"));
+	}
+
+	// Valid high-end values, including the most negative key ID, pass validation
+	// and only fail later for lack of an application / an active session.
+	for (name, value) in [
+		("rikeyid", Some("-2147483648")),
+		("rikeyid", Some("4294967295")),
+		("mode", Some("7680x4320x240")),
+	] {
+		let launch = body_text(server.launch(launch_params(&[(name, value)]), None, peer).await).await;
+		assert!(launch.contains("find application"), "{launch}");
+		let resume = body_text(server.resume(launch_params(&[(name, value)]), None, peer).await).await;
+		assert!(resume.contains("Failed to update session keys"), "{resume}");
+	}
+
+	assert!(server.session_manager.get_session_context().await.unwrap().is_none());
+	assert_eq!(
+		server.session_manager.authorize_stream(peer.ip()).await,
+		Some(grant),
+		"rejected requests did not rotate the authorization generation"
+	);
+}

@@ -32,27 +32,21 @@ pub mod application;
 pub mod authorization;
 pub mod compositor;
 pub mod inhibit;
+pub mod keys;
 pub mod manager;
+pub(crate) mod negotiation;
 pub mod stream;
 
 /// Timeout in seconds for the HTTP launch endpoint to wait for the session to launch.
 pub(crate) const APP_LAUNCH_HTTP_TIMEOUT_SECS: u64 = 60;
 
-/// Raw session encryption key data.
-#[derive(Clone, Debug)]
-pub struct SessionKeyData {
-	/// AES GCM key used for encoding video / audio / control messages.
-	pub remote_input_key: Vec<u8>,
+pub use self::keys::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
 
-	/// AES GCM initialization vector for video / audio / control messages.
-	pub remote_input_key_id: i64,
-}
-
-pub(crate) type SessionKeysReceiver = watch::Receiver<SessionKeyData>;
-pub(crate) type SessionKeysSender = watch::Sender<SessionKeyData>;
+pub(crate) type SessionKeysReceiver = watch::Receiver<keys::ActiveKeys>;
+pub(crate) type SessionKeysSender = watch::Sender<keys::ActiveKeys>;
 pub(crate) type AuthorizationReceiver = watch::Receiver<authorization::StreamAuthorization>;
 
-/// Session keys — either raw keys or a watch receiver.
+/// Session keys — validated keys from launch, then the manager-published watch.
 #[derive(Clone, Debug)]
 pub enum SessionKeys {
 	Keys(SessionKeyData),
@@ -60,13 +54,6 @@ pub enum SessionKeys {
 }
 
 impl SessionKeys {
-	pub(crate) fn new(remote_input_key: Vec<u8>, remote_input_key_id: i64) -> Self {
-		Self::Keys(SessionKeyData {
-			remote_input_key,
-			remote_input_key_id,
-		})
-	}
-
 	pub(crate) fn clone_rx(&self) -> Option<SessionKeysReceiver> {
 		match self {
 			Self::Rx(rx) => Some(rx.clone()),

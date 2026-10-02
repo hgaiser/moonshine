@@ -60,10 +60,10 @@ while resetting or replacing the encoders and transport state.
 | Step | Owner and contract |
 | --- | --- |
 | HTTP launch | Authenticated GameStream API initializes and launches the application/compositor |
-| RTSP ANNOUNCE | Validates negotiated formats and stores pending video/audio contexts |
+| RTSP ANNOUNCE | Validates negotiated formats and numeric domains, then stores pending video/audio contexts |
 | RTSP PLAY | Constructs initial streams, or commits a reconnect transition |
 | Control `StartB` | Opens the audio/video start gates; tools can trigger them through manager notifications |
-| HTTP resume | Updates session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
+| HTTP resume | Validates and publishes session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
 | Unchanged reconnect | Pauses delivery, resets client-visible video sequencing, requests an independently decodable first frame and acknowledges ordered transport activation before PLAY completes |
 | Changed reconnect | Pauses affected epochs, updates compositor output when needed, and recreates affected video/audio resources |
 | Cancel, application exit or session failure | Session shutdown releases application, stream tasks and native resources; the manager can accept a later launch |
@@ -88,6 +88,23 @@ Accepted HTTP, HTTPS and RTSP connections run in bounded, cancellable tasks
 (`ingress.rs`) that hold a global shutdown delay token, with TLS handshake,
 request-header and RTSP framing deadlines. Pairing approval is a loopback-only
 operator action; first pairing cannot rely on a paired client certificate.
+
+Launch, resume and ANNOUNCE values are validated against shared numeric
+domains (`session/negotiation.rs`, `VideoStreamContext::validate`) before the
+manager pauses, rekeys or reconfigures anything; a rejected request leaves the
+working stream unchanged. The domains are consumer limits (nonzero timing,
+representable extents, one-datagram shards including the encryption prefix,
+32-bit Vulkan Video rate control, implemented audio durations), not quality caps.
+
+Session keys (`session/keys.rs`) are validated at the HTTPS boundary and
+published as material with a server-owned generation; consumers detect key
+changes by generation, never by the client's `rikeyid`. AES-GCM nonce counters
+for video and host control messages belong to the key bytes through the
+manager's process-lifetime key ledger, so packetizer recreation, reconfigure,
+reconnect, key-ID-only changes or a later session reusing the key continue the
+same counters. A video epoch that negotiated encryption either encrypts every
+shard or emits none (nonce exhaustion retires the key instead of wrapping).
+Audio uses the protocol's fixed AES-CBC IV (`rikeyid` plus RTP sequence).
 
 A pending ANNOUNCE is not the active encoder configuration. Keep pending and
 active contexts separate until PLAY, and preserve epoch barriers so old packets

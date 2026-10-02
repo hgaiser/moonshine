@@ -30,9 +30,14 @@ const MAX_OUTGOING_BUFFER: usize = 64 * 1024 * 1024;
 /// The server emits samples at this rate to the encoder.
 pub(crate) const CAPTURE_SAMPLE_RATE: u32 = 48000;
 
-/// Clock tick rate. Determines audio frame size sent to the encoder.
-/// For 5ms frames: 200 Hz; for 10ms frames: 100 Hz.
-const DEFAULT_CLOCK_RATE_HZ: u32 = 200;
+/// Clock tick rate for a negotiated packet duration. Determines the audio
+/// frame size sent to the encoder: 200 Hz for 5 ms frames, 100 Hz for 10 ms.
+/// Negotiation rejects other durations; reaching here with one is an error
+/// rather than a silent change of the client's requested timing.
+fn clock_rate_hz(packet_duration_ms: u32) -> Result<u32, Error> {
+	crate::session::negotiation::validate_audio_packet_duration(packet_duration_ms)?;
+	Ok(1000 / packet_duration_ms)
+}
 
 const SINK_NAME: &str = "moonshine";
 
@@ -202,19 +207,7 @@ impl PulseServer {
 		let listener = UnixListener::from_std(listener);
 		let poll = mio::Poll::new()?;
 
-		let clock_rate_hz = match packet_duration_ms {
-			5 | 10 => 1000 / packet_duration_ms,
-			_ => {
-				if packet_duration_ms != 0 {
-					tracing::warn!(
-						"Unsupported packet_duration_ms {}, falling back to default {}Hz",
-						packet_duration_ms,
-						DEFAULT_CLOCK_RATE_HZ,
-					);
-				}
-				DEFAULT_CLOCK_RATE_HZ
-			},
-		};
+		let clock_rate_hz = clock_rate_hz(packet_duration_ms)?;
 
 		let mut clock = mio_timerfd::TimerFd::new(mio_timerfd::ClockId::Monotonic)?;
 		clock.set_timeout_interval(&time::Duration::from_nanos(1_000_000_000 / clock_rate_hz as u64))?;
@@ -444,10 +437,7 @@ impl PulseServer {
 			6 | 8 => channels,
 			_ => 2,
 		};
-		let clock_rate_hz = match packet_duration_ms {
-			5 | 10 => 1000 / packet_duration_ms,
-			_ => DEFAULT_CLOCK_RATE_HZ,
-		};
+		let clock_rate_hz = clock_rate_hz(packet_duration_ms)?;
 		self.clock
 			.set_timeout_interval(&time::Duration::from_nanos(1_000_000_000 / u64::from(clock_rate_hz)))?;
 		self.clock_rate_hz = clock_rate_hz;

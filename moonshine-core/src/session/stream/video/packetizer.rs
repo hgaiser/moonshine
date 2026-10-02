@@ -5,9 +5,11 @@ use aes_gcm::{
 };
 use fec_rs::ReedSolomon;
 use std::collections::{HashMap, hash_map::Entry};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::session::SessionKeysReceiver;
+use crate::session::keys::KeyNonces;
 
 use crate::session::stream::video::shard_batch::{ShardBatch, ShardBuf};
 
@@ -27,7 +29,7 @@ const NV_PACKET_OFFSET: usize = RTP_HEADER_SIZE + PADDING_SIZE;
 const PAYLOAD_OFFSET: usize = NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE;
 
 /// Size of the per-shard encryption prefix: iv(12) + frameNumber(4) + tag(16).
-const ENC_PREFIX_SIZE: usize = 12 + 4 + 16;
+pub(super) const ENC_PREFIX_SIZE: usize = 12 + 4 + 16;
 
 #[repr(u8)]
 enum RtpFlag {
@@ -46,6 +48,22 @@ struct VideoFrameHeader {
 }
 
 const VIDEO_FRAME_HEADER_SIZE: usize = 8;
+
+/// Smallest negotiable `packetSize`: the NV packet header plus the video
+/// frame header, so a frame's first shard carries its complete frame header.
+pub(super) const MIN_VIDEO_PACKET_SIZE: usize = NV_VIDEO_PACKET_SIZE + VIDEO_FRAME_HEADER_SIZE;
+
+/// UDP payload bytes of one shard for a negotiated `packetSize`.
+///
+/// The client's `packetSize` covers the NV header and payload; the packetizer
+/// adds the RTP header and padding, and the encryption prefix when encrypting
+/// (Moonlight already subtracts that prefix from an encrypted stream's size).
+pub(super) fn wire_shard_size(packet_size: usize, encrypted: bool) -> Option<usize> {
+	let prefix = if encrypted { ENC_PREFIX_SIZE } else { 0 };
+	packet_size
+		.checked_add(RTP_HEADER_SIZE + PADDING_SIZE)?
+		.checked_add(prefix)
+}
 
 impl VideoFrameHeader {
 	fn serialize(&self, buffer: &mut [u8]) {
@@ -113,64 +131,79 @@ fn copy_header_and_data(
 	}
 }
 
+/// Video encryption for one packetizer epoch.
+///
+/// `Disabled` is only ever the negotiated plaintext mode. An epoch that
+/// negotiated encryption is `Enabled` or `Unavailable`, and an `Unavailable`
+/// epoch emits no shards at all; it never degrades to plaintext.
+enum VideoEncryption {
+	Disabled,
+	Enabled {
+		/// Boxed: the expanded AES key schedule dwarfs the other variants.
+		cipher: Box<Aes128Gcm>,
+		/// Server-owned generation of the published key (not the client key ID).
+		generation: u64,
+		/// Nonces belong to the key, not to this packetizer: a recreated or
+		/// concurrently draining packetizer for the same key shares them.
+		nonces: Arc<KeyNonces>,
+	},
+	/// The key's nonce space is exhausted; nothing more may be encrypted with it.
+	Unavailable {
+		generation: u64,
+	},
+}
+
 pub(crate) struct Packetizer {
 	pyrowave_dialect: Option<PyroWaveDialect>,
 	fec_encoders: HashMap<(usize, usize), ReedSolomon>,
 	/// Watch channel for encryption keys — read eagerly per `packetize()` call.
 	keys_rx: SessionKeysReceiver,
-	/// Whether video encryption is enabled by the client.
-	encrypt: bool,
-	/// AES-128-GCM cipher for video encryption, `None` when disabled or uninitialized.
-	cipher: Option<Aes128Gcm>,
-	/// Last seen `remote_input_key_id` — used to detect key rotation.
-	last_key_id: i64,
-	/// Monotonically increasing IV counter (one increment per encrypted shard).
-	gcm_iv_counter: u64,
+	encryption: VideoEncryption,
 	/// Rate limit recurring layout warnings for consistently large frames.
 	last_fec_warning: Option<Instant>,
 }
 
 impl Packetizer {
 	pub fn new(encrypt: bool, keys_rx: SessionKeysReceiver) -> Self {
-		Self {
+		let mut packetizer = Self {
 			pyrowave_dialect: None,
 			fec_encoders: HashMap::new(),
 			keys_rx,
-			encrypt,
-			cipher: None,
-			last_key_id: i64::MIN,
-			gcm_iv_counter: 0,
+			encryption: VideoEncryption::Disabled,
 			last_fec_warning: None,
+		};
+		if encrypt {
+			packetizer.encryption = packetizer.current_encryption();
 		}
+		packetizer
 	}
 
 	pub fn set_pyrowave_dialect(&mut self, dialect: Option<PyroWaveDialect>) {
 		self.pyrowave_dialect = dialect;
 	}
 
-	/// Update the cipher if the encryption key has rotated.
-	/// Called eagerly at the start of each `packetize()` call.
+	fn current_encryption(&self) -> VideoEncryption {
+		let keys = self.keys_rx.borrow();
+		let material = keys.material();
+		// Key bytes were validated at the HTTP boundary; the type guarantees a
+		// 16-byte AES-128 key, so cipher construction cannot fail here.
+		VideoEncryption::Enabled {
+			cipher: Box::new(Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(material.key().as_bytes()))),
+			generation: material.generation(),
+			nonces: material.nonces().clone(),
+		}
+	}
+
+	/// Switch to a newly published key. Called eagerly by every `packetize()`.
 	fn maybe_update_cipher(&mut self) {
-		if !self.encrypt {
-			return;
+		let current = match &self.encryption {
+			VideoEncryption::Disabled => return,
+			VideoEncryption::Enabled { generation, .. } | VideoEncryption::Unavailable { generation } => *generation,
+		};
+		if self.keys_rx.borrow().material().generation() != current {
+			self.encryption = self.current_encryption();
+			tracing::debug!("Video encryption key updated");
 		}
-		let keys = &*self.keys_rx.borrow();
-		if keys.remote_input_key_id == self.last_key_id {
-			return;
-		}
-		self.last_key_id = keys.remote_input_key_id;
-		if keys.remote_input_key.len() != 16 {
-			tracing::error!(
-				"Video encryption key must be exactly 16 bytes, got {}",
-				keys.remote_input_key.len()
-			);
-			self.cipher = None;
-			return;
-		}
-		let key = Key::<Aes128Gcm>::from_slice(&keys.remote_input_key);
-		self.cipher = Some(Aes128Gcm::new(key));
-		self.gcm_iv_counter = 0;
-		tracing::debug!("Video encryption cipher updated for key_id={}", self.last_key_id);
 	}
 
 	/// Pre-create FEC encoders for all possible block sizes to avoid
@@ -207,6 +240,9 @@ impl Packetizer {
 	) -> Result<ShardBatch, ()> {
 		// Eagerly read current encryption key and update cipher if rotated.
 		self.maybe_update_cipher();
+		if let VideoEncryption::Unavailable { .. } = self.encryption {
+			return Err(());
+		}
 
 		tracing::trace!(
 			"Packetizing frame {}, size={}, keyframe={}",
@@ -256,7 +292,10 @@ impl Packetizer {
 		let requested_shard_size = PAYLOAD_OFFSET + requested_shard_payload_size;
 
 		// When encryption is enabled, reserve space for the per-shard prefix.
-		let prefix_size = if self.cipher.is_some() { ENC_PREFIX_SIZE } else { 0 };
+		let prefix_size = match self.encryption {
+			VideoEncryption::Disabled => 0,
+			_ => ENC_PREFIX_SIZE,
+		};
 
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
@@ -441,13 +480,26 @@ impl Packetizer {
 			}
 
 			// Encrypt each shard if video encryption is enabled.
-			if let Some(cipher) = &self.cipher {
+			if let VideoEncryption::Enabled {
+				cipher,
+				nonces,
+				generation,
+			} = &self.encryption
+			{
+				// One reservation per block. Exhaustion is detected before any IV
+				// could repeat; the partial frame is discarded and the key retired.
+				let Ok(first_counter) = nonces.video.reserve(total_shards as u64) else {
+					tracing::error!("Video encryption nonce space exhausted; refusing to send further video");
+					self.encryption = VideoEncryption::Unavailable {
+						generation: *generation,
+					};
+					return Err(());
+				};
 				for shard_index in 0..total_shards {
 					// Build the 12-byte IV: bytes 0..8 = counter (LE), byte 11 = 'V'.
 					let mut iv = [0u8; 12];
-					iv[..8].copy_from_slice(&self.gcm_iv_counter.to_le_bytes());
+					iv[..8].copy_from_slice(&(first_counter + shard_index as u64).to_le_bytes());
 					iv[11] = b'V';
-					self.gcm_iv_counter += 1;
 
 					let nonce = Nonce::from_slice(&iv);
 
@@ -604,6 +656,7 @@ fn packet_layout(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::session::keys::ActiveKeys;
 
 	#[test]
 	fn native_wire_v1_uses_the_ordinary_packetizer_byte_for_byte() {
@@ -612,10 +665,8 @@ mod tests {
 		for encrypt in [false, true] {
 			for fec in [0, 20] {
 				let data: Vec<u8> = (0..32768).map(|i| (i * 131) as u8).collect();
-				let mut ordinary = packetizer();
-				ordinary.encrypt = encrypt;
-				let mut native = packetizer();
-				native.encrypt = encrypt;
+				let mut ordinary = packetizer_with(encrypt);
+				let mut native = packetizer_with(encrypt);
 				native.set_pyrowave_dialect(Some(PyroWaveDialect::NativeWireV1));
 				let a = ordinary.packetize(&data, true, 1392, 0, fec, 1, &mut 0, 42, 3).unwrap();
 				let b = native.packetize(&data, true, 1392, 0, fec, 1, &mut 0, 42, 3).unwrap();
@@ -637,8 +688,7 @@ mod tests {
 			frame.extend_from_slice(&(block << 8).to_le_bytes());
 		}
 		for encrypt in [false, true] {
-			let mut p = packetizer();
-			p.encrypt = encrypt;
+			let mut p = packetizer_with(encrypt);
 			p.set_pyrowave_dialect(Some(PyroWaveDialect::RecordFramed));
 			let batch = p.packetize(&frame, true, 80, 0, 20, 1, &mut 0, 0, 0).unwrap();
 			let prefix = if encrypt { ENC_PREFIX_SIZE } else { 0 };
@@ -687,6 +737,184 @@ mod tests {
 		}
 	}
 
+	/// `(iv, plaintext)` of one decrypted shard.
+	type DecryptedShard = ([u8; 12], Vec<u8>);
+
+	/// Decrypt every shard of `batch` with `key`.
+	fn decrypt_shards(batch: &ShardBatch, key: &[u8; 16]) -> Result<Vec<DecryptedShard>, ()> {
+		let cipher = Aes128Gcm::new(Key::<Aes128Gcm>::from_slice(key));
+		batch
+			.as_bytes()
+			.chunks_exact(batch.shard_size())
+			.map(|shard| {
+				let iv: [u8; 12] = shard[..12].try_into().unwrap();
+				let mut data = shard[ENC_PREFIX_SIZE..].to_vec();
+				cipher
+					.decrypt_in_place_detached(
+						Nonce::from_slice(&iv),
+						b"",
+						&mut data,
+						aes_gcm::Tag::from_slice(&shard[16..32]),
+					)
+					.map_err(|_| ())?;
+				Ok((iv, data))
+			})
+			.collect()
+	}
+
+	fn frame(byte: u8, len: usize) -> Vec<u8> {
+		vec![byte; len]
+	}
+
+	#[test]
+	fn encrypted_epochs_never_emit_plaintext() {
+		let (_tx, rx) = tokio::sync::watch::channel(ActiveKeys::for_test([0x11; 16], 7));
+		let mut encrypted = Packetizer::new(true, rx.clone());
+		let mut plain = Packetizer::new(false, rx);
+		let data = frame(0xab, 5000);
+		let batch = encrypted.packetize(&data, true, 1024, 0, 20, 1, &mut 0, 0, 0).unwrap();
+		let reference = plain.packetize(&data, true, 1024, 0, 20, 1, &mut 0, 0, 0).unwrap();
+		assert_eq!(batch.shard_size(), reference.shard_size() + ENC_PREFIX_SIZE);
+		assert_eq!(batch.shard_count(), reference.shard_count());
+		assert!(
+			!batch.as_bytes().windows(32).any(|window| window == [0xab; 32]),
+			"plaintext payload visible in an encrypted epoch"
+		);
+		let decrypted = decrypt_shards(&batch, &[0x11; 16]).unwrap();
+		for ((iv, data), original) in decrypted
+			.iter()
+			.zip(reference.as_bytes().chunks_exact(reference.shard_size()))
+		{
+			assert_eq!(data.as_slice(), original);
+			assert_eq!(iv[8..], [0, 0, 0, b'V'], "client-compatible IV format");
+		}
+		assert!(decrypt_shards(&batch, &[0x12; 16]).is_err());
+	}
+
+	/// Every IV emitted under a key across packetizer recreation, unchanged
+	/// resume, key-ID-only updates, interleaved packetizers and later reuse of
+	/// the key is unique, and every shard decrypts with the epoch's key.
+	#[test]
+	fn key_nonces_are_unique_across_packetizer_lifetimes_and_key_updates() {
+		use crate::session::keys::{KeyLedger, RemoteInputKey, RemoteInputKeyId, SessionKeyData};
+		use std::collections::HashSet;
+
+		let first = [0x33; 16];
+		let second = [0x44; 16];
+		let mut ledger = KeyLedger::default();
+		let mut publish = |key: [u8; 16], id: u32| {
+			ledger.publish(SessionKeyData::new(
+				RemoteInputKey::from_bytes(key),
+				RemoteInputKeyId::new(id),
+			))
+		};
+		let (tx, rx) = tokio::sync::watch::channel(publish(first, 1));
+		let mut seen = HashSet::new();
+		let mut record = |batch: ShardBatch, key: [u8; 16]| {
+			for (iv, _) in decrypt_shards(&batch, &key).expect("shard encrypted under the epoch key") {
+				assert!(seen.insert((key, iv)), "reused (key, nonce)");
+			}
+		};
+		let mut frame_number = 0;
+		let mut pack = |packetizer: &mut Packetizer| {
+			frame_number += 1;
+			packetizer
+				.packetize(
+					&frame(frame_number as u8, 3000),
+					true,
+					512,
+					1,
+					20,
+					frame_number,
+					&mut 0,
+					0,
+					0,
+				)
+				.unwrap()
+		};
+
+		// A draining epoch and its replacement interleave under one key.
+		let mut retired = Packetizer::new(true, rx.clone());
+		let mut current = Packetizer::new(true, rx.clone());
+		for _ in 0..3 {
+			record(pack(&mut retired), first);
+			record(pack(&mut current), first);
+		}
+		// Unchanged resume republishes the same key.
+		tx.send_replace(publish(first, 1));
+		record(pack(&mut current), first);
+		// Mode/codec change recreates the packetizer.
+		let mut recreated = Packetizer::new(true, rx.clone());
+		record(pack(&mut recreated), first);
+		record(pack(&mut retired), first);
+		// Only the client key ID changes.
+		tx.send_replace(publish(first, i32::MIN as u32));
+		record(pack(&mut recreated), first);
+		// Same key ID, different key: the cipher must switch.
+		tx.send_replace(publish(second, i32::MIN as u32));
+		let batch = pack(&mut recreated);
+		assert!(
+			decrypt_shards(&batch, &first).is_err(),
+			"stale key after same-ID update"
+		);
+		record(batch, second);
+		record(pack(&mut current), second);
+		// A later epoch (or session) reusing the first key continues its nonces.
+		tx.send_replace(publish(first, 1));
+		let mut reused = Packetizer::new(true, rx);
+		record(pack(&mut reused), first);
+		record(pack(&mut current), first);
+		assert!(seen.len() > 100);
+	}
+
+	#[test]
+	fn nonce_exhaustion_fails_before_reuse_without_emitting_shards() {
+		use crate::session::keys::{KeyNonces, VIDEO_NONCE_END};
+
+		let nonces = KeyNonces::for_test(VIDEO_NONCE_END - 10, 0);
+		let (tx, rx) = tokio::sync::watch::channel(ActiveKeys::with_nonces([0x66; 16], 1, nonces.clone()));
+		let mut packetizer = Packetizer::new(true, rx.clone());
+		let batch = packetizer
+			.packetize(&frame(1, 16), true, 1024, 0, 0, 1, &mut 0, 0, 0)
+			.unwrap();
+		let (iv, _) = decrypt_shards(&batch, &[0x66; 16]).unwrap()[0];
+		assert_eq!(u64::from_le_bytes(iv[..8].try_into().unwrap()), VIDEO_NONCE_END - 10);
+
+		// Needs more counters than remain: nothing is emitted, nothing wraps.
+		let mut sequence = 0;
+		assert!(
+			packetizer
+				.packetize(&frame(2, 20 * 1008), true, 1024, 0, 0, 2, &mut sequence, 0, 0)
+				.is_err()
+		);
+		assert_eq!(nonces.video.high_water(), VIDEO_NONCE_END - 9);
+		// The key is retired for this epoch, even for frames that would fit.
+		assert!(
+			packetizer
+				.packetize(&frame(3, 16), true, 1024, 0, 0, 3, &mut 0, 0, 0)
+				.is_err()
+		);
+		// Another packetizer may use the remaining counters, but never past the end.
+		let mut other = Packetizer::new(true, rx);
+		let batch = other
+			.packetize(&frame(4, 8 * 1008), true, 1024, 0, 0, 4, &mut 0, 0, 0)
+			.unwrap();
+		assert_eq!(batch.shard_count(), 9);
+		assert!(
+			other
+				.packetize(&frame(5, 16), true, 1024, 0, 0, 5, &mut 0, 0, 0)
+				.is_err()
+		);
+		assert_eq!(nonces.video.high_water(), VIDEO_NONCE_END);
+
+		// A newly published key restores service.
+		tx.send_replace(ActiveKeys::for_test([0x77; 16], 1));
+		let batch = packetizer
+			.packetize(&frame(6, 16), true, 1024, 0, 0, 6, &mut 0, 0, 0)
+			.unwrap();
+		assert!(decrypt_shards(&batch, &[0x77; 16]).is_ok());
+	}
+
 	#[test]
 	fn ordinary_frames_keep_fec() {
 		let layout = packet_layout(400, 20, 0).unwrap();
@@ -723,11 +951,12 @@ mod tests {
 	}
 
 	fn packetizer() -> Packetizer {
-		let (_tx, rx) = tokio::sync::watch::channel(crate::session::SessionKeyData {
-			remote_input_key: vec![0; 16],
-			remote_input_key_id: 0,
-		});
-		Packetizer::new(false, rx)
+		packetizer_with(false)
+	}
+
+	fn packetizer_with(encrypt: bool) -> Packetizer {
+		let (_tx, rx) = tokio::sync::watch::channel(ActiveKeys::for_test([0; 16], 0));
+		Packetizer::new(encrypt, rx)
 	}
 
 	#[test]

@@ -108,6 +108,7 @@ pub(super) fn handle_command(
 		},
 		pulse::Command::CreatePlaybackStream(params) => {
 			let mut sample_spec = params.sample_spec;
+			let mut spec_from_formats = false;
 			if sample_spec.format == pulse::SampleFormat::Invalid
 				&& let Some(format) = params.formats.iter().find_map(|f| match sample_spec_from_format(f) {
 					Ok(ss) => Some(ss),
@@ -117,6 +118,7 @@ pub(super) fn handle_command(
 					},
 				}) {
 				sample_spec = format;
+				spec_from_formats = true;
 			}
 
 			if !is_supported_format(sample_spec.format) {
@@ -139,6 +141,20 @@ pub(super) fn handle_command(
 			} else {
 				(sample_spec, params.channel_map)
 			};
+
+			// Validate the effective spec (after format/fix_channels fallbacks,
+			// which Wine relies on) before any arithmetic or allocation uses it.
+			// Like PulseAudio, the channel map must match an explicit spec.
+			let explicit_map = (!params.flags.fix_channels && !spec_from_formats).then_some(&stream_channel_map);
+			if let Err(reason) = validate_sample_spec(&stream_spec, explicit_map) {
+				tracing::warn!("rejecting playback stream: {reason}");
+				pulse::write_error(
+					&mut ClientWriter(&mut client.outgoing),
+					seq,
+					&pulse::PulseError::Invalid,
+				)?;
+				return Ok(());
+			}
 
 			let mut buffer_attr = params.buffer_attr;
 			configure_buffer(&mut buffer_attr, &stream_spec);
@@ -584,50 +600,91 @@ pub(super) fn handle_stream_write(client: &mut Client, desc: pulse::Descriptor, 
 	Ok(())
 }
 
+/// PA_CHANNELS_MAX; also the width of the playback buffer's per-frame scratch.
+const MAX_STREAM_CHANNELS: u8 = 32;
+/// PA_RATE_MAX.
+const MAX_STREAM_RATE: u32 = 48_000 * 16;
+
+/// Check a stream sample spec (and, for an explicit spec, its channel map)
+/// against the ranges PulseAudio itself accepts. A zero channel count or rate
+/// would otherwise reach frame-size and resampler division.
+fn validate_sample_spec(spec: &pulse::SampleSpec, channel_map: Option<&pulse::ChannelMap>) -> Result<(), String> {
+	if !is_supported_format(spec.format) {
+		return Err(format!("unsupported sample format {:?}", spec.format));
+	}
+	if !(1..=MAX_STREAM_CHANNELS).contains(&spec.channels) {
+		return Err(format!(
+			"channel count {} is outside 1..={MAX_STREAM_CHANNELS}",
+			spec.channels
+		));
+	}
+	if !(1..=MAX_STREAM_RATE).contains(&spec.sample_rate) {
+		return Err(format!(
+			"sample rate {} is outside 1..={MAX_STREAM_RATE}",
+			spec.sample_rate
+		));
+	}
+	if let Some(map) = channel_map
+		&& map.num_channels() != spec.channels
+	{
+		return Err(format!(
+			"channel map has {} channels but the sample spec has {}",
+			map.num_channels(),
+			spec.channels
+		));
+	}
+	Ok(())
+}
+
+/// Negotiate playback buffer attributes, as PulseAudio's
+/// `fix_playback_buffer_attr` does, for a spec accepted by `validate_sample_spec`.
+///
+/// `u32::MAX` selects a default. Arithmetic is done in `u64` so client values
+/// cannot overflow, and the result always satisfies:
+/// every value is a whole number of frames; `frame <= minreq`;
+/// `2 * minreq <= tlength <= maxlength <= 1 s`; `prebuf <= tlength`.
 fn configure_buffer(attr: &mut pulse::stream::BufferAttr, spec: &pulse::SampleSpec) {
-	let sample_size = spec.format.bytes_per_sample();
-	let frame_size = spec.channels as usize * sample_size;
-	let len_10ms = (frame_size * spec.sample_rate as usize / 100) as u32;
+	let frame = (spec.channels as u64 * spec.format.bytes_per_sample() as u64).max(1);
+	let align_up = |bytes: u64, unit: u64| bytes.div_ceil(unit) * unit;
+	let align_down = |bytes: u64| bytes / frame * frame;
+	// One 10 ms block, a whole number of frames (at least one).
+	let len_10ms = align_down(frame * u64::from(spec.sample_rate) / 100).max(frame);
+	// Half a block, but at least one frame (a block may be a single frame).
+	let half_10ms = align_up(len_10ms / 2, frame).max(frame);
+	let cap = len_10ms * 100;
 
-	if attr.max_length == u32::MAX {
-		attr.max_length = len_10ms * 20;
-	} else {
-		attr.max_length = attr.max_length.next_multiple_of(frame_size as u32).min(len_10ms * 100);
+	let max_length = match attr.max_length {
+		u32::MAX => len_10ms * 20,
+		requested => align_up(u64::from(requested), frame),
 	}
+	// Room for at least two minimum requests.
+	.clamp(2 * half_10ms, cap);
 
-	if attr.minimum_request_length == u32::MAX {
-		attr.minimum_request_length = (len_10ms / 2).next_multiple_of(frame_size as u32);
-	} else {
-		attr.minimum_request_length = attr
-			.minimum_request_length
-			.next_multiple_of(frame_size as u32)
-			.max(len_10ms / 2);
+	let minimum_request_length = match attr.minimum_request_length {
+		u32::MAX => half_10ms,
+		requested => align_up(u64::from(requested), frame).max(half_10ms),
 	}
+	.min(align_down(max_length / 2));
 
-	if attr.target_length == u32::MAX {
-		attr.target_length = (len_10ms * 6)
-			.next_multiple_of(attr.minimum_request_length)
-			.min(attr.max_length);
-	} else {
-		attr.target_length = attr
-			.target_length
-			.next_multiple_of(attr.minimum_request_length)
-			.max(len_10ms * 6)
-			.min(attr.max_length);
-
-		if attr.target_length < (attr.minimum_request_length * 2) {
-			attr.target_length = attr.minimum_request_length * 2;
-		}
+	let target_length = match attr.target_length {
+		u32::MAX => align_up(len_10ms * 6, minimum_request_length),
+		requested => align_up(u64::from(requested), minimum_request_length).max(len_10ms * 6),
 	}
+	.min(max_length)
+	.max(2 * minimum_request_length);
 
-	if attr.pre_buffering == u32::MAX {
-		attr.pre_buffering = attr.target_length;
-	} else {
-		attr.pre_buffering = attr
-			.pre_buffering
-			.next_multiple_of(attr.minimum_request_length)
-			.min(attr.target_length);
-	}
+	let pre_buffering = match attr.pre_buffering {
+		u32::MAX => target_length,
+		requested => align_up(u64::from(requested), minimum_request_length).min(target_length),
+	};
+
+	// Every value is bounded by `cap` (1 s of at most 32 x 4-byte channels at
+	// PA_RATE_MAX), which fits in u32.
+	let narrow = |bytes: u64| u32::try_from(bytes).unwrap_or(u32::MAX);
+	attr.max_length = narrow(max_length);
+	attr.minimum_request_length = narrow(minimum_request_length);
+	attr.target_length = narrow(target_length);
+	attr.pre_buffering = narrow(pre_buffering);
 }
 
 fn write_reply<T: pulse::CommandReply + std::fmt::Debug>(
@@ -682,5 +739,147 @@ fn sink_input_info_from_stream(stream: &PlaybackStream, client_id: u32) -> pulse
 		has_volume: true,
 		volume_writable: true,
 		..Default::default()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn spec(format: pulse::SampleFormat, channels: u8, sample_rate: u32) -> pulse::SampleSpec {
+		pulse::SampleSpec {
+			format,
+			channels,
+			sample_rate,
+		}
+	}
+
+	fn stereo() -> pulse::SampleSpec {
+		spec(pulse::SampleFormat::S16Le, 2, 48_000)
+	}
+
+	fn defaults() -> pulse::stream::BufferAttr {
+		pulse::stream::BufferAttr {
+			max_length: u32::MAX,
+			target_length: u32::MAX,
+			pre_buffering: u32::MAX,
+			minimum_request_length: u32::MAX,
+			fragment_size: u32::MAX,
+		}
+	}
+
+	fn assert_invariants(attr: &pulse::stream::BufferAttr, spec: &pulse::SampleSpec) {
+		let frame = spec.channels as u32 * spec.format.bytes_per_sample() as u32;
+		for value in [
+			attr.max_length,
+			attr.minimum_request_length,
+			attr.target_length,
+			attr.pre_buffering,
+		] {
+			assert_eq!(value % frame, 0, "{attr:?} for {spec:?}");
+		}
+		assert!(attr.minimum_request_length >= frame, "{attr:?}");
+		assert!(attr.target_length >= 2 * attr.minimum_request_length, "{attr:?}");
+		assert!(attr.target_length <= attr.max_length, "{attr:?}");
+		assert!(attr.pre_buffering <= attr.target_length, "{attr:?}");
+		let one_second = spec.sample_rate as u64 * frame as u64;
+		assert!(
+			u64::from(attr.max_length) <= one_second.max(100 * frame as u64),
+			"{attr:?}"
+		);
+	}
+
+	#[test]
+	fn default_stereo_negotiation_is_unchanged() {
+		let mut attr = defaults();
+		configure_buffer(&mut attr, &stereo());
+		// 10 ms of 48 kHz S16 stereo is 1920 bytes.
+		assert_eq!(attr.max_length, 1920 * 20);
+		assert_eq!(attr.minimum_request_length, 960);
+		assert_eq!(attr.target_length, 1920 * 6);
+		assert_eq!(attr.pre_buffering, 1920 * 6);
+	}
+
+	#[test]
+	fn invalid_specs_are_rejected_before_buffer_arithmetic() {
+		for invalid in [
+			spec(pulse::SampleFormat::S16Le, 0, 48_000),
+			spec(pulse::SampleFormat::S16Le, 33, 48_000),
+			spec(pulse::SampleFormat::S16Le, u8::MAX, 48_000),
+			spec(pulse::SampleFormat::S16Le, 2, 0),
+			spec(pulse::SampleFormat::S16Le, 2, MAX_STREAM_RATE + 1),
+			spec(pulse::SampleFormat::S16Le, 2, u32::MAX),
+			spec(pulse::SampleFormat::Invalid, 2, 48_000),
+			spec(pulse::SampleFormat::Alaw, 2, 48_000),
+		] {
+			assert!(validate_sample_spec(&invalid, None).is_err(), "{invalid:?}");
+		}
+		for valid in [
+			stereo(),
+			spec(pulse::SampleFormat::Float32Le, 1, 8_000),
+			spec(pulse::SampleFormat::S24Le, 6, 96_000),
+			spec(pulse::SampleFormat::S32Be, 8, 192_000),
+			spec(pulse::SampleFormat::U8, 32, MAX_STREAM_RATE),
+			spec(pulse::SampleFormat::S16Le, 2, 1),
+		] {
+			assert!(validate_sample_spec(&valid, None).is_ok(), "{valid:?}");
+		}
+	}
+
+	#[test]
+	fn explicit_channel_maps_must_match_the_spec() {
+		let stereo_map = pulse::ChannelMap::stereo();
+		assert!(validate_sample_spec(&stereo(), Some(&stereo_map)).is_ok());
+		let surround = spec(pulse::SampleFormat::S16Le, 6, 48_000);
+		assert!(validate_sample_spec(&surround, Some(&stereo_map)).is_err());
+		// Format-derived and fix_channels specs are not checked against the map.
+		assert!(validate_sample_spec(&surround, None).is_ok());
+	}
+
+	#[test]
+	fn extreme_attributes_keep_invariants_without_overflow() {
+		let edge = [0, 1, 2, 3, 959, 960, 961, u32::MAX - 2, u32::MAX - 1];
+		let specs = [
+			stereo(),
+			spec(pulse::SampleFormat::U8, 1, 1),
+			spec(pulse::SampleFormat::S24Le, 3, 44_100),
+			spec(pulse::SampleFormat::S24Le, 7, 11_025),
+			spec(pulse::SampleFormat::Float32Le, 32, MAX_STREAM_RATE),
+			spec(pulse::SampleFormat::S16Le, 2, 99),
+		];
+		for spec in specs {
+			for max_length in edge.iter().copied().chain([u32::MAX]) {
+				for minimum_request_length in edge.iter().copied().chain([u32::MAX]) {
+					for target_length in edge.iter().copied().chain([u32::MAX]) {
+						for pre_buffering in [0, 1, u32::MAX - 1, u32::MAX] {
+							let mut attr = pulse::stream::BufferAttr {
+								max_length,
+								target_length,
+								pre_buffering,
+								minimum_request_length,
+								fragment_size: u32::MAX,
+							};
+							configure_buffer(&mut attr, &spec);
+							assert_invariants(&attr, &spec);
+						}
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn renegotiation_is_idempotent() {
+		let mut attr = pulse::stream::BufferAttr {
+			max_length: 7777,
+			target_length: 3333,
+			pre_buffering: 1111,
+			minimum_request_length: 1001,
+			fragment_size: u32::MAX,
+		};
+		configure_buffer(&mut attr, &stereo());
+		let first = attr;
+		configure_buffer(&mut attr, &stereo());
+		assert_eq!(attr, first);
 	}
 }

@@ -9,7 +9,7 @@ use super::pacing_timer::PacingTimer;
 use super::shard_batch::ShardBatch;
 
 /// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
-const MAX_UDP_PAYLOAD: usize = 65507;
+pub(super) const MAX_UDP_PAYLOAD: usize = 65507;
 /// Use the common 64-segment GSO cadence for pacing even when GSO is off.
 const MAX_PACING_SEGMENTS: usize = 64;
 

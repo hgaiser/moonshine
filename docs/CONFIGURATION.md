@@ -102,7 +102,11 @@ private_key = "$HOME/.config/moonshine/key.pem"
 | `private_key` | path string, `$HOME/.config/moonshine/key.pem` | TLS private key file, created if needed. Required in an explicit table. Supports `~` and environment-variable expansion. Keep it private. |
 
 Changing ports may require corresponding client and firewall changes. Keep
-listeners accessible only over a trusted LAN or VPN.
+listeners accessible only over a trusted LAN or VPN. Startup refuses a
+configuration in which two TCP listeners (`webserver.port`,
+`webserver.port_https`, `stream.port`) or two UDP listeners
+(`stream.video.port`, `stream.audio.port`, `stream.control.port`) share a
+nonzero port, or whose `address` is not an IP address.
 
 Pairing approval is an operator action on the host. `/pin` and `/submit-pin`
 reject requests whose peer or `Host` is not loopback and cross-origin browser
@@ -144,7 +148,7 @@ ssh -L 47989:localhost:47989 user@host
 | `encrypt` | boolean, `false` | Enable AES-128-GCM video encryption when supported by client negotiation. |
 | `log_stats` | boolean, `true` | Emit five-second capture, pipeline, transport, DMA-BUF, runtime/CPU/memory/fd summaries and swapchain feedback. `false` skips diagnostic accumulation and process sampling; benchmark statistics, operational warnings/errors, and separately enabled frame-spike logs remain available. |
 | `log_frame_spikes` | boolean, `false` | Warn when a frame's encoding and packetization exceeds the frame budget. Useful for latency diagnostics. |
-| `max_packet_size` | nonnegative integer, `0` | Cap the client-requested stream packet size in bytes. `0` disables the cap; caps below `200` are ignored with a warning. Smaller client requests are honored. |
+| `max_packet_size` | nonnegative integer, `0` | Cap the client-requested stream packet size in bytes. `0` disables the cap; caps below `200` are ignored with a warning. Smaller client requests are honored. With video encryption the cap also covers the 32-byte encryption prefix, keeping the same on-wire size. |
 
 To silence periodic streaming statistics, add this to the existing video table
 and restart Pyroshine (set it to `true` to enable them again):
@@ -165,6 +169,10 @@ FEC adds bandwidth overhead; it does not replace a reliable network connection.
 16 additional bytes of stream overhead. For example, an IPv4 path with MTU
 1420 can use `1376` (1420 − 20 IP − 8 UDP − 16 stream overhead). IPv6 and other
 tunnels have different overheads. See [PyroWave transport details](PYROWAVE.md).
+An encrypted video stream spends 32 bytes of each packet on the encryption
+prefix (Moonlight already announces a correspondingly smaller packet size), so
+the cap is applied to the remaining payload and the datagram size is unchanged.
+Requests whose datagram would exceed one UDP payload (65507 bytes) are rejected.
 
 ### `[stream.audio]`
 

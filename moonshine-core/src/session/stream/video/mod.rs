@@ -90,7 +90,11 @@ impl VideoStreamConfig {
 	/// A client only asks for what it believes it can receive, so a request
 	/// smaller than the cap is honored; the cap only lowers oversized requests.
 	/// A cap of `0` disables the limit.
-	pub(crate) fn clamp_packet_size(&self, requested: usize) -> usize {
+	///
+	/// The cap bounds the on-wire datagram at `max_packet_size + 16` bytes. An
+	/// encrypted stream's packet size excludes its 32-byte per-shard prefix
+	/// (Moonlight subtracts it before announcing), so the cap does as well.
+	pub(crate) fn clamp_packet_size(&self, requested: usize, encrypted: bool) -> usize {
 		if self.max_packet_size == 0 {
 			return requested;
 		}
@@ -101,7 +105,12 @@ impl VideoStreamConfig {
 			);
 			return requested;
 		}
-		requested.min(self.max_packet_size)
+		let cap = if encrypted {
+			self.max_packet_size - packetizer::ENC_PREFIX_SIZE
+		} else {
+			self.max_packet_size
+		};
+		requested.min(cap)
 	}
 }
 
@@ -197,6 +206,42 @@ pub struct VideoStreamContext {
 }
 
 impl VideoStreamContext {
+	/// Check every value that timing, allocation, encoder and transport code
+	/// consume. Callers validate before pausing or reconfiguring a live epoch.
+	pub(crate) fn validate(&self) -> Result<(), String> {
+		crate::session::negotiation::validate_display_mode(self.width, self.height, self.fps)?;
+		self.format.validate().map_err(str::to_string)?;
+		if self.packet_size < packetizer::MIN_VIDEO_PACKET_SIZE {
+			return Err(format!(
+				"video packet size {} is below the {}-byte protocol minimum",
+				self.packet_size,
+				packetizer::MIN_VIDEO_PACKET_SIZE
+			));
+		}
+		match packetizer::wire_shard_size(self.packet_size, self.encrypt_video) {
+			Some(shard) if shard <= gso_socket::MAX_UDP_PAYLOAD => {},
+			_ => {
+				return Err(format!(
+					"video packet size {} does not fit one UDP datagram{}",
+					self.packet_size,
+					if self.encrypt_video { " with encryption" } else { "" }
+				));
+			},
+		}
+		if self.bitrate == 0 {
+			return Err("video bitrate must be non-zero".to_string());
+		}
+		// Vulkan Video rate control takes a 32-bit bit rate; PyroWave budgets
+		// with checked `usize` arithmetic and has no such limit.
+		if self.format.codec != VideoCodec::PyroWave && u32::try_from(self.bitrate).is_err() {
+			return Err(format!(
+				"video bitrate {} bps exceeds the {} encoder's 32-bit rate-control range",
+				self.bitrate, self.format.codec
+			));
+		}
+		Ok(())
+	}
+
 	/// Names of negotiated properties whose change requires a new stream epoch.
 	///
 	/// Keep this list next to the context definition so newly-added negotiated
@@ -890,21 +935,128 @@ mod tests {
 
 	#[test]
 	fn no_cap_honors_requested() {
-		assert_eq!(config(0).clamp_packet_size(1392), 1392);
+		assert_eq!(config(0).clamp_packet_size(1392, false), 1392);
 	}
 
 	#[test]
 	fn smaller_client_request_is_honored() {
-		assert_eq!(config(1200).clamp_packet_size(1024), 1024);
+		assert_eq!(config(1200).clamp_packet_size(1024, false), 1024);
 	}
 
 	#[test]
 	fn larger_client_request_is_capped() {
-		assert_eq!(config(1200).clamp_packet_size(1392), 1200);
+		assert_eq!(config(1200).clamp_packet_size(1392, false), 1200);
+	}
+
+	#[test]
+	fn encrypted_cap_preserves_the_configured_wire_size() {
+		// Moonlight announces 1392 - 32 for an encrypted 1392-byte stream.
+		assert_eq!(config(1376).clamp_packet_size(1360, true), 1344);
+		assert_eq!(config(1376).clamp_packet_size(1300, true), 1300);
+		let wire = |size, encrypted| packetizer::wire_shard_size(size, encrypted).unwrap();
+		assert_eq!(wire(config(1376).clamp_packet_size(1360, true), true), 1376 + 16);
+		assert_eq!(wire(config(1376).clamp_packet_size(1392, false), false), 1376 + 16);
+	}
+
+	fn valid_context() -> VideoStreamContext {
+		VideoStreamContext {
+			width: 3840,
+			height: 2160,
+			fps: 120,
+			packet_size: 1392,
+			bitrate: 900_000_000,
+			format: NegotiatedVideoFormat::sdr(
+				VideoCodec::Hevc,
+				ChromaFormat::Yuv420,
+				BitDepth::Eight,
+				ColorRange::Limited,
+			),
+			max_reference_frames: 1,
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn high_end_contexts_validate() {
+		for (width, height, fps, bitrate) in [
+			(3840, 2160, 120, 650_000_000),
+			(3840, 2160, 144, 900_000_000),
+			(3840, 2160, 240, 900_000_000),
+			(7680, 4320, 60, 900_000_000),
+			(2560, 1440, 500, 150_000_000),
+		] {
+			for encrypt_video in [false, true] {
+				let context = VideoStreamContext {
+					width,
+					height,
+					fps,
+					bitrate,
+					encrypt_video,
+					..valid_context()
+				};
+				assert_eq!(context.validate(), Ok(()), "{width}x{height}@{fps} {bitrate}");
+			}
+		}
+		// PyroWave budgets beyond the conventional encoder's 32-bit range.
+		let pyrowave = VideoStreamContext {
+			bitrate: u32::MAX as usize + 1,
+			format: NegotiatedVideoFormat::sdr(
+				VideoCodec::PyroWave,
+				ChromaFormat::Yuv420,
+				BitDepth::Eight,
+				ColorRange::Full,
+			),
+			..valid_context()
+		};
+		assert_eq!(pyrowave.validate(), Ok(()));
+	}
+
+	#[test]
+	fn degenerate_contexts_are_rejected() {
+		let cases: [fn(&mut VideoStreamContext); 11] = [
+			|c| c.fps = 0,
+			|c| c.width = 0,
+			|c| c.height = 0,
+			|c| c.width = 16_385,
+			|c| c.fps = u32::MAX,
+			|c| c.bitrate = 0,
+			|c| c.bitrate = u32::MAX as usize + 1,
+			|c| c.packet_size = 0,
+			|c| c.packet_size = 23,
+			|c| c.packet_size = gso_socket::MAX_UDP_PAYLOAD,
+			|c| c.packet_size = usize::MAX,
+		];
+		for (index, mutate) in cases.iter().enumerate() {
+			let mut context = valid_context();
+			mutate(&mut context);
+			assert!(context.validate().is_err(), "case {index}: {context:?}");
+		}
+		// Largest datagram-sized packets: encryption costs exactly its prefix.
+		let largest = gso_socket::MAX_UDP_PAYLOAD - 16;
+		let plain = VideoStreamContext {
+			packet_size: largest,
+			..valid_context()
+		};
+		assert_eq!(plain.validate(), Ok(()));
+		let encrypted = VideoStreamContext {
+			encrypt_video: true,
+			..plain.clone()
+		};
+		assert!(encrypted.validate().is_err());
+		let encrypted = VideoStreamContext {
+			packet_size: largest - packetizer::ENC_PREFIX_SIZE,
+			..encrypted
+		};
+		assert_eq!(encrypted.validate(), Ok(()));
+		let minimum = VideoStreamContext {
+			packet_size: packetizer::MIN_VIDEO_PACKET_SIZE,
+			..valid_context()
+		};
+		assert_eq!(minimum.validate(), Ok(()));
 	}
 
 	#[test]
 	fn undersized_cap_is_ignored() {
-		assert_eq!(config(50).clamp_packet_size(1392), 1392);
+		assert_eq!(config(50).clamp_packet_size(1392, false), 1392);
 	}
 }

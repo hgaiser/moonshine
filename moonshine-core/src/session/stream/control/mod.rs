@@ -15,6 +15,7 @@ use crate::session::compositor::{
 	frame::{HdrMetadata, HdrModeState},
 	input::CompositorInputEvent,
 };
+use crate::session::keys::ActiveKeys;
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::audio::AudioStartHandle;
 use crate::session::stream::video::VideoStreamHandle;
@@ -469,15 +470,18 @@ fn build_termination_payload(error_code: u32) -> Vec<u8> {
 }
 
 /// Send an encrypted control packet to the connected peer if it exists and is connected.
-fn send_to_peer(
-	host: &mut Host,
-	peer_id: tokio_enet::PeerId,
-	key: &[u8],
-	sequence_number: u32,
-	payload: &[u8],
-	label: &str,
-) {
-	if let Ok(packet) = encode_control(key, sequence_number, payload)
+/// Encrypt and send a host-originated message. Its envelope sequence number
+/// is the GCM nonce counter, so it is allocated from the key's control nonce
+/// sequence: it never restarts for a key that was used before (resume with the
+/// same key, a new control task, or a later session reusing the key).
+fn send_to_peer(host: &mut Host, peer_id: tokio_enet::PeerId, keys: &ActiveKeys, payload: &[u8], label: &str) {
+	let Ok(sequence_number) = keys.material().nonces().control.reserve(1) else {
+		tracing::error!("Control encryption nonce space exhausted; not sending {label}");
+		return;
+	};
+	// `CONTROL_NONCE_END` bounds the sequence to the 32-bit envelope field.
+	let sequence_number = sequence_number as u32;
+	if let Ok(packet) = encode_control(keys.key().as_bytes(), sequence_number, payload)
 		&& let Some(peer) = host.peer_mut(peer_id)
 		&& peer.state() == PeerState::Connected
 	{
@@ -488,22 +492,14 @@ fn send_to_peer(
 }
 
 /// Build and send an HDR mode control message, then advance `sequence_number`.
-fn send_hdr_state(
-	host: &mut Host,
-	peer_id: tokio_enet::PeerId,
-	state: &HdrModeState,
-	key: &[u8],
-	sequence_number: &mut u32,
-	label: &str,
-) {
+fn send_hdr_state(host: &mut Host, peer_id: tokio_enet::PeerId, state: &HdrModeState, keys: &ActiveKeys, label: &str) {
 	let metadata = if state.enabled {
 		Some(state.metadata.unwrap_or_else(HdrMetadata::fallback))
 	} else {
 		None
 	};
 	let payload = build_hdr_mode_payload(state.enabled, metadata.as_ref());
-	send_to_peer(host, peer_id, key, *sequence_number, &payload, label);
-	*sequence_number += 1;
+	send_to_peer(host, peer_id, keys, &payload, label);
 	tracing::debug!("Sent HDR mode ({label}) to client: enabled={}", state.enabled);
 }
 
@@ -546,8 +542,6 @@ async fn run_control_loop(
 	// Create a channel over which we can receive feedback messages to send to the connected client.
 	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
 
-	// Sequence number of feedback messages.
-	let mut sequence_number = 0u32;
 	let mut send_hdr_mode = false;
 	let mut audio_triggered = false;
 	// Only the peer that authenticated the current generation is dispatched
@@ -573,9 +567,8 @@ async fn run_control_loop(
 		{
 			tracing::debug!("Sending control feedback command: {command:?}");
 			let payload = command.as_packet();
-			let key = context.keys_rx.borrow().remote_input_key.clone();
-			send_to_peer(&mut host, peer_id, &key, sequence_number, &payload, "feedback");
-			sequence_number += 1;
+			let keys = context.keys_rx.borrow().clone();
+			send_to_peer(&mut host, peer_id, &keys, &payload, "feedback");
 		}
 
 		let event = host
@@ -614,7 +607,7 @@ async fn run_control_loop(
 			})) => {
 				let authenticated = {
 					let keys = context.keys_rx.borrow();
-					peers.authenticate(peer_id, packet.data(), &keys.remote_input_key)
+					peers.authenticate(peer_id, packet.data(), keys.key().as_bytes())
 				};
 				let decrypted = match authenticated {
 					Ok(decrypted) => decrypted,
@@ -683,9 +676,9 @@ async fn run_control_loop(
 			send_hdr_mode = false;
 			if let Some(peer_id) = peers.active() {
 				let state = hdr_metadata_rx.borrow_and_update().clone();
-				let key = context.keys_rx.borrow().remote_input_key.clone();
+				let keys = context.keys_rx.borrow().clone();
 				tracing::info!("Informing client: HDR session");
-				send_hdr_state(&mut host, peer_id, &state, &key, &mut sequence_number, "initial");
+				send_hdr_state(&mut host, peer_id, &state, &keys, "initial");
 			}
 		}
 
@@ -694,15 +687,8 @@ async fn run_control_loop(
 			&& let Some(peer_id) = peers.active()
 		{
 			let state = hdr_metadata_rx.borrow_and_update().clone();
-			let key = context.keys_rx.borrow().remote_input_key.clone();
-			send_hdr_state(
-				&mut host,
-				peer_id,
-				&state,
-				&key,
-				&mut sequence_number,
-				"metadata update",
-			);
+			let keys = context.keys_rx.borrow().clone();
+			send_hdr_state(&mut host, peer_id, &state, &keys, "metadata update");
 		}
 	}
 
@@ -713,15 +699,8 @@ async fn run_control_loop(
 	// client as a graceful shutdown so it does not display an error.
 	let termination_payload = build_termination_payload(0x80030023);
 	if let Some(peer_id) = peers.active() {
-		let key = context.keys_rx.borrow().remote_input_key.clone();
-		send_to_peer(
-			&mut host,
-			peer_id,
-			&key,
-			sequence_number,
-			&termination_payload,
-			"termination",
-		);
+		let keys = context.keys_rx.borrow().clone();
+		send_to_peer(&mut host, peer_id, &keys, &termination_payload, "termination");
 	}
 	let _ = host.flush().await;
 
@@ -919,9 +898,9 @@ mod tests {
 		use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerId};
 
 		use super::*;
-		use crate::session::SessionKeyData;
 		use crate::session::authorization::StreamAuthorization;
 		use crate::session::stream::video::VideoPacketMessage;
+		use crate::session::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
 
 		const NEW_KEY: [u8; 16] = [5; 16];
 
@@ -1025,10 +1004,11 @@ mod tests {
 			authorization.require_session_id();
 			let connect_data = authorization.control_connect_data();
 			let (authorization_tx, authorization_rx) = watch::channel(authorization);
-			let (keys_tx, keys_rx) = watch::channel(SessionKeyData {
-				remote_input_key: KEY.to_vec(),
-				remote_input_key_id: 1,
-			});
+			let mut ledger = crate::session::keys::KeyLedger::default();
+			let (keys_tx, keys_rx) = watch::channel(ledger.publish(SessionKeyData::new(
+				RemoteInputKey::from_bytes(KEY),
+				RemoteInputKeyId::new(1),
+			)));
 
 			let host = Host::new(HostConfig {
 				address: Some(SocketAddr::new(client_ip.into(), 0)),
@@ -1136,10 +1116,10 @@ mod tests {
 			next.require_session_id();
 			let next_data = next.control_connect_data();
 			authorization_tx.send_replace(next);
-			keys_tx.send_replace(SessionKeyData {
-				remote_input_key: NEW_KEY.to_vec(),
-				remote_input_key_id: 2,
-			});
+			keys_tx.send_replace(ledger.publish(SessionKeyData::new(
+				RemoteInputKey::from_bytes(NEW_KEY),
+				RemoteInputKeyId::new(2),
+			)));
 			legit.pump(Duration::from_millis(100)).await;
 			assert!(legit.disconnected, "stale generation peer is disconnected");
 			legit.send(&KEY, &request_idr).await;

@@ -5,6 +5,7 @@ use tokio::sync::mpsc;
 
 use crate::crypto::encrypt_cbc;
 use crate::session::SessionKeysReceiver;
+use crate::session::keys::RemoteInputKeyId;
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::RtpHeader;
 
@@ -98,6 +99,15 @@ fn create_encoder(sample_rate: u32, stream_config: &OpusStreamConfig) -> Result<
 		.set_bitrate(opus::Bitrate::Bits(stream_config.bitrate as i32))
 		.map_err(|e| tracing::warn!("Failed to set audio bitrate: {e}"))?;
 	Ok(encoder)
+}
+
+/// GameStream audio AES-CBC IV: big-endian `rikeyid + RTP sequence number`,
+/// zero-padded. The client computes this sum in wrapping 32-bit arithmetic, so
+/// any accepted key ID (including those near `u32::MAX`) must wrap here too.
+fn audio_iv(key_id: RemoteInputKeyId, sequence_number: u16) -> [u8; 16] {
+	let mut iv = [0u8; 16];
+	iv[..4].copy_from_slice(&key_id.get().wrapping_add(u32::from(sequence_number)).to_be_bytes());
+	iv
 }
 
 struct AudioEncoderInner {}
@@ -237,10 +247,8 @@ impl AudioEncoderInner {
 			// Encrypt the audio data if encryption is enabled.
 			let payload = match encrypt {
 				true => {
-					let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
-					let mut iv = iv.to_be_bytes().to_vec();
-					iv.extend([0u8; 12]);
-					match encrypt_cbc(&encoded_audio[..encoded_size], &keys.remote_input_key, &iv) {
+					let iv = audio_iv(keys.key_id(), sequence_number);
+					match encrypt_cbc(&encoded_audio[..encoded_size], keys.key().as_bytes(), &iv) {
 						Ok(payload) => payload,
 						Err(e) => {
 							tracing::warn!("Failed to encrypt audio: {e}");
@@ -367,5 +375,27 @@ impl AudioEncoderInner {
 		}
 
 		tracing::debug!("Audio encoder stopped.");
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn audio_iv_matches_the_client_for_extreme_key_ids() {
+		// moonlight-common-c: `BE32(avRiKeyId + rtp->sequenceNumber)` in uint32.
+		for (key_id, sequence, expected) in [
+			(0u32, 0u16, 0u32),
+			(1, 1, 2),
+			(u32::MAX, 1, 0),
+			(u32::MAX, u16::MAX, u32::from(u16::MAX) - 1),
+			(i32::MIN as u32, u16::MAX, (i32::MIN as u32) + u32::from(u16::MAX)),
+			(i32::MAX as u32, 1, 1 << 31),
+		] {
+			let iv = audio_iv(RemoteInputKeyId::new(key_id), sequence);
+			assert_eq!(iv[..4], expected.to_be_bytes(), "{key_id} + {sequence}");
+			assert_eq!(iv[4..], [0; 12]);
+		}
 	}
 }

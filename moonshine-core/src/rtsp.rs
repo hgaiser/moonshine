@@ -20,6 +20,7 @@ use crate::healthcheck::{
 use crate::ingress::Ingress;
 use crate::session::authorization::{ML_FF_SESSION_ID_V1, MediaStream, StreamAuthorization, canonical_ip};
 use crate::session::manager::SessionManager;
+use crate::session::negotiation;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::audio::AudioChannels;
 use crate::session::stream::audio::AudioConfig;
@@ -387,7 +388,14 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
-		let packet_size = self.video_config.clamp_packet_size(requested_packet_size);
+		// Parse the client's encryption flags from the ANNOUNCE SDP. The packet
+		// size cap depends on whether video carries the encryption prefix.
+		let client_encryption_flags: u8 =
+			get_optional_sdp_attribute(&sdp_session, "x-ss-general.encryptionEnabled").unwrap_or(0);
+		let encrypt_video = self.video_config.encrypt && (client_encryption_flags & EncryptionFlags::Video as u8 != 0);
+		let packet_size = self
+			.video_config
+			.clamp_packet_size(requested_packet_size, encrypt_video);
 		if packet_size != requested_packet_size {
 			tracing::info!("Clamping client video packet size from {requested_packet_size} to {packet_size} bytes.");
 		}
@@ -484,10 +492,6 @@ impl RtspServer {
 			if full_range { "full" } else { "limited" }
 		);
 
-		// Parse the client's encryption flags from the ANNOUNCE SDP.
-		let client_encryption_flags: u8 =
-			get_optional_sdp_attribute(&sdp_session, "x-ss-general.encryptionEnabled").unwrap_or(0);
-
 		let range = if full_range {
 			ColorRange::Full
 		} else {
@@ -546,8 +550,13 @@ impl RtspServer {
 			qos: video_qos_type != "0",
 			format,
 			max_reference_frames,
-			encrypt_video: self.video_config.encrypt && (client_encryption_flags & EncryptionFlags::Video as u8 != 0),
+			encrypt_video,
 		};
+		// Reject before the session manager pauses or reconfigures anything.
+		if let Err(reason) = video_stream_context.validate() {
+			tracing::warn!(reason, "Rejecting invalid video negotiation");
+			return bad_request(cseq, request.version(), &reason);
+		}
 
 		let packet_duration: u32 = match get_sdp_attribute(&sdp_session, "x-nv-aqos.packetDuration") {
 			Ok(packet_duration) => packet_duration,
@@ -556,6 +565,11 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
+		// Unsupported durations used to fall back to 5 ms silently.
+		if let Err(reason) = negotiation::validate_audio_packet_duration(packet_duration) {
+			tracing::warn!(reason, "Rejecting invalid audio negotiation");
+			return bad_request(cseq, request.version(), &reason);
+		}
 		let audio_qos_type: String = match get_sdp_attribute(&sdp_session, "x-nv-aqos.qosTrafficType") {
 			Ok(audio_qos_type) => audio_qos_type,
 			Err(()) => {
@@ -565,7 +579,7 @@ impl RtspServer {
 		};
 
 		// Parse surround audio attributes from SDP.
-		let surround_channels: u8 =
+		let surround_channels: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.numChannels").unwrap_or(2);
 		let surround_mask: u32 =
 			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.channelMask").unwrap_or(0x3);
@@ -574,7 +588,13 @@ impl RtspServer {
 			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.AudioQuality").unwrap_or(1);
 
 		let (channels, channel_mask) = if surround_enable != 0 {
-			(AudioChannels::from(surround_channels), surround_mask)
+			match negotiation::audio_channels(surround_channels) {
+				Ok(channels) => (channels, surround_mask),
+				Err(reason) => {
+					tracing::warn!(reason, "Rejecting invalid audio negotiation");
+					return bad_request(cseq, request.version(), &reason);
+				},
+			}
 		} else {
 			// Fall back to the values from the HTTP launch request.
 			let ctx = self.session_manager.get_session_context().await;
@@ -861,6 +881,14 @@ fn normalize_request_target(request: Vec<u8>) -> Vec<u8> {
 	normalized
 }
 
+/// A 400 response whose body tells the client which value was rejected.
+fn bad_request(cseq: i32, version: rtsp_types::Version, reason: &str) -> rtsp_types::Response<Vec<u8>> {
+	rtsp_types::Response::builder(version, rtsp_types::StatusCode::BadRequest)
+		.header(headers::CSEQ, cseq.to_string())
+		.header(headers::CONTENT_TYPE, "text/plain")
+		.build(reason.as_bytes().to_vec())
+}
+
 fn rtsp_response(
 	cseq: i32,
 	version: rtsp_types::Version,
@@ -965,6 +993,121 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 #[cfg(test)]
 mod tests {
 	use super::bitrate_bps_from_kbps;
+
+	/// CFG-001: ANNOUNCE rejects values that timing, allocation, transport or
+	/// audio code cannot honor with a 400 before the session manager sees them,
+	/// while admitting high-end 4K/high-refresh/high-bitrate requests.
+	mod negotiation_domains {
+		use super::super::*;
+		use crate::healthcheck::CODEC_HEVC;
+
+		fn sdp(overrides: &[(&str, &str)]) -> String {
+			let mut attributes = vec![
+				("x-nv-video[0].clientViewportWd", "3840"),
+				("x-nv-video[0].clientViewportHt", "2160"),
+				("x-nv-video[0].maxFPS", "120"),
+				("x-nv-video[0].packetSize", "1392"),
+				("x-ml-video.configuredBitrateKbps", "900000"),
+				("x-nv-vqos[0].fec.minRequiredFecPackets", "2"),
+				("x-nv-vqos[0].qosTrafficType", "5"),
+				("x-nv-vqos[0].bitStreamFormat", "1"),
+				("x-nv-aqos.packetDuration", "5"),
+				("x-nv-aqos.qosTrafficType", "4"),
+				("x-ss-general.encryptionEnabled", "7"),
+			];
+			for (name, value) in overrides {
+				match attributes.iter_mut().find(|(existing, _)| existing == name) {
+					Some(attribute) => attribute.1 = value,
+					None => attributes.push((name, value)),
+				}
+			}
+			let mut body = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=test\r\nt=0 0\r\n".to_string();
+			for (name, value) in attributes {
+				body.push_str(&format!("a={name}:{value}\r\n"));
+			}
+			body
+		}
+
+		async fn announce(server: &RtspServer, grant: &StreamAuthorization, body: String) -> (u16, String) {
+			let request = rtsp_types::Request::builder(Method::Announce, rtsp_types::Version::V1_0)
+				.header(headers::CSEQ, "6")
+				.build(body.into_bytes());
+			let response = server.handle_announce_request(&request, 6, grant).await;
+			(
+				response.status().into(),
+				String::from_utf8_lossy(response.body()).into_owned(),
+			)
+		}
+
+		#[tokio::test]
+		async fn announce_validates_numeric_domains_before_the_session() {
+			let shutdown = ShutdownManager::new();
+			let manager = SessionManager::for_test(shutdown.clone());
+			let grant = manager.authorize_client_for_test("127.0.0.1".parse().unwrap()).await;
+			let mut server = RtspServer::for_test(manager, RtspLimits::default());
+			server.supported_codecs = CODEC_HEVC;
+			server.video_config.encrypt = true;
+
+			// Valid requests pass validation and reach the manager, which refuses
+			// them only because no session was launched (500, not 400).
+			for overrides in [
+				&[][..],
+				&[("x-nv-video[0].maxFPS", "240")][..],
+				&[("x-ml-video.configuredBitrateKbps", "650000")][..],
+				&[
+					("x-nv-video[0].clientViewportWd", "7680"),
+					("x-nv-video[0].clientViewportHt", "4320"),
+				][..],
+				&[("x-nv-aqos.packetDuration", "10")][..],
+				&[
+					("x-nv-audio.surround.enable", "1"),
+					("x-nv-audio.surround.numChannels", "8"),
+				][..],
+				// Encrypted jumbo packets that still fit one datagram.
+				&[("x-nv-video[0].packetSize", "65459")][..],
+			] {
+				let (status, body) = announce(&server, &grant, sdp(overrides)).await;
+				assert_eq!(status, 500, "{overrides:?}: {body}");
+			}
+
+			for (overrides, reason) in [
+				(&[("x-nv-video[0].maxFPS", "0")][..], "refresh rate"),
+				(&[("x-nv-video[0].clientViewportWd", "0")][..], "width"),
+				(&[("x-nv-video[0].clientViewportHt", "100000")][..], "height"),
+				(&[("x-nv-video[0].packetSize", "0")][..], "packet size"),
+				(&[("x-nv-video[0].packetSize", "16")][..], "packet size"),
+				// Fits without, but not with, the 32-byte encryption prefix.
+				(&[("x-nv-video[0].packetSize", "65460")][..], "UDP datagram"),
+				(
+					&[("x-nv-video[0].packetSize", "18446744073709551615")][..],
+					"UDP datagram",
+				),
+				(&[("x-ml-video.configuredBitrateKbps", "0")][..], "bitrate"),
+				(&[("x-ml-video.configuredBitrateKbps", "5000000")][..], "32-bit"),
+				(&[("x-nv-aqos.packetDuration", "20")][..], "audio packet duration"),
+				(&[("x-nv-aqos.packetDuration", "0")][..], "audio packet duration"),
+				(
+					&[
+						("x-nv-audio.surround.enable", "1"),
+						("x-nv-audio.surround.numChannels", "4"),
+					][..],
+					"channel count",
+				),
+				(
+					&[
+						("x-nv-audio.surround.enable", "1"),
+						("x-nv-audio.surround.numChannels", "258"),
+					][..],
+					"channel count",
+				),
+			] {
+				let (status, body) = announce(&server, &grant, sdp(overrides)).await;
+				assert_eq!(status, 400, "{overrides:?}: {body}");
+				assert!(body.contains(reason), "{overrides:?}: {body}");
+			}
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		}
+	}
 
 	mod framing {
 		use super::super::*;

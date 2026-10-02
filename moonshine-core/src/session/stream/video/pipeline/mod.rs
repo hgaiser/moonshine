@@ -749,7 +749,8 @@ impl VideoPipelineInner {
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
 		.with_b_frames(0) // No B-frames for low latency
 		.with_max_reference_frames(ctx.max_reference_frames)
-		.with_virtual_buffer_size_ms(1000 / ctx.fps)
+		// One frame of VBV, but never 0 ms for refresh rates above 1 kHz.
+		.with_virtual_buffer_size_ms((1000 / ctx.fps).max(1))
 		.with_initial_virtual_buffer_size_ms(0);
 
 		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
@@ -1615,10 +1616,7 @@ mod tests {
 	async fn resume_ack_waits_for_transport_epoch_and_reports_activation_failure() {
 		use super::*;
 		for succeeds in [true, false] {
-			let (_keys, keys_rx) = watch::channel(crate::session::SessionKeyData {
-				remote_input_key: vec![0; 16],
-				remote_input_key_id: 0,
-			});
+			let (_keys, keys_rx) = watch::channel(crate::session::keys::ActiveKeys::for_test([0; 16], 0));
 			let (consumer_tx, consumer_rx) = mpsc::channel(2);
 			let (packet_tx, mut packet_rx) = mpsc::channel(2);
 			let (stats_tx, _) = broadcast::channel(1);

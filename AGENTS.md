@@ -30,6 +30,7 @@ unless explicitly marked as root.
 | `webserver/`, `rtsp.rs`, `ingress.rs` | GameStream HTTP/HTTPS API and pairing; RTSP negotiation and stream orchestration; bounded connection supervision |
 | `session/mod.rs`, `session/manager.rs`, `session/application.rs` | Session states, launch/resume/reconfiguration, application lifetime |
 | `session/authorization.rs` | Launch/resume authorization generations binding RTSP, control and media discovery to the paired client |
+| `session/keys.rs`, `session/negotiation.rs` | Validated session keys, key-scoped AES-GCM nonce ownership; shared launch/resume/ANNOUNCE numeric domains |
 | `session/compositor/` | Embedded headless Smithay compositor, scene/focus/cursor/input, GBM/DMA-BUF capture |
 | `session/stream/audio/` | Embedded PulseAudio-compatible capture server, Opus encoding, audio packets/UDP |
 | `session/stream/control/` | Control protocol, input decoding/routing, Inputtino devices and feedback |
