@@ -1,6 +1,5 @@
 use async_shutdown::ShutdownManager;
 use fec_rs::ReedSolomon;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 use crate::crypto::encrypt_cbc;
@@ -39,7 +38,7 @@ impl AudioEncoder {
 		encrypt: bool,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop: ShutdownManager<SessionShutdownReason>,
-		start_notify: Arc<tokio::sync::Notify>,
+		start: tokio::sync::watch::Receiver<bool>,
 	) -> Result<(), ()> {
 		tracing::debug!("Starting audio encoder.");
 		tracing::debug!(
@@ -83,7 +82,7 @@ impl AudioEncoder {
 					encrypt,
 					packet_tx,
 					stop,
-					start_notify,
+					start,
 				)
 			})
 			.map_err(|e| tracing::error!("Failed to start audio encode thread: {e}"))?;
@@ -106,7 +105,7 @@ impl AudioEncoderInner {
 		encrypt: bool,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop: ShutdownManager<SessionShutdownReason>,
-		start_notify: Arc<tokio::sync::Notify>,
+		mut start: tokio::sync::watch::Receiver<bool>,
 	) {
 		// Trigger session shutdown when the audio encoder stops.
 		let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioEncoderStopped);
@@ -117,7 +116,10 @@ impl AudioEncoderInner {
 			.enable_all()
 			.build()
 			.expect("Failed to build tokio runtime for audio encoder");
-		if rt.block_on(stop.wrap_cancel(start_notify.notified())).is_err() {
+		if !matches!(
+			rt.block_on(stop.wrap_cancel(start.wait_for(|started| *started))),
+			Ok(Ok(_))
+		) {
 			tracing::debug!("Audio encoder stopped before start signal.");
 			return;
 		}
