@@ -207,9 +207,7 @@ impl SessionBackend for SystemSession {
 			Some(context) => session.reconfigure_video(context).await?,
 			None => session.reset_video_stream().await?,
 		}
-		if let Some(context) = plan.audio {
-			session.reconfigure_audio(context).await?;
-		}
+		session.reconfigure_audio(plan.audio).await?;
 		Ok(())
 	}
 

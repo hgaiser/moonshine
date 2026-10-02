@@ -17,7 +17,11 @@ use crate::session::stream::audio::{
 const NR_DATA_SHARDS: usize = 4;
 const NR_PARITY_SHARDS: usize = 2;
 const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
-const MAX_SHARD_SIZE: usize = 2048_usize.div_ceil(16) * 16;
+// Moonlight AudioStream.c receives at most 1400 bytes, including RTP/FEC.
+const MAX_PACKET_SIZE: usize = 1400;
+const MAX_OPUS_PAYLOAD_SIZE: usize =
+	MAX_PACKET_SIZE - std::mem::size_of::<RtpHeader>() - std::mem::size_of::<AudioFecHeader>() - 16;
+const MAX_SHARD_SIZE: usize = MAX_PACKET_SIZE.div_ceil(16) * 16;
 
 #[derive(Debug)]
 #[repr(C)]
@@ -43,6 +47,7 @@ impl AudioEncoder {
 		stop: ShutdownManager<SessionShutdownReason>,
 		start: StartWaiter,
 		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
+		generation: u64,
 	) -> Result<(), ()> {
 		let stream_config = &context.audio_config.stream_config;
 		tracing::debug!("Starting audio encoder.");
@@ -54,7 +59,7 @@ impl AudioEncoder {
 			stream_config.coupled_streams,
 		);
 
-		let encoder = create_encoder(sample_rate, stream_config)?;
+		let encoder = create_encoder(sample_rate, stream_config, context.packet_duration_ms)?;
 
 		let fec_encoder = ReedSolomon::new(NR_DATA_SHARDS, NR_PARITY_SHARDS)
 			.map_err(|e| tracing::warn!("Failed to create FEC encoder: {e}"))?;
@@ -77,6 +82,7 @@ impl AudioEncoder {
 					stop,
 					start,
 					reconfigure_rx,
+					generation,
 				)
 			})
 			.map_err(|e| tracing::error!("Failed to start audio encode thread: {e}"))?;
@@ -85,7 +91,11 @@ impl AudioEncoder {
 	}
 }
 
-fn create_encoder(sample_rate: u32, stream_config: &OpusStreamConfig) -> Result<opus::MSEncoder, ()> {
+fn create_encoder(
+	sample_rate: u32,
+	stream_config: &OpusStreamConfig,
+	packet_duration_ms: u32,
+) -> Result<opus::MSEncoder, ()> {
 	let mut encoder = opus::MSEncoder::new(
 		sample_rate,
 		stream_config.streams,
@@ -98,7 +108,11 @@ fn create_encoder(sample_rate: u32, stream_config: &OpusStreamConfig) -> Result<
 		.set_vbr(false)
 		.map_err(|e| tracing::warn!("Failed to disable variable bitrate: {e}"))?;
 	encoder
-		.set_bitrate(opus::Bitrate::Bits(stream_config.bitrate as i32))
+		.set_bitrate(opus::Bitrate::Bits(
+			stream_config
+				.bitrate
+				.min((MAX_OPUS_PAYLOAD_SIZE as u32 * 8 * 1000) / packet_duration_ms.max(1)) as i32,
+		))
 		.map_err(|e| tracing::warn!("Failed to set audio bitrate: {e}"))?;
 	Ok(encoder)
 }
@@ -129,6 +143,7 @@ impl AudioEncoderInner {
 		stop: ShutdownManager<SessionShutdownReason>,
 		start: StartWaiter,
 		reconfigure_rx: crossbeam_channel::Receiver<AudioEncoderReconfigure>,
+		mut generation: u64,
 	) {
 		let rt = tokio::runtime::Builder::new_current_thread()
 			.enable_all()
@@ -140,6 +155,7 @@ impl AudioEncoderInner {
 			return;
 		}
 
+		let mut keys = keys_rx.borrow().clone();
 		let mut sequence_number = 0u16;
 		let mut stream_start_time = std::time::Instant::now();
 
@@ -162,14 +178,16 @@ impl AudioEncoderInner {
 		let mut base_timestamp = 0u32;
 
 		// A buffer for an audio sample after it has been encoded.
-		// TODO: Decide the correct size for this buffer.
-		let mut encoded_audio = vec![0u8; 1400];
+		// Reserve space for RTP, FEC and worst-case CBC padding. High-quality
+		// surround bitrate is constrained by this budget at the negotiated duration.
+		let mut encoded_audio = vec![0u8; MAX_OPUS_PAYLOAD_SIZE];
 
 		// Pre-seed the recycling pipeline with empty frames.
 		for _ in 0..3 {
 			let _ = frame_recycle_tx.send(AudioFrame {
 				buf: Vec::new(),
 				capture_ts_ms: 0,
+				generation,
 			});
 		}
 
@@ -181,7 +199,7 @@ impl AudioEncoderInner {
 							Ok(command) => command,
 							Err(_) => return,
 						};
-						match create_encoder(sample_rate, &command.context.audio_config.stream_config) {
+						match create_encoder(sample_rate, &command.context.audio_config.stream_config, command.context.packet_duration_ms) {
 							Ok(reconfigured) => encoder = reconfigured,
 							Err(()) => {
 								let _ = command.applied.send(Err(()));
@@ -189,6 +207,8 @@ impl AudioEncoderInner {
 							},
 						}
 						encrypt = command.context.encrypt_audio;
+						generation = command.generation;
+						keys = command.keys;
 						sequence_number = 0;
 						stream_start_time = std::time::Instant::now();
 						fec_encoder.reset_force();
@@ -199,10 +219,12 @@ impl AudioEncoderInner {
 							let _ = frame_recycle_tx.try_send(AudioFrame {
 								buf: stale.buf,
 								capture_ts_ms: 0,
+				generation,
 							});
 						}
 						let (ready, waiting) = tokio::sync::oneshot::channel();
 						if packet_tx.blocking_send(AudioPacketMessage::BeginEpoch {
+							generation,
 							qos: command.context.qos,
 							ready,
 						}).is_err() || rt.block_on(waiting).is_err() {
@@ -212,7 +234,10 @@ impl AudioEncoderInner {
 						let _ = command.applied.send(Ok(()));
 					},
 					recv(frame_rx) -> frame => match frame {
-						Ok(frame) => break frame,
+						Ok(frame) => {
+							if frame.generation == generation { break frame; }
+							let _ = frame_recycle_tx.try_send(frame);
+						},
 						Err(_) => {
 							tracing::debug!("PulseServer channel closed.");
 							return;
@@ -234,13 +259,11 @@ impl AudioEncoderInner {
 					let _ = frame_recycle_tx.try_send(AudioFrame {
 						buf: frame.buf,
 						capture_ts_ms: 0,
+						generation,
 					});
 					continue;
 				},
 			};
-
-			// Read current keys from watch channel.
-			let keys = &*keys_rx.borrow();
 
 			// Encrypt the audio data if encryption is enabled.
 			let payload = match encrypt {
@@ -253,6 +276,7 @@ impl AudioEncoderInner {
 							let _ = frame_recycle_tx.try_send(AudioFrame {
 								buf: frame.buf,
 								capture_ts_ms: 0,
+								generation,
 							});
 							continue;
 						},
@@ -295,7 +319,13 @@ impl AudioEncoderInner {
 			let data_shard_size = std::mem::size_of::<RtpHeader>() + payload.len();
 			let data_shard = shard[..data_shard_size].to_vec();
 
-			if packet_tx.blocking_send(AudioPacketMessage::Packet(data_shard)).is_err() {
+			if packet_tx
+				.blocking_send(AudioPacketMessage::Packet {
+					generation,
+					data: data_shard,
+				})
+				.is_err()
+			{
 				tracing::debug!("Failed to send packet over channel, channel is likely closed.");
 				break;
 			}
@@ -316,6 +346,7 @@ impl AudioEncoderInner {
 					let _ = frame_recycle_tx.try_send(AudioFrame {
 						buf: frame.buf,
 						capture_ts_ms: 0,
+						generation,
 					});
 					continue;
 				}
@@ -356,7 +387,10 @@ impl AudioEncoderInner {
 					let parity_shard = shard[..parity_shard_size].to_vec();
 
 					if packet_tx
-						.blocking_send(AudioPacketMessage::Packet(parity_shard))
+						.blocking_send(AudioPacketMessage::Packet {
+							generation,
+							data: parity_shard,
+						})
 						.is_err()
 					{
 						tracing::debug!("Failed to send packet over channel, channel is likely closed.");
@@ -369,6 +403,7 @@ impl AudioEncoderInner {
 			let _ = frame_recycle_tx.try_send(AudioFrame {
 				buf: frame.buf,
 				capture_ts_ms: 0,
+				generation,
 			});
 		}
 
@@ -379,6 +414,205 @@ impl AudioEncoderInner {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[tokio::test]
+	async fn reconnect_resets_encoder_keys_pcm_sequence_and_fec_together() {
+		use crate::session::stream::audio::{AudioChannels, AudioConfig};
+		use crate::session::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
+		let stop = ShutdownManager::new();
+		let start = crate::session::lifecycle::StartLatch::new();
+		let mut ledger = crate::session::keys::KeyLedger::default();
+		let initial = ledger.publish(SessionKeyData::new(
+			RemoteInputKey::from_bytes([1; 16]),
+			RemoteInputKeyId::new(1),
+		));
+		let (keys_tx, keys_rx) = tokio::sync::watch::channel(initial.clone());
+		let (frames, frame_rx) = crossbeam_channel::bounded(16);
+		let (recycle, _recycle_rx) = crossbeam_channel::bounded(16);
+		let (packets, mut packet_rx) = mpsc::channel(32);
+		let (commands, command_rx) = crossbeam_channel::unbounded();
+		let mut context = AudioStreamContext {
+			packet_duration_ms: 5,
+			encrypt_audio: true,
+			..Default::default()
+		};
+		AudioEncoder::spawn(
+			48_000,
+			context.clone(),
+			frame_rx,
+			recycle,
+			keys_rx,
+			packets,
+			stop.clone(),
+			start.waiter(),
+			command_rx,
+			1,
+		)
+		.unwrap();
+		start.open();
+		// Leave a partial old FEC group. A live key update must not rekey it.
+		frames
+			.send(AudioFrame {
+				buf: vec![0.8; 480],
+				capture_ts_ms: 0,
+				generation: 1,
+			})
+			.unwrap();
+		let _ = tokio::time::timeout(std::time::Duration::from_secs(2), packet_rx.recv())
+			.await
+			.unwrap()
+			.unwrap();
+		// Updating the shared key alone cannot split the current FEC group.
+		keys_tx.send_replace(ledger.publish(SessionKeyData::new(
+			RemoteInputKey::from_bytes([9; 16]),
+			RemoteInputKeyId::new(9),
+		)));
+		frames
+			.send(AudioFrame {
+				buf: vec![0.8; 480],
+				capture_ts_ms: 0,
+				generation: 1,
+			})
+			.unwrap();
+		let AudioPacketMessage::Packet { data, .. } =
+			tokio::time::timeout(std::time::Duration::from_secs(2), packet_rx.recv())
+				.await
+				.unwrap()
+				.unwrap()
+		else {
+			panic!("expected old-epoch packet");
+		};
+		let mut reference =
+			create_encoder(48_000, &context.audio_config.stream_config, context.packet_duration_ms).unwrap();
+		let mut encoded = vec![0; MAX_SHARD_SIZE];
+		reference.encode_float(&vec![0.8; 480], &mut encoded).unwrap();
+		let size = reference.encode_float(&vec![0.8; 480], &mut encoded).unwrap();
+		assert_eq!(
+			&data[12..],
+			encrypt_cbc(
+				&encoded[..size],
+				initial.key().as_bytes(),
+				&audio_iv(initial.key_id(), 1)
+			)
+			.unwrap()
+		);
+		for (index, (channels, quality, duration)) in [
+			(AudioChannels::Stereo, true, 5), // unchanged resume with the same key
+			(AudioChannels::Stereo, true, 5), // unchanged resume + rekey
+			(AudioChannels::Stereo, false, 10),
+			(AudioChannels::Surround51, true, 5),
+			(AudioChannels::Surround71, true, 10),
+			(AudioChannels::Stereo, true, 5),
+		]
+		.into_iter()
+		.enumerate()
+		{
+			let generation = index as u64 + 2;
+			context.packet_duration_ms = duration;
+			context.audio_config = AudioConfig::from_channels(channels, 0, quality);
+			let keys = if index == 0 {
+				initial.clone()
+			} else {
+				ledger.publish(SessionKeyData::new(
+					RemoteInputKey::from_bytes([generation as u8; 16]),
+					RemoteInputKeyId::new(generation as u32),
+				))
+			};
+			keys_tx.send_replace(keys.clone());
+			let (applied, waiting) = tokio::sync::oneshot::channel();
+			commands
+				.send(AudioEncoderReconfigure {
+					generation,
+					keys: keys.clone(),
+					context: context.clone(),
+					applied,
+				})
+				.unwrap();
+			loop {
+				let message = tokio::time::timeout(std::time::Duration::from_secs(2), packet_rx.recv())
+					.await
+					.unwrap()
+					.unwrap();
+				if let AudioPacketMessage::BeginEpoch {
+					generation: actual,
+					ready,
+					..
+				} = message
+				{
+					assert_eq!(actual, generation);
+					ready.send(()).unwrap();
+					break;
+				}
+			}
+			waiting.await.unwrap().unwrap();
+			// Late old PCM has the wrong size and a recognizable nonzero pattern.
+			frames
+				.send(AudioFrame {
+					buf: vec![0.8; 480],
+					capture_ts_ms: 0,
+					generation: generation - 1,
+				})
+				.unwrap();
+			let samples = vec![0.0; 48 * duration as usize * channels as usize];
+			let mut reference =
+				create_encoder(48_000, &context.audio_config.stream_config, context.packet_duration_ms).unwrap();
+			let mut encoded = vec![0; MAX_SHARD_SIZE];
+			for sequence in 0..4u16 {
+				frames
+					.send(AudioFrame {
+						buf: samples.clone(),
+						capture_ts_ms: 0,
+						generation,
+					})
+					.unwrap();
+				let AudioPacketMessage::Packet {
+					generation: actual,
+					data,
+				} = tokio::time::timeout(std::time::Duration::from_secs(2), packet_rx.recv())
+					.await
+					.unwrap()
+					.unwrap()
+				else {
+					panic!("expected data");
+				};
+				assert_eq!(actual, generation);
+				assert!(data.len() <= MAX_PACKET_SIZE);
+				assert_eq!(data[1], 97);
+				assert_eq!(u16::from_be_bytes(data[2..4].try_into().unwrap()), sequence);
+				let size = reference.encode_float(&samples, &mut encoded).unwrap();
+				assert_eq!(
+					&data[12..],
+					encrypt_cbc(
+						&encoded[..size],
+						keys.key().as_bytes(),
+						&audio_iv(keys.key_id(), sequence)
+					)
+					.unwrap()
+				);
+			}
+			for parity in 0..2u8 {
+				let AudioPacketMessage::Packet {
+					generation: actual,
+					data,
+				} = tokio::time::timeout(std::time::Duration::from_secs(2), packet_rx.recv())
+					.await
+					.unwrap()
+					.unwrap()
+				else {
+					panic!("expected parity");
+				};
+				assert_eq!(actual, generation);
+				assert!(data.len() <= MAX_PACKET_SIZE);
+				assert_eq!(data[1], 127);
+				assert_eq!(data[12], parity);
+				assert_eq!(&data[14..16], &[0, 0]); // FEC base sequence restarts
+			}
+		}
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		drop(frames);
+		drop(commands);
+		stop.wait_shutdown_complete().await;
+	}
 
 	#[test]
 	fn audio_iv_matches_the_client_for_extreme_key_ids() {

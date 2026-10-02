@@ -125,12 +125,12 @@ pub(crate) struct StartRequest {
 	pub stop: ShutdownManager<SessionShutdownReason>,
 }
 
-/// What a reconnect PLAY changes. `None` keeps that stream's epoch; video is
-/// then only reset (counters + IDR) for the resuming client.
+/// Every reconnect resets both media epochs. `video: None` retains the costly
+/// pipeline and resets counters + IDR; audio always commits its negotiated context.
 #[derive(Debug)]
 pub(crate) struct ResumePlan {
 	pub video: Option<VideoStreamContext>,
-	pub audio: Option<AudioStreamContext>,
+	pub audio: AudioStreamContext,
 }
 
 /// The resource-owning work behind each manager transition.
@@ -955,7 +955,7 @@ impl<B: SessionBackend> SessionCore<B> {
 						);
 					}
 					// Every reconnect needs a barrier, including identical-mode resume.
-					Some(self.backend.pause(active, true, audio_changed))
+					Some(self.backend.pause(active, true, true))
 				},
 				Some(SessionState::Initialized(_)) => {
 					tracing::warn!("SetStreamContext rejected: session not yet launched (Initialized state)");
@@ -1078,7 +1078,7 @@ impl<B: SessionBackend> SessionCore<B> {
 							tracing::info!("Reconnect stream configuration unchanged; using fast resume path");
 							ResumePlan {
 								video: None,
-								audio: None,
+								audio: audio.clone(),
 							}
 						},
 						ReconnectDecision::Reconfigure {
@@ -1093,7 +1093,7 @@ impl<B: SessionBackend> SessionCore<B> {
 							}
 							ResumePlan {
 								video: (!video_changed_fields.is_empty()).then(|| video.clone()),
-								audio: audio_changed.then(|| audio.clone()),
+								audio: audio.clone(),
 							}
 						},
 					};

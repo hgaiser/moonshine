@@ -201,9 +201,10 @@ impl SessionBackend for FakeBackend {
 	fn pause(
 		&self,
 		_session: &FakeSession,
-		_video: bool,
-		_audio: bool,
+		video: bool,
+		audio: bool,
 	) -> impl Future<Output = Result<(), ()>> + Send + 'static {
+		assert!(video && audio, "every reconnect pauses both media epochs");
 		let gate = (
 			self.gates[&Op::Pause].entered.clone(),
 			self.gates[&Op::Pause].released.subscribe(),
@@ -222,7 +223,8 @@ impl SessionBackend for FakeBackend {
 		}
 	}
 
-	async fn resume(&self, _session: &mut FakeSession, _plan: ResumePlan) -> Result<(), ()> {
+	async fn resume(&self, _session: &mut FakeSession, plan: ResumePlan) -> Result<(), ()> {
+		assert!(matches!(plan.audio.packet_duration_ms, 5 | 10));
 		self.gate(Op::Resume).await
 	}
 

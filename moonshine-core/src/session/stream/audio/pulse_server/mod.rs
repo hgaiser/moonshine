@@ -48,6 +48,7 @@ const ZERO_VOL: [f32; 8] = [0.0; 8];
 pub(crate) struct AudioFrame {
 	/// Interleaved f32 samples for the negotiated channel count.
 	pub buf: Vec<f32>,
+	pub generation: u64,
 
 	/// Capture timestamp in milliseconds since process start.
 	pub capture_ts_ms: u64,
@@ -153,6 +154,7 @@ struct ServerState {
 }
 
 pub(crate) struct PulseServer {
+	generation: u64,
 	listener: UnixListener,
 	poll: mio::Poll,
 	clock: mio_timerfd::TimerFd,
@@ -202,6 +204,7 @@ impl PulseServer {
 		frame_recycle_rx: crossbeam_channel::Receiver<AudioFrame>,
 		stop: ShutdownManager<SessionShutdownReason>,
 		reconfigure_rx: crossbeam_channel::Receiver<PulseReconfigure>,
+		generation: u64,
 	) -> Result<(), Error> {
 		listener.set_nonblocking(true)?;
 		let listener = UnixListener::from_std(listener);
@@ -302,6 +305,7 @@ impl PulseServer {
 		dummy_sink.formats[0] = default_format_info.clone();
 
 		let server = Self {
+			generation,
 			listener,
 			poll,
 			clock,
@@ -357,7 +361,23 @@ impl PulseServer {
 
 		loop {
 			while let Ok(request) = self.reconfigure_rx.try_recv() {
-				let result = self.reconfigure(request.channels, request.packet_duration_ms);
+				let result = if request.reconfigure_capture {
+					self.reconfigure(request.channels, request.packet_duration_ms)
+				} else {
+					Ok(())
+				};
+				if result.is_ok() {
+					// Retain Pulse sockets, but discard buffered PCM and resampler history.
+					for client in self.clients.values_mut() {
+						for stream in client.playback_streams.values_mut() {
+							stream.missing += stream.buffer.len_bytes() as i64;
+							stream.read_offset = stream.write_offset;
+							stream.buffer.clear();
+						}
+					}
+					self.spare_frame = None;
+					self.generation = request.generation;
+				}
 				let _ = request.applied.send(result.map_err(|error| error.to_string()));
 			}
 
@@ -444,12 +464,8 @@ impl PulseServer {
 		self.clock
 			.set_timeout_interval(&time::Duration::from_nanos(1_000_000_000 / u64::from(clock_rate_hz)))?;
 		self.clock_rate_hz = clock_rate_hz;
-
-		// Existing playback streams were negotiated against the old virtual sink
-		// format. Disconnect them so PulseAudio clients reconnect and negotiate the
-		// new channel layout rather than mixing with stale channel assumptions.
-		for (_, mut client) in std::mem::take(&mut self.clients) {
-			let _ = self.poll.registry().deregister(&mut client.socket);
+		if channels == self.server_state.capture_channels {
+			return Ok(());
 		}
 
 		let channel_map = match channels {
@@ -478,6 +494,16 @@ impl PulseServer {
 			channels,
 			sample_rate: CAPTURE_SAMPLE_RATE,
 		};
+		// Playback wire formats remain valid: rebuild their output conversion,
+		// retaining Pulse sockets and per-client negotiated source formats.
+		for client in self.clients.values_mut() {
+			for stream in client.playback_streams.values_mut() {
+				stream.missing += stream.buffer.len_bytes() as i64;
+				stream.read_offset = stream.write_offset;
+				stream.buffer.reconfigure_output(capture_spec);
+				stream.volume.resize(channels as usize, 1.0);
+			}
+		}
 		self.server_state.capture_channels = channels;
 		self.server_state.capture_spec = capture_spec;
 		self.server_state.server_info.sample_spec = capture_spec;
@@ -678,6 +704,7 @@ impl PulseServer {
 					// deadlocking the encoder which is blocked on frame_rx.recv().
 					AudioFrame {
 						buf: vec![0.0; encode_len as usize],
+						generation: self.generation,
 						capture_ts_ms: 0,
 					}
 				}
@@ -793,6 +820,7 @@ impl PulseServer {
 		}
 
 		frame.capture_ts_ms = capture_ts;
+		frame.generation = self.generation;
 		match self.frame_tx.try_send(frame) {
 			Ok(()) => {},
 			Err(crossbeam_channel::TrySendError::Full(frame)) => {
@@ -803,5 +831,81 @@ impl PulseServer {
 		}
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+mod epoch_tests {
+	use super::*;
+	#[tokio::test]
+	async fn same_mode_duration_and_layout_resumes_retain_pulse_connection() {
+		use std::io::Read;
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("native");
+		let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
+		let (_recycle_tx, recycle_rx) = crossbeam_channel::bounded(3);
+		let (commands, command_rx) = crossbeam_channel::unbounded();
+		let stop = ShutdownManager::new();
+		PulseServer::spawn(
+			listener,
+			path.clone(),
+			2,
+			5,
+			frame_tx,
+			recycle_rx,
+			stop.clone(),
+			command_rx,
+			1,
+		)
+		.unwrap();
+		let mut client = std::os::unix::net::UnixStream::connect(&path).unwrap();
+		client.set_nonblocking(true).unwrap();
+		tokio::time::sleep(time::Duration::from_millis(30)).await;
+		for (index, (channels, duration, changed)) in
+			[(2, 5, false), (2, 10, true), (6, 10, true), (8, 5, true), (2, 5, true)]
+				.into_iter()
+				.enumerate()
+		{
+			let generation = index as u64 + 2;
+			let (applied, waiting) = tokio::sync::oneshot::channel();
+			commands
+				.send(PulseReconfigure {
+					generation,
+					reconfigure_capture: changed,
+					channels,
+					packet_duration_ms: duration,
+					applied,
+				})
+				.unwrap();
+			tokio::time::timeout(time::Duration::from_secs(1), waiting)
+				.await
+				.unwrap()
+				.unwrap()
+				.unwrap();
+			let error = client.read(&mut [0; 1]).unwrap_err();
+			assert_eq!(
+				error.kind(),
+				std::io::ErrorKind::WouldBlock,
+				"Pulse socket remains connected"
+			);
+			// The capture producer stamps its generation and negotiated frame size.
+			let frame = tokio::task::spawn_blocking({
+				let rx = frame_rx.clone();
+				move || {
+					loop {
+						let f = rx.recv_timeout(time::Duration::from_secs(1)).unwrap();
+						if f.generation == generation {
+							break f;
+						}
+					}
+				}
+			})
+			.await
+			.unwrap();
+			assert_eq!(frame.buf.len(), 48 * duration as usize * channels as usize);
+		}
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		stop.wait_shutdown_complete().await;
 	}
 }

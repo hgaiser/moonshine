@@ -14,6 +14,14 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-4] - 2026-10-01
+
+### Fixed
+
+- Audio now pauses on disconnect and every reconnect, including unchanged settings. Endpoint discovery cannot bypass the epoch barrier; new delivery commits keys, PCM generation, Opus, RTP/FEC and negotiated settings together while retaining application Pulse connections.
+- Authorized control-peer disconnect/replacement now releases held keys, modifiers, mouse buttons, touch/pen contacts and queued text, neutralizes controllers, cancels Home/Guide timers and retires old feedback callbacks. Late previous-peer disconnects cannot reset the new peer's input.
+- High-quality surround audio at 10 ms now respects Moonlight’s 1400-byte receive limit, including encryption and FEC overhead.
+
 ## [v0.17.0-beta-3] - 2026-10-01
 
 ### Fixed

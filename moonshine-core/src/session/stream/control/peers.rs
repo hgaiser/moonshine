@@ -111,6 +111,10 @@ impl ControlPeers {
 		}
 	}
 
+	pub(super) fn generation(&self) -> u64 {
+		self.generation
+	}
+
 	/// The peer that authenticated the current generation, if any.
 	pub(super) fn active(&self) -> Option<PeerId> {
 		self.active
@@ -342,6 +346,11 @@ mod tests {
 			peers.authenticate(peer(3), &encode_client_control(&new_key, 0, &message), &new_key),
 			Ok(message)
 		);
+		assert!(
+			!peers.disconnect(peer(0)),
+			"late old-peer disconnect must not revoke the new owner"
+		);
+		assert_eq!(peers.active(), Some(peer(3)));
 		assert!(peers.disconnect(peer(3)));
 		assert!(!peers.disconnect(peer(3)));
 	}

@@ -517,17 +517,34 @@ fn send_hdr_state(host: &mut Host, peer_id: tokio_enet::PeerId, state: &HdrModeS
 /// instance learns that another resume took over. Unauthorized peers are
 /// instead reset immediately, which frees their slot without waiting for an
 /// acknowledgement they control.
-fn adopt_current_generation(host: &mut Host, peers: &mut ControlPeers, authorization_rx: &mut AuthorizationReceiver) {
+async fn adopt_current_generation(
+	host: &mut Host,
+	peers: &mut ControlPeers,
+	authorization_rx: &mut AuthorizationReceiver,
+	input: &mut InputHandler,
+	feedback_tx: &mut mpsc::Sender<FeedbackCommand>,
+	feedback_rx: &mut mpsc::Receiver<FeedbackCommand>,
+) -> Result<(), ()> {
 	if !authorization_rx.has_changed().unwrap_or(false) {
-		return;
+		return Ok(());
 	}
 	let generation = authorization_rx.borrow_and_update().generation();
-	for peer_id in peers.begin_generation(generation) {
+	if generation == peers.generation() {
+		return Ok(());
+	}
+	let had_owner = peers.active().is_some();
+	let stale_peers = peers.begin_generation(generation);
+	(*feedback_tx, *feedback_rx) = mpsc::channel(10);
+	if had_owner {
+		input.reset().await?;
+	}
+	for peer_id in stale_peers {
 		tracing::info!(%peer_id, "Disconnecting control peer of a replaced launch/resume generation");
 		if let Some(peer) = host.peer_mut(peer_id) {
 			peer.disconnect(0);
 		}
 	}
+	Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -537,7 +554,7 @@ async fn run_control_loop(
 	video_handle: VideoStreamHandle,
 	audio_trigger: AudioStartHandle,
 	context: ControlStreamContext,
-	input_handler: InputHandler,
+	mut input_handler: InputHandler,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	mut hdr_metadata_rx: watch::Receiver<HdrModeState>,
 ) {
@@ -546,7 +563,7 @@ async fn run_control_loop(
 	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 
 	// Create a channel over which we can receive feedback messages to send to the connected client.
-	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
+	let (mut feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
 
 	let mut send_hdr_mode = false;
 	let mut audio_triggered = false;
@@ -565,7 +582,19 @@ async fn run_control_loop(
 			break;
 		}
 
-		adopt_current_generation(&mut host, &mut peers, &mut authorization_rx);
+		if adopt_current_generation(
+			&mut host,
+			&mut peers,
+			&mut authorization_rx,
+			&mut input_handler,
+			&mut feedback_tx,
+			&mut feedback_rx,
+		)
+		.await
+		.is_err()
+		{
+			break;
+		}
 
 		// Check for feedback messages.
 		if let Ok(command) = feedback_rx.try_recv()
@@ -583,7 +612,19 @@ async fn run_control_loop(
 			.map_err(|e| tracing::error!("Failure in enet host: {e}"));
 		// A launch/resume may have completed while servicing; never attribute an
 		// event from a replaced generation's peer to the new one.
-		adopt_current_generation(&mut host, &mut peers, &mut authorization_rx);
+		if adopt_current_generation(
+			&mut host,
+			&mut peers,
+			&mut authorization_rx,
+			&mut input_handler,
+			&mut feedback_tx,
+			&mut feedback_rx,
+		)
+		.await
+		.is_err()
+		{
+			break;
+		}
 
 		match event {
 			Ok(Some(Event::Connect { peer_id, data })) => {
@@ -598,14 +639,21 @@ async fn run_control_loop(
 			},
 			Ok(Some(Event::Disconnect { peer_id, .. })) => {
 				// Retain the application, but stop high-bitrate traffic to the old
-				// UDP endpoint. ANNOUNCE/PLAY activates the next video epoch.
+				// UDP endpoints. ANNOUNCE/PLAY activates the next media epochs.
 				// Peers of a replaced generation were already forgotten, so an old
 				// client disconnecting after resume cannot pause the new epoch.
 				if peers.disconnect(peer_id) {
+					(feedback_tx, feedback_rx) = mpsc::channel(10);
+					if input_handler.reset().await.is_err() {
+						break;
+					}
+					if audio_trigger.pause_for_reconfigure().await.is_err() {
+						break;
+					}
 					if video_handle.pause_for_reconfigure().await.is_err() {
 						break;
 					}
-					tracing::info!("Control peer disconnected; paused video delivery for resume");
+					tracing::info!("Control peer disconnected; paused media delivery and released input for resume");
 				}
 			},
 			Ok(Some(Event::Receive {
@@ -989,10 +1037,8 @@ mod tests {
 			input_data(&[0x03, 0, 0, 0, 0, 0x41, 0, 0, 0, 0])
 		}
 
-		fn count_key_presses(input: &calloop::channel::Channel<CompositorInputEvent>) -> usize {
-			std::iter::from_fn(|| input.try_recv().ok())
-				.filter(|event| matches!(event, CompositorInputEvent::KeyDown { keycode: 30 }))
-				.count()
+		fn count_key_presses(input: &AtomicUsize) -> usize {
+			input.swap(0, Ordering::SeqCst)
 		}
 
 		fn drain(idr: &mut tokio::sync::broadcast::Receiver<()>) -> usize {
@@ -1025,7 +1071,32 @@ mod tests {
 			.unwrap();
 			let server = host.local_addr().unwrap();
 			let stop = ShutdownManager::new();
-			let (input_tx, input_rx) = calloop::channel::channel();
+			let (input_tx, input_events) = calloop::channel::channel();
+			let input_rx = Arc::new(AtomicUsize::new(0));
+			let resets = Arc::new(AtomicUsize::new(0));
+			tokio::spawn({
+				let presses = input_rx.clone();
+				let resets = resets.clone();
+				let stop = stop.clone();
+				async move {
+					while !stop.is_shutdown_triggered() {
+						while let Ok(event) = input_events.try_recv() {
+							match event {
+								CompositorInputEvent::KeyDown { keycode: 30 } => {
+									presses.fetch_add(1, Ordering::SeqCst);
+								},
+								CompositorInputEvent::Reset { keys, ready, .. } => {
+									assert_eq!(keys, vec![30]);
+									resets.fetch_add(1, Ordering::SeqCst);
+									ready.send(()).unwrap();
+								},
+								_ => {},
+							}
+						}
+						tokio::time::sleep(Duration::from_millis(1)).await;
+					}
+				}
+			});
 			let input_handler = InputHandler::new(input_tx, stop.clone(), Default::default()).unwrap();
 			let (video_handle, probe) = VideoStreamHandle::for_test();
 			let mut idr = probe.idr_rx;
@@ -1135,7 +1206,13 @@ mod tests {
 			assert_eq!(drain(&mut idr), 0);
 			assert_eq!(pauses.load(Ordering::SeqCst), 0);
 
+			assert_eq!(
+				resets.load(Ordering::SeqCst),
+				1,
+				"replacement releases the old held key"
+			);
 			let mut resumed = Client::connect(client_ip, server, next_data).await;
+			resumed.send(&NEW_KEY, &key_down_a()).await;
 			resumed.send(&NEW_KEY, &request_idr).await;
 			assert_eq!(drain(&mut idr), 1);
 
@@ -1145,6 +1222,11 @@ mod tests {
 			}
 			resumed.pump(Duration::from_millis(150)).await;
 			assert_eq!(pauses.load(Ordering::SeqCst), 1);
+			assert_eq!(
+				resets.load(Ordering::SeqCst),
+				2,
+				"active disconnect releases the new held key"
+			);
 
 			stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
 			tokio::time::timeout(Duration::from_secs(2), control)

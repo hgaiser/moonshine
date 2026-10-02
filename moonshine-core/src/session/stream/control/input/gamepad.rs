@@ -564,6 +564,13 @@ impl Gamepad {
 	}
 
 	/// Apply button flags to the gamepad.
+	pub fn neutralize(&self) {
+		self.set_pressed(0);
+		self.gamepad.set_stick(JoypadStickPosition::LS, 0, 0);
+		self.gamepad.set_stick(JoypadStickPosition::RS, 0, 0);
+		self.gamepad.set_triggers(0, 0);
+	}
+
 	pub fn set_pressed(&self, button_flags: u32) {
 		self.gamepad.set_pressed(button_flags as i32);
 	}

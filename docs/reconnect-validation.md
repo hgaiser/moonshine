@@ -45,14 +45,14 @@ A client disconnect without cancellation is intentionally allowed to retain the
 host application/session for resume. Check retained-session behavior separately
 from final teardown; disconnect alone does not imply every host task must exit.
 
-During disconnect, verify `Control peer disconnected; paused video delivery for
+During disconnect, verify `Control peer disconnected; paused media delivery and released input for
 resume` when ENet reports the active peer disconnect. A UDP PING discovers an
 endpoint but cannot bypass a paused epoch. Only PINGs from the client of the
 latest launch/resume are accepted (with its `X-SS-Ping-Payload` when the client
 supports session IDs), so a delayed PING from a previous connection or another
 host cannot redirect the resumed stream. A resume also disconnects the previous
-generation's control peer without pausing the new epoch. RTSP ANNOUNCE pauses video for every
-reconnect; PLAY waits for ordered encoder-counter reset and transport activation
+generation's control peer without pausing the new epoch. RTSP ANNOUNCE pauses audio and video for every
+reconnect; PLAY waits for ordered encoder/key/sample/FEC reset and transport activation
 before completing, including identical-mode resumes. Dropped paused batches must
 still release PyroWave's send completion/capture credit.
 
@@ -99,3 +99,28 @@ Teardown is ordered and complete ([session ownership](ARCHITECTURE.md#session-ow
 Unit tests of reconnect decisions and epoch barriers do not prove remote-client
 resume. Include relevant [compositor checks](COMPOSITOR.md#validation-and-runtime-checks)
 and [GPU matrix](PYROWAVE.md#validation-matrix), reporting hardware/client coverage.
+
+## Audio and controlling-peer input
+
+For same-mode resume, repeat with unchanged keys and fresh keys. Play recognizable
+PCM before/after the disconnect. Verify silence after Pause acknowledgment even
+when PING discovers the next endpoint; the first new audio must use its current
+key, channel layout, 5/10 ms duration and restarted sequence/FEC group. Change
+quality, stereo/5.1/7.1 and duration independently and together. Pulse application
+connections must remain open, with no application restart. Existing source streams
+are converted into the new sink layout; applications may choose a new source
+format when they next negotiate playback.
+
+Disconnect while holding a key and modifier, mouse button, touch and pen contact,
+queued clipboard text, each stick/trigger and controller button. No input may remain
+active after the cleanup acknowledgment. Disconnect immediately before a Home/Guide
+hold deadline and during its activation rumble; no old shortcut may fire. Reconnect
+with the same controller and a different subtype. Check Edge extra buttons, ordinary
+DualSense, Xbox and Nintendo controllers over USB/Bluetooth, and Steam Input where
+supported. Verify rumble, LED, motion requests and adaptive-trigger feedback on the
+current client. Deliver a late old-peer disconnect while the new peer holds input;
+it must leave that input intact. Controller devices are neutralized and recreated
+at ownership loss; inspect Steam's device reappearance and preserved subtype.
+
+Automated coverage and remaining hardware checks for Batch 4 are recorded in
+[the remediation report](reports/RECONNECT_AUDIO_INPUT_2026-10-02.md).

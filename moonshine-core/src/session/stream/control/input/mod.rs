@@ -141,9 +141,16 @@ pub(super) fn parse_input_event(buffer: &[u8]) -> Result<(), ()> {
 	InputEvent::from_bytes(buffer).map(|_| ())
 }
 
+enum GamepadCommand {
+	Input(InputEvent, mpsc::Sender<FeedbackCommand>),
+	Reset(tokio::sync::oneshot::Sender<()>),
+}
+
 pub(crate) struct InputHandler {
+	keys: std::collections::BTreeSet<u32>,
+	buttons: std::collections::BTreeSet<u32>,
 	input_tx: calloop::channel::Sender<CompositorInputEvent>,
-	gamepad_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
+	gamepad_tx: mpsc::Sender<GamepadCommand>,
 }
 
 impl InputHandler {
@@ -180,19 +187,26 @@ impl InputHandler {
 			})
 			.map_err(|e| tracing::error!("Failed to spawn gamepad input thread: {e}"))?;
 
-		Ok(Self { input_tx, gamepad_tx })
+		Ok(Self {
+			input_tx,
+			gamepad_tx,
+			keys: Default::default(),
+			buttons: Default::default(),
+		})
 	}
 
-	async fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
+	async fn handle_input(&mut self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
 		match event {
 			InputEvent::KeyDown(key) => {
 				if let Some(keycode) = key.to_linux_keycode() {
+					self.keys.insert(keycode);
 					tracing::trace!("Pressing key: {key:?} (keycode: {keycode})");
 					let _ = self.input_tx.send(CompositorInputEvent::KeyDown { keycode });
 				}
 			},
 			InputEvent::KeyUp(key) => {
 				if let Some(keycode) = key.to_linux_keycode() {
+					self.keys.remove(&keycode);
 					tracing::trace!("Releasing key: {key:?} (keycode: {keycode})");
 					let _ = self.input_tx.send(CompositorInputEvent::KeyUp { keycode });
 				}
@@ -216,6 +230,7 @@ impl InputHandler {
 			InputEvent::MouseButtonDown(button) => {
 				tracing::trace!("Pressing mouse button: {button:?}");
 				let button_code: u32 = button.into();
+				self.buttons.insert(button_code);
 				let _ = self
 					.input_tx
 					.send(CompositorInputEvent::MouseButtonDown { button: button_code });
@@ -223,6 +238,7 @@ impl InputHandler {
 			InputEvent::MouseButtonUp(button) => {
 				tracing::trace!("Releasing mouse button: {button:?}");
 				let button_code: u32 = button.into();
+				self.buttons.remove(&button_code);
 				let _ = self
 					.input_tx
 					.send(CompositorInputEvent::MouseButtonUp { button: button_code });
@@ -282,7 +298,7 @@ impl InputHandler {
 			// Gamepad events: forward to gamepad handler thread.
 			gamepad_event => {
 				self.gamepad_tx
-					.send((gamepad_event, feedback))
+					.send(GamepadCommand::Input(gamepad_event, feedback))
 					.await
 					.map_err(|e| tracing::warn!("Failed to send gamepad event: {e}"))?;
 			},
@@ -290,7 +306,27 @@ impl InputHandler {
 		Ok(())
 	}
 
-	pub async fn handle_raw_input(&self, event: &[u8], feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
+	/// Called only after ControlPeers revokes the active owner. Both queues are
+	/// ordered; completion prevents a timer/device from surviving into a new peer.
+	pub async fn reset(&mut self) -> Result<(), ()> {
+		let (ready, waiting) = tokio::sync::oneshot::channel();
+		self.input_tx
+			.send(CompositorInputEvent::Reset {
+				keys: std::mem::take(&mut self.keys).into_iter().collect(),
+				buttons: std::mem::take(&mut self.buttons).into_iter().collect(),
+				ready,
+			})
+			.map_err(|_| ())?;
+		let (done, gamepads_done) = tokio::sync::oneshot::channel();
+		self.gamepad_tx
+			.send(GamepadCommand::Reset(done))
+			.await
+			.map_err(|_| ())?;
+		gamepads_done.await.map_err(|_| ())?;
+		waiting.await.map_err(|_| ())
+	}
+
+	pub async fn handle_raw_input(&mut self, event: &[u8], feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
 		let event = InputEvent::from_bytes(event)?;
 		self.handle_input(event, feedback).await
 	}
@@ -360,6 +396,12 @@ impl GamepadSlot {
 
 	/// Advance the remap state machine using internally tracked button state.
 	fn advance(&mut self, now: Instant) -> HoldTransition {
+		if self.feedback_tx.is_closed() {
+			self.remap.cancel();
+			self.home_rumble_off_at = None;
+			self.gamepad.neutralize();
+			return HoldTransition::None;
+		}
 		self.check_rumble(now);
 		let (remapped, transition) = self.remap.advance(now);
 		self.gamepad.set_pressed(remapped);
@@ -415,7 +457,7 @@ impl GamepadSlot {
 impl Drop for GamepadSlot {
 	fn drop(&mut self) {
 		// Release input and the shortcut pulse before destroying/reusing a slot.
-		self.gamepad.set_pressed(0);
+		self.gamepad.neutralize();
 		if self.home_rumble_off_at.is_some() {
 			self.send_rumble(0, 0);
 		}
@@ -423,7 +465,7 @@ impl Drop for GamepadSlot {
 }
 
 async fn run_gamepad_handler(
-	mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
+	mut command_rx: mpsc::Receiver<GamepadCommand>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	gamepad_config: GamepadConfig,
 ) {
@@ -435,7 +477,24 @@ async fn run_gamepad_handler(
 	let timer_wake_for_timer = timer_wake.clone();
 	let timer_task = tokio::task::spawn_local(run_timer_task(gamepads_timer, timer_wake_for_timer));
 
-	while let Ok(Some((command, feedback_tx))) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
+	while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
+		let (command, feedback_tx) = match command {
+			GamepadCommand::Input(event, feedback) => (event, feedback),
+			GamepadCommand::Reset(done) => {
+				// The timer uses this same mutex, so after acknowledgment it can
+				// never advance a previous owner's slot. Arrival recreates its exact
+				// subtype and binds every native feedback callback to the new owner.
+				for slot in gamepads.lock().await.iter_mut() {
+					*slot = None;
+				}
+				timer_wake.notify_one();
+				let _ = done.send(());
+				continue;
+			},
+		};
+		if feedback_tx.is_closed() {
+			continue;
+		}
 		match command {
 			InputEvent::GamepadInfo(gamepad) => {
 				tracing::debug!("Gamepad info: {gamepad:?}");
@@ -643,6 +702,62 @@ async fn run_timer_task(gamepads: Arc<Mutex<[Option<GamepadSlot>; 16]>>, wake: A
 #[cfg(test)]
 mod tests {
 	use super::InputEvent;
+
+	#[tokio::test]
+	async fn owner_reset_orders_key_modifier_mouse_pointer_text_and_gamepad_cleanup() {
+		use super::*;
+		let stop = ShutdownManager::new();
+		let (tx, rx) = calloop::channel::channel();
+		let mut handler = InputHandler::new(tx, stop.clone(), Default::default()).unwrap();
+		let (feedback, _feedback_rx) = mpsc::channel(10);
+		for event in [
+			InputEvent::KeyDown(keyboard::Key::A),
+			InputEvent::KeyDown(keyboard::Key::LeftControl),
+			InputEvent::MouseButtonDown(mouse::MouseButton::Left),
+			InputEvent::Utf8Text("queued text".into()),
+			InputEvent::Touch(touch::Touch {
+				event_kind: PointerEventKind::Down,
+				pointer_id: 7,
+				x: 0.2,
+				y: 0.4,
+			}),
+			InputEvent::Pen(touch::Pen {
+				event_kind: PointerEventKind::Down,
+				tool_kind: touch::PenToolKind::Pen,
+				buttons: 3,
+				x: 0.2,
+				y: 0.4,
+				pressure_or_distance: 0.5,
+				rotation: 0,
+				tilt: 0,
+			}),
+		] {
+			handler.handle_input(event, feedback.clone()).await.unwrap();
+		}
+		let reset = tokio::spawn(async move {
+			handler.reset().await.unwrap();
+			handler
+		});
+		let ready = loop {
+			if let Ok(CompositorInputEvent::Reset { keys, buttons, ready }) = rx.try_recv() {
+				assert_eq!(keys, vec![29, 30]);
+				assert_eq!(buttons, vec![0x110]);
+				break ready;
+			}
+			tokio::task::yield_now().await;
+		};
+		assert!(!reset.is_finished(), "reset waits for compositor cleanup");
+		ready.send(()).unwrap();
+		let mut handler = reset.await.unwrap();
+		assert!(handler.keys.is_empty() && handler.buttons.is_empty());
+		handler
+			.handle_input(InputEvent::KeyDown(keyboard::Key::B), feedback)
+			.await
+			.unwrap();
+		assert_eq!(handler.keys.iter().copied().collect::<Vec<_>>(), vec![48]);
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		stop.wait_shutdown_complete().await;
+	}
 
 	#[test]
 	fn parses_utf8_text_event() {

@@ -121,6 +121,11 @@ impl HoldToHome {
 		self.apply(self.last_flags, now)
 	}
 
+	pub fn cancel(&mut self) {
+		self.state = State::Inactive;
+		self.last_flags = 0;
+	}
+
 	pub fn next_deadline(&self) -> Option<Instant> {
 		match self.state {
 			State::Pending { deadline } => Some(deadline),
@@ -139,6 +144,27 @@ mod tests {
 		config.home_button.trigger = Some(trigger);
 		config.home_button.hold_ms = 750;
 		config
+	}
+
+	#[test]
+	fn ownership_loss_just_before_deadline_cancels_home_and_tap() {
+		for trigger in [HomeTrigger::HoldBack, HomeTrigger::BackStart] {
+			let mut config = GamepadConfig::default();
+			config.home_button.trigger = Some(trigger);
+			config.home_button.hold_ms = 750;
+			let mut remap = HoldToHome::new(&config);
+			let now = Instant::now();
+			remap.apply(BACK_FLAG | START_FLAG, now);
+			assert_eq!(remap.advance(now + Duration::from_millis(749)).1, HoldTransition::None);
+			remap.cancel();
+			assert!(remap.next_deadline().is_none());
+			assert_eq!(remap.advance(now + Duration::from_secs(10)), (0, HoldTransition::None));
+			remap.apply(BACK_FLAG | START_FLAG, now);
+			remap.apply(0, now + Duration::from_millis(1));
+			remap.cancel();
+			assert!(remap.next_deadline().is_none());
+			assert_eq!(remap.advance(now + Duration::from_secs(10)), (0, HoldTransition::None));
+		}
 	}
 
 	#[test]

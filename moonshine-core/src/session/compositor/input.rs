@@ -25,10 +25,15 @@ use crate::session::compositor::state::MoonshineCompositor;
 /// Input events sent from the control stream to the compositor.
 ///
 /// These are transport-level events that cross the tokio→calloop boundary.
-/// They carry only primitive data (keycodes, coordinates, button codes) so
-/// they can be `Send` without any Wayland object references.
+/// They carry input data and completion acknowledgments, and are `Send`
+/// without any Wayland object references.
 #[derive(Debug)]
 pub(crate) enum CompositorInputEvent {
+	Reset {
+		keys: Vec<u32>,
+		buttons: Vec<u32>,
+		ready: tokio::sync::oneshot::Sender<()>,
+	},
 	/// A key was pressed. `keycode` is a Linux evdev keycode.
 	KeyDown {
 		keycode: u32,
@@ -110,7 +115,8 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 
 	// Pointer use activates the fallback cursor; it never overrides an app hide.
 	match event {
-		CompositorInputEvent::KeyDown { .. }
+		CompositorInputEvent::Reset { .. }
+		| CompositorInputEvent::KeyDown { .. }
 		| CompositorInputEvent::KeyUp { .. }
 		| CompositorInputEvent::TypeText { .. }
 		| CompositorInputEvent::TouchDown { .. }
@@ -124,6 +130,18 @@ pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCo
 	}
 
 	match event {
+		CompositorInputEvent::Reset { keys, buttons, ready } => {
+			state.pending_text.clear();
+			for keycode in keys {
+				process_input(CompositorInputEvent::KeyUp { keycode }, state);
+			}
+			for button in buttons {
+				process_input(CompositorInputEvent::MouseButtonUp { button }, state);
+			}
+			process_input(CompositorInputEvent::TouchCancelAll, state);
+			release_pen(state, time);
+			let _ = ready.send(());
+		},
 		CompositorInputEvent::KeyDown { keycode } => {
 			tracing::trace!(target: "input", "Key down: {keycode}");
 

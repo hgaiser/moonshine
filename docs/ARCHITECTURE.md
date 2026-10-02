@@ -65,9 +65,29 @@ cancellation and teardown follow [session ownership and shutdown](#session-owner
 | RTSP PLAY | After checking every prerequisite, constructs initial streams or commits a reconnect transition |
 | Control `StartB` | Opens the persistent audio/video start latches; tools open the same latches through the manager |
 | HTTP resume | Validates and publishes session keys and retains requested session parameters; RTSP remains authoritative for encoded stream properties |
-| Unchanged reconnect | Pauses delivery, resets client-visible video sequencing, requests an independently decodable first frame and acknowledges ordered transport activation before PLAY completes |
-| Changed reconnect | Pauses affected epochs, updates compositor output when needed, and recreates affected video/audio resources |
+| Unchanged reconnect | Pauses both streams, retains the video pipeline and Pulse sockets, resets client-visible media sequencing/encoder state, and acknowledges ordered transport activation before PLAY completes |
+| Changed reconnect | Pauses both epochs, updates compositor output when needed, and commits negotiated video/audio resources before activating delivery |
 | Cancel, application exit or session failure | One teardown stops the application unit and joins every worker; only then can the manager accept a later launch |
+
+Audio uses the same Pause → producer reset → BeginEpoch barrier as video on
+all reconnects, including identical settings. PING discovers a destination but
+cannot activate delivery. PCM frames and audio packets carry the manager's
+existing authorization generation; the encoder freezes key material at the
+ordered boundary, recreates Opus state, and clears RTP/FEC state before transport
+activation. Pulse clears queued PCM and resampler history before acknowledging
+the sample boundary. Same-mode and duration-only resumes retain Pulse clients;
+layout changes rebuild their output converters while preserving negotiated source
+formats and sockets. Existing stereo sources remain stereo content when upmixed
+into a surround sink until the application chooses a surround source format.
+
+The authenticated controlling peer owns input through the existing ControlPeers
+tracker. Disconnect or authorization-generation replacement closes its feedback
+receiver, orders compositor key/button releases and touch/pen/text cancellation,
+and waits for gamepad neutralization and slot destruction. The slot mutex also
+serializes Home/Guide timers; closed feedback ownership suppresses timer firing.
+The new peer's arrival recreates controllers using its exact subtype/capabilities
+and fresh feedback callbacks. Only an active peer's disconnect performs cleanup;
+a delayed disconnect from a replaced generation cannot release new input.
 
 RTSP access requires an existing session context established through the
 GameStream lifecycle. Do not move launch authentication into the streaming hot

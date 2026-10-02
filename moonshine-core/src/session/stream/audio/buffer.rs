@@ -96,7 +96,22 @@ where
 	}
 
 	pub fn clear(&mut self) {
-		self.buffer_mut().inner.clear()
+		let buffer = self.buffer();
+		let sample_spec = buffer.sample_spec;
+		let channel_map = buffer.channel_map;
+		let sample_rate = match self {
+			Self::Passthrough(_) => sample_spec.sample_rate,
+			Self::Resampling { output_rate, .. } => *output_rate,
+		};
+		*self = Self::new(
+			sample_spec,
+			channel_map,
+			pulse::SampleSpec {
+				channels: F::CHANNELS as u8,
+				sample_rate,
+				format: pulse::SampleFormat::Float32Le,
+			},
+		);
 	}
 }
 
@@ -133,6 +148,7 @@ where
 {
 	inner: VecDeque<u8>,
 	pub sample_spec: pulse::SampleSpec,
+	pub(super) channel_map: pulse::ChannelMap,
 	downmix: DownmixCoeffs,
 	bpp: usize,
 	_phantom: std::marker::PhantomData<F>,
@@ -146,6 +162,7 @@ where
 		let downmix = DownmixCoeffs::from_channel_map(&channel_map, sample_spec.channels);
 		Self {
 			inner: VecDeque::new(),
+			channel_map,
 			sample_spec,
 			downmix,
 			bpp: sample_spec.format.bytes_per_sample(),
@@ -364,5 +381,34 @@ impl DownmixCoeffs {
 			.zip(samples.iter())
 			.map(|(coeff, sample)| coeff * sample)
 			.sum()
+	}
+}
+
+#[cfg(test)]
+mod epoch_tests {
+	use super::*;
+	#[test]
+	fn clearing_pcm_also_clears_resampler_history() {
+		for rate in [48_000, 44_100] {
+			let spec = pulse::SampleSpec {
+				format: pulse::SampleFormat::Float32Le,
+				channels: 2,
+				sample_rate: rate,
+			};
+			let out = pulse::SampleSpec {
+				sample_rate: 48_000,
+				..spec
+			};
+			let mut buffer = PlaybackBuffer::<[f32; 2]>::new(spec, pulse::ChannelMap::stereo(), out);
+			buffer.write(&0.8f32.to_le_bytes().repeat(1000));
+			let _ = dasp::Signal::next(&mut buffer.drain(100).unwrap());
+			buffer.clear();
+			assert!(buffer.is_empty());
+			buffer.write(&0.0f32.to_le_bytes().repeat(1000));
+			let mut samples = buffer.drain(100).unwrap();
+			for _ in 0..100 {
+				assert_eq!(dasp::Signal::next(&mut samples), [0.0, 0.0]);
+			}
+		}
 	}
 }

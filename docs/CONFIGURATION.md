@@ -184,6 +184,9 @@ Requests whose datagram would exceed one UDP payload (65507 bytes) are rejected.
 
 Channel count, audio quality, resolution, FPS, bitrate, and video codec are
 negotiated with the client; they are not additional `config.toml` settings.
+Audio supports 5/10 ms packets. Opus bitrate is bounded by Moonlight’s 1400-byte
+packet limit, including encryption and FEC overhead; high-quality surround at
+10 ms is limited to 1,088,000 bits/s.
 
 ### `[stream.control]`
 
