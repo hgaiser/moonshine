@@ -435,7 +435,13 @@ impl RtspServer {
 			get_optional_sdp_attribute(&sdp_session, "x-nv-audio.surround.AudioQuality").unwrap_or(1);
 
 		let (channels, channel_mask) = if surround_enable != 0 {
-			(AudioChannels::from(surround_channels), surround_mask)
+			let audio_channels = AudioChannels::try_from(surround_channels)
+				.inspect_err(|err| {
+					tracing::warn!("{err}, falling back to stereo");
+				})
+				.unwrap_or(AudioChannels::Stereo);
+
+			(audio_channels, surround_mask)
 		} else {
 			// Fall back to the values from the HTTP launch request.
 			let ctx = self.session_manager.get_session_context().await;
