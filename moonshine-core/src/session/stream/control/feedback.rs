@@ -1,6 +1,6 @@
 use crate::session::stream::control::ControlMessageType;
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum FeedbackCommand {
 	Rumble(RumbleCommand),
 	SetLed(SetLedCommand),
@@ -19,7 +19,7 @@ impl FeedbackCommand {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RumbleCommand {
 	pub id: u16,
 	pub low_frequency: u16,
@@ -52,7 +52,7 @@ impl RumbleCommand {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SetLedCommand {
 	pub id: u16,
 	pub rgb: (u8, u8, u8),
@@ -84,7 +84,7 @@ impl SetLedCommand {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct EnableMotionEventCommand {
 	pub id: u16,
 	pub report_rate: u16,
@@ -115,7 +115,7 @@ impl EnableMotionEventCommand {
 	}
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TriggerEffectCommand {
 	pub id: u16,
 	pub trigger_event_flags: u8,

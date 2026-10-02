@@ -2174,6 +2174,14 @@ impl XwmHandler for MoonshineCompositor {
 		self.xwm.as_mut().expect("XWayland WM not initialized")
 	}
 
+	fn disconnected(&mut self, _xwm: XwmId) {
+		// Smithay's X11 event source has seen the WM connection close and is
+		// removing itself; session teardown waits for this before dropping
+		// the WM (see `terminate_xwayland`).
+		self.xwm_disconnected = true;
+		tracing::debug!("X11 window manager connection closed");
+	}
+
 	fn property_notify(&mut self, _xwm: XwmId, window: X11Surface, property: smithay::xwayland::xwm::WmWindowProperty) {
 		if let smithay::xwayland::xwm::WmWindowProperty::Other(atom) = property
 			&& self.x11_focus.as_ref().is_some_and(|xf| xf.is_app_id_property(atom))

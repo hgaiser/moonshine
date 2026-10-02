@@ -119,8 +119,18 @@ with the same controller and a different subtype. Check Edge extra buttons, ordi
 DualSense, Xbox and Nintendo controllers over USB/Bluetooth, and Steam Input where
 supported. Verify rumble, LED, motion requests and adaptive-trigger feedback on the
 current client. Deliver a late old-peer disconnect while the new peer holds input;
-it must leave that input intact. Controller devices are neutralized and recreated
-at ownership loss; inspect Steam's device reappearance and preserved subtype.
+it must leave that input intact. Controller devices are neutralized but stay
+enumerated at ownership loss: check `/proc/bus/input/devices` keeps the same
+`Moonshine` entries across a resume, that the server logs `Gamepad bound to the
+controlling peer` rather than `Gamepad N connected`, and that Steam raises no
+overlay (no `direct_reject_overlay` in the capture diagnostics). Reconnecting a
+different subtype must still recreate the device, and a controller the new client
+does not report must disappear.
+
+For a full stop, run several launch → stream → quit cycles and confirm
+`pgrep -P "$(pgrep -x pyroshine)" -x Xwayland` returns nothing and no new
+`/tmp/.X*-lock` remains after each `Session stopped; ready for a new session.`;
+a resume keeps the same XWayland PID and display.
 
 Automated coverage and remaining hardware checks for Batch 4 are recorded in
 [the remediation report](reports/RECONNECT_AUDIO_INPUT_2026-10-02.md).

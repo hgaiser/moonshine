@@ -97,11 +97,21 @@ into a surround sink until the application chooses a surround source format.
 The authenticated controlling peer owns input through the existing ControlPeers
 tracker. Disconnect or authorization-generation replacement closes its feedback
 receiver, orders compositor key/button releases and touch/pen/text cancellation,
-and waits for gamepad neutralization and slot destruction. The slot mutex also
-serializes Home/Guide timers; closed feedback ownership suppresses timer firing.
-The new peer's arrival recreates controllers using its exact subtype/capabilities
-and fresh feedback callbacks. Only an active peer's disconnect performs cleanup;
-a delayed disconnect from a replaced generation cannot release new input.
+and waits until every virtual controller is neutralized (buttons, sticks,
+triggers, touchpad contacts, angular rate), its pending Home/Guide transition and
+activation pulse are cancelled, and its feedback route is revoked. Device
+lifetime is separate from ownership: the virtual controllers stay plugged in, so
+a retained game does not see an unplug (which also made Steam raise its overlay
+and force composited capture after every reconnect). Native callbacks hold an
+owner-switchable route (`control/input/ownership.rs`), never a peer's channel;
+feedback produced while unowned is dropped. The next peer's first input for a
+slot claims it, re-enables motion reports and replays the device's current LED
+and per-trigger effect state; rumble is never replayed. An arrival with a
+different virtual identity (family or Edge subtype), a controller missing from
+the client's active mask, or session teardown destroys the device. The slot
+mutex serializes Home/Guide timers. Only an active peer's disconnect performs
+cleanup; a delayed disconnect from a replaced generation cannot release new
+input or revoke the new owner.
 
 RTSP access requires an existing session context established through the
 GameStream lifecycle. Do not move launch authentication into the streaming hot
@@ -176,6 +186,15 @@ cannot leave half-applied state: it starts a deterministic full teardown.
 Duplicate, premature or stale requests (PLAY without a current-generation
 ANNOUNCE, a second PLAY or launch, ANNOUNCE/PLAY during another transition) are
 rejected without touching the retained application or streams.
+
+The compositor owns the session's XWayland process. Smithay neither signals nor
+reaps it and calloop never frees a loop whose sources hold loop handles, so the
+compositor identifies the child it forked, holds a pidfd for it, and at teardown
+closes its Wayland client, waits (2 s, then `SIGKILL` via the pidfd, 1 s), lets
+the WM's X11 source observe the closed connection, and releases the display lock
+and sockets before its worker guard drops. A process that survives is reported
+and keeps the session `Stopping`, so the teardown deadline fails terminally
+instead of reporting `Idle`. A retained-session reconnect does not touch it.
 
 **Workers** (compositor, video pipeline thread and packet task, audio encoder
 and packet task, PulseAudio server, control stream, gamepad thread) register a

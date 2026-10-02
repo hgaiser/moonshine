@@ -10,6 +10,7 @@ See the [configuration reference](CONFIGURATION.md) for the full schema of these
 - [Prevent the host from suspending while streaming](#prevent-the-host-from-suspending-while-streaming)
 - [Run games in high-performance mode](#run-games-in-high-performance-mode)
 - [Use Gamescope with the client's resolution](#use-gamescope-with-the-clients-resolution)
+- [Match a game's fullscreen resolution to the stream](#match-a-games-fullscreen-resolution-to-the-stream)
 - [Run Flatpak Steam inside Pyroshine's compositor](#run-flatpak-steam-inside-pyroshines-compositor)
 - [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 - [Debug a failing application](#debug-a-failing-application)
@@ -116,6 +117,18 @@ Pyroshine sets `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and `MOONSHIN
 Wrapping the game in Gamescope can also work around focus or rendering issues: Gamescope provides its own Wayland/X11 surfaces and input handling, so games that misbehave under Pyroshine's compositor directly (unfocused windows, scaling artifacts, etc.) often behave correctly when run inside it.
 
 Note that these environment variables are only set when the app is launched by Pyroshine, so fall back to defaults (e.g. `${MOONSHINE_CLIENT_WIDTH:-2560}`) if you also run the same command outside a stream.
+
+## Match a game's fullscreen resolution to the stream
+
+Games remember their fullscreen resolution, often from a different monitor or an
+earlier stream. Under Proton, a saved mode that the current stream does not offer
+can leave the game believing in a different display size than the window it
+renders into. Civilization VI, for example, then animates its main-menu buttons
+outside the visible area: the background renders but the menu is missing, with or
+without the Vulkan XWayland bypass. Set the in-game resolution to the client's
+resolution (or use borderless/windowed at that size); Pyroshine already scales a
+smaller window to fill the stream. Use the Gamescope wrapper above to render at a
+different internal resolution.
 
 ## Run Flatpak Steam inside Pyroshine's compositor
 

@@ -18,6 +18,7 @@ mod protocols;
 mod scaling;
 mod state;
 mod x11_focus;
+mod xwayland_process;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -502,39 +503,27 @@ fn run_compositor(
 	// Insert the Wayland display as a calloop event source so client
 	// messages (including XWayland's protocol handshake) are dispatched
 	// whenever data arrives on the Wayland socket, not only after the
-	// frame timer fires.
+	// frame timer fires. A dispatcher keeps the Display reachable outside
+	// the loop: teardown must run client cleanup after killing XWayland.
+	let display_dispatcher = calloop::Dispatcher::new(
+		calloop::generic::Generic::new(display, calloop::Interest::READ, calloop::Mode::Level),
+		|_, display, state: &mut MoonshineCompositor| {
+			// Safety: the Display is dropped only after the loop stops.
+			dispatch_wayland_clients(unsafe { display.get_mut() }, state);
+			Ok(calloop::PostAction::Continue)
+		},
+	);
 	event_loop
 		.handle()
-		.insert_source(
-			calloop::generic::Generic::new(display, calloop::Interest::READ, calloop::Mode::Level),
-			|_, display, state: &mut MoonshineCompositor| {
-				// Safety: we never drop the display while the event loop runs.
-				unsafe {
-					let display = display.get_mut();
-					if let Err(e) = display.dispatch_clients(state) {
-						tracing::error!("Failed to dispatch Wayland clients: {e}");
-					}
-
-					// Send deferred wp_image_description_info_v1 destructor events.
-					for info in state.deferred_info_done.drain(..) {
-						info.done();
-					}
-
-					// Flush pending events back to clients. Without this,
-					// responses (e.g. wl_registry.global, wl_callback.done)
-					// remain buffered and are never sent, causing XWayland's
-					// initial roundtrip to block indefinitely.
-					if let Err(e) = display.flush_clients() {
-						tracing::error!("Failed to flush Wayland clients: {e}");
-					}
-				}
-				Ok(calloop::PostAction::Continue)
-			},
-		)
+		.register_dispatcher(display_dispatcher.clone())
 		.map_err(|e| format!("Failed to insert Wayland display source: {e}"))?;
 
+	// Sources that only serve a live session. Teardown removes them before
+	// it dispatches the loop to terminate XWayland.
+	let mut session_sources = Vec::new();
+
 	// Register the input channel from the control stream.
-	event_loop
+	let token = event_loop
 		.handle()
 		.insert_source(input_rx, |event, _, state: &mut MoonshineCompositor| {
 			if let calloop::channel::Event::Msg(input_event) = event {
@@ -546,10 +535,11 @@ fn run_compositor(
 			}
 		})
 		.map_err(|e| format!("Failed to insert input channel: {e}"))?;
+	session_sources.push(token);
 
 	let refresh_rate = Arc::new(AtomicU32::new(context.refresh_rate.max(1)));
 	let reconfigured_refresh_rate = refresh_rate.clone();
-	event_loop
+	let token = event_loop
 		.handle()
 		.insert_source(reconfigure_rx, move |event, _, state: &mut MoonshineCompositor| {
 			if let calloop::channel::Event::Msg(request) = event {
@@ -562,6 +552,7 @@ fn run_compositor(
 			}
 		})
 		.map_err(|e| format!("Failed to insert compositor reconfiguration channel: {e}"))?;
+	session_sources.push(token);
 
 	// Set up the frame timer.
 	// Use Instant-based absolute scheduling so that render time inside
@@ -575,7 +566,7 @@ fn run_compositor(
 	state.next_refresh_at = std::time::Instant::now() + frame_interval;
 	state.next_capture_at = state.next_refresh_at;
 	let timer = smithay::reexports::calloop::timer::Timer::from_deadline(state.next_refresh_at);
-	event_loop
+	let token = event_loop
 		.handle()
 		.insert_source(timer, move |_event, _metadata, state: &mut MoonshineCompositor| {
 			// Type a bounded batch of any clipboard text queued since the last tick.
@@ -592,6 +583,7 @@ fn run_compositor(
 			smithay::reexports::calloop::timer::TimeoutAction::ToInstant(state.next_refresh_at)
 		})
 		.map_err(|e| format!("Failed to insert frame timer: {e}"))?;
+	session_sources.push(token);
 
 	if let Some(demand) = capture_demand {
 		// One preallocated timer, rearmed by coalesced consumer demand. Keep the
@@ -603,23 +595,29 @@ fn run_compositor(
 				calloop::timer::TimeoutAction::ToDuration(std::time::Duration::from_secs(86400))
 			},
 		);
-		let handle = event_loop.handle();
-		let token = handle
+		let token = event_loop
+			.handle()
 			.register_dispatcher(capture_timer.clone())
 			.map_err(|e| format!("Failed to register capture demand timer: {e}"))?;
-		event_loop
+		session_sources.push(token);
+		// calloop never clears sources when the loop is dropped, so a strong
+		// handle captured by a source would leak the whole loop (and the
+		// Display and XWayland with it). Hold it weakly.
+		let handle = event_loop.handle().downgrade();
+		let demand_token = event_loop
 			.handle()
 			.insert_source(demand, move |_, _, state: &mut MoonshineCompositor| {
 				if state.frame_tx.requested() {
 					capture_timer
 						.as_source_mut()
 						.set_deadline(state.next_capture_at.max(std::time::Instant::now()));
-					if let Err(error) = handle.update(&token) {
+					if let Some(Err(error)) = handle.upgrade().map(|handle| handle.update(&token)) {
 						tracing::warn!(%error, "Failed to rearm capture demand timer");
 					}
 				}
 			})
 			.map_err(|e| format!("Failed to register capture demand wakeup: {e}"))?;
+		session_sources.push(demand_token);
 	}
 
 	tracing::info!(
@@ -650,15 +648,81 @@ fn run_compositor(
 		}
 	}
 
-	// Stop the application first so X11 clients disconnect from
-	// Xwayland, then tear down the X11 window manager. When the event
-	// loop is dropped afterwards, Smithay's XWayland::Drop disconnects
-	// the Wayland client, and the `-terminate` flag causes Xwayland to
-	// exit.
+	// The manager stopped the application before triggering this stop. Close
+	// the session's own X11 helpers, stop rendering and input, then terminate
+	// XWayland explicitly: neither Smithay's drop behavior nor `-terminate`
+	// ends the process while the loop still holds its connections.
 	state.shutdown_session_processes();
+	for token in session_sources {
+		event_loop.handle().remove(token);
+	}
+	let xwayland = state.terminate_xwayland(
+		|state, client| {
+			// Safety: the Display stays owned by the dispatcher; no dispatch
+			// of the loop is running.
+			let mut source = display_dispatcher.as_source_mut();
+			let display = unsafe { source.get_mut() };
+			// `dispatch_clients` only cleans up dead clients when some client
+			// is readable; dispatching the killed client always does, closing
+			// its socket now rather than whenever the Display is dropped. The
+			// result is an error for a killed client, as expected.
+			let _ = display.backend().dispatch_single_client(state, client);
+			let _ = display.flush_clients();
+		},
+		|state, timeout| {
+			if let Err(error) = event_loop.dispatch(Some(timeout), state) {
+				tracing::warn!(%error, "Event loop dispatch failed during compositor teardown");
+			}
+		},
+	);
+	if let Err(error) = xwayland {
+		// Holding the worker guard keeps the session in `Stopping`: the
+		// manager's teardown deadline then fails terminally instead of
+		// reporting `Idle` while a session process is alive.
+		tracing::error!(%error, "Session XWayland survived teardown; holding session completion");
+		if let Some(process) = state.xwayland_process.as_ref() {
+			while !matches!(process.wait_exit(std::time::Duration::from_secs(5)), Ok(true)) {
+				tracing::error!(pid = process.pid(), "Session XWayland is still alive");
+			}
+		}
+	}
+
+	// Drop everything the loop owns now rather than at an unspecified point,
+	// and detect any remaining reference cycle that would keep the Display,
+	// its client sockets or GPU resources alive past session completion.
+	let loop_handle = event_loop.handle().downgrade();
+	drop(state);
+	drop(display_dispatcher);
+	drop(event_loop);
+	if !loop_handle.expired() {
+		tracing::error!("Compositor event loop leaked after teardown; session resources may outlive the session");
+	}
 
 	tracing::info!("Compositor stopped.");
 	Ok(())
+}
+
+/// Dispatch and flush Wayland clients, including client cleanup for killed
+/// or disconnected clients (which is what closes their sockets).
+fn dispatch_wayland_clients(
+	display: &mut smithay::reexports::wayland_server::Display<MoonshineCompositor>,
+	state: &mut MoonshineCompositor,
+) {
+	if let Err(e) = display.dispatch_clients(state) {
+		tracing::error!("Failed to dispatch Wayland clients: {e}");
+	}
+
+	// Send deferred wp_image_description_info_v1 destructor events.
+	for info in state.deferred_info_done.drain(..) {
+		info.done();
+	}
+
+	// Flush pending events back to clients. Without this, responses (e.g.
+	// wl_registry.global, wl_callback.done) remain buffered and are never
+	// sent, causing XWayland's initial roundtrip to block indefinitely.
+	if let Err(e) = display.flush_clients() {
+		tracing::error!("Failed to flush Wayland clients: {e}");
+	}
 }
 
 /// Find the appropriate DRM render node.

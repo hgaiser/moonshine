@@ -14,6 +14,14 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-8] - 2026-10-01
+
+### Fixed
+
+- Stop each finished session from leaking its XWayland server, display lock and Wayland/X11 connections: calloop never freed the compositor loop, and Smithay neither signals nor reaps XWayland. Teardown now closes XWayland's client, waits for the process through a pidfd (escalating to `SIGKILL`), and keeps the session `Stopping` if it survives; retained-session reconnects keep their XWayland.
+- Keep virtual controllers plugged in across a Moonlight reconnect. Ownership loss still releases every input, cancels Home/Guide timers and revokes feedback, but no longer unplugs the device; the next peer reclaims it with fresh motion enable and the device's LED/trigger state, and native feedback can only reach the current owner.
+- Remove the stream stutter after reconnecting to a retained game: the controller unplug made Steam raise its overlay for each reconnect, forcing composited capture until it closed.
+
 ## [v0.17.0-beta-7] - 2026-10-01
 
 ### Fixed

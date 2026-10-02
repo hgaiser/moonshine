@@ -345,6 +345,14 @@ pub(crate) struct MoonshineCompositor {
 	// -- XWayland --
 	pub xwayland_shell_state: XWaylandShellState,
 	pub xwm: Option<X11Wm>,
+	/// Set by `XwmHandler::disconnected` once Smithay's X11 event source has
+	/// observed the WM connection close (XWayland exited) and removed itself.
+	pub(super) xwm_disconnected: bool,
+	/// Session-owned XWayland process, Wayland client and event source. Full
+	/// teardown terminates them explicitly; see [`Self::terminate_xwayland`].
+	pub(super) xwayland_process: Option<super::xwayland_process::OwnedChild>,
+	pub(super) xwayland_client: Option<smithay::reexports::wayland_server::Client>,
+	pub(super) xwayland_token: Option<RegistrationToken>,
 	pub xdisplay: Option<u32>,
 	/// Channel to notify the session thread of the XWayland display number
 	/// once it becomes ready.
@@ -821,6 +829,10 @@ impl MoonshineCompositor {
 				deferred_info_done: Vec::new(),
 				xwayland_shell_state,
 				xwm: None,
+				xwm_disconnected: false,
+				xwayland_process: None,
+				xwayland_client: None,
+				xwayland_token: None,
 				xdisplay: None,
 				xdisplay_tx: Some(xdisplay_tx),
 				wayland_socket_token: Some(wayland_socket_token),
@@ -2391,6 +2403,9 @@ impl MoonshineCompositor {
 			"Spawning XWayland"
 		);
 
+		// Smithay forks Xwayland from this thread; the before/after snapshot
+		// identifies exactly that child so teardown can own its lifetime.
+		let children_before = super::xwayland_process::thread_children();
 		let (xwayland, client) = match XWayland::spawn(
 			&self.display_handle,
 			None,
@@ -2412,8 +2427,21 @@ impl MoonshineCompositor {
 				return;
 			},
 		};
+		self.xwayland_process = match children_before
+			.and_then(|before| super::xwayland_process::OwnedChild::adopt_new_child(&before, "Xwayland"))
+		{
+			Ok(process) => Some(process),
+			Err(error) => {
+				// Teardown still closes every connection; it just cannot bound
+				// or verify the process exit without a pidfd.
+				tracing::warn!(%error, "Could not take ownership of the XWayland process; its exit cannot be verified");
+				None
+			},
+		};
+		self.xwayland_client = Some(client.clone());
 		tracing::debug!(
 			display_number = xwayland.display_number(),
+			pid = self.xwayland_process.as_ref().map(|process| process.pid()),
 			"XWayland process spawned, waiting for readiness."
 		);
 
@@ -2461,8 +2489,9 @@ impl MoonshineCompositor {
 				},
 			});
 
-		if let Err(e) = ret {
-			tracing::error!("Failed to insert XWayland source into event loop: {e}");
+		match ret {
+			Ok(token) => self.xwayland_token = Some(token),
+			Err(e) => tracing::error!("Failed to insert XWayland source into event loop: {e}"),
 		}
 	}
 
@@ -2513,11 +2542,12 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Shut down XWayland server connections.
+	/// Release the session's own X11 helpers before XWayland is terminated.
 	///
-	/// Drops the X11 window manager connection so Xwayland sees no remaining
-	/// connections and exits. The application's systemd scope is stopped by
-	/// `Application::Drop` after the compositor thread has exited.
+	/// Stops accepting Wayland clients and closes the focus-control X11
+	/// connection. The X11 window manager stays alive: Smithay's X11 event
+	/// source dispatches into it until it observes the WM connection close in
+	/// [`Self::terminate_xwayland`].
 	pub fn shutdown_session_processes(&mut self) {
 		self.gpu_timer.destroy(&mut self.renderer);
 		if let Some(token) = self.wayland_socket_token.take() {
@@ -2538,12 +2568,88 @@ impl MoonshineCompositor {
 		if self.x11_focus.take().is_some() {
 			tracing::debug!("Cleared X11 focus control connection");
 		}
+	}
 
-		// Drop the X11 window manager, closing the privileged WM
-		// connection to Xwayland. Xwayland will see no remaining connections.
+	/// Terminate the session-owned XWayland and release everything tied to it.
+	///
+	/// Dropping Smithay's handles is not sufficient: its X11 event source keeps
+	/// a loop handle (a reference cycle that calloop never breaks), and
+	/// `XWayland`'s drop only marks the Wayland client killed without closing
+	/// its socket or signalling the process. This disconnects the client and
+	/// closes its socket now, waits for the process with a bound (escalating
+	/// to `SIGKILL` through its pidfd), lets the X11 source observe the closed
+	/// WM connection and remove itself, and finally removes the XWayland
+	/// source, which unlinks the display lock and listening sockets.
+	///
+	/// `close_client` must dispatch that one client so the Display runs its
+	/// dead-client cleanup; `dispatch_loop` runs one bounded loop iteration.
+	///
+	/// Returns `Err` only if the process is provably still alive. The caller
+	/// must not report the session stopped in that case.
+	pub fn terminate_xwayland(
+		&mut self,
+		mut close_client: impl FnMut(&mut Self, smithay::reexports::wayland_server::backend::ClientId),
+		mut dispatch_loop: impl FnMut(&mut Self, std::time::Duration),
+	) -> Result<(), String> {
+		const EXIT_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+		const EXIT_AFTER_KILL: std::time::Duration = std::time::Duration::from_secs(1);
+		const XWM_DRAIN: std::time::Duration = std::time::Duration::from_secs(1);
+
+		if let Some(client) = self.xwayland_client.take() {
+			self.display_handle.backend_handle().kill_client(
+				client.id(),
+				smithay::reexports::wayland_server::backend::DisconnectReason::ConnectionClosed,
+			);
+			// Killing only marks the client; cleanup closes its socket, which
+			// is what makes Xwayland exit.
+			close_client(self, client.id());
+		}
+
+		let result = match self.xwayland_process.as_ref() {
+			Some(process) => match process.terminate(EXIT_GRACE, EXIT_AFTER_KILL) {
+				Ok(super::xwayland_process::Termination::Exited) => {
+					tracing::debug!(pid = process.pid(), "XWayland exited");
+					Ok(())
+				},
+				Ok(super::xwayland_process::Termination::Killed) => {
+					tracing::warn!(pid = process.pid(), "XWayland did not exit after disconnect; killed it");
+					Ok(())
+				},
+				Err(error) => Err(format!(
+					"XWayland (pid {}) could not be stopped: {error}",
+					process.pid()
+				)),
+			},
+			None => Ok(()),
+		};
+
+		// With the process gone the WM connection is closed: Smithay's event
+		// thread exits and its channel source reports `Closed` and removes
+		// itself, breaking its loop-handle cycle. Keep the WM alive until then;
+		// queued X11 events are still dispatched into it.
+		if result.is_ok() && self.xwm.is_some() {
+			let deadline = std::time::Instant::now() + XWM_DRAIN;
+			while !self.xwm_disconnected {
+				let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+				if remaining.is_zero() {
+					tracing::warn!("X11 window manager connection did not report closure");
+					break;
+				}
+				dispatch_loop(self, remaining.min(std::time::Duration::from_millis(50)));
+			}
+		}
 		if self.xwm.take().is_some() {
 			tracing::debug!("Dropped X11 window manager");
 		}
+		// Drops Smithay's `XWayland`, releasing the X11 display lock file and
+		// listening sockets with it.
+		if let Some(token) = self.xwayland_token.take() {
+			self.handle.remove(token);
+		}
+		if result.is_ok() {
+			self.xwayland_process = None;
+		}
+		result
 	}
 }
 

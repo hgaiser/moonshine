@@ -4,11 +4,11 @@ use inputtino::{
 };
 use serde::{Deserialize, Serialize};
 use strum_macros::FromRepr;
-use tokio::sync::mpsc;
 
+use super::ownership::FeedbackRoute;
 use crate::session::stream::control::{
 	FeedbackCommand,
-	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
+	feedback::{RumbleCommand, SetLedCommand, TriggerEffectCommand},
 };
 
 const SONY_VENDOR: u16 = 0x054c;
@@ -200,6 +200,48 @@ impl GamepadInfo {
 	fn has_capability(&self, capability: &GamepadCapability) -> bool {
 		(self.capabilities & *capability as u16) != 0
 	}
+
+	/// The virtual device this arrival produces under `policy`.
+	pub fn virtual_identity(&self, policy: GamepadEmulation) -> VirtualIdentity {
+		let kind = match policy.target(self.kind) {
+			GamepadKind::Unknown | GamepadKind::Steam => GamepadKind::Xbox,
+			kind => kind,
+		};
+		VirtualIdentity {
+			kind,
+			dualsense_edge: kind == GamepadKind::PlayStation && self.is_dualsense_edge(),
+		}
+	}
+}
+
+/// Everything that determines the native device a slot exposes to the game:
+/// the emulated family and, for PlayStation, the Edge subtype. Arrivals with
+/// the same identity reuse the existing device; any difference recreates it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct VirtualIdentity {
+	kind: GamepadKind,
+	dualsense_edge: bool,
+}
+
+impl VirtualIdentity {
+	/// Whether the device reports motion, which each owner must enable.
+	pub fn has_motion(self) -> bool {
+		self.kind == GamepadKind::PlayStation
+	}
+}
+
+/// Operations the gamepad thread applies to a virtual controller.
+///
+/// Implemented by the Inputtino-backed [`Gamepad`]; tests substitute a
+/// recording device to exercise ownership without uinput/uhid access.
+pub(crate) trait VirtualGamepad {
+	/// Return every persistent input to rest without removing the device.
+	fn neutralize(&mut self);
+	fn set_pressed(&self, button_flags: u32);
+	fn apply_update(&self, update: &GamepadUpdate);
+	fn touch(&mut self, touch: &GamepadTouch);
+	fn set_motion(&self, motion: &GamepadMotion);
+	fn set_battery(&self, battery: &GamepadBattery);
 }
 
 #[derive(Debug)]
@@ -422,14 +464,14 @@ pub(crate) struct Gamepad {
 	/// The underlying inputtino joypad, used to inject button presses, stick
 	/// positions, triggers, touchpad events, and motion data.
 	gamepad: inputtino::Joypad,
+	/// Touchpad contacts currently placed, released when ownership is lost.
+	fingers: std::collections::BTreeSet<u32>,
 }
 
 impl Gamepad {
-	pub async fn new(
-		info: &GamepadInfo,
-		feedback_tx: mpsc::Sender<FeedbackCommand>,
-		policy: GamepadEmulation,
-	) -> Result<Self, ()> {
+	/// Create the native device. Its feedback callbacks hold `route`, never a
+	/// particular peer's channel, so the device can outlive its first owner.
+	pub fn new(info: &GamepadInfo, route: FeedbackRoute, policy: GamepadEmulation) -> Result<Self, ()> {
 		let kind = policy.target(info.kind);
 		tracing::debug!(index = info.index, incoming = ?info.kind, ?policy, virtual_kind = ?kind,
 			edge = info.is_dualsense_edge(), supported_buttons = format_args!("{:#010x}", info.supported_buttons),
@@ -484,10 +526,10 @@ impl Gamepad {
 					PS5Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
 
 				gamepad.set_on_led({
-					let feedback_tx = feedback_tx.clone();
+					let route = route.clone();
 					let index = info.index;
 					move |r, g, b| {
-						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
+						route.deliver_blocking(FeedbackCommand::SetLed(SetLedCommand {
 							id: index as u16,
 							rgb: (r as u8, g as u8, b as u8),
 						}));
@@ -495,7 +537,7 @@ impl Gamepad {
 				});
 
 				gamepad.set_on_trigger_effect({
-					let feedback_tx = feedback_tx.clone();
+					let route = route.clone();
 					let index = info.index;
 					move |trigger_event_flags, type_left, type_right, left, right| {
 						let left: &[u8; 10] = if let Ok(left) = left.try_into() {
@@ -514,7 +556,7 @@ impl Gamepad {
 
 						// tracing::info!("Trigger effect: {:?} {:?} {:?} {:?}", type_left, type_right, left, right);
 
-						let _ = feedback_tx.blocking_send(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
+						route.deliver_blocking(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
 							id: index as u16,
 							trigger_event_flags,
 							type_left,
@@ -525,22 +567,8 @@ impl Gamepad {
 					}
 				});
 
-				// Enable gyro and accelerometer events.
-				let _ = feedback_tx
-					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
-						id: info.index as u16,
-						report_rate: 100,
-						motion_type: JoypadMotionType::ACCELERATION as u8,
-					}))
-					.await;
-				let _ = feedback_tx
-					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
-						id: info.index as u16,
-						report_rate: 100,
-						motion_type: JoypadMotionType::GYROSCOPE as u8,
-					}))
-					.await;
-
+				// Gyro/accelerometer reports are enabled per owner when the
+				// route is claimed (see `FeedbackRoute::claim`).
 				Joypad::PS5(gamepad)
 			},
 			GamepadKind::Nintendo => Joypad::Switch(
@@ -548,11 +576,10 @@ impl Gamepad {
 			),
 		};
 
-		let feedback_tx_for_rumble = feedback_tx.clone();
 		gamepad.set_on_rumble({
 			let index = info.index;
 			move |low_frequency, high_frequency| {
-				let _ = feedback_tx_for_rumble.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
+				route.deliver_blocking(FeedbackCommand::Rumble(RumbleCommand {
 					id: index as u16,
 					low_frequency: low_frequency as u16,
 					high_frequency: high_frequency as u16,
@@ -560,23 +587,36 @@ impl Gamepad {
 			}
 		});
 
-		Ok(Self { gamepad })
+		Ok(Self {
+			gamepad,
+			fingers: Default::default(),
+		})
 	}
+}
 
-	/// Apply button flags to the gamepad.
-	pub fn neutralize(&self) {
+impl VirtualGamepad for Gamepad {
+	/// Release buttons, sticks, triggers, touchpad contacts and angular rate.
+	/// The accelerometer keeps its last (orientation) sample: zero would read
+	/// as free fall rather than rest.
+	fn neutralize(&mut self) {
 		self.set_pressed(0);
 		self.gamepad.set_stick(JoypadStickPosition::LS, 0, 0);
 		self.gamepad.set_stick(JoypadStickPosition::RS, 0, 0);
 		self.gamepad.set_triggers(0, 0);
+		if let Joypad::PS5(gamepad) = &self.gamepad {
+			for finger in std::mem::take(&mut self.fingers) {
+				gamepad.release_finger(finger);
+			}
+			gamepad.set_motion(JoypadMotionType::GYROSCOPE, 0.0, 0.0, 0.0);
+		}
 	}
 
-	pub fn set_pressed(&self, button_flags: u32) {
+	fn set_pressed(&self, button_flags: u32) {
 		self.gamepad.set_pressed(button_flags as i32);
 	}
 
 	/// Apply a gamepad update (sticks, triggers) to the device.
-	pub fn apply_update(&self, update: &GamepadUpdate) {
+	fn apply_update(&self, update: &GamepadUpdate) {
 		// Send analog triggers.
 		self.gamepad
 			.set_stick(JoypadStickPosition::LS, update.left_stick.0, update.left_stick.1);
@@ -586,21 +626,23 @@ impl Gamepad {
 			.set_triggers(update.left_trigger as i16, update.right_trigger as i16);
 	}
 
-	pub fn touch(&mut self, touch: &GamepadTouch) {
+	fn touch(&mut self, touch: &GamepadTouch) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
 			if touch.pressure > 0.5 {
+				self.fingers.insert(touch.pointer_id);
 				gamepad.place_finger(
 					touch.pointer_id,
 					(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
 					(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
 				);
 			} else {
+				self.fingers.remove(&touch.pointer_id);
 				gamepad.release_finger(touch.pointer_id);
 			}
 		}
 	}
 
-	pub fn set_motion(&self, motion: &GamepadMotion) {
+	fn set_motion(&self, motion: &GamepadMotion) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
 			gamepad.set_motion(
 				motion.motion_type,
@@ -611,7 +653,7 @@ impl Gamepad {
 		}
 	}
 
-	pub fn set_battery(&self, gamepad_battery: &GamepadBattery) {
+	fn set_battery(&self, gamepad_battery: &GamepadBattery) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
 			let state = match gamepad_battery.battery_state {
 				BatteryState::Discharging => InputtinoBatterState::BATTERY_DISCHARGING,
