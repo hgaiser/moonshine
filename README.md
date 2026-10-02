@@ -277,6 +277,46 @@ Box art is automatically loaded from Heroic's `images-cache/` directory for any 
 The default configuration directory is `~/.config/heroic`, falling back to `~/.var/app/com.heroicgameslauncher.hgl/config/heroic` when only the Flatpak is installed.
 You can override it with the `config_dir` option.
 
+**Bottles scanner** — finds games and applications in the [Bottles](https://github.com/bottlesdevs/Bottles) Library tab:
+
+```toml
+[[application_scanner]]
+type = "bottles"
+command = ["bottles-cli", "run", "-b", "{bottle}", "--program-id", "{program_id}"]
+umu_command = ["bottles-cli", "umu", "run", "--game", "{umu_game}"]
+```
+
+Only entries you added to Bottles' Library ("Add to Library" on a program) are exposed — not every program Bottles discovers. UMU entries appear once Bottles reports them as ready, and Steam shortcuts in the Library are skipped. `umu_command` is optional: without it, UMU entries are skipped.
+
+If you installed Bottles from Flathub, launch it through Flatpak instead:
+
+```toml
+[[application_scanner]]
+type = "bottles"
+command = [
+  "dbus-run-session", "--",
+  "flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+  "run", "-b", "{bottle}", "--program-id", "{program_id}",
+]
+umu_command = [
+  "dbus-run-session", "--",
+  "flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+  "umu", "run", "--game", "{umu_game}",
+]
+```
+
+The `dbus-run-session` prefix keeps the game inside Moonshine's compositor instead of on your desktop, the same as for Flatpak Steam in [TIPS.md](TIPS.md), which explains why Flatpak needs it.
+
+`{bottle}` is the bottle's name, `{program_id}` the program's internal id, `{name}` the entry's display name, and `{umu_game}` the id of a game managed through Bottles' UMU integration.
+Commands are resolved against Moonshine's own `PATH`, so a bare `bottles-cli` only works for a natively installed Bottles; use an absolute path or the Flatpak form otherwise.
+
+The default data directory is the first of `~/.local/share/bottles` and `~/.var/app/com.usebottles.bottles/data/bottles` that contains a `library.yml` — leftover data from an uninstalled native Bottles does not shadow the Flatpak install.
+You can override it with the `data_dir` option.
+
+Box art is automatically loaded from Bottles' grid images when available, falling back to the program's icon.
+
+One limitation: Bottles launches executables that live outside the bottle (e.g. on a separate game drive) through `wine start`, which exits immediately, so Moonshine ends the session shortly after launch. Games installed inside the bottle prefix are unaffected.
+
 ## Tips & Tricks
 
 See [TIPS.md](TIPS.md) for practical recipes and workarounds.
