@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
@@ -28,6 +29,7 @@ use self::stream::control::ControlStreamConfig;
 use self::stream::video::VideoStreamConfig;
 
 pub mod application;
+pub mod authorization;
 pub mod compositor;
 pub mod inhibit;
 pub mod manager;
@@ -48,6 +50,7 @@ pub struct SessionKeyData {
 
 pub(crate) type SessionKeysReceiver = watch::Receiver<SessionKeyData>;
 pub(crate) type SessionKeysSender = watch::Sender<SessionKeyData>;
+pub(crate) type AuthorizationReceiver = watch::Receiver<authorization::StreamAuthorization>;
 
 /// Session keys — either raw keys or a watch receiver.
 #[derive(Clone, Debug)]
@@ -102,6 +105,10 @@ pub struct SessionContext {
 
 	/// If true, the compositor will be launched with HDR support.
 	pub hdr: bool,
+
+	/// Address of the paired client that authenticated the launch. RTSP, control
+	/// and media endpoint discovery are bound to it (see `authorization`).
+	pub client_ip: IpAddr,
 }
 
 /// Session-level values carried by the authenticated HTTP `/resume` request.
@@ -267,6 +274,7 @@ impl LaunchedSession {
 		&self.context
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn start(
 		self,
 		video_config: VideoStreamConfig,
@@ -275,6 +283,7 @@ impl LaunchedSession {
 		audio_ctx: AudioStreamContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		inhibit_sleep: bool,
+		authorization_rx: AuthorizationReceiver,
 	) -> Result<(ActiveSession, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>), ()> {
 		let Self {
 			context,
@@ -293,12 +302,18 @@ impl LaunchedSession {
 
 		// Start video stream — gated, returns VideoStreamHandle.
 		let video_handle = video_stream
-			.start(video_config, video_ctx.clone(), keys_rx.clone(), stop.clone())
+			.start(
+				video_config,
+				video_ctx.clone(),
+				keys_rx.clone(),
+				authorization_rx.clone(),
+				stop.clone(),
+			)
 			.map_err(|()| tracing::error!("Failed to start video stream"))?;
 
 		// Start audio stream — gated, returns AudioStartHandle.
 		let audio_trigger = audio
-			.start(audio_ctx.clone(), keys_rx)
+			.start(audio_ctx.clone(), keys_rx, authorization_rx.clone())
 			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
 
 		// Clone the start notifies for external triggering (e.g. bench binary).
@@ -311,7 +326,7 @@ impl LaunchedSession {
 		let video_handle_for_resume = video_handle.clone();
 
 		// Start control stream — receives both handles.
-		let control_ctx = ControlStreamContext::new(&context);
+		let control_ctx = ControlStreamContext::new(&context, authorization_rx);
 		control_stream.start(
 			stream_timeout,
 			control_ctx,

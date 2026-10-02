@@ -3,3 +3,5 @@ __pycache__/
 /result
 /analysis_*
 *.bak
+docs/reports/PRODUCTION_READINESS_REVIEW_2026-10-01.md
+docs/reports/production-readiness-2026-10-01

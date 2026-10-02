@@ -101,7 +101,9 @@ paths before upgrading or migrating from Moonshine.
 
 See the [configuration reference](CONFIGURATION.md) for application entries and
 server settings. Add the host in Moonlight and submit its pairing PIN at
-`http://localhost:47989/pin` on the host (or the configured HTTP port).
+`http://localhost:47989/pin` on the host (or the configured HTTP port). The page
+only accepts requests from the host itself; on a headless host, use an SSH port
+forward as described under [`[webserver]`](CONFIGURATION.md#webserver).
 Keep the host on a trusted LAN or VPN and restrict its listening ports.
 
 ## Service diagnostics

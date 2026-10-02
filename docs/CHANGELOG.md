@@ -14,6 +14,17 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Security
+
+- Pairing approval (`/pin`, `/submit-pin`) is accepted only from the host itself: a loopback peer, a loopback `Host`, and same-origin browser requests. The PIN applies only to the pending request shown on the page, which now lists the requester address and certificate fingerprint; unapproved requests expire after five minutes. A non-loopback `address` gets an additional loopback-only approval listener.
+- RTSP negotiation, media endpoint discovery and the control connection are bound to the paired client and the latest `/launch` or `/resume`. Clients supporting Moonlight's session-ID extension also receive per-launch/resume `X-SS-Ping-Payload` and `X-SS-Connect-Data` values that their media PINGs and control connection must echo; other clients are bound by address.
+- Control messages are accepted only from the peer that authenticated with the current session key. Plaintext, wrong-key, replayed and stale-generation messages are dropped and cannot inject input, keep a stream alive, or receive feedback.
+
+### Fixed
+
+- Malformed, truncated or nested control messages are rejected without panicking or ending the session, and non-finite gamepad motion/touch values are ignored.
+- A client that stalls during the TLS handshake no longer blocks other HTTPS clients. HTTP, HTTPS and RTSP connections are bounded in number, size and duration, and are released promptly on shutdown.
+
 ## [v0.16.15] - 2026-10-01
 
 ### Fixed

@@ -722,6 +722,9 @@ async fn run_benchmark(
 		audio_channels: AudioChannels::Stereo,
 		audio_channel_mask: 0x3,
 		hdr: args.hdr,
+		// The benchmark is the local client: it discovers the video endpoint
+		// with a legacy PING from loopback below.
+		client_ip: std::net::Ipv4Addr::LOCALHOST.into(),
 	};
 
 	tracing::info!("Initializing session...");
@@ -758,14 +761,25 @@ async fn run_benchmark(
 		encrypt_audio: false,
 	};
 
+	let Some(grant) = session_manager
+		.authorize_stream(std::net::Ipv4Addr::LOCALHOST.into())
+		.await
+	else {
+		let _ = session_manager.stop_session().await;
+		return Err(boxed_error("Session has no stream authorization"));
+	};
+
 	tracing::info!("Setting stream contexts...");
-	if let Err(err) = session_manager.set_stream_context(video_ctx, audio_ctx).await {
+	if let Err(err) = session_manager
+		.set_stream_context(&grant, video_ctx, audio_ctx, false)
+		.await
+	{
 		let _ = session_manager.stop_session().await;
 		return Err(boxed_error(format!("Failed to set stream context: {err:?}")));
 	}
 
 	tracing::info!("Starting session streams...");
-	if let Err(err) = session_manager.start_session().await {
+	if let Err(err) = session_manager.start_session(&grant).await {
 		let _ = session_manager.stop_session().await;
 		return Err(boxed_error(format!("Failed to start session: {err:?}")));
 	}

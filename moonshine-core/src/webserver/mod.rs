@@ -1,7 +1,7 @@
 use std::{
 	collections::HashMap,
 	convert::Infallible,
-	net::{IpAddr, SocketAddr, ToSocketAddrs},
+	net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs},
 	path::PathBuf,
 	str::FromStr,
 };
@@ -14,7 +14,7 @@ use hyper::{
 	header::{self, HeaderValue},
 	service::service_fn,
 };
-use hyper_util::rt::tokio::TokioIo;
+use hyper_util::rt::tokio::{TokioIo, TokioTimer};
 use image::ImageFormat;
 use image::imageops::FilterType;
 use network_interface::NetworkInterfaceConfig;
@@ -26,6 +26,7 @@ use tokio::net::TcpListener;
 use crate::{
 	ShutdownReason,
 	clients::ClientManager,
+	ingress::Ingress,
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys, application::ApplicationConfig,
 		manager::SessionManager,
@@ -41,6 +42,8 @@ mod bandwidth;
 #[cfg(test)]
 mod bandwidth_tests;
 mod pairing;
+#[cfg(test)]
+mod security_tests;
 
 /// Configuration for the embedded webserver.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -96,6 +99,41 @@ pub struct Webserver {
 	supported_codecs: u32,
 	hdr_supported: bool,
 	shutdown: ShutdownManager<ShutdownReason>,
+	limits: WebLimits,
+}
+
+/// Concurrent connections per HTTP/HTTPS listener. Moonlight uses a handful
+/// (server polling, app list, a few parallel box-art downloads).
+const MAX_HTTP_CONNECTIONS: usize = 64;
+/// Hyper read buffer bound per connection. Pairing requests carry a hex PEM
+/// certificate in the query string, which fits comfortably.
+const MAX_HTTP_BUFFER_BYTES: usize = 64 * 1024;
+/// Bound for operator PIN submission bodies.
+const MAX_PIN_BODY_BYTES: usize = 1024;
+
+/// Deadlines applied to every accepted HTTP/HTTPS connection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WebLimits {
+	/// Time for a client to complete the TLS handshake.
+	pub tls_handshake_timeout: std::time::Duration,
+	/// Time to receive request headers. Hyper also applies it while a keep-alive
+	/// connection waits for the next request, bounding idle connections.
+	pub header_read_timeout: std::time::Duration,
+	/// Time to receive a request body the server reads (PIN submission).
+	pub body_read_timeout: std::time::Duration,
+	/// Time an operator has to approve a pairing request.
+	pub pairing_approval_timeout: std::time::Duration,
+}
+
+impl Default for WebLimits {
+	fn default() -> Self {
+		Self {
+			tls_handshake_timeout: std::time::Duration::from_secs(10),
+			header_read_timeout: std::time::Duration::from_secs(30),
+			body_read_timeout: std::time::Duration::from_secs(10),
+			pairing_approval_timeout: std::time::Duration::from_secs(300),
+		}
+	}
 }
 
 impl Webserver {
@@ -129,197 +167,184 @@ impl Webserver {
 			supported_codecs,
 			hdr_supported,
 			shutdown: shutdown.clone(),
+			limits: WebLimits::default(),
 		};
 
 		// Run HTTP webserver.
-		let http_address = (address.as_str(), server.webserver_config.port)
-			.to_socket_addrs()
-			.map_err(|e| {
-				tracing::error!(
-					"Failed to resolve address '{}' port {}: {e}",
-					address,
-					server.webserver_config.port
-				)
-			})?
-			.next()
-			.ok_or_else(|| {
-				tracing::error!(
-					"Failed to resolve address '{}' port {}",
-					address,
-					server.webserver_config.port
-				)
-			})?;
+		let http_address = resolve_listen_address(&address, server.webserver_config.port)?;
+		server.spawn_listener("http", http_address, None, ShutdownReason::HttpShutdown);
 
-		tokio::spawn({
-			let server = server.clone();
-			let shutdown = shutdown.clone();
-
-			async move {
+		// PIN approval is restricted to loopback peers. When the configured
+		// address does not accept loopback connections, give the operator a
+		// loopback-only listener on the same port. Failing to bind it only
+		// disables local approval, not the GameStream service.
+		if let Some(operator_address) = operator_listen_address(http_address) {
+			tokio::spawn({
 				let server = server.clone();
-				let _ = shutdown
-					.wrap_cancel(
-						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpShutdown, async move {
-							let listener = bind_listener(http_address)
-								.map_err(|e| tracing::error!("Failed to bind to address {http_address}: {e}"))?;
-
-							tracing::debug!("HTTP server listening for connections on {http_address}");
-							loop {
-								let (connection, address) = listener
-									.accept()
-									.await
-									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
-								tracing::trace!("Accepted connection from {address}.");
-
-								let peer_address = unmap_v4_mapped(address);
-								let address = connection.local_addr().ok().map(unmap_v4_mapped);
-								let mac_address = if let Some(address) = address {
-									get_mac_address(address.ip()).unwrap_or(None)
-								} else {
-									None
-								};
-
-								let io = TokioIo::new(connection);
-
-								tokio::spawn({
-									let server = server.clone();
-									let shutdown = server.shutdown.clone();
-									async move {
-										let _ = shutdown
-											.wrap_cancel(async move {
-												let _ = hyper::server::conn::http1::Builder::new()
-													.serve_connection(
-														io,
-														service_fn(|request| {
-															server.serve(
-																request,
-																address,
-																peer_address,
-																mac_address.clone(),
-																false,
-																None,
-															)
-														}),
-													)
-													.await;
-											})
-											.await;
-									}
-								});
-							}
-
-							// Is there another way to define the return type of this function?
-							#[allow(unreachable_code)]
-							Ok::<(), ()>(())
-						}),
-					)
-					.await;
-
-				tracing::debug!("HTTP server shutting down.");
-			}
-		});
+				async move {
+					let shutdown = server.shutdown.clone();
+					let _ = shutdown
+						.wrap_cancel(async move {
+							let listener = bind_listener(operator_address).map_err(|e| {
+								tracing::warn!(
+									"Failed to bind the local pairing approval listener on {operator_address}: {e}"
+								)
+							})?;
+							tracing::debug!("Local pairing approval available on {operator_address}");
+							let ingress = Ingress::new("http-operator", MAX_HTTP_CONNECTIONS, server.shutdown.clone());
+							server.serve_listener(listener, None, ingress).await
+						})
+						.await;
+				}
+			});
+		}
 
 		// Run HTTPS webserver.
-		let https_address = (address.as_str(), server.webserver_config.port_https)
-			.to_socket_addrs()
-			.map_err(|e| {
-				tracing::error!(
-					"Failed to resolve address '{}' port {}: {e}",
-					address,
-					server.webserver_config.port_https
-				)
-			})?
-			.next()
-			.ok_or_else(|| {
-				tracing::error!(
-					"Failed to resolve address '{}' port {}",
-					address,
-					server.webserver_config.port_https
-				)
-			})?;
-
-		tokio::spawn({
-			let server = server.clone();
-			async move {
-				let _ = shutdown
-					.wrap_cancel(
-						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpsShutdown, async move {
-							let listener = bind_listener(https_address)
-								.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
-							let acceptor = TlsAcceptor::from_config(
-								server.webserver_config.certificate.clone(),
-								server.webserver_config.private_key.clone(),
-							)?;
-
-							tracing::debug!("HTTPS server listening for connections on {https_address}");
-							loop {
-								let (connection, address) = listener
-									.accept()
-									.await
-									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
-								tracing::trace!("Accepted TLS connection from {address}.");
-
-								let peer_address = unmap_v4_mapped(address);
-								let address = connection.local_addr().ok().map(unmap_v4_mapped);
-								let mac_address = if let Some(address) = address {
-									get_mac_address(address.ip()).unwrap_or(None)
-								} else {
-									None
-								};
-
-								let connection = match acceptor.accept(connection).await {
-									Ok(connection) => connection,
-									Err(()) => continue,
-								};
-
-								// Extract peer certificate fingerprint from TLS connection for mTLS verification.
-								let peer_cert_fingerprint = connection
-									.get_ref()
-									.1
-									.peer_certificates()
-									.and_then(|certs| certs.first())
-									.map(|cert| hex::encode(Sha256::digest(cert.as_ref())));
-
-								let io = TokioIo::new(connection);
-
-								tokio::spawn({
-									let server = server.clone();
-									let shutdown = server.shutdown.clone();
-									async move {
-										let _ = shutdown
-											.wrap_cancel(async move {
-												let _ = hyper::server::conn::http1::Builder::new()
-													.serve_connection(
-														io,
-														service_fn(|request| {
-															server.serve(
-																request,
-																address,
-																peer_address,
-																mac_address.clone(),
-																true,
-																peer_cert_fingerprint.clone(),
-															)
-														}),
-													)
-													.await;
-											})
-											.await;
-									}
-								});
-							}
-
-							// Is there another way to define the return type of this function?
-							#[allow(unreachable_code)]
-							Ok::<(), ()>(())
-						}),
-					)
-					.await;
-
-				tracing::debug!("HTTPS server shutting down.");
-			}
-		});
+		let https_address = resolve_listen_address(&address, server.webserver_config.port_https)?;
+		let acceptor = TlsAcceptor::from_config(
+			server.webserver_config.certificate.clone(),
+			server.webserver_config.private_key.clone(),
+		)?;
+		server.spawn_listener(
+			"https",
+			https_address,
+			Some(std::sync::Arc::new(acceptor)),
+			ShutdownReason::HttpsShutdown,
+		);
 
 		Ok(server)
+	}
+
+	/// Run a listener until global shutdown; a listener failure shuts down the server.
+	fn spawn_listener(
+		&self,
+		name: &'static str,
+		address: SocketAddr,
+		tls: Option<std::sync::Arc<TlsAcceptor>>,
+		reason: ShutdownReason,
+	) {
+		let server = self.clone();
+		tokio::spawn(async move {
+			let shutdown = server.shutdown.clone();
+			let _ = shutdown
+				.wrap_cancel(shutdown.wrap_trigger_shutdown(reason, async move {
+					let listener = bind_listener(address)
+						.map_err(|e| tracing::error!("Failed to bind to address {address}: {e}"))?;
+					tracing::debug!("{name} server listening for connections on {address}");
+					let ingress = Ingress::new(name, MAX_HTTP_CONNECTIONS, server.shutdown.clone());
+					server.serve_listener(listener, tls, ingress).await
+				}))
+				.await;
+			tracing::debug!("{name} server shutting down.");
+		});
+	}
+
+	/// Accept connections. Each one, including its TLS handshake, runs in its own
+	/// bounded and cancellable task so a stalled client cannot block the others.
+	async fn serve_listener(
+		&self,
+		listener: TcpListener,
+		tls: Option<std::sync::Arc<TlsAcceptor>>,
+		ingress: Ingress,
+	) -> Result<(), ()> {
+		loop {
+			let (connection, address) = listener
+				.accept()
+				.await
+				.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
+			tracing::trace!("Accepted connection from {address}.");
+
+			let Some(permit) = ingress.admit(address) else {
+				continue;
+			};
+			let server = self.clone();
+			let tls = tls.clone();
+			permit.spawn(async move { server.serve_connection(connection, address, tls).await });
+		}
+	}
+
+	async fn serve_connection(
+		&self,
+		connection: tokio::net::TcpStream,
+		address: SocketAddr,
+		tls: Option<std::sync::Arc<TlsAcceptor>>,
+	) {
+		let peer_address = unmap_v4_mapped(address);
+		let local_address = connection.local_addr().ok().map(unmap_v4_mapped);
+		let mac_address = local_address.and_then(|address| get_mac_address(address.ip()).unwrap_or(None));
+
+		let Some(acceptor) = tls else {
+			self.serve_http(
+				TokioIo::new(connection),
+				local_address,
+				peer_address,
+				mac_address,
+				false,
+				None,
+			)
+			.await;
+			return;
+		};
+
+		let connection =
+			match tokio::time::timeout(self.limits.tls_handshake_timeout, acceptor.accept(connection)).await {
+				Ok(Ok(connection)) => connection,
+				Ok(Err(())) => return,
+				Err(_) => {
+					tracing::debug!("TLS handshake from {peer_address} timed out.");
+					return;
+				},
+			};
+
+		// Extract peer certificate fingerprint from TLS connection for mTLS verification.
+		let peer_cert_fingerprint = connection
+			.get_ref()
+			.1
+			.peer_certificates()
+			.and_then(|certs| certs.first())
+			.map(|cert| hex::encode(Sha256::digest(cert.as_ref())));
+
+		self.serve_http(
+			TokioIo::new(connection),
+			local_address,
+			peer_address,
+			mac_address,
+			true,
+			peer_cert_fingerprint,
+		)
+		.await;
+	}
+
+	/// Serve HTTP/1.1 requests on an established (optionally TLS) connection.
+	async fn serve_http<I>(
+		&self,
+		io: I,
+		local_address: Option<SocketAddr>,
+		peer_address: SocketAddr,
+		mac_address: Option<String>,
+		https: bool,
+		peer_cert_fingerprint: Option<String>,
+	) where
+		I: hyper::rt::Read + hyper::rt::Write + Unpin,
+	{
+		let _ = hyper::server::conn::http1::Builder::new()
+			.timer(TokioTimer::new())
+			.header_read_timeout(self.limits.header_read_timeout)
+			.max_buf_size(MAX_HTTP_BUFFER_BYTES)
+			.serve_connection(
+				io,
+				service_fn(|request| {
+					self.serve(
+						request,
+						local_address,
+						peer_address,
+						mac_address.clone(),
+						https,
+						peer_cert_fingerprint.clone(),
+					)
+				}),
+			)
+			.await;
 	}
 
 	async fn serve(
@@ -400,9 +425,11 @@ impl Webserver {
 						request,
 						params,
 						local_address,
+						peer_address,
 						&self.server_certs,
 						&self.client_manager,
 						self.webserver_config.port,
+						self.limits.pairing_approval_timeout,
 						&self.shutdown,
 					)
 					.await
@@ -412,13 +439,13 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.launch(params, local_address).await
+					self.launch(params, local_address, peer_address).await
 				},
 				(&Method::GET, "/resume") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp.map(BodyExt::boxed_unsync));
 					}
-					self.resume(params, local_address).await
+					self.resume(params, local_address, peer_address).await
 				},
 				(&Method::GET, "/cancel") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
@@ -453,9 +480,11 @@ impl Webserver {
 						request,
 						params,
 						local_address,
+						peer_address,
 						&self.server_certs,
 						&self.client_manager,
 						self.webserver_config.port,
+						self.limits.pairing_approval_timeout,
 						&self.shutdown,
 					)
 					.await
@@ -464,11 +493,17 @@ impl Webserver {
 					if !self.webserver_config.enable_pairing {
 						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
 					}
+					if let Some(response) = self.verify_operator(&request, peer_address) {
+						return Ok(response.map(BodyExt::boxed_unsync));
+					}
 					self.pin(params)
 				},
 				(&Method::POST, "/submit-pin") => {
 					if !self.webserver_config.enable_pairing {
 						return Ok(bad_request("Pairing is disabled.".to_string()).map(BodyExt::boxed_unsync));
+					}
+					if let Some(response) = self.verify_operator(&request, peer_address) {
+						return Ok(response.map(BodyExt::boxed_unsync));
 					}
 					self.submit_pin(request).await
 				},
@@ -692,60 +727,72 @@ impl Webserver {
 			})
 			.filter(|id| !id.is_empty())
 			.unwrap_or_else(|| "0123456789ABCDEF".to_string());
+
+		// The page approves one specific pending request: its approval token is
+		// required on submission, so a request that replaces it (same client ID)
+		// cannot inherit the operator's PIN. Show the requester so the operator
+		// can recognize it.
+		let Some(pending) = self.client_manager.pending_approval(&unique_id) else {
+			return Response::builder()
+				.status(StatusCode::NOT_FOUND)
+				.header(header::CACHE_CONTROL, "no-store")
+				.body(Full::new(Bytes::from("No pending pairing request for this client.")))
+				.unwrap();
+		};
 		let content = include_bytes!("../../../assets/pin.html");
 		let html = String::from_utf8_lossy(content);
-		let html = html.replace("{{UNIQUE_ID}}", &unique_id);
+		let html = html
+			.replace("{{UNIQUE_ID}}", &unique_id)
+			.replace("{{REQUEST}}", &pending.approval)
+			.replace("{{REQUESTER}}", &escape_xml(pending.requester.to_string()))
+			.replace(
+				"{{FINGERPRINT}}",
+				&escape_xml(pending.fingerprint.as_deref().unwrap_or("unknown")),
+			);
 		let mut response = Response::new(Full::new(Bytes::from(html)));
-		response.headers_mut().insert(
+		let headers = response.headers_mut();
+		headers.insert(
 			header::CONTENT_TYPE,
 			HeaderValue::from_static("text/html; charset=UTF-8"),
 		);
+		headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+		headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+		headers.insert(
+			header::CONTENT_SECURITY_POLICY,
+			HeaderValue::from_static("frame-ancestors 'none'"),
+		);
+		headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
 
 		response
 	}
 
 	async fn submit_pin(&self, request: Request<hyper::body::Incoming>) -> Response<Full<Bytes>> {
-		// Enforce a hard 1 KB limit while reading the body to reject oversized requests early.
-		let body = match Limited::new(request.into_body(), 1024).collect().await {
-			Ok(body) => body.to_bytes(),
-			Err(e) => {
+		// Enforce a hard size limit and deadline while reading the body.
+		let body = Limited::new(request.into_body(), MAX_PIN_BODY_BYTES).collect();
+		let body = match tokio::time::timeout(self.limits.body_read_timeout, body).await {
+			Ok(Ok(body)) => body.to_bytes(),
+			Ok(Err(e)) => {
 				tracing::warn!("Failed to read request body: {e}");
+				return bad_request("Bad request.".to_string());
+			},
+			Err(_) => {
+				tracing::warn!("Timed out reading PIN submission.");
 				return bad_request("Bad request.".to_string());
 			},
 		};
 
 		let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
-
-		let unique_id = match params.get("uniqueid") {
-			Some(unique_id) => unique_id,
-			None => {
-				tracing::warn!("Missing 'uniqueid' in PIN submission.");
-				return bad_request("Bad request.".to_string());
-			},
+		let (Some(unique_id), Some(pin), Some(approval)) =
+			(params.get("uniqueid"), params.get("pin"), params.get("request"))
+		else {
+			tracing::warn!("PIN submission requires 'uniqueid', 'pin' and 'request'.");
+			return bad_request("Bad request.".to_string());
 		};
 
-		let pin = match params.get("pin") {
-			Some(pin) => pin,
-			None => {
-				tracing::warn!("Missing 'pin' in PIN submission.");
-				return bad_request("Bad request.".to_string());
-			},
-		};
-
-		let response = self.client_manager.register_pin(unique_id, pin);
-		match response {
+		match self.client_manager.register_pin(unique_id, pin, approval) {
 			Ok(()) => {
 				tracing::info!("PIN registered successfully.");
-				match Response::builder()
-					.status(StatusCode::OK)
-					.body(Full::new(Bytes::from("PIN accepted.")))
-				{
-					Ok(response) => response,
-					Err(e) => {
-						tracing::warn!("Failed to create response: {e}");
-						bad_request("Bad request.".to_string())
-					},
-				}
+				Response::new(Full::new(Bytes::from("PIN accepted.")))
 			},
 			Err(()) => bad_request("Failed to register PIN.".to_string()),
 		}
@@ -764,6 +811,7 @@ impl Webserver {
 		&self,
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
+		peer_address: SocketAddr,
 	) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
@@ -889,6 +937,7 @@ impl Webserver {
 				audio_channels,
 				audio_channel_mask,
 				hdr,
+				client_ip: peer_address.ip(),
 			})
 			.await;
 
@@ -944,6 +993,7 @@ impl Webserver {
 		&self,
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
+		peer_address: SocketAddr,
 	) -> Response<Full<Bytes>> {
 		let remote_input_key = match params.remove("rikey") {
 			Some(remote_input_key) => remote_input_key,
@@ -1025,6 +1075,7 @@ impl Webserver {
 					remote_input_key_id,
 				},
 				resume_request,
+				peer_address.ip(),
 			)
 			.await
 		{
@@ -1073,6 +1124,25 @@ impl Webserver {
 		response
 	}
 
+	/// Operator approval is a host-local administrative action served on the
+	/// client-reachable HTTP listener; reject anything else with 403.
+	fn verify_operator(
+		&self,
+		request: &Request<hyper::body::Incoming>,
+		peer_address: SocketAddr,
+	) -> Option<Response<Full<Bytes>>> {
+		let reason = authorize_operator_request(peer_address, request.headers(), self.webserver_config.port).err()?;
+		tracing::warn!(%peer_address, reason, "Rejected pairing approval request");
+		Some(
+			Response::builder()
+				.status(StatusCode::FORBIDDEN)
+				.body(Full::new(Bytes::from(
+					"Pairing approval is only available from the host itself (http://localhost).",
+				)))
+				.unwrap(),
+		)
+	}
+
 	/// Verify that the connecting client has presented a TLS certificate
 	/// that belongs to a paired client. Returns `None` if authorized,
 	/// or `Some(response)` with a 401 response if not.
@@ -1092,6 +1162,84 @@ impl Webserver {
 			},
 		}
 	}
+}
+
+/// Authorize a request to the operator PIN approval routes.
+///
+/// - The peer must be loopback: only the host operator may approve pairing.
+///   First pairing cannot rely on a paired client certificate.
+/// - `Host` must name a loopback host on our port, defeating DNS rebinding of
+///   an attacker domain to 127.0.0.1.
+/// - Browser metadata, when present, must describe a same-origin request on a
+///   loopback origin, so another website cannot submit a PIN through the
+///   operator's browser (CSRF). Non-browser clients (curl) send neither header.
+fn authorize_operator_request(peer: SocketAddr, headers: &header::HeaderMap, port: u16) -> Result<(), &'static str> {
+	if !peer.ip().to_canonical().is_loopback() {
+		return Err("non-loopback peer");
+	}
+	let host = headers
+		.get(header::HOST)
+		.and_then(|value| value.to_str().ok())
+		.ok_or("missing Host")?;
+	if !is_loopback_authority(host, port) {
+		return Err("non-loopback Host");
+	}
+	if let Some(origin) = headers.get(header::ORIGIN) {
+		let origin = origin.to_str().map_err(|_| "invalid Origin")?;
+		let authority = origin.strip_prefix("http://").ok_or("cross-origin request")?;
+		if !is_loopback_authority(authority, port) {
+			return Err("cross-origin request");
+		}
+	}
+	if let Some(site) = headers.get("sec-fetch-site")
+		&& !matches!(site.as_bytes(), b"same-origin" | b"none")
+	{
+		return Err("cross-site request");
+	}
+	Ok(())
+}
+
+/// Whether `authority` (`host[:port]`) names a loopback host on `port`.
+fn is_loopback_authority(authority: &str, port: u16) -> bool {
+	let (host, authority_port) = match authority.strip_prefix('[') {
+		Some(bracketed) => match bracketed.split_once(']') {
+			Some((host, "")) => (host, None),
+			Some((host, rest)) => match rest.strip_prefix(':') {
+				Some(port) => (host, Some(port)),
+				None => return false,
+			},
+			None => return false,
+		},
+		None => match authority.rsplit_once(':') {
+			Some((host, port)) => (host, Some(port)),
+			None => (authority, None),
+		},
+	};
+	let port_matches = match authority_port {
+		Some(authority_port) => authority_port.parse::<u16>().is_ok_and(|value| value == port),
+		None => port == 80,
+	};
+	let loopback = host.eq_ignore_ascii_case("localhost")
+		|| host.parse::<IpAddr>().is_ok_and(|ip| ip.to_canonical().is_loopback());
+	port_matches && loopback
+}
+
+fn resolve_listen_address(address: &str, port: u16) -> Result<SocketAddr, ()> {
+	(address, port)
+		.to_socket_addrs()
+		.map_err(|e| tracing::error!("Failed to resolve address '{address}' port {port}: {e}"))?
+		.next()
+		.ok_or_else(|| tracing::error!("Failed to resolve address '{address}' port {port}"))
+}
+
+/// Address of the loopback listener for operator PIN approval, needed only when
+/// the configured HTTP listener cannot accept loopback connections.
+fn operator_listen_address(http_address: SocketAddr) -> Option<SocketAddr> {
+	let ip = http_address.ip();
+	if ip.is_unspecified() || ip.to_canonical().is_loopback() {
+		return None;
+	}
+	Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), http_address.port()))
 }
 
 /// Bind a TCP listener for the webserver. When the address is IPv6 we disable

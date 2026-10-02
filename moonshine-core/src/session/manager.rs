@@ -1,3 +1,4 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
@@ -12,6 +13,7 @@ use crate::session::SessionKeyData;
 use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
 use crate::session::SessionState;
+use crate::session::authorization::StreamAuthorization;
 use crate::session::compositor::CompositorConfig;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
@@ -117,8 +119,19 @@ struct SessionManagerInner {
 	/// currently used by the live encoders until PLAY commits the new epoch.
 	pending_video_stream_context: Option<VideoStreamContext>,
 	pending_audio_stream_context: Option<AudioStreamContext>,
+	/// Generation that produced the pending stream contexts. PLAY commits them
+	/// only if no later launch/resume replaced that generation.
+	pending_generation: Option<u64>,
 	/// Authenticated session-level settings from the most recent `/resume`.
 	resume_request: Option<ResumeRequest>,
+
+	/// Authorization of the current launch/resume generation. RTSP, control and
+	/// media endpoint discovery accept only this client and generation.
+	authorization_tx: Option<watch::Sender<StreamAuthorization>>,
+
+	/// Next authorization generation. Never reset, so a stale grant from an
+	/// earlier session cannot match a later one.
+	next_generation: u64,
 
 	/// Broadcast sender for per-frame encoding statistics.
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -147,6 +160,27 @@ struct SessionManagerInner {
 }
 
 impl SessionManagerInner {
+	/// Start a new authorization generation for `client_ip`, replacing every
+	/// identifier the previous generation handed out.
+	fn rotate_authorization(&mut self, client_ip: IpAddr) -> Result<(), ()> {
+		let authorization = StreamAuthorization::new(self.next_generation, client_ip)?;
+		self.next_generation += 1;
+		match &self.authorization_tx {
+			Some(tx) => {
+				tx.send_replace(authorization);
+			},
+			None => self.authorization_tx = Some(watch::channel(authorization).0),
+		}
+		Ok(())
+	}
+
+	/// Whether `grant` belongs to the current generation.
+	fn is_current(&self, grant: &StreamAuthorization) -> bool {
+		self.authorization_tx
+			.as_ref()
+			.is_some_and(|tx| tx.borrow().generation() == grant.generation())
+	}
+
 	fn reset_session(&mut self) {
 		if let Some(handle) = self.stop_watcher.take() {
 			handle.abort();
@@ -155,7 +189,9 @@ impl SessionManagerInner {
 		self.keys_tx = None;
 		self.pending_video_stream_context = None;
 		self.pending_audio_stream_context = None;
+		self.pending_generation = None;
 		self.resume_request = None;
+		self.authorization_tx = None;
 		self.video_start_notify = None;
 		self.audio_start_notify = None;
 		self.stop = ShutdownManager::new();
@@ -214,7 +250,10 @@ impl SessionManager {
 			keys_tx: None,
 			pending_video_stream_context: None,
 			pending_audio_stream_context: None,
+			pending_generation: None,
 			resume_request: None,
+			authorization_tx: None,
+			next_generation: 1,
 			stats_tx: tokio::sync::broadcast::channel(256).0,
 			stop_watcher: None,
 			video_start_notify: None,
@@ -259,19 +298,43 @@ impl SessionManager {
 		}
 	}
 
+	/// Authorize an RTSP peer for the current launch/resume generation.
+	///
+	/// The returned grant must accompany the ANNOUNCE and PLAY it authorizes;
+	/// they are rejected if a later launch/resume replaced its generation.
+	pub async fn authorize_stream(&self, peer: IpAddr) -> Option<StreamAuthorization> {
+		let guard = self.inner.lock().await;
+		let authorization = guard.authorization_tx.as_ref()?.borrow().clone();
+		authorization.admits_peer(peer).then_some(authorization)
+	}
+
 	/// Set the video and audio stream contexts after receiving RTSP ANNOUNCE.
+	///
+	/// `session_id_v1` records that the client announced Moonlight's
+	/// `ML_FF_SESSION_ID_V1`, after which media and control discovery require
+	/// the generation's session identifiers.
 	pub async fn set_stream_context(
 		&self,
+		grant: &StreamAuthorization,
 		video_stream_context: VideoStreamContext,
 		audio_stream_context: AudioStreamContext,
+		session_id_v1: bool,
 	) -> Result<(), ()> {
 		let mut guard = self.inner.lock().await;
+		if !guard.is_current(grant) {
+			tracing::warn!(
+				generation = grant.generation(),
+				"Rejecting RTSP ANNOUNCE from a replaced launch/resume generation"
+			);
+			return Err(());
+		}
 		let resume_request = guard.resume_request.clone();
 		let (pause_video, pause_audio) = match guard.session.as_ref() {
 			Some(SessionState::Launched(_)) => {
 				tracing::debug!("Stream contexts received via RTSP ANNOUNCE.");
 				guard.pending_video_stream_context = Some(video_stream_context);
 				guard.pending_audio_stream_context = Some(audio_stream_context);
+				guard.pending_generation = Some(grant.generation());
 				(None, None)
 			},
 			Some(SessionState::Initialized(_)) => {
@@ -323,6 +386,7 @@ impl SessionManager {
 				let pause_audio = audio_changed.then(|| active.audio_handle());
 				guard.pending_video_stream_context = Some(video_stream_context);
 				guard.pending_audio_stream_context = Some(audio_stream_context);
+				guard.pending_generation = Some(grant.generation());
 				(pause_video, pause_audio)
 			},
 			None => {
@@ -330,6 +394,9 @@ impl SessionManager {
 				return Err(());
 			},
 		};
+		if session_id_v1 && let Some(tx) = &guard.authorization_tx {
+			tx.send_modify(StreamAuthorization::require_session_id);
+		}
 		drop(guard);
 		if let Some(handle) = pause_video {
 			handle.pause_for_reconfigure().await.map_err(|()| {
@@ -371,6 +438,7 @@ impl SessionManager {
 		};
 		let (tx, rx) = watch::channel(session_keys);
 		context.keys = SessionKeys::Rx(rx);
+		let client_ip = context.client_ip;
 
 		let compositor_config = guard.compositor_config.clone();
 		let video_config = guard.video_config.clone();
@@ -390,6 +458,7 @@ impl SessionManager {
 			stats_tx,
 		)
 		.await?;
+		guard.rotate_authorization(client_ip)?;
 		guard.session = Some(SessionState::Initialized(session));
 
 		spawn_session_watchdog(&self.inner, &mut guard);
@@ -444,11 +513,23 @@ impl SessionManager {
 	///
 	/// Returns `Ok(())` only after all three streams (video, audio, control) are
 	/// successfully constructed. Returns `Err(())` if any stream fails to initialize.
-	pub async fn start_session(&self) -> Result<(), ()> {
+	///
+	/// `grant` must be the authorization under which the pending contexts were
+	/// announced; PLAY from a replaced generation cannot commit them.
+	pub async fn start_session(&self, grant: &StreamAuthorization) -> Result<(), ()> {
 		// Active sessions take an explicit resume path. Temporarily taking the
 		// state prevents a concurrent PLAY from racing the epoch transition.
 		let resume = {
 			let mut guard = self.inner.lock().await;
+			if !guard.is_current(grant) || guard.pending_generation != Some(grant.generation()) {
+				tracing::warn!(
+					generation = grant.generation(),
+					pending_generation = ?guard.pending_generation,
+					"Rejecting RTSP PLAY without a pending ANNOUNCE from the current generation"
+				);
+				return Err(());
+			}
+			guard.pending_generation = None;
 			if matches!(guard.session, Some(SessionState::Active(_))) {
 				let video = guard.pending_video_stream_context.take();
 				let audio = guard.pending_audio_stream_context.take();
@@ -549,6 +630,11 @@ impl SessionManager {
 		let mut guard = self.inner.lock().await;
 		let video_config = guard.video_config.clone();
 		let stream_timeout = guard.stream_timeout;
+		let Some(authorization_rx) = guard.authorization_tx.as_ref().map(watch::Sender::subscribe) else {
+			tracing::error!("Session has no stream authorization");
+			guard.reset_session();
+			return Err(());
+		};
 		match launched
 			.start(
 				video_config,
@@ -557,6 +643,7 @@ impl SessionManager {
 				audio_stream_context,
 				stop,
 				guard.inhibit_sleep,
+				authorization_rx,
 			)
 			.await
 		{
@@ -599,7 +686,15 @@ impl SessionManager {
 	}
 
 	/// Update keys and retain authenticated session-level resume parameters.
-	pub(crate) async fn resume_session(&self, keys: SessionKeyData, request: ResumeRequest) -> Result<(), ()> {
+	///
+	/// A resume starts a new authorization generation for `client_ip`: the
+	/// previous client's RTSP, control and media discovery stop being accepted.
+	pub(crate) async fn resume_session(
+		&self,
+		keys: SessionKeyData,
+		request: ResumeRequest,
+		client_ip: IpAddr,
+	) -> Result<(), ()> {
 		let mut guard = self.inner.lock().await;
 
 		if guard.stop.is_shutdown_triggered() {
@@ -612,15 +707,47 @@ impl SessionManager {
 			return Err(());
 		}
 
-		if let Some(keys_tx) = &guard.keys_tx {
-			keys_tx.send_replace(keys);
-		} else {
+		if guard.keys_tx.is_none() {
 			tracing::warn!("Active streaming session has no key sender; rejecting resume.");
 			return Err(());
 		}
+		guard.rotate_authorization(client_ip)?;
+		if let Some(keys_tx) = &guard.keys_tx {
+			keys_tx.send_replace(keys);
+		}
+		// Contexts announced under the previous generation must not be committed.
+		guard.pending_video_stream_context = None;
+		guard.pending_audio_stream_context = None;
+		guard.pending_generation = None;
 		guard.resume_request = Some(request);
 
 		Ok(())
+	}
+}
+
+#[cfg(test)]
+impl SessionManager {
+	/// Manager with default stream configuration, for RTSP/ingress tests.
+	pub(crate) fn for_test(shutdown: ShutdownManager<ShutdownReason>) -> Self {
+		Self::new(
+			Default::default(),
+			Default::default(),
+			Default::default(),
+			Default::default(),
+			"127.0.0.1".into(),
+			30,
+			false,
+			shutdown,
+		)
+		.unwrap()
+	}
+
+	/// Start an authorization generation without launching a session, as an
+	/// authenticated `/launch` would.
+	pub(crate) async fn authorize_client_for_test(&self, client_ip: IpAddr) -> StreamAuthorization {
+		let mut guard = self.inner.lock().await;
+		guard.rotate_authorization(client_ip).unwrap();
+		guard.authorization_tx.as_ref().unwrap().borrow().clone()
 	}
 }
 
@@ -723,6 +850,54 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[tokio::test]
+	async fn stream_grants_are_bound_to_client_and_generation() {
+		let shutdown = ShutdownManager::new();
+		let manager = SessionManager::for_test(shutdown);
+		let client: IpAddr = "192.168.1.20".parse().unwrap();
+		assert!(manager.authorize_stream(client).await.is_none(), "no launch yet");
+
+		let first = manager.authorize_client_for_test(client).await;
+		let mapped: IpAddr = "::ffff:192.168.1.20".parse().unwrap();
+		assert_eq!(manager.authorize_stream(mapped).await, Some(first.clone()));
+		assert!(
+			manager
+				.authorize_stream("192.168.1.21".parse().unwrap())
+				.await
+				.is_none()
+		);
+
+		// A resume (new generation) invalidates grants handed out earlier, even
+		// for the same client, and its PLAY cannot commit contexts it did not announce.
+		let second = manager.authorize_client_for_test(client).await;
+		assert!(second.generation() > first.generation());
+		{
+			let mut guard = manager.inner.lock().await;
+			assert!(!guard.is_current(&first));
+			assert!(guard.is_current(&second));
+			guard.pending_generation = Some(first.generation());
+		}
+		assert!(manager.start_session(&first).await.is_err());
+		assert!(manager.start_session(&second).await.is_err());
+		assert_eq!(
+			manager.inner.lock().await.pending_generation,
+			Some(first.generation()),
+			"rejected PLAY must not consume pending contexts"
+		);
+		assert!(
+			manager
+				.set_stream_context(&first, video(VideoCodec::H264), audio(), false)
+				.await
+				.is_err()
+		);
+
+		// Another client resuming takes the session over.
+		let other: IpAddr = "192.168.1.30".parse().unwrap();
+		let third = manager.authorize_client_for_test(other).await;
+		assert!(manager.authorize_stream(client).await.is_none());
+		assert_eq!(manager.authorize_stream(other).await, Some(third));
 	}
 
 	#[test]

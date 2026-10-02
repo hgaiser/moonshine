@@ -64,7 +64,7 @@ Then import the module and enable the service in your configuration:
 }
 ```
 
-After `nixos-rebuild switch` the service is running. There is no `systemctl enable` step, and user lingering is enabled automatically. Pair with a Moonlight client as usual via http://localhost:47989/pin .
+After `nixos-rebuild switch` the service is running. There is no `systemctl enable` step, and user lingering is enabled automatically. Pair with a Moonlight client as usual via http://localhost:47989/pin on the host (loopback only; use an SSH port forward on headless machines).
 
 If you stream headless (no active desktop session) and want gamepad support, the streaming user must be a member of the `input` group so streamed games can read the virtual gamepads moonshine creates. The service does not grant it. Add it to the user's `extraGroups`:
 

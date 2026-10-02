@@ -27,8 +27,9 @@ unless explicitly marked as root.
 | Root `src/main.rs` | CLI, config loading, startup probes, server wiring, shutdown |
 | `config.rs`, `healthcheck.rs` | Config loading/defaults and host/codec capability checks |
 | `app_scanner/`, `clients.rs`, `state.rs`, `tls.rs`, `discovery.rs` | Application discovery, pairing/client state, certificates, mDNS |
-| `webserver/`, `rtsp.rs` | GameStream HTTP/HTTPS API and pairing; RTSP negotiation and stream orchestration |
+| `webserver/`, `rtsp.rs`, `ingress.rs` | GameStream HTTP/HTTPS API and pairing; RTSP negotiation and stream orchestration; bounded connection supervision |
 | `session/mod.rs`, `session/manager.rs`, `session/application.rs` | Session states, launch/resume/reconfiguration, application lifetime |
+| `session/authorization.rs` | Launch/resume authorization generations binding RTSP, control and media discovery to the paired client |
 | `session/compositor/` | Embedded headless Smithay compositor, scene/focus/cursor/input, GBM/DMA-BUF capture |
 | `session/stream/audio/` | Embedded PulseAudio-compatible capture server, Opus encoding, audio packets/UDP |
 | `session/stream/control/` | Control protocol, input decoding/routing, Inputtino devices and feedback |

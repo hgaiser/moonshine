@@ -135,6 +135,12 @@ impl InputEvent {
 	}
 }
 
+/// Decode an input event without dispatching it (parser regression tests).
+#[cfg(test)]
+pub(super) fn parse_input_event(buffer: &[u8]) -> Result<(), ()> {
+	InputEvent::from_bytes(buffer).map(|_| ())
+}
+
 pub(crate) struct InputHandler {
 	input_tx: calloop::channel::Sender<CompositorInputEvent>,
 	gamepad_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
@@ -644,5 +650,74 @@ mod tests {
 	fn rejects_empty_utf8_text_event() {
 		let payload = [0x17, 0x00, 0x00, 0x00];
 		assert!(InputEvent::from_bytes(&payload).is_err());
+	}
+
+	const EVENT_TYPES: [u32; 17] = [
+		0x03,
+		0x04,
+		0x05,
+		0x07,
+		0x08,
+		0x09,
+		0x0A,
+		0x5500_0001,
+		0x5500_0002,
+		0x5500_0003,
+		0x5500_0004,
+		0x5500_0005,
+		0x5500_0006,
+		0x5500_0007,
+		0x0C,
+		0x0D,
+		0x17,
+	];
+
+	/// Every subtype decoder bounds-checks before reading: all truncations of
+	/// zero-, one- and pattern-filled payloads yield a value or an error.
+	#[test]
+	fn every_subtype_truncation_is_bounded() {
+		for event_type in EVENT_TYPES {
+			for fill in [0x00, 0x01, 0xff, 0x7f] {
+				for len in 0..64 {
+					let mut payload = event_type.to_le_bytes().to_vec();
+					payload.extend(std::iter::repeat_n(fill, len));
+					let _ = InputEvent::from_bytes(&payload);
+				}
+			}
+		}
+		for len in 0..4 {
+			assert!(InputEvent::from_bytes(&[0x03; 4][..len]).is_err());
+		}
+	}
+
+	/// Non-finite motion and touch values are rejected before they reach the
+	/// native device or the touchpad conversion.
+	#[test]
+	fn rejects_non_finite_gamepad_values() {
+		let finite = 0.5_f32.to_le_bytes();
+		for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+			for field in 0..3 {
+				let mut motion = 0x5500_0006_u32.to_le_bytes().to_vec();
+				motion.extend([0, 1, 0, 0]); // index, acceleration, reserved
+				for i in 0..3 {
+					motion.extend(if i == field { bad.to_le_bytes() } else { finite });
+				}
+				assert!(InputEvent::from_bytes(&motion).is_err(), "motion {field} {bad}");
+
+				let mut touch = 0x5500_0005_u32.to_le_bytes().to_vec();
+				touch.extend([0, 1, 0, 0, 1, 0, 0, 0]); // index, event, reserved, pointer
+				for i in 0..3 {
+					touch.extend(if i == field { bad.to_le_bytes() } else { finite });
+				}
+				assert!(InputEvent::from_bytes(&touch).is_err(), "touch {field} {bad}");
+			}
+		}
+		let mut motion = 0x5500_0006_u32.to_le_bytes().to_vec();
+		motion.extend([0, 2, 0, 0]);
+		motion.extend(finite.repeat(3));
+		assert!(matches!(
+			InputEvent::from_bytes(&motion),
+			Ok(InputEvent::GamepadMotion(_))
+		));
 	}
 }

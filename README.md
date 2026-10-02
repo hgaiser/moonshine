@@ -52,7 +52,8 @@ command = ["/absolute/path/to/game"]
 ```
 
 Restart the service after editing, add the host in Moonlight, and enter the
-client's pairing PIN at `http://localhost:47989/pin` on the host:
+client's pairing PIN at `http://localhost:47989/pin` on the host (the page only
+accepts requests from the host itself; see [headless pairing](docs/CONFIGURATION.md#webserver)):
 
 ```sh
 sudo systemctl restart "pyroshine@$USER"

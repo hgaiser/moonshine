@@ -1,4 +1,4 @@
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 
 use async_shutdown::ShutdownManager;
 use http_body_util::Full;
@@ -13,6 +13,7 @@ use tokio::sync::Notify;
 use crate::ShutdownReason;
 use crate::clients::ClientManager;
 use crate::clients::PendingClient;
+use crate::clients::new_approval_token;
 use crate::webserver::bad_request;
 
 /// Extract a required query parameter, or return a 400 bad-request response.
@@ -53,13 +54,19 @@ fn paired_xml_response(inner: impl std::fmt::Display) -> Response<Full<Bytes>> {
 ///   5. /pair?clientpairingsecret=...
 ///
 /// After completing these steps, we have paired with the client.
+///
+/// Step 1 waits until the host operator enters the client's PIN on the
+/// loopback-only approval page (`/pin`), bounded by `approval_timeout`.
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_pair_request(
 	request: Request<hyper::body::Incoming>,
 	mut params: HashMap<String, String>,
 	local_address: Option<SocketAddr>,
+	peer_address: SocketAddr,
 	server_certs: &str, // Pass as string (PEM)
 	client_manager: &ClientManager,
 	http_port: u16,
+	approval_timeout: Duration,
 	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
 	if params.contains_key("phrase") {
@@ -69,9 +76,11 @@ pub async fn handle_pair_request(
 					request,
 					params,
 					local_address,
+					peer_address,
 					server_certs,
 					client_manager,
 					http_port,
+					approval_timeout,
 					shutdown,
 				)
 				.await
@@ -96,13 +105,16 @@ pub async fn handle_pair_request(
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn get_server_cert(
 	_request: Request<hyper::body::Incoming>,
 	mut params: HashMap<String, String>,
 	local_address: Option<SocketAddr>,
+	peer_address: SocketAddr,
 	server_pem_str: &str,
 	client_manager: &ClientManager,
 	http_port: u16,
+	approval_timeout: Duration,
 	shutdown: &ShutdownManager<ShutdownReason>,
 ) -> Response<Full<Bytes>> {
 	let client_cert = require_param!(params, "clientcert");
@@ -145,36 +157,41 @@ async fn get_server_cert(
 		},
 	};
 
-	let pin_notifier = {
-		let pending_client = PendingClient {
-			id: unique_id.clone(),
-			pem: client_pem,
-			salt,
-			pin_notify: Arc::new(Notify::new()),
-			key: None,
-			server_secret: None,
-			server_challenge: None,
-			client_hash: None,
-		};
-		let notify = pending_client.pin_notify.clone();
-
-		match client_manager.start_pairing(pending_client) {
-			Ok(()) => {},
-			Err(()) => {
-				let message = "Failed to start pairing client".to_string();
-				tracing::warn!("{message}");
-				return bad_request(message);
-			},
-		};
-
-		notify
+	let Ok(approval) = new_approval_token() else {
+		return bad_request("Failed to start pairing client".to_string());
 	};
+	let pin_notify = Arc::new(Notify::new());
+	// Register interest before the request becomes visible to the operator, so a
+	// PIN submitted immediately cannot be missed.
+	let pin_notified = pin_notify.notified();
+	tokio::pin!(pin_notified);
+	pin_notified.as_mut().enable();
+
+	let pending_client = PendingClient {
+		id: unique_id.clone(),
+		pem: client_pem,
+		salt,
+		pin_notify: pin_notify.clone(),
+		approval: approval.clone(),
+		requester: peer_address.ip(),
+		key: None,
+		server_secret: None,
+		server_challenge: None,
+		client_hash: None,
+	};
+	if client_manager.start_pairing(pending_client).is_err() {
+		let message = "Failed to start pairing client".to_string();
+		tracing::warn!("{message}");
+		return bad_request(message);
+	}
 
 	// Emit a notification, allowing the user to automatically open the PIN page.
-	if let Some(local_address) = local_address {
-		let pin_address = SocketAddr::new(local_address.ip(), http_port);
-		let pin_url = format!("http://{pin_address}/pin?uniqueid={unique_id}");
-		tracing::info!("Waiting for pin to be sent at {pin_url}");
+	// Approval is only accepted from the host itself, so link to loopback rather
+	// than to the address the client used.
+	if local_address.is_some() {
+		let encoded_id: String = url::form_urlencoded::byte_serialize(unique_id.as_bytes()).collect();
+		let pin_url = format!("http://localhost:{http_port}/pin?uniqueid={encoded_id}");
+		tracing::info!(requester = %peer_address, "Waiting for the host operator to enter the PIN at {pin_url}");
 
 		let _ = std::thread::Builder::new()
 			.name("pin-notification".to_string())
@@ -202,9 +219,15 @@ async fn get_server_cert(
 	}
 
 	tokio::select! {
-		_ = pin_notifier.notified() => {},
+		_ = &mut pin_notified => {},
+		_ = tokio::time::sleep(approval_timeout) => {
+			tracing::warn!(requester = %peer_address, "Pairing request was not approved in time.");
+			client_manager.cancel_pairing(&unique_id, &approval);
+			return bad_request("Pairing was not approved in time.".to_string());
+		},
 		_ = shutdown.wait_shutdown_triggered() => {
 			tracing::info!("Shutdown triggered, aborting pairing.");
+			client_manager.cancel_pairing(&unique_id, &approval);
 			return bad_request("Server is shutting down.".to_string());
 		},
 	}

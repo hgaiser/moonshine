@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::RwLock;
 
@@ -34,6 +35,14 @@ pub(crate) struct PendingClient {
 	/// A channel that sends a notification when a PIN has been received for this client.
 	pub(crate) pin_notify: Arc<Notify>,
 
+	/// Random token identifying this request on the operator approval page. A
+	/// PIN applies only to the request the operator was shown, never to a later
+	/// request that replaced it under the same client ID.
+	pub(crate) approval: String,
+
+	/// Address that sent the pairing request, shown to the operator.
+	pub(crate) requester: IpAddr,
+
 	/// Cryptographic key.
 	pub(crate) key: Option<[u8; 16]>,
 
@@ -45,6 +54,22 @@ pub(crate) struct PendingClient {
 
 	/// Cryptographic hash.
 	pub(crate) client_hash: Option<Vec<u8>>,
+}
+
+/// A pending pairing request as presented to the operator.
+pub(crate) struct PendingApproval {
+	pub(crate) approval: String,
+	pub(crate) requester: IpAddr,
+	pub(crate) fingerprint: Option<String>,
+}
+
+/// Generate a pending request's approval token.
+pub(crate) fn new_approval_token() -> Result<String, ()> {
+	let mut token = [0u8; 16];
+	SystemRandom::new()
+		.fill(&mut token)
+		.map_err(|_| tracing::warn!("Failed to generate random"))?;
+	Ok(hex::encode(token))
 }
 
 /// Manages client pairing state and operations.
@@ -62,11 +87,20 @@ pub struct ClientManager {
 impl ClientManager {
 	#[cfg(test)]
 	pub(crate) fn isolated(path: std::path::PathBuf) -> Self {
+		Self::isolated_with_identity(path, String::new(), String::new())
+	}
+
+	#[cfg(test)]
+	pub(crate) fn isolated_with_identity(
+		path: std::path::PathBuf,
+		server_cert_pem: String,
+		server_private_key_pem: String,
+	) -> Self {
 		Self {
 			pending_clients: Default::default(),
 			state: PersistentState::isolated(path),
-			server_cert_pem: String::new(),
-			server_private_key_pem: String::new(),
+			server_cert_pem,
+			server_private_key_pem,
 		}
 	}
 
@@ -99,13 +133,51 @@ impl ClientManager {
 		Ok(())
 	}
 
-	pub(crate) fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
+	/// Describe the pending request for `id` to the operator.
+	pub(crate) fn pending_approval(&self, id: &str) -> Option<PendingApproval> {
+		let inner = self
+			.pending_clients
+			.read()
+			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))
+			.ok()?;
+		let client = inner.get(id)?;
+		Some(PendingApproval {
+			approval: client.approval.clone(),
+			requester: client.requester,
+			fingerprint: cert_pem_fingerprint(&client.pem),
+		})
+	}
+
+	/// Forget a pending request that was not approved in time, unless it was
+	/// already replaced by a newer request for the same client ID.
+	pub(crate) fn cancel_pairing(&self, id: &str, approval: &str) {
+		if let Ok(mut inner) = self.pending_clients.write()
+			&& inner.get(id).is_some_and(|client| client.approval == approval)
+		{
+			inner.remove(id);
+		}
+	}
+
+	/// Apply the operator's PIN to the pending request identified by `approval`.
+	pub(crate) fn register_pin(&self, id: &str, pin: &str, approval: &str) -> Result<(), ()> {
+		if pin.is_empty() || pin.len() > 16 || !pin.bytes().all(|b| b.is_ascii_digit()) {
+			tracing::warn!("Rejected PIN that is not a short decimal number");
+			return Err(());
+		}
 		let mut inner = self.pending_clients.write().map_err(|poison| {
 			tracing::error!("RwLock poisoned: {poison}");
 		})?;
 		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
+		if aws_lc_rs::constant_time::verify_slices_are_equal(client.approval.as_bytes(), approval.as_bytes()).is_err() {
+			tracing::warn!("PIN submission does not match the displayed pairing request for {id}");
+			return Err(());
+		}
+		if client.key.is_some() {
+			tracing::warn!("A PIN was already registered for this pairing request");
+			return Err(());
+		}
 		let key = create_key(&client.salt, pin).map_err(|e| tracing::warn!("Failed to create client key: {e}"))?;
 		client.key = Some(key);
 		client.pin_notify.notify_waiters();
@@ -222,7 +294,7 @@ impl ClientManager {
 	}
 }
 
-fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
+pub(crate) fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
 	let mut key = Vec::with_capacity(salt.len() + pin.len());
 	key.extend(salt);
 	key.extend(pin.as_bytes());
@@ -236,7 +308,7 @@ fn create_key(salt: &[u8; 16], pin: &str) -> Result<[u8; 16], String> {
 		.map_err(|e| format!("Received unexpected key result: {e}"))
 }
 
-fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
 	let key_bytes = {
 		let mut reader = std::io::Cursor::new(key_pem.as_bytes());
 		match rustls_pemfile::private_key(&mut reader) {
@@ -257,7 +329,7 @@ fn sign(data: &[u8], key_pem: &str) -> Result<Vec<u8>, String> {
 	Ok(signature)
 }
 
-fn extract_certificate_signature(pem: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn extract_certificate_signature(pem: &str) -> Result<Vec<u8>, String> {
 	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).map_err(|e| format!("Failed to parse PEM: {}", e))?;
 	let cert = pem_obj
 		.parse_x509()
@@ -320,7 +392,7 @@ fn verify_pairing_secret(client: &mut PendingClient, client_secret: Vec<u8>) -> 
 	Ok(())
 }
 
-fn aes_encrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
+pub(crate) fn aes_encrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 	let key: Array<u8, _> = (*key).into();
 	let cipher = Aes128::new(&key);
 	if !data.len().is_multiple_of(16) {
@@ -335,7 +407,7 @@ fn aes_encrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 	Ok(encrypted)
 }
 
-fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
+pub(crate) fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 	let key: Array<u8, _> = (*key).into();
 	let cipher = Aes128::new(&key);
 	if !data.len().is_multiple_of(16) {

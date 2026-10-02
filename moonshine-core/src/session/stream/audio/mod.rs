@@ -9,8 +9,9 @@ use tokio::net::UdpSocket;
 use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
-use crate::session::SessionKeysReceiver;
+use crate::session::authorization::MediaStream;
 use crate::session::manager::SessionShutdownReason;
+use crate::session::{AuthorizationReceiver, SessionKeysReceiver};
 
 use self::encoder::AudioEncoder;
 use self::pulse_server::{CAPTURE_SAMPLE_RATE, PulseServer};
@@ -186,6 +187,19 @@ pub(crate) struct AudioStartHandle {
 	pulse_reconfigure_tx: crossbeam_channel::Sender<PulseReconfigure>,
 }
 
+#[cfg(test)]
+impl AudioStartHandle {
+	/// A handle not connected to an encoder, for control-stream tests.
+	pub(crate) fn for_test() -> Self {
+		Self {
+			notify: Arc::new(Notify::new()),
+			packet_tx: mpsc::channel(1).0,
+			encoder_reconfigure_tx: crossbeam_channel::unbounded().0,
+			pulse_reconfigure_tx: crossbeam_channel::unbounded().0,
+		}
+	}
+}
+
 pub(crate) struct AudioEncoderReconfigure {
 	context: AudioStreamContext,
 	applied: tokio::sync::oneshot::Sender<Result<(), ()>>,
@@ -300,7 +314,12 @@ impl AudioStream {
 		})
 	}
 
-	pub fn start(self, context: AudioStreamContext, keys_rx: SessionKeysReceiver) -> Result<AudioStartHandle, ()> {
+	pub fn start(
+		self,
+		context: AudioStreamContext,
+		keys_rx: SessionKeysReceiver,
+		authorization_rx: AuthorizationReceiver,
+	) -> Result<AudioStartHandle, ()> {
 		// Apply QoS to UDP socket.
 		if context.qos {
 			let _ = self.udp_socket.set_tos_v4(224);
@@ -311,7 +330,13 @@ impl AudioStream {
 
 		// Create packet channel and spawn handler — gated behind start_notify.
 		let (packet_tx, packet_rx) = mpsc::channel::<AudioPacketMessage>(16);
-		spawn_handle_audio_packets(packet_rx, self.udp_socket, start_notify.clone(), self.stop.clone());
+		spawn_handle_audio_packets(
+			packet_rx,
+			self.udp_socket,
+			authorization_rx,
+			start_notify.clone(),
+			self.stop.clone(),
+		);
 
 		// Create frame channels for PulseServer and encoder communication.
 		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
@@ -357,6 +382,7 @@ impl AudioStream {
 fn spawn_handle_audio_packets(
 	mut packet_rx: mpsc::Receiver<AudioPacketMessage>,
 	socket: UdpSocket,
+	authorization: AuthorizationReceiver,
 	start: Arc<Notify>,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) {
@@ -405,11 +431,13 @@ fn spawn_handle_audio_packets(
 						Err(_) => break,
 					};
 
-					if &buf[..len] == b"PING" {
+					// Only the current launch/resume generation may (re)discover the
+					// destination; the source port may change (NAT, client sockets).
+					if authorization.borrow().admits_media_ping(MediaStream::Audio, address, &buf[..len]) {
 						tracing::trace!("Received audio stream PING message from {address}.");
 						client_address = Some(address);
 					} else {
-						tracing::warn!("Received unknown message on audio stream of length {len}.");
+						tracing::debug!(%address, len, "Ignoring unauthorized audio endpoint discovery datagram");
 					}
 				},
 			}
@@ -417,4 +445,58 @@ fn spawn_handle_audio_packets(
 
 		tracing::debug!("Audio packet stream stopped.");
 	});
+}
+
+#[cfg(test)]
+mod tests {
+	use std::time::Duration;
+
+	use tokio::sync::watch;
+
+	use super::*;
+	use crate::session::authorization::StreamAuthorization;
+
+	async fn receives(socket: &UdpSocket, expected: &[u8]) -> bool {
+		let mut buf = [0u8; 64];
+		match tokio::time::timeout(Duration::from_millis(200), socket.recv_from(&mut buf)).await {
+			Ok(Ok((len, _))) => &buf[..len] == expected,
+			_ => false,
+		}
+	}
+
+	/// Audio endpoint discovery accepts only the authorized client: a legacy
+	/// PING from another host cannot redirect the stream.
+	#[tokio::test]
+	async fn endpoint_discovery_rejects_unauthorized_hosts() {
+		let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let server = socket.local_addr().unwrap();
+		let stop = ShutdownManager::new();
+		let start = Arc::new(Notify::new());
+		let (tx, rx) = mpsc::channel(4);
+		let authorization = StreamAuthorization::new(1, "127.0.0.1".parse().unwrap()).unwrap();
+		let (_authorization_tx, authorization_rx) = watch::channel(authorization.clone());
+		spawn_handle_audio_packets(rx, socket, authorization_rx, start.clone(), stop.clone());
+		start.notify_one();
+
+		let attacker = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+		attacker.send_to(b"PING", server).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		tx.send(AudioPacketMessage::Packet(vec![0xaa; 32])).await.unwrap();
+		assert!(!receives(&attacker, &[0xaa; 32]).await);
+
+		let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let mut ping = authorization.ping_payload(MediaStream::Audio).as_bytes().to_vec();
+		ping.extend(1u32.to_be_bytes());
+		client.send_to(&ping, server).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		tx.send(AudioPacketMessage::Packet(vec![0xbb; 32])).await.unwrap();
+		assert!(receives(&client, &[0xbb; 32]).await);
+
+		attacker.send_to(&ping, server).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		tx.send(AudioPacketMessage::Packet(vec![0xcc; 32])).await.unwrap();
+		assert!(receives(&client, &[0xcc; 32]).await);
+		assert!(!receives(&attacker, &[0xcc; 32]).await);
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+	}
 }

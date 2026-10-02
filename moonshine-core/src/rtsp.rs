@@ -1,11 +1,13 @@
 use crate::session::stream::video::pyrowave_protocol::{BITSTREAM_ID, PyroWaveDialect};
 use std::net::{IpAddr, SocketAddr};
 use std::str::FromStr;
+use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use rtsp_types::Method;
 use rtsp_types::headers;
 use rtsp_types::headers::Transport;
+use tokio::io::AsyncRead;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpListener;
@@ -15,6 +17,8 @@ use crate::ShutdownReason;
 use crate::healthcheck::{
 	CODEC_PYROWAVE, CODEC_PYROWAVE_444, CODEC_PYROWAVE_HDR, CODEC_PYROWAVE_MASK, supports_video_format,
 };
+use crate::ingress::Ingress;
+use crate::session::authorization::{ML_FF_SESSION_ID_V1, MediaStream, StreamAuthorization, canonical_ip};
 use crate::session::manager::SessionManager;
 use crate::session::stream::audio::ALL_AUDIO_CONFIGS;
 use crate::session::stream::audio::AudioChannels;
@@ -41,6 +45,32 @@ enum EncryptionFlags {
 	Audio = 0x04,
 }
 
+/// Concurrent RTSP connections. Moonlight sends one request per connection,
+/// sequentially; the headroom only absorbs abandoned connections.
+const MAX_RTSP_CONNECTIONS: usize = 16;
+/// Bound for the request line and headers.
+const MAX_RTSP_HEADER_BYTES: usize = 16 * 1024;
+/// Bound for a request body (Moonlight's ANNOUNCE SDP is a few KiB).
+const MAX_RTSP_BODY_BYTES: usize = 64 * 1024;
+
+/// Deadlines for one RTSP connection.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct RtspLimits {
+	/// Time to receive the complete request after the connection is accepted.
+	pub request_timeout: Duration,
+	/// Time to deliver the response.
+	pub response_timeout: Duration,
+}
+
+impl Default for RtspLimits {
+	fn default() -> Self {
+		Self {
+			request_timeout: Duration::from_secs(10),
+			response_timeout: Duration::from_secs(10),
+		}
+	}
+}
+
 #[derive(Clone)]
 pub struct RtspServer {
 	address: String,
@@ -50,6 +80,7 @@ pub struct RtspServer {
 	control_config: ControlStreamConfig,
 	session_manager: SessionManager,
 	supported_codecs: u32,
+	limits: RtspLimits,
 }
 
 impl RtspServer {
@@ -72,11 +103,13 @@ impl RtspServer {
 			control_config: control_config.clone(),
 			session_manager,
 			supported_codecs,
+			limits: RtspLimits::default(),
 		};
 
 		tokio::spawn({
 			let server = server.clone();
 			async move {
+				let ingress = Ingress::new("rtsp", MAX_RTSP_CONNECTIONS, shutdown.clone());
 				let _ = shutdown
 					.wrap_cancel(shutdown.wrap_trigger_shutdown(ShutdownReason::RtspShutdown, {
 						let server = server.clone();
@@ -91,25 +124,7 @@ impl RtspServer {
 								.map_err(|e| tracing::error!("Failed to bind to address {}: {}", socket_addr, e))?;
 
 							tracing::debug!("RTSP server listening on {}", socket_addr);
-
-							loop {
-								let (connection, address) = listener
-									.accept()
-									.await
-									.map_err(|e| tracing::error!("Failed to accept connection: {}", e))?;
-								tracing::trace!("Accepted connection from {}", address);
-
-								tokio::spawn({
-									let server = server.clone();
-									async move {
-										let _ = server.handle_connection(connection, address).await;
-									}
-								});
-							}
-
-							// Is there another way to define the return type of this function?
-							#[allow(unreachable_code)]
-							Ok::<(), ()>(())
+							server.serve_listener(listener, ingress).await
 						}
 					}))
 					.await;
@@ -119,6 +134,40 @@ impl RtspServer {
 		});
 
 		server
+	}
+
+	/// Server without a listener, for tests that drive [`Self::serve_listener`].
+	#[cfg(test)]
+	pub(crate) fn for_test(session_manager: SessionManager, limits: RtspLimits) -> Self {
+		Self {
+			address: "127.0.0.1".into(),
+			rtsp_port: 0,
+			video_config: Default::default(),
+			audio_config: Default::default(),
+			control_config: Default::default(),
+			session_manager,
+			supported_codecs: 0,
+			limits,
+		}
+	}
+
+	/// Accept connections, each handled in its own bounded, cancellable task.
+	pub(crate) async fn serve_listener(&self, listener: TcpListener, ingress: Ingress) -> Result<(), ()> {
+		loop {
+			let (connection, address) = listener
+				.accept()
+				.await
+				.map_err(|e| tracing::error!("Failed to accept connection: {}", e))?;
+			tracing::trace!("Accepted connection from {}", address);
+
+			let Some(permit) = ingress.admit(address) else {
+				continue;
+			};
+			let server = self.clone();
+			permit.spawn(async move {
+				let _ = server.handle_connection(connection, address).await;
+			});
+		}
 	}
 
 	fn capabilities(&self) -> u8 {
@@ -197,7 +246,12 @@ impl RtspServer {
 			.build(Vec::new())
 	}
 
-	fn handle_setup_request(&self, request: &rtsp_types::Request<Vec<u8>>, cseq: i32) -> rtsp_types::Response<Vec<u8>> {
+	fn handle_setup_request(
+		&self,
+		request: &rtsp_types::Request<Vec<u8>>,
+		cseq: i32,
+		grant: &StreamAuthorization,
+	) -> rtsp_types::Response<Vec<u8>> {
 		let transports = match request.typed_header::<rtsp_types::headers::Transports>() {
 			Ok(transports) => transports,
 			Err(e) => {
@@ -252,11 +306,19 @@ impl RtspServer {
 
 					tracing::debug!("Responding with server_port={port} for stream '{stream_id}'.");
 
-					return rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
+					let mut response = rtsp_types::Response::builder(request.version(), rtsp_types::StatusCode::Ok)
 						.header(headers::CSEQ, cseq.to_string())
 						.header(headers::SESSION, "MoonshineSession;timeout = 90".to_string())
-						.header(headers::TRANSPORT, format!("server_port={port}"))
-						.build(Vec::new());
+						.header(headers::TRANSPORT, format!("server_port={port}"));
+					// Sunshine session identifiers (`ML_FF_SESSION_ID_V1`): supporting
+					// clients echo them in media PINGs and ENet connect data. Moonlight
+					// matches option names case-sensitively.
+					response = match stream_id {
+						"audio" => response.header(PING_PAYLOAD_HEADER.clone(), grant.ping_payload(MediaStream::Audio)),
+						"video" => response.header(PING_PAYLOAD_HEADER.clone(), grant.ping_payload(MediaStream::Video)),
+						_ => response.header(CONNECT_DATA_HEADER.clone(), grant.control_connect_data().to_string()),
+					};
+					return response.build(Vec::new());
 				},
 				t => {
 					tracing::warn!("Received request for unsupported transport: {:?}", t);
@@ -285,6 +347,7 @@ impl RtspServer {
 		&self,
 		request: &rtsp_types::Request<Vec<u8>>,
 		cseq: i32,
+		grant: &StreamAuthorization,
 	) -> rtsp_types::Response<Vec<u8>> {
 		let sdp_session = match sdp_types::Session::parse(request.body()) {
 			Ok(sdp_session) => sdp_session,
@@ -538,9 +601,12 @@ impl RtspServer {
 			encrypt_audio: client_encryption_flags & EncryptionFlags::Audio as u8 != 0,
 		};
 
+		let client_features: u32 = get_optional_sdp_attribute(&sdp_session, "x-ml-general.featureFlags").unwrap_or(0);
+		let session_id_v1 = client_features & ML_FF_SESSION_ID_V1 != 0;
+
 		if self
 			.session_manager
-			.set_stream_context(video_stream_context, audio_stream_context)
+			.set_stream_context(grant, video_stream_context, audio_stream_context, session_id_v1)
 			.await
 			.is_err()
 		{
@@ -556,8 +622,9 @@ impl RtspServer {
 		&self,
 		request: &rtsp_types::Request<Vec<u8>>,
 		cseq: i32,
+		grant: &StreamAuthorization,
 	) -> rtsp_types::Response<Vec<u8>> {
-		if self.session_manager.start_session().await.is_err() {
+		if self.session_manager.start_session(grant).await.is_err() {
 			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::InternalServerError);
 		}
 
@@ -567,54 +634,39 @@ impl RtspServer {
 	}
 
 	async fn handle_connection(&self, mut connection: TcpStream, address: SocketAddr) -> Result<(), ()> {
-		// Gate RTSP access: only process requests when a session has been initialized
-		// via the authenticated /launch or /resume endpoint (H-3 mitigation).
-		match self.session_manager.get_session_context().await {
-			Ok(Some(_)) => {},
-			_ => {
-				tracing::warn!("Rejected RTSP connection from {}: no active session", address);
-				return Ok(());
-			},
-		}
-
-		let mut message_buffer = String::new();
-
-		let message = loop {
-			let mut buffer = [0u8; 2048];
-			let bytes_read = connection
-				.read(&mut buffer)
-				.await
-				.map_err(|e| tracing::warn!("Failed to read from connection '{}': {}", address, e))?;
-			if bytes_read == 0 {
-				tracing::warn!("Received empty RTSP request.");
-				return Ok(());
-			}
-			message_buffer.push_str(
-				std::str::from_utf8(&buffer[..bytes_read])
-					.map_err(|e| tracing::warn!("Failed to convert message to string: {e}"))?,
+		// Gate RTSP access: only the client that authenticated the current
+		// /launch or /resume generation may negotiate. The grant ties every
+		// ANNOUNCE/PLAY to that generation; a later resume invalidates it.
+		let Some(grant) = self.session_manager.authorize_stream(canonical_ip(address.ip())).await else {
+			tracing::warn!(
+				"Rejected RTSP connection from {}: no session authorized for this client",
+				address
 			);
-
-			// Hacky workaround to fix rtsp_types parsing SETUP/PLAY requests from Moonlight.
-			let message_buffer = message_buffer.replace("streamid", "rtsp://localhost?streamid");
-			let message_buffer = message_buffer.replace("PLAY /", "PLAY rtsp://localhost/");
-
-			tracing::trace!("Request: {}", message_buffer);
-			let result = rtsp_types::Message::parse(&message_buffer);
-
-			break match result {
-				Ok((message, _consumed)) => message,
-				Err(rtsp_types::ParseError::Incomplete(_)) => {
-					tracing::debug!("Incomplete RTSP message received, waiting for more data.");
-					continue;
-				},
-				Err(e) => {
-					tracing::warn!("Failed to parse request as RTSP message: {}", e);
-					return Err(());
-				},
-			};
+			return Ok(());
 		};
 
-		// tracing::trace!("Consumed {} bytes into RTSP request: {:#?}", consumed, message);
+		let request = match tokio::time::timeout(self.limits.request_timeout, read_rtsp_request(&mut connection)).await
+		{
+			Ok(Ok(request)) => request,
+			Ok(Err(error)) => {
+				tracing::warn!(%address, ?error, "Rejected RTSP request");
+				return Err(());
+			},
+			Err(_) => {
+				tracing::warn!(%address, "RTSP request was not received in time");
+				return Err(());
+			},
+		};
+		let request = normalize_request_target(request);
+		tracing::trace!("Request: {}", String::from_utf8_lossy(&request));
+
+		let message = match rtsp_types::Message::parse(&request) {
+			Ok((message, _consumed)) => message,
+			Err(e) => {
+				tracing::warn!("Failed to parse request as RTSP message: {}", e);
+				return Err(());
+			},
+		};
 
 		let response = match message {
 			rtsp_types::Message::Request(ref request) => {
@@ -628,11 +680,11 @@ impl RtspServer {
 					.map_err(|e| tracing::warn!("Failed to parse CSeq header: {}", e))?;
 
 				match request.method() {
-					Method::Announce => self.handle_announce_request(request, cseq).await,
+					Method::Announce => self.handle_announce_request(request, cseq, &grant).await,
 					Method::Describe => self.handle_describe_request(request, cseq).await,
 					Method::Options => self.handle_options_request(request, cseq),
-					Method::Setup => self.handle_setup_request(request, cseq),
-					Method::Play => self.handle_play_request(request, cseq).await,
+					Method::Setup => self.handle_setup_request(request, cseq, &grant),
+					Method::Play => self.handle_play_request(request, cseq, &grant).await,
 					method => {
 						tracing::warn!("Received request with unsupported method {:?}", method);
 						rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest)
@@ -653,19 +705,160 @@ impl RtspServer {
 			.write(&mut buffer)
 			.map_err(|e| tracing::warn!("Failed to serialize RTSP response: {}", e))?;
 
-		connection
-			.write_all(&buffer)
-			.await
-			.map_err(|e| tracing::warn!("Failed to send RTSP response: {}", e))?;
-
-		// For some reason, Moonlight expects a connection per request, so we close the connection here.
-		connection
-			.shutdown()
-			.await
-			.map_err(|e| tracing::warn!("Failed to shutdown the connection: {e}"))?;
-
-		Ok(())
+		let respond = async {
+			connection.write_all(&buffer).await?;
+			// For some reason, Moonlight expects a connection per request, so we close the connection here.
+			connection.shutdown().await
+		};
+		match tokio::time::timeout(self.limits.response_timeout, respond).await {
+			Ok(Ok(())) => Ok(()),
+			Ok(Err(e)) => {
+				tracing::warn!("Failed to send RTSP response: {e}");
+				Err(())
+			},
+			Err(_) => {
+				tracing::warn!(%address, "RTSP response was not delivered in time");
+				Err(())
+			},
+		}
 	}
+}
+
+static PING_PAYLOAD_HEADER: std::sync::LazyLock<headers::HeaderName> =
+	std::sync::LazyLock::new(|| headers::HeaderName::from_static_str("X-SS-Ping-Payload").expect("ASCII header"));
+static CONNECT_DATA_HEADER: std::sync::LazyLock<headers::HeaderName> =
+	std::sync::LazyLock::new(|| headers::HeaderName::from_static_str("X-SS-Connect-Data").expect("ASCII header"));
+
+/// Why an RTSP request could not be framed.
+#[derive(Debug, PartialEq, Eq)]
+enum RtspRequestError {
+	/// The peer closed the connection before sending a complete request.
+	Incomplete,
+	HeaderTooLarge,
+	BodyTooLarge,
+	InvalidContentLength,
+	Io(std::io::ErrorKind),
+}
+
+/// Incremental, bounded framing of one RTSP request (request line, headers
+/// and a `Content-Length` body). Bytes are scanned once; nothing is parsed or
+/// copied until the request is complete.
+#[derive(Default)]
+struct RtspRequestFramer {
+	buffer: Vec<u8>,
+	scanned: usize,
+	total_length: Option<usize>,
+}
+
+impl RtspRequestFramer {
+	/// Append received bytes; returns the complete request once available.
+	fn push(&mut self, data: &[u8]) -> Result<Option<Vec<u8>>, RtspRequestError> {
+		self.buffer.extend_from_slice(data);
+		if self.total_length.is_none() {
+			// Resume the terminator search across reads that split it.
+			let from = self.scanned.saturating_sub(3);
+			match find_subsequence(&self.buffer[from..], b"\r\n\r\n") {
+				Some(position) => {
+					let header_length = from + position + 4;
+					if header_length > MAX_RTSP_HEADER_BYTES {
+						return Err(RtspRequestError::HeaderTooLarge);
+					}
+					let body_length = content_length(&self.buffer[..header_length])?;
+					if body_length > MAX_RTSP_BODY_BYTES {
+						return Err(RtspRequestError::BodyTooLarge);
+					}
+					self.total_length = Some(header_length + body_length);
+				},
+				None if self.buffer.len() > MAX_RTSP_HEADER_BYTES => return Err(RtspRequestError::HeaderTooLarge),
+				None => {
+					self.scanned = self.buffer.len();
+					return Ok(None);
+				},
+			}
+		}
+		match self.total_length {
+			Some(total) if self.buffer.len() >= total => {
+				// One request per connection; ignore anything after it.
+				self.buffer.truncate(total);
+				Ok(Some(std::mem::take(&mut self.buffer)))
+			},
+			_ => Ok(None),
+		}
+	}
+}
+
+fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+	haystack.windows(needle.len()).position(|window| window == needle)
+}
+
+/// Body length declared by the request headers (absent means no body).
+fn content_length(head: &[u8]) -> Result<usize, RtspRequestError> {
+	let mut length = None;
+	for line in head.split(|&byte| byte == b'\n').skip(1) {
+		let line = line.strip_suffix(b"\r").unwrap_or(line);
+		let Some(colon) = line.iter().position(|&byte| byte == b':') else {
+			continue;
+		};
+		if !line[..colon].trim_ascii().eq_ignore_ascii_case(b"content-length") {
+			continue;
+		}
+		let value = line[colon + 1..].trim_ascii();
+		if value.is_empty() || value.len() > 10 || !value.iter().all(u8::is_ascii_digit) {
+			return Err(RtspRequestError::InvalidContentLength);
+		}
+		let value: usize = std::str::from_utf8(value)
+			.ok()
+			.and_then(|value| value.parse().ok())
+			.ok_or(RtspRequestError::InvalidContentLength)?;
+		if length.is_some_and(|length| length != value) {
+			return Err(RtspRequestError::InvalidContentLength);
+		}
+		length = Some(value);
+	}
+	Ok(length.unwrap_or(0))
+}
+
+async fn read_rtsp_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<Vec<u8>, RtspRequestError> {
+	let mut framer = RtspRequestFramer::default();
+	let mut chunk = [0u8; 4096];
+	loop {
+		let read = reader
+			.read(&mut chunk)
+			.await
+			.map_err(|error| RtspRequestError::Io(error.kind()))?;
+		if read == 0 {
+			return Err(RtspRequestError::Incomplete);
+		}
+		if let Some(request) = framer.push(&chunk[..read])? {
+			return Ok(request);
+		}
+	}
+}
+
+/// Rewrite Moonlight's request targets into URIs `rtsp_types` accepts: SETUP and
+/// ANNOUNCE use a bare `streamid=...` and PLAY uses `/`. Only the request line
+/// is changed; headers and the SDP body are passed through untouched.
+fn normalize_request_target(request: Vec<u8>) -> Vec<u8> {
+	let Some(line_end) = find_subsequence(&request, b"\r\n") else {
+		return request;
+	};
+	let Ok(line) = std::str::from_utf8(&request[..line_end]) else {
+		return request;
+	};
+	let mut parts = line.splitn(3, ' ');
+	let (Some(method), Some(target), Some(version)) = (parts.next(), parts.next(), parts.next()) else {
+		return request;
+	};
+	let target = if target.starts_with("streamid") {
+		format!("rtsp://localhost?{target}")
+	} else if method == "PLAY" && target.starts_with('/') {
+		format!("rtsp://localhost{target}")
+	} else {
+		return request;
+	};
+	let mut normalized = format!("{method} {target} {version}").into_bytes();
+	normalized.extend_from_slice(&request[line_end..]);
+	normalized
 }
 
 fn rtsp_response(
@@ -772,6 +965,238 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 #[cfg(test)]
 mod tests {
 	use super::bitrate_bps_from_kbps;
+
+	mod framing {
+		use super::super::*;
+
+		const OPTIONS: &[u8] = b"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+
+		fn announce(body: &str) -> Vec<u8> {
+			format!(
+				"ANNOUNCE streamid=control/13/0 RTSP/1.0\r\nCSeq: 6\r\nContent-type: application/sdp\r\nContent-length: {}\r\n\r\n{body}",
+				body.len()
+			)
+			.into_bytes()
+		}
+
+		#[test]
+		fn frames_complete_and_fragmented_requests() {
+			let mut framer = RtspRequestFramer::default();
+			assert_eq!(framer.push(OPTIONS), Ok(Some(OPTIONS.to_vec())));
+
+			// Byte-by-byte delivery, including the terminator and a multi-byte
+			// UTF-8 sequence split across reads, with trailing data ignored.
+			let request = announce("s=caf\u{e9}\r\na=x-nv-video[0].maxFPS:60\r\n");
+			let mut stream = request.clone();
+			stream.extend_from_slice(b"TRAILING");
+			let mut framer = RtspRequestFramer::default();
+			let mut complete = None;
+			for (index, byte) in stream.iter().enumerate() {
+				if let Some(framed) = framer.push(std::slice::from_ref(byte)).unwrap() {
+					assert_eq!(index + 1, request.len());
+					complete = Some(framed);
+					break;
+				}
+			}
+			assert_eq!(complete, Some(request));
+		}
+
+		#[test]
+		fn rejects_oversized_and_invalid_requests() {
+			let mut framer = RtspRequestFramer::default();
+			let header = vec![b'a'; MAX_RTSP_HEADER_BYTES];
+			assert_eq!(framer.push(&header), Ok(None));
+			assert_eq!(framer.push(b"a"), Err(RtspRequestError::HeaderTooLarge));
+
+			// Declared bodies are bounded before any body bytes arrive.
+			let mut framer = RtspRequestFramer::default();
+			let request = format!(
+				"ANNOUNCE streamid=x RTSP/1.0\r\nCSeq: 1\r\nContent-Length: {}\r\n\r\n",
+				MAX_RTSP_BODY_BYTES + 1
+			);
+			assert_eq!(framer.push(request.as_bytes()), Err(RtspRequestError::BodyTooLarge));
+
+			for length in ["-1", "1x", "", "99999999999", "1, 2"] {
+				let request = format!("ANNOUNCE x RTSP/1.0\r\nContent-Length: {length}\r\n\r\n");
+				assert_eq!(
+					RtspRequestFramer::default().push(request.as_bytes()),
+					Err(RtspRequestError::InvalidContentLength),
+					"{length:?}"
+				);
+			}
+			let conflicting = b"ANNOUNCE x RTSP/1.0\r\nContent-Length: 1\r\ncontent-length: 2\r\n\r\nab";
+			assert_eq!(
+				RtspRequestFramer::default().push(conflicting),
+				Err(RtspRequestError::InvalidContentLength)
+			);
+		}
+
+		#[tokio::test]
+		async fn incomplete_request_is_an_error() {
+			let mut partial: &[u8] = b"OPTIONS rtsp://x RTSP/1.0\r\nCSeq: 1\r\n";
+			assert_eq!(read_rtsp_request(&mut partial).await, Err(RtspRequestError::Incomplete));
+			let mut short_body: &[u8] = &announce("v=0\r\n")[..60];
+			assert_eq!(
+				read_rtsp_request(&mut short_body).await,
+				Err(RtspRequestError::Incomplete)
+			);
+		}
+
+		#[test]
+		fn normalizes_only_moonlight_request_targets() {
+			let setup = b"SETUP streamid=video/0/0 RTSP/1.0\r\nX-Note: streamid\r\n\r\n".to_vec();
+			assert_eq!(
+				normalize_request_target(setup),
+				b"SETUP rtsp://localhost?streamid=video/0/0 RTSP/1.0\r\nX-Note: streamid\r\n\r\n"
+			);
+			let play = b"PLAY / RTSP/1.0\r\nCSeq: 7\r\n\r\n".to_vec();
+			assert_eq!(
+				normalize_request_target(play),
+				b"PLAY rtsp://localhost/ RTSP/1.0\r\nCSeq: 7\r\n\r\n"
+			);
+			let body = announce("a=streamid\r\nPLAY /\r\n");
+			let normalized = normalize_request_target(body.clone());
+			assert!(normalized.starts_with(b"ANNOUNCE rtsp://localhost?streamid=control/13/0 RTSP/1.0\r\n"));
+			assert!(normalized.ends_with(b"a=streamid\r\nPLAY /\r\n"), "body untouched");
+			assert_eq!(normalize_request_target(OPTIONS.to_vec()), OPTIONS);
+			assert_eq!(
+				normalize_request_target(b"\xff\xfe /x y\r\n".to_vec()),
+				b"\xff\xfe /x y\r\n"
+			);
+		}
+	}
+
+	mod server {
+		use std::time::{Duration, Instant};
+
+		use async_shutdown::ShutdownManager;
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		use tokio::net::{TcpListener, TcpSocket, TcpStream};
+
+		use super::super::*;
+		use crate::session::authorization::MediaStream;
+
+		const LIMITS: RtspLimits = RtspLimits {
+			request_timeout: Duration::from_millis(300),
+			response_timeout: Duration::from_millis(300),
+		};
+
+		async fn start() -> (
+			std::net::SocketAddr,
+			StreamAuthorization,
+			ShutdownManager<crate::ShutdownReason>,
+		) {
+			let shutdown = ShutdownManager::new();
+			let manager = SessionManager::for_test(shutdown.clone());
+			let grant = manager.authorize_client_for_test("127.0.0.1".parse().unwrap()).await;
+			let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+			let address = listener.local_addr().unwrap();
+			let server = RtspServer::for_test(manager, LIMITS);
+			let ingress = Ingress::new("rtsp-test", MAX_RTSP_CONNECTIONS, shutdown.clone());
+			let cancel = shutdown.clone();
+			tokio::spawn(async move { cancel.wrap_cancel(server.serve_listener(listener, ingress)).await });
+			(address, grant, shutdown)
+		}
+
+		async fn connect_from(source: &str, server: std::net::SocketAddr) -> TcpStream {
+			let socket = TcpSocket::new_v4().unwrap();
+			socket.bind(format!("{source}:0").parse().unwrap()).unwrap();
+			socket.connect(server).await.unwrap()
+		}
+
+		async fn exchange(source: &str, server: std::net::SocketAddr, request: &[u8]) -> String {
+			let mut stream = connect_from(source, server).await;
+			stream.write_all(request).await.unwrap();
+			let mut response = Vec::new();
+			// A refused connection may be reset because its request was never read.
+			let _ = tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+				.await
+				.unwrap();
+			String::from_utf8(response).unwrap()
+		}
+
+		#[tokio::test]
+		async fn only_the_authorized_client_negotiates() {
+			let (server, grant, shutdown) = start().await;
+			let options = b"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 1\r\n\r\n";
+			assert_eq!(exchange("127.0.0.2", server, options).await, "", "unauthorized host");
+			assert!(
+				exchange("127.0.0.1", server, options)
+					.await
+					.starts_with("RTSP/1.0 200 ")
+			);
+
+			// SETUP hands out the generation's Sunshine session identifiers.
+			for (stream, header) in [
+				(
+					"audio",
+					format!("X-SS-Ping-Payload: {}", grant.ping_payload(MediaStream::Audio)),
+				),
+				(
+					"video",
+					format!("X-SS-Ping-Payload: {}", grant.ping_payload(MediaStream::Video)),
+				),
+				(
+					"control",
+					format!("X-SS-Connect-Data: {}", grant.control_connect_data()),
+				),
+			] {
+				let request = format!(
+					"SETUP streamid={stream}/0/0 RTSP/1.0\r\nCSeq: 3\r\nTransport: unicast;X-GS-ClientPort=50000-50001\r\nIf-Modified-Since: Thu, 01 Jan 1970 00:00:00 GMT\r\n\r\n"
+				);
+				let response = exchange("127.0.0.1", server, request.as_bytes()).await;
+				assert!(response.starts_with("RTSP/1.0 200 "), "{response}");
+				assert!(response.contains(&format!("{header}\r\n")), "{response}");
+			}
+
+			// ANNOUNCE and PLAY without an initialized session are refused rather
+			// than committing anything.
+			let play = b"PLAY / RTSP/1.0\r\nCSeq: 7\r\n\r\n";
+			assert!(exchange("127.0.0.1", server, play).await.starts_with("RTSP/1.0 500"));
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		}
+
+		#[tokio::test]
+		async fn stalled_and_oversized_requests_are_bounded() {
+			let (server, _grant, shutdown) = start().await;
+			// A stalled request does not delay other clients and is closed at its deadline.
+			let mut stalled = connect_from("127.0.0.1", server).await;
+			stalled
+				.write_all(b"OPTIONS rtsp://x RTSP/1.0\r\nCSeq: 1\r\n")
+				.await
+				.unwrap();
+			let started = Instant::now();
+			let options = b"OPTIONS rtsp://127.0.0.1:48010 RTSP/1.0\r\nCSeq: 2\r\n\r\n";
+			let response = exchange("127.0.0.1", server, options).await;
+			assert!(response.starts_with("RTSP/1.0 200 "), "{response:?}");
+			assert!(started.elapsed() < LIMITS.request_timeout);
+			let mut rest = Vec::new();
+			tokio::time::timeout(Duration::from_secs(2), stalled.read_to_end(&mut rest))
+				.await
+				.expect("stalled request is closed at its deadline")
+				.unwrap();
+			assert!(rest.is_empty());
+
+			// An oversized header is rejected as soon as it exceeds the bound.
+			let mut oversized = connect_from("127.0.0.1", server).await;
+			let started = Instant::now();
+			let _ = oversized.write_all(&vec![b'a'; MAX_RTSP_HEADER_BYTES + 4096]).await;
+			let mut rest = Vec::new();
+			let _ = tokio::time::timeout(Duration::from_secs(2), oversized.read_to_end(&mut rest)).await;
+			assert!(started.elapsed() < LIMITS.request_timeout, "closed before the deadline");
+			assert!(rest.is_empty());
+
+			// A request delivered byte by byte is still served.
+			let mut fragmented = connect_from("127.0.0.1", server).await;
+			for byte in options {
+				fragmented.write_all(std::slice::from_ref(byte)).await.unwrap();
+			}
+			let mut response = Vec::new();
+			fragmented.read_to_end(&mut response).await.unwrap();
+			assert!(response.starts_with(b"RTSP/1.0 200 "));
+			shutdown.trigger_shutdown(crate::ShutdownReason::AppQuit).unwrap();
+		}
+	}
 
 	#[test]
 	fn negotiation_fixtures_and_conventional_isolation() {

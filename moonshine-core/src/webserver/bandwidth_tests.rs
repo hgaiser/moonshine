@@ -123,6 +123,7 @@ async fn authenticated_probe_discovery_exact_payload_and_admission() {
 		supported_codecs: crate::healthcheck::CODEC_PYROWAVE,
 		hdr_supported: false,
 		shutdown,
+		limits: WebLimits::default(),
 	};
 	let acceptor = || TlsAcceptor::from_config(&host_cert, &host_key).unwrap();
 	let response = request(

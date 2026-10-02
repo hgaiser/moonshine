@@ -71,7 +71,7 @@ command = ["/usr/bin/steam", "steam://open/bigpicture"]
 | Setting | Type / default | Effect |
 | --- | --- | --- |
 | `name` | string, `"Pyroshine"` | Host name shown to clients and advertised through discovery. |
-| `address` | string, `"0.0.0.0"` | Bind address for web and stream listeners. `0.0.0.0` is IPv4; `::` enables dual-stack IPv4/IPv6. |
+| `address` | string, `"0.0.0.0"` | Bind address for web and stream listeners. `0.0.0.0` is IPv4; `::` enables dual-stack IPv4/IPv6. With a specific non-loopback address, the pairing PIN page is additionally served on `127.0.0.1` at the HTTP port. |
 | `inhibit_sleep` | boolean, `true` | Ask logind to block suspend while streaming. Requires the shipped polkit rule and `pyroshine` group access; the packaged service grants that group. Failure logs a warning and does not prevent streaming. |
 | `application` | array of tables, Steam entry | Static applications exposed to clients; see below. |
 | `application_scanner` | array of tables, Steam scanner | Dynamically discover installed applications at startup and append them to the static list; see below. |
@@ -95,7 +95,7 @@ private_key = "$HOME/.config/moonshine/key.pem"
 
 | Setting | Type / default when table is omitted | Effect |
 | --- | --- | --- |
-| `port` | integer, `47989` | HTTP GameStream API and pairing PIN page port (TCP). Required in an explicit table. |
+| `port` | integer, `47989` | HTTP GameStream API and pairing PIN page port (TCP). The PIN page only accepts requests from the host itself. Required in an explicit table. |
 | `port_https` | integer, `47984` | HTTPS GameStream API port (TCP). Required in an explicit table. |
 | `enable_pairing` | boolean, `true` | Allow new clients to pair. Set `false` after pairing to disable new pairings. |
 | `certificate` | path string, `$HOME/.config/moonshine/cert.pem` | TLS certificate file, created if needed. Required in an explicit table. Supports `~` and environment-variable expansion. |
@@ -103,6 +103,19 @@ private_key = "$HOME/.config/moonshine/key.pem"
 
 Changing ports may require corresponding client and firewall changes. Keep
 listeners accessible only over a trusted LAN or VPN.
+
+Pairing approval is an operator action on the host. `/pin` and `/submit-pin`
+reject requests whose peer or `Host` is not loopback and cross-origin browser
+requests, so a client cannot approve its own pairing. The page approves the
+specific pending request it shows (requester address and certificate
+fingerprint); an unapproved request expires after five minutes and the client
+must retry. On a headless host, forward the port over SSH and open the page
+locally:
+
+```sh
+ssh -L 47989:localhost:47989 user@host
+# then open http://localhost:47989/pin on this machine
+```
 
 ## `[stream]`
 

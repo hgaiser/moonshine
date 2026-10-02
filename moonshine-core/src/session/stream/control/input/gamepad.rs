@@ -233,14 +233,23 @@ impl GamepadTouch {
 			return Err(());
 		}
 
+		let x = f32::from_le_bytes(buffer[8..12].try_into().unwrap());
+		let y = f32::from_le_bytes(buffer[12..16].try_into().unwrap());
+		let pressure = f32::from_le_bytes(buffer[16..20].try_into().unwrap());
+		// `clamp` keeps NaN, which would otherwise reach the touchpad conversion.
+		if !x.is_finite() || !y.is_finite() || !pressure.is_finite() {
+			tracing::warn!(?x, ?y, ?pressure, "Ignoring gamepad touch with non-finite values");
+			return Err(());
+		}
+
 		Ok(Self {
 			index: buffer[0],
 			_event_type: buffer[1],
 			// zero: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			pointer_id: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
-			x: f32::from_le_bytes(buffer[8..12].try_into().unwrap()).clamp(0.0, 1.0),
-			y: f32::from_le_bytes(buffer[12..16].try_into().unwrap()).clamp(0.0, 1.0),
-			pressure: f32::from_le_bytes(buffer[16..20].try_into().unwrap()).clamp(0.0, 1.0),
+			x: x.clamp(0.0, 1.0),
+			y: y.clamp(0.0, 1.0),
+			pressure: pressure.clamp(0.0, 1.0),
 		})
 	}
 }
@@ -346,11 +355,22 @@ impl GamepadMotion {
 				},
 			},
 			// zero: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
-			x: f32::from_le_bytes(buffer[4..8].try_into().unwrap()),
-			y: f32::from_le_bytes(buffer[8..12].try_into().unwrap()),
-			z: f32::from_le_bytes(buffer[12..16].try_into().unwrap()),
+			x: finite_motion(buffer[4..8].try_into().unwrap())?,
+			y: finite_motion(buffer[8..12].try_into().unwrap())?,
+			z: finite_motion(buffer[12..16].try_into().unwrap())?,
 		})
 	}
+}
+
+/// Motion samples are passed to the native device; reject NaN/infinity
+/// instead of relying on float-to-integer conversion behavior there.
+fn finite_motion(bytes: [u8; 4]) -> Result<f32, ()> {
+	let value = f32::from_le_bytes(bytes);
+	if !value.is_finite() {
+		tracing::warn!(?value, "Ignoring gamepad motion with a non-finite value");
+		return Err(());
+	}
+	Ok(value)
 }
 
 #[derive(Debug, FromRepr)]

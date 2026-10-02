@@ -5,9 +5,10 @@ use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
-use crate::session::SessionKeysReceiver;
+use crate::session::authorization::MediaStream;
 use crate::session::compositor::frame::HdrModeState;
 use crate::session::manager::SessionShutdownReason;
+use crate::session::{AuthorizationReceiver, SessionKeysReceiver};
 
 mod diagnostics;
 pub(crate) mod fec;
@@ -373,6 +374,32 @@ impl VideoStreamHandle {
 	}
 }
 
+/// Receivers behind a [`VideoStreamHandle::for_test`] handle.
+#[cfg(test)]
+pub(super) struct VideoHandleProbe {
+	pub(super) idr_rx: broadcast::Receiver<()>,
+	pub(super) packet_rx: mpsc::Receiver<VideoPacketMessage>,
+}
+
+#[cfg(test)]
+impl VideoStreamHandle {
+	/// A handle not connected to a pipeline, for control-stream tests.
+	pub(super) fn for_test() -> (Self, VideoHandleProbe) {
+		let (idr_tx, idr_rx) = broadcast::channel(16);
+		let (packet_tx, packet_rx) = mpsc::channel(16);
+		let handle = Self {
+			notify: Arc::new(Notify::new()),
+			idr_tx,
+			invalidate_tx: broadcast::channel(16).0,
+			reset_tx: std::sync::mpsc::channel().0,
+			fec_feedback_tx: watch::channel(FrameFecStatus::default()).0,
+			packet_tx,
+			reconfigure_tx: std::sync::mpsc::channel().0,
+		};
+		(handle, VideoHandleProbe { idr_rx, packet_rx })
+	}
+}
+
 pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
 	frame_rx: crate::session::compositor::admission::CaptureReceiver,
@@ -414,6 +441,7 @@ impl VideoStream {
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
+		authorization_rx: AuthorizationReceiver,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<VideoStreamHandle, ()> {
 		let Self {
@@ -455,6 +483,7 @@ impl VideoStream {
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
+			authorization_rx,
 			start_notify.clone(),
 			stop.clone(),
 			pacing_bitrate,
@@ -494,9 +523,11 @@ impl VideoStream {
 	}
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<VideoPacketMessage>,
 	mut socket: UdpGsoSocket,
+	authorization: AuthorizationReceiver,
 	start: Arc<Notify>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	mut pacing_bitrate: Option<u64>,
@@ -625,11 +656,13 @@ fn spawn_handle_video_packets(
 						Err(_) => break,
 					};
 
-					if &buf[..len] == b"PING" {
+					// Only the current launch/resume generation may (re)discover the
+					// destination; the source port may change (NAT, client sockets).
+					if authorization.borrow().admits_media_ping(MediaStream::Video, address, &buf[..len]) {
 						tracing::trace!("Received video stream PING message from {address}.");
 						client_address = Some(address);
 					} else {
-						tracing::warn!("Received unknown message on video stream of length {len}.");
+						tracing::debug!(%address, len, "Ignoring unauthorized video endpoint discovery datagram");
 					}
 				},
 			}
@@ -652,7 +685,17 @@ mod tests {
 		let stop = ShutdownManager::new();
 		let start = Arc::new(Notify::new());
 		let (tx, rx) = mpsc::channel(16);
-		spawn_handle_video_packets(rx, socket, start.clone(), stop.clone(), Some(650_000_000), 120, false);
+		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
+		spawn_handle_video_packets(
+			rx,
+			socket,
+			authorization_rx,
+			start.clone(),
+			stop.clone(),
+			Some(650_000_000),
+			120,
+			false,
+		);
 		start.notify_one();
 		let mut buf = [0u8; 64];
 		for codec in [VideoCodec::PyroWave, VideoCodec::Hevc, VideoCodec::PyroWave] {
@@ -704,6 +747,107 @@ mod tests {
 					.is_err()
 			);
 		}
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+	}
+
+	fn test_authorization(
+		client: &str,
+	) -> (
+		watch::Sender<crate::session::authorization::StreamAuthorization>,
+		AuthorizationReceiver,
+	) {
+		watch::channel(crate::session::authorization::StreamAuthorization::new(1, client.parse().unwrap()).unwrap())
+	}
+
+	fn session_ping(authorization: &crate::session::authorization::StreamAuthorization, counter: u32) -> Vec<u8> {
+		let mut ping = authorization.ping_payload(MediaStream::Video).as_bytes().to_vec();
+		ping.extend(counter.to_be_bytes());
+		ping
+	}
+
+	async fn send_frame(tx: &mpsc::Sender<VideoPacketMessage>, byte: u8) {
+		let mut shard = shard_batch::ShardBuf::new(1, 64, 0);
+		shard.shard_mut(0).fill(byte);
+		tx.send(VideoPacketMessage::Batch(shard.into_batch())).await.unwrap();
+	}
+
+	async fn receives(socket: &tokio::net::UdpSocket, byte: u8) -> bool {
+		let mut buf = [0u8; 128];
+		match tokio::time::timeout(std::time::Duration::from_millis(200), socket.recv_from(&mut buf)).await {
+			Ok(Ok((len, _))) => buf[..len] == [byte; 64],
+			_ => false,
+		}
+	}
+
+	/// Unauthorized hosts, forged/stale payloads and legacy PINGs from session-ID
+	/// clients cannot redirect video; the authorized client may change ports.
+	#[tokio::test]
+	async fn endpoint_discovery_is_bound_to_the_authorized_generation() {
+		use tokio::net::UdpSocket;
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let server = socket.local_addr().unwrap();
+		let stop = ShutdownManager::new();
+		let start = Arc::new(Notify::new());
+		let (tx, rx) = mpsc::channel(16);
+		let (authorization_tx, authorization_rx) = test_authorization("127.0.0.1");
+		authorization_tx.send_modify(crate::session::authorization::StreamAuthorization::require_session_id);
+		spawn_handle_video_packets(
+			rx,
+			socket,
+			authorization_rx,
+			start.clone(),
+			stop.clone(),
+			None,
+			60,
+			false,
+		);
+		start.notify_one();
+		let current = authorization_tx.borrow().clone();
+
+		// Another host knowing the payload, and the client with a wrong payload or
+		// a legacy PING after announcing session-ID support.
+		let attacker = UdpSocket::bind("127.0.0.2:0").await.unwrap();
+		attacker.send_to(&session_ping(&current, 1), server).await.unwrap();
+		let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let mut forged = session_ping(&current, 1);
+		forged[3] ^= 0x20;
+		client.send_to(&forged, server).await.unwrap();
+		client.send_to(b"PING", server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		send_frame(&tx, 0x11).await;
+		assert!(!receives(&attacker, 0x11).await);
+		assert!(!receives(&client, 0x11).await);
+
+		// The authorized client discovers the endpoint, then moves to a new port.
+		client.send_to(&session_ping(&current, 2), server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		send_frame(&tx, 0x22).await;
+		assert!(receives(&client, 0x22).await);
+		let rebound = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		rebound.send_to(&session_ping(&current, 3), server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		send_frame(&tx, 0x33).await;
+		assert!(receives(&rebound, 0x33).await);
+		assert!(!receives(&client, 0x33).await);
+		// An attacker cannot steal it back.
+		attacker.send_to(&session_ping(&current, 4), server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		send_frame(&tx, 0x44).await;
+		assert!(receives(&rebound, 0x44).await);
+		assert!(!receives(&attacker, 0x44).await);
+
+		// After a resume, the previous generation's payload is stale.
+		let next = crate::session::authorization::StreamAuthorization::new(2, "127.0.0.1".parse().unwrap()).unwrap();
+		authorization_tx.send_replace(next.clone());
+		client.send_to(&session_ping(&current, 5), server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		send_frame(&tx, 0x55).await;
+		assert!(receives(&rebound, 0x55).await);
+		assert!(!receives(&client, 0x55).await);
+		client.send_to(&session_ping(&next, 1), server).await.unwrap();
+		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+		send_frame(&tx, 0x66).await;
+		assert!(receives(&client, 0x66).await);
 		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
 	}
 

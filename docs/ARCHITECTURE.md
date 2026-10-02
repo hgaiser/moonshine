@@ -72,6 +72,23 @@ RTSP access requires an existing session context established through the
 GameStream lifecycle. Do not move launch authentication into the streaming hot
 path or treat possession of an RTSP socket as pairing authorization.
 
+Each authenticated `/launch` or `/resume` starts an authorization generation
+(`session/authorization.rs`) owned by the session manager: the paired client's
+normalized address plus fresh Sunshine session identifiers. RTSP accepts only
+that address, and ANNOUNCE/PLAY commit only within the generation that issued
+them. Media PINGs must come from that address and, for clients announcing
+Moonlight's `ML_FF_SESSION_ID_V1`, echo the generation's ping payload; source
+ports stay free for NAT. The control stream admits peers by address and connect
+data, but dispatches only the peer that authenticated with the HTTPS-delivered
+AES-GCM key, with a per-generation replay window. Without session-ID support,
+clients sharing one address are distinguished only by the control key; media
+endpoint discovery then relies on address alone.
+
+Accepted HTTP, HTTPS and RTSP connections run in bounded, cancellable tasks
+(`ingress.rs`) that hold a global shutdown delay token, with TLS handshake,
+request-header and RTSP framing deadlines. Pairing approval is a loopback-only
+operator action; first pairing cannot rely on a paired client certificate.
+
 A pending ANNOUNCE is not the active encoder configuration. Keep pending and
 active contexts separate until PLAY, and preserve epoch barriers so old packets
 or captured frames cannot enter the new stream. Changed audio layout/duration
