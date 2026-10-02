@@ -224,7 +224,7 @@ impl Packetizer {
 	/// Packetize an encoded frame into a batch of network-ready shards.
 	///
 	/// Returns a `ShardBatch` containing all data + parity shards packed
-	/// contiguously in a single allocation per block.
+	/// contiguously in a single zeroed allocation per frame.
 	#[allow(clippy::too_many_arguments)]
 	pub fn packetize(
 		&mut self,
@@ -337,15 +337,29 @@ impl Packetizer {
 		);
 		tracing::trace!("Sending {nr_blocks} blocks of video data.");
 
-		// Accumulate all blocks into a single batch.
-		let mut all_shards = ShardBatch::empty();
+		// Plan all block capacities before allocating; FEC and encryption operate
+		// on disjoint views of this single zeroed, sender-owned frame buffer.
+		let mut frame_shards = 0;
+		for block in 0..nr_blocks {
+			let data = ((block + 1) * nr_data_shards_per_block).min(nr_data_shards) - block * nr_data_shards_per_block;
+			let parity = if disable_fec {
+				0
+			} else {
+				block_fec_parameters(data, fec_percentage, minimum_fec_packets as usize)
+					.ok_or(())?
+					.1
+			};
+			frame_shards += data + parity;
+		}
+		let allocated = Instant::now();
+		let mut shard_buf = ShardBuf::new(frame_shards, requested_shard_size, prefix_size);
+		let mut block_start = 0;
 
-		let mut total_alloc_us = 0u128;
+		let total_alloc_us = allocated.elapsed().as_micros();
 		let mut total_data_write_us = 0u128;
 		let mut total_fec_encoder_us = 0u128;
 		let mut total_fec_compute_us = 0u128;
 		let mut total_fec_headers_us = 0u128;
-		let mut total_extend_us = 0u128;
 		let mut total_parity_shards = 0usize;
 
 		for block_index in 0..nr_blocks {
@@ -374,14 +388,12 @@ impl Packetizer {
 				"Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards."
 			);
 
-			// Single allocation for all shards in this block (data + parity), zeroed.
+			// Select this block in the single zeroed frame allocation.
 			let total_shards = nr_data_shards + nr_parity_shards;
 			total_parity_shards = total_parity_shards
 				.checked_add(nr_parity_shards)
 				.ok_or_else(|| tracing::error!("Video parity-shard count overflow"))?;
-			let t_alloc = Instant::now();
-			let mut shard_buf = ShardBuf::new(total_shards, requested_shard_size, prefix_size);
-			total_alloc_us += t_alloc.elapsed().as_micros();
+			shard_buf.select_block(block_start, total_shards);
 
 			let t_data_write = Instant::now();
 
@@ -517,17 +529,16 @@ impl Packetizer {
 				}
 			}
 
-			let t_extend = Instant::now();
-			all_shards.extend_from(&shard_buf.into_batch());
-			total_extend_us += t_extend.elapsed().as_micros();
+			block_start += total_shards;
 
 			tracing::trace!("Finished sending frame {frame_number}.");
 		}
 
 		tracing::trace!(
-			"Packetize breakdown: alloc_us={total_alloc_us} data_write_us={total_data_write_us} fec_encoder_us={total_fec_encoder_us} fec_compute_us={total_fec_compute_us} fec_headers_us={total_fec_headers_us} extend_us={total_extend_us}",
+			"Packetize breakdown: alloc_us={total_alloc_us} data_write_us={total_data_write_us} fec_encoder_us={total_fec_encoder_us} fec_compute_us={total_fec_compute_us} fec_headers_us={total_fec_headers_us}",
 		);
 
+		let mut all_shards = shard_buf.into_batch();
 		all_shards.set_frame_metadata(
 			frame_number,
 			encoded_data.len(),
@@ -734,6 +745,121 @@ mod tests {
 				.flat_map(|s| s.as_ref().unwrap().iter().copied())
 				.collect();
 			assert_eq!(&rebuilt[8..8 + frame.len()], &frame);
+		}
+	}
+
+	#[test]
+	fn packets_match_pre_remediation_full_batch_fingerprints() {
+		use sha2::{Digest, Sha256};
+		for (size, fec, encrypted, expected) in [
+			(
+				16000,
+				0,
+				false,
+				"24fca8220828eae880c558db63b96e043463b08ce92cd7db43dd3270c0a95efe",
+			),
+			(
+				16000,
+				0,
+				true,
+				"0f31da56ab9b73cbe302117e43787c3599ffd5834af0dfcd9c54110aff2369ce",
+			),
+			(
+				128000,
+				20,
+				false,
+				"d7720a61045e59aab7f95622ab6e00f9a046962d1b18d493e8966d946703a18b",
+			),
+			(
+				128000,
+				20,
+				true,
+				"a1b5e9efc41a2b2021aa45966487c761b7fdd6270cce6ad30b4deac741a17d71",
+			),
+			(
+				512000,
+				20,
+				false,
+				"cb8794f145bc0d74d42037abb7bdf35600bdbc1d9e1cd8b6de05a3e0b68f6a79",
+			),
+			(
+				512000,
+				20,
+				true,
+				"3f3beafce8394363690b2137490156224495c15fe177bbf6180163aded0279c5",
+			),
+			(
+				2000000,
+				0,
+				false,
+				"03d4f811e149c6cd8d6fb89edf00c56dba2ad7c81413d7d05e65bae52c9cb62e",
+			),
+			(
+				2000000,
+				0,
+				true,
+				"42de8946c2120735baf3d3c6abb92cc0fbc77109da77b724e84e53c654844d6b",
+			),
+		] {
+			let data: Vec<u8> = (0..size).map(|i| (i * 31 + i / 97) as u8).collect();
+			let (_tx, rx) = tokio::sync::watch::channel(ActiveKeys::for_test([0x11; 16], 7));
+			let mut packetizer = Packetizer::new(encrypted, rx);
+			let first = packetizer
+				.packetize(&data, true, 1024, 0, fec, 1, &mut 0, 123, 5)
+				.unwrap();
+			if encrypted {
+				// The recorded baseline fixture is sample 20, after twenty nonce
+				// reservations. Skip only counters, never re-encrypt with a reused IV.
+				packetizer
+					.keys_rx
+					.borrow()
+					.material()
+					.nonces()
+					.video
+					.reserve(19 * first.shard_count() as u64)
+					.unwrap();
+			}
+			let batch = packetizer
+				.packetize(&data, true, 1024, 0, fec, 1, &mut 0, 123, 5)
+				.unwrap();
+			assert_eq!(hex::encode(Sha256::digest(batch.as_bytes())), expected);
+		}
+	}
+
+	/// CPU-only, fixed-content transport baseline. Run alone with --ignored --nocapture.
+	#[test]
+	#[ignore]
+	fn transport_packetizer_measurements() {
+		use sha2::{Digest, Sha256};
+		for size in [16_000, 128_000, 512_000, 2_000_000] {
+			for fec in [0, 20] {
+				for encrypted in [false, true] {
+					let data: Vec<u8> = (0..size).map(|i| (i * 31 + i / 97) as u8).collect();
+					let (_tx, rx) = tokio::sync::watch::channel(ActiveKeys::for_test([0x11; 16], 7));
+					let mut packetizer = Packetizer::new(encrypted, rx);
+					for sample in 0..120 {
+						measurement_allocator::reset();
+						let started = Instant::now();
+						let batch = packetizer
+							.packetize(&data, true, 1024, 0, fec, 1, &mut 0, 123, 5)
+							.unwrap();
+						let ns = started.elapsed().as_nanos();
+						let counts = measurement_allocator::counts();
+						if sample >= 20 {
+							println!(
+								"packetizer,{size},{fec},{encrypted},{sample},{ns},{},{},{},{},{},{},{}",
+								batch.as_bytes().len(),
+								batch.fec_blocks(),
+								hex::encode(Sha256::digest(batch.as_bytes())),
+								counts[0],
+								counts[1],
+								counts[2],
+								counts[3]
+							);
+						}
+					}
+				}
+			}
 		}
 	}
 
@@ -1071,5 +1197,52 @@ mod tests {
 		assert_eq!(after.blocks, 4);
 		assert!(after.fec_percentage > 0);
 		assert!(after.fec_percentage <= 20);
+	}
+}
+
+#[cfg(test)]
+mod measurement_allocator {
+	use std::alloc::{GlobalAlloc, Layout, System};
+	use std::cell::Cell;
+	thread_local! {
+		static COUNTS: Cell<[usize; 4]> = const { Cell::new([0; 4]) };
+	}
+	pub struct MeasuredAllocator;
+	fn record(index: usize, bytes: usize) {
+		COUNTS.with(|counts| {
+			let mut c = counts.get();
+			c[index] += bytes;
+			counts.set(c);
+		});
+	}
+	// Delegates unchanged to System; thread-local counters require no allocation.
+	unsafe impl GlobalAlloc for MeasuredAllocator {
+		unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+			record(0, 1);
+			record(1, layout.size());
+			unsafe { System.alloc(layout) }
+		}
+		unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+			record(0, 1);
+			record(1, layout.size());
+			unsafe { System.alloc_zeroed(layout) }
+		}
+		unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+			unsafe { System.dealloc(ptr, layout) }
+		}
+		unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, size: usize) -> *mut u8 {
+			record(0, 1);
+			record(1, size);
+			record(2, layout.size());
+			unsafe { System.realloc(ptr, layout, size) }
+		}
+	}
+	#[global_allocator]
+	static ALLOCATOR: MeasuredAllocator = MeasuredAllocator;
+	pub fn reset() {
+		COUNTS.with(|c| c.set([0; 4]));
+	}
+	pub fn counts() -> [usize; 4] {
+		COUNTS.with(Cell::get)
 	}
 }

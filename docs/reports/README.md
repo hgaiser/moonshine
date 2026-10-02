@@ -1,10 +1,12 @@
 # Historical architecture and validation reports
 
 These snapshots preserve reasoning, measurements and unperformed checks from
-September 30 / October 1, 2026 development. They are not current architecture
+September 30–October 2, 2026 development. They are not current architecture
 contracts or proof that a later checkout passed validation. Test counts, versions
 and local workspace paths describe the original runs.
 
+- [Transport remediation (2026-10-02)](TRANSPORT_REMEDIATION_2026-10-02.md):
+  packetizer allocation/copy evidence, completion admission, truthful UDP outcomes and hardware acceptance limits.
 - [Production-readiness review (2026-10-01)](PRODUCTION_READINESS_REVIEW_2026-10-01.md):
   revision-pinned findings, reproduced defects, implementation batches and release acceptance gates.
 - [Pacing cadence correction](PACING_CADENCE.md): composition timing and precise

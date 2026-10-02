@@ -1,3 +1,68 @@
+use std::sync::{
+	Arc,
+	atomic::{AtomicUsize, Ordering},
+};
+
+/// One encoder submission, held until transport release (or any earlier error).
+pub(crate) struct NetworkCredit(pub Arc<AtomicUsize>);
+impl Drop for NetworkCredit {
+	fn drop(&mut self) {
+		self.0.fetch_sub(1, Ordering::Relaxed);
+	}
+}
+
+use std::time::Instant;
+
+/// Output queue storage, including the batch currently borrowed by the sender.
+#[derive(Default)]
+pub(crate) struct QueueDepth {
+	frames: AtomicUsize,
+	bytes: AtomicUsize,
+	high_frames: AtomicUsize,
+	high_bytes: AtomicUsize,
+}
+
+struct QueueStorage {
+	depth: Arc<QueueDepth>,
+	bytes: usize,
+}
+impl Drop for QueueStorage {
+	fn drop(&mut self) {
+		self.depth.frames.fetch_sub(1, Ordering::Relaxed);
+		self.depth.bytes.fetch_sub(self.bytes, Ordering::Relaxed);
+	}
+}
+
+/// UDP kernel submission is not receiver delivery. Attempts count logical
+/// datagrams once, excluding readiness retries and GSO fallback duplication.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TransportOutcome {
+	pub attempted_datagrams: usize,
+	pub attempted_payload_bytes: usize,
+	pub submitted_datagrams: usize,
+	pub submitted_payload_bytes: usize,
+	pub failed_datagrams: usize,
+	pub last_error: Option<std::io::ErrorKind>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CompletionDisposition {
+	Submitted,
+	Failed,
+	Discarded,
+	Cancelled,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TransportCompletion {
+	pub finished_at: Instant,
+	pub send_started_at: Option<Instant>,
+	pub outcome: TransportOutcome,
+	pub disposition: CompletionDisposition,
+	pub discarded_datagrams: usize,
+	pub discarded_payload_bytes: usize,
+}
+
 /// A batch of equal-sized network shards stored in a single contiguous buffer.
 ///
 /// Replaces `Vec<Vec<u8>>` to avoid one heap allocation per shard
@@ -17,11 +82,18 @@ pub(crate) struct ShardBatch {
 	/// Capture timestamp used as the origin of frame-aware transport pacing.
 	pacing_origin: Option<std::time::Instant>,
 	/// Optional low-latency completion signal used by synchronous producers.
-	send_completion: Option<std::sync::mpsc::SyncSender<std::time::Instant>>,
+	send_started_at: Option<Instant>,
+	outcome: TransportOutcome,
+	disposition: CompletionDisposition,
+	release: Option<NetworkCredit>,
+	storage: Option<QueueStorage>,
+	observer: Option<Box<dyn FnOnce(TransportCompletion) + Send>>,
+	send_completion: Option<std::sync::mpsc::SyncSender<TransportCompletion>>,
 }
 
 impl ShardBatch {
 	/// Create an empty batch (no allocation).
+	#[cfg(test)]
 	pub fn empty() -> Self {
 		Self {
 			data: Vec::new(),
@@ -33,6 +105,12 @@ impl ShardBatch {
 			fec_blocks: 0,
 			pacing_origin: None,
 			send_completion: None,
+			send_started_at: None,
+			outcome: TransportOutcome::default(),
+			disposition: CompletionDisposition::Cancelled,
+			release: None,
+			storage: None,
+			observer: None,
 		}
 	}
 
@@ -94,26 +172,99 @@ impl ShardBatch {
 		self.fec_blocks = fec_blocks;
 	}
 
-	/// Append all shards from `other` into this batch.
-	///
-	/// Both batches must have the same shard_size (or `self` must be empty).
-	pub fn extend_from(&mut self, other: &ShardBatch) {
-		debug_assert!(self.shard_size == 0 || self.shard_size == other.shard_size);
-		if self.shard_size == 0 {
-			self.shard_size = other.shard_size;
-		}
-		self.data.extend_from_slice(&other.data);
-	}
-
-	pub fn set_send_completion(&mut self, completion: std::sync::mpsc::SyncSender<std::time::Instant>) {
+	pub fn set_send_completion(&mut self, completion: std::sync::mpsc::SyncSender<TransportCompletion>) {
 		debug_assert!(self.send_completion.is_none());
 		self.send_completion = Some(completion);
 	}
 
-	pub fn notify_sent(&mut self) {
-		if let Some(completion) = self.send_completion.take() {
-			let _ = completion.send(std::time::Instant::now());
+	pub fn track_queue(&mut self, depth: Arc<QueueDepth>) {
+		let bytes = self.data.len();
+		let frames = depth.frames.fetch_add(1, Ordering::Relaxed) + 1;
+		let total = depth.bytes.fetch_add(bytes, Ordering::Relaxed) + bytes;
+		depth.high_frames.fetch_max(frames, Ordering::Relaxed);
+		depth.high_bytes.fetch_max(total, Ordering::Relaxed);
+		self.storage = Some(QueueStorage { depth, bytes });
+	}
+
+	pub fn hold_until_release(&mut self, credit: NetworkCredit) {
+		self.release = Some(credit);
+	}
+
+	pub fn observe_completion(&mut self, observer: impl FnOnce(TransportCompletion) + Send + 'static) {
+		self.observer = Some(Box::new(observer));
+	}
+
+	pub fn mark_send_started(&mut self) {
+		self.send_started_at = Some(Instant::now());
+	}
+
+	pub fn transport_parts(&mut self) -> (&[u8], &mut TransportOutcome) {
+		(&self.data, &mut self.outcome)
+	}
+
+	pub fn finish(&mut self, disposition: CompletionDisposition) -> TransportCompletion {
+		self.disposition = disposition;
+		if let Some(storage) = &self.storage {
+			tracing::trace!(
+				queue_frames = storage.depth.frames.load(Ordering::Relaxed),
+				queue_bytes = storage.depth.bytes.load(Ordering::Relaxed),
+				queue_high_frames = storage.depth.high_frames.load(Ordering::Relaxed),
+				queue_high_bytes = storage.depth.high_bytes.load(Ordering::Relaxed),
+				"Video queue storage"
+			);
 		}
+		if self.send_completion.is_some() || self.observer.is_some() || self.release.is_some() {
+			tracing::trace!(
+				frame_number = self.frame_number,
+				?disposition,
+				attempted_datagrams = self.outcome.attempted_datagrams,
+				attempted_payload_bytes = self.outcome.attempted_payload_bytes,
+				submitted_datagrams = self.outcome.submitted_datagrams,
+				submitted_payload_bytes = self.outcome.submitted_payload_bytes,
+				failed_datagrams = self.outcome.failed_datagrams,
+				discarded_datagrams = self
+					.shard_count()
+					.saturating_sub(self.outcome.submitted_datagrams + self.outcome.failed_datagrams),
+				resource_release = true,
+				"Video batch completion"
+			);
+		}
+		let completion = TransportCompletion {
+			finished_at: Instant::now(),
+			send_started_at: self.send_started_at,
+			outcome: self.outcome,
+			disposition,
+			discarded_datagrams: self
+				.shard_count()
+				.saturating_sub(self.outcome.submitted_datagrams + self.outcome.failed_datagrams),
+			discarded_payload_bytes: self
+				.data
+				.len()
+				.saturating_sub(self.outcome.submitted_payload_bytes + self.outcome.failed_datagrams * self.shard_size),
+		};
+		self.storage.take();
+		self.release.take();
+		if let Some(signal) = self.send_completion.take() {
+			let _ = signal.try_send(completion);
+		}
+		if let Some(observer) = self.observer.take() {
+			observer(completion);
+		}
+		completion
+	}
+
+	pub fn notify_sent(&mut self) {
+		self.finish(if self.outcome.failed_datagrams == 0 {
+			CompletionDisposition::Submitted
+		} else {
+			CompletionDisposition::Failed
+		});
+	}
+}
+
+impl Drop for ShardBatch {
+	fn drop(&mut self) {
+		self.finish(self.disposition);
 	}
 }
 
@@ -129,6 +280,7 @@ impl ShardBatch {
 /// headers) and is **not** included in FEC encoding.
 pub(crate) struct ShardBuf {
 	data: Vec<u8>,
+	block_start: usize,
 	/// Total bytes per shard slot (prefix_size + data_size).
 	stride: usize,
 	/// Bytes reserved before each shard for per-shard metadata.
@@ -145,6 +297,7 @@ impl ShardBuf {
 		let stride = prefix_size + data_size;
 		Self {
 			data: vec![0u8; shard_count * stride],
+			block_start: 0,
 			stride,
 			prefix_size,
 			data_size,
@@ -152,16 +305,25 @@ impl ShardBuf {
 		}
 	}
 
+	/// Select one FEC block within the owned frame allocation. No bytes move.
+	pub fn select_block(&mut self, start: usize, count: usize) {
+		assert!((start + count) * self.stride <= self.data.len());
+		self.block_start = start;
+		self.shard_count = count;
+	}
+
 	/// Returns a mutable reference to the data portion of the shard at the
 	/// given index (excludes prefix).
 	pub fn shard_mut(&mut self, index: usize) -> &mut [u8] {
-		let start = index * self.stride + self.prefix_size;
+		debug_assert!(index < self.shard_count);
+		let start = (self.block_start + index) * self.stride + self.prefix_size;
 		&mut self.data[start..start + self.data_size]
 	}
 
 	/// Returns a mutable reference to the prefix portion of the shard.
 	pub fn prefix_mut(&mut self, index: usize) -> &mut [u8] {
-		let start = index * self.stride;
+		debug_assert!(index < self.shard_count);
+		let start = (self.block_start + index) * self.stride;
 		&mut self.data[start..start + self.prefix_size]
 	}
 
@@ -179,7 +341,9 @@ impl ShardBuf {
 		let data_size = self.data_size;
 		(0..self.shard_count)
 			.map(|i| {
-				let slice = unsafe { std::slice::from_raw_parts_mut(ptr.add(i * stride + prefix_size), data_size) };
+				let slice = unsafe {
+					std::slice::from_raw_parts_mut(ptr.add((self.block_start + i) * stride + prefix_size), data_size)
+				};
 				ShardSlice(slice)
 			})
 			.collect()
@@ -200,6 +364,12 @@ impl ShardBuf {
 			fec_blocks: 0,
 			pacing_origin: None,
 			send_completion: None,
+			send_started_at: None,
+			outcome: TransportOutcome::default(),
+			disposition: CompletionDisposition::Cancelled,
+			release: None,
+			storage: None,
+			observer: None,
 		}
 	}
 }
@@ -225,6 +395,46 @@ impl AsMut<[u8]> for ShardSlice<'_> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn release_is_once_even_when_notifications_cannot_be_delivered() {
+		for disposition in [
+			CompletionDisposition::Submitted,
+			CompletionDisposition::Failed,
+			CompletionDisposition::Discarded,
+			CompletionDisposition::Cancelled,
+		] {
+			let counter = Arc::new(AtomicUsize::new(1));
+			let queue = Arc::new(QueueDepth::default());
+			let mut batch = ShardBuf::new(2, 64, 0).into_batch();
+			batch.hold_until_release(NetworkCredit(counter.clone()));
+			batch.track_queue(queue.clone());
+			let (tx, rx) = std::sync::mpsc::sync_channel(0);
+			batch.set_send_completion(tx);
+			drop(rx); // completion must release resources without a waiting receiver.
+			batch.finish(disposition);
+			assert_eq!(counter.load(Ordering::Relaxed), 0);
+			assert_eq!(queue.bytes.load(Ordering::Relaxed), 0);
+			assert_eq!(queue.high_bytes.load(Ordering::Relaxed), 128);
+			drop(batch);
+			assert_eq!(counter.load(Ordering::Relaxed), 0);
+		}
+	}
+
+	#[test]
+	fn block_views_share_one_zeroed_frame_allocation() {
+		let mut buffer = ShardBuf::new(7, 16, 4);
+		let ptr = buffer.data.as_ptr();
+		buffer.select_block(0, 3);
+		buffer.shard_mut(1).fill(0xaa);
+		buffer.select_block(3, 4);
+		assert!(buffer.shard_mut(0).iter().all(|b| *b == 0));
+		buffer.shard_mut(0).fill(0xbb);
+		let batch = buffer.into_batch();
+		assert_eq!(batch.as_bytes().as_ptr(), ptr);
+		assert_eq!(batch.shard_count(), 7);
+		assert!(batch.as_bytes().chunks_exact(20).all(|s| s[..4] == [0; 4]));
+	}
 
 	#[test]
 	fn send_completion_is_signalled_once() {

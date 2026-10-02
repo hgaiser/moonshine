@@ -152,18 +152,23 @@ pub struct FrameStats {
 	pub encode_wait: std::time::Duration,
 	/// Time spent packetizing the encoded data.
 	pub packetize: std::time::Duration,
-	/// Time from packetization through packet-channel handoff. PyroWave waits
-	/// through the final UDP socket submission; conventional codecs currently
-	/// stop this measurement when the packet channel accepts the batch.
+	/// Queue handoff/residence measured separately from actual socket work.
+	pub enqueue: std::time::Duration,
+	/// Actual socket work through final submission or failure.
 	pub send: std::time::Duration,
 	/// Total end-to-end latency for this frame.
 	pub total: std::time::Duration,
 	/// Number of bytes encoded for this frame.
 	pub encoded_bytes: usize,
-	/// Approximate transmitted bytes including FEC, packet headers, and encryption prefix.
+	/// Successfully submitted UDP payload bytes including FEC and encryption;
+	/// kernel acceptance does not confirm receiver delivery.
 	pub wire_bytes: usize,
-	/// Number of UDP video shards emitted for this frame.
+	/// Number of UDP video shards successfully submitted to the kernel.
 	pub packet_count: usize,
+	/// Logical UDP attempts; readiness retries/fallback duplication are excluded.
+	pub attempted_packet_count: usize,
+	pub failed_packet_count: usize,
+	pub discarded_packet_count: usize,
 	/// Stale compositor frames discarded before this frame was encoded.
 	pub stale_frames_dropped: u32,
 	/// Whether this frame is a key (IDR) frame.
@@ -318,6 +323,7 @@ pub(crate) struct VideoStreamHandle {
 	reset_tx: std::sync::mpsc::Sender<tokio::sync::oneshot::Sender<Result<(), ()>>>,
 	fec_feedback_tx: watch::Sender<FrameFecStatus>,
 	packet_tx: mpsc::Sender<VideoPacketMessage>,
+	pause_tx: watch::Sender<u64>,
 	reconfigure_tx: std::sync::mpsc::Sender<VideoReconfigureCommand>,
 }
 
@@ -374,6 +380,9 @@ impl VideoStreamHandle {
 
 	/// Stop delivering packets until the encoder activates the next client epoch.
 	pub async fn pause_for_reconfigure(&self) -> Result<(), ()> {
+		// Interrupt socket waits before ordering the pause barrier behind old work.
+		self.pause_tx
+			.send_modify(|generation| *generation = generation.wrapping_add(1));
 		let (ready, waiting) = tokio::sync::oneshot::channel();
 		self.packet_tx
 			.send(VideoPacketMessage::Pause(ready))
@@ -431,6 +440,7 @@ impl VideoStreamHandle {
 		let (idr_tx, idr_rx) = broadcast::channel(16);
 		let (packet_tx, packet_rx) = mpsc::channel(16);
 		let handle = Self {
+			pause_tx: watch::channel(0u64).0,
 			start: StartLatch::new(),
 			idr_tx,
 			invalidate_tx: broadcast::channel(16).0,
@@ -515,6 +525,7 @@ impl VideoStream {
 
 		// Packet channel.
 		let (packet_tx, packet_rx) = mpsc::channel::<VideoPacketMessage>(128);
+		let (pause_tx, pause_rx) = watch::channel(0u64);
 		if config.log_stats {
 			diagnostics::spawn_watchdog(stop.clone(), packet_tx.downgrade());
 		}
@@ -526,6 +537,7 @@ impl VideoStream {
 		let worker = WorkerGuard::register(&stop, SessionShutdownReason::VideoPacketHandlerStopped)?;
 		spawn_handle_video_packets(
 			packet_rx,
+			pause_rx,
 			socket,
 			authorization_rx,
 			start.waiter(),
@@ -563,6 +575,7 @@ impl VideoStream {
 			reset_tx,
 			fec_feedback_tx,
 			packet_tx,
+			pause_tx,
 			reconfigure_tx,
 		})
 	}
@@ -573,6 +586,7 @@ impl VideoStream {
 #[allow(clippy::too_many_arguments)]
 fn spawn_handle_video_packets(
 	packet_rx: mpsc::Receiver<VideoPacketMessage>,
+	mut pause_rx: watch::Receiver<u64>,
 	socket: UdpGsoSocket,
 	authorization: AuthorizationReceiver,
 	start: StartWaiter,
@@ -601,9 +615,17 @@ fn spawn_handle_video_packets(
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			tokio::select! {
+				Ok(()) = pause_rx.changed() => {
+					if !paused { client_address = None; }
+					paused = true;
+				},
 				message = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match message {
 						Ok(Some(VideoPacketMessage::Pause(ready))) => {
+							// The FIFO barrier can win before changed(). Consume
+							// its urgent notification before acknowledging; otherwise
+							// that old notification could pause the next BeginEpoch.
+							pause_rx.borrow_and_update();
 							if !paused {
 								client_address = None;
 							}
@@ -627,21 +649,31 @@ fn spawn_handle_video_packets(
 									continue;
 								}
 
+								batch.mark_send_started();
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
-								match stop_session_manager
-									.wrap_cancel(socket.send_batch(&batch, addr, pacing_bitrate))
-									.await
+								match tokio::select! {
+									biased;
+									Ok(()) = pause_rx.changed() => {
+										paused = true;
+										client_address = None;
+										let completion = batch.finish(shard_batch::CompletionDisposition::Discarded);
+										transport_window.record(&gso_socket::SendStats::released(completion), packet_rx.len());
+										continue;
+									},
+									result = stop_session_manager.wrap_cancel(socket.send_batch(&mut batch, addr, pacing_bitrate)) => result,
+								}
 								{
 									Ok(send_stats) => {
 										transport_window.record(&send_stats, packet_rx.len());
-										if send_stats.fallback_chunks > 0
+										if (send_stats.fallback_chunks > 0 || send_stats.outcome.failed_datagrams > 0)
 											&& last_send_warn
 												.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1))
 										{
 											tracing::warn!(
-												"GSO send failed for {} chunk(s), sent per-shard instead",
-												send_stats.fallback_chunks
+												last_error = ?send_stats.outcome.last_error,
+												"Video transport: {} fallback chunks, {} failed datagrams",
+												send_stats.fallback_chunks, send_stats.outcome.failed_datagrams
 											);
 											last_send_warn = Some(std::time::Instant::now());
 										}
@@ -684,10 +716,14 @@ fn spawn_handle_video_packets(
 											);
 										}
 									},
-									Err(_) => break,
+									Err(_) => {
+										let completion = batch.finish(shard_batch::CompletionDisposition::Cancelled);
+										transport_window.record(&gso_socket::SendStats::released(completion), packet_rx.len());
+										break;
+									},
 								}
 							}
-							batch.notify_sent();
+							if client_address.is_some() && !paused { batch.notify_sent(); } else { let completion = batch.finish(shard_batch::CompletionDisposition::Discarded); transport_window.record(&gso_socket::SendStats::released(completion), packet_rx.len()); }
 						},
 						Ok(None) => {
 							tracing::debug!("Video packet channel closed.");
@@ -728,6 +764,163 @@ mod tests {
 	use super::*;
 
 	#[tokio::test]
+	async fn pause_and_stop_interrupt_blocked_network_work_and_release_all_credits() {
+		use std::sync::{
+			Arc,
+			atomic::{AtomicUsize, Ordering},
+		};
+		use std::time::Duration;
+		for pause in [false, true] {
+			let mut socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+			socket.force_no_gso_for_test();
+			socket.faults.stall_after = Some(1);
+			let server = socket.local_addr().unwrap();
+			let stop = ShutdownManager::new();
+			let (mut handle, _probe) = VideoStreamHandle::for_test();
+			let (tx, rx) = mpsc::channel(16);
+			handle.packet_tx = tx.clone();
+			let (pause_tx, pause_rx) = watch::channel(0u64);
+			handle.pause_tx = pause_tx;
+			let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
+			spawn_handle_video_packets(
+				rx,
+				pause_rx,
+				socket,
+				authorization_rx,
+				handle.start.waiter(),
+				stop.clone(),
+				worker(&stop),
+				None,
+				120,
+				false,
+			);
+			handle.trigger();
+			let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+			client.send_to(b"PING", server).await.unwrap();
+			tokio::time::sleep(Duration::from_millis(10)).await;
+			let credits = Arc::new(AtomicUsize::new(3));
+			let mut completions = Vec::new();
+			for _ in 0..3 {
+				let mut batch = shard_batch::ShardBuf::new(3, 64, 0).into_batch();
+				batch.hold_until_release(shard_batch::NetworkCredit(credits.clone()));
+				let (sent, completed) = std::sync::mpsc::sync_channel(1);
+				batch.set_send_completion(sent);
+				completions.push(completed);
+				tx.send(VideoPacketMessage::Batch(batch)).await.unwrap();
+			}
+			// The first datagram was submitted; the second is permanently blocked.
+			tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut [0; 64]))
+				.await
+				.unwrap()
+				.unwrap();
+			assert_eq!(credits.load(Ordering::Relaxed), 3);
+			if pause {
+				tokio::time::timeout(Duration::from_secs(1), handle.pause_for_reconfigure())
+					.await
+					.unwrap()
+					.unwrap();
+				let (ready, waiting) = tokio::sync::oneshot::channel();
+				tx.send(VideoPacketMessage::BeginEpoch {
+					context: VideoStreamContext {
+						fps: 120,
+						bitrate: 750_000_000,
+						..Default::default()
+					},
+					ready,
+				})
+				.await
+				.unwrap();
+				waiting.await.unwrap();
+			} else {
+				stop.trigger_shutdown(SessionShutdownReason::VideoPacketHandlerStopped);
+			}
+			if pause {
+				stop.trigger_shutdown(SessionShutdownReason::VideoPacketHandlerStopped);
+			}
+			tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
+				.await
+				.unwrap();
+			assert_eq!(credits.load(Ordering::Relaxed), 0);
+			let completion = completions[0].try_recv().unwrap();
+			assert_eq!(completion.outcome.submitted_datagrams, 1);
+			assert_eq!(
+				completion.disposition,
+				if pause {
+					shard_batch::CompletionDisposition::Discarded
+				} else {
+					shard_batch::CompletionDisposition::Cancelled
+				}
+			);
+			for c in &completions[1..] {
+				assert_eq!(c.try_recv().unwrap().outcome.submitted_datagrams, 0);
+			}
+			assert!(
+				tokio::time::timeout(Duration::from_millis(20), client.recv_from(&mut [0; 64]))
+					.await
+					.is_err()
+			);
+		}
+	}
+
+	#[tokio::test(flavor = "current_thread")]
+	async fn queued_pause_notification_cannot_pause_the_following_epoch() {
+		use std::time::Duration;
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let server = socket.local_addr().unwrap();
+		let stop = ShutdownManager::new();
+		let start = StartLatch::new();
+		let (tx, rx) = mpsc::channel(16);
+		let (pause_tx, pause_rx) = watch::channel(0u64);
+		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
+		spawn_handle_video_packets(
+			rx,
+			pause_rx,
+			socket,
+			authorization_rx,
+			start.waiter(),
+			stop.clone(),
+			worker(&stop),
+			None,
+			60,
+			false,
+		);
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		start.open();
+		for _ in 0..32 {
+			// Queue both ordered barriers and the urgent notification before
+			// yielding. Either notification or FIFO reception may win the select.
+			let (paused, pause_ack) = tokio::sync::oneshot::channel();
+			let (ready, epoch_ack) = tokio::sync::oneshot::channel();
+			pause_tx.send_modify(|g| *g += 1);
+			tx.send(VideoPacketMessage::Pause(paused)).await.unwrap();
+			tx.send(VideoPacketMessage::BeginEpoch {
+				context: VideoStreamContext::default(),
+				ready,
+			})
+			.await
+			.unwrap();
+			pause_ack.await.unwrap();
+			epoch_ack.await.unwrap();
+			// Any unread urgent notification is now ready to run. It must not
+			// disable the newly acknowledged epoch.
+			tokio::time::sleep(Duration::from_millis(1)).await;
+			client.send_to(b"PING", server).await.unwrap();
+			tokio::time::sleep(Duration::from_millis(2)).await;
+			let mut fresh = shard_batch::ShardBuf::new(1, 64, 0);
+			fresh.shard_mut(0).fill(0x11);
+			tx.send(VideoPacketMessage::Batch(fresh.into_batch())).await.unwrap();
+			let mut buf = [0; 64];
+			let (len, _) = tokio::time::timeout(Duration::from_secs(1), client.recv_from(&mut buf))
+				.await
+				.unwrap()
+				.unwrap();
+			assert_eq!(&buf[..len], &[0x11; 64]);
+		}
+		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+		stop.wait_shutdown_complete().await;
+	}
+
+	#[tokio::test]
 	async fn reconnect_ping_cannot_deliver_old_batches_before_epoch_activation() {
 		use std::time::Duration;
 		use tokio::net::UdpSocket;
@@ -736,9 +929,11 @@ mod tests {
 		let stop = ShutdownManager::new();
 		let start = StartLatch::new();
 		let (tx, rx) = mpsc::channel(16);
+		let (pause_tx, pause_rx) = watch::channel(0u64);
 		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
 		spawn_handle_video_packets(
 			rx,
+			pause_rx,
 			socket,
 			authorization_rx,
 			start.waiter(),
@@ -752,6 +947,7 @@ mod tests {
 		let mut buf = [0u8; 64];
 		for codec in [VideoCodec::PyroWave, VideoCodec::Hevc, VideoCodec::PyroWave] {
 			let (ready, waiting) = tokio::sync::oneshot::channel();
+			pause_tx.send_modify(|g| *g += 1);
 			tx.send(VideoPacketMessage::Pause(ready)).await.unwrap();
 			waiting.await.unwrap();
 			let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -759,6 +955,7 @@ mod tests {
 			// Let the endpoint discovery arrive while negotiation is paused.
 			tokio::time::sleep(Duration::from_millis(10)).await;
 			let (ready, waiting) = tokio::sync::oneshot::channel();
+			pause_tx.send_modify(|g| *g += 1);
 			tx.send(VideoPacketMessage::Pause(ready)).await.unwrap();
 			waiting.await.unwrap(); // Duplicate disconnect/ANNOUNCE pauses retain the new PING.
 			let mut old = shard_batch::ShardBuf::new(1, 64, 0);
@@ -817,6 +1014,7 @@ mod tests {
 		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
 		spawn_handle_video_packets(
 			rx,
+			watch::channel(0u64).1,
 			socket,
 			authorization_rx,
 			start.waiter(),
@@ -963,6 +1161,7 @@ mod tests {
 		authorization_tx.send_modify(crate::session::authorization::StreamAuthorization::require_session_id);
 		spawn_handle_video_packets(
 			rx,
+			watch::channel(0u64).1,
 			socket,
 			authorization_rx,
 			start.waiter(),

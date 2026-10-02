@@ -52,8 +52,12 @@ use pixelforge::{
 /// valid — a dropped frame never enters the encoder's reference state, unlike
 /// discarding an already-encoded packet, which would break decoding until the
 /// next IDR. Sized just above pixelforge's encode pipeline depth (2) to keep the
-/// GPU fed plus one slot of slack, bounding added latency to ~3 frames.
+/// GPU fed plus one slot of slack, bounding useful work to three frames even under network stalls.
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
+
+fn conventional_can_admit(in_flight: &AtomicUsize) -> bool {
+	in_flight.load(Ordering::Relaxed) < MAX_FRAMES_IN_FLIGHT
+}
 
 /// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
 const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
@@ -218,7 +222,7 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 		frames = n,
 		fps = (n as f64 / elapsed_s).round() as u32,
 		bitrate_kbps = (bytes_total.saturating_mul(8) as f64 / elapsed_s / 1000.0).round() as u64,
-		wire_bitrate_kbps = (wire_bytes_total.saturating_mul(8) as f64 / elapsed_s / 1000.0).round() as u64,
+		packetized_bitrate_kbps = (wire_bytes_total.saturating_mul(8) as f64 / elapsed_s / 1000.0).round() as u64,
 		packets = packet_count,
 		keyframes,
 		total_p50_us = p50(&totals),
@@ -241,10 +245,10 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 		encode_wait_p95_us = p95(&encode_waits),
 		encode_wait_p99_us = p99(&encode_waits),
 		packetize_p50_us = p50(&packetizes),
-		send_p50_us = p50(&sends),
-		send_p95_us = p95(&sends),
-		send_p99_us = p99(&sends),
-		"Frame latency summary (μs)"
+		enqueue_p50_us = p50(&sends),
+		enqueue_p95_us = p95(&sends),
+		enqueue_p99_us = p99(&sends),
+		"Frame enqueue latency summary (μs)"
 	);
 }
 
@@ -279,23 +283,15 @@ enum ConsumerMessage {
 	/// A submitted frame's context together with the [`EncodeFuture`] that
 	/// resolves with its encoded packet. Awaiting the future yields the packet
 	/// for exactly this frame, so context and packet are paired by construction.
-	Frame(FrameContext, EncodeFuture),
+	Frame(FrameContext, EncodeFuture, InFlightGuard),
 	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
 	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
 	/// effect before any frame submitted after the reset.
 	ResetCounters(tokio::sync::oneshot::Sender<Result<(), ()>>),
 }
 
-/// Decrements the in-flight frame counter when dropped, on every exit path of a
-/// consumer-loop iteration (success or early `continue`). This is what tells the
-/// encoding thread a slot has freed up so it can stop dropping new captures.
-struct InFlightGuard(Arc<AtomicUsize>);
-
-impl Drop for InFlightGuard {
-	fn drop(&mut self) {
-		self.0.fetch_sub(1, Ordering::Relaxed);
-	}
-}
+/// An owned useful-work credit travels from submission through transport release.
+use super::shard_batch::NetworkCredit as InFlightGuard;
 
 /// Packet consumer thread: for each submitted frame, awaits its
 /// [`EncodeFuture`] to get the encoded packet, injects HDR SEI if needed,
@@ -307,7 +303,7 @@ impl Drop for InFlightGuard {
 /// the encoding thread's next loop iteration. Pairing is implicit — each message
 /// carries both the context and the future for the same frame.
 ///
-/// `in_flight` counts frames submitted but not yet finished here; each fully
+/// `in_flight` counts frames submitted through transport resource release; each fully
 /// processed (or dropped) frame decrements it via [`InFlightGuard`], which is the
 /// signal the encoding thread's drop-to-catch-up gate reads.
 #[allow(clippy::too_many_arguments)]
@@ -323,6 +319,7 @@ async fn run_packet_consumer(
 	mut fec_feedback_rx: watch::Receiver<FrameFecStatus>,
 ) -> Result<(), String> {
 	let mut failures = FailurePolicy::default();
+	let network_queue = Arc::new(super::shard_batch::QueueDepth::default());
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
 	let mut latency_samples: Vec<LatencySample> = if config.log_stats {
@@ -347,7 +344,7 @@ async fn run_packet_consumer(
 		if fec_feedback_rx.has_changed().unwrap_or(false) {
 			fec_controller.observe(*fec_feedback_rx.borrow_and_update());
 		}
-		let (frame_context, future) = match msg {
+		let (frame_context, future, credit) = match msg {
 			ConsumerMessage::ResetCounters(applied) => {
 				frame_number = 0;
 				sequence_number = 0;
@@ -371,12 +368,12 @@ async fn run_packet_consumer(
 				}
 				continue;
 			},
-			ConsumerMessage::Frame(frame_context, future) => (frame_context, future),
+			ConsumerMessage::Frame(frame_context, future, credit) => (frame_context, future, credit),
 		};
 
-		// This frame is in flight until the iteration ends; release its slot on
-		// every exit path (including the early `continue`s below).
-		let _in_flight = InFlightGuard(in_flight.clone());
+		// Keep the submission credit on early errors; successful packetization
+		// transfers it to the network batch.
+		let _in_flight = credit;
 
 		let t_wait_started = std::time::Instant::now();
 		let consumer_queue_dur = t_wait_started.saturating_duration_since(frame_context.submitted_at);
@@ -420,7 +417,7 @@ async fn run_packet_consumer(
 		let processing_latency = t_start.duration_since(frame_context.created_at);
 		let latency_100us = (processing_latency.as_micros() / 100).min(u16::MAX as u128) as u16;
 
-		let shards = match packetizer.packetize(
+		let mut shards = match packetizer.packetize(
 			&packet.data,
 			is_key_frame,
 			ctx.packet_size,
@@ -444,6 +441,7 @@ async fn run_packet_consumer(
 					"failed to packetize encoded frame",
 				);
 				apply_failure(&mut failures, &failure, None)?;
+				let _ = idr_tx.send(());
 				continue;
 			},
 		};
@@ -457,6 +455,50 @@ async fn run_packet_consumer(
 		// session is already tearing down. Stop the consumer; the encoding thread
 		// then sees its `frame_ctx_tx` fail and exits too, which drops the
 		// video-pipeline shutdown token and tears the session down.
+		// Transfer this credit to the sender. Packet queue occupancy cannot hide
+		// encoded work from capture admission, and cancellation/discard releases it.
+		shards.hold_until_release(_in_flight);
+		shards.track_queue(network_queue.clone());
+		let completion_stats = FrameStats {
+			channel_wait: frame_context.channel_wait,
+			import: frame_context.import,
+			convert: frame_context.convert,
+			submit: frame_context.submit,
+			consumer_queue: consumer_queue_dur,
+			encode_wait: encode_wait_dur,
+			packetize: t_packetized - t_start,
+			enqueue: std::time::Duration::ZERO,
+			send: std::time::Duration::ZERO,
+			total: std::time::Duration::ZERO,
+			encoded_bytes,
+			wire_bytes: 0,
+			packet_count: 0,
+			attempted_packet_count: 0,
+			failed_packet_count: 0,
+			discarded_packet_count: 0,
+			stale_frames_dropped: 0,
+			is_key_frame,
+		};
+		let completion_stats_tx = stats_tx.clone();
+		let completion_idr_tx = idr_tx.clone();
+		shards.observe_completion(move |completion| {
+			let mut stats = completion_stats;
+			let started = completion.send_started_at.unwrap_or(completion.finished_at);
+			stats.enqueue = started.saturating_duration_since(t_packetized);
+			stats.send = completion.finished_at.saturating_duration_since(started);
+			stats.total = completion
+				.finished_at
+				.saturating_duration_since(frame_context.created_at);
+			stats.wire_bytes = completion.outcome.submitted_payload_bytes;
+			stats.packet_count = completion.outcome.submitted_datagrams;
+			stats.attempted_packet_count = completion.outcome.attempted_datagrams;
+			stats.failed_packet_count = completion.outcome.failed_datagrams;
+			stats.discarded_packet_count = packet_count.saturating_sub(stats.packet_count + stats.failed_packet_count);
+			if completion.disposition == super::shard_batch::CompletionDisposition::Failed {
+				let _ = completion_idr_tx.send(());
+			}
+			let _ = completion_stats_tx.send(stats);
+		});
 		if packet_tx.send(VideoPacketMessage::Batch(shards)).await.is_err() {
 			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
 			break;
@@ -479,7 +521,7 @@ async fn run_packet_consumer(
 				consumer_queue_us = consumer_queue_dur.as_micros() as u64,
 				encode_wait_us = encode_wait_dur.as_micros() as u64,
 				packetize_us = packetize_dur.as_micros() as u64,
-				send_us = send_dur.as_micros() as u64,
+				enqueue_us = send_dur.as_micros() as u64,
 				encoded_bytes,
 				is_key_frame,
 				buffer_index = frame_context.buffer_index,
@@ -514,11 +556,15 @@ async fn run_packet_consumer(
 			consumer_queue: consumer_queue_dur,
 			encode_wait: encode_wait_dur,
 			packetize: packetize_dur,
+			enqueue: send_dur,
 			send: send_dur,
 			total,
 			encoded_bytes,
 			wire_bytes,
 			packet_count,
+			attempted_packet_count: 0,
+			failed_packet_count: 0,
+			discarded_packet_count: 0,
 			stale_frames_dropped: 0,
 			is_key_frame,
 		};
@@ -528,7 +574,6 @@ async fn run_packet_consumer(
 			packet_tx.max_capacity() - packet_tx.capacity(),
 			None,
 		);
-		let _ = stats_tx.send(stats);
 
 		// Periodic summary every 5 seconds.
 		if config.log_stats
@@ -1015,7 +1060,7 @@ impl VideoPipelineInner {
 			// waiting and encoding consume this frame's pacing window instead of being added
 			// on top of it, preserving the negotiated frame cadence.
 			shards.set_pacing_origin(pacing_origin);
-			let wire_bytes = shards.as_bytes().len();
+
 			let packet_count = shards.shard_count();
 			let packetized = std::time::Instant::now();
 			let (completion_tx, completion_rx) = std::sync::mpsc::sync_channel(1);
@@ -1030,7 +1075,7 @@ impl VideoPipelineInner {
 			let queued = std::time::Instant::now();
 			let sent = loop {
 				match completion_rx.recv_timeout(frame_interval) {
-					Ok(sent) => break sent,
+					Ok(completion) => break completion,
 					Err(std::sync::mpsc::RecvTimeoutError::Timeout)
 						if !stop_session_manager.is_shutdown_triggered() => {},
 					Err(std::sync::mpsc::RecvTimeoutError::Timeout) => return Ok(None),
@@ -1050,11 +1095,21 @@ impl VideoPipelineInner {
 				consumer_queue: std::time::Duration::ZERO,
 				encode_wait: encoded.encode_wait,
 				packetize: packetized.duration_since(before_packetize),
-				send: sent.duration_since(packetized),
-				total: sent.duration_since(created_at),
+				enqueue: sent
+					.send_started_at
+					.unwrap_or(sent.finished_at)
+					.saturating_duration_since(packetized),
+				send: sent
+					.finished_at
+					.saturating_duration_since(sent.send_started_at.unwrap_or(queued)),
+				total: sent.finished_at.duration_since(created_at),
 				encoded_bytes: encoded.data_size,
-				wire_bytes,
-				packet_count,
+				wire_bytes: sent.outcome.submitted_payload_bytes,
+				packet_count: sent.outcome.submitted_datagrams,
+				attempted_packet_count: sent.outcome.attempted_datagrams,
+				failed_packet_count: sent.outcome.failed_datagrams,
+				discarded_packet_count: packet_count
+					.saturating_sub(sent.outcome.submitted_datagrams + sent.outcome.failed_datagrams),
 				stale_frames_dropped,
 				is_key_frame: true,
 			};
@@ -1079,9 +1134,9 @@ impl VideoPipelineInner {
 				encoded_bytes = stats.encoded_bytes,
 				encode_wait_us = duration_micros_u64(stats.encode_wait),
 				packet_channel_wait_us = duration_micros_u64(queued.duration_since(packetized)),
-				socket_send_us = duration_micros_u64(sent.duration_since(queued)),
+				socket_send_us = duration_micros_u64(sent.finished_at.saturating_duration_since(queued)),
 				total_us = duration_micros_u64(stats.total),
-				"Sent PyroWave frame"
+				"PyroWave frame transport completed"
 			);
 			diagnostics.record(
 				&stats,
@@ -1143,7 +1198,7 @@ impl VideoPipelineInner {
 		// packetizes/sends — so packets go out as soon as the GPU finishes,
 		// independent of this loop's cadence.
 		//
-		// `in_flight` counts frames submitted but not yet finished by the consumer.
+		// `in_flight` counts frames through network completion/discard.
 		// The encoding thread reads it to decide when to drop new captures (see
 		// `MAX_FRAMES_IN_FLIGHT`); the consumer decrements it per frame. The channel
 		// is sized just above that gate so it never actually blocks the producer —
@@ -1306,16 +1361,14 @@ impl VideoPipelineInner {
 			}
 
 			// Try to receive a frame from compositor (with timeout).
-			let received_frame = match frame_rx
-				.recv_timeout_if(frame_interval, in_flight.load(Ordering::Relaxed) < MAX_FRAMES_IN_FLIGHT)
-			{
+			let received_frame = match frame_rx.recv_timeout_if(frame_interval, conventional_can_admit(&in_flight)) {
 				Ok(frame) => Some(frame),
 				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
 					// If we have a pending IDR request and have encoded before,
 					// re-encode the encoder's input image (still contains
 					// the last frame's data after color conversion).
-					if pending_idr && has_encoded {
+					if pending_idr && has_encoded && conventional_can_admit(&in_flight) {
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
@@ -1337,7 +1390,11 @@ impl VideoPipelineInner {
 								// Count this frame in flight; the consumer decrements when done.
 								in_flight.fetch_add(1, Ordering::Relaxed);
 								submitted_count += 1;
-								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
+								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(
+									frame_context,
+									future,
+									InFlightGuard(in_flight.clone()),
+								));
 							},
 							Err(e) => {
 								// The IDR stays pending and is retried on the next frame.
@@ -1362,9 +1419,9 @@ impl VideoPipelineInner {
 				// far behind, skip this capture *before* encoding it so the stream
 				// stays realtime instead of accumulating latency. Dropping pre-encode
 				// keeps the encoded P-frame chain valid (a skipped frame never enters
-				// the encoder's reference state). The IDR re-encode path is never
-				// gated — the client needs that keyframe.
-				if in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT {
+				// the encoder's reference state). IDR replay also waits for a
+				// credit so recovery cannot create an unbounded hidden queue.
+				if !conventional_can_admit(&in_flight) {
 					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
 						tracing::warn!(
 							encoder_in_flight = in_flight.load(Ordering::Relaxed),
@@ -1659,7 +1716,11 @@ impl VideoPipelineInner {
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
 						if frame_ctx_tx
-							.blocking_send(ConsumerMessage::Frame(frame_context, future))
+							.blocking_send(ConsumerMessage::Frame(
+								frame_context,
+								future,
+								InFlightGuard(in_flight.clone()),
+							))
 							.is_err()
 						{
 							tracing::debug!("Packet consumer gone; stopping encoding loop.");
@@ -1807,6 +1868,32 @@ mod tests {
 	const XBGR2101010: u32 = 0x30334258; // "XB30"
 	const ABGR16161616F: u32 = 0x48344241; // "AB4H"
 	const XBGR16161616F: u32 = 0x48344258; // "XB4H"
+
+	#[tokio::test]
+	async fn conventional_credit_bound_includes_a_delayed_network_queue() {
+		use super::*;
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		let (tx, mut rx) = mpsc::channel(128);
+		for _ in 0..MAX_FRAMES_IN_FLIGHT {
+			assert!(conventional_can_admit(&in_flight));
+			in_flight.fetch_add(1, Ordering::Relaxed);
+			let mut batch = super::super::shard_batch::ShardBuf::new(1, 64, 0).into_batch();
+			batch.hold_until_release(InFlightGuard(in_flight.clone()));
+			tx.send(batch).await.unwrap();
+		}
+		assert!(!conventional_can_admit(&in_flight));
+		let mut sending = rx.recv().await.unwrap();
+		for _ in 0..10 {
+			tokio::task::yield_now().await;
+			assert!(!conventional_can_admit(&in_flight));
+		}
+		// Handoff/dequeue did not free a credit. Success and all discard/failure
+		// paths do, so another capture can be admitted without dropping references.
+		sending.notify_sent();
+		assert!(conventional_can_admit(&in_flight));
+		drop(rx);
+		assert_eq!(in_flight.load(Ordering::Relaxed), 0);
+	}
 
 	#[test]
 	fn drm_fourcc_abgr_xbgr_8bit_maps_to_rgba() {

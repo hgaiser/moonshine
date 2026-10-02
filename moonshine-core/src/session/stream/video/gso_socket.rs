@@ -6,7 +6,7 @@ use tokio::io::Interest;
 use tokio::net::UdpSocket;
 
 use super::pacing_timer::PacingTimer;
-use super::shard_batch::ShardBatch;
+use super::shard_batch::{ShardBatch, TransportCompletion, TransportOutcome};
 
 /// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
 pub(super) const MAX_UDP_PAYLOAD: usize = 65507;
@@ -118,6 +118,29 @@ fn pacing_schedule(
 	}
 }
 
+/// Rebase after observed readiness waits or a chunk overrun that consumed the
+/// next slot. Ordinary healthy send cost does not extend every pacing interval.
+fn rebase_after_chunk(
+	origin: Instant,
+	duration: Duration,
+	preceding: u64,
+	chunk_wire: u64,
+	total: u64,
+	completed: Instant,
+	waited: bool,
+) -> Option<Instant> {
+	if duration.is_zero() {
+		return None;
+	}
+	let offset = scaled_duration(duration, preceding, total);
+	let next = origin + scaled_duration(duration, preceding.saturating_add(chunk_wire), total);
+	if waited || completed >= next {
+		Some(completed.checked_sub(offset).unwrap_or(completed))
+	} else {
+		None
+	}
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct SendStats {
 	pub gso_sends: u32,
@@ -127,7 +150,12 @@ pub(crate) struct SendStats {
 	pub gso_segments_per_send: usize,
 	pub final_chunk_segments: usize,
 	pub final_chunk_bytes: usize,
+	/// Successfully submitted IP/UDP bytes, not confirmed receiver delivery.
 	pub wire_bytes: u64,
+	pub planned_wire_bytes: u64,
+	pub outcome: TransportOutcome,
+	pub discarded_datagrams: usize,
+	pub discarded_payload_bytes: usize,
 	pub elapsed: Duration,
 	pub pacing_duration: Duration,
 	pub scheduled_pacing_duration: Duration,
@@ -137,6 +165,30 @@ pub(crate) struct SendStats {
 	pub backpressure_rebases: u32,
 }
 
+impl SendStats {
+	pub fn released(completion: TransportCompletion) -> Self {
+		Self {
+			outcome: completion.outcome,
+			discarded_datagrams: completion.discarded_datagrams,
+			discarded_payload_bytes: completion.discarded_payload_bytes,
+			elapsed: completion
+				.send_started_at
+				.map(|start| completion.finished_at.saturating_duration_since(start))
+				.unwrap_or_default(),
+			..Self::default()
+		}
+	}
+}
+
+#[cfg(test)]
+#[derive(Default)]
+pub(super) struct SendFaults {
+	pub reject_gso: bool,
+	pub fail_after: Option<usize>,
+	pub stall_after: Option<usize>,
+	pub stall_duration: Option<Duration>,
+}
+
 /// UDP socket for video with GSO and frame-aware super-packet pacing.
 ///
 /// A complete intra frame arrives here at once. Submitting all GSO packets
@@ -144,6 +196,10 @@ pub(crate) struct SendStats {
 /// but its chunk boundaries are paced from encoded bytes, negotiated bitrate,
 /// and actual per-frame wire bytes.
 pub(crate) struct UdpGsoSocket {
+	#[cfg(test)]
+	pub(super) faults: SendFaults,
+	#[cfg(test)]
+	chunk_starts: Vec<Instant>,
 	socket: UdpSocket,
 	udp_state: UdpSocketState,
 	disable_gso: bool,
@@ -168,12 +224,21 @@ impl UdpGsoSocket {
 			tracing::debug!("GSO not available, using per-shard sends");
 		}
 		Ok(Self {
+			#[cfg(test)]
+			faults: SendFaults::default(),
+			#[cfg(test)]
+			chunk_starts: Vec::new(),
 			socket,
 			udp_state,
 			disable_gso,
 			pacing_timer: None,
 			pacing_timer_initialized: false,
 		})
+	}
+
+	#[cfg(test)]
+	pub(super) fn force_no_gso_for_test(&mut self) {
+		self.disable_gso = true;
 	}
 
 	pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
@@ -190,12 +255,18 @@ impl UdpGsoSocket {
 
 	/// `bitrate_bps` is set for the intra-only PyroWave path. Conventional
 	/// inter-frame codecs retain their established immediate-send behavior.
-	pub async fn send_batch(&mut self, batch: &ShardBatch, addr: SocketAddr, bitrate_bps: Option<u64>) -> SendStats {
+	pub async fn send_batch(
+		&mut self,
+		batch: &mut ShardBatch,
+		addr: SocketAddr,
+		bitrate_bps: Option<u64>,
+	) -> SendStats {
 		let started = Instant::now();
+		*batch.transport_parts().1 = TransportOutcome::default();
 		let shard_size = batch.shard_size();
 		let shard_count = batch.shard_count();
 		let mut stats = SendStats {
-			wire_bytes: wire_bytes(batch.as_bytes().len(), shard_count, addr),
+			planned_wire_bytes: wire_bytes(batch.as_bytes().len(), shard_count, addr),
 			..Default::default()
 		};
 		if shard_size == 0 || shard_count == 0 {
@@ -235,10 +306,15 @@ impl UdpGsoSocket {
 		let header_size = network_header_size(addr) as u64;
 		let mut preceding_wire_bytes = 0u64;
 
-		for chunk in batch.as_bytes().chunks(chunk_bytes) {
+		let (bytes, outcome) = batch.transport_parts();
+		for chunk in bytes.chunks(chunk_bytes) {
 			if !scheduled_pacing_duration.is_zero() {
-				let deadline =
-					pacing_origin + scaled_duration(scheduled_pacing_duration, preceding_wire_bytes, stats.wire_bytes);
+				let deadline = pacing_origin
+					+ scaled_duration(
+						scheduled_pacing_duration,
+						preceding_wire_bytes,
+						stats.planned_wire_bytes,
+					);
 				let now = Instant::now();
 				if now < deadline {
 					if let Some(timer) = &mut self.pacing_timer {
@@ -262,11 +338,16 @@ impl UdpGsoSocket {
 					.max(Instant::now().saturating_duration_since(deadline));
 			}
 
+			#[cfg(test)]
+			self.chunk_starts.push(Instant::now());
 			let chunk_segments = chunk.len().div_ceil(shard_size);
 			stats.final_chunk_segments = chunk_segments;
 			stats.final_chunk_bytes = chunk.len();
+			let before_would_block = stats.would_block_events;
 			let mut chunk_would_block = false;
 			if gso_active {
+				outcome.attempted_datagrams += chunk_segments;
+				outcome.attempted_payload_bytes += chunk.len();
 				let transmit = Transmit {
 					destination: addr,
 					ecn: None,
@@ -275,6 +356,10 @@ impl UdpGsoSocket {
 					src_ip: None,
 				};
 				let result = send_with_readiness(&self.socket, &mut stats.would_block_events, || {
+					#[cfg(test)]
+					if self.faults.reject_gso {
+						return Err(std::io::ErrorKind::InvalidInput.into());
+					}
 					let result = self.udp_state.try_send(UdpSockRef::from(&self.socket), &transmit);
 					chunk_would_block |= matches!(&result, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock);
 					result
@@ -283,17 +368,21 @@ impl UdpGsoSocket {
 				if let Err(e) = result {
 					gso_active = false;
 					stats.fallback_chunks = stats.fallback_chunks.saturating_add(1);
-					tracing::debug!("GSO send failed ({e}), falling back to per-shard sends for this chunk");
-					stats.per_shard_sends = stats
-						.per_shard_sends
-						.saturating_add(self.send_shards(chunk, shard_size, addr).await);
+					outcome.last_error = Some(e.kind());
+					stats.per_shard_sends = stats.per_shard_sends.saturating_add(
+						self.send_shards(chunk, shard_size, addr, &mut stats.would_block_events, outcome, true)
+							.await,
+					);
 				} else {
 					stats.gso_sends = stats.gso_sends.saturating_add(1);
+					outcome.submitted_datagrams += chunk_segments;
+					outcome.submitted_payload_bytes += chunk.len();
 				}
 			} else {
-				stats.per_shard_sends = stats
-					.per_shard_sends
-					.saturating_add(self.send_shards(chunk, shard_size, addr).await);
+				stats.per_shard_sends = stats.per_shard_sends.saturating_add(
+					self.send_shards(chunk, shard_size, addr, &mut stats.would_block_events, outcome, false)
+						.await,
+				);
 			}
 
 			let chunk_wire_bytes = u64::try_from(chunk.len()).unwrap_or(u64::MAX).saturating_add(
@@ -304,28 +393,79 @@ impl UdpGsoSocket {
 			// Socket backpressure may consume multiple scheduled chunk slots. Move
 			// the remaining schedule forward from the completed chunk instead of
 			// releasing every now-overdue GSO send as a catch-up microburst.
-			if chunk_would_block && !scheduled_pacing_duration.is_zero() {
-				let completed_chunk_deadline_offset =
-					scaled_duration(scheduled_pacing_duration, preceding_wire_bytes, stats.wire_bytes);
-				let now = Instant::now();
-				pacing_origin = now.checked_sub(completed_chunk_deadline_offset).unwrap_or(now);
+			if let Some(rebased) = rebase_after_chunk(
+				pacing_origin,
+				scheduled_pacing_duration,
+				preceding_wire_bytes,
+				chunk_wire_bytes,
+				stats.planned_wire_bytes,
+				Instant::now(),
+				chunk_would_block || stats.would_block_events > before_would_block,
+			) {
+				pacing_origin = rebased;
 				stats.backpressure_rebases = stats.backpressure_rebases.saturating_add(1);
 			}
 			preceding_wire_bytes = preceding_wire_bytes.saturating_add(chunk_wire_bytes);
 		}
+		stats.outcome = *outcome;
+		stats.wire_bytes = wire_bytes(outcome.submitted_payload_bytes, outcome.submitted_datagrams, addr);
 		stats.elapsed = started.elapsed();
 		stats
 	}
 
-	async fn send_shards(&self, bytes: &[u8], shard_size: usize, addr: SocketAddr) -> u32 {
+	async fn send_shards(
+		&self,
+		bytes: &[u8],
+		shard_size: usize,
+		addr: SocketAddr,
+		would_block: &mut u32,
+		outcome: &mut TransportOutcome,
+		already_attempted: bool,
+	) -> u32 {
 		if shard_size == 0 {
 			return 0;
 		}
-		let mut sent = 0u32;
+		let mut sent = 0;
 		for shard in bytes.chunks(shard_size) {
-			match self.socket.send_to(shard, addr).await {
-				Ok(_) => sent = sent.saturating_add(1),
-				Err(e) => tracing::warn!("Failed to send packet to client: {e}"),
+			if !already_attempted {
+				outcome.attempted_datagrams += 1;
+				outcome.attempted_payload_bytes += shard.len();
+			}
+			#[cfg(test)]
+			if self.faults.stall_after == Some(outcome.submitted_datagrams) {
+				*would_block += 1;
+				match self.faults.stall_duration {
+					Some(delay) => tokio::time::sleep(delay).await,
+					None => std::future::pending::<()>().await,
+				}
+			}
+			// Use the same readiness and stall observation as raw GSO sends.
+			let result = send_with_readiness(&self.socket, would_block, || {
+				#[cfg(test)]
+				if self.faults.fail_after.is_some_and(|n| outcome.submitted_datagrams >= n) {
+					return Err(std::io::ErrorKind::NetworkUnreachable.into());
+				}
+				socket2::SockRef::from(&self.socket)
+					.send_to(shard, &addr.into())
+					.and_then(|n| {
+						if n == shard.len() {
+							Ok(())
+						} else {
+							Err(std::io::ErrorKind::WriteZero.into())
+						}
+					})
+			})
+			.await;
+			match result {
+				Ok(()) => {
+					sent += 1;
+					outcome.submitted_datagrams += 1;
+					outcome.submitted_payload_bytes += shard.len();
+				},
+				Err(error) => {
+					outcome.last_error = Some(error.kind());
+					outcome.failed_datagrams += 1;
+				},
 			}
 		}
 		sent
@@ -344,6 +484,8 @@ mod tests {
 		let udp_state = UdpSocketState::new(UdpSockRef::from(&raw_socket)).unwrap();
 		(
 			UdpGsoSocket {
+				faults: SendFaults::default(),
+				chunk_starts: Vec::new(),
 				socket: raw_socket,
 				udp_state,
 				disable_gso,
@@ -359,6 +501,92 @@ mod tests {
 		let mut batch = ShardBuf::new(shards, shard_size, 0).into_batch();
 		batch.set_frame_metadata(1, encoded_size, shards, 0, 1);
 		batch
+	}
+
+	#[test]
+	fn chunk_overruns_and_readiness_waits_rebase_without_catch_up() {
+		let origin = Instant::now();
+		let duration = Duration::from_millis(30);
+		for waited in [false, true] {
+			for stall in [100, 500] {
+				let completed = origin + Duration::from_millis(stall);
+				let rebased = rebase_after_chunk(origin, duration, 100, 100, 300, completed, waited).unwrap();
+				let next = rebased + scaled_duration(duration, 200, 300);
+				assert_eq!(next.duration_since(completed), Duration::from_millis(10));
+			}
+		}
+		assert!(
+			rebase_after_chunk(
+				origin,
+				duration,
+				100,
+				100,
+				300,
+				origin + Duration::from_millis(11),
+				false
+			)
+			.is_none()
+		);
+	}
+
+	#[tokio::test]
+	async fn partial_and_permanent_failures_count_only_kernel_submissions() {
+		for after in [0, 3] {
+			let (mut socket, _receiver, destination) = loopback_socket(true).await;
+			socket.faults.fail_after = Some(after);
+			let mut batch = test_batch(7, 64, 448);
+			let stats = socket.send_batch(&mut batch, destination, None).await;
+			assert_eq!(stats.outcome.attempted_datagrams, 7);
+			assert_eq!(stats.outcome.attempted_payload_bytes, 448);
+			assert_eq!(stats.outcome.submitted_datagrams, after);
+			assert_eq!(stats.outcome.submitted_payload_bytes, after * 64);
+			assert_eq!(stats.outcome.failed_datagrams, 7 - after);
+			assert_eq!(stats.wire_bytes, (after * (64 + 28)) as u64);
+			let (tx, rx) = std::sync::mpsc::sync_channel(1);
+			batch.set_send_completion(tx);
+			batch.notify_sent();
+			assert_eq!(
+				rx.try_recv().unwrap().disposition,
+				super::super::shard_batch::CompletionDisposition::Failed
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn actual_fallback_submits_each_datagram_once() {
+		let (mut socket, receiver, destination) = loopback_socket(false).await;
+		if socket.udp_state.max_gso_segments() <= 1 {
+			return;
+		}
+		socket.faults.reject_gso = true;
+		let mut batch = test_batch(47, 1408, 47 * 1376);
+		let stats = socket.send_batch(&mut batch, destination, None).await;
+		assert_eq!(stats.fallback_chunks, 1);
+		assert_eq!(stats.outcome.attempted_datagrams, 47);
+		assert_eq!(stats.outcome.submitted_datagrams, 47);
+		assert_eq!(stats.outcome.failed_datagrams, 0);
+		for _ in 0..47 {
+			assert_eq!(receiver.recv_from(&mut [0; 2048]).await.unwrap().0, 1408);
+		}
+	}
+
+	#[tokio::test]
+	async fn fallback_and_no_gso_rebase_after_100_and_500_ms_stalls() {
+		for fallback in [false, true] {
+			for stall in [100, 500] {
+				let (mut socket, _receiver, destination) = loopback_socket(!fallback).await;
+				socket.faults.reject_gso = fallback;
+				socket.faults.stall_after = Some(10);
+				socket.faults.stall_duration = Some(Duration::from_millis(stall));
+				let mut batch = test_batch(100, 1408, 100 * 1376);
+				let stats = socket.send_batch(&mut batch, destination, Some(100_000_000)).await;
+				assert_eq!(stats.outcome.submitted_datagrams, 100);
+				assert!(stats.backpressure_rebases >= 1);
+				assert_eq!(socket.chunk_starts.len(), 3);
+				// An overdue third chunk cannot follow the second immediately.
+				assert!(socket.chunk_starts[2].duration_since(socket.chunk_starts[1]) >= Duration::from_millis(4));
+			}
+		}
 	}
 
 	#[tokio::test]
@@ -455,7 +683,7 @@ mod tests {
 		assert!(send.as_mut().poll(&mut Context::from_waker(Waker::noop())).is_pending());
 		drop(send);
 		assert_eq!(would_block, 2);
-		let stats = socket.send_batch(&test_batch(1, 64, 64), destination, None).await;
+		let stats = socket.send_batch(&mut test_batch(1, 64, 64), destination, None).await;
 		assert_eq!(stats.gso_sends + stats.per_shard_sends, 1);
 		let mut buf = [1; 64];
 		receiver.recv_from(&mut buf).await.unwrap();
@@ -599,8 +827,8 @@ mod tests {
 	#[tokio::test]
 	async fn gso_bypass_sends_every_shard_individually() {
 		let (mut socket, receiver, destination) = loopback_socket(true).await;
-		let batch = test_batch(47, 1408, 47 * 1376 - 8);
-		let stats = socket.send_batch(&batch, destination, None).await;
+		let mut batch = test_batch(47, 1408, 47 * 1376 - 8);
+		let stats = socket.send_batch(&mut batch, destination, None).await;
 		assert_eq!(stats.gso_sends, 0);
 		assert_eq!(stats.per_shard_sends, 47);
 		assert_eq!(stats.gso_segments_per_send, 0);
@@ -620,8 +848,8 @@ mod tests {
 	async fn available_gso_segments_a_real_loopback_batch() {
 		let (mut socket, receiver, destination) = loopback_socket(false).await;
 		let gso_available = socket.udp_state.max_gso_segments() > 1;
-		let batch = test_batch(47, 1408, 47 * 1376 - 8);
-		let stats = socket.send_batch(&batch, destination, None).await;
+		let mut batch = test_batch(47, 1408, 47 * 1376 - 8);
+		let stats = socket.send_batch(&mut batch, destination, None).await;
 		if gso_available {
 			assert_eq!(stats.gso_sends + stats.fallback_chunks, 2);
 		} else {
@@ -640,12 +868,12 @@ mod tests {
 	#[tokio::test]
 	async fn repeated_frame_sends_preserve_every_shard() {
 		let (mut socket, receiver, destination) = loopback_socket(false).await;
-		let batch = test_batch(47, 1408, 47 * 1376 - 8);
+		let mut batch = test_batch(47, 1408, 47 * 1376 - 8);
 		let mut buffer = [0u8; 2048];
 		// Drain each frame so UDP receive-buffer overflow cannot make the test
 		// depend on scheduling speed. Exercise repeated use of one GSO socket.
 		for _ in 0..1024 {
-			let stats = socket.send_batch(&batch, destination, None).await;
+			let stats = socket.send_batch(&mut batch, destination, None).await;
 			assert!(stats.gso_sends > 0 || stats.per_shard_sends > 0);
 			for _ in 0..47 {
 				let (size, _) = tokio::time::timeout(Duration::from_secs(1), receiver.recv_from(&mut buffer))
@@ -666,8 +894,8 @@ mod tests {
 		// One byte beyond the maximum UDP payload deterministically produces
 		// EMSGSIZE. The fallback also fails visibly, but the important invariant
 		// here is that rejection enters the per-shard fallback path once.
-		let batch = test_batch(1, MAX_UDP_PAYLOAD + 1, 1024);
-		let stats = socket.send_batch(&batch, destination, None).await;
+		let mut batch = test_batch(1, MAX_UDP_PAYLOAD + 1, 1024);
+		let stats = socket.send_batch(&mut batch, destination, None).await;
 		assert_eq!(stats.gso_sends, 0);
 		assert_eq!(stats.fallback_chunks, 1);
 	}
@@ -679,7 +907,7 @@ mod tests {
 		batch.set_pacing_origin(Instant::now());
 		let result = tokio::time::timeout(
 			Duration::from_millis(10),
-			socket.send_batch(&batch, destination, Some(1_000_000_000)),
+			socket.send_batch(&mut batch, destination, Some(1_000_000_000)),
 		)
 		.await;
 		assert!(result.is_err(), "the send should be cancelled between pacing quanta");

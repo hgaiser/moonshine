@@ -15,7 +15,7 @@ or GLES rendering. Without demand it retains dirty state and skips capture work.
 | Consumer | When demand is useful | When admission ends |
 | --- | --- | --- |
 | PyroWave | Prior frame's encode, packetization and socket send have completed | Actual socket-send completion, or an error/drop |
-| Conventional codec | Below the existing encoder in-flight bound | Encode submission; asynchronous consumer work remains separately bounded |
+| Conventional codec | Fewer than three useful frames outstanding, including network work | Final socket submission, transport failure, epoch discard or cancellation |
 
 The source buffer's `consumed` flag is independent. It releases the DMA-BUF only
 after GPU reads finish; PyroWave can release the client's buffer before paced
@@ -59,8 +59,29 @@ scaling needs an explicit transform contract and pixel comparisons.
 
 ## Encoding, caches and queue selection
 
-Conventional encoding uses Pixelforge's asynchronous pipeline and a bounded
-in-flight gate. Rejecting capture before encoding preserves predictive reference
+Conventional encoding uses Pixelforge's asynchronous pipeline with three owned
+completion credits spanning submission, readback, packetization, queue residence
+and socket submission. The capture thread issues demand only below that bound;
+IDR replays use the same gate. The consumer moves each credit into its batch
+rather than freeing it at enqueue. RAII also covers queued encoder messages,
+packetization errors, sender failure, cancellation and discarded epochs.
+The three credits retain the existing encode/send overlap on healthy links.
+
+Network output storage is bounded by three frames. For a negotiated wire shard
+size `S`, the protocol's maximum four unprotected blocks of 1023 data shards
+bound it by `3 * 4092 * S` bytes; protected blocks have at most 255 total shards.
+This is a representability bound, not a desired queue size. TRACE completion
+records expose current/high-water output frames and bytes. An indefinitely
+blocked socket can make those frames indefinitely old; stop and pause interrupt
+socket waits, and pause is acknowledged only after old delivery is disabled.
+No arbitrary already-encoded predictive frame is dropped to meet an age target.
+Transport loss requests an IDR; epoch discard is followed by the existing reset
+and IDR activation contract.
+
+The source DMA-BUF's GPU-read completion remains independent of these network
+credits. Do not use kernel submission as source-read completion or proof of
+receiver delivery.
+Rejecting capture before encoding preserves predictive reference
 chains; discarding encoded reference frames can break decoding until an IDR.
 PyroWave completes one encode and send before requesting the next capture.
 This bounds latency but can limit FPS when capture + encode + paced send consumes
@@ -70,7 +91,10 @@ AsyncFd for precise packet deadlines. A mutable send borrow enforces one wait
 per timer; cancellation and rearming cannot leak a prior frame's expiry. There
 is no spin loop or pacing thread. Timer initialization/wait failure falls back
 to Tokio's ordinary timer without failing startup. Unpaced conventional sends
-do not allocate or use this timer. Late-frame rebasing, packet spacing, FEC and
+do not allocate or use this timer. GSO and per-datagram fallback share the same readiness retry and observed
+WouldBlock counters. An observed readiness wait or a chunk overrun moves the remaining pacing schedule forward;
+no overdue later chunks are released together. The maximum within-chunk burst
+remains the existing payload-capped GSO cadence (also used without GSO). FEC and
 rate-control budgets remain unchanged.
 
 See the [pacing follow-up](reports/PACING_CADENCE.md) for the correction to the
@@ -108,3 +132,27 @@ Deferred work needs specific evidence before implementation:
 Use [GPU validation](PYROWAVE.md#validation-matrix), compositor/Steam acceptance
 and [reconnect checks](reconnect-validation.md) after pipeline changes. Loopback
 runs cannot establish physical network capacity or end-to-end client behavior.
+
+## Transport ownership and outcomes
+
+Packetization plans every FEC block first and writes into disjoint views of one
+zeroed contiguous frame allocation. Prefix bytes remain outside FEC; encryption
+runs in place after parity and metadata. Sending borrows that owned allocation
+through completion. Capacity pooling is deferred pending a measured benefit.
+
+`TransportCompletion` distinguishes successful kernel submission, failure,
+epoch discard and cancellation, separately from releasing a useful-work credit.
+Logical attempted datagrams/UDP payload bytes count once even if readiness
+retries or GSO fallback repeat the socket operation. `would_block_events` and
+`fallback_chunks` count those additional operations. Submitted counters increase
+only after successful complete socket submission. A cancelled partial frame
+retains its successful prefix, with its unsent remainder reported as discarded.
+Completion notifications never block resource release. Per-datagram failures
+are aggregated into batch counters and warnings are limited to once per second.
+
+Benchmark `FrameStats.enqueue` covers queue handoff/residence and `send` covers
+socket work; `total` now ends at transport completion for conventional codecs too.
+`wire_bytes` is successfully submitted UDP payload (including FEC and encryption),
+not IP/link traffic or client delivery. The sender summary additionally estimates
+Ethernet load with IPv6/UDP and framing overhead. Pipeline enqueue summaries
+measure earlier handoff separately and do not report transmission throughput.

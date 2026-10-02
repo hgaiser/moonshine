@@ -32,6 +32,18 @@ struct Args {
 	/// PyroWave queue preference at normal priority; auto prefers graphics.
 	#[arg(long, default_value = "auto", value_parser = ["auto", "graphics", "compute"])]
 	pyrowave_queue: String,
+	/// Transport measurement controls; encoding bitrate/quality remains unchanged.
+	#[arg(long)]
+	encrypt_video: bool,
+	#[arg(long, default_value = "fixed", value_parser = ["off", "fixed", "auto"])]
+	fec_mode: String,
+	#[arg(long, default_value_t = 20)]
+	fec_percentage: u8,
+	#[arg(long, default_value_t = 2)]
+	minimum_fec_packets: u32,
+	#[arg(long, default_value_t = 1400)]
+	packet_size: usize,
+
 	/// Command to run (application to spawn).
 	command: Vec<String>,
 
@@ -227,6 +239,7 @@ struct StatsSummary {
 	avg_consumer_queue_us: f64,
 	avg_packetize_us: f64,
 	avg_send_us: f64,
+	avg_enqueue_us: f64,
 	key_frames: u64,
 }
 
@@ -270,6 +283,7 @@ impl StatsSummary {
 			+ self.encode_wait.avg_us
 			+ self.avg_packetize_us
 			+ self.avg_send_us
+			+ self.avg_enqueue_us
 	}
 
 	fn avg_delta_us(&self) -> f64 {
@@ -311,6 +325,7 @@ struct StatsAccumulator {
 	encode_wait_us: u128,
 	packetize_us: u128,
 	send_us: u128,
+	enqueue_us: u128,
 	total_samples_us: Vec<u64>,
 	submit_samples_us: Vec<u64>,
 	encode_wait_samples_us: Vec<u64>,
@@ -338,6 +353,7 @@ impl StatsAccumulator {
 			encode_wait_us: 0,
 			packetize_us: 0,
 			send_us: 0,
+			enqueue_us: 0,
 			total_samples_us: Vec::new(),
 			submit_samples_us: Vec::new(),
 			encode_wait_samples_us: Vec::new(),
@@ -371,6 +387,7 @@ impl StatsAccumulator {
 		self.encode_wait_us += encode_wait as u128;
 		self.packetize_us += stats.packetize.as_micros();
 		self.send_us += stats.send.as_micros();
+		self.enqueue_us += stats.enqueue.as_micros();
 		self.total_samples_us.push(total);
 		self.submit_samples_us.push(submit);
 		self.encode_wait_samples_us.push(encode_wait);
@@ -422,6 +439,7 @@ impl StatsAccumulator {
 			avg_consumer_queue_us: self.consumer_queue_us as f64 / self.count as f64,
 			avg_packetize_us: self.packetize_us as f64 / self.count as f64,
 			avg_send_us: self.send_us as f64 / self.count as f64,
+			avg_enqueue_us: self.enqueue_us as f64 / self.count as f64,
 			key_frames: self.key_frames,
 		})
 	}
@@ -430,7 +448,7 @@ impl StatsAccumulator {
 		let summary = self.summary()?;
 
 		tracing::info!(
-			"{} [{} frames, {:.1} fps, {:.2} Mbps encoded, {:.2} Mbps wire]",
+			"{} [{} frames, {:.1} fps, {:.2} Mbps encoded, {:.2} Mbps submitted UDP payload]",
 			label,
 			summary.count,
 			summary.fps,
@@ -483,7 +501,7 @@ impl StatsAccumulator {
 			summary.encode_wait.p99_us
 		);
 		tracing::info!(
-			"  avg breakdown: ch_wait={avg_channel_wait:.0}us  import={avg_import:.0}us  convert={avg_convert:.0}us  submit={avg_submit:.0}us  enc_wait={avg_encode_wait:.0}us  pkt={avg_packetize:.0}us  send={avg_send:.0}us",
+			"  avg breakdown: ch_wait={avg_channel_wait:.0}us  import={avg_import:.0}us  convert={avg_convert:.0}us  submit={avg_submit:.0}us  enc_wait={avg_encode_wait:.0}us  pkt={avg_packetize:.0}us  enqueue={avg_enqueue:.0}us  send={avg_send:.0}us",
 			avg_channel_wait = summary.avg_channel_wait_us,
 			avg_import = summary.avg_import_us,
 			avg_convert = summary.avg_convert_us,
@@ -491,6 +509,7 @@ impl StatsAccumulator {
 			avg_encode_wait = summary.encode_wait.avg_us,
 			avg_packetize = summary.avg_packetize_us,
 			avg_send = summary.avg_send_us,
+			avg_enqueue = summary.avg_enqueue_us,
 		);
 		tracing::info!(
 			"  accounted: avg={avg_accounted:.0}us  delta={avg_delta:.0}us  queue_diag={avg_consumer_queue:.0}us",
@@ -684,6 +703,12 @@ async fn run_benchmark(
 			..Default::default()
 		},
 		VideoStreamConfig {
+			fec_percentage: args.fec_percentage,
+			fec_mode: match args.fec_mode.as_str() {
+				"off" => moonshine_core::session::stream::video::FecMode::Off,
+				"auto" => moonshine_core::session::stream::video::FecMode::Auto,
+				_ => moonshine_core::session::stream::video::FecMode::Fixed,
+			},
 			pyrowave_queue: match args.pyrowave_queue.as_str() {
 				"graphics" => PyroWaveQueueMode::Graphics,
 				"compute" => PyroWaveQueueMode::Compute,
@@ -746,13 +771,13 @@ async fn run_benchmark(
 		width,
 		height,
 		fps: target_fps,
-		packet_size: 1400,
+		packet_size: args.packet_size,
 		bitrate: args.bitrate,
-		minimum_fec_packets: 2,
+		minimum_fec_packets: args.minimum_fec_packets,
 		qos: false,
 		format: negotiated_format,
 		max_reference_frames: 1,
-		encrypt_video: false,
+		encrypt_video: args.encrypt_video,
 	};
 
 	let audio_ctx = AudioStreamContext {
@@ -794,10 +819,22 @@ async fn run_benchmark(
 	// address and actually transmits encoded frames over UDP (otherwise all
 	// packets are silently dropped waiting for a Moonlight client to connect).
 	let ping_addr: std::net::SocketAddr = "127.0.0.1:47998".parse().unwrap();
-	if let Ok(ping_sock) = UdpSocket::bind("127.0.0.1:0") {
-		let _ = ping_sock.send_to(b"PING", ping_addr);
-		tracing::debug!("Sent PING to video socket at {ping_addr}");
+	// Keep a live receiver: closing the discovery socket can generate ICMP
+	// errors, and packetized bytes cannot establish actual UDP submission.
+	struct DrainGuard(tokio::task::JoinHandle<()>);
+	impl Drop for DrainGuard {
+		fn drop(&mut self) {
+			self.0.abort();
+		}
 	}
+	let ping_sock = UdpSocket::bind("127.0.0.1:0")?;
+	ping_sock.send_to(b"PING", ping_addr)?;
+	ping_sock.set_nonblocking(true)?;
+	let receiver = tokio::net::UdpSocket::from_std(ping_sock)?;
+	let _udp_receiver = DrainGuard(tokio::spawn(async move {
+		let mut buffer = [0u8; 65536];
+		while receiver.recv_from(&mut buffer).await.is_ok() {}
+	}));
 
 	tracing::info!("Session active. Collecting stats...");
 

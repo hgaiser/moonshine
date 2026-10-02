@@ -24,6 +24,12 @@ pub(super) struct TransportWindow {
 	send_total: Duration,
 	max_lateness: Duration,
 	max_queue: usize,
+	attempted_bytes: u64,
+	submitted_bytes: u64,
+	submitted_datagrams: u64,
+	failed_datagrams: u64,
+	discarded_datagrams: u64,
+	discarded_bytes: u64,
 }
 
 impl TransportWindow {
@@ -41,6 +47,12 @@ impl TransportWindow {
 			send_total: Duration::ZERO,
 			max_lateness: Duration::ZERO,
 			max_queue: 0,
+			attempted_bytes: 0,
+			submitted_bytes: 0,
+			submitted_datagrams: 0,
+			failed_datagrams: 0,
+			discarded_datagrams: 0,
+			discarded_bytes: 0,
 		}
 	}
 
@@ -48,6 +60,12 @@ impl TransportWindow {
 		if !self.enabled {
 			return;
 		}
+		self.attempted_bytes += stats.outcome.attempted_payload_bytes as u64;
+		self.submitted_bytes += stats.outcome.submitted_payload_bytes as u64;
+		self.submitted_datagrams += stats.outcome.submitted_datagrams as u64;
+		self.discarded_datagrams += stats.discarded_datagrams as u64;
+		self.discarded_bytes += stats.discarded_payload_bytes as u64;
+		self.failed_datagrams += stats.outcome.failed_datagrams as u64;
 		self.frames += 1;
 		self.would_block += u64::from(stats.would_block_events);
 		self.fallback += u64::from(stats.fallback_chunks);
@@ -60,6 +78,15 @@ impl TransportWindow {
 		self.max_queue = self.max_queue.max(queue);
 		if self.started.elapsed() >= INTERVAL {
 			tracing::info!(
+				attempted_udp_payload_bytes = self.attempted_bytes,
+				submitted_udp_payload_bytes = self.submitted_bytes,
+				submitted_datagrams = self.submitted_datagrams,
+				failed_datagrams = self.failed_datagrams,
+				discarded_datagrams = self.discarded_datagrams,
+				discarded_payload_bytes = self.discarded_bytes,
+				resource_release_completions = self.frames,
+				submitted_udp_payload_mbps =
+					self.submitted_bytes as f64 * 8.0 / self.started.elapsed().as_secs_f64() / 1e6,
 				frames = self.frames,
 				would_block_events = self.would_block,
 				fallback_chunks = self.fallback,
@@ -84,8 +111,7 @@ pub(super) struct PipelineWindow {
 	frames: u64,
 	stale: u64,
 	encoded_bytes: u64,
-	wire_bytes: u64,
-	packets: u64,
+
 	sums: [u64; 9],
 	maxima: [u64; 9],
 }
@@ -98,8 +124,7 @@ impl PipelineWindow {
 			frames: 0,
 			stale: 0,
 			encoded_bytes: 0,
-			wire_bytes: 0,
-			packets: 0,
+
 			sums: [0; 9],
 			maxima: [0; 9],
 		}
@@ -112,8 +137,7 @@ impl PipelineWindow {
 		self.frames += 1;
 		self.stale += u64::from(stats.stale_frames_dropped);
 		self.encoded_bytes += stats.encoded_bytes as u64;
-		self.wire_bytes += stats.wire_bytes as u64;
-		self.packets += stats.packet_count as u64;
+
 		for (i, duration) in [
 			stats.channel_wait,
 			stats.import,
@@ -136,11 +160,8 @@ impl PipelineWindow {
 		if elapsed >= INTERVAL {
 			let avg = self.sums.map(|us| us / self.frames);
 			tracing::info!(
-				delivered_frames = self.frames, fps = self.frames as f64 / elapsed.as_secs_f64(),
+				encoded_frames = self.frames, fps = self.frames as f64 / elapsed.as_secs_f64(),
 				encoded_mbps = self.encoded_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1e6,
-				udp_payload_mbps_including_fec = self.wire_bytes as f64 * 8.0 / elapsed.as_secs_f64() / 1e6,
-				// IPv6 + UDP + Ethernet header/FCS + preamble + inter-frame gap.
-				estimated_ethernet_mbps_ipv6 = (self.wire_bytes + self.packets * 86) as f64 * 8.0 / elapsed.as_secs_f64() / 1e6,
 				stale_frames_dropped = self.stale, encoder_in_flight = in_flight,
 				packet_queue, import_cache = ?imports,
 				channel_wait_us = avg[0], max_channel_wait_us = self.maxima[0],
@@ -263,11 +284,15 @@ mod tests {
 			consumer_queue: Duration::from_micros(5),
 			encode_wait: Duration::from_micros(6),
 			packetize: Duration::from_micros(7),
+			enqueue: Duration::ZERO,
 			send: Duration::from_micros(8),
 			total: Duration::from_micros(36),
 			encoded_bytes: 100,
 			wire_bytes: 120,
 			packet_count: 10,
+			attempted_packet_count: 10,
+			failed_packet_count: 0,
+			discarded_packet_count: 0,
 			stale_frames_dropped: 2,
 			is_key_frame: true,
 		};

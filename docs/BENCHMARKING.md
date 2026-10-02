@@ -37,6 +37,11 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
 | `--fps <N>` | `60` | Target frame rate |
 | `--bitrate <N>` | `20000000` | Target bitrate in bits per second |
+| `--encrypt-video` | off | Enable the same video AES-GCM path used in streaming |
+| `--fec-mode <mode>` | `fixed` | Select `off`, `fixed`, or `auto` FEC policy |
+| `--fec-percentage <N>` | `20` | Requested parity percentage; effective layout still obeys the protocol limits |
+| `--minimum-fec-packets <N>` | `2` | Negotiated minimum parity count |
+| `--packet-size <N>` | `1400` | Negotiated packet size, validated by the production setup path |
 | `--codec <codec>` | `h264` | Video codec: `h264`, `hevc`, `av1`, or `pyrowave` |
 | `--chroma <mode>` | `420` | Chroma sampling: `420` or `444`, subject to codec support |
 | `--bit-depth <N>` | `8` (SDR), `10` (HDR) | Select `8` or `10` bits; incompatible formats are rejected |
@@ -91,7 +96,7 @@ Every 5 seconds, a summary is printed with:
 - **Total latency** — avg/min/max and p50/p95/p99 time for the full pipeline per frame
 - **Submit latency** — avg/min/max and p50/p95/p99 CPU time spent submitting a frame to the asynchronous encoder
 - **Encode wait latency** — avg/min/max and p50/p95/p99 time waiting for the asynchronous encode/readback future
-- **Breakdown** — avg time per stage: channel wait, DMA-BUF import, color conversion, submit, encode wait, packetization, send; consumer queue is reported as a diagnostic included inside encode wait
+- **Breakdown** — avg time per stage: channel wait, DMA-BUF import, color conversion, submit, encode wait, packetization, enqueue/residence and actual socket send; consumer queue is reported as a diagnostic included inside encode wait
 - **Key frames** — number of keyframes emitted
 
 At the end of the run, a final summary covers the entire session (excluding the warmup period).
@@ -125,8 +130,10 @@ Import hit/miss/recreate/evict counters preserve the existing FD identity and
 complete import-layout checks. Direct rejection counters identify the first
 blocking condition per attempted capture, rather than every possible condition.
 
-Transport summaries show encoded Mbps, UDP payload Mbps including FEC and
-protocol/encryption bytes, and estimated Ethernet Mbps including IPv6/UDP,
+Pipeline summaries show encoded Mbps. Transport summaries distinguish logical
+attempts, successful kernel submissions, failures and discards, and report
+submitted UDP payload Mbps including FEC and protocol/encryption bytes, plus
+estimated submitted Ethernet Mbps including IPv6/UDP,
 Ethernet header/FCS, preamble and inter-frame gap. VLAN/tunnel overhead and other
 traffic are additional. Do not treat the UDP payload as physical wire bitrate.
 
@@ -135,3 +142,22 @@ it does not include game rendering, client decode/display, or the compositor
 CPU fence wait. Measure those separately when evaluating end-to-end latency.
 See [the historical optimization report](reports/PIPELINE_OPTIMIZATION.md) for measured results,
 validation gaps, and changes deliberately deferred.
+
+## Packetizer and transport remediation evidence
+
+See [the 2026-10-02 transport report](reports/TRANSPORT_REMEDIATION_2026-10-02.md)
+for fixed-content CPU measurements, raw GPU/loopback runs, fault tests and remaining
+physical-LAN/client acceptance work. `scripts/transport_measurements.py` prepares
+an original-revision measurement harness and compares whole-batch fingerprints
+as well as per-trial allocations and timing. Run measurements without concurrent
+compilation, keep the governor and diagnostics unchanged, and retain outliers.
+The pipeline benchmark keeps a live UDP drain but does not decode video.
+
+The GPU A/B helper `scripts/transport_gpu_measurements.py` records the exact argv,
+process CPU/RSS and system-wide GPU busy samples alongside each log. It refuses
+to replace an active `moonshine-session.service` or use an occupied video port.
+Finish active streaming before benchmarking and do not run compilation during
+measurement. The default matrix holds the scene and 750 Mbps configuration fixed;
+additional matched runs exercise encryption, FEC, no-GSO and 650/900 Mbps settings.
+Configured bitrate is not proof that a physical 1 Gbps link can carry the resulting
+FEC, encryption and link overhead.

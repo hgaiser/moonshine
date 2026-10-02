@@ -14,6 +14,18 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-7] - 2026-10-01
+
+### Fixed
+
+- Hold conventional video admission through UDP completion or discard, including IDR replays; interrupt blocked sends on pause and retain predictive recovery after transport loss.
+- Distinguish attempted UDP work, successful kernel submission, failures and resource release; aggregate transport errors and rebase fallback pacing after socket stalls.
+
+### Changed
+
+- Packetize all FEC blocks into one zeroed, sender-owned allocation, removing the full output-shard assembly copy without changing packet bytes or configured encoding quality.
+- Keep a live loopback receiver in the pipeline benchmark and report enqueue time separately from actual socket time and submitted UDP payload throughput.
+
 ## [v0.17.0-beta-6] - 2026-10-01
 
 ### Fixed
