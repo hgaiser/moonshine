@@ -14,6 +14,8 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-1] - 2026-10-01
+
 ### Security
 
 - Pairing approval (`/pin`, `/submit-pin`) is accepted only from the host itself: a loopback peer, a loopback `Host`, and same-origin browser requests. The PIN applies only to the pending request shown on the page, which now lists the requester address and certificate fingerprint; unapproved requests expire after five minutes. A non-loopback `address` gets an additional loopback-only approval listener.
