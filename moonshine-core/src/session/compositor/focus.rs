@@ -73,7 +73,7 @@ impl From<Window> for KeyboardFocusTarget {
 /// Collapses four nearly-identical match arms (`enter`, `leave`, `key`,
 /// `modifiers`) into a single macro invocation.
 macro_rules! delegate_keyboard {
-	($method:ident($($param:ident : $ty:ty),*) -> $ret:ty) => {
+	($method:ident($($param:ident : $ty:ty),* $(,)?) -> $ret:ty) => {
 		fn $method(&self, $($param: $ty),*) -> $ret {
 			match self.0.underlying_surface() {
 				WindowSurface::Wayland(w) => KeyboardTarget::$method(w.wl_surface(), $($param),*),
@@ -84,10 +84,33 @@ macro_rules! delegate_keyboard {
 }
 
 impl KeyboardTarget<MoonshineCompositor> for KeyboardFocusTarget {
-	delegate_keyboard!(enter(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, keys: Vec<KeysymHandle<'_>>, serial: Serial) -> ());
+	delegate_keyboard!(
+		enter(
+			seat: &Seat<MoonshineCompositor>,
+			data: &mut MoonshineCompositor,
+			keys: Vec<KeysymHandle<'_>>,
+			serial: Serial,
+		) -> ()
+	);
 	delegate_keyboard!(leave(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, serial: Serial) -> ());
-	delegate_keyboard!(key(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, key: KeysymHandle<'_>, state: KeyState, serial: Serial, time: InputTime) -> ());
-	delegate_keyboard!(modifiers(seat: &Seat<MoonshineCompositor>, data: &mut MoonshineCompositor, modifiers: ModifiersState, serial: Serial) -> ());
+	delegate_keyboard!(
+		key(
+			seat: &Seat<MoonshineCompositor>,
+			data: &mut MoonshineCompositor,
+			key: KeysymHandle<'_>,
+			state: KeyState,
+			serial: Serial,
+			time: InputTime,
+		) -> ()
+	);
+	delegate_keyboard!(
+		modifiers(
+			seat: &Seat<MoonshineCompositor>,
+			data: &mut MoonshineCompositor,
+			modifiers: ModifiersState,
+			serial: Serial,
+		) -> ()
+	);
 }
 
 // ============================================================================
