@@ -128,7 +128,7 @@ impl ControlPeers {
 		}
 		self.generation = generation;
 		self.replay = ReplayWindow::new();
-		let mut stale: Vec<_> = self.candidates.drain(..).collect();
+		let mut stale = std::mem::take(&mut self.candidates);
 		stale.extend(self.active.take());
 		stale
 	}

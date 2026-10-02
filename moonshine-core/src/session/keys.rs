@@ -163,7 +163,7 @@ impl NonceSequence {
 	/// never wrap and are never handed out twice.
 	pub fn reserve(&self, count: u64) -> Result<u64, NonceExhausted> {
 		self.next
-			.fetch_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+			.try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
 				next.checked_add(count).filter(|&after| after <= self.end)
 			})
 			.map_err(|_| NonceExhausted)
