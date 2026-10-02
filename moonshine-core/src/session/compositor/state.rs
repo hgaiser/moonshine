@@ -18,7 +18,7 @@ use smithay::backend::renderer::damage::OutputDamageTracker;
 use smithay::backend::renderer::element::surface::WaylandSurfaceRenderElement;
 use smithay::backend::renderer::element::surface::render_elements_from_surface_tree;
 use smithay::backend::renderer::element::utils::{Relocate, RelocateRenderElement, RescaleRenderElement};
-use smithay::backend::renderer::element::{AsRenderElements, Element, Id, Kind, RenderElement};
+use smithay::backend::renderer::element::{AsRenderElements, Element, Id, Kind, RenderElement, RenderElementStates};
 use smithay::backend::renderer::gles::{GlesError, GlesFrame, GlesRenderer};
 use smithay::backend::renderer::utils::{CommitCounter, DamageSet, OpaqueRegions, with_renderer_surface_state};
 use smithay::backend::renderer::{Bind, BufferType, ImportDma, Renderer};
@@ -220,7 +220,6 @@ pub(crate) struct MoonshineCompositor {
 	// -- Rendering --
 	pub output: Output,
 	pub damage_tracker: OutputDamageTracker,
-	pub allocator: GbmAllocator<std::fs::File>,
 	pub renderer: GlesRenderer,
 
 	// -- DMA-BUF --
@@ -247,6 +246,10 @@ pub(crate) struct MoonshineCompositor {
 
 	// -- Desktop --
 	pub space: Space<smithay::desktop::Window>,
+	pub popups: smithay::desktop::PopupManager,
+	pub(super) popup_grab: Option<smithay::desktop::PopupGrab<Self>>,
+	pub(super) popup_pointer_target: Option<(WlSurface, Point<f64, Logical>)>,
+	pub(super) input_serials: super::input_serials::InputSerials<smithay::reexports::wayland_server::backend::ClientId>,
 	pub clock: Clock<Monotonic>,
 
 	// -- Lifecycle --
@@ -649,7 +652,6 @@ impl MoonshineCompositor {
 				activation_state,
 				output,
 				damage_tracker,
-				allocator,
 				renderer,
 				dmabuf_state,
 				dmabuf_global,
@@ -664,6 +666,10 @@ impl MoonshineCompositor {
 				active_pen_tool_kind: None,
 				pen_buttons: 0,
 				space,
+				popups: smithay::desktop::PopupManager::default(),
+				popup_grab: None,
+				popup_pointer_target: None,
+				input_serials: Default::default(),
 				clock,
 				handle,
 				width,
@@ -1088,7 +1094,11 @@ impl MoonshineCompositor {
 		// game (gamescope's `paint_all`), so direct scanout — which bypasses the
 		// space — is disabled.
 		let overlay_raised = self.overlay_raised;
-		if !cursor_visible && !overlay_raised {
+		// Direct scanout also bypasses native Wayland popup menus (combo
+		// boxes, context menus) since it never touches the GLES compositor;
+		// keep compositing while one is mapped, even after the cursor fades.
+		let popups_active = !self.popup_surfaces_for_render().is_empty();
+		if !cursor_visible && !overlay_raised && !popups_active {
 			if self.is_override_active() {
 				if self.try_direct_scanout_override() {
 					tracing::trace!("Frame via direct scanout (override path)");
@@ -1151,9 +1161,13 @@ impl MoonshineCompositor {
 			tracing::debug!("Failed to set downscale filter: {e}");
 		}
 
+		// Computed before bind() to avoid a borrow conflict with self.renderer:
+		// popup_surfaces_for_render() needs &self while framebuffer below holds
+		// &mut self.renderer for its lifetime.
+		let popups_for_render = self.popup_surfaces_for_render();
+
 		// Bind the pre-allocated Dmabuf as a render target.
-		let bind_result = self.renderer.bind(&mut self.buffer_pool[idx].dmabuf);
-		let mut framebuffer = match bind_result {
+		let mut framebuffer = match self.renderer.bind(&mut self.buffer_pool[idx].dmabuf) {
 			Ok(fb) => fb,
 			Err(e) => {
 				tracing::error!("Failed to bind Dmabuf for rendering: {e}");
@@ -1237,6 +1251,31 @@ impl MoonshineCompositor {
 		);
 		elements.extend(space_elements.into_iter().map(OutputRenderElements::Space));
 
+		// Native Wayland popups (combo boxes, context menus, tooltips) are not
+		// part of `self.space` — they live above their parent surface's content
+		// at a position relative to it. Layer them on top of the space/override
+		// content, below the cursor.
+		if !popups_for_render.is_empty() {
+			let popup_elements: Vec<WaylandSurfaceRenderElement<GlesRenderer>> = popups_for_render
+				.iter()
+				.flat_map(|(surface, location)| {
+					render_elements_from_surface_tree(
+						&mut self.renderer,
+						surface,
+						(location.x, location.y),
+						scale,
+						1.0,
+						Kind::Unspecified,
+					)
+				})
+				.collect();
+			elements.extend(
+				popup_elements
+					.into_iter()
+					.map(|element| OutputRenderElements::Space(SpaceRenderElements::Surface(element))),
+			);
+		}
+
 		tracing::trace!(
 			num_space_elements,
 			num_render_elements = elements.len(),
@@ -1285,11 +1324,12 @@ impl MoonshineCompositor {
 		self.buffer_last_rendered_at[idx] = Some(self.render_count);
 		self.render_count += 1;
 
-		let sync = match &render_result {
-			Ok(r) => r.sync.clone(),
-			Err(smithay::backend::renderer::damage::Error::OutputNoMode(_)) => {
-				smithay::backend::renderer::sync::SyncPoint::signaled()
-			},
+		let (sync, render_states) = match render_result {
+			Ok(r) => (r.sync, r.states),
+			Err(smithay::backend::renderer::damage::Error::OutputNoMode(_)) => (
+				smithay::backend::renderer::sync::SyncPoint::signaled(),
+				RenderElementStates::default(),
+			),
 			Err(e) => {
 				tracing::error!("Failed to render output: {e}");
 				return;
@@ -1345,21 +1385,18 @@ impl MoonshineCompositor {
 		// Native Wayland clients can wait for presentation feedback before
 		// submitting again, even when their buffers are composited rather than scanned out.
 		let mut feedback = OutputPresentationFeedback::new(&self.output);
-		if let Ok(result) = &render_result {
-			for window in self.space.elements() {
-				window.take_presentation_feedback(
-					&mut feedback,
-					|surface, _| {
-						result
-							.states
-							.element_was_presented(surface)
-							.then(|| self.output.clone())
-					},
-					|_, _| {
-						smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
-					},
-				);
-			}
+		for window in self.space.elements() {
+			window.take_presentation_feedback(
+				&mut feedback,
+				|surface, _| {
+					render_states
+						.element_was_presented(surface)
+						.then(|| self.output.clone())
+				},
+				|_, _| {
+					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+				},
+			);
 		}
 
 		// Also send frame callbacks to the override surface if active,
@@ -1387,6 +1424,28 @@ impl MoonshineCompositor {
 				},
 			);
 		}
+
+		// Native popups similarly need frame callbacks and presentation
+		// feedback delivered so their clients (combo boxes, context menus)
+		// unblock and can be dismissed/redrawn promptly.
+		for (popup_surface, _) in &popups_for_render {
+			send_frames_surface_tree(
+				popup_surface,
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
+			take_presentation_feedback_surface_tree(
+				popup_surface,
+				&mut feedback,
+				|_, _| Some(self.output.clone()),
+				|_, _| {
+					smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback::Kind::empty()
+				},
+			);
+		}
+
 		let frame_period = self
 			.output
 			.preferred_mode()
