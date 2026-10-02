@@ -251,3 +251,18 @@ A host/stream/game run must confirm it. Applications that reject conservative
 capabilities before creating any Vulkan device remain a limitation of the safe
 feature-enable gate. Explicit application mode lists are also not overridden to
 force a three-image configuration.
+
+## Presentation failures and temporary surface ownership
+
+Limiter and bypass recreation hints replace only ICD `SUCCESS` or `SUBOPTIMAL`.
+Negative aggregate results remain authoritative, and negative per-swapchain
+results are never overwritten. All eligible swapchains in a batch receive their
+hints; a mixed batch retains its driver failure even when other entries need
+recreation. `OUT_OF_DATE` takes precedence over synthetic `SUBOPTIMAL`.
+
+Bypass construction owns each temporary `wl_surface` with a rollback guard. Any
+failure, including missing instance/dispatch or an ICD constructor error, sends
+one protocol destructor and flushes. A successful Vulkan constructor transfers
+the proxy to live surface ownership; ordinary teardown destroys the Vulkan
+surface before destroying the protocol surface. XCB fallback remains available.
+The mock ICD and in-process Wayland server tests run without GPU hardware.

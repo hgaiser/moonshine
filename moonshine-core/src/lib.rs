@@ -7,6 +7,7 @@ pub mod config;
 pub(crate) mod crypto;
 pub mod discovery;
 pub(crate) mod durable;
+pub(crate) mod gpu;
 pub mod healthcheck;
 pub(crate) mod ingress;
 pub mod rtsp;

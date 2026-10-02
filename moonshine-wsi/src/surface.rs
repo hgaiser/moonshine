@@ -28,6 +28,45 @@ use crate::state::{
 use crate::swapchain::can_bypass_xwayland;
 use crate::xcb::{xcb_get_window_extent, xlib_to_xcb_connection};
 
+/// A proxy drop does not send wl_surface.destroy. Roll back only until the
+/// ICD has successfully created its surface; after that, live SurfaceData owns
+/// the protocol destructor (after destroying the Vulkan surface).
+struct TemporarySurface<T, F: Fn(&T)> {
+	surface: Option<T>,
+	destroy: F,
+}
+
+impl<T, F: Fn(&T)> TemporarySurface<T, F> {
+	fn new(surface: T, destroy: F) -> Self {
+		Self {
+			surface: Some(surface),
+			destroy,
+		}
+	}
+	fn get(&self) -> &T {
+		self.surface.as_ref().expect("temporary surface still owned")
+	}
+	fn transfer(mut self) -> T {
+		self.surface.take().expect("temporary surface still owned")
+	}
+}
+
+fn construct_surface<T>(surface: T, destroy: impl Fn(&T), constructor: impl FnOnce(&T) -> VkResult) -> Option<T> {
+	let temporary = TemporarySurface::new(surface, destroy);
+	if constructor(temporary.get()) != VK_SUCCESS {
+		return None;
+	}
+	Some(temporary.transfer())
+}
+
+impl<T, F: Fn(&T)> Drop for TemporarySurface<T, F> {
+	fn drop(&mut self) {
+		if let Some(surface) = self.surface.take() {
+			(self.destroy)(&surface);
+		}
+	}
+}
+
 /// Whether to bind the moonshine swapchain on the application's own Wayland
 /// display for native Wayland surfaces.  Opt-in until validated, since it
 /// takes over presentation for native Wayland clients.
@@ -899,42 +938,46 @@ unsafe fn try_xwayland_bypass(
 		}
 
 		// Create a fresh wl_surface on the compositor.
-		let wl_surface = wl.compositor.create_surface(&wl.qh, ());
-		wl.connection.flush().ok();
+		let wl_surface = construct_surface(
+			wl.compositor.create_surface(&wl.qh, ()),
+			|surface: &WlSurface| {
+				surface.destroy();
+				wl.connection.flush().ok();
+			},
+			|wl_surface| {
+				wl.connection.flush().ok();
 
-		// Get the raw wl_display* and wl_surface* for the Vulkan call.
-		let display_ptr = wl.connection.backend().display_ptr() as *mut std::ffi::c_void;
-		let surface_ptr = wl_surface.id().as_ptr() as *mut std::ffi::c_void;
+				// Get the raw wl_display* and wl_surface* for the Vulkan call.
+				let display_ptr = wl.connection.backend().display_ptr() as *mut std::ffi::c_void;
+				let surface_ptr = wl_surface.id().as_ptr() as *mut std::ffi::c_void;
 
-		// Move the wl_surface to the default event queue so the ICD's
-		// wl_display_dispatch() calls can receive events (frame callbacks,
-		// buffer releases, etc.) for this surface.  Without this, the surface
-		// lives on our private queue and the ICD blocks forever.
-		wl_proxy_set_queue(surface_ptr, std::ptr::null_mut());
+				// Move the wl_surface to the default event queue so the ICD's
+				// wl_display_dispatch() calls can receive events (frame callbacks,
+				// buffer releases, etc.) for this surface.  Without this, the surface
+				// lives on our private queue and the ICD blocks forever.
+				wl_proxy_set_queue(surface_ptr, std::ptr::null_mut());
 
-		// Create a Vulkan Wayland surface backed by our bypass wl_surface.
-		// The ICD will render directly to this surface, bypassing XWayland.
-		let create_info = VkWaylandSurfaceCreateInfoKHR {
-			s_type: ash::vk::StructureType::WAYLAND_SURFACE_CREATE_INFO_KHR,
-			p_next: std::ptr::null(),
-			flags: ash::vk::WaylandSurfaceCreateFlagsKHR::empty(),
-			display: display_ptr,
-			surface: surface_ptr,
-			_marker: PhantomData,
-		};
+				// Create a Vulkan Wayland surface backed by our bypass wl_surface.
+				// The ICD will render directly to this surface, bypassing XWayland.
+				let create_info = VkWaylandSurfaceCreateInfoKHR {
+					s_type: ash::vk::StructureType::WAYLAND_SURFACE_CREATE_INFO_KHR,
+					p_next: std::ptr::null(),
+					flags: ash::vk::WaylandSurfaceCreateFlagsKHR::empty(),
+					display: display_ptr,
+					surface: surface_ptr,
+					_marker: PhantomData,
+				};
 
-		let result = with_instance(instance_key, |data| {
-			if let Some(next) = data.dispatch.create_wayland_surface {
-				next(instance, &create_info, p_allocator, p_surface)
-			} else {
-				VK_ERROR_FEATURE_NOT_PRESENT
-			}
-		})
-		.unwrap_or(VK_ERROR_INITIALIZATION_FAILED);
-
-		if result != VK_SUCCESS {
-			return None;
-		}
+				with_instance(instance_key, |data| {
+					if let Some(next) = data.dispatch.create_wayland_surface {
+						next(instance, &create_info, p_allocator, p_surface)
+					} else {
+						VK_ERROR_FEATURE_NOT_PRESENT
+					}
+				})
+				.unwrap_or(VK_ERROR_INITIALIZATION_FAILED)
+			},
+		)?;
 
 		crate::log_debug!("try_xwayland_bypass: created wl_surface for xcb_window={}", xcb_window);
 		Some(wl_surface)
@@ -978,5 +1021,183 @@ mod tests {
 	#[test]
 	fn layer_extensions_are_non_empty() {
 		assert!(!LAYER_EXTENSIONS.is_empty());
+	}
+}
+
+#[cfg(test)]
+mod protocol_lifecycle_tests {
+	use super::*;
+	use crate::state::WaylandState;
+	use std::sync::{
+		Arc,
+		atomic::{AtomicBool, AtomicUsize, Ordering},
+	};
+	use wayland_server::protocol::{wl_compositor, wl_surface};
+	use wayland_server::{Client, DataInit, Dispatch, Display, DisplayHandle, GlobalDispatch, New};
+
+	#[derive(Default)]
+	struct Counts {
+		creates: AtomicUsize,
+		destroys: AtomicUsize,
+	}
+	struct Server(Arc<Counts>);
+	impl GlobalDispatch<wl_compositor::WlCompositor, ()> for Server {
+		fn bind(
+			_: &mut Self,
+			_: &DisplayHandle,
+			_: &Client,
+			resource: New<wl_compositor::WlCompositor>,
+			_: &(),
+			init: &mut DataInit<'_, Self>,
+		) {
+			init.init(resource, ());
+		}
+	}
+	impl Dispatch<wl_compositor::WlCompositor, ()> for Server {
+		fn request(
+			state: &mut Self,
+			_: &Client,
+			_: &wl_compositor::WlCompositor,
+			request: wl_compositor::Request,
+			_: &(),
+			_: &DisplayHandle,
+			init: &mut DataInit<'_, Self>,
+		) {
+			if let wl_compositor::Request::CreateSurface { id } = request {
+				state.0.creates.fetch_add(1, Ordering::SeqCst);
+				init.init(id, ());
+			} else {
+				panic!("unexpected compositor request");
+			}
+		}
+	}
+	impl Dispatch<wl_surface::WlSurface, ()> for Server {
+		fn request(
+			state: &mut Self,
+			_: &Client,
+			_: &wl_surface::WlSurface,
+			request: wl_surface::Request,
+			_: &(),
+			_: &DisplayHandle,
+			_: &mut DataInit<'_, Self>,
+		) {
+			assert!(matches!(request, wl_surface::Request::Destroy));
+			state.0.destroys.fetch_add(1, Ordering::SeqCst);
+		}
+	}
+	struct Fixture {
+		connection: wayland_client::Connection,
+		queue: wayland_client::EventQueue<WaylandState>,
+		compositor: wayland_client::protocol::wl_compositor::WlCompositor,
+		counts: Arc<Counts>,
+		stop: Arc<AtomicBool>,
+		server: Option<std::thread::JoinHandle<()>>,
+	}
+	impl Fixture {
+		fn new() -> Self {
+			let (client, socket) = std::os::unix::net::UnixStream::pair().unwrap();
+			let counts = Arc::new(Counts::default());
+			let stop = Arc::new(AtomicBool::new(false));
+			let server_counts = counts.clone();
+			let server_stop = stop.clone();
+			let mut display = Display::<Server>::new().unwrap();
+			display
+				.handle()
+				.create_global::<Server, wl_compositor::WlCompositor, ()>(4, ());
+			display.handle().insert_client(socket, Arc::new(())).unwrap();
+			let server = std::thread::spawn(move || {
+				let mut state = Server(server_counts);
+				let started = std::time::Instant::now();
+				while !server_stop.load(Ordering::SeqCst) && started.elapsed() < std::time::Duration::from_secs(5) {
+					display.dispatch_clients(&mut state).unwrap();
+					display.flush_clients().unwrap();
+					std::thread::sleep(std::time::Duration::from_millis(1));
+				}
+			});
+			let connection = wayland_client::Connection::from_socket(client).unwrap();
+			let (globals, queue) = wayland_client::globals::registry_queue_init::<WaylandState>(&connection).unwrap();
+			let compositor = globals.bind(&queue.handle(), 1..=4, ()).unwrap();
+			Self {
+				connection,
+				queue,
+				compositor,
+				counts,
+				stop,
+				server: Some(server),
+			}
+		}
+		fn sync(&mut self, creates: usize, destroys: usize) {
+			self.queue.roundtrip(&mut WaylandState).unwrap();
+			assert_eq!(self.counts.creates.load(Ordering::SeqCst), creates);
+			assert_eq!(self.counts.destroys.load(Ordering::SeqCst), destroys);
+		}
+	}
+	impl Drop for Fixture {
+		fn drop(&mut self) {
+			self.stop.store(true, Ordering::SeqCst);
+			self.server.take().unwrap().join().unwrap();
+		}
+	}
+	#[test]
+	fn temporary_surfaces_are_destroyed_on_every_rollback_stage_and_retry() {
+		let mut fixture = Fixture::new();
+		let mut count = 0;
+		// Failure before flush, after flush, after queue migration, missing
+		// instance/dispatch, and each failed ICD constructor result.
+		for _retry in 0..20 {
+			for stage in 0..7 {
+				let failed = construct_surface(
+					fixture.compositor.create_surface(&fixture.queue.handle(), ()),
+					|surface: &WlSurface| {
+						surface.destroy();
+						fixture.connection.flush().unwrap();
+					},
+					|surface| {
+						if stage > 0 {
+							fixture.connection.flush().unwrap();
+						}
+						if stage > 1 {
+							unsafe {
+								wl_proxy_set_queue(surface.id().as_ptr().cast(), std::ptr::null_mut());
+							}
+						}
+						match stage {
+							3 => VK_ERROR_INITIALIZATION_FAILED,
+							4 => VK_ERROR_FEATURE_NOT_PRESENT,
+							5 => VK_ERROR_DEVICE_LOST,
+							6 => ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+							_ => ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+						}
+					},
+				);
+				assert!(failed.is_none());
+				count += 1;
+				fixture.sync(count, count);
+			}
+		}
+	}
+	#[test]
+	fn successful_transfer_defers_protocol_destroy_until_live_owner_teardown() {
+		let mut fixture = Fixture::new();
+		for count in 1..=20 {
+			let live_surface = construct_surface(
+				fixture.compositor.create_surface(&fixture.queue.handle(), ()),
+				|surface: &WlSurface| {
+					surface.destroy();
+					fixture.connection.flush().unwrap();
+				},
+				|surface| {
+					unsafe {
+						wl_proxy_set_queue(surface.id().as_ptr().cast(), std::ptr::null_mut());
+					}
+					VK_SUCCESS
+				},
+			)
+			.unwrap();
+			fixture.sync(count, count - 1);
+			// Represents SurfaceData teardown after vkDestroySurfaceKHR.
+			live_surface.destroy();
+			fixture.sync(count, count);
+		}
 	}
 }

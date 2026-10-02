@@ -39,7 +39,6 @@ use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess}
 use pixelforge::{
 	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
 	EncoderTuningMode, InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext,
-	VideoContextBuilder,
 };
 
 /// Maximum number of frames in flight (submitted to the encoder but not yet
@@ -565,7 +564,11 @@ impl VideoPipeline {
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
+		let capture_context = frame_rx.context().map_err(|error| {
+			tracing::error!(%error, "Cannot start video pipeline");
+		})?;
 		let inner = VideoPipelineInner {
+			capture_context,
 			config,
 			context,
 			keys_rx,
@@ -608,6 +611,7 @@ impl VideoPipeline {
 }
 
 struct VideoPipelineInner {
+	capture_context: VideoContext,
 	config: VideoStreamConfig,
 	context: VideoStreamContext,
 	keys_rx: SessionKeysReceiver,
@@ -731,10 +735,8 @@ impl VideoPipelineInner {
 		let ctx = &self.context;
 		ctx.format.validate().map_err(str::to_string)?;
 
-		// Create Vulkan video context.
-		let context = VideoContextBuilder::new()
-			.build()
-			.map_err(|e| format!("Failed to create video context: {e}"))?;
+		// Reuse the compositor-verified device through every stream epoch.
+		let context = self.capture_context.clone();
 
 		// Convert our video format to pixelforge's codec.
 		let codec = match ctx.format.codec {
@@ -808,9 +810,7 @@ impl VideoPipelineInner {
 	) -> Result<Option<VideoReconfigureCommand>, String> {
 		let ctx = &self.context;
 		ctx.format.validate().map_err(str::to_string)?;
-		let video_context = VideoContextBuilder::new()
-			.build()
-			.map_err(|e| format!("Failed to create Vulkan context for PyroWave adapter matching: {e}"))?;
+		let video_context = self.capture_context.clone();
 		let mut encoder = PyroWaveEncoder::new(
 			&video_context,
 			ctx.format,

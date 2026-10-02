@@ -39,11 +39,13 @@ pub(crate) enum CaptureSendError {
 }
 
 pub(crate) struct CaptureSender {
+	context: Arc<std::sync::OnceLock<pixelforge::VideoContext>>,
 	tx: mpsc::SyncSender<ExportedFrame>,
 	demand_source: Option<PingSource>,
 	state: Arc<AtomicU64>,
 }
 pub(crate) struct CaptureReceiver {
+	context: Arc<std::sync::OnceLock<pixelforge::VideoContext>>,
 	rx: mpsc::Receiver<ExportedFrame>,
 	demand: Option<Ping>,
 	state: Arc<AtomicU64>,
@@ -52,6 +54,7 @@ pub(crate) struct CaptureReceiver {
 pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	let (tx, rx) = mpsc::sync_channel(1);
 	let state = Arc::new(AtomicU64::new(IDLE));
+	let context = Arc::new(std::sync::OnceLock::new());
 	let (demand, demand_source) = match make_ping() {
 		Ok((ping, source)) => (Some(ping), Some(source)),
 		Err(error) => {
@@ -61,14 +64,26 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	};
 	(
 		CaptureSender {
+			context: context.clone(),
 			tx,
 			demand_source,
 			state: state.clone(),
 		},
-		CaptureReceiver { rx, state, demand },
+		CaptureReceiver {
+			context,
+			rx,
+			state,
+			demand,
+		},
 	)
 }
 impl CaptureSender {
+	pub(crate) fn set_context(&self, context: pixelforge::VideoContext) {
+		assert!(
+			self.context.set(context).is_ok(),
+			"capture context initialized exactly once"
+		);
+	}
 	pub(crate) fn take_demand_source(&mut self) -> Option<PingSource> {
 		self.demand_source.take()
 	}
@@ -114,6 +129,12 @@ impl CaptureSender {
 	}
 }
 impl CaptureReceiver {
+	pub(crate) fn context(&self) -> Result<pixelforge::VideoContext, String> {
+		self.context
+			.get()
+			.cloned()
+			.ok_or_else(|| "Capture GPU context not initialized; compositor must be ready before streaming".into())
+	}
 	pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<ExportedFrame, mpsc::RecvTimeoutError> {
 		self.recv_timeout_if(timeout, true)
 	}

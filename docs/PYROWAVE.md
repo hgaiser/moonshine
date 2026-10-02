@@ -58,7 +58,7 @@ PyroWave-aware wire-v1 extension uses orthogonal chroma and HDR bits:
 | `0x02000000` | PyroWave HDR10 (with either advertised chroma mode) |
 
 The server advertises a chroma bit only after loading API 0.7.0, matching
-PyroWave to the selected Vulkan adapter, confirming external-memory
+PyroWave to the capture-verified Vulkan adapter, confirming external-memory
 interoperability, and creating the corresponding SDR encoder. It advertises the
 shared HDR bit only when every advertised chroma mode also passes its 10-bit
 probe. Conventional codec bits are likewise set only after creating the exact

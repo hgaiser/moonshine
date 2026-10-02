@@ -6,7 +6,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use pixelforge::{Codec, EncodeBitDepth, EncodeConfig, Encoder, PixelFormat, VideoContext, VideoContextBuilder};
+use pixelforge::{Codec, EncodeBitDepth, EncodeConfig, Encoder, PixelFormat, VideoContext};
 
 use crate::config::Config;
 use crate::session::stream::video::pyrowave::{PyroWaveEncoder, SOURCE_REVISION, SOURCE_URL};
@@ -259,6 +259,14 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 	};
 
 	run_gpu_checks(&mut report, &gpu_config);
+	// --no-health-check discards the report, but identity/selection failures
+	// must still reach the administrator before the generic startup gate.
+	for check in report.checks.iter().filter(|check| {
+		check.outcome == CheckOutcome::Failed
+			&& matches!(check.name, "GPU config" | "Render access" | "EGL/GLES" | "Vulkan")
+	}) {
+		tracing::error!(check = check.name, error = %check.message, "GPU capability probe failed");
+	}
 
 	Capabilities {
 		supported_codecs: report.supported_codecs,
@@ -270,12 +278,12 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 
 /// Run the GPU/codec/HDR probes and record their results into `report`.
 fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
-	let render_node = check_render_nodes(report, gpu_config);
-	let render_node_open = check_render_node_open(report, gpu_config, render_node.as_ref());
+	check_render_nodes(report, gpu_config);
+	let render_node_open = check_render_node_open(report, gpu_config);
 	// Prefer the configured/accessible node over the first discovered one, so
 	// the EGL probe (HDR detection) runs on the GPU the compositor will use.
-	let egl_result = check_egl(report, render_node_open.as_ref().or(render_node.as_ref()));
-	let vk_context = check_vulkan(report);
+	let egl_result = check_egl(report, render_node_open.as_ref());
+	let vk_context = check_vulkan(report, render_node_open.as_ref().filter(|_| egl_result.is_some()));
 	check_codecs(report, vk_context.as_ref());
 	report.dma_buf_supported = check_dmabuf(report, vk_context.as_ref());
 	check_wsi_layer(report);
@@ -291,7 +299,7 @@ fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
 	}
 
 	if let Some((_, hdr, _)) = &egl_result {
-		report.hdr_supported = *hdr;
+		report.hdr_supported = *hdr && vk_context.is_some() && report.dma_buf_supported;
 	}
 }
 
@@ -439,50 +447,19 @@ fn check_render_nodes(report: &mut HealthReport, _gpu_config: &Option<String>) -
 	Some(entries[0].path())
 }
 
-fn check_render_node_open(
-	report: &mut HealthReport,
-	gpu_config: &Option<String>,
-	fallback_node: Option<&PathBuf>,
-) -> Option<PathBuf> {
+fn check_render_node_open(report: &mut HealthReport, gpu_config: &Option<String>) -> Option<PathBuf> {
 	let start = Instant::now();
 	let node = match find_render_node(gpu_config) {
 		Ok(n) => n,
 		Err(e) => {
-			// When a GPU was explicitly configured but could not be resolved, this
-			// is a real misconfiguration: the compositor will fail to start with it
-			// even if the probe below passes on a fallback node. Record it as a
-			// failure so startup gating matches runtime behavior.
-			if gpu_config.is_some() {
-				let cfg = gpu_config.as_deref().unwrap_or("<unknown>");
-				match fallback_node {
-					Some(fb) => {
-						report.add_failed(
-							"GPU config",
-							format!(
-								"  Configured GPU `{}` could not be resolved: {}\n  Falling back to {} for the remaining checks, but the compositor will fail to start with this configuration.",
-								cfg,
-								e,
-								fb.display()
-							),
-							start.elapsed().as_millis() as u64,
-						);
-					},
-					None => {
-						report.add_failed(
-							"GPU config",
-							format!(
-								"  Configured GPU `{}` could not be resolved: {}\n  No usable render node found.",
-								cfg, e
-							),
-							start.elapsed().as_millis() as u64,
-						);
-						return None;
-					},
-				}
-			}
-			// No explicit config (or config invalid but a fallback exists): proceed
-			// with the fallback node.
-			fallback_node?.clone()
+			// No diagnostic fallback: even --no-health-check must not advertise
+			// an unrelated GPU when the runtime selection cannot be resolved.
+			report.add_failed(
+				"GPU config",
+				format!("  Cannot resolve capture render node: {e}"),
+				start.elapsed().as_millis() as u64,
+			);
+			return None;
 		},
 	};
 
@@ -602,9 +579,19 @@ fn check_egl(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(Strin
 	Some((gpu_name, hdr_supported, format_names))
 }
 
-fn check_vulkan(report: &mut HealthReport) -> Option<VideoContext> {
+fn check_vulkan(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<VideoContext> {
 	let start = Instant::now();
-	match VideoContextBuilder::new().app_name("Pyroshine Health Check").build() {
+	let context = node
+		.ok_or_else(|| "No usable configured capture render node/EGL path".to_string())
+		.and_then(|node| {
+			let file = std::fs::OpenOptions::new()
+				.read(true)
+				.write(true)
+				.open(node)
+				.map_err(|e| format!("Cannot open {}: {e}", node.display()))?;
+			crate::gpu::capture_context(&file)
+		});
+	match context {
 		Ok(ctx) => {
 			let props = ctx.device_properties();
 			let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }
@@ -1419,6 +1406,32 @@ pub(crate) fn find_render_node(gpu_config: &Option<String>) -> Result<PathBuf, S
 mod tests {
 	use super::*;
 	use crate::session::stream::video::ColorRange;
+
+	#[test]
+	fn unavailable_capture_path_advertises_no_video_capabilities() {
+		let mut report = HealthReport {
+			duration: Duration::ZERO,
+			checks: Vec::new(),
+			all_fatal_passed: true,
+			supported_codecs: 0,
+			hdr_supported: false,
+			dma_buf_supported: false,
+			gpu_name: String::new(),
+		};
+		let context = check_vulkan(&mut report, None);
+		assert!(context.is_none());
+		check_codecs(&mut report, context.as_ref());
+		assert!(!check_dmabuf(&mut report, context.as_ref()));
+		assert_eq!(report.supported_codecs, 0);
+		assert!(!report.hdr_supported);
+		assert!(!report.all_fatal_passed);
+		assert!(
+			report
+				.checks
+				.iter()
+				.any(|check| check.message.contains("capture render node/EGL"))
+		);
+	}
 
 	#[test]
 	fn profile_capabilities_are_not_codec_wide() {

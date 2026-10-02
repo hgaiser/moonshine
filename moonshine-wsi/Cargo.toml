@@ -17,3 +17,6 @@ libc = "0.2"
 [package.metadata.cargo-machete]
 # wayland-backend is a direct dep to enable client_system feature for system libwayland-client.so linking.
 ignored = ["wayland-backend"]
+
+[dev-dependencies]
+wayland-server = "0.31"

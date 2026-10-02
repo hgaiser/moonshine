@@ -323,6 +323,10 @@ fn run_compositor(
 		.open(&render_node)
 		.map_err(|e| format!("Failed to open render node {}: {e}", render_node.display()))?;
 
+	// Resolve against the actual opened device before publishing readiness or
+	// launching an application. Clones retain this GPU across stream epochs.
+	frame_tx.set_context(crate::gpu::capture_context(&render_fd_alloc)?);
+
 	// Clone the file handle for the EGL display's GBM device.
 	// GbmDevice takes ownership of the file, so we need a separate handle.
 	let render_fd_egl = render_fd_alloc

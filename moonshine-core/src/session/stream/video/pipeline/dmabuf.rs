@@ -632,7 +632,15 @@ mod tests {
 				.collect()
 		};
 		let format = vk::Format::B8G8R8A8_UNORM;
-		let context = pixelforge::VideoContextBuilder::new().build().unwrap();
+		let node = crate::healthcheck::find_render_node(&None).unwrap();
+		let file = std::fs::OpenOptions::new().read(true).write(true).open(node).unwrap();
+		let verified = crate::gpu::capture_context(&file).unwrap();
+		let (sender, receiver) = crate::session::compositor::admission::capture_channel();
+		sender.set_context(verified.clone());
+		let context = receiver.context().unwrap();
+		assert_eq!(context.physical_device(), verified.physical_device());
+		assert_eq!(context.device().handle(), verified.device().handle());
+		drop((sender, file, verified));
 		let mut importer = DmaBufImporter::new(context.clone(), false).unwrap();
 
 		let mut first_allocator = allocator();

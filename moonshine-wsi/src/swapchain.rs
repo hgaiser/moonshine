@@ -370,6 +370,14 @@ pub unsafe extern "C" fn destroy_swapchain(
 }
 
 pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const VkPresentInfoKHR) -> VkResult {
+	unsafe { queue_present_with_fifo(queue, p_present_info, is_forcing_fifo()) }
+}
+
+unsafe fn queue_present_with_fifo(
+	queue: VkQueue,
+	p_present_info: *const VkPresentInfoKHR,
+	force_fifo: bool,
+) -> VkResult {
 	unsafe {
 		let queue_key = device_key_of(queue);
 
@@ -379,8 +387,6 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 		} else {
 			&[]
 		};
-
-		let force_fifo = is_forcing_fifo();
 
 		// Respect an application's mode chain and never prepend a duplicate.
 		let app_mode_info = find_in_chain::<ash::vk::SwapchainPresentModeInfoEXT>(
@@ -545,6 +551,14 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 			}
 		}
 
+		// Capture driver precedence before writing any synthetic per-chain status.
+		let driver_results = if present_info.p_results.is_null() {
+			None
+		} else {
+			Some(std::slice::from_raw_parts_mut(present_info.p_results, swapchains.len()))
+		};
+		let mut outcomes = PresentOutcomes::new(result, driver_results);
+
 		// Recreate for limiter changes when the engine re-queries mode lists,
 		// or when the ICD cannot safely switch the declared modes dynamically.
 		let frame_limiter_aware = swapchains
@@ -570,16 +584,7 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 				.unwrap_or(false);
 
 				if fifo_changed {
-					if !present_info.p_results.is_null() {
-						let results = std::slice::from_raw_parts_mut(
-							present_info.p_results,
-							present_info.swapchain_count as usize,
-						);
-						if results[i] >= ash::vk::Result::SUCCESS {
-							results[i] = VK_ERROR_OUT_OF_DATE_KHR;
-						}
-					}
-					return VK_ERROR_OUT_OF_DATE_KHR;
+					outcomes.request(i, VK_ERROR_OUT_OF_DATE_KHR);
 				}
 			}
 		}
@@ -603,21 +608,56 @@ pub unsafe extern "C" fn queue_present(queue: VkQueue, p_present_info: *const Vk
 			if transition == VK_ERROR_OUT_OF_DATE_KHR {
 				retire_swapchain(sw_key);
 			}
-			// Do not replace an ICD failure with a policy hint.
-			if result < ash::vk::Result::SUCCESS {
-				return result;
-			}
-			if !present_info.p_results.is_null() {
-				let results =
-					std::slice::from_raw_parts_mut(present_info.p_results, present_info.swapchain_count as usize);
-				if results[i] >= ash::vk::Result::SUCCESS {
-					results[i] = transition;
-				}
-			}
-			return transition;
+			outcomes.request(i, transition);
 		}
 
-		result
+		outcomes.result()
+	}
+}
+
+/// Driver failures win over policy hints, including failures in mixed batches.
+/// Only SUCCESS/SUBOPTIMAL are eligible for a synthetic recreation request.
+struct PresentOutcomes<'a> {
+	driver: ash::vk::Result,
+	policy: ash::vk::Result,
+	per_chain: Option<&'a mut [ash::vk::Result]>,
+}
+
+impl<'a> PresentOutcomes<'a> {
+	fn new(driver: ash::vk::Result, per_chain: Option<&'a mut [ash::vk::Result]>) -> Self {
+		let driver = if driver.as_raw() < 0 {
+			driver
+		} else {
+			per_chain
+				.as_deref()
+				.and_then(|results| results.iter().copied().find(|r| r.as_raw() < 0))
+				.unwrap_or(driver)
+		};
+		Self {
+			driver,
+			policy: VK_SUCCESS,
+			per_chain,
+		}
+	}
+
+	fn request(&mut self, index: usize, hint: ash::vk::Result) {
+		if let Some(results) = self.per_chain.as_deref_mut() {
+			if !matches!(results[index], VK_SUCCESS | VK_SUBOPTIMAL_KHR) {
+				return;
+			}
+			results[index] = hint;
+		}
+		if hint == VK_ERROR_OUT_OF_DATE_KHR || self.policy == VK_SUCCESS {
+			self.policy = hint;
+		}
+	}
+
+	fn result(&self) -> ash::vk::Result {
+		if matches!(self.driver, VK_SUCCESS | VK_SUBOPTIMAL_KHR) && self.policy != VK_SUCCESS {
+			self.policy
+		} else {
+			self.driver
+		}
 	}
 }
 
@@ -1092,5 +1132,210 @@ mod tests {
 	fn nits_dark_typical_min() {
 		// 0.005 cd/m² (typical OLED) × 10000 = 50
 		assert_eq!(nits_to_u16_dark(0.005), 50);
+	}
+}
+
+#[cfg(test)]
+mod present_driver_tests {
+	use super::*;
+	use crate::state::{
+		DeviceData, DeviceKey, InstanceKey, SwapchainData, insert_device, insert_swapchain, remove_device,
+		remove_swapchain,
+	};
+	use std::collections::VecDeque;
+
+	#[repr(C)]
+	struct Driver {
+		key: usize,
+		aggregate: VkResult,
+		per_chain: [VkResult; 3],
+		calls: usize,
+		modes: Vec<VkPresentModeKHR>,
+	}
+	unsafe extern "C" fn present(queue: VkQueue, info: *const VkPresentInfoKHR) -> VkResult {
+		unsafe {
+			let driver = &mut *(queue.as_raw() as *mut Driver);
+			let info = &*info;
+			driver.calls += 1;
+			if !info.p_results.is_null() {
+				std::ptr::copy_nonoverlapping(driver.per_chain.as_ptr(), info.p_results, info.swapchain_count as usize);
+			}
+			if let Some(modes) = find_in_chain::<ash::vk::SwapchainPresentModeInfoEXT>(
+				info.p_next,
+				ash::vk::StructureType::SWAPCHAIN_PRESENT_MODE_INFO_EXT,
+			) {
+				driver.modes =
+					std::slice::from_raw_parts((*modes).p_present_modes, (*modes).swapchain_count as usize).to_vec();
+			}
+			driver.aggregate
+		}
+	}
+	unsafe extern "C" fn get_proc(_: VkDevice, _: *const std::ffi::c_char) -> PFN_vkVoidFunction {
+		None
+	}
+	unsafe extern "C" fn destroy(_: VkDevice, _: *const VkAllocationCallbacks) {}
+
+	struct Fixture {
+		driver: Box<Driver>,
+		chains: [VkSwapchain; 3],
+	}
+	impl Fixture {
+		fn new(aggregate: VkResult, per_chain: [VkResult; 3], dynamic: bool, at_creation: bool) -> Self {
+			let mut driver = Box::new(Driver {
+				key: 0,
+				aggregate,
+				per_chain,
+				calls: 0,
+				modes: Vec::new(),
+			});
+			driver.key = (&*driver as *const Driver) as usize;
+			let key = DeviceKey(driver.key);
+			insert_device(
+				key,
+				DeviceData {
+					dispatch: DeviceDispatch {
+						get_device_proc_addr: get_proc,
+						destroy_device: destroy,
+						queue_present: Some(present),
+						create_swapchain: None,
+						get_swapchain_images: None,
+						destroy_swapchain: None,
+						acquire_next_image: None,
+						set_hdr_metadata: None,
+						acquire_next_image2: None,
+						get_refresh_cycle_duration: None,
+						get_past_presentation_timing: None,
+					},
+					instance_key: InstanceKey(driver.key),
+					has_maintenance1: dynamic,
+					physical_device: VkPhysicalDevice::null(),
+				},
+			);
+			let chains = std::array::from_fn(|i| VkSwapchain::from_raw(driver.key as u64 + i as u64 + 1));
+			for chain in chains {
+				insert_swapchain(
+					SwapchainKey::from_raw(chain.as_raw()),
+					SwapchainData {
+						device_key: key,
+						present_mode: VkPresentModeKHR::IMMEDIATE,
+						icd_present_mode: VkPresentModeKHR::IMMEDIATE,
+						declared_present_modes: if dynamic {
+							vec![VkPresentModeKHR::IMMEDIATE, VkPresentModeKHR::FIFO]
+						} else {
+							vec![]
+						},
+						_format: ash::vk::Format::UNDEFINED,
+						_color_space: ash::vk::ColorSpaceKHR::SRGB_NONLINEAR,
+						_image_count: Some(3),
+						_extent: ash::vk::Extent2D::default(),
+						_surface: VkSurface::null(),
+						ms_swapchain: None,
+						refresh_cycle_ns: 0,
+						retired: false,
+						force_fifo_at_creation: at_creation,
+						is_bypassing_xwayland: false,
+						past_timings: VecDeque::new(),
+					},
+				);
+			}
+			Self { driver, chains }
+		}
+		fn present(&mut self, force: bool, results: Option<&mut [VkResult; 3]>) -> VkResult {
+			let indices = [0; 3];
+			let info = VkPresentInfoKHR {
+				swapchain_count: 3,
+				p_swapchains: self.chains.as_ptr(),
+				p_image_indices: indices.as_ptr(),
+				p_results: results.map_or(std::ptr::null_mut(), |r| r.as_mut_ptr()),
+				..Default::default()
+			};
+			unsafe { queue_present_with_fifo(VkQueue::from_raw(self.driver.key as u64), &info, force) }
+		}
+	}
+	impl Drop for Fixture {
+		fn drop(&mut self) {
+			for chain in self.chains {
+				remove_swapchain(SwapchainKey::from_raw(chain.as_raw()));
+			}
+			remove_device(DeviceKey(self.driver.key));
+		}
+	}
+	#[test]
+	fn limiter_toggles_preserve_icd_failures_with_and_without_results() {
+		for status in [
+			VK_SUCCESS,
+			VK_SUBOPTIMAL_KHR,
+			VK_ERROR_DEVICE_LOST,
+			ash::vk::Result::ERROR_OUT_OF_HOST_MEMORY,
+			ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY,
+		] {
+			for force in [false, true] {
+				for per_chain in [false, true] {
+					let mut fixture = Fixture::new(status, [status; 3], false, !force);
+					let mut results = [VK_SUCCESS; 3];
+					let result = fixture.present(force, per_chain.then_some(&mut results));
+					let expected = if status.as_raw() < 0 {
+						status
+					} else {
+						VK_ERROR_OUT_OF_DATE_KHR
+					};
+					assert_eq!(result, expected);
+					if per_chain {
+						assert_eq!(results, [expected; 3]);
+					}
+					assert_eq!(fixture.driver.calls, 1);
+				}
+			}
+		}
+	}
+	#[test]
+	fn mixed_results_keep_each_driver_failure_and_update_all_eligible_chains() {
+		let failure = ash::vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
+		for aggregate in [VK_SUCCESS, VK_SUBOPTIMAL_KHR, VK_ERROR_DEVICE_LOST] {
+			let mut fixture = Fixture::new(aggregate, [VK_SUCCESS, failure, VK_SUBOPTIMAL_KHR], false, false);
+			let mut results = [VK_SUCCESS; 3];
+			assert_eq!(
+				fixture.present(true, Some(&mut results)),
+				if aggregate.as_raw() < 0 { aggregate } else { failure }
+			);
+			assert_eq!(results, [VK_ERROR_OUT_OF_DATE_KHR, failure, VK_ERROR_OUT_OF_DATE_KHR]);
+		}
+	}
+	#[test]
+	fn dynamic_fifo_toggles_keep_modes_and_results_without_recreation() {
+		let mut fixture = Fixture::new(VK_SUCCESS, [VK_SUCCESS; 3], true, false);
+		for force in [true, false, true, false] {
+			let mut results = [VK_SUCCESS; 3];
+			assert_eq!(fixture.present(force, Some(&mut results)), VK_SUCCESS);
+			assert_eq!(results, [VK_SUCCESS; 3]);
+			assert!(
+				fixture.driver.modes
+					== vec![
+						if force {
+							VkPresentModeKHR::FIFO
+						} else {
+							VkPresentModeKHR::IMMEDIATE
+						};
+						3
+					]
+			);
+		}
+	}
+	#[test]
+	fn bypass_and_limiter_hints_share_driver_precedence() {
+		let mut per_chain = [VK_SUCCESS, VK_SUBOPTIMAL_KHR, VK_ERROR_DEVICE_LOST];
+		let mut outcomes = PresentOutcomes::new(VK_SUCCESS, Some(&mut per_chain));
+		outcomes.request(0, VK_SUBOPTIMAL_KHR);
+		outcomes.request(1, VK_ERROR_OUT_OF_DATE_KHR);
+		outcomes.request(2, VK_ERROR_OUT_OF_DATE_KHR);
+		assert_eq!(outcomes.result(), VK_ERROR_DEVICE_LOST);
+		assert_eq!(
+			per_chain,
+			[VK_SUBOPTIMAL_KHR, VK_ERROR_OUT_OF_DATE_KHR, VK_ERROR_DEVICE_LOST]
+		);
+		let mut outcomes = PresentOutcomes::new(VK_SUBOPTIMAL_KHR, None);
+		outcomes.request(0, VK_ERROR_OUT_OF_DATE_KHR);
+		outcomes.request(1, VK_SUBOPTIMAL_KHR);
+		assert_eq!(outcomes.result(), VK_ERROR_OUT_OF_DATE_KHR);
 	}
 }

@@ -46,6 +46,20 @@ capabilities; it does not bypass the DMA-BUF requirement. Advertised codec/HDR
 support comes from actual encoder/profile probes and configuration, not merely
 from finding a library or extension name.
 
+`gpu.rs` verifies the selected Vulkan context against the opened GBM/EGL DRM
+node using `VK_EXT_physical_device_drm`, with complete PCI identity as a fallback.
+The compositor publishes a verified, shared `VideoContext` through the capture
+channel before readiness. Conventional encoding, DMA-BUF import and PyroWave UUID
+matching clone that context throughout the session and reconnects. Healthcheck uses
+the same verification before profile probes, including with `--no-health-check`.
+Unresolvable configuration or unknown/mismatched device identity advertises no
+codec/HDR/DMA-BUF capability and prevents startup/session launch. No cross-device
+capture-to-encoder path is validated or enabled. This identity check does not prove
+that every application's client DMA-BUF format/modifier imports successfully;
+normal import validation and terminal failure handling still apply. Applications
+on a different GPU can use compositor composition if their EGL imports work;
+that client-to-compositor transfer is separate from capture-to-encoder selection.
+
 A missing/incompatible optional PyroWave library leaves conventional codecs
 available. A negotiated PyroWave stream does not silently switch to another
 codec or software encoder. See [PyroWave](PYROWAVE.md#capability-and-negotiation-extension).

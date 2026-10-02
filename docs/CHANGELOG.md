@@ -14,6 +14,14 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-6] - 2026-10-01
+
+### Fixed
+
+- Verify capture and Vulkan encoder/import GPU identity before advertising capabilities or launching a session; reject unvalidated cross-device paths with actionable diagnostics and retain the verified context across reconnects.
+- Preserve Vulkan driver presentation errors during limiter and bypass changes, and update all eligible per-swapchain recreation results in mixed batches.
+- Destroy temporary Wayland bypass surfaces exactly once on construction failure while preserving successful surface ownership and XCB fallback.
+
 ## [v0.17.0-beta-5] - 2026-10-01
 
 ### Security
