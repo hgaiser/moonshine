@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
@@ -257,7 +256,14 @@ impl LaunchedSession {
 		audio_ctx: AudioStreamContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		inhibit_sleep: bool,
-	) -> Result<(ActiveSession, Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>), ()> {
+	) -> Result<
+		(
+			ActiveSession,
+			tokio::sync::watch::Sender<bool>,
+			tokio::sync::watch::Sender<bool>,
+		),
+		(),
+	> {
 		let Self {
 			context,
 			launched_compositor,
@@ -287,9 +293,9 @@ impl LaunchedSession {
 			.start(audio_ctx, keys_rx)
 			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
 
-		// Clone the start notifies for external triggering (e.g. bench binary).
-		let video_start_notify = video_handle.clone_start_notify();
-		let audio_start_notify = audio_trigger.clone_start_notify();
+		// Clone the start flags for external triggering (e.g. bench binary).
+		let video_start = video_handle.clone_start();
+		let audio_start = audio_trigger.clone_start();
 
 		// Keep a handle to the video stream so a resuming client can reset its
 		// frame counters (see `ActiveSession::reset_video_stream`).
@@ -318,8 +324,8 @@ impl LaunchedSession {
 				video_handle: video_handle_for_resume,
 				sleep_inhibitor,
 			},
-			video_start_notify,
-			audio_start_notify,
+			video_start,
+			audio_start,
 		))
 	}
 }

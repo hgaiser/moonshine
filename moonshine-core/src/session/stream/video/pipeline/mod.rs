@@ -15,7 +15,7 @@ use std::sync::atomic::Ordering;
 use ash::vk;
 use async_shutdown::ShutdownManager;
 use smithay::backend::allocator::Buffer;
-use tokio::sync::{Notify, broadcast, mpsc, watch};
+use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::CompositorFrames;
@@ -458,7 +458,7 @@ impl VideoPipeline {
 		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		start_notify: Arc<Notify>,
+		start: watch::Receiver<bool>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
@@ -487,7 +487,7 @@ impl VideoPipeline {
 					reset_request_rx,
 					stop_session_manager,
 					hdr_metadata_tx,
-					start_notify,
+					start,
 					stats_tx,
 				);
 			})
@@ -516,7 +516,7 @@ impl VideoPipelineInner {
 		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		start_notify: Arc<Notify>,
+		mut start: watch::Receiver<bool>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) {
 		tracing::debug!("Starting video pipeline.");
@@ -531,10 +531,10 @@ impl VideoPipelineInner {
 			.enable_all()
 			.build()
 			.expect("Failed to build tokio runtime for video pipeline");
-		if rt
-			.block_on(stop_session_manager.wrap_cancel(start_notify.notified()))
-			.is_err()
-		{
+		if !matches!(
+			rt.block_on(stop_session_manager.wrap_cancel(start.wait_for(|started| *started))),
+			Ok(Ok(_))
+		) {
 			tracing::debug!("Video pipeline stopped before start signal.");
 			return;
 		}
