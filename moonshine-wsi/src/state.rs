@@ -365,8 +365,7 @@ pub struct SurfaceData {
 	/// The `wl_surface` on the Moonshine compositor associated with this
 	/// tracked Vulkan surface.
 	///
-	/// Only XWayland bypass surfaces are tracked; native Wayland surfaces
-	/// pass through to the ICD without an entry in `SURFACE_MAP`.
+	/// XWayland bypass surfaces and opted-in native Wayland surfaces are tracked.
 	pub wl_surface: WlSurface,
 	/// For XWayland bypass: the original XCB window ID.
 	pub xcb_window: Option<u32>,
@@ -507,6 +506,18 @@ pub fn remove_surface(key: SurfaceKey) {
 
 pub fn with_surface<R>(key: SurfaceKey, f: impl FnOnce(&SurfaceData) -> R) -> Option<R> {
 	surface_map().force_read().get(&key).map(f)
+}
+
+pub fn surface_hdr_supported(instance: InstanceKey, surface: SurfaceKey) -> bool {
+	let Some(native) = with_surface(surface, |s| s.native.as_ref().map(|n| n.connection.clone())) else {
+		return false;
+	};
+	native
+		.or_else(|| get_wayland_connection(instance))
+		.is_some_and(|connection| {
+			let wl = connection.force_lock();
+			!wl.dead && wl.caps.hdr_supported
+		})
 }
 
 pub fn insert_swapchain(key: SwapchainKey, data: SwapchainData) {

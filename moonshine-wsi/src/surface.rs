@@ -23,7 +23,7 @@ use crate::dispatch::*;
 use crate::instance::connect_to_foreign_display;
 use crate::state::{
 	InstanceKey, MutexExt, SurfaceData, SurfaceKey, get_wayland_connection, insert_surface, is_layer_active,
-	remove_surface, with_instance, with_surface,
+	remove_surface, surface_hdr_supported, with_instance, with_surface,
 };
 use crate::swapchain::can_bypass_xwayland;
 use crate::xcb::{xcb_get_window_extent, xlib_to_xcb_connection};
@@ -228,21 +228,13 @@ unsafe fn create_plain_xcb_surface(
 	}
 }
 
-/// Returns the XCB fallback surface to present through when XWayland bypass is
-/// not safe for `surface`, or `None` to use `surface` as-is.
-///
-/// A `None` result also means the surface is not layer-managed (e.g. a native
-/// Wayland surface), in which case the app's own surface is used.
-pub(crate) unsafe fn icd_fallback_surface(surface: VkSurface) -> Option<VkSurface> {
-	unsafe {
-		let key = SurfaceKey::from_raw(surface.as_raw());
-		let fallback = with_surface(key, |sd| sd.fallback_surface)?;
-		if fallback.is_null() || can_bypass_xwayland(key) {
-			None
-		} else {
-			Some(fallback)
-		}
+/// Select the ICD fallback using the same bypass decision as the caller.
+/// Untracked surfaces and surfaces without a fallback use the original surface.
+pub(crate) fn icd_fallback_surface(surface: VkSurface, bypass_allowed: bool) -> Option<VkSurface> {
+	if bypass_allowed {
+		return None;
 	}
+	with_surface(SurfaceKey::from_raw(surface.as_raw()), |s| s.fallback_surface).filter(|fallback| !fallback.is_null())
 }
 
 /// Convert a libX11 `Display*` to an `xcb_connection_t*` using
@@ -340,7 +332,8 @@ pub unsafe extern "C" fn get_physical_device_surface_capabilities(
 	unsafe {
 		let instance_key = instance_key_of(physical_device);
 
-		let fallback = icd_fallback_surface(surface);
+		let bypass_allowed = can_bypass_xwayland(SurfaceKey::from_raw(surface.as_raw()));
+		let fallback = icd_fallback_surface(surface, bypass_allowed);
 		let icd_surface = fallback.unwrap_or(surface);
 
 		let result = with_instance(instance_key, |data| {
@@ -376,7 +369,9 @@ pub unsafe extern "C" fn get_physical_device_surface_capabilities2(
 	unsafe {
 		let instance_key = instance_key_of(physical_device);
 
-		let fallback = icd_fallback_surface((*p_surface_info).surface);
+		let surface = (*p_surface_info).surface;
+		let bypass_allowed = can_bypass_xwayland(SurfaceKey::from_raw(surface.as_raw()));
+		let fallback = icd_fallback_surface(surface, bypass_allowed);
 		let mut icd_surface_info = *p_surface_info;
 		if let Some(fb) = fallback {
 			icd_surface_info.surface = fb;
@@ -434,7 +429,8 @@ pub unsafe extern "C" fn get_physical_device_surface_present_modes(
 			return VK_SUCCESS;
 		}
 
-		let icd_surface = icd_fallback_surface(surface).unwrap_or(surface);
+		let bypass_allowed = can_bypass_xwayland(SurfaceKey::from_raw(surface.as_raw()));
+		let icd_surface = icd_fallback_surface(surface, bypass_allowed).unwrap_or(surface);
 
 		with_instance(instance_key, |data| {
 			if let Some(next) = data.dispatch.get_physical_device_surface_present_modes {
@@ -636,11 +632,10 @@ pub unsafe extern "C" fn get_physical_device_surface_formats(
 	unsafe {
 		let instance_key = instance_key_of(physical_device);
 
-		let hdr_supported = get_wayland_connection(instance_key)
-			.map(|arc| arc.force_lock().caps.hdr_supported)
-			.unwrap_or(false);
+		let hdr_supported = surface_hdr_supported(instance_key, SurfaceKey::from_raw(surface.as_raw()));
 
-		let fallback = icd_fallback_surface(surface);
+		let bypass_allowed = can_bypass_xwayland(SurfaceKey::from_raw(surface.as_raw()));
+		let fallback = icd_fallback_surface(surface, bypass_allowed);
 		let icd_surface = fallback.unwrap_or(surface);
 
 		let call_icd = |count, buf| {
@@ -654,9 +649,9 @@ pub unsafe extern "C" fn get_physical_device_surface_formats(
 			.unwrap_or(VK_ERROR_INITIALIZATION_FAILED)
 		};
 
-		// HDR formats only apply on the bypass path; the XCB fallback goes
-		// through XWayland's Glamor compositing, which cannot carry HDR.
-		if !hdr_supported || fallback.is_some() {
+		// Only the bypass route reports the injected color spaces through
+		// swapchain feedback; the XCB fallback goes through Glamor.
+		if !hdr_supported || !bypass_allowed {
 			return call_icd(p_surface_format_count, p_surface_formats);
 		}
 
@@ -683,11 +678,10 @@ pub unsafe extern "C" fn get_physical_device_surface_formats2(
 	unsafe {
 		let instance_key = instance_key_of(physical_device);
 
-		let hdr_supported = get_wayland_connection(instance_key)
-			.map(|arc| arc.force_lock().caps.hdr_supported)
-			.unwrap_or(false);
-
-		let fallback = icd_fallback_surface((*p_surface_info).surface);
+		let surface = (*p_surface_info).surface;
+		let hdr_supported = surface_hdr_supported(instance_key, SurfaceKey::from_raw(surface.as_raw()));
+		let bypass_allowed = can_bypass_xwayland(SurfaceKey::from_raw(surface.as_raw()));
+		let fallback = icd_fallback_surface(surface, bypass_allowed);
 		let mut icd_surface_info = *p_surface_info;
 		if let Some(fb) = fallback {
 			icd_surface_info.surface = fb;
@@ -704,7 +698,7 @@ pub unsafe extern "C" fn get_physical_device_surface_formats2(
 			.unwrap_or(VK_ERROR_INITIALIZATION_FAILED)
 		};
 
-		if !hdr_supported || fallback.is_some() {
+		if !hdr_supported || !bypass_allowed {
 			return call_icd(p_surface_format_count, p_surface_formats);
 		}
 
