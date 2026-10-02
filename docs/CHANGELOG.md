@@ -14,6 +14,20 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-9] - 2026-10-01
+
+### Added
+
+- Add `--cycles` and `--reconnect-cycles` to `moonshine-bench` for repeated-session acceptance on real hardware: launch → stream → stop → relaunch sessions, or authenticated reconnect epochs on one retained application, changing one negotiated setting per cycle and checking delivered frames, port and application-unit release, child processes and process resources.
+
+### Fixed
+
+- Stop `moonshine-bench` runs from ending after one minute: without a Moonlight client sending control pings, the session's control timeout stopped `--duration 0` and every run longer than 60 seconds.
+
+### Changed
+
+- Report hardware-dependent tests (pinned PyroWave FFI load, GPU DMA-BUF import) as ignored in ordinary test runs instead of passing without executing; CI selects the FFI check explicitly and fails unless it loaded the library.
+
 ## [v0.17.0-beta-8] - 2026-10-01
 
 ### Fixed

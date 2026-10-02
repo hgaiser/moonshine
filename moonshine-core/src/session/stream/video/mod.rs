@@ -832,10 +832,10 @@ mod tests {
 				.unwrap();
 				waiting.await.unwrap();
 			} else {
-				stop.trigger_shutdown(SessionShutdownReason::VideoPacketHandlerStopped);
+				let _ = stop.trigger_shutdown(SessionShutdownReason::VideoPacketHandlerStopped);
 			}
 			if pause {
-				stop.trigger_shutdown(SessionShutdownReason::VideoPacketHandlerStopped);
+				let _ = stop.trigger_shutdown(SessionShutdownReason::VideoPacketHandlerStopped);
 			}
 			tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
 				.await
@@ -1116,6 +1116,69 @@ mod tests {
 				.await
 				.is_err()
 		);
+	}
+
+	/// TEST-001 fault injection on the real owners: `VideoStream::start` spawns
+	/// the registered UDP packet handler and then fails to construct the
+	/// pipeline (no verified capture device). Over 100 sessions on one fixed
+	/// port, the failed start must still be joined by the session's completion
+	/// and must release the port for the next session.
+	#[tokio::test]
+	async fn failed_pipeline_construction_releases_the_started_packet_handler() {
+		let port = tokio::net::UdpSocket::bind("127.0.0.1:0")
+			.await
+			.unwrap()
+			.local_addr()
+			.unwrap()
+			.port();
+		let config = VideoStreamConfig {
+			port,
+			..Default::default()
+		};
+		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
+		for cycle in 0..100 {
+			let stop = ShutdownManager::new();
+			let (_capture_tx, capture_rx) = crate::session::compositor::admission::capture_channel();
+			let stream = VideoStream::new(
+				config.clone(),
+				"127.0.0.1".into(),
+				capture_rx,
+				watch::channel(HdrModeState::new(false)).0,
+				stop.clone(),
+				broadcast::channel(1).0,
+			)
+			.await
+			.unwrap_or_else(|()| panic!("cycle {cycle}: previous session still owns the video port"));
+			let keys = watch::channel(crate::session::keys::KeyLedger::default().publish(
+				crate::session::SessionKeyData::new(
+					crate::session::RemoteInputKey::from_bytes([1; 16]),
+					crate::session::RemoteInputKeyId::new(1),
+				),
+			));
+			let started = stream.start(
+				config.clone(),
+				VideoStreamContext {
+					width: 1920,
+					height: 1080,
+					fps: 60,
+					packet_size: 1392,
+					bitrate: 20_000_000,
+					..Default::default()
+				},
+				keys.1,
+				authorization_rx.clone(),
+				stop.clone(),
+			);
+			assert!(started.is_err(), "cycle {cycle}: no capture device was verified");
+			// The manager's failed-transition path stops the session.
+			let _ = stop.trigger_shutdown(SessionShutdownReason::TransitionFailed);
+			tokio::time::timeout(std::time::Duration::from_secs(5), stop.wait_shutdown_complete())
+				.await
+				.unwrap_or_else(|_| panic!("cycle {cycle}: started packet handler was not joined"));
+			tokio::net::UdpSocket::bind(("127.0.0.1", port))
+				.await
+				.unwrap_or_else(|e| panic!("cycle {cycle}: completed stop must release the port: {e}"));
+		}
 	}
 
 	fn test_authorization(

@@ -27,7 +27,16 @@ def instrument(root, current_root):
     s = s.replace('\t\t\tpacketize: packetize_dur,\n\t\t\tsend:', '\t\t\tpacketize: packetize_dur,\n\t\t\tenqueue: send_dur,\n\t\t\tsend:', 1)
     s = s.replace('send: sent.duration_since(packetized),', 'enqueue: std::time::Duration::ZERO,\n\t\t\t\tsend: sent.duration_since(packetized),')
     p.write_text(s)
-    (root / 'moonshine-tools/src/bin/bench.rs').write_text((current_root / 'moonshine-tools/src/bin/bench.rs').read_text())
+    # Share the current stats reader; lifecycle cycles need newer manager APIs.
+    bench = (current_root / 'moonshine-tools/src/bin/bench.rs').read_text()
+    bench = bench.replace('#[path = "bench/cycles.rs"]\nmod cycles;\n', '')
+    bench = bench.replace('''\tif args.cycles > 0 {
+\t\tcycles::run_full_cycles(&args).await
+\t} else if args.reconnect_cycles > 0 {
+\t\tcycles::run_reconnect_cycles(&args).await
+\t} else if args.matrix''', '\tif args.matrix')
+    assert 'cycles::' not in bench
+    (root / 'moonshine-tools/src/bin/bench.rs').write_text(bench)
     p = root / 'moonshine-core/src/session/stream/video/diagnostics.rs'
     s = p.read_text().replace('packetize: Duration::', 'enqueue: Duration::ZERO,\n\t\t\tpacketize: Duration::')
     p.write_text(s)

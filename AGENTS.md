@@ -121,7 +121,7 @@ from CI (native prerequisites are in `CONTRIBUTING.md`):
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-features -- -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
 ```
@@ -129,10 +129,12 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
 CI also runs `cargo machete` (install with `cargo install cargo-machete`),
 `python3 scripts/changelog.py check`, and
 `python3 -m unittest discover -s scripts -p 'test_changelog.py'`.
-Its test leg builds PyroWave with `scripts/build-pyrowave.sh` and runs
-`session::stream::video::pyrowave::tests::ffi_loads_pinned_api` in `moonshine-core`
-with `MOONSHINE_TEST_PYROWAVE=1` and `MOONSHINE_PYROWAVE_LIBRARY` pointing to the
-built library; use the full invocation in `CONTRIBUTING.md` or CI.
+Its test leg builds PyroWave with `scripts/build-pyrowave.sh` and runs the
+`#[ignore]`d `session::stream::video::pyrowave::tests::ffi_loads_pinned_api` in
+`moonshine-core` with `--ignored`, `MOONSHINE_TEST_PYROWAVE=1` and
+`MOONSHINE_PYROWAVE_LIBRARY` pointing to the built library; use the full
+invocation in `CONTRIBUTING.md` or CI. Hardware-dependent tests are ignored by
+default so a run without hardware reports them as not executed, never as passed.
 
 - Documentation-only work needs diff/Markdown/path checks and `git diff --check`,
   not a full native build. Select other checks according to the affected behavior.

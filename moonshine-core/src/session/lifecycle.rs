@@ -123,6 +123,14 @@ mod tests {
 		ShutdownManager::new()
 	}
 
+	/// A lost opening must fail the test, not hang it.
+	async fn started(wait: impl std::future::Future<Output = Result<(), ()>>) {
+		tokio::time::timeout(Duration::from_secs(1), wait)
+			.await
+			.expect("an opened latch must start its waiter")
+			.unwrap();
+	}
+
 	#[tokio::test]
 	async fn latch_opened_before_any_waiter_starts_every_waiter() {
 		let stop = stop();
@@ -137,7 +145,7 @@ mod tests {
 					.unwrap();
 			}
 			// A waiter created after opening also starts immediately.
-			latch.waiter().wait(&stop).await.unwrap();
+			started(latch.waiter().wait(&stop)).await;
 		}
 	}
 
@@ -149,8 +157,8 @@ mod tests {
 		assert!(latch.open());
 		assert!(!latch.open(), "only the first StartB opens the latch");
 		assert!(latch.is_open());
-		first.wait(&stop).await.unwrap();
-		latch.waiter().wait(&stop).await.unwrap();
+		started(first.wait(&stop)).await;
+		started(latch.waiter().wait(&stop)).await;
 	}
 
 	#[tokio::test]

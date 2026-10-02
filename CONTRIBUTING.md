@@ -145,18 +145,33 @@ CI runs these workspace checks:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-features -- -D warnings
+cargo clippy --workspace --all-features --all-targets -- -D warnings
 cargo test --workspace --all-features
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
 ```
 
-To verify the pinned PyroWave C API with the library you just built:
+Hardware-dependent tests are `#[ignore]`d, so an ordinary run reports them as
+ignored rather than passed. Select them explicitly; a selected check fails if
+its opt-in is missing. To verify the pinned PyroWave C API with the library you
+just built (the output must show `1 passed` and `pyrowave-ffi: loaded`):
 
 ```sh
 MOONSHINE_TEST_PYROWAVE=1 \
 MOONSHINE_PYROWAVE_LIBRARY=/tmp/pyrowave-install/lib/libpyrowave-shared.so.0 \
-  cargo test -p moonshine-core session::stream::video::pyrowave::tests::ffi_loads_pinned_api
+  cargo test -p moonshine-core session::stream::video::pyrowave::tests::ffi_loads_pinned_api \
+  -- --ignored --exact --nocapture
 ```
+
+On a host with a GPU render node, the DMA-BUF source-ownership import test:
+
+```sh
+MOONSHINE_TEST_GPU=1 cargo test -p moonshine-core \
+  session::stream::video::pipeline::dmabuf::tests::gpu_import_after_source_owner_teardown_and_fd_reuse \
+  -- --ignored --exact --nocapture
+```
+
+Repeated-session acceptance on real hardware uses the benchmark's
+[lifecycle cycles](docs/BENCHMARKING.md#lifecycle-cycles).
 
 For codec, compositor, or transport changes, also run the relevant
 [GPU validation matrix](docs/PYROWAVE.md), [benchmarks](docs/BENCHMARKING.md),

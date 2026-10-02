@@ -316,6 +316,20 @@ impl AudioStream {
 		address: String,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
+		let pulse_socket_dir = dirs::runtime_dir()
+			.ok_or_else(|| tracing::error!("Failed to get runtime directory for PulseAudio socket"))?
+			.join("moonshine/pulse");
+		Self::new_in(config, address, stop, &pulse_socket_dir).await
+	}
+
+	/// [`Self::new`] with the PulseAudio socket in `pulse_socket_dir`. Tests use
+	/// a private directory: the fixed production path may belong to a live session.
+	async fn new_in(
+		config: AudioStreamConfig,
+		address: String,
+		stop: ShutdownManager<SessionShutdownReason>,
+		pulse_socket_dir: &std::path::Path,
+	) -> Result<Self, ()> {
 		tracing::debug!("Initializing audio stream.");
 
 		let udp_socket = UdpSocket::bind((address, config.port))
@@ -323,10 +337,7 @@ impl AudioStream {
 			.map_err(|e| tracing::error!("Failed to bind to UDP socket: {e}"))?;
 
 		// Create the socket directory for the PulseAudio server.
-		let pulse_socket_dir = dirs::runtime_dir()
-			.ok_or_else(|| tracing::error!("Failed to get runtime directory for PulseAudio socket"))?
-			.join("moonshine/pulse");
-		std::fs::create_dir_all(&pulse_socket_dir)
+		std::fs::create_dir_all(pulse_socket_dir)
 			.map_err(|e| tracing::error!("Failed to create pulse socket directory: {e}"))?;
 		let pulse_socket_path = pulse_socket_dir.join("native");
 
@@ -675,6 +686,83 @@ mod tests {
 		tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
 			.await
 			.unwrap();
+	}
+
+	/// TEST-001: the real audio owners — Pulse server, Opus encoder thread and
+	/// UDP packet handler — through 100 sessions on one fixed port, alternating
+	/// stereo/5.1/7.1, 5/10 ms packets, quality, encryption and no, single or
+	/// duplicated `StartB`. Started cycles must deliver audio to the authorized
+	/// endpoint; every completed stop must have released the port.
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn hundred_real_audio_sessions_release_a_fixed_port() {
+		let pulse_dir = tempfile::tempdir().unwrap();
+		let port = UdpSocket::bind("127.0.0.1:0")
+			.await
+			.unwrap()
+			.local_addr()
+			.unwrap()
+			.port();
+		let mut ledger = crate::session::keys::KeyLedger::default();
+		for cycle in 0..100u32 {
+			let stop = ShutdownManager::new();
+			let audio = AudioStream::new_in(
+				AudioStreamConfig { port },
+				"127.0.0.1".into(),
+				stop.clone(),
+				pulse_dir.path(),
+			)
+			.await
+			.unwrap_or_else(|()| panic!("cycle {cycle}: previous session still owns the audio port"));
+			let (channels, mask) = [
+				(AudioChannels::Stereo, 0x3),
+				(AudioChannels::Surround51, 0x3f),
+				(AudioChannels::Surround71, 0x63f),
+			][cycle as usize % 3];
+			let context = AudioStreamContext {
+				packet_duration_ms: if (cycle / 3) % 2 == 0 { 5 } else { 10 },
+				qos: false,
+				audio_config: AudioConfig::from_channels(channels, mask, cycle % 2 == 0),
+				encrypt_audio: cycle % 4 < 2,
+			};
+			let keys = ledger.publish(crate::session::SessionKeyData::new(
+				crate::session::RemoteInputKey::from_bytes([cycle as u8; 16]),
+				crate::session::RemoteInputKeyId::new(cycle),
+			));
+			let authorization = StreamAuthorization::new(u64::from(cycle) + 1, "127.0.0.1".parse().unwrap()).unwrap();
+			let (_keys_tx, keys_rx) = watch::channel(keys);
+			let (_authorization_tx, authorization_rx) = watch::channel(authorization.clone());
+			let handle = audio.start(context, keys_rx, authorization_rx).unwrap();
+			let starts = cycle % 3;
+			for _ in 0..starts {
+				handle.trigger();
+			}
+			if starts > 0 {
+				let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+				let mut ping = authorization.ping_payload(MediaStream::Audio).as_bytes().to_vec();
+				ping.extend(1u32.to_be_bytes());
+				let mut buf = [0u8; 1500];
+				let mut delivered = false;
+				for _ in 0..25 {
+					client.send_to(&ping, ("127.0.0.1", port)).await.unwrap();
+					if let Ok(Ok((len, _))) =
+						tokio::time::timeout(Duration::from_millis(200), client.recv_from(&mut buf)).await
+					{
+						// An RTP version-2 audio packet with a payload.
+						delivered = len > 12 && buf[0] >> 6 == 2;
+						break;
+					}
+				}
+				assert!(delivered, "cycle {cycle}: started audio must reach the endpoint");
+			}
+			stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+			tokio::time::timeout(Duration::from_secs(5), stop.wait_shutdown_complete())
+				.await
+				.unwrap_or_else(|_| panic!("cycle {cycle}: audio owners did not complete"));
+			UdpSocket::bind(("127.0.0.1", port))
+				.await
+				.unwrap_or_else(|e| panic!("cycle {cycle}: completed stop must release the port: {e}"));
+			drop(handle);
+		}
 	}
 
 	/// Audio endpoint discovery accepts only the authorized client: a legacy

@@ -28,6 +28,10 @@ Repeat reversible mode changes in both directions, including HDR back to SDR
 and surround back to stereo. Where the client exposes them, also vary packet
 size/encryption and exercise codec/chroma/bit-depth changes independently.
 
+Before client testing, `moonshine-bench --reconnect-cycles 100` and `--cycles 100`
+([lifecycle cycles](BENCHMARKING.md#lifecycle-cycles)) exercise the same
+backend transitions on the host without a client.
+
 ## Acceptance
 
 For every changed-mode reconnect, verify:

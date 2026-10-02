@@ -91,6 +91,8 @@ struct FakeBackend {
 	stop_on_launch_return: AtomicBool,
 	/// The most recent session's stop, so tests can play a failing worker.
 	session_stop: std::sync::Mutex<Option<ShutdownManager<SessionShutdownReason>>>,
+	/// Every committed reconnect plan: whether video was recreated, and audio.
+	plans: std::sync::Mutex<Vec<(bool, AudioStreamContext)>>,
 }
 
 struct FakeSession {
@@ -106,6 +108,7 @@ impl FakeBackend {
 			worker_exit: watch::channel(true).0,
 			stop_on_launch_return: AtomicBool::new(false),
 			session_stop: std::sync::Mutex::new(None),
+			plans: std::sync::Mutex::new(Vec::new()),
 		}
 	}
 
@@ -225,6 +228,7 @@ impl SessionBackend for FakeBackend {
 
 	async fn resume(&self, _session: &mut FakeSession, plan: ResumePlan) -> Result<(), ()> {
 		assert!(matches!(plan.audio.packet_duration_ms, 5 | 10));
+		self.plans.lock().unwrap().push((plan.video.is_some(), plan.audio));
 		self.gate(Op::Resume).await
 	}
 
@@ -828,4 +832,306 @@ async fn hung_application_stop_is_bounded() {
 	assert!(started.elapsed() <= SESSION_TEARDOWN_DEADLINE);
 	assert_eq!(h.phase().await, "idle");
 	assert_eq!(h.counters().resources.load(Ordering::SeqCst), 0);
+}
+
+/// One point of the repeated-session settings matrix. Each [`Self::step`]
+/// changes exactly one negotiated axis, so consecutive cycles differ in one
+/// property (or none, for the unchanged-resume axis).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Matrix {
+	large: bool,
+	high_fps: bool,
+	high_bitrate: bool,
+	codec: usize,
+	encrypt: bool,
+	hdr: bool,
+	yuv444: bool,
+	channels: usize,
+	high_quality: bool,
+	ten_ms: bool,
+}
+
+const AXES: [&str; 11] = [
+	"unchanged",
+	"resolution",
+	"fps",
+	"bitrate",
+	"codec",
+	"encryption",
+	"dynamic range",
+	"chroma",
+	"audio channels",
+	"audio quality",
+	"packet duration",
+];
+
+const CODECS: [VideoCodec; 4] = [
+	VideoCodec::H264,
+	VideoCodec::Hevc,
+	VideoCodec::Av1,
+	VideoCodec::PyroWave,
+];
+
+impl Matrix {
+	fn step(mut self, axis: usize) -> Self {
+		match axis {
+			0 => {},
+			1 => self.large ^= true,
+			2 => self.high_fps ^= true,
+			3 => self.high_bitrate ^= true,
+			4 => self.codec = (self.codec + 1) % CODECS.len(),
+			5 => self.encrypt ^= true,
+			6 => self.hdr ^= true,
+			7 => self.yuv444 ^= true,
+			8 => self.channels = (self.channels + 1) % 3,
+			9 => self.high_quality ^= true,
+			10 => self.ten_ms ^= true,
+			_ => unreachable!(),
+		}
+		self
+	}
+
+	fn resolution(self) -> (u32, u32) {
+		if self.large { (2560, 1440) } else { (1920, 1080) }
+	}
+
+	fn fps(self) -> u32 {
+		if self.high_fps { 120 } else { 60 }
+	}
+
+	fn audio_channels(self) -> (AudioChannels, u32) {
+		[
+			(AudioChannels::Stereo, 0x3),
+			(AudioChannels::Surround51, 0x3f),
+			(AudioChannels::Surround71, 0x63f),
+		][self.channels]
+	}
+
+	fn video(self) -> VideoStreamContext {
+		let codec = CODECS[self.codec];
+		let chroma = if self.yuv444 {
+			ChromaFormat::Yuv444
+		} else {
+			ChromaFormat::Yuv420
+		};
+		let range = if codec == VideoCodec::PyroWave {
+			ColorRange::Full
+		} else {
+			ColorRange::Limited
+		};
+		let (width, height) = self.resolution();
+		VideoStreamContext {
+			pyrowave_dialect: (codec == VideoCodec::PyroWave)
+				.then_some(crate::session::stream::video::pyrowave_protocol::PyroWaveDialect::NativeWireV1),
+			width,
+			height,
+			fps: self.fps(),
+			bitrate: if self.high_bitrate { 80_000_000 } else { 20_000_000 },
+			format: if self.hdr {
+				NegotiatedVideoFormat::hdr10(codec, chroma, range)
+			} else {
+				NegotiatedVideoFormat::sdr(codec, chroma, BitDepth::Eight, range)
+			},
+			encrypt_video: self.encrypt,
+			..video()
+		}
+	}
+
+	fn audio(self) -> AudioStreamContext {
+		let (channels, mask) = self.audio_channels();
+		AudioStreamContext {
+			packet_duration_ms: if self.ten_ms { 10 } else { 5 },
+			audio_config: AudioConfig::from_channels(channels, mask, self.high_quality),
+			encrypt_audio: self.encrypt,
+			..audio()
+		}
+	}
+
+	fn context(self) -> SessionContext {
+		let (audio_channels, audio_channel_mask) = self.audio_channels();
+		SessionContext {
+			resolution: self.resolution(),
+			refresh_rate: self.fps(),
+			hdr: self.hdr,
+			audio_channels,
+			audio_channel_mask,
+			..context()
+		}
+	}
+}
+
+async fn workers_started(h: &Harness, count: usize) {
+	tokio::time::timeout(Duration::from_secs(5), async {
+		while h.counters().workers_started.load(Ordering::SeqCst) < count {
+			tokio::task::yield_now().await;
+		}
+	})
+	.await
+	.expect("stream workers did not start");
+}
+
+/// TEST-001: 100 complete launch → stream → stop → relaunch cycles through one
+/// manager. Settings move along every negotiated axis, `StartB` is absent,
+/// single or duplicated, and the stop comes from the user, the application
+/// exiting or a failing worker. After every completed stop nothing remains:
+/// no fake socket/thread/GPU owner, no application unit, no orphan, no stale
+/// authorization, and the next initialization never overlaps old resources.
+#[tokio::test]
+async fn hundred_full_session_cycles_release_everything() {
+	let h = Harness::new();
+	let mut settings = Matrix::default();
+	let mut started = 0;
+	for cycle in 0..100 {
+		settings = settings.step(cycle % AXES.len());
+		h.core.initialize_session(settings.context()).await.unwrap();
+		h.core.launch_session().await.unwrap();
+		let grant = h.grant().await;
+		h.core
+			.set_stream_context(&grant, settings.video(), settings.audio(), false)
+			.await
+			.unwrap();
+		h.core.start_session(&grant).await.unwrap();
+		let context = h.core.get_session_context().await.unwrap();
+		assert_eq!(context.resolution, settings.resolution());
+		assert_eq!(context.hdr, settings.hdr);
+		for _ in 0..cycle % 3 {
+			h.core.trigger_streams_start().await;
+		}
+		if cycle % 3 != 0 {
+			started += 2;
+			workers_started(&h, started).await;
+		}
+		let stop = h.backend().session_stop.lock().unwrap().clone().unwrap();
+		match (cycle / 3) % 3 {
+			0 => h.core.stop_session().await.unwrap(),
+			1 => {
+				let _ = stop.trigger_shutdown(SessionShutdownReason::ApplicationStopped);
+				h.wait_idle().await;
+			},
+			_ => {
+				let _ = stop.trigger_shutdown(SessionShutdownReason::VideoEncoderStopped);
+				h.wait_idle().await;
+			},
+		}
+		h.assert_released().await;
+		assert!(h.core.start_session(&grant).await.is_err(), "cycle {cycle}: stale PLAY");
+		assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), cycle + 1);
+		assert_eq!(
+			h.counters().workers_started.load(Ordering::SeqCst),
+			started,
+			"cycle {cycle}: a worker started without StartB"
+		);
+	}
+	assert!(!h.counters().overlapped.load(Ordering::SeqCst));
+}
+
+/// TEST-001: 100 connect → stream → disconnect → resume cycles on one retained
+/// application. Each cycle is a new authenticated generation (alternating a
+/// fresh and a reused key) and changes one negotiated axis or nothing. Every
+/// reconnect pauses both media epochs before it resumes, recreates video only
+/// when a video property changed, always commits the audio epoch, rejects the
+/// previous generation, and leaves resource ownership flat.
+#[tokio::test]
+async fn hundred_reconnect_cycles_alternate_every_negotiated_axis() {
+	let h = Harness::new();
+	let mut settings = Matrix::default();
+	h.core.initialize_session(settings.context()).await.unwrap();
+	h.core.launch_session().await.unwrap();
+	let mut previous = h.grant().await;
+	h.core
+		.set_stream_context(&previous, settings.video(), settings.audio(), false)
+		.await
+		.unwrap();
+	h.core.start_session(&previous).await.unwrap();
+	h.core.trigger_streams_start().await;
+	workers_started(&h, 2).await;
+	let resources = h.counters().resources.load(Ordering::SeqCst);
+	let mut fast_resumes = 0;
+	for cycle in 0..100u32 {
+		let axis = cycle as usize % AXES.len();
+		let next = settings.step(axis);
+		let key = RemoteInputKey::from_bytes([(cycle % 2) as u8 + 1; 16]);
+		h.core
+			.resume_session(
+				SessionKeyData::new(key, RemoteInputKeyId::new(cycle)),
+				ResumeRequest::default(),
+				h.client,
+			)
+			.await
+			.unwrap();
+		let grant = h.grant().await;
+		assert!(
+			h.core
+				.set_stream_context(&previous, next.video(), next.audio(), false)
+				.await
+				.is_err(),
+			"cycle {cycle}: the previous generation cannot announce"
+		);
+		let (pauses, resumes) = (h.calls(Op::Pause), h.calls(Op::Resume));
+		h.core
+			.set_stream_context(&grant, next.video(), next.audio(), false)
+			.await
+			.unwrap();
+		assert_eq!(h.calls(Op::Pause), pauses + 1, "cycle {cycle}: reconnect must pause");
+		h.core.start_session(&grant).await.unwrap();
+		h.core.trigger_streams_start().await;
+		assert_eq!(h.calls(Op::Resume), resumes + 1);
+		let order = h.counters().order.lock().unwrap().clone();
+		assert!(order.iter().rposition(|op| *op == Op::Pause) < order.iter().rposition(|op| *op == Op::Resume));
+
+		let (video_recreated, audio) = h.backend().plans.lock().unwrap().pop().unwrap();
+		assert_eq!(
+			video_recreated,
+			settings.video() != next.video(),
+			"cycle {cycle}: {} change",
+			AXES[axis]
+		);
+		fast_resumes += usize::from(!video_recreated);
+		assert_eq!(audio, next.audio(), "cycle {cycle}: audio epoch is always committed");
+		assert_eq!(h.phase().await, "active");
+		assert_eq!(
+			h.counters().resources.load(Ordering::SeqCst),
+			resources,
+			"cycle {cycle}"
+		);
+		assert_eq!(
+			h.counters().unit_stops.load(Ordering::SeqCst),
+			0,
+			"application retained"
+		);
+		let context = h.core.get_session_context().await.unwrap();
+		assert_eq!(context.resolution, next.resolution());
+		assert_eq!(context.refresh_rate, next.fps());
+		assert_eq!(context.hdr, next.hdr);
+		assert_eq!(
+			(context.audio_channels, context.audio_channel_mask),
+			next.audio_channels()
+		);
+		settings = next;
+		previous = grant;
+	}
+	// Unchanged and audio-only reconnects keep the video pipeline.
+	assert!(fast_resumes >= 30, "{fast_resumes}");
+	h.core.stop_session().await.unwrap();
+	h.assert_released().await;
+	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 1);
+	assert!(!h.counters().overlapped.load(Ordering::SeqCst));
+}
+
+/// TEST-001/STAB-003: service shutdown (SIGTERM, Ctrl+C) while each transition
+/// is in flight cancels it, completes the global shutdown only after the
+/// session was released, and refuses later sessions.
+#[tokio::test]
+async fn service_shutdown_during_every_transition_completes() {
+	for op in TRANSITIONS {
+		let h = Harness::new();
+		let task = hold_at(&h, op).await;
+		h.shutdown.trigger_shutdown(ShutdownReason::AppQuit).unwrap();
+		tokio::time::timeout(Duration::from_secs(5), h.shutdown.wait_shutdown_complete())
+			.await
+			.unwrap_or_else(|_| panic!("{op:?}: service shutdown did not complete"));
+		assert!(task.await.unwrap().is_err(), "{op:?}: cancelled request must fail");
+		h.assert_released().await;
+		assert!(h.initialize().await.is_err(), "{op:?}");
+	}
 }

@@ -143,6 +143,37 @@ CPU fence wait. Measure those separately when evaluating end-to-end latency.
 See [the historical optimization report](reports/PIPELINE_OPTIMIZATION.md) for measured results,
 validation gaps, and changes deliberately deferred.
 
+### Lifecycle cycles
+
+Repeated-session acceptance on real hardware. Stop any running Pyroshine
+service first: cycles bind the default video port and create the
+`moonshine-session.service` application unit.
+
+```sh
+# Launch → stream → stop → relaunch through one session manager.
+moonshine-bench --cycles 100 --cycle-log full.jsonl /usr/bin/vkcube
+# Authenticated resume → ANNOUNCE → PLAY epochs on one retained application.
+moonshine-bench --reconnect-cycles 100 --cycle-log reconnect.jsonl /usr/bin/vkcube
+```
+
+Each cycle changes one property, in order: none (unchanged resume), resolution
+(1920x1080/1280x720), FPS (60/120), bitrate, codec (`--cycle-codecs`, default
+`h264,hevc,av1,pyrowave`), encryption, SDR/HDR10, 4:2:0/4:4:4, audio
+stereo/5.1/7.1, audio quality and 5/10 ms packets. Combinations the Vulkan Video
+backend does not encode (conventional 4:4:4, 10-bit H.264) are normalized to the
+nearest supported format; the `settings` field records what was negotiated.
+A cycle passes when the epoch delivers at least a quarter of its target frames
+in `--cycle-seconds` (default 2) and the loopback client receives video bytes.
+Full cycles additionally require a successful stop, a bindable video port, no
+active application unit and no remaining child process (XWayland) afterwards.
+Every cycle records process FD/thread counts and RSS; look for a plateau.
+Add `--composited` to run the cycles through forced scene composition instead
+of direct export.
+
+The benchmark has no Moonlight client: there is no ENet control, audio endpoint
+or client decode. Cycles establish backend ownership and streaming continuity;
+client compatibility still needs the [reconnect matrix](reconnect-validation.md).
+
 ## Packetizer and transport remediation evidence
 
 See [the 2026-10-02 transport report](reports/TRANSPORT_REMEDIATION_2026-10-02.md)

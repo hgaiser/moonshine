@@ -1278,6 +1278,13 @@ impl SessionManager {
 		self.stats_tx.subscribe()
 	}
 
+	/// Start a new authorization generation with `keys`, exactly as an
+	/// authenticated HTTPS `/resume` from `client_ip` would. For the benchmark's
+	/// reconnect cycles, which have no Moonlight client; servers use `/resume`.
+	pub async fn bench_resume(&self, keys: SessionKeyData, client_ip: IpAddr) -> Result<(), ()> {
+		self.resume_session(keys, ResumeRequest::default(), client_ip).await
+	}
+
 	/// Trigger the video and audio pipelines to start encoding.
 	///
 	/// In the normal flow, this is triggered by the control stream when the

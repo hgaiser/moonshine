@@ -37,7 +37,7 @@ jobs:
             deps: true
           - name: Clippy
             components: clippy
-            run: cargo clippy --workspace --all-features -- -D warnings
+            run: cargo clippy --workspace --all-features --all-targets -- -D warnings
             deps: true
           - name: Rustfmt
             components: rustfmt
@@ -67,9 +67,14 @@ jobs:
         run: |
           ./scripts/build-pyrowave.sh "$RUNNER_TEMP/pyrowave" "$RUNNER_TEMP/pyrowave-install"
           test -e "$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.0"
+          # The check is ignored in ordinary runs; select it explicitly and fail
+          # unless it ran and actually loaded the library (no vacuous pass).
           MOONSHINE_TEST_PYROWAVE=1 \
           MOONSHINE_PYROWAVE_LIBRARY="$RUNNER_TEMP/pyrowave-install/lib/libpyrowave-shared.so.0" \
-            cargo test -p moonshine-core session::stream::video::pyrowave::tests::ffi_loads_pinned_api
+            cargo test -p moonshine-core session::stream::video::pyrowave::tests::ffi_loads_pinned_api \
+            -- --ignored --exact --nocapture 2>&1 | tee "$RUNNER_TEMP/pyrowave-ffi.log"
+          grep -q 'test result: ok. 1 passed' "$RUNNER_TEMP/pyrowave-ffi.log"
+          grep -q 'pyrowave-ffi: loaded' "$RUNNER_TEMP/pyrowave-ffi.log"
 
       - name: ${{ matrix.name }}
         run: ${{ matrix.run }}

@@ -98,6 +98,48 @@ struct Args {
 	/// Print per-frame stats to stderr instead of periodic summary.
 	#[arg(long)]
 	verbose: bool,
+
+	/// Run N launch → stream → stop → relaunch sessions through one session
+	/// manager, changing one negotiated setting per cycle.
+	#[arg(long, default_value_t = 0)]
+	cycles: u32,
+
+	/// Run N authenticated resume → ANNOUNCE → PLAY reconnect epochs on one
+	/// retained application, changing one negotiated setting per cycle.
+	#[arg(long, default_value_t = 0)]
+	reconnect_cycles: u32,
+
+	/// Seconds of streaming verified in each cycle.
+	#[arg(long, default_value_t = 2)]
+	cycle_seconds: u64,
+
+	/// Codec rotation for cycles; list only codecs the host encodes.
+	#[arg(long, default_value = "h264,hevc,av1,pyrowave", value_parser = parse_codec_list)]
+	cycle_codecs: String,
+
+	/// Append one JSON object per cycle to this file.
+	#[arg(long)]
+	cycle_log: Option<std::path::PathBuf>,
+}
+
+#[path = "bench/cycles.rs"]
+mod cycles;
+
+/// Control-stream inactivity timeout. The benchmark has no Moonlight client to
+/// send control pings, so the production timeout would end every run longer
+/// than it (including `--duration 0` and long soak runs) after one minute.
+const STREAM_TIMEOUT_SECS: u64 = 24 * 60 * 60;
+
+fn parse_codec_list(value: &str) -> Result<String, String> {
+	let valid = value
+		.split(',')
+		.map(str::trim)
+		.all(|codec| matches!(codec, "h264" | "hevc" | "av1" | "pyrowave"));
+	if valid && !value.trim().is_empty() {
+		Ok(value.to_string())
+	} else {
+		Err("expected a comma-separated list of h264, hevc, av1 and pyrowave".to_string())
+	}
 }
 
 fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
@@ -543,7 +585,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		std::process::exit(1);
 	}
 
-	if args.matrix || args.pyrowave_matrix {
+	if args.cycles > 0 {
+		cycles::run_full_cycles(&args).await
+	} else if args.reconnect_cycles > 0 {
+		cycles::run_reconnect_cycles(&args).await
+	} else if args.matrix || args.pyrowave_matrix {
 		run_matrix(&args).await
 	} else {
 		run_single(&args).await
@@ -668,8 +714,6 @@ async fn run_benchmark(
 	codec: &str,
 	duration: u64,
 ) -> Result<BenchmarkReport, Box<dyn std::error::Error>> {
-	const STREAM_TIMEOUT_SECS: u64 = 60;
-
 	let (width, height) = parse_resolution(resolution).map_err(boxed_error)?;
 	let video_format = parse_codec(codec);
 	let negotiated_format = selected_format(args, video_format)?;

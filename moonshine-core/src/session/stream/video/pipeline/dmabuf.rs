@@ -579,13 +579,14 @@ mod tests {
 		assert!(!same_open_file(a.as_raw_fd(), other.as_raw_fd()));
 	}
 
-	/// STAB-004 on real hardware (opt-in with `MOONSHINE_TEST_GPU=1`; ordinary
-	/// CI has no GPU). A frame exported from a GBM pool whose buffer and
+	/// STAB-004 on real hardware (opt-in with `MOONSHINE_TEST_GPU=1` and
+	/// `--ignored`; ordinary CI has no GPU). A frame exported from a GBM pool whose buffer and
 	/// allocator were dropped — the compositor exiting before the encoder
 	/// imports — still imports into Vulkan, and a new buffer that receives the
 	/// same descriptor number after the frame is gone never aliases the cached
 	/// import.
 	#[test]
+	#[ignore = "needs a GPU render node: MOONSHINE_TEST_GPU=1"]
 	fn gpu_import_after_source_owner_teardown_and_fd_reuse() {
 		use super::DmaBufImporter;
 		use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
@@ -594,10 +595,10 @@ mod tests {
 		use std::sync::Arc;
 		use std::sync::atomic::AtomicBool;
 
-		if std::env::var_os("MOONSHINE_TEST_GPU").is_none() {
-			eprintln!("skipped: set MOONSHINE_TEST_GPU=1 to run the GPU import test");
-			return;
-		}
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_GPU").is_some(),
+			"set MOONSHINE_TEST_GPU=1 to run the GPU import test"
+		);
 		const SIZE: u32 = 256;
 		let allocator = || {
 			let node = crate::healthcheck::find_render_node(&None).unwrap();

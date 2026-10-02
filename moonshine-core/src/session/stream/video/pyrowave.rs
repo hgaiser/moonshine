@@ -1162,11 +1162,20 @@ mod tests {
 		);
 	}
 
+	/// Ignored by default so an ordinary run reports it as not executed rather
+	/// than as a vacuous pass. When selected with `--ignored`, a missing opt-in
+	/// is a failure: the check must actually load the library under test.
 	#[test]
+	#[ignore = "needs the pinned PyroWave build: MOONSHINE_TEST_PYROWAVE=1 MOONSHINE_PYROWAVE_LIBRARY=<lib>"]
 	fn ffi_loads_pinned_api() {
-		if std::env::var_os("MOONSHINE_TEST_PYROWAVE").is_some() {
-			Api::load().expect("the packaged authoritative PyroWave library must expose the pinned ABI");
-		}
+		assert!(
+			std::env::var_os("MOONSHINE_TEST_PYROWAVE").is_some(),
+			"set MOONSHINE_TEST_PYROWAVE=1 to run the pinned PyroWave FFI check"
+		);
+		let library = std::env::var_os("MOONSHINE_PYROWAVE_LIBRARY")
+			.expect("set MOONSHINE_PYROWAVE_LIBRARY to the pinned library under test");
+		Api::load().expect("the packaged authoritative PyroWave library must expose the pinned ABI");
+		eprintln!("pyrowave-ffi: loaded {}", std::path::Path::new(&library).display());
 	}
 	#[test]
 	fn queue_config_defaults_to_graphics_and_compute_is_explicit() {
