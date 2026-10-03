@@ -65,6 +65,16 @@ nix profile install github:hgaiser/moonshine
 
 After installing, follow the [Enable the service](#enable-the-service) steps below (the NixOS module handles this for you when enabled).
 
+Moonshine is now directly packaged in nixpkgs, you can add it to your system packages or enable the module directly:
+
+```nix
+environment.systemPackages = with pkgs; [ moonshine ];
+services.moonshine = {
+	enable = true;
+	# Checkout more settings at https://search.nixos.org/options?query=moonshine
+};
+```
+
 ### Bazzite / Silverblue / Atomic distros
 
 On Fedora Atomic distros, download the `.rpm` from the [releases page](https://github.com/hgaiser/moonshine/releases) and layer it:
