@@ -23,7 +23,9 @@ use smithay::reexports::wayland_server::protocol::wl_seat::WlSeat;
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::utils::{Logical, Point, Rectangle, Serial};
 use smithay::wayland::buffer::BufferHandler;
-use smithay::wayland::compositor::{CompositorClientState, CompositorHandler, CompositorState, is_sync_subsurface};
+use smithay::wayland::compositor::{
+	CompositorClientState, CompositorHandler, CompositorState, add_pre_commit_hook, is_sync_subsurface,
+};
 use smithay::wayland::dmabuf::{DmabufGlobal, DmabufHandler, DmabufState, ImportNotifier};
 use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{ConstraintRemove, PointerConstraintsHandler, with_pointer_constraint};
@@ -42,6 +44,7 @@ use smithay::wayland::seat::WaylandFocus;
 use smithay::xwayland::XWaylandClientData;
 
 use crate::session::compositor::focus::{KeyboardFocusTarget, WindowFlags, WindowMetadata, get_window_priority_key};
+use crate::session::compositor::held_commits;
 use crate::session::compositor::state::{ClientState, MoonshineCompositor};
 
 // ---------------------------------------------------------------------------
@@ -358,6 +361,10 @@ impl CompositorHandler for MoonshineCompositor {
 			return &state.compositor_state;
 		}
 		unreachable!("Client has neither ClientState nor XWaylandClientData");
+	}
+
+	fn new_surface(&mut self, surface: &WlSurface) {
+		add_pre_commit_hook::<Self, _>(surface, held_commits::hold_until_rendered);
 	}
 
 	fn commit(&mut self, surface: &WlSurface) {

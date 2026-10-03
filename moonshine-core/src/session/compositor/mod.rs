@@ -10,6 +10,7 @@ mod focus;
 pub(crate) mod frame;
 mod gamescope_swapchain;
 mod handlers;
+mod held_commits;
 pub(crate) mod input;
 mod protocols;
 mod scaling;
