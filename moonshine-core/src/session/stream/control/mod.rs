@@ -163,6 +163,14 @@ impl<'a> ControlMessage<'a> {
 			ControlMessageType::LossStats => Ok(Self::LossStats),
 			ControlMessageType::FrameStats => Ok(Self::FrameStats),
 			ControlMessageType::InputData => {
+				if buffer.len() < 8 {
+					tracing::warn!(
+						"Expected input data message of at least 8 bytes, got {} bytes.",
+						buffer.len()
+					);
+					return Err(());
+				}
+
 				// Length of the input event, excluding the length itself.
 				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 				if length as usize != buffer.len() - 8 {
@@ -464,7 +472,8 @@ async fn run_control_loop(
 	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 
 	// Create a channel over which we can receive feedback messages to send to the connected client.
-	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
+	// Gamepad callbacks drop commands when this is full, so leave room for bursts.
+	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(64);
 
 	// Sequence number of feedback messages.
 	let mut sequence_number = 0u32;
@@ -483,10 +492,12 @@ async fn run_control_loop(
 			break;
 		}
 
-		// Check for feedback messages.
-		if let Ok(command) = feedback_rx.try_recv()
-			&& let Some(peer_id) = connected_peer
-		{
+		// Send queued feedback messages; games can queue several per loop iteration.
+		// Bounded so a steady stream of feedback can't starve ENet servicing.
+		for command in std::iter::from_fn(|| feedback_rx.try_recv().ok()).take(64) {
+			let Some(peer_id) = connected_peer else {
+				continue;
+			};
 			tracing::debug!("Sending control feedback command: {command:?}");
 			let payload = command.as_packet();
 			let key = context.keys_rx.borrow().remote_input_key.clone();
@@ -510,7 +521,8 @@ async fn run_control_loop(
 			Ok(Some(Event::Receive { ref packet, .. })) => {
 				let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 					Ok(control_message) => control_message,
-					Err(()) => break,
+					// Skip messages we can't parse (e.g. types from newer clients) instead of ending the session.
+					Err(()) => continue,
 				};
 				tracing::trace!("Received control message: {control_message:?}");
 
