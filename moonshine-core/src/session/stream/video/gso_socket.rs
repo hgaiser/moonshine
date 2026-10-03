@@ -207,6 +207,13 @@ pub(crate) struct UdpGsoSocket {
 	pacing_timer_initialized: bool,
 }
 
+#[cfg(test)]
+impl std::os::fd::AsRawFd for UdpGsoSocket {
+	fn as_raw_fd(&self) -> std::os::fd::RawFd {
+		self.socket.as_raw_fd()
+	}
+}
+
 impl UdpGsoSocket {
 	pub async fn new(address: &str, port: u16) -> Result<Self, ()> {
 		let socket = UdpSocket::bind((address, port))

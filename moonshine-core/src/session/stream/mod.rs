@@ -9,6 +9,9 @@ pub mod audio;
 pub mod control;
 pub mod video;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct StreamConfig {

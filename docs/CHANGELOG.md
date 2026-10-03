@@ -14,10 +14,13 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+## [v0.17.0-beta-10] - 2026-10-03
+
 ### Fixed
 
 - Keep the running application when a client disappears. A client that stopped sending control pings (crash, suspend, network loss, or simply after a clean disconnect) previously ended the whole session once `[stream].timeout` elapsed, closing the game. The timeout now only retires the silent client, as a clean disconnect does: held input is released and media paused while the session waits, without a deadline, for a resume. Quitting the session from Moonlight or the application exiting still ends it.
 - Keep video capture on the virtual display's refresh deadlines. When the encoder became ready after a refresh tick (for example a PyroWave paced send finishing late), capture ran at the encoder's completion time, after that tick's frame callbacks, instead of on the refresh grid. Measured at 2880x1920@120, up to 88% of gameplay captures drifted off the grid, with frame spacing reaching 16.7 ms at p95 while average FPS still read about 120. A late encoder can now only complete the tick's own capture, and only while no client has committed since, so captures stay on the grid.
+- Take ownership of the session's XWayland process reliably. Right after spawning it, the process could still carry the compositor thread's name, so the ownership check sometimes refused it (more often on a loaded host). XWayland's exit then could not be verified or bounded at teardown, and `Could not take ownership of the XWayland process` was logged. The check now allows a short, bounded time for the new process to take its executable's name.
 - Leave the live virtual output untouched on reconnects that change only codec, bitrate, chroma, bit depth or transport settings; only resolution, refresh rate or HDR changes reconfigure the compositor.
 
 ### Added

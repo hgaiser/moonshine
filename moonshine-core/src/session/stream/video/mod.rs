@@ -772,6 +772,7 @@ fn spawn_handle_video_packets(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::session::stream::test_support::SocketId;
 
 	#[tokio::test]
 	async fn pause_and_stop_interrupt_blocked_network_work_and_release_all_credits() {
@@ -1013,13 +1014,15 @@ mod tests {
 		WorkerGuard::register(stop, SessionShutdownReason::VideoPacketHandlerStopped).unwrap()
 	}
 
-	/// Spawn a packet handler on an ephemeral port and return its address.
+	/// Spawn a packet handler on an ephemeral port and return its address
+	/// and the identity of the socket it owns.
 	async fn spawn_unstarted(
 		stop: &ShutdownManager<SessionShutdownReason>,
 		start: &StartLatch,
-	) -> (std::net::SocketAddr, mpsc::Sender<VideoPacketMessage>) {
+	) -> (std::net::SocketAddr, SocketId, mpsc::Sender<VideoPacketMessage>) {
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
 		let address = socket.local_addr().unwrap();
+		let id = SocketId::of(&socket);
 		let (tx, rx) = mpsc::channel(16);
 		let (_authorization, authorization_rx) = test_authorization("127.0.0.1");
 		spawn_handle_video_packets(
@@ -1034,7 +1037,7 @@ mod tests {
 			60,
 			false,
 		);
-		(address, tx)
+		(address, id, tx)
 	}
 
 	/// STAB-001: a stop before `StartB` completes only after the packet
@@ -1043,15 +1046,16 @@ mod tests {
 	async fn stop_before_start_releases_the_socket_before_completion() {
 		let stop = ShutdownManager::new();
 		let start = StartLatch::new();
-		let (address, _tx) = spawn_unstarted(&stop, &start).await;
+		let (_address, socket, _tx) = spawn_unstarted(&stop, &start).await;
 		tokio::task::yield_now().await;
 		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
 		tokio::time::timeout(std::time::Duration::from_secs(1), stop.wait_shutdown_complete())
 			.await
 			.unwrap();
-		tokio::net::UdpSocket::bind(address)
-			.await
-			.expect("completed shutdown must imply the video port is free");
+		assert!(
+			!socket.is_open(),
+			"completed shutdown must imply the video port is free"
+		);
 		// A late StartB cannot resurrect the stopped handler.
 		start.open();
 	}
@@ -1061,12 +1065,12 @@ mod tests {
 	async fn stop_before_first_poll_is_still_joined() {
 		let stop = ShutdownManager::new();
 		let start = StartLatch::new();
-		let (address, _tx) = spawn_unstarted(&stop, &start).await;
+		let (_address, socket, _tx) = spawn_unstarted(&stop, &start).await;
 		stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
 		tokio::time::timeout(std::time::Duration::from_secs(1), stop.wait_shutdown_complete())
 			.await
 			.unwrap();
-		tokio::net::UdpSocket::bind(address).await.unwrap();
+		assert!(!socket.is_open());
 	}
 
 	/// STAB-001: `StartB` before the handler polls its gate, and duplicate
@@ -1075,7 +1079,7 @@ mod tests {
 	async fn early_and_duplicate_start_signals_start_the_handler() {
 		let stop = ShutdownManager::new();
 		let start = StartLatch::new();
-		let (address, tx) = spawn_unstarted(&stop, &start).await;
+		let (address, socket, tx) = spawn_unstarted(&stop, &start).await;
 		assert!(start.open());
 		assert!(!start.open());
 		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1093,7 +1097,7 @@ mod tests {
 		tokio::time::timeout(std::time::Duration::from_secs(1), stop.wait_shutdown_complete())
 			.await
 			.unwrap();
-		tokio::net::UdpSocket::bind(address).await.unwrap();
+		assert!(!socket.is_open());
 	}
 
 	/// A port still owned by another session makes stream construction fail

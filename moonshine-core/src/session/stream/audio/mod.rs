@@ -622,7 +622,7 @@ mod tests {
 	async fn stop_before_start_releases_the_audio_socket_before_completion() {
 		for flavor_yield in [false, true] {
 			let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-			let address = socket.local_addr().unwrap();
+			let id = crate::session::stream::test_support::SocketId::of(&socket);
 			let stop = ShutdownManager::new();
 			let start = StartLatch::new();
 			let (_tx, rx) = mpsc::channel(4);
@@ -643,9 +643,7 @@ mod tests {
 			tokio::time::timeout(Duration::from_secs(1), stop.wait_shutdown_complete())
 				.await
 				.unwrap();
-			UdpSocket::bind(address)
-				.await
-				.expect("completed shutdown must imply the audio port is free");
+			assert!(!id.is_open(), "completed shutdown must imply the audio port is free");
 			start.open();
 		}
 	}
