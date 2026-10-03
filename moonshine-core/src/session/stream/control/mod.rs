@@ -547,6 +547,28 @@ async fn adopt_current_generation(
 	Ok(())
 }
 
+/// Detach the session from its retired active peer: release the input it
+/// holds, drop feedback queued for it and stop high-bitrate traffic to its UDP
+/// endpoints. The application, compositor and stream workers are retained;
+/// `/resume` + ANNOUNCE/PLAY activate the next media epochs for a new peer.
+///
+/// Shared by a clean ENet disconnect and a liveness timeout so that client loss
+/// always leaves the same resumable state. Call it only after `ControlPeers`
+/// has retired the peer, so a stale peer's event can never detach its
+/// replacement. An error means a session subsystem is gone and is fatal.
+async fn detach_active_peer(
+	input: &mut InputHandler,
+	audio: &AudioStartHandle,
+	video: &VideoStreamHandle,
+	feedback_tx: &mut mpsc::Sender<FeedbackCommand>,
+	feedback_rx: &mut mpsc::Receiver<FeedbackCommand>,
+) -> Result<(), ()> {
+	(*feedback_tx, *feedback_rx) = mpsc::channel(10);
+	input.reset().await?;
+	audio.pause_for_reconfigure().await?;
+	video.pause_for_reconfigure().await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_control_loop(
 	stream_timeout: u64,
@@ -559,8 +581,9 @@ async fn run_control_loop(
 	mut hdr_metadata_rx: watch::Receiver<HdrModeState>,
 ) {
 	// The caller's `WorkerGuard` stops the session when this loop exits and
-	// holds completion until the ENet host has been dropped.
-	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
+	// holds completion until the ENet host has been dropped. The loop therefore
+	// ends only on session shutdown or a genuine control failure: losing the
+	// client (disconnect or liveness timeout) detaches the session instead.
 
 	// Create a channel over which we can receive feedback messages to send to the connected client.
 	let (mut feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
@@ -570,18 +593,12 @@ async fn run_control_loop(
 	// Only the peer that authenticated the current generation is dispatched
 	// to and receives feedback.
 	let mut authorization_rx = context.authorization_rx.clone();
-	let mut peers = ControlPeers::new(authorization_rx.borrow_and_update().generation());
+	let mut peers = ControlPeers::new(
+		authorization_rx.borrow_and_update().generation(),
+		Duration::from_secs(stream_timeout),
+	);
 
 	while !stop_session_manager.is_shutdown_triggered() {
-		// Check if the timeout has passed.
-		if std::time::Instant::now() > stop_deadline {
-			tracing::info!(
-				"Stopping because we haven't received a ping for {} seconds.",
-				stream_timeout
-			);
-			break;
-		}
-
 		if adopt_current_generation(
 			&mut host,
 			&mut peers,
@@ -638,19 +655,20 @@ async fn run_control_loop(
 				}
 			},
 			Ok(Some(Event::Disconnect { peer_id, .. })) => {
-				// Retain the application, but stop high-bitrate traffic to the old
-				// UDP endpoints. ANNOUNCE/PLAY activates the next media epochs.
-				// Peers of a replaced generation were already forgotten, so an old
-				// client disconnecting after resume cannot pause the new epoch.
+				// Peers of a replaced generation (or an already expired owner) were
+				// already forgotten, so an old client disconnecting after resume
+				// cannot detach the new epoch.
 				if peers.disconnect(peer_id) {
-					(feedback_tx, feedback_rx) = mpsc::channel(10);
-					if input_handler.reset().await.is_err() {
-						break;
-					}
-					if audio_trigger.pause_for_reconfigure().await.is_err() {
-						break;
-					}
-					if video_handle.pause_for_reconfigure().await.is_err() {
+					if detach_active_peer(
+						&mut input_handler,
+						&audio_trigger,
+						&video_handle,
+						&mut feedback_tx,
+						&mut feedback_rx,
+					)
+					.await
+					.is_err()
+					{
 						break;
 					}
 					tracing::info!("Control peer disconnected; paused media delivery and released input for resume");
@@ -702,7 +720,7 @@ async fn run_control_loop(
 						send_hdr_mode = true;
 					},
 					ControlMessage::Ping => {
-						stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
+						peers.keep_alive(peer_id, std::time::Instant::now());
 					},
 					ControlMessage::InputData(event) => {
 						let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;
@@ -721,7 +739,37 @@ async fn run_control_loop(
 					},
 				};
 			},
-			Ok(None) => (),
+			Ok(None) => {
+				// Checked only once ENet has no pending event, so a ping that
+				// already arrived is credited before its sender can be expired.
+				// A detached session has no deadline, so this never repeats
+				// against an absent peer.
+				if let Some(peer_id) = peers.take_expired(std::time::Instant::now()) {
+					tracing::info!(
+						%peer_id,
+						timeout_secs = stream_timeout,
+						"Control peer sent no ping within the stream timeout; detaching it and retaining the session for resume"
+					);
+					// Graceful, so a client that was merely suspended learns the
+					// stream detached; its eventual disconnect event is no longer
+					// attributed to anyone.
+					if let Some(peer) = host.peer_mut(peer_id) {
+						peer.disconnect(0);
+					}
+					if detach_active_peer(
+						&mut input_handler,
+						&audio_trigger,
+						&video_handle,
+						&mut feedback_tx,
+						&mut feedback_rx,
+					)
+					.await
+					.is_err()
+					{
+						break;
+					}
+				}
+			},
 			Err(_) => break,
 		}
 
@@ -945,18 +993,26 @@ mod tests {
 
 	mod enet {
 		use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-		use std::sync::Arc;
 		use std::sync::atomic::{AtomicUsize, Ordering};
+		use std::sync::{Arc, Mutex};
 		use std::time::{Duration, Instant};
 
 		use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerId};
 
 		use super::*;
 		use crate::session::authorization::StreamAuthorization;
+		use crate::session::keys::KeyLedger;
 		use crate::session::stream::video::VideoPacketMessage;
 		use crate::session::{RemoteInputKey, RemoteInputKeyId, SessionKeyData};
 
 		const NEW_KEY: [u8; 16] = [5; 16];
+		const CLIENT_IP: Ipv4Addr = Ipv4Addr::LOCALHOST;
+		/// `[stream].timeout` for lifecycle tests, which must outlast it.
+		const SHORT_TIMEOUT: u64 = 1;
+
+		fn timeouts(count: f64) -> Duration {
+			Duration::from_secs_f64(SHORT_TIMEOUT as f64 * count)
+		}
 
 		struct Client {
 			host: Host,
@@ -1017,6 +1073,23 @@ mod tests {
 				envelope
 			}
 
+			/// Ping as a streaming Moonlight client does, for `duration`.
+			async fn keep_alive(&mut self, key: &[u8], duration: Duration) {
+				let deadline = Instant::now() + duration;
+				while Instant::now() < deadline {
+					self.send(key, &ping()).await;
+					self.pump(Duration::from_millis(190)).await;
+				}
+			}
+
+			/// A clean ENet disconnect, as when Moonlight ends the stream.
+			async fn disconnect(&mut self) {
+				if let Some(peer) = self.host.peer_mut(self.peer) {
+					peer.disconnect(0);
+				}
+				self.pump(Duration::from_millis(150)).await;
+			}
+
 			/// Decrypt host-originated control messages received so far.
 			fn feedback(&self, key: &[u8]) -> Vec<Vec<u8>> {
 				self.received
@@ -1031,18 +1104,212 @@ mod tests {
 					})
 					.collect()
 			}
+
+			fn hdr_messages(&self, key: &[u8]) -> usize {
+				self.feedback(key)
+					.iter()
+					.filter(|message| message.starts_with(&0x010e_u16.to_le_bytes()))
+					.count()
+			}
 		}
 
 		fn key_down_a() -> Vec<u8> {
 			input_data(&[0x03, 0, 0, 0, 0, 0x41, 0, 0, 0, 0])
 		}
 
-		fn count_key_presses(input: &AtomicUsize) -> usize {
-			input.swap(0, Ordering::SeqCst)
+		fn ping() -> Vec<u8> {
+			plaintext_control(0x0200, &[])
 		}
 
-		fn drain(idr: &mut tokio::sync::broadcast::Receiver<()>) -> usize {
-			std::iter::from_fn(|| idr.try_recv().ok()).count()
+		fn request_idr() -> Vec<u8> {
+			plaintext_control(0x0302, &[])
+		}
+
+		fn start_b() -> Vec<u8> {
+			plaintext_control(0x0307, &[])
+		}
+
+		/// A control worker started through [`ControlStream::start`], so it is
+		/// supervised by a `WorkerGuard` exactly as in a session: if the loop ever
+		/// exits, `stop` records `ControlStreamStopped` and the session manager's
+		/// watchdog would tear the session (and its application) down.
+		struct Server {
+			addr: SocketAddr,
+			stop: ShutdownManager<SessionShutdownReason>,
+			authorization_tx: watch::Sender<StreamAuthorization>,
+			keys_tx: watch::Sender<ActiveKeys>,
+			ledger: KeyLedger,
+			hdr_tx: watch::Sender<HdrModeState>,
+			presses: Arc<AtomicUsize>,
+			/// Keys released by each input reset.
+			resets: Arc<Mutex<Vec<Vec<u32>>>>,
+			video_pauses: Arc<AtomicUsize>,
+			audio_pauses: Arc<AtomicUsize>,
+			idr: tokio::sync::broadcast::Receiver<()>,
+		}
+
+		impl Server {
+			fn start(stream_timeout: u64) -> Self {
+				Self::start_with(stream_timeout, true)
+			}
+
+			/// `video_alive: false` drops the video packet worker, so pausing video
+			/// fails as it does when that subsystem has died.
+			fn start_with(stream_timeout: u64, video_alive: bool) -> Self {
+				let mut authorization = StreamAuthorization::new(1, CLIENT_IP.into()).unwrap();
+				authorization.require_session_id();
+				let (authorization_tx, authorization_rx) = watch::channel(authorization);
+				let mut ledger = KeyLedger::default();
+				let (keys_tx, keys_rx) = watch::channel(ledger.publish(SessionKeyData::new(
+					RemoteInputKey::from_bytes(KEY),
+					RemoteInputKeyId::new(1),
+				)));
+
+				let host = Host::new(HostConfig {
+					address: Some(SocketAddr::new(CLIENT_IP.into(), 0)),
+					peer_count: 16,
+					channel_limit: 0x30,
+					..Default::default()
+				})
+				.unwrap();
+				let addr = host.local_addr().unwrap();
+				let stop = ShutdownManager::new();
+				let (input_tx, input_events) = calloop::channel::channel();
+				let presses = Arc::new(AtomicUsize::new(0));
+				let resets = Arc::new(Mutex::new(Vec::new()));
+				tokio::spawn({
+					let presses = presses.clone();
+					let resets = resets.clone();
+					let stop = stop.clone();
+					async move {
+						while !stop.is_shutdown_triggered() {
+							while let Ok(event) = input_events.try_recv() {
+								match event {
+									CompositorInputEvent::KeyDown { keycode: 30 } => {
+										presses.fetch_add(1, Ordering::SeqCst);
+									},
+									CompositorInputEvent::Reset { keys, ready, .. } => {
+										resets.lock().unwrap().push(keys);
+										ready.send(()).unwrap();
+									},
+									_ => {},
+								}
+							}
+							tokio::time::sleep(Duration::from_millis(1)).await;
+						}
+					}
+				});
+				let input_handler = InputHandler::new(input_tx, stop.clone(), Default::default()).unwrap();
+				let (video_handle, probe) = VideoStreamHandle::for_test();
+				let video_pauses = Arc::new(AtomicUsize::new(0));
+				let mut packet_rx = probe.packet_rx;
+				if video_alive {
+					tokio::spawn({
+						let pauses = video_pauses.clone();
+						async move {
+							while let Some(message) = packet_rx.recv().await {
+								if let VideoPacketMessage::Pause(ready) = message {
+									pauses.fetch_add(1, Ordering::SeqCst);
+									let _ = ready.send(());
+								}
+							}
+						}
+					});
+				} else {
+					packet_rx.close();
+				}
+				let (audio_trigger, audio_pauses) = AudioStartHandle::for_test();
+				let (hdr_tx, hdr_rx) = watch::channel(HdrModeState::new(false));
+				ControlStream {
+					stop: stop.clone(),
+					input_handler,
+					host,
+				}
+				.start(
+					stream_timeout,
+					ControlStreamContext {
+						keys_rx,
+						authorization_rx,
+					},
+					video_handle,
+					audio_trigger,
+					hdr_rx,
+				);
+				Self {
+					addr,
+					stop,
+					authorization_tx,
+					keys_tx,
+					ledger,
+					hdr_tx,
+					presses,
+					resets,
+					video_pauses,
+					audio_pauses,
+					idr: probe.idr_rx,
+				}
+			}
+
+			fn connect_data(&self) -> u32 {
+				self.authorization_tx.borrow().control_connect_data()
+			}
+
+			/// Connect a peer with the current generation's connect data.
+			async fn connect(&self) -> Client {
+				Client::connect(CLIENT_IP, self.addr, self.connect_data()).await
+			}
+
+			/// An authenticated `/resume`: a new generation and key for the same
+			/// session, published in the session manager's order.
+			fn resume(&mut self, generation: u64, key: [u8; 16]) {
+				let mut next = StreamAuthorization::new(generation, CLIENT_IP.into()).unwrap();
+				next.require_session_id();
+				self.authorization_tx.send_replace(next);
+				self.keys_tx.send_replace(self.ledger.publish(SessionKeyData::new(
+					RemoteInputKey::from_bytes(key),
+					RemoteInputKeyId::new(generation as u32),
+				)));
+			}
+
+			/// The control worker is running and nothing has stopped the session.
+			fn assert_alive(&self, context: &str) {
+				assert_eq!(self.stop.shutdown_reason(), None, "{context}");
+			}
+
+			/// (video, audio) pause barriers acknowledged so far.
+			fn pauses(&self) -> (usize, usize) {
+				(
+					self.video_pauses.load(Ordering::SeqCst),
+					self.audio_pauses.load(Ordering::SeqCst),
+				)
+			}
+
+			fn resets(&self) -> Vec<Vec<u32>> {
+				self.resets.lock().unwrap().clone()
+			}
+
+			fn presses(&self) -> usize {
+				self.presses.swap(0, Ordering::SeqCst)
+			}
+
+			fn idrs(&mut self) -> usize {
+				std::iter::from_fn(|| self.idr.try_recv().ok()).count()
+			}
+
+			/// The user's `/cancel` (`SessionManager::stop_session`): the worker
+			/// exits, completes and releases its ENet port.
+			async fn cancel(self) {
+				self.stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
+				tokio::time::timeout(Duration::from_secs(5), self.stop.wait_shutdown_complete())
+					.await
+					.expect("control worker completes after an explicit stop");
+				assert_eq!(self.stop.shutdown_reason(), Some(SessionShutdownReason::UserStopped));
+				Host::new(HostConfig {
+					address: Some(self.addr),
+					..Default::default()
+				})
+				.expect("control port released");
+			}
 		}
 
 		/// Two-peer regression for SEC-002/BUG-001 over real loopback ENet:
@@ -1051,98 +1318,24 @@ mod tests {
 		/// session; the authenticated client keeps working throughout.
 		#[tokio::test]
 		async fn control_is_bound_to_the_authenticated_peer_and_generation() {
-			let client_ip = Ipv4Addr::LOCALHOST;
-			let mut authorization = StreamAuthorization::new(1, client_ip.into()).unwrap();
-			authorization.require_session_id();
-			let connect_data = authorization.control_connect_data();
-			let (authorization_tx, authorization_rx) = watch::channel(authorization);
-			let mut ledger = crate::session::keys::KeyLedger::default();
-			let (keys_tx, keys_rx) = watch::channel(ledger.publish(SessionKeyData::new(
-				RemoteInputKey::from_bytes(KEY),
-				RemoteInputKeyId::new(1),
-			)));
-
-			let host = Host::new(HostConfig {
-				address: Some(SocketAddr::new(client_ip.into(), 0)),
-				peer_count: 16,
-				channel_limit: 0x30,
-				..Default::default()
-			})
-			.unwrap();
-			let server = host.local_addr().unwrap();
-			let stop = ShutdownManager::new();
-			let (input_tx, input_events) = calloop::channel::channel();
-			let input_rx = Arc::new(AtomicUsize::new(0));
-			let resets = Arc::new(AtomicUsize::new(0));
-			tokio::spawn({
-				let presses = input_rx.clone();
-				let resets = resets.clone();
-				let stop = stop.clone();
-				async move {
-					while !stop.is_shutdown_triggered() {
-						while let Ok(event) = input_events.try_recv() {
-							match event {
-								CompositorInputEvent::KeyDown { keycode: 30 } => {
-									presses.fetch_add(1, Ordering::SeqCst);
-								},
-								CompositorInputEvent::Reset { keys, ready, .. } => {
-									assert_eq!(keys, vec![30]);
-									resets.fetch_add(1, Ordering::SeqCst);
-									ready.send(()).unwrap();
-								},
-								_ => {},
-							}
-						}
-						tokio::time::sleep(Duration::from_millis(1)).await;
-					}
-				}
-			});
-			let input_handler = InputHandler::new(input_tx, stop.clone(), Default::default()).unwrap();
-			let (video_handle, probe) = VideoStreamHandle::for_test();
-			let mut idr = probe.idr_rx;
-			let pauses = Arc::new(AtomicUsize::new(0));
-			tokio::spawn({
-				let pauses = pauses.clone();
-				let mut packet_rx = probe.packet_rx;
-				async move {
-					while let Some(message) = packet_rx.recv().await {
-						if let VideoPacketMessage::Pause(ready) = message {
-							pauses.fetch_add(1, Ordering::SeqCst);
-							let _ = ready.send(());
-						}
-					}
-				}
-			});
-			let (_hdr_tx, hdr_rx) = watch::channel(HdrModeState::new(false));
-			let control = tokio::spawn(run_control_loop(
-				60,
-				host,
-				video_handle,
-				AudioStartHandle::for_test(),
-				ControlStreamContext {
-					keys_rx,
-					authorization_rx,
-				},
-				input_handler,
-				stop.clone(),
-				hdr_rx,
-			));
-			let request_idr = plaintext_control(0x0302, &[]);
+			let mut server = Server::start(60);
+			let connect_data = server.connect_data();
+			let request_idr = request_idr();
 
 			// Another host, or the client's address with wrong connect data.
-			let mut other_host = Client::connect(Ipv4Addr::new(127, 0, 0, 2), server, connect_data).await;
-			let mut wrong_data = Client::connect(client_ip, server, connect_data ^ 1).await;
+			let mut other_host = Client::connect(Ipv4Addr::new(127, 0, 0, 2), server.addr, connect_data).await;
+			let mut wrong_data = Client::connect(CLIENT_IP, server.addr, connect_data ^ 1).await;
 			// Rejected peers are reset server-side: their slot is freed and later
 			// packets are ignored (tokio-enet does not notify the remote).
 			other_host.send(&KEY, &request_idr).await;
 			wrong_data.send(&KEY, &request_idr).await;
-			assert_eq!(drain(&mut idr), 0);
+			assert_eq!(server.idrs(), 0);
 
 			// Same-address peers that know the connect data but not the key.
-			let mut legit = Client::connect(client_ip, server, connect_data).await;
-			let mut plaintext = Client::connect(client_ip, server, connect_data).await;
-			let mut wrong_key = Client::connect(client_ip, server, connect_data).await;
-			let mut malformed = Client::connect(client_ip, server, connect_data).await;
+			let mut legit = server.connect().await;
+			let mut plaintext = server.connect().await;
+			let mut wrong_key = server.connect().await;
+			let mut malformed = server.connect().await;
 			plaintext.send_raw(&key_down_a()).await;
 			plaintext.send_raw(&request_idr).await;
 			wrong_key.send(&[9; 16], &key_down_a()).await;
@@ -1150,89 +1343,211 @@ mod tests {
 			legit.pump(Duration::from_millis(50)).await;
 			// A rejected peer stays rejected even once it sends valid messages.
 			plaintext.send(&KEY, &request_idr).await;
-			assert_eq!(count_key_presses(&input_rx), 0, "no injected input");
-			assert_eq!(drain(&mut idr), 0, "no injected recovery");
+			assert_eq!(server.presses(), 0, "no injected input");
+			assert_eq!(server.idrs(), 0, "no injected recovery");
 
 			// The authenticated client is dispatched.
 			legit.send(&KEY, &key_down_a()).await;
 			let captured = legit.send(&KEY, &request_idr).await;
-			assert_eq!(count_key_presses(&input_rx), 1);
-			assert_eq!(drain(&mut idr), 1);
+			assert_eq!(server.presses(), 1);
+			assert_eq!(server.idrs(), 1);
 
 			// Replays (through the client or another peer) and malformed packets
 			// from the active client are dropped without ending the session.
-			let mut replayer = Client::connect(client_ip, server, connect_data).await;
+			let mut replayer = server.connect().await;
 			replayer.send_raw(&captured).await;
 			legit.send_raw(&captured).await;
 			legit.send_raw(&[0x06, 0x02, 0, 0]).await;
 			legit.send_raw(&[0xff; 3]).await;
-			assert_eq!(drain(&mut idr), 0, "replayed recovery request");
+			assert_eq!(server.idrs(), 0, "replayed recovery request");
 			replayer.send(&KEY, &request_idr).await;
-			assert_eq!(drain(&mut idr), 0, "another peer cannot take over the active client");
+			assert_eq!(server.idrs(), 0, "another peer cannot take over the active client");
 			legit.send(&KEY, &request_idr).await;
-			assert_eq!(drain(&mut idr), 1, "client still served after its malformed packets");
-			assert!(!control.is_finished());
+			assert_eq!(server.idrs(), 1, "client still served after its malformed packets");
+			server.assert_alive("rejected packets never stop the control worker");
 
 			// Only the active client receives feedback.
-			legit.send(&KEY, &plaintext_control(0x0307, &[])).await;
+			legit.send(&KEY, &start_b()).await;
 			legit.pump(Duration::from_millis(50)).await;
-			assert!(
-				legit
-					.feedback(&KEY)
-					.iter()
-					.any(|message| message.starts_with(&0x010e_u16.to_le_bytes())),
-				"HDR mode feedback after StartB"
-			);
+			assert_eq!(legit.hdr_messages(&KEY), 1, "HDR mode feedback after StartB");
 			for peer in [&other_host, &wrong_data, &plaintext, &wrong_key, &malformed, &replayer] {
 				assert!(peer.received.is_empty());
 			}
 
 			// A resume replaces the generation and key: the previous client is
 			// disconnected and cannot act, without pausing the new epoch.
-			let mut next = StreamAuthorization::new(2, client_ip.into()).unwrap();
-			next.require_session_id();
-			let next_data = next.control_connect_data();
-			authorization_tx.send_replace(next);
-			keys_tx.send_replace(ledger.publish(SessionKeyData::new(
-				RemoteInputKey::from_bytes(NEW_KEY),
-				RemoteInputKeyId::new(2),
-			)));
+			server.resume(2, NEW_KEY);
 			legit.pump(Duration::from_millis(100)).await;
 			assert!(legit.disconnected, "stale generation peer is disconnected");
 			legit.send(&KEY, &request_idr).await;
-			let mut stale = Client::connect(client_ip, server, connect_data).await;
+			let mut stale = Client::connect(CLIENT_IP, server.addr, connect_data).await;
 			stale.send(&KEY, &request_idr).await;
 			stale.send(&NEW_KEY, &request_idr).await;
-			assert_eq!(drain(&mut idr), 0);
-			assert_eq!(pauses.load(Ordering::SeqCst), 0);
+			assert_eq!(server.idrs(), 0);
+			assert_eq!(server.pauses(), (0, 0));
+			assert_eq!(server.resets(), vec![vec![30]], "replacement releases the old held key");
 
-			assert_eq!(
-				resets.load(Ordering::SeqCst),
-				1,
-				"replacement releases the old held key"
-			);
-			let mut resumed = Client::connect(client_ip, server, next_data).await;
+			let mut resumed = server.connect().await;
 			resumed.send(&NEW_KEY, &key_down_a()).await;
 			resumed.send(&NEW_KEY, &request_idr).await;
-			assert_eq!(drain(&mut idr), 1);
+			assert_eq!(server.idrs(), 1);
 
 			// The active client's disconnect pauses delivery for its resume.
-			if let Some(peer) = resumed.host.peer_mut(resumed.peer) {
-				peer.disconnect(0);
-			}
-			resumed.pump(Duration::from_millis(150)).await;
-			assert_eq!(pauses.load(Ordering::SeqCst), 1);
+			resumed.disconnect().await;
+			assert_eq!(server.pauses(), (1, 1));
 			assert_eq!(
-				resets.load(Ordering::SeqCst),
-				2,
+				server.resets(),
+				vec![vec![30], vec![30]],
 				"active disconnect releases the new held key"
 			);
+			server.cancel().await;
+		}
 
-			stop.trigger_shutdown(SessionShutdownReason::UserStopped).unwrap();
-			tokio::time::timeout(Duration::from_secs(2), control)
+		/// Client loss is not session loss: after a clean disconnect the control
+		/// worker keeps the session detached for several stream timeouts without
+		/// re-detaching, a `/resume` client takes over the same worker, its pings
+		/// keep it beyond the timeout, and only an explicit cancel ends the worker.
+		#[tokio::test]
+		async fn clean_disconnect_detaches_and_outlives_the_stream_timeout() {
+			let mut server = Server::start(SHORT_TIMEOUT);
+			let mut client = server.connect().await;
+			client.send(&KEY, &key_down_a()).await;
+			client.send(&KEY, &request_idr()).await;
+			assert_eq!((server.presses(), server.idrs()), (1, 1));
+
+			client.disconnect().await;
+			assert_eq!(server.resets(), vec![vec![30]], "held key released");
+			assert_eq!(server.pauses(), (1, 1), "media to the old endpoints paused");
+
+			tokio::time::sleep(timeouts(3.5)).await;
+			server.assert_alive("a detached session outlives the stream timeout");
+			assert_eq!(server.pauses(), (1, 1), "no repeated detach without a peer");
+			assert_eq!(server.resets().len(), 1);
+
+			server.resume(2, NEW_KEY);
+			let mut resumed = server.connect().await;
+			resumed.send(&NEW_KEY, &key_down_a()).await;
+			resumed.send(&NEW_KEY, &request_idr()).await;
+			assert_eq!((server.presses(), server.idrs()), (1, 1), "resumed client is served");
+			resumed.keep_alive(&NEW_KEY, timeouts(2.5)).await;
+			resumed.send(&NEW_KEY, &request_idr()).await;
+			assert_eq!(server.idrs(), 1, "pings keep the resumed client active");
+			assert_eq!(server.pauses(), (1, 1));
+			assert_eq!(server.resets().len(), 1);
+			server.assert_alive("resumed session");
+			server.cancel().await;
+		}
+
+		/// A client that vanishes without an ENet disconnect (crash, suspend,
+		/// network loss) is detached once its liveness deadline passes: input is
+		/// released, media paused, feedback retired and the transport closed,
+		/// while the worker and session stay alive and resumable.
+		#[tokio::test]
+		async fn silent_peer_is_detached_without_stopping_the_session() {
+			let mut server = Server::start(SHORT_TIMEOUT);
+			let mut client = server.connect().await;
+			client.send(&KEY, &key_down_a()).await;
+			client.send(&KEY, &start_b()).await;
+			client.keep_alive(&KEY, timeouts(1.5)).await;
+			assert_eq!(client.hdr_messages(&KEY), 1);
+			assert_eq!(server.pauses(), (0, 0), "a pinging peer is not detached");
+			assert!(server.resets().is_empty());
+
+			// The client stops servicing its connection entirely.
+			tokio::time::sleep(timeouts(2.0)).await;
+			assert_eq!(server.resets(), vec![vec![30]], "held key released");
+			assert_eq!(server.pauses(), (1, 1), "media to the old endpoints paused");
+			server.assert_alive("peer timeout is a detach, not a session stop");
+
+			// Feedback no longer reaches it, its transport was closed, and its
+			// late messages neither reattach it nor act.
+			server.hdr_tx.send_replace(HdrModeState::new(true));
+			client.send(&KEY, &ping()).await;
+			client.send(&KEY, &request_idr()).await;
+			client.pump(Duration::from_millis(100)).await;
+			assert!(client.disconnected, "stale peer is disconnected");
+			assert_eq!(client.hdr_messages(&KEY), 1, "no feedback to the retired peer");
+			assert_eq!(server.idrs(), 0);
+
+			tokio::time::sleep(timeouts(3.0)).await;
+			server.assert_alive("detached session survives several timeouts");
+			assert_eq!(server.pauses(), (1, 1), "the timeout does not repeat without a peer");
+			assert_eq!(server.resets().len(), 1);
+
+			server.resume(2, NEW_KEY);
+			let mut resumed = server.connect().await;
+			resumed.send(&NEW_KEY, &start_b()).await;
+			resumed.send(&NEW_KEY, &request_idr()).await;
+			resumed.pump(Duration::from_millis(50)).await;
+			assert_eq!(server.idrs(), 1, "the retained session resumes");
+			assert!(resumed.hdr_messages(&NEW_KEY) >= 1, "feedback reaches the new peer");
+			server.cancel().await;
+		}
+
+		/// A previous peer's resume replacement, original deadline and late
+		/// disconnect cannot reset, pause, detach or take feedback from the peer
+		/// that replaced it; that peer is detached only by its own deadline.
+		#[tokio::test]
+		async fn stale_peer_cannot_detach_its_replacement() {
+			let mut server = Server::start(SHORT_TIMEOUT);
+			let mut old = server.connect().await;
+			old.send(&KEY, &key_down_a()).await;
+			assert_eq!(server.presses(), 1);
+
+			// `/resume` before the old peer's deadline. The generation change
+			// releases its key; the resume's ANNOUNCE pauses media, not control.
+			server.resume(2, NEW_KEY);
+			let mut new = server.connect().await;
+			new.send(&NEW_KEY, &key_down_a()).await;
+			new.send(&NEW_KEY, &start_b()).await;
+			assert_eq!(server.presses(), 1);
+			assert_eq!(server.resets(), vec![vec![30]]);
+
+			// The old deadline passes, then the old transport disconnects late.
+			new.keep_alive(&NEW_KEY, timeouts(1.5)).await;
+			old.pump(Duration::from_millis(100)).await;
+			assert!(old.disconnected, "replaced peer is disconnected");
+			old.send(&KEY, &ping()).await;
+			new.keep_alive(&NEW_KEY, timeouts(1.5)).await;
+
+			server.assert_alive("stale events never stop the session");
+			assert_eq!(server.pauses(), (0, 0), "stale events never pause the replacement");
+			assert_eq!(
+				server.resets(),
+				vec![vec![30]],
+				"the replacement's held key is untouched"
+			);
+			new.send(&NEW_KEY, &request_idr()).await;
+			assert_eq!(server.idrs(), 1, "the replacement is still the active peer");
+			server.hdr_tx.send_replace(HdrModeState::new(true));
+			new.pump(Duration::from_millis(100)).await;
+			assert_eq!(new.hdr_messages(&NEW_KEY), 2, "the replacement keeps its feedback");
+			assert_eq!(old.hdr_messages(&KEY), 0);
+
+			// The replacement falling silent is detached by its own deadline.
+			tokio::time::sleep(timeouts(2.0)).await;
+			assert_eq!(server.pauses(), (1, 1));
+			assert_eq!(server.resets(), vec![vec![30], vec![30]]);
+			server.assert_alive("replacement timeout is a detach");
+			server.cancel().await;
+		}
+
+		/// Supervision is not weakened: a detach that cannot complete because a
+		/// session subsystem has died ends the worker, which stops the session
+		/// with `ControlStreamStopped` for the manager's watchdog to tear down.
+		#[tokio::test]
+		async fn failed_detach_stops_the_session_as_a_control_failure() {
+			let server = Server::start_with(SHORT_TIMEOUT, false);
+			let mut client = server.connect().await;
+			client.send(&KEY, &request_idr()).await;
+			client.disconnect().await;
+			let reason = tokio::time::timeout(Duration::from_secs(5), server.stop.wait_shutdown_triggered())
 				.await
-				.unwrap()
-				.unwrap();
+				.expect("the control worker exits");
+			assert_eq!(reason, SessionShutdownReason::ControlStreamStopped);
+			tokio::time::timeout(Duration::from_secs(5), server.stop.wait_shutdown_complete())
+				.await
+				.expect("the control worker completes");
 		}
 	}
 

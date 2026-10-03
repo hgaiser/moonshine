@@ -433,7 +433,7 @@ mod tests {
 		let batch = buffer.into_batch();
 		assert_eq!(batch.as_bytes().as_ptr(), ptr);
 		assert_eq!(batch.shard_count(), 7);
-		assert!(batch.as_bytes().chunks_exact(20).all(|s| s[..4] == [0; 4]));
+		assert!(batch.as_bytes().as_chunks::<20>().0.iter().all(|s| s[..4] == [0; 4]));
 	}
 
 	#[test]

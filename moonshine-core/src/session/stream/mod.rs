@@ -24,7 +24,9 @@ pub struct StreamConfig {
 	/// Configuration for the control stream.
 	pub control: ControlStreamConfig,
 
-	/// Time in seconds since last ping after which the stream closes.
+	/// Seconds the active client may go without a control ping before it is
+	/// treated as gone. Its input is released and media delivery paused, but
+	/// the session and application keep running for a later resume.
 	pub timeout: u64,
 }
 

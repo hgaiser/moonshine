@@ -20,6 +20,9 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+/// Bound for a just-spawned child to take its executable's name.
+const EXEC_NAME_SETTLE: Duration = Duration::from_millis(100);
+
 /// Direct children forked by the calling thread.
 ///
 /// Linux lists children per creating task in `/proc/thread-self/children`;
@@ -54,16 +57,28 @@ impl OwnedChild {
 	/// command name; anything else (including zero or several candidates) is
 	/// refused rather than guessed.
 	pub(super) fn adopt_new_child(before: &BTreeSet<i32>, comm: &str) -> io::Result<Self> {
-		let after = thread_children()?;
-		let mut candidates = after
-			.difference(before)
-			.copied()
-			.filter(|&pid| is_direct_child(pid, comm));
-		let (Some(pid), None) = (candidates.next(), candidates.next()) else {
-			return Err(io::Error::new(
-				io::ErrorKind::NotFound,
-				format!("expected exactly one new `{comm}` child of this thread"),
-			));
+		// `Command::spawn` returns once the child's exec has released the
+		// parent, but the kernel renames the child to the new executable only
+		// after that release. Until then it still carries this thread's name,
+		// so give a new child a short, bounded time to finish exec.
+		let deadline = Instant::now() + EXEC_NAME_SETTLE;
+		let pid = loop {
+			let after = thread_children()?;
+			let mut new = after.difference(before).copied().peekable();
+			let has_new_child = new.peek().is_some();
+			let mut candidates = new.filter(|&pid| is_direct_child(pid, comm));
+			match (candidates.next(), candidates.next()) {
+				(Some(pid), None) => break pid,
+				(None, _) if has_new_child && Instant::now() < deadline => {
+					std::thread::sleep(Duration::from_micros(200));
+				},
+				_ => {
+					return Err(io::Error::new(
+						io::ErrorKind::NotFound,
+						format!("expected exactly one new `{comm}` child of this thread"),
+					));
+				},
+			}
 		};
 		// SAFETY: pidfd_open takes a pid and flags and returns a new fd or -1.
 		let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
@@ -270,6 +285,16 @@ mod tests {
 		assert!(!is_direct_child(std::process::id() as i32, &helper_comm()));
 		child.kill().unwrap();
 		child.wait().unwrap();
+	}
+
+	#[test]
+	fn adoption_does_not_race_the_childs_exec_rename() {
+		// Each spawn returns before the kernel renames the child; adoption
+		// must wait for the name instead of refusing the right process.
+		for _ in 0..50 {
+			let (mut child, _owned) = spawn_adopted(0);
+			child.wait().unwrap();
+		}
 	}
 
 	#[test]

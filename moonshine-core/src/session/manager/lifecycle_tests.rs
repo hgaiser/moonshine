@@ -715,17 +715,25 @@ async fn teardown_waits_for_delayed_workers_before_replacement() {
 }
 
 /// STAB-003: a worker failure stops the session through the watchdog, which
-/// hands over to teardown without cancelling it.
+/// hands over to teardown without cancelling it. This includes the control
+/// worker itself exiting: client loss only detaches it, so its exit is fatal.
 #[tokio::test]
 async fn watchdog_triggered_cleanup_completes() {
 	let h = Harness::new();
-	h.active().await;
-	let stop = h.backend().session_stop.lock().unwrap().clone().unwrap();
-	stop.trigger_shutdown(SessionShutdownReason::VideoEncoderStopped)
-		.unwrap();
-	h.wait_idle().await;
-	h.assert_released().await;
-	assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), 1);
+	for (round, reason) in [
+		SessionShutdownReason::VideoEncoderStopped,
+		SessionShutdownReason::ControlStreamStopped,
+	]
+	.into_iter()
+	.enumerate()
+	{
+		h.active().await;
+		let stop = h.backend().session_stop.lock().unwrap().clone().unwrap();
+		stop.trigger_shutdown(reason).unwrap();
+		h.wait_idle().await;
+		h.assert_released().await;
+		assert_eq!(h.counters().unit_stops.load(Ordering::SeqCst), round + 1, "{reason:?}");
+	}
 	// The next session starts normally.
 	h.active().await;
 	h.core.stop_session().await.unwrap();

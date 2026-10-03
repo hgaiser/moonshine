@@ -48,6 +48,11 @@ For every changed-mode reconnect, verify:
 A client disconnect without cancellation is intentionally allowed to retain the
 host application/session for resume. Check retained-session behavior separately
 from final teardown; disconnect alone does not imply every host task must exit.
+The same applies to a client that vanishes without disconnecting (killed
+Moonlight, suspended laptop, pulled network): after `[stream].timeout` the log
+shows `Control peer sent no ping within the stream timeout; detaching it and
+retaining the session for resume`, and the application must still be running
+well past several timeouts and resumable.
 
 During disconnect, verify `Control peer disconnected; paused media delivery and released input for
 resume` when ENet reports the active peer disconnect. A UDP PING discovers an

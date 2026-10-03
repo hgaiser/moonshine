@@ -16,6 +16,7 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ### Fixed
 
+- Keep the running application when a client disappears. A client that stopped sending control pings (crash, suspend, network loss, or simply after a clean disconnect) previously ended the whole session once `[stream].timeout` elapsed, closing the game. The timeout now only retires the silent client, as a clean disconnect does: held input is released and media paused while the session waits, without a deadline, for a resume. Quitting the session from Moonlight or the application exiting still ends it.
 - Keep video capture on the virtual display's refresh deadlines. When the encoder became ready after a refresh tick (for example a PyroWave paced send finishing late), capture ran at the encoder's completion time, after that tick's frame callbacks, instead of on the refresh grid. Measured at 2880x1920@120, up to 88% of gameplay captures drifted off the grid, with frame spacing reaching 16.7 ms at p95 while average FPS still read about 120. A late encoder can now only complete the tick's own capture, and only while no client has committed since, so captures stay on the grid.
 - Leave the live virtual output untouched on reconnects that change only codec, bitrate, chroma, bit depth or transport settings; only resolution, refresh rate or HDR changes reconfigure the compositor.
 

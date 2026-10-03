@@ -131,7 +131,7 @@ identity recovery, state migration and authorized revocation.
 | Setting | Type / default | Effect |
 | --- | --- | --- |
 | `port` | integer, `48010` | RTSP negotiation listener port (TCP). |
-| `timeout` | nonnegative integer, `60` | Seconds without stream pings before the stream closes. |
+| `timeout` | nonnegative integer, `60` | Seconds the streaming client may go without a control ping before it is treated as disconnected: its held input is released and media delivery pauses, as for a clean disconnect. The session and application keep running, without a further deadline, until a resume or an explicit quit. |
 | `video` | table | Video transport settings below. |
 | `audio` | table | Audio transport settings below. |
 | `control` | table | Control transport and gamepad settings below. |

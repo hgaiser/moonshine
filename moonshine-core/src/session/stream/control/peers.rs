@@ -8,6 +8,13 @@
 //! Only the active peer's messages are dispatched, only they extend the stream
 //! timeout, and only the active peer receives feedback.
 //!
+//! The stream timeout is the active peer's *liveness* deadline, not the
+//! session's: it exists only while a peer owns the generation, is armed when
+//! the peer authenticates and refreshed by its pings, and is dropped with the
+//! ownership itself (disconnect, expiry or a new generation). A stale peer's
+//! deadline therefore cannot outlive it or affect its replacement, and a
+//! detached session waiting for `/resume` has no deadline at all.
+//!
 //! Every supported client encrypts all control messages: the server advertises
 //! the Sunshine `ControlV2` encryption flag and protocol version 7.1.431, for
 //! which moonlight-common-c always encrypts. Plaintext is therefore rejected.
@@ -16,6 +23,7 @@
 //! so a captured message cannot be replayed through the same or another peer.
 
 use std::net::SocketAddr;
+use std::time::{Duration, Instant};
 
 use tokio_enet::PeerId;
 
@@ -93,21 +101,30 @@ pub(super) enum Rejection {
 	Superseded,
 }
 
+/// The peer that owns the current generation and its liveness deadline.
+struct ActivePeer {
+	id: PeerId,
+	deadline: Instant,
+}
+
 /// Control peers of the current launch/resume generation.
 pub(super) struct ControlPeers {
 	generation: u64,
-	active: Option<PeerId>,
+	active: Option<ActivePeer>,
 	candidates: Vec<PeerId>,
 	replay: ReplayWindow,
+	/// How long the active peer may go without a ping before it is retired.
+	liveness: Duration,
 }
 
 impl ControlPeers {
-	pub(super) fn new(generation: u64) -> Self {
+	pub(super) fn new(generation: u64, liveness: Duration) -> Self {
 		Self {
 			generation,
 			active: None,
 			candidates: Vec::new(),
 			replay: ReplayWindow::new(),
+			liveness,
 		}
 	}
 
@@ -117,7 +134,30 @@ impl ControlPeers {
 
 	/// The peer that authenticated the current generation, if any.
 	pub(super) fn active(&self) -> Option<PeerId> {
-		self.active
+		self.active.as_ref().map(|active| active.id)
+	}
+
+	/// Extend the active peer's liveness deadline. Returns `false` (and changes
+	/// nothing) for any other peer.
+	pub(super) fn keep_alive(&mut self, peer: PeerId, now: Instant) -> bool {
+		match &mut self.active {
+			Some(active) if active.id == peer => {
+				active.deadline = now + self.liveness;
+				true
+			},
+			_ => false,
+		}
+	}
+
+	/// Retire the active peer if its liveness deadline has passed, returning
+	/// it. The caller detaches its input/media exactly as for a disconnect and
+	/// resets its transport; a later event from it is no longer attributed.
+	pub(super) fn take_expired(&mut self, now: Instant) -> Option<PeerId> {
+		if self.active.as_ref().is_some_and(|active| now >= active.deadline) {
+			self.active.take().map(|active| active.id)
+		} else {
+			None
+		}
 	}
 
 	/// Adopt a new launch/resume generation (new client and key). Returns the
@@ -129,7 +169,7 @@ impl ControlPeers {
 		self.generation = generation;
 		self.replay = ReplayWindow::new();
 		let mut stale = std::mem::take(&mut self.candidates);
-		stale.extend(self.active.take());
+		stale.extend(self.active.take().map(|active| active.id));
 		stale
 	}
 
@@ -153,7 +193,7 @@ impl ControlPeers {
 	/// Forget a disconnected peer. Returns whether it was the active peer.
 	pub(super) fn disconnect(&mut self, peer: PeerId) -> bool {
 		self.candidates.retain(|candidate| *candidate != peer);
-		if self.active == Some(peer) {
+		if self.active() == Some(peer) {
 			self.active = None;
 			true
 		} else {
@@ -163,7 +203,7 @@ impl ControlPeers {
 
 	/// Authenticate a received packet and return its decrypted control message.
 	pub(super) fn authenticate(&mut self, peer: PeerId, packet: &[u8], key: &[u8]) -> Result<Vec<u8>, Rejection> {
-		let is_active = self.active == Some(peer);
+		let is_active = self.active() == Some(peer);
 		if !is_active && !self.candidates.contains(&peer) {
 			return Err(Rejection::Unauthorized);
 		}
@@ -185,8 +225,13 @@ impl ControlPeers {
 			return Err(Rejection::Replay);
 		}
 		if !is_active {
+			// Ownership starts the liveness deadline, so a peer that
+			// authenticates once and then falls silent is still retired.
 			self.candidates.retain(|candidate| *candidate != peer);
-			self.active = Some(peer);
+			self.active = Some(ActivePeer {
+				id: peer,
+				deadline: Instant::now() + self.liveness,
+			});
 		}
 		Ok(plaintext)
 	}
@@ -200,6 +245,7 @@ mod tests {
 	use super::*;
 
 	const KEY: [u8; 16] = [7; 16];
+	const LIVENESS: Duration = Duration::from_secs(60);
 
 	fn peer(id: usize) -> PeerId {
 		PeerId(id)
@@ -250,7 +296,7 @@ mod tests {
 	#[test]
 	fn connection_requires_address_and_connect_data() {
 		let auth = authorization(1);
-		let mut peers = ControlPeers::new(1);
+		let mut peers = ControlPeers::new(1, LIVENESS);
 		let other = Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 2)), 1));
 		assert!(!peers.connect(peer(0), other, auth.control_connect_data(), &auth));
 		assert!(!peers.connect(peer(1), local(1), auth.control_connect_data() ^ 1, &auth));
@@ -271,7 +317,7 @@ mod tests {
 	#[test]
 	fn only_an_authenticated_peer_becomes_active() {
 		let auth = authorization(1);
-		let mut peers = ControlPeers::new(1);
+		let mut peers = ControlPeers::new(1, LIVENESS);
 		for id in 0..4 {
 			assert!(peers.connect(peer(id), local(id as u16), auth.control_connect_data(), &auth));
 		}
@@ -315,7 +361,7 @@ mod tests {
 	#[test]
 	fn new_generation_disconnects_previous_peers_and_resets_replay_state() {
 		let old = authorization(1);
-		let mut peers = ControlPeers::new(1);
+		let mut peers = ControlPeers::new(1, LIVENESS);
 		assert!(peers.connect(peer(0), local(1), old.control_connect_data(), &old));
 		assert!(peers.connect(peer(1), local(2), old.control_connect_data(), &old));
 		let message = plaintext_control(0x0200, &[]);
@@ -353,5 +399,61 @@ mod tests {
 		assert_eq!(peers.active(), Some(peer(3)));
 		assert!(peers.disconnect(peer(3)));
 		assert!(!peers.disconnect(peer(3)));
+	}
+
+	#[test]
+	fn liveness_deadline_belongs_to_the_active_peer() {
+		let auth = authorization(1);
+		let mut peers = ControlPeers::new(1, LIVENESS);
+		let message = plaintext_control(0x0200, &[]);
+		let later = |by: Duration| Instant::now() + by;
+		// Nothing owns the generation, so nothing can expire, however long.
+		assert!(peers.connect(peer(0), local(1), auth.control_connect_data(), &auth));
+		assert_eq!(peers.take_expired(later(10 * LIVENESS)), None);
+		assert!(
+			!peers.keep_alive(peer(0), Instant::now()),
+			"a candidate has no deadline"
+		);
+
+		// Authentication arms the deadline; only the owner's ping extends it.
+		peers
+			.authenticate(peer(0), &encode_client_control(&KEY, 0, &message), &KEY)
+			.unwrap();
+		assert_eq!(peers.take_expired(Instant::now()), None);
+		assert!(!peers.keep_alive(peer(1), later(LIVENESS)));
+		assert!(peers.keep_alive(peer(0), later(LIVENESS)));
+		assert_eq!(
+			peers.take_expired(later(LIVENESS + LIVENESS / 2)),
+			None,
+			"ping extended it"
+		);
+		assert_eq!(peers.take_expired(later(3 * LIVENESS)), Some(peer(0)));
+		// Expiry retires ownership exactly once; the peer's late events are inert.
+		assert_eq!(peers.active(), None);
+		assert_eq!(peers.take_expired(later(10 * LIVENESS)), None);
+		assert!(!peers.disconnect(peer(0)));
+		assert!(!peers.keep_alive(peer(0), Instant::now()));
+		assert_eq!(
+			peers.authenticate(peer(0), &encode_client_control(&KEY, 1, &message), &KEY),
+			Err(Rejection::Unauthorized)
+		);
+
+		// A replacement generation's owner has its own deadline: the previous
+		// owner's expiry, disconnect or ping cannot touch it.
+		assert!(peers.connect(peer(1), local(1), auth.control_connect_data(), &auth));
+		peers
+			.authenticate(peer(1), &encode_client_control(&KEY, 2, &message), &KEY)
+			.unwrap();
+		assert!(peers.begin_generation(2).contains(&peer(1)));
+		assert_eq!(peers.take_expired(later(10 * LIVENESS)), None, "no owner after resume");
+		let new = authorization(2);
+		assert!(peers.connect(peer(2), local(2), new.control_connect_data(), &new));
+		peers
+			.authenticate(peer(2), &encode_client_control(&KEY, 0, &message), &KEY)
+			.unwrap();
+		assert!(!peers.disconnect(peer(1)));
+		assert!(!peers.keep_alive(peer(1), later(10 * LIVENESS)));
+		assert_eq!(peers.take_expired(Instant::now()), None);
+		assert_eq!(peers.active(), Some(peer(2)));
 	}
 }

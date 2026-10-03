@@ -190,17 +190,23 @@ pub(crate) struct AudioStartHandle {
 
 #[cfg(test)]
 impl AudioStartHandle {
-	/// A handle not connected to an encoder, for control-stream tests.
-	pub(crate) fn for_test() -> Self {
+	/// A handle not connected to an encoder, for control-stream tests, and the
+	/// number of pause barriers it has acknowledged.
+	pub(crate) fn for_test() -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
 		let (packet_tx, mut packet_rx) = mpsc::channel(4);
-		tokio::spawn(async move {
-			while let Some(message) = packet_rx.recv().await {
-				if let AudioPacketMessage::Pause(ready) = message {
-					let _ = ready.send(());
+		let pauses = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		tokio::spawn({
+			let pauses = pauses.clone();
+			async move {
+				while let Some(message) = packet_rx.recv().await {
+					if let AudioPacketMessage::Pause(ready) = message {
+						pauses.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+						let _ = ready.send(());
+					}
 				}
 			}
 		});
-		Self {
+		let handle = Self {
 			start: StartLatch::new(),
 			packet_tx,
 			encoder_reconfigure_tx: crossbeam_channel::unbounded().0,
@@ -216,7 +222,8 @@ impl AudioStartHandle {
 				crate::session::authorization::StreamAuthorization::new(1, "127.0.0.1".parse().unwrap()).unwrap(),
 			)
 			.1,
-		}
+		};
+		(handle, pauses)
 	}
 }
 
