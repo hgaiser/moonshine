@@ -70,8 +70,17 @@ RTP counters restart at the client-visible epoch, and the first frame is an IDR
 (or the equivalent independent PyroWave frame).
 
 For a changed mode, verify that `Reconnect negotiation received` lists the
-changed fields, the compositor log reports the new output mode when needed, and
-the video/audio epoch recreation log appears before packets from the new epoch.
+changed fields, the compositor logs `Reconfigured live compositor output` only
+when resolution, refresh rate or HDR changed (a codec, bitrate, chroma or
+transport change keeps the live output), and the video/audio epoch recreation
+log appears before packets from the new epoch.
+
+With `[stream.video] log_stats = true`, compare the `Video capture cadence`
+summaries of the initial stream with those after each reconnect, while the same
+scene keeps rendering. Capture interval p95/p99 should stay near the refresh
+interval, `same_slot_captures` at zero, and the share of captures covering
+exactly one commit unchanged; Moonlight's average FPS alone cannot show uneven
+sampling.
 
 ## Epoch and failure checks
 

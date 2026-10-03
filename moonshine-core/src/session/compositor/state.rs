@@ -245,11 +245,20 @@ pub(crate) struct MoonshineCompositor {
 	// -- Frame relay to encoder --
 	pub frame_tx: super::admission::CaptureSender,
 	pub(super) capture_failed: bool,
-	pub(super) next_capture_at: std::time::Instant,
-	/// Shared refresh grid for callbacks and receiver-driven capture.
+	/// Deadline of the refresh slot being serviced. The refresh timer is the
+	/// only capture clock: callbacks and capture opportunities share it.
 	pub(super) next_refresh_at: std::time::Instant,
-	max_capture_lateness_us: u64,
-	missed_capture_slots: u64,
+	/// Refresh deadline sampled by the capture currently being attempted.
+	capture_deadline: std::time::Instant,
+	capture_schedule: super::capture::CaptureSchedule,
+	cadence: super::capture::CaptureCadence,
+	/// Incremented by every client surface commit. A deferred slot may only be
+	/// completed while it is unchanged, i.e. before any client answers the
+	/// slot's frame callbacks with newer content.
+	pub(super) commit_generation: u64,
+	/// Commits of the WSI override surface (the presented game), for cadence
+	/// diagnostics only.
+	pub(super) source_commit_generation: u64,
 
 	// -- Input --
 	pub seat: Seat<Self>,
@@ -586,7 +595,6 @@ impl MoonshineCompositor {
 		self.output.set_preferred(mode);
 		self.damage_tracker = OutputDamageTracker::from_output(&self.output);
 		self.screen_dirty = true;
-		self.next_capture_at = self.next_refresh_at;
 		tracing::info!(width, height, refresh_rate, hdr, "Reconfigured live compositor output");
 		Ok(())
 	}
@@ -780,10 +788,12 @@ impl MoonshineCompositor {
 				dmabuf_global,
 				frame_tx,
 				capture_failed: false,
-				next_capture_at: std::time::Instant::now(),
 				next_refresh_at: std::time::Instant::now(),
-				max_capture_lateness_us: 0,
-				missed_capture_slots: 0,
+				capture_deadline: std::time::Instant::now(),
+				capture_schedule: Default::default(),
+				cadence: super::capture::CaptureCadence::new(log_stats),
+				commit_generation: 0,
+				source_commit_generation: 0,
 				seat,
 				pending_text: String::new(),
 				cursor_position: initial_cursor_position,
@@ -1270,20 +1280,18 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Service producer lifecycle even when downstream cannot use a capture.
+	/// Service producer lifecycle on a refresh tick that publishes no capture.
 	/// Frame callbacks allow the game to commit its newest buffer. Presentation
 	/// feedback for skipped commits is discarded, never reported as displayed.
-	fn service_uncaptured_frame(&mut self, send_callbacks: bool) {
+	fn service_uncaptured_frame(&mut self) {
 		let mut feedback = OutputPresentationFeedback::new(&self.output);
 		for window in self.space.elements() {
-			if send_callbacks {
-				window.send_frame(
-					&self.output,
-					self.clock.now(),
-					Some(std::time::Duration::ZERO),
-					|_, _| Some(self.output.clone()),
-				);
-			}
+			window.send_frame(
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
 			window.take_presentation_feedback(
 				&mut feedback,
 				|_, _| Some(self.output.clone()),
@@ -1295,15 +1303,13 @@ impl MoonshineCompositor {
 		if let Some((surface, _)) = &self.override_surface
 			&& surface.alive()
 		{
-			if send_callbacks {
-				send_frames_surface_tree(
-					surface,
-					&self.output,
-					self.clock.now(),
-					Some(std::time::Duration::ZERO),
-					|_, _| Some(self.output.clone()),
-				);
-			}
+			send_frames_surface_tree(
+				surface,
+				&self.output,
+				self.clock.now(),
+				Some(std::time::Duration::ZERO),
+				|_, _| Some(self.output.clone()),
+			);
 			take_presentation_feedback_surface_tree(
 				surface,
 				&mut feedback,
@@ -1320,9 +1326,81 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Render on demand; only the refresh timer emits frame callbacks. This
-	/// prevents demand wakeups from increasing the client's render cadence.
-	pub fn render_and_export(&mut self, send_callbacks: bool) {
+	/// Refresh tick for `deadline`: the only capture clock and the only source
+	/// of frame callbacks. A capture, when admitted, precedes the callbacks.
+	pub fn refresh_tick(&mut self, deadline: std::time::Instant) {
+		if self.capture_schedule.begin_tick() && self.log_stats {
+			self.cadence.expired_slots += 1;
+		}
+		self.capture_deadline = deadline;
+		self.render_and_export(true);
+	}
+
+	/// Consumer demand: complete this refresh slot's deferred capture, if the
+	/// scene still holds the content of the slot's deadline. Demand never
+	/// opens a slot, sends frame callbacks or resolves presentation feedback.
+	pub fn complete_deferred_capture(&mut self) {
+		match self.capture_schedule.demand(self.commit_generation) {
+			super::capture::DemandOpportunity::None => {},
+			super::capture::DemandOpportunity::Superseded => {
+				if self.log_stats {
+					self.cadence.superseded_slots += 1;
+				}
+			},
+			super::capture::DemandOpportunity::Capture(slot) => {
+				self.capture_deadline = slot.deadline;
+				self.render_and_export(false);
+			},
+		}
+	}
+
+	/// Diagnostics for a commit of the WSI-presented game surface.
+	pub(super) fn note_source_commit(&mut self) {
+		self.source_commit_generation = self.source_commit_generation.wrapping_add(1);
+		if !self.log_stats {
+			return;
+		}
+		let interval = std::time::Duration::from_nanos(
+			1_000_000_000_000 / self.output.current_mode().map_or(60_000, |mode| mode.refresh.max(1)) as u64,
+		);
+		let now = std::time::Instant::now();
+		// `next_refresh_at` is the upcoming tick unless that tick is overdue.
+		let last_deadline = if self.next_refresh_at > now {
+			self.next_refresh_at.checked_sub(interval).unwrap_or(now)
+		} else {
+			self.next_refresh_at
+		};
+		self.cadence
+			.record_source_commit(now.saturating_duration_since(last_deadline));
+	}
+
+	/// Bookkeeping for a frame accepted by the consumer.
+	fn capture_published(&mut self, send_callbacks: bool, now: std::time::Instant) {
+		self.screen_dirty = false;
+		self.last_frame_sent_at = now;
+		self.capture_schedule.captured();
+		let trigger = if send_callbacks {
+			super::capture::CaptureTrigger::Refresh
+		} else {
+			super::capture::CaptureTrigger::DeferredSlot
+		};
+		self.cadence.record(
+			now,
+			self.capture_deadline,
+			trigger,
+			self.commit_generation,
+			self.source_commit_generation,
+		);
+		tracing::trace!(
+			?trigger,
+			lateness_us = now.saturating_duration_since(self.capture_deadline).as_micros() as u64,
+			commit_generation = self.commit_generation,
+			"Capture published"
+		);
+	}
+
+	/// Capture for a refresh tick (`send_callbacks`) or a deferred slot.
+	fn render_and_export(&mut self, send_callbacks: bool) {
 		if self.log_stats && self.gpu_timer.has_pending() {
 			self.gpu_timer.poll(&mut self.renderer);
 		}
@@ -1390,9 +1468,38 @@ impl MoonshineCompositor {
 				scanout_buffer_map = self.scanout_buffer_map.len(),
 				retired_buffer_pools = self.retired_buffer_pools.len(),
 				released_scanout_buffers = self.released_scanout_buffers,
-				max_capture_lateness_us = self.max_capture_lateness_us,
-				missed_capture_slots = self.missed_capture_slots,
 				"Video capture resources"
+			);
+			let c = self.cadence.take_summary();
+			tracing::info!(
+				captures = c.captures,
+				capture_interval_min_us = c.interval_us[0],
+				capture_interval_p50_us = c.interval_us[1],
+				capture_interval_p95_us = c.interval_us[2],
+				capture_interval_p99_us = c.interval_us[3],
+				capture_interval_max_us = c.interval_us[4],
+				capture_lateness_p50_us = c.lateness_us[0],
+				capture_lateness_p99_us = c.lateness_us[1],
+				capture_lateness_max_us = c.lateness_us[2],
+				refresh_captures = c.refresh,
+				deferred_slot_captures = c.deferred,
+				same_slot_captures = c.same_slot,
+				captures_without_new_commit = c.commits[0],
+				captures_with_one_commit = c.commits[1],
+				captures_with_two_commits = c.commits[2],
+				captures_with_three_plus_commits = c.commits[3],
+				game_surface_commits = c.source_commit_count,
+				captures_without_new_game_commit = c.source_commits[0],
+				captures_with_one_game_commit = c.source_commits[1],
+				captures_with_two_game_commits = c.source_commits[2],
+				captures_with_three_plus_game_commits = c.source_commits[3],
+				game_commit_phase_p05_us = c.source_commit_phase_us[0],
+				game_commit_phase_p50_us = c.source_commit_phase_us[1],
+				game_commit_phase_p95_us = c.source_commit_phase_us[2],
+				deferred_slots = c.deferred_slots,
+				superseded_slots = c.superseded_slots,
+				expired_slots = c.expired_slots,
+				"Video capture cadence"
 			);
 			let r = self.direct_rejections;
 			tracing::info!(
@@ -1425,37 +1532,29 @@ impl MoonshineCompositor {
 			self.direct_rejections = [0; DirectReject::COUNT];
 			self.last_resource_summary = std::time::Instant::now();
 			self.released_scanout_buffers = 0;
-			self.max_capture_lateness_us = 0;
-			self.missed_capture_slots = 0;
 		}
 		// Preserve the one-second keepalive for an actually static screen.
 		if !tick.render {
-			self.service_uncaptured_frame(send_callbacks);
+			if send_callbacks {
+				self.service_uncaptured_frame();
+			}
 			return;
 		}
 
-		if std::time::Instant::now() < self.next_capture_at {
-			self.service_uncaptured_frame(send_callbacks);
-			return;
-		}
 		let Some(credit) = self.frame_tx.try_acquire() else {
-			if self.log_stats {
-				self.pre_render_rejected += 1;
+			if send_callbacks {
+				// The consumer may still accept this slot's content before
+				// any client commits again; it never gets a second slot.
+				self.capture_schedule
+					.defer(self.capture_deadline, self.commit_generation);
+				if self.log_stats {
+					self.pre_render_rejected += 1;
+					self.cadence.deferred_slots += 1;
+				}
+				self.service_uncaptured_frame();
 			}
-			self.service_uncaptured_frame(send_callbacks);
 			return;
 		};
-		// Keep the ideal cadence, skipping missed intervals without a catch-up burst.
-		let interval = std::time::Duration::from_nanos(
-			1_000_000_000_000 / self.output.current_mode().map_or(60_000, |mode| mode.refresh.max(1)) as u64,
-		);
-		let now = std::time::Instant::now();
-		if self.log_stats {
-			let lateness = now.saturating_duration_since(self.next_capture_at);
-			self.max_capture_lateness_us = self.max_capture_lateness_us.max(lateness.as_micros() as u64);
-			self.missed_capture_slots += (lateness.as_nanos() / interval.as_nanos()) as u64;
-		}
-		self.next_capture_at = super::capture::next_capture_deadline(self.next_capture_at, now, interval);
 		let mut credit = Some(credit);
 
 		// Try direct scanout: bypass compositor rendering when a single
@@ -1494,6 +1593,9 @@ impl MoonshineCompositor {
 			// The encoder is still reading this buffer — skip the frame
 			// to avoid overwriting its content.
 			tracing::trace!("Buffer {idx} still in use by encoder, skipping frame");
+			if send_callbacks {
+				self.service_uncaptured_frame();
+			}
 			return;
 		}
 
@@ -1548,8 +1650,7 @@ impl MoonshineCompositor {
 			self.gpu_timer.begin(&mut self.renderer);
 		}
 		// Bind the pre-allocated Dmabuf as a render target.
-		let bind_result = self.renderer.bind(&mut self.buffer_pool[idx].dmabuf);
-		let mut framebuffer = match bind_result {
+		let mut framebuffer = match self.renderer.bind(&mut self.buffer_pool[idx].dmabuf) {
 			Ok(fb) => fb,
 			Err(e) => {
 				self.gpu_timer.end(&mut self.renderer);
@@ -1712,6 +1813,7 @@ impl MoonshineCompositor {
 		let mut exported_frame = exported_frame;
 		exported_frame.created_at = std::time::Instant::now();
 
+		let mut published_at = None;
 		// Send the pre-built frame to the encoder.
 		// The rendering happened after export_dmabuf duplicated the fds,
 		// but the fds reference the same DMA-BUF — the encoder will see
@@ -1737,8 +1839,9 @@ impl MoonshineCompositor {
 					self.captured_frames += 1;
 					self.composited_frames += 1;
 				}
-				self.screen_dirty = false;
-				self.last_frame_sent_at = std::time::Instant::now();
+				// Recorded after the last use of `render_result`, which
+				// borrows the bound buffer.
+				published_at = Some(std::time::Instant::now());
 			},
 		}
 
@@ -1822,6 +1925,10 @@ impl MoonshineCompositor {
 		// loop.
 		if let Err(e) = self.display_handle.flush_clients() {
 			tracing::error!("Failed to flush clients after render: {e}");
+		}
+		drop(render_result);
+		if let Some(at) = published_at {
+			self.capture_published(send_callbacks, at);
 		}
 	}
 
@@ -1955,8 +2062,7 @@ impl MoonshineCompositor {
 					self.captured_frames += 1;
 					self.direct_frames += 1;
 				}
-				self.screen_dirty = false;
-				self.last_frame_sent_at = std::time::Instant::now();
+				self.capture_published(send_callbacks, std::time::Instant::now());
 			},
 		}
 
@@ -2127,8 +2233,7 @@ impl MoonshineCompositor {
 					self.captured_frames += 1;
 					self.direct_frames += 1;
 				}
-				self.screen_dirty = false;
-				self.last_frame_sent_at = std::time::Instant::now();
+				self.capture_published(send_callbacks, std::time::Instant::now());
 			},
 		}
 

@@ -60,6 +60,7 @@ for GPU timestamp, composition and encoded/UDP/Ethernet measurement boundaries.
 | Signature | Investigate |
 | --- | --- |
 | FPS falls, captures age, encoding timings stay stable | Game frame cadence, demand, scene changes and buffer release/flush progress |
+| Client FPS steady but motion stutters | `Video capture cadence`: interval spread, deferred/superseded slots and captures covering 0 or 2+ commits |
 | Clean scene, completed buffers still held, client stops committing | Release-before-static-gate ordering; a swapchain-starved client cannot dirty the scene |
 | Import/conversion latency or fd/cache counts grow | Full DMA-BUF identity/layout, eviction and partial allocation cleanup |
 | Submit/encode wait grows with in-flight/consumer occupancy | GPU contention, encoder progress, device loss or overflow |

@@ -363,6 +363,10 @@ impl CompositorHandler for MoonshineCompositor {
 	fn commit(&mut self, surface: &WlSurface) {
 		// Mark the screen as dirty so the next timer tick renders and sends a frame.
 		self.screen_dirty = true;
+		self.commit_generation = self.commit_generation.wrapping_add(1);
+		if self.override_surface.as_ref().is_some_and(|(s, _)| s == surface) {
+			self.note_source_commit();
+		}
 
 		// Apply pending color management state.
 		if let Some(cm) = &mut self.color_management {

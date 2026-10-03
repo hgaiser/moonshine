@@ -154,11 +154,19 @@ pub(crate) struct CompositorReady {
 	pub hdr_capable: bool,
 }
 
+/// Properties of the live virtual output. Only these require changing the
+/// running compositor; codec, bitrate, chroma, bit depth and transport
+/// settings belong to the video pipeline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct OutputMode {
+	pub width: u32,
+	pub height: u32,
+	pub refresh_rate: u32,
+	pub hdr: bool,
+}
+
 struct CompositorReconfigure {
-	width: u32,
-	height: u32,
-	refresh_rate: u32,
-	hdr: bool,
+	mode: OutputMode,
 	applied: tokio::sync::oneshot::Sender<Result<bool, String>>,
 }
 
@@ -185,6 +193,8 @@ pub(crate) struct Compositor {
 pub(crate) struct LaunchedCompositor {
 	ready: CompositorReady,
 	reconfigure_tx: calloop::channel::Sender<CompositorReconfigure>,
+	/// The applied output mode, with the effective (not requested) HDR state.
+	mode: OutputMode,
 }
 
 impl CompositorContext {
@@ -254,6 +264,12 @@ impl Compositor {
 			reconfigure_rx,
 		} = self;
 
+		let requested = OutputMode {
+			width: context.width,
+			height: context.height,
+			refresh_rate: context.refresh_rate,
+			hdr: context.hdr,
+		};
 		// Registered before the thread exists: session completion then implies
 		// the compositor state (buffer pools, client buffers, Xwayland) is gone.
 		let worker = crate::session::lifecycle::WorkerGuard::register(&stop, SessionShutdownReason::CompositorStopped)?;
@@ -273,7 +289,16 @@ impl Compositor {
 			tracing::warn!("Timed out waiting for compositor ready: {e}");
 		})?;
 
-		Ok(LaunchedCompositor { ready, reconfigure_tx })
+		// Mirrors the launch-time format selection: HDR only when capable.
+		let mode = OutputMode {
+			hdr: requested.hdr && ready.hdr_capable,
+			..requested
+		};
+		Ok(LaunchedCompositor {
+			ready,
+			reconfigure_tx,
+			mode,
+		})
 	}
 }
 
@@ -281,21 +306,26 @@ impl LaunchedCompositor {
 	pub fn ready(&self) -> &CompositorReady {
 		&self.ready
 	}
-	pub async fn reconfigure(&self, width: u32, height: u32, refresh_rate: u32, hdr: bool) -> Result<bool, ()> {
+	/// Apply `mode` to the live output and return the effective HDR state.
+	///
+	/// An unchanged mode is not sent to the compositor: resetting the output,
+	/// its damage tracking or the clients' advertised wl_output state for a
+	/// media-only reconnect (codec, bitrate, chroma, FEC, ...) has no purpose.
+	pub async fn reconfigure(&mut self, mode: OutputMode) -> Result<bool, ()> {
+		if mode == self.mode {
+			tracing::debug!(?mode, "Reconnect keeps the live compositor output mode");
+			return Ok(self.mode.hdr);
+		}
 		let (applied, waiting) = tokio::sync::oneshot::channel();
 		self.reconfigure_tx
-			.send(CompositorReconfigure {
-				width,
-				height,
-				refresh_rate,
-				hdr,
-				applied,
-			})
+			.send(CompositorReconfigure { mode, applied })
 			.map_err(|_| ())?;
-		waiting
+		let hdr = waiting
 			.await
 			.map_err(|_| ())?
-			.map_err(|error| tracing::warn!(%error, "Compositor reconfiguration failed"))
+			.map_err(|error| tracing::warn!(%error, "Compositor reconfiguration failed"))?;
+		self.mode = OutputMode { hdr, ..mode };
+		Ok(hdr)
 	}
 }
 
@@ -543,9 +573,15 @@ fn run_compositor(
 		.handle()
 		.insert_source(reconfigure_rx, move |event, _, state: &mut MoonshineCompositor| {
 			if let calloop::channel::Event::Msg(request) = event {
-				let result = state.reconfigure_output(request.width, request.height, request.refresh_rate, request.hdr);
+				let OutputMode {
+					width,
+					height,
+					refresh_rate,
+					hdr,
+				} = request.mode;
+				let result = state.reconfigure_output(width, height, refresh_rate, hdr);
 				if result.is_ok() {
-					reconfigured_refresh_rate.store(request.refresh_rate.max(1), Ordering::Release);
+					reconfigured_refresh_rate.store(refresh_rate.max(1), Ordering::Release);
 				}
 				let effective_hdr = result.map(|()| state.hdr);
 				let _ = request.applied.send(effective_hdr);
@@ -561,17 +597,18 @@ fn run_compositor(
 	// actual period and producing ~58 Hz instead of 60 Hz.
 	let frame_nanos: u64 = 1_000_000_000u64 / u64::from(context.refresh_rate.max(1));
 	let frame_interval = std::time::Duration::from_nanos(frame_nanos);
-	// Both timers use the same grid. Demand and a temporary paced-send stall
-	// must not create a persistent phase offset from application callbacks.
+	// The refresh timer is the only capture clock: each deadline offers one
+	// capture, taken before that slot's frame callbacks (see
+	// `capture::CaptureSchedule`). Consumer demand only completes a slot the
+	// tick deferred, so neither demand nor reconnects can start another phase.
 	state.next_refresh_at = std::time::Instant::now() + frame_interval;
-	state.next_capture_at = state.next_refresh_at;
 	let timer = smithay::reexports::calloop::timer::Timer::from_deadline(state.next_refresh_at);
 	let token = event_loop
 		.handle()
-		.insert_source(timer, move |_event, _metadata, state: &mut MoonshineCompositor| {
+		.insert_source(timer, move |deadline, _metadata, state: &mut MoonshineCompositor| {
 			// Type a bounded batch of any clipboard text queued since the last tick.
 			input::drain_pending_text(state);
-			state.render_and_export(true);
+			state.refresh_tick(deadline);
 			// Schedule the next frame relative to the ideal wall-clock
 			// target, not relative to "now". This absorbs render-time
 			// jitter and keeps a steady cadence.
@@ -579,45 +616,22 @@ fn run_compositor(
 				1_000_000_000u64 / u64::from(refresh_rate.load(Ordering::Acquire).max(1)),
 			);
 			state.next_refresh_at =
-				capture::next_capture_deadline(state.next_refresh_at, std::time::Instant::now(), interval);
+				capture::next_refresh_deadline(state.next_refresh_at, std::time::Instant::now(), interval);
 			smithay::reexports::calloop::timer::TimeoutAction::ToInstant(state.next_refresh_at)
 		})
 		.map_err(|e| format!("Failed to insert frame timer: {e}"))?;
 	session_sources.push(token);
 
 	if let Some(demand) = capture_demand {
-		// One preallocated timer, rearmed by coalesced consumer demand. Keep the
-		// lifecycle timer above so blocked capture never blocks Wayland clients.
-		let capture_timer = calloop::Dispatcher::new(
-			calloop::timer::Timer::from_duration(std::time::Duration::from_secs(86400)),
-			|_, _, state: &mut MoonshineCompositor| {
-				state.render_and_export(false);
-				calloop::timer::TimeoutAction::ToDuration(std::time::Duration::from_secs(86400))
-			},
-		);
+		// Coalesced consumer demand. Without a deferred slot this is a no-op;
+		// the next refresh tick samples admission itself.
 		let token = event_loop
 			.handle()
-			.register_dispatcher(capture_timer.clone())
-			.map_err(|e| format!("Failed to register capture demand timer: {e}"))?;
-		session_sources.push(token);
-		// calloop never clears sources when the loop is dropped, so a strong
-		// handle captured by a source would leak the whole loop (and the
-		// Display and XWayland with it). Hold it weakly.
-		let handle = event_loop.handle().downgrade();
-		let demand_token = event_loop
-			.handle()
-			.insert_source(demand, move |_, _, state: &mut MoonshineCompositor| {
-				if state.frame_tx.requested() {
-					capture_timer
-						.as_source_mut()
-						.set_deadline(state.next_capture_at.max(std::time::Instant::now()));
-					if let Some(Err(error)) = handle.upgrade().map(|handle| handle.update(&token)) {
-						tracing::warn!(%error, "Failed to rearm capture demand timer");
-					}
-				}
+			.insert_source(demand, |_, _, state: &mut MoonshineCompositor| {
+				state.complete_deferred_capture();
 			})
 			.map_err(|e| format!("Failed to register capture demand wakeup: {e}"))?;
-		session_sources.push(demand_token);
+		session_sources.push(token);
 	}
 
 	tracing::info!(
@@ -748,5 +762,61 @@ mod tests {
 		assert_eq!(sanitize_output_scale(Some(0.0)), 1.0);
 		assert_eq!(sanitize_output_scale(Some(f64::NAN)), 1.0);
 		assert_eq!(sanitize_output_scale(Some(9.0)), 1.0);
+	}
+}
+
+#[cfg(test)]
+mod reconfigure_tests {
+	use super::{CompositorReady, LaunchedCompositor, OutputMode};
+
+	#[tokio::test]
+	async fn only_output_mode_changes_reach_the_live_compositor() {
+		let (reconfigure_tx, requests) = calloop::channel::channel();
+		let mode = OutputMode {
+			width: 2880,
+			height: 1920,
+			refresh_rate: 120,
+			hdr: false,
+		};
+		let mut compositor = LaunchedCompositor {
+			ready: CompositorReady {
+				xdisplay: 0,
+				wayland_display: String::new(),
+				hdr_capable: true,
+			},
+			reconfigure_tx,
+			mode,
+		};
+		// A codec/bitrate/chroma-only reconnect keeps the output untouched.
+		assert_eq!(compositor.reconfigure(mode).await, Ok(false));
+		assert!(requests.try_recv().is_err());
+
+		let responder = std::thread::spawn(move || {
+			let mut applied = Vec::new();
+			while let Ok(request) = requests.recv() {
+				applied.push(request.mode);
+				let _ = request.applied.send(Ok(request.mode.hdr));
+			}
+			applied
+		});
+		let changes = [
+			OutputMode {
+				width: 1920,
+				height: 1080,
+				..mode
+			},
+			OutputMode {
+				refresh_rate: 60,
+				..mode
+			},
+			OutputMode { hdr: true, ..mode },
+		];
+		for change in changes {
+			assert_eq!(compositor.reconfigure(change).await, Ok(change.hdr));
+			// Repeating the now-applied mode is again a no-op.
+			assert_eq!(compositor.reconfigure(change).await, Ok(change.hdr));
+		}
+		drop(compositor);
+		assert_eq!(responder.join().unwrap(), changes);
 	}
 }

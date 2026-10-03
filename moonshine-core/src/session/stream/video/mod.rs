@@ -251,6 +251,16 @@ impl VideoStreamContext {
 	///
 	/// Keep this list next to the context definition so newly-added negotiated
 	/// fields cannot silently fall through the reconnect fast path.
+	/// The virtual-output properties this stream requires from the compositor.
+	pub(crate) fn output_mode(&self) -> crate::session::compositor::OutputMode {
+		crate::session::compositor::OutputMode {
+			width: self.width,
+			height: self.height,
+			refresh_rate: self.fps,
+			hdr: self.format.hdr,
+		}
+	}
+
 	pub(crate) fn changed_fields(&self, requested: &Self) -> Vec<&'static str> {
 		let mut changed = Vec::new();
 		macro_rules! changed {
@@ -1298,6 +1308,67 @@ mod tests {
 		};
 		assert_eq!(active.changed_fields(&records), vec!["PyroWave dialect"]);
 		assert_eq!(records.changed_fields(&active), vec!["PyroWave dialect"]);
+	}
+
+	#[test]
+	fn only_display_properties_change_the_compositor_output_mode() {
+		use pyrowave_protocol::PyroWaveDialect;
+		let active = valid_context();
+		let media_only = [
+			VideoStreamContext {
+				pyrowave_dialect: Some(PyroWaveDialect::NativeWireV1),
+				format: NegotiatedVideoFormat::sdr(
+					VideoCodec::PyroWave,
+					ChromaFormat::Yuv444,
+					BitDepth::Ten,
+					ColorRange::Full,
+				),
+				..active.clone()
+			},
+			VideoStreamContext {
+				format: NegotiatedVideoFormat::sdr(
+					VideoCodec::Av1,
+					ChromaFormat::Yuv420,
+					BitDepth::Ten,
+					ColorRange::Full,
+				),
+				..active.clone()
+			},
+			VideoStreamContext {
+				bitrate: 150_000_000,
+				..active.clone()
+			},
+			VideoStreamContext {
+				packet_size: 1024,
+				minimum_fec_packets: 4,
+				qos: !active.qos,
+				encrypt_video: !active.encrypt_video,
+				max_reference_frames: 4,
+				..active.clone()
+			},
+		];
+		for requested in media_only {
+			assert!(!active.changed_fields(&requested).is_empty());
+			assert_eq!(requested.output_mode(), active.output_mode(), "{requested:?}");
+		}
+		let display = [
+			VideoStreamContext {
+				width: 2560,
+				height: 1440,
+				..active.clone()
+			},
+			VideoStreamContext {
+				fps: 60,
+				..active.clone()
+			},
+			VideoStreamContext {
+				format: NegotiatedVideoFormat::hdr10(VideoCodec::Hevc, ChromaFormat::Yuv420, ColorRange::Limited),
+				..active.clone()
+			},
+		];
+		for requested in display {
+			assert_ne!(requested.output_mode(), active.output_mode(), "{requested:?}");
+		}
 	}
 
 	#[test]

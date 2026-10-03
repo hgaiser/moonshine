@@ -14,6 +14,15 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep video capture on the virtual display's refresh deadlines. When the encoder became ready after a refresh tick (for example a PyroWave paced send finishing late), capture ran at the encoder's completion time, after that tick's frame callbacks, instead of on the refresh grid. Measured at 2880x1920@120, up to 88% of gameplay captures drifted off the grid, with frame spacing reaching 16.7 ms at p95 while average FPS still read about 120. A late encoder can now only complete the tick's own capture, and only while no client has committed since, so captures stay on the grid.
+- Leave the live virtual output untouched on reconnects that change only codec, bitrate, chroma, bit depth or transport settings; only resolution, refresh rate or HDR changes reconfigure the compositor.
+
+### Added
+
+- Report capture cadence with `log_stats`: capture interval percentiles, lateness against the refresh deadline, refresh versus deferred captures, how many client commits each capture covered, and the WSI-presented game surface's commit coverage and commit time within the refresh slot.
+
 ## [v0.17.0-beta-9] - 2026-10-01
 
 ### Added

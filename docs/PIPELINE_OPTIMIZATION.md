@@ -26,15 +26,32 @@ Epoch changes drain queued frames and reject racing old sends/receives. An old
 credit's completion cannot replenish the new generation. Receiver disconnect is
 terminal. The capacity-one handoff slot is not another admission credit.
 
-Demand wakes calloop through a coalesced ping and preallocated timer. Absolute
-capture deadlines and application refresh callbacks share one clock grid. Both
-skip whole missed slots without rebasing their phase or sending catch-up bursts;
-codec changes reuse that refresh grid. Capture summaries include maximum capture
-lateness and missed slots to distinguish pacing stalls from encoder stage cost.
-Missed slots include static/no-demand gaps; they are not client frame-loss counts. The regular refresh timer
-still dispatches Wayland, services input, releases buffers and sends frame
-callbacks even while capture is blocked. Demand wakeups do not increase callback
-cadence; skipped presentation feedback is discarded, not reported as presented.
+The refresh timer is the only capture clock. Each absolute refresh deadline
+offers at most one capture, taken before that slot's frame callbacks; a late
+wakeup skips whole slots without rebasing the phase or bursting. Reconnects,
+epoch resets and codec changes keep this grid; only a refresh-rate change alters
+its interval. If admission has no credit at the tick, the slot is deferred.
+Demand wakes calloop through a coalesced ping and may complete that deferred
+slot only while no client has committed since the tick, i.e. with the scene as
+of the deadline. Demand never opens a slot, so a consumer's completion time
+cannot become a second sampling clock that captures content rendered in
+response to the slot's own callbacks. The next tick discards a slot still
+waiting. The refresh timer still dispatches Wayland, services input, releases
+buffers and sends frame callbacks even while capture is blocked. Demand wakeups
+do not increase callback cadence or resolve presentation feedback; skipped
+presentation feedback is discarded, not reported as presented.
+
+With `log_stats`, the five-second `Video capture cadence` summary reports
+capture spacing (min/p50/p95/p99/max), lateness against the sampled deadline,
+refresh versus deferred-slot captures, deferred/superseded/expired slots and how
+many client surface commits each capture covered. Average FPS cannot reveal
+uneven sampling: steady 120 FPS with captures covering 0 or 2+ commits means
+repeated or never-captured application frames. Cursor and overlay surfaces also
+commit, so these counts bound rather than equal game-frame repeats/skips; the
+`game_*` fields count only the WSI-presented game surface and report when its
+commits land after the refresh deadline. A game paced by frame callbacks covers
+one commit per capture and commits shortly after each tick.
+`same_slot_captures` must stay zero.
 
 Completed scanout holds must be released and resulting Wayland events flushed
 before static-screen skipping. A clean screen can mean the game is waiting for

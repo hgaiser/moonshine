@@ -448,10 +448,7 @@ impl ActiveSession {
 	}
 
 	pub(crate) async fn reconfigure_video(&mut self, context: VideoStreamContext) -> Result<(), ()> {
-		let effective_hdr = self
-			.compositor
-			.reconfigure(context.width, context.height, context.fps, context.format.hdr)
-			.await?;
+		let effective_hdr = self.compositor.reconfigure(context.output_mode()).await?;
 		if effective_hdr != context.format.hdr {
 			tracing::warn!(
 				requested_hdr = context.format.hdr,
