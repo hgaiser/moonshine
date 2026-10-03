@@ -26,6 +26,7 @@ use smithay::reexports::wayland_protocols::wp::color_representation::v1::server:
 };
 use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
 use smithay::reexports::wayland_server::{Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource};
+use smithay::wayland::compositor::{Cacheable, with_states};
 
 use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata};
 use crate::session::compositor::state::MoonshineCompositor;
@@ -230,10 +231,24 @@ impl SwapchainColor {
 	}
 }
 
+/// A surface's `wp_color_management` image description. It is double-buffered
+/// with the rest of the surface state, so it takes effect with the commit that
+/// carries it and not with whichever commit is applied next.
+#[derive(Debug, Default, Clone, Copy)]
+struct SurfaceImageDescription(Option<ImageDescription>);
+
+impl Cacheable for SurfaceImageDescription {
+	fn commit(&mut self, _dh: &DisplayHandle) -> Self {
+		*self
+	}
+
+	fn merge_into(self, into: &mut Self, _dh: &DisplayHandle) {
+		*into = self;
+	}
+}
+
 /// Tracks per-surface color space declarations.
 pub(crate) struct ColorManagementState {
-	/// Pending image description per surface (applied on next commit).
-	pending: HashMap<WlSurface, Option<ImageDescription>>,
 	/// Current (committed) image description per surface.
 	current: HashMap<WlSurface, ImageDescription>,
 	/// Current image description per surface from gamescope/moonshine swapchain.
@@ -255,7 +270,6 @@ impl ColorManagementState {
 			);
 
 		Self {
-			pending: HashMap::new(),
 			current: HashMap::new(),
 			gamescope_current: HashMap::new(),
 			hdr,
@@ -269,7 +283,7 @@ impl ColorManagementState {
 			color_space = ?desc.to_frame_color_space(),
 			"set_pending"
 		);
-		self.pending.insert(surface.clone(), Some(desc));
+		Self::set_pending_description(surface, Some(desc));
 	}
 
 	/// Gamescope: `swapchain_feedback` carries the color space only.
@@ -333,37 +347,46 @@ impl ColorManagementState {
 
 	/// Clear the pending image description (from `unset_image_description`).
 	pub fn unset_pending(&mut self, surface: &WlSurface) {
-		self.pending.insert(surface.clone(), None);
+		Self::set_pending_description(surface, None);
 	}
 
-	/// Apply pending state on surface commit.
+	fn set_pending_description(surface: &WlSurface, desc: Option<ImageDescription>) {
+		// The color management object outlives its surface and is inert after it.
+		if surface.is_alive() {
+			with_states(surface, |states| {
+				states.cached_state.get::<SurfaceImageDescription>().pending().0 = desc;
+			});
+		}
+	}
+
+	/// Apply the image description of the commit that was just applied.
 	pub fn commit(&mut self, surface: &WlSurface) {
-		// Apply wp_color_management pending state.
-		if let Some(pending) = self.pending.remove(surface) {
-			match pending {
-				Some(desc) => {
-					// Some clients (e.g. Forza Horizon via vkd3d-proton)
-					// re-set an identical description every frame; log only
-					// actual changes to keep debug output readable.
-					let prev = self.current.insert(surface.clone(), desc);
-					if prev != Some(desc) {
-						tracing::debug!(
-							surface_id = ?surface.id(),
-							color_space = ?desc.to_frame_color_space(),
-							num_current = self.current.len(),
-							"commit: inserting into current"
-						);
-					}
-				},
-				None => {
-					if self.current.remove(surface).is_some() {
-						tracing::debug!(
-							surface_id = ?surface.id(),
-							"commit: removing from current"
-						);
-					}
-				},
-			}
+		let committed = with_states(surface, |states| {
+			states.cached_state.get::<SurfaceImageDescription>().current().0
+		});
+		match committed {
+			Some(desc) => {
+				// Some clients (e.g. Forza Horizon via vkd3d-proton)
+				// re-set an identical description every frame; log only
+				// actual changes to keep debug output readable.
+				let prev = self.current.insert(surface.clone(), desc);
+				if prev != Some(desc) {
+					tracing::debug!(
+						surface_id = ?surface.id(),
+						color_space = ?desc.to_frame_color_space(),
+						num_current = self.current.len(),
+						"commit: inserting into current"
+					);
+				}
+			},
+			None => {
+				if self.current.remove(surface).is_some() {
+					tracing::debug!(
+						surface_id = ?surface.id(),
+						"commit: removing from current"
+					);
+				}
+			},
 		}
 	}
 
@@ -458,7 +481,6 @@ impl ColorManagementState {
 
 	/// Clean up tracking for a destroyed surface.
 	pub fn surface_destroyed(&mut self, surface: &WlSurface) {
-		self.pending.remove(surface);
 		self.current.remove(surface);
 		self.gamescope_current.remove(surface);
 	}
