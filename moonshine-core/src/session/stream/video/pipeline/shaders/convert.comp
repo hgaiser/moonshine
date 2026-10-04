@@ -1,0 +1,221 @@
+#version 450
+// RGB -> encoder-input YCbCr conversion for the conventional (Vulkan Video)
+// codecs, optionally compositing one premultiplied-alpha overlay (the
+// compositor cursor) while sampling the source.
+//
+// Numerically mirrors Pixelforge's `color_convert.comp` (same coefficients,
+// transfer functions, per-sample clamping, 2x2 chroma box filter and
+// truncating quantization) so either converter produces the same encoder
+// input. The output buffer uses Pixelforge's packed plane layout; it is copied
+// into the encoder's input image afterwards.
+//
+// Each invocation owns a 4x2 pixel block and therefore whole 32-bit output
+// words: no atomics and no buffer clear are needed. Callers must guarantee
+// width % 4 == 0 and height % 2 == 0 (otherwise rows are not word aligned).
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+
+layout(push_constant) uniform PushConstants {
+    uint width;
+    uint height;
+    uint output_format;  // 0=NV12, 2=YUV444, 3=P010, 4=YUV444P10 (Pixelforge numbering)
+    uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB->BT.2020+PQ, 3=scRGB linear->BT.2020+PQ
+    uint full_range;
+    float sdr_white_nits;
+    // Overlay rectangle in output pixels: [x0, y0) .. [x0 + w, y0 + h). w == 0 disables it.
+    ivec2 overlay_origin;
+    uvec2 overlay_size;
+} params;
+
+layout(binding = 0) uniform sampler2D inputImage;
+
+layout(std430, binding = 1) writeonly buffer OutputBuffer {
+    uint output_data[];
+};
+
+// Premultiplied RGBA overlay sampled 1:1 with texelFetch.
+layout(binding = 2) uniform sampler2D overlayImage;
+
+const float BT709_Y_R = 0.2126;
+const float BT709_Y_G = 0.7152;
+const float BT709_Y_B = 0.0722;
+const float BT709_U_R = -0.1146;
+const float BT709_U_G = -0.3854;
+const float BT709_U_B = 0.5000;
+const float BT709_V_R = 0.5000;
+const float BT709_V_G = -0.4542;
+const float BT709_V_B = -0.0458;
+
+const float BT2020_Y_R = 0.2627;
+const float BT2020_Y_G = 0.6780;
+const float BT2020_Y_B = 0.0593;
+const float BT2020_U_R = -0.1396;
+const float BT2020_U_G = -0.3604;
+const float BT2020_U_B = 0.5000;
+const float BT2020_V_R = 0.5000;
+const float BT2020_V_G = -0.4598;
+const float BT2020_V_B = -0.0402;
+
+const float PQ_M1 = 0.1593017578125;
+const float PQ_M2 = 78.84375;
+const float PQ_C1 = 0.8359375;
+const float PQ_C2 = 18.8515625;
+const float PQ_C3 = 18.6875;
+
+vec3 linear_to_pq(vec3 L) {
+    L = max(L, vec3(0.0));
+    vec3 Lm1 = pow(L, vec3(PQ_M1));
+    vec3 N = pow((PQ_C1 + PQ_C2 * Lm1) / (1.0 + PQ_C3 * Lm1), vec3(PQ_M2));
+    return N;
+}
+
+vec3 srgb_to_linear(vec3 srgb) {
+    srgb = clamp(srgb, 0.0, 1.0);
+    return mix(
+        pow((srgb + 0.055) / 1.055, vec3(2.4)),
+        srgb / 12.92,
+        lessThanEqual(srgb, vec3(0.04045))
+    );
+}
+
+vec3 bt709_to_bt2020(vec3 rgb709) {
+    return vec3(
+        0.6274 * rgb709.r + 0.3293 * rgb709.g + 0.0433 * rgb709.b,
+        0.0691 * rgb709.r + 0.9195 * rgb709.g + 0.0114 * rgb709.b,
+        0.0164 * rgb709.r + 0.0880 * rgb709.g + 0.8956 * rgb709.b
+    );
+}
+
+vec3 read_rgb(ivec2 coord) {
+    vec4 rgba = texelFetch(inputImage, coord, 0);
+    // Late composition happens in the source's encoding, exactly where the
+    // GLES compositor blends a premultiplied cursor into its output buffer.
+    ivec2 rel = coord - params.overlay_origin;
+    if (params.overlay_size.x != 0u && all(greaterThanEqual(rel, ivec2(0))) &&
+        all(lessThan(uvec2(rel), params.overlay_size))) {
+        vec4 o = texelFetch(overlayImage, rel, 0);
+        rgba.rgb = o.rgb + rgba.rgb * (1.0 - o.a);
+    }
+    if (params.color_space == 2u) {
+        vec3 linear_709 = srgb_to_linear(rgba.rgb);
+        vec3 linear_2020 = bt709_to_bt2020(linear_709);
+        return linear_to_pq(linear_2020 * (params.sdr_white_nits / 10000.0));
+    }
+    if (params.color_space == 3u) {
+        vec3 linear_2020 = bt709_to_bt2020(rgba.rgb);
+        return linear_to_pq(linear_2020 * (params.sdr_white_nits / 10000.0));
+    }
+    return rgba.rgb;
+}
+
+vec3 rgb_to_yuv(vec3 rgb) {
+    float yr, yg, yb, ur, ug, ub, vr, vg, vb;
+    if (params.color_space >= 1u) {
+        yr = BT2020_Y_R; yg = BT2020_Y_G; yb = BT2020_Y_B;
+        ur = BT2020_U_R; ug = BT2020_U_G; ub = BT2020_U_B;
+        vr = BT2020_V_R; vg = BT2020_V_G; vb = BT2020_V_B;
+    } else {
+        yr = BT709_Y_R; yg = BT709_Y_G; yb = BT709_Y_B;
+        ur = BT709_U_R; ug = BT709_U_G; ub = BT709_U_B;
+        vr = BT709_V_R; vg = BT709_V_G; vb = BT709_V_B;
+    }
+    float y = yr * rgb.r + yg * rgb.g + yb * rgb.b;
+    float u = 0.5 + ur * rgb.r + ug * rgb.g + ub * rgb.b;
+    float v = 0.5 + vr * rgb.r + vg * rgb.g + vb * rgb.b;
+    return vec3(clamp(y, 0.0, 1.0), clamp(u, 0.0, 1.0), clamp(v, 0.0, 1.0));
+}
+
+uint q8_y(float y) {
+    if (params.full_range == 0u) return uint(clamp(y * 219.0 + 16.0, 0.0, 255.0));
+    return uint(clamp(y * 255.0, 0.0, 255.0));
+}
+
+uint q8_c(float c) {
+    if (params.full_range == 0u) return uint(clamp((c - 0.5) * 224.0 + 128.0, 0.0, 255.0));
+    return uint(clamp(c * 255.0, 0.0, 255.0));
+}
+
+uint q10_y(float y) {
+    uint val;
+    if (params.full_range == 0u) val = uint(clamp(y * 876.0 + 64.0, 0.0, 1023.0));
+    else val = uint(clamp(y * 1023.0, 0.0, 1023.0));
+    return (val << 6u) & 0xFFC0u;
+}
+
+uint q10_c(float c) {
+    uint val;
+    if (params.full_range == 0u) val = uint(clamp((c - 0.5) * 896.0 + 512.0, 0.0, 1023.0));
+    else val = uint(clamp(c * 1023.0, 0.0, 1023.0));
+    return (val << 6u) & 0xFFC0u;
+}
+
+void main() {
+    uvec2 block = gl_GlobalInvocationID.xy;
+    uint x0 = block.x * 4u;
+    uint y0 = block.y * 2u;
+    if (x0 >= params.width || y0 >= params.height) return;
+
+    // yuv[row][col] for the 4x2 block.
+    vec3 yuv[2][4];
+    for (uint r = 0u; r < 2u; r++)
+        for (uint c = 0u; c < 4u; c++)
+            yuv[r][c] = rgb_to_yuv(read_rgb(ivec2(x0 + c, y0 + r)));
+
+    uint W = params.width;
+    uint pixel_count = W * params.height;
+
+    if (params.output_format == 0u) {
+        // NV12: byte-packed Y rows, then interleaved UV at half resolution.
+        for (uint r = 0u; r < 2u; r++) {
+            uint word = q8_y(yuv[r][0].x) | (q8_y(yuv[r][1].x) << 8u) |
+                        (q8_y(yuv[r][2].x) << 16u) | (q8_y(yuv[r][3].x) << 24u);
+            output_data[((y0 + r) * W + x0) / 4u] = word;
+        }
+        uint uv = 0u;
+        for (uint c = 0u; c < 2u; c++) {
+            vec3 a = yuv[0][2u * c], b = yuv[0][2u * c + 1u], d = yuv[1][2u * c], e = yuv[1][2u * c + 1u];
+            // Same summation order as Pixelforge: (00 + 10 + 01 + 11) / 4.
+            float avg_u = (a.y + b.y + d.y + e.y) / 4.0;
+            float avg_v = (a.z + b.z + d.z + e.z) / 4.0;
+            uv |= (q8_c(avg_u) | (q8_c(avg_v) << 8u)) << (16u * c);
+        }
+        uint uv_byte = pixel_count + (y0 / 2u) * W + x0;
+        output_data[uv_byte / 4u] = uv;
+    } else if (params.output_format == 3u) {
+        // P010: 16-bit Y samples, then 16-bit interleaved UV at half resolution.
+        for (uint r = 0u; r < 2u; r++) {
+            uint base = ((y0 + r) * W + x0) / 2u;
+            output_data[base + 0u] = q10_y(yuv[r][0].x) | (q10_y(yuv[r][1].x) << 16u);
+            output_data[base + 1u] = q10_y(yuv[r][2].x) | (q10_y(yuv[r][3].x) << 16u);
+        }
+        for (uint c = 0u; c < 2u; c++) {
+            vec3 a = yuv[0][2u * c], b = yuv[0][2u * c + 1u], d = yuv[1][2u * c], e = yuv[1][2u * c + 1u];
+            float avg_u = (a.y + b.y + d.y + e.y) / 4.0;
+            float avg_v = (a.z + b.z + d.z + e.z) / 4.0;
+            uint uv_idx = (y0 / 2u) * (W / 2u) + x0 / 2u + c;
+            output_data[pixel_count / 2u + uv_idx] = q10_c(avg_u) | (q10_c(avg_v) << 16u);
+        }
+    } else if (params.output_format == 2u) {
+        // YUV444 8-bit: byte-packed Y plane, then interleaved full-resolution UV.
+        for (uint r = 0u; r < 2u; r++) {
+            uint p = (y0 + r) * W + x0;
+            output_data[p / 4u] = q8_y(yuv[r][0].x) | (q8_y(yuv[r][1].x) << 8u) |
+                                  (q8_y(yuv[r][2].x) << 16u) | (q8_y(yuv[r][3].x) << 24u);
+            uint uv_word = pixel_count / 4u + p / 2u;
+            output_data[uv_word + 0u] = q8_c(yuv[r][0].y) | (q8_c(yuv[r][0].z) << 8u) |
+                                        (q8_c(yuv[r][1].y) << 16u) | (q8_c(yuv[r][1].z) << 24u);
+            output_data[uv_word + 1u] = q8_c(yuv[r][2].y) | (q8_c(yuv[r][2].z) << 8u) |
+                                        (q8_c(yuv[r][3].y) << 16u) | (q8_c(yuv[r][3].z) << 24u);
+        }
+    } else {
+        // YUV444P10: 16-bit Y plane, then 32-bit interleaved UV per pixel.
+        for (uint r = 0u; r < 2u; r++) {
+            uint p = (y0 + r) * W + x0;
+            output_data[p / 2u + 0u] = q10_y(yuv[r][0].x) | (q10_y(yuv[r][1].x) << 16u);
+            output_data[p / 2u + 1u] = q10_y(yuv[r][2].x) | (q10_y(yuv[r][3].x) << 16u);
+            uint uv_base = pixel_count / 2u + p;
+            for (uint c = 0u; c < 4u; c++)
+                output_data[uv_base + c] = q10_c(yuv[r][c].y) | (q10_c(yuv[r][c].z) << 16u);
+        }
+    }
+}

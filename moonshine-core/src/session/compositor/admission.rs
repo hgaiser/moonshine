@@ -4,7 +4,7 @@ use super::frame::ExportedFrame;
 use smithay::reexports::calloop::ping::{Ping, PingSource, make_ping};
 use std::sync::{
 	Arc,
-	atomic::{AtomicU64, Ordering},
+	atomic::{AtomicBool, AtomicU64, Ordering},
 	mpsc,
 };
 use std::time::{Duration, Instant};
@@ -40,12 +40,15 @@ pub(crate) enum CaptureSendError {
 
 pub(crate) struct CaptureSender {
 	context: Arc<std::sync::OnceLock<pixelforge::VideoContext>>,
+	overlay_supported: Arc<AtomicBool>,
 	tx: mpsc::SyncSender<ExportedFrame>,
 	demand_source: Option<PingSource>,
 	state: Arc<AtomicU64>,
 }
 pub(crate) struct CaptureReceiver {
 	context: Arc<std::sync::OnceLock<pixelforge::VideoContext>>,
+	/// Whether the active consumer composites `ExportedFrame::overlay`.
+	overlay_supported: Arc<AtomicBool>,
 	rx: mpsc::Receiver<ExportedFrame>,
 	demand: Option<Ping>,
 	state: Arc<AtomicU64>,
@@ -55,6 +58,7 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	let (tx, rx) = mpsc::sync_channel(1);
 	let state = Arc::new(AtomicU64::new(IDLE));
 	let context = Arc::new(std::sync::OnceLock::new());
+	let overlay_supported = Arc::new(AtomicBool::new(false));
 	let (demand, demand_source) = match make_ping() {
 		Ok((ping, source)) => (Some(ping), Some(source)),
 		Err(error) => {
@@ -65,12 +69,14 @@ pub(crate) fn capture_channel() -> (CaptureSender, CaptureReceiver) {
 	(
 		CaptureSender {
 			context: context.clone(),
+			overlay_supported: overlay_supported.clone(),
 			tx,
 			demand_source,
 			state: state.clone(),
 		},
 		CaptureReceiver {
 			context,
+			overlay_supported,
 			rx,
 			state,
 			demand,
@@ -100,6 +106,12 @@ impl CaptureSender {
 			state: self.state.clone(),
 			ticket,
 		})
+	}
+	/// Whether frames may carry a late-composition overlay. A frame captured
+	/// before the consumer withdrew support is dropped by that consumer, never
+	/// encoded without its overlay.
+	pub(crate) fn overlay_supported(&self) -> bool {
+		self.overlay_supported.load(Ordering::Acquire)
 	}
 	pub(crate) fn requested(&self) -> bool {
 		self.state.load(Ordering::Acquire) & STATE_MASK == REQUESTED
@@ -134,6 +146,10 @@ impl CaptureReceiver {
 			.get()
 			.cloned()
 			.ok_or_else(|| "Capture GPU context not initialized; compositor must be ready before streaming".into())
+	}
+	/// Declare whether this consumer composites frame overlays.
+	pub(crate) fn set_overlay_supported(&self, supported: bool) {
+		self.overlay_supported.store(supported, Ordering::Release);
 	}
 	pub(crate) fn recv_timeout(&self, timeout: Duration) -> Result<ExportedFrame, mpsc::RecvTimeoutError> {
 		self.recv_timeout_if(timeout, true)
@@ -201,6 +217,7 @@ impl CaptureReceiver {
 }
 impl Drop for CaptureReceiver {
 	fn drop(&mut self) {
+		self.overlay_supported.store(false, Ordering::Release);
 		self.state.fetch_or(CLOSED, Ordering::AcqRel);
 		while let Ok(frame) = self.rx.try_recv() {
 			frame.consumed.store(true, Ordering::Release);
@@ -273,6 +290,19 @@ mod tests {
 		drop(credit);
 		assert!(!tx.occupied());
 	}
+	#[test]
+	fn overlay_support_is_declared_by_the_consumer_and_withdrawn_on_drop() {
+		let (tx, rx) = capture_channel();
+		assert!(!tx.overlay_supported(), "no consumer composites overlays by default");
+		rx.set_overlay_supported(true);
+		assert!(tx.overlay_supported());
+		rx.set_overlay_supported(false);
+		assert!(!tx.overlay_supported());
+		rx.set_overlay_supported(true);
+		drop(rx);
+		assert!(!tx.overlay_supported(), "a dropped consumer cannot draw overlays");
+	}
+
 	#[test]
 	fn reset_cannot_be_replenished_by_old_credit() {
 		let (tx, rx) = capture_channel();

@@ -3,6 +3,7 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+mod convert;
 pub(super) mod dmabuf;
 pub(super) mod failure;
 mod hdr_sei;
@@ -33,6 +34,8 @@ use crate::session::stream::video::{
 	VideoCodec, VideoPacketMessage, VideoReconfigureCommand, VideoStreamConfig, VideoStreamContext,
 };
 
+pub use convert::ConversionQueueMode;
+use convert::InputConverter;
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 use failure::{EncodeFailure, EncodeStage, FailurePolicy, Recovery, SourceAccess};
 
@@ -973,6 +976,12 @@ impl VideoPipelineInner {
 			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
 			let stale_frames_dropped = 0u32;
 			let (encoded, created_at, pacing_origin, buffer_index, channel_wait) = if let Some(frame) = received {
+				if frame.overlay.is_some() {
+					// PyroWave never advertises late composition; this capture
+					// raced an epoch switch. Drop it rather than lose the cursor.
+					frame.consumed.store(true, Ordering::Release);
+					continue;
+				}
 				gpu_window_encodes += 1;
 				let received_at = std::time::Instant::now();
 				let created_at = frame.created_at;
@@ -1242,6 +1251,54 @@ impl VideoPipelineInner {
 			(ChromaFormat::Yuv444, BitDepth::Eight) => OutputFormat::YUV444,
 			(ChromaFormat::Yuv444, BitDepth::Ten) => OutputFormat::YUV444P10,
 		};
+
+		// Pyroshine's packed converter: no atomics, preferably on the dedicated
+		// compute family, and able to composite the cursor of a direct export.
+		// Pixelforge's converter remains the fallback for extents it cannot pack.
+		let mut input_converter = if convert::supports_extent(ctx.width, ctx.height) {
+			match InputConverter::new(
+				context.clone(),
+				self.config.conversion_queue,
+				ctx.width,
+				ctx.height,
+				output_format,
+				if ctx.format.hdr {
+					ColorSpace::Bt2020
+				} else {
+					ColorSpace::Bt709
+				},
+				ctx.format.range == ColorRange::Full,
+			) {
+				Ok(converter) => {
+					tracing::info!(
+						async_compute = converter.async_compute,
+						"Using packed RGB to YCbCr converter with late cursor composition"
+					);
+					Some(converter)
+				},
+				Err(e) => {
+					tracing::warn!("Packed converter unavailable ({e}); using Pixelforge's converter");
+					None
+				},
+			}
+		} else {
+			tracing::info!(
+				width = ctx.width,
+				height = ctx.height,
+				"Stream extent is not word aligned; using Pixelforge's converter without late composition"
+			);
+			None
+		};
+		frame_rx.set_overlay_supported(input_converter.is_some());
+		// Withdraw overlay support on every exit; the next consumer re-declares it.
+		struct OverlaySupport<'a>(&'a crate::session::compositor::admission::CaptureReceiver);
+		impl Drop for OverlaySupport<'_> {
+			fn drop(&mut self) {
+				self.0.set_overlay_supported(false);
+			}
+		}
+		let _overlay_support = OverlaySupport(frame_rx);
+		let mut convert_window = convert::ConvertWindow::default();
 
 		// Converter per input format, plus the source import whose view it caches.
 		let mut color_converters: std::collections::HashMap<u32, (ColorConverter, Option<Arc<CachedImport>>)> =
@@ -1530,44 +1587,11 @@ impl VideoPipelineInner {
 
 				let t2_imported = std::time::Instant::now();
 
-				// Get (or build) a converter for this input format. Cached per
-				// format so switching render paths doesn't rebuild one each frame.
-				let (converter, cached_source) = match color_converters.entry(frame.format) {
-					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-					std::collections::hash_map::Entry::Vacant(e) => {
-						let color_space = if ctx.format.hdr {
-							ColorSpace::Bt2020
-						} else {
-							ColorSpace::Bt709
-						};
-						let full_range = ctx.format.range == ColorRange::Full;
-						let mut config =
-							ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
-						config.color_space = color_space;
-						config.full_range = full_range;
-						match ColorConverter::new(context.clone(), config) {
-							Ok(conv) => {
-								tracing::debug!("Created color converter for input format {frame_input_format:?}");
-								e.insert((conv, None))
-							},
-							Err(e) => {
-								let failure = EncodeFailure::new(
-									EncodeStage::Setup,
-									Recovery::DropFrame,
-									SourceAccess::NotSubmitted,
-									format!("failed to create color converter: {e}"),
-								);
-								apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
-								continue;
-							},
-						}
-					},
-				};
-
 				// In HDR mode, select per-frame color space and encoder VUI
 				// based on the frame's actual color space. SDR frames are
 				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
 				// dynamic VUI switching in the encoder.
+				let mut frame_color = None;
 				if ctx.format.hdr {
 					let frame_cs = frame.color_space;
 					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
@@ -1593,35 +1617,91 @@ impl VideoPipelineInner {
 						),
 					};
 
-					// Switch encoder VUI first. Only update the converter if
-					// the encoder switch succeeds, so that the converter's
-					// color space stays in sync with the encoder's VUI.
+					// Switch encoder VUI first. The converter's color space is
+					// updated below only after the encoder accepted the switch,
+					// so it stays in sync with the encoder's VUI.
 					if encoder_color_desc != Some(color_desc) {
 						tracing::debug!(
 							"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
 						);
 						match encoder.set_color_description(color_desc) {
-							Ok(()) => {
-								encoder_color_desc = Some(color_desc);
-								converter.set_color_space(cs);
-								converter.set_full_range(full_range);
-								converter.set_sdr_reference_white_nits(sdr_white_nits);
-							},
+							Ok(()) => encoder_color_desc = Some(color_desc),
 							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
 						}
-					} else {
+					}
+					frame_color = Some((cs, full_range, sdr_white_nits));
+				}
+
+				let converted = if let Some(converter) = input_converter.as_mut() {
+					if let Some((cs, full_range, sdr_white_nits)) = frame_color {
+						converter.set_color(cs, full_range, sdr_white_nits);
+					}
+					converter
+						.convert(
+							&source_import,
+							import_vk_format,
+							needs_transition,
+							frame.overlay.as_ref(),
+							encoder.input_image(),
+						)
+						.map(|outcome| {
+							convert_window.record(outcome.gpu_ns, frame.overlay.is_some());
+						})
+						.map_err(PixelForgeError::Vulkan)
+				} else if frame.overlay.is_some() {
+					// Captured while this consumer still advertised overlays (an
+					// epoch switch raced the capture). Never encode it without its
+					// cursor: drop it; the next capture is composited by GLES.
+					convert_window.overlay_drops += 1;
+					frame.consumed.store(true, Ordering::Release);
+					continue;
+				} else {
+					// Get (or build) a converter for this input format. Cached per
+					// format so switching render paths doesn't rebuild one each frame.
+					let (converter, cached_source) = match color_converters.entry(frame.format) {
+						std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+						std::collections::hash_map::Entry::Vacant(e) => {
+							let color_space = if ctx.format.hdr {
+								ColorSpace::Bt2020
+							} else {
+								ColorSpace::Bt709
+							};
+							let full_range = ctx.format.range == ColorRange::Full;
+							let mut config =
+								ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
+							config.color_space = color_space;
+							config.full_range = full_range;
+							match ColorConverter::new(context.clone(), config) {
+								Ok(conv) => {
+									tracing::debug!("Created color converter for input format {frame_input_format:?}");
+									e.insert((conv, None))
+								},
+								Err(e) => {
+									let failure = EncodeFailure::new(
+										EncodeStage::Setup,
+										Recovery::DropFrame,
+										SourceAccess::NotSubmitted,
+										format!("failed to create color converter: {e}"),
+									);
+									apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+									continue;
+								},
+							}
+						},
+					};
+					if let Some((cs, full_range, sdr_white_nits)) = frame_color {
 						converter.set_color_space(cs);
 						converter.set_full_range(full_range);
 						converter.set_sdr_reference_white_nits(sdr_white_nits);
 					}
-				}
-
-				// Retain the source image; the converter caches a view of it.
-				*cached_source = Some(Arc::clone(&source_import));
+					// Retain the source image; the converter caches a view of it.
+					*cached_source = Some(Arc::clone(&source_import));
+					converter.convert(source_image, src_layout, encoder.input_image())
+				};
 
 				// Convert to YUV.
-				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					// pixelforge submits the conversion and waits for its fence; an
+				if let Err(e) = converted {
+					// Both converters submit the conversion and wait for its fence; an
 					// error may follow a submission whose reads are still pending.
 					// Establish completion before the compositor may reuse the source.
 					let failure = if is_device_lost(&e) {
@@ -1652,6 +1732,9 @@ impl VideoPipelineInner {
 					};
 					apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
 					continue;
+				}
+				if self.config.log_stats {
+					convert_window.maybe_log(input_converter.as_ref().map(|c| c.async_compute));
 				}
 
 				// The DMA-BUF content has been read into the encoder's input

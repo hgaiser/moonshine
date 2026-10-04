@@ -165,6 +165,27 @@ pub(crate) fn same_open_file(a: RawFd, b: RawFd) -> bool {
 }
 
 impl CachedImport {
+	/// Wrap a test-owned image (not a DMA-BUF) so GPU fixture tests can drive
+	/// consumers of imports. The entry owns and frees `image` and `memory`.
+	#[cfg(test)]
+	pub(crate) fn for_test(
+		context: VideoContext,
+		image: vk::Image,
+		memory: vk::DeviceMemory,
+		width: u32,
+		height: u32,
+		format: vk::Format,
+	) -> Self {
+		Self {
+			image,
+			memory,
+			params: ImportParams::new(width, height, format, &[]),
+			fd: std::fs::File::open("/dev/null").expect("open /dev/null").into(),
+			last_used: Mutex::new(Instant::now()),
+			context,
+		}
+	}
+
 	/// The imported Vulkan image.
 	pub(crate) fn image(&self) -> vk::Image {
 		self.image

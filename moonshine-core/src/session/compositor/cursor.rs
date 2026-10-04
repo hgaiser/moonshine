@@ -14,11 +14,13 @@ use smithay::backend::renderer::{ImportAll, ImportMem, Renderer, Texture};
 use smithay::input::pointer::CursorImageStatus;
 use smithay::utils::{Physical, Point, Scale, Transform};
 
+use super::frame::{OverlayFormat, OverlayImage};
+
 // ── XCursor loading ──────────────────────────────────────────────────
 
-/// Load the default cursor from the XCursor theme and return a
-/// `MemoryRenderBuffer` suitable for compositing.
-pub(crate) fn load_default_cursor() -> MemoryRenderBuffer {
+/// Load the default cursor from the XCursor theme. Returns the GLES buffer
+/// and the same premultiplied texels as a late-composition overlay image.
+pub(crate) fn load_default_cursor() -> (MemoryRenderBuffer, std::sync::Arc<OverlayImage>) {
 	let name = std::env::var("XCURSOR_THEME").ok().unwrap_or_else(|| "default".into());
 	let size = std::env::var("XCURSOR_SIZE")
 		.ok()
@@ -31,14 +33,66 @@ pub(crate) fn load_default_cursor() -> MemoryRenderBuffer {
 		fallback_cursor()
 	});
 
-	MemoryRenderBuffer::from_slice(
+	let buffer = MemoryRenderBuffer::from_slice(
 		&image.pixels_rgba,
 		Fourcc::Abgr8888,
 		(image.width as i32, image.height as i32),
 		1,
 		Transform::Normal,
 		None,
-	)
+	);
+	let overlay = std::sync::Arc::new(OverlayImage {
+		generation: next_overlay_generation(),
+		width: image.width,
+		height: image.height,
+		format: OverlayFormat::Rgba8,
+		pixels: image.pixels_rgba.into_boxed_slice(),
+	});
+	(buffer, overlay)
+}
+
+/// Process-wide overlay content generations; never reused across images.
+pub(crate) fn next_overlay_generation() -> u64 {
+	static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+	NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Copy a `wl_shm` cursor buffer into a tightly packed BGRA overlay.
+/// Returns `None` for formats GLES would interpret differently.
+pub(crate) fn shm_overlay_pixels(
+	ptr: *const u8,
+	len: usize,
+	data: &smithay::wayland::shm::BufferData,
+) -> Option<(u32, u32, Box<[u8]>)> {
+	use smithay::reexports::wayland_server::protocol::wl_shm::Format;
+	let opaque = match data.format {
+		Format::Argb8888 => false,
+		Format::Xrgb8888 => true,
+		_ => return None,
+	};
+	let (width, height, stride, offset) = (data.width, data.height, data.stride, data.offset);
+	if width <= 0 || height <= 0 || stride < width * 4 || offset < 0 {
+		return None;
+	}
+	let (width, height, stride, offset) = (width as usize, height as usize, stride as usize, offset as usize);
+	let end = offset
+		.checked_add(stride.checked_mul(height - 1)?)?
+		.checked_add(width * 4)?;
+	if end > len {
+		return None;
+	}
+	let mut pixels = vec![0u8; width * height * 4].into_boxed_slice();
+	for (y, row) in pixels.chunks_exact_mut(width * 4).enumerate() {
+		// SAFETY: bounds checked above against the pool mapping length.
+		let source = unsafe { std::slice::from_raw_parts(ptr.add(offset + y * stride), width * 4) };
+		row.copy_from_slice(source);
+		if opaque {
+			for texel in row.as_chunks_mut::<4>().0 {
+				texel[3] = 0xff;
+			}
+		}
+	}
+	Some((width as u32, height as u32, pixels))
 }
 
 fn load_icon(theme: &xcursor::CursorTheme, size: u32) -> Result<xcursor::parser::Image, CursorLoadError> {
@@ -247,6 +301,61 @@ impl CursorState {
 	}
 	pub fn visible(&self) -> bool {
 		self.active && !matches!(self.image, CursorImageStatus::Hidden)
+	}
+}
+
+#[cfg(test)]
+mod overlay_tests {
+	use super::*;
+	use smithay::reexports::wayland_server::protocol::wl_shm::Format;
+	use smithay::wayland::shm::BufferData;
+
+	fn data(format: Format, width: i32, height: i32, stride: i32, offset: i32) -> BufferData {
+		BufferData {
+			offset,
+			width,
+			height,
+			stride,
+			format,
+		}
+	}
+
+	#[test]
+	fn shm_cursor_rows_are_packed_and_premultiplied_texels_preserved() {
+		// 2x2 ARGB8888 (B,G,R,A bytes) with a 12-byte stride and 4-byte offset.
+		let mut pool = [0xEEu8; 4 + 12 * 2];
+		pool[4..12].copy_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+		pool[16..24].copy_from_slice(&[9, 10, 11, 12, 13, 14, 15, 16]);
+		let (w, h, pixels) =
+			shm_overlay_pixels(pool.as_ptr(), pool.len(), &data(Format::Argb8888, 2, 2, 12, 4)).unwrap();
+		assert_eq!((w, h), (2, 2));
+		assert_eq!(&*pixels, &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+	}
+
+	#[test]
+	fn opaque_shm_cursor_gets_full_alpha() {
+		let pool = [1u8, 2, 3, 0, 4, 5, 6, 77];
+		let (_, _, pixels) =
+			shm_overlay_pixels(pool.as_ptr(), pool.len(), &data(Format::Xrgb8888, 2, 1, 8, 0)).unwrap();
+		assert_eq!(&*pixels, &[1, 2, 3, 255, 4, 5, 6, 255]);
+	}
+
+	#[test]
+	fn unsupported_or_truncated_cursor_buffers_fall_back_to_composition() {
+		let pool = [0u8; 16];
+		assert!(shm_overlay_pixels(pool.as_ptr(), pool.len(), &data(Format::Rgb565, 2, 2, 4, 0)).is_none());
+		assert!(shm_overlay_pixels(pool.as_ptr(), pool.len(), &data(Format::Argb8888, 2, 3, 8, 0)).is_none());
+		assert!(shm_overlay_pixels(pool.as_ptr(), pool.len(), &data(Format::Argb8888, 2, 2, 4, 0)).is_none());
+		assert!(shm_overlay_pixels(pool.as_ptr(), pool.len(), &data(Format::Argb8888, 0, 2, 8, 0)).is_none());
+	}
+
+	#[test]
+	fn default_cursor_overlay_matches_gles_buffer_texels() {
+		let (_, overlay) = load_default_cursor();
+		assert_eq!(overlay.format, OverlayFormat::Rgba8);
+		assert_eq!(overlay.pixels.len(), (overlay.width * overlay.height * 4) as usize);
+		let (_, again) = load_default_cursor();
+		assert_ne!(overlay.generation, again.generation, "generations are never reused");
 	}
 }
 

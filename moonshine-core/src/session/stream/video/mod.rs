@@ -18,6 +18,7 @@ mod pacing_timer;
 mod packetizer;
 mod pipeline;
 pub(crate) mod pyrowave;
+pub use pipeline::ConversionQueueMode;
 pub use pyrowave::PyroWaveQueueMode;
 mod shard_batch;
 pub use fec::FecMode;
@@ -64,6 +65,9 @@ pub struct VideoStreamConfig {
 	pub log_stats: bool,
 	/// GPU scheduling preference for cross-process PyroWave encoding; auto prefers graphics.
 	pub pyrowave_queue: pyrowave::PyroWaveQueueMode,
+	/// Queue for H.264/HEVC/AV1 RGB-to-YCbCr conversion; auto prefers a
+	/// dedicated compute family so a GPU-bound game cannot delay it.
+	pub conversion_queue: pipeline::ConversionQueueMode,
 
 	/// Upper bound for the client-requested video packet size, in bytes.
 	///
@@ -128,6 +132,7 @@ impl Default for VideoStreamConfig {
 			log_frame_spikes: false,
 			log_stats: true,
 			pyrowave_queue: pyrowave::PyroWaveQueueMode::Auto,
+			conversion_queue: pipeline::ConversionQueueMode::Auto,
 			max_packet_size: 0,
 		}
 	}

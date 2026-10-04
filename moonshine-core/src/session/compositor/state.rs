@@ -270,6 +270,16 @@ pub(crate) struct MoonshineCompositor {
 	pub cursor_position: Point<f64, Logical>,
 	pub cursor: super::cursor::CursorState,
 	pub pointer_element: PointerElement,
+	/// The default cursor's texels for late composition.
+	default_cursor_overlay: Arc<super::frame::OverlayImage>,
+	/// Last client cursor buffer copied for late composition, keyed by its
+	/// surface and commit so unchanged cursors are not copied again.
+	client_cursor_overlay: Option<(
+		smithay::reexports::wayland_server::backend::ObjectId,
+		CommitCounter,
+		Arc<super::frame::OverlayImage>,
+	)>,
+	late_cursor_frames: u64,
     pub capture_mode: super::CaptureMode,
     capture_path: Option<&'static str>,
 	last_resource_summary: std::time::Instant,
@@ -734,7 +744,7 @@ impl MoonshineCompositor {
 			dmabuf_state.create_global_with_default_feedback::<Self>(&display_handle, &default_feedback);
 
 		// Load the default xcursor and build a PointerElement with it.
-		let cursor_buffer = cursor::load_default_cursor();
+		let (cursor_buffer, default_cursor_overlay) = cursor::load_default_cursor();
 		let mut pointer_element = PointerElement::default();
 		pointer_element.set_buffer(cursor_buffer);
 
@@ -799,6 +809,9 @@ impl MoonshineCompositor {
 				cursor_position: initial_cursor_position,
 				cursor: Default::default(),
 				pointer_element,
+				default_cursor_overlay,
+				client_cursor_overlay: None,
+				late_cursor_frames: 0,
 				capture_mode,
 				capture_path: None,
 				last_resource_summary: std::time::Instant::now(),
@@ -1170,8 +1183,14 @@ impl MoonshineCompositor {
 
 	/// One buffer must reproduce the complete scene, independently of focus.
 	fn can_direct_scanout_scene(&self) -> Result<(), DirectReject> {
+		self.direct_scene_eligibility(self.cursor_visible())
+	}
+
+	/// Eligibility of everything except (optionally) the cursor. With
+	/// `cursor == false` the caller must reproduce a visible cursor itself.
+	fn direct_scene_eligibility(&self, cursor: bool) -> Result<(), DirectReject> {
 		let extras = super::capture::SceneExtras {
-			cursor: self.cursor_visible(),
+			cursor,
 			steam_overlay: self.overlay_window.is_some(),
 			steam_notification: self.notification_window.is_some(),
 			external_overlay: self.external_overlay_window.is_some(),
@@ -1278,6 +1297,104 @@ impl MoonshineCompositor {
 		} else {
 			Ok(())
 		}
+	}
+
+	/// The visible cursor as a late-composition overlay, positioned exactly
+	/// where `render_and_export` would draw it. `None` when GLES composition
+	/// is needed to reproduce it (scaled, transformed, cropped, DMA-BUF or
+	/// multi-surface cursors). Callers have already excluded output scaling.
+	fn cursor_overlay(&mut self) -> Option<super::frame::FrameOverlay> {
+		if self.output.current_scale().fractional_scale() != 1.0 {
+			return None;
+		}
+		let (image, hotspot, offset) = match &self.cursor.image {
+			CursorImageStatus::Hidden => return None,
+			// The GLES path draws named cursors at the pointer, without a hotspot.
+			CursorImageStatus::Named(_) => (self.default_cursor_overlay.clone(), (0, 0).into(), (0, 0).into()),
+			CursorImageStatus::Surface(surface) => {
+				let surface = surface.clone();
+				if !surface.alive() {
+					return None;
+				}
+				let mut extra_content = false;
+				compositor::with_surface_tree_downward(
+					&surface,
+					(),
+					|_, _, &()| smithay::wayland::compositor::TraversalAction::DoChildren(()),
+					|child, states, &()| {
+						if child != &surface
+							&& states
+								.data_map
+								.get::<smithay::backend::renderer::utils::RendererSurfaceStateUserData>()
+								.is_some_and(|state| state.lock().unwrap().buffer().is_some())
+						{
+							extra_content = true;
+						}
+					},
+					|_, _, &()| true,
+				);
+				if extra_content {
+					return None;
+				}
+				let hotspot = compositor::with_states(&surface, |states| {
+					states
+						.data_map
+						.get::<std::sync::Mutex<CursorImageAttributes>>()
+						.and_then(|m| m.lock().ok())
+						.map(|attrs| attrs.hotspot)
+						.unwrap_or_else(|| (0, 0).into())
+				});
+				let (buffer, commit, offset) = with_renderer_surface_state(&surface, |state| {
+					let view = state.view()?;
+					let buffer = state.buffer()?.clone();
+					let size = state.buffer_size()?;
+					// 1:1 texels only: a scaled, transformed or cropped cursor
+					// needs the GLES sampler to match composition.
+					if state.buffer_scale() != 1
+						|| state.buffer_transform() != smithay::utils::Transform::Normal
+						|| view.src.loc != (0.0, 0.0).into()
+						|| view.src.size != size.to_f64()
+						|| view.dst != size
+					{
+						return None;
+					}
+					Some((buffer, state.current_commit(), view.offset))
+				})
+				.flatten()?;
+				let id = surface.id();
+				let image = match &self.client_cursor_overlay {
+					Some((cached_id, cached_commit, image)) if *cached_id == id && *cached_commit == commit => {
+						image.clone()
+					},
+					_ => {
+						let (width, height, pixels) =
+							smithay::wayland::shm::with_buffer_contents(&buffer, |ptr, len, data| {
+								cursor::shm_overlay_pixels(ptr, len, &data)
+							})
+							.ok()
+							.flatten()?;
+						let image = Arc::new(super::frame::OverlayImage {
+							generation: cursor::next_overlay_generation(),
+							width,
+							height,
+							format: super::frame::OverlayFormat::Bgra8,
+							pixels,
+						});
+						self.client_cursor_overlay = Some((id, commit, image.clone()));
+						image
+					},
+				};
+				(image, hotspot, offset)
+			},
+		};
+		let location = (self.cursor_position - hotspot.to_f64())
+			.to_physical(1.0)
+			.to_i32_round::<i32>();
+		Some(super::frame::FrameOverlay {
+			image,
+			x: location.x + offset.x,
+			y: location.y + offset.y,
+		})
 	}
 
 	/// Service producer lifecycle on a refresh tick that publishes no capture.
@@ -1461,6 +1578,7 @@ impl MoonshineCompositor {
 				compositor_gpu_ms_per_second = (self.captured_frames != 0 && (self.composited_frames == 0 || self.gpu_timer.samples != 0)).then(|| self.gpu_timer.nanoseconds as f64 / self.last_resource_summary.elapsed().as_secs_f64() / 1e6),
 				captured_frames = self.captured_frames, pre_render_rejected = self.pre_render_rejected,
 				stale_after_render = self.stale_after_render, direct_export_frames = self.direct_frames,
+				late_cursor_frames = self.late_cursor_frames,
 				composited_frames = self.composited_frames, capture_requested = self.frame_tx.requested(), capture_occupied = self.frame_tx.occupied(),
 				screen_dirty = self.screen_dirty,
 				last_capture_age_ms = self.last_frame_sent_at.elapsed().as_millis() as u64,
@@ -1528,6 +1646,7 @@ impl MoonshineCompositor {
 			self.pre_render_rejected = 0;
 			self.stale_after_render = 0;
 			self.direct_frames = 0;
+			self.late_cursor_frames = 0;
 			self.composited_frames = 0;
 			self.direct_rejections = [0; DirectReject::COUNT];
 			self.last_resource_summary = std::time::Instant::now();
@@ -1570,20 +1689,46 @@ impl MoonshineCompositor {
 		//
 		// Direct scanout bypasses GLES, so skip it while an actually-drawn
 		// cursor (not client-hidden) needs compositing.
-		if let Err(reason) = self.can_direct_scanout_scene() {
-			if self.log_stats {
-				self.direct_rejections[reason as usize] += 1;
-			}
-		} else {
-			if self.is_override_active() {
-				if self.try_direct_scanout_override(&mut credit, send_callbacks) {
-					self.record_capture_path("direct_override");
+		//
+		// A visible cursor alone does not force composition when the consumer
+		// composites overlays itself (late composition): the scene without the
+		// cursor must still be directly exportable and the cursor image must be
+		// representable 1:1; otherwise GLES draws it as before.
+		let direct = match self.can_direct_scanout_scene() {
+			Ok(()) => Ok(None),
+			Err(DirectReject::Cursor) if self.frame_tx.overlay_supported() => self
+				.direct_scene_eligibility(false)
+				.and_then(|()| self.cursor_overlay().map(Some).ok_or(DirectReject::Cursor)),
+			Err(reason) => Err(reason),
+		};
+		match direct {
+			Err(reason) => {
+				if self.log_stats {
+					self.direct_rejections[reason as usize] += 1;
+				}
+			},
+			Ok(overlay) => {
+				let late_cursor = overlay.is_some();
+				if self.is_override_active() {
+					if self.try_direct_scanout_override(&mut credit, send_callbacks, overlay) {
+						self.record_capture_path(if late_cursor {
+							"direct_override+cursor"
+						} else {
+							"direct_override"
+						});
+						if late_cursor && self.log_stats {
+							self.late_cursor_frames += 1;
+						}
+						return;
+					}
+				} else if self.try_direct_scanout(&mut credit, send_callbacks, overlay) {
+					self.record_capture_path(if late_cursor { "direct+cursor" } else { "direct" });
+					if late_cursor && self.log_stats {
+						self.late_cursor_frames += 1;
+					}
 					return;
 				}
-			} else if self.try_direct_scanout(&mut credit, send_callbacks) {
-				self.record_capture_path("direct");
-				return;
-			}
+			},
 		}
 
 		// Pick the next buffer from the pre-allocated pool.
@@ -1946,6 +2091,7 @@ impl MoonshineCompositor {
 		&mut self,
 		credit: &mut Option<super::admission::CaptureCredit>,
 		send_callbacks: bool,
+		overlay: Option<super::frame::FrameOverlay>,
 	) -> bool {
 		// Scene eligibility has proved that this opaque top window covers all
 		// other windows. Clone just the candidate, without a per-frame Vec.
@@ -2035,13 +2181,14 @@ impl MoonshineCompositor {
 
 		// The frame takes its own reference to the client's DMA-BUF; the held
 		// wl_buffer below only defers the client's content reuse.
-		let exported_frame = ExportedFrame::from_dmabuf(
+		let mut exported_frame = ExportedFrame::from_dmabuf(
 			&client_dmabuf,
 			buffer_index,
 			consumed.clone(),
 			color_space,
 			hdr_metadata,
 		);
+		exported_frame.overlay = overlay;
 
 		// Hold the client Buffer alive until the encoder finishes reading.
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
@@ -2120,6 +2267,7 @@ impl MoonshineCompositor {
 		&mut self,
 		credit: &mut Option<super::admission::CaptureCredit>,
 		send_callbacks: bool,
+		overlay: Option<super::frame::FrameOverlay>,
 	) -> bool {
 		let override_surface = match self.override_surface.as_ref() {
 			Some((s, _)) if s.alive() => s.clone(),
@@ -2207,13 +2355,14 @@ impl MoonshineCompositor {
 
 		// The frame takes its own reference to the client's DMA-BUF; the held
 		// wl_buffer below only defers the client's content reuse.
-		let exported_frame = ExportedFrame::from_dmabuf(
+		let mut exported_frame = ExportedFrame::from_dmabuf(
 			&client_dmabuf,
 			buffer_index,
 			consumed.clone(),
 			color_space,
 			hdr_metadata,
 		);
+		exported_frame.overlay = overlay;
 
 		self.held_scanout_buffers.push((consumed.clone(), buffer_id, buffer));
 
