@@ -33,6 +33,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--matrix` | off | Run the built-in 4K, 1440p, and 1080p matrix across 60/120/360 FPS and `hevc`, `h264`, and `av1` |
 | `--composited` | off | Force the GLES fallback, independent of fullscreen direct-export eligibility |
 | `--cursor <mode>` | off | Emulate client pointer use so the compositor cursor is visible: `static` (one motion) or `moving` (motion every refresh tick). Also applies to `--cycles` and `--reconnect-cycles` |
+| `--conversion-queue <mode>` | `auto` | H.264/HEVC/AV1 conversion queue: `auto`/`compute` (dedicated compute family when present) or `graphics` |
 | `--pyrowave-queue <mode>` | `auto` | Compare PyroWave `auto` (graphics), `graphics`, or explicit `compute` at normal queue priority |
 | `--pyrowave-matrix` | off | Run the PyroWave 1080p/1440p/4K matrix across 60/120/144 FPS |
 | `--resolution <WxH>` | `1920x1080` | Stream resolution |
@@ -174,6 +175,16 @@ of direct export.
 The benchmark has no Moonlight client: there is no ENet control, audio endpoint
 or client decode. Cycles establish backend ownership and streaming continuity;
 client compatibility still needs the [reconnect matrix](reconnect-validation.md).
+
+## Game interference harness
+
+`scripts/gpu_interference/` measures what streaming costs a GPU-bound game:
+a headless fixed-cost 4K render loop reports FPS, 1% lows and frame-time
+percentiles with and without a concurrent `moonshine-bench` stream, while a
+sampler records per-process DRM engine time and amdgpu power, clocks and memory
+activity. See its README for calibration and interpretation limits; repeat
+runs interleaved because a GPU's sustained clocks drift by about half a percent
+over a long session.
 
 ## Packetizer and transport remediation evidence
 

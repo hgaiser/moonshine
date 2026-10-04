@@ -89,7 +89,9 @@ then one buffer-to-image copy fills the encoder input slot. Its arithmetic
 mirrors Pixelforge's shader; the GPU fixture
 `packed_converter_matches_pixelforge_on_gpu` compares both converters' output
 for every format, color mode and range. It submits to the dedicated compute
-family by default (`conversion_queue`); Pixelforge shares the input image
+family by default (`conversion_queue`): with a GPU-bound game on an RX 9070
+XT, three interleaved runs each measured 0.90% game FPS loss on compute versus
+1.28% on graphics (1% lows 2.28% versus 3.10%). Pixelforge shares the input image
 concurrently with that family. The conversion still ends with a CPU fence wait
 before `Encoder::encode`, whose API takes no wait semaphore, and releases the
 source only after that wait. Pixelforge's converter is the fallback for widths
