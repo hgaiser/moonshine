@@ -95,6 +95,15 @@ pub enum CaptureMode {
 	Composited,
 }
 
+/// Benchmark-only synthetic pointer, injected through the normal input path.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BenchPointer {
+	/// One absolute motion at the output centre activates the cursor.
+	Static,
+	/// Absolute motion on every refresh tick along a fixed circle.
+	Moving,
+}
+
 /// Configuration for the embedded headless compositor.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
@@ -119,6 +128,11 @@ pub struct CompositorConfig {
 
 	/// Keyboard configuration for the compositor's XKB state.
 	pub keyboard: KeyboardConfig,
+
+	/// Benchmark diagnostic: emulate client pointer use so cursor capture
+	/// paths can be measured without a Moonlight control stream.
+	#[serde(skip)]
+	pub bench_pointer: Option<BenchPointer>,
 }
 
 impl Default for CompositorConfig {
@@ -130,6 +144,7 @@ impl Default for CompositorConfig {
 			steam_mode: true,
 			virtual_connector_strategy: VirtualConnectorStrategy::SingleApplication,
 			keyboard: KeyboardConfig::default(),
+			bench_pointer: None,
 		}
 	}
 }
@@ -595,6 +610,8 @@ fn run_compositor(
 	// the callback doesn't drift the cadence. `ToDuration` would add the
 	// interval *after* the callback returns, progressively skewing the
 	// actual period and producing ~58 Hz instead of 60 Hz.
+	let bench_pointer = config.bench_pointer;
+	let mut bench_pointer_ticks = 0u32;
 	let frame_nanos: u64 = 1_000_000_000u64 / u64::from(context.refresh_rate.max(1));
 	let frame_interval = std::time::Duration::from_nanos(frame_nanos);
 	// The refresh timer is the only capture clock: each deadline offers one
@@ -608,6 +625,22 @@ fn run_compositor(
 		.insert_source(timer, move |deadline, _metadata, state: &mut MoonshineCompositor| {
 			// Type a bounded batch of any clipboard text queued since the last tick.
 			input::drain_pending_text(state);
+			if let Some(mode) = bench_pointer {
+				if mode == BenchPointer::Moving || bench_pointer_ticks == 0 {
+					let angle = f64::from(bench_pointer_ticks) * 0.05;
+					let (x, y) = (16384.0 + 8000.0 * angle.cos(), 16384.0 + 8000.0 * angle.sin());
+					input::process_input(
+						CompositorInputEvent::MouseMoveAbsolute {
+							x: x as i16,
+							y: y as i16,
+							screen_width: i16::MAX,
+							screen_height: i16::MAX,
+						},
+						state,
+					);
+				}
+				bench_pointer_ticks = bench_pointer_ticks.wrapping_add(1);
+			}
 			state.refresh_tick(deadline);
 			// Schedule the next frame relative to the ideal wall-clock
 			// target, not relative to "now". This absorbs render-time

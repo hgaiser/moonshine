@@ -400,6 +400,7 @@ fn session_manager(args: &Args, shutdown: &ShutdownManager<ShutdownReason>) -> R
 			} else {
 				CaptureMode::Auto
 			},
+			bench_pointer: super::bench_pointer(args),
 			..Default::default()
 		},
 		VideoStreamConfig::default(),
