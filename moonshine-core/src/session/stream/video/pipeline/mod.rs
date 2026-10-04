@@ -190,7 +190,7 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 /// single [`ConsumerMessage::Frame`], so the packet is paired with its context by
 /// construction — there is no separate packet channel to keep in lockstep.
 struct FrameContext {
-	/// When the source frame was captured (for end-to-end latency).
+	/// When the source frame was captured.
 	created_at: std::time::Instant,
 	/// Pre-encode latency breakdown measured on the encoding thread.
 	channel_wait: std::time::Duration,
@@ -263,6 +263,8 @@ async fn run_packet_consumer(
 	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
 	let mut last_summary_time = std::time::Instant::now();
 	let frame_interval_us = 1_000_000 / ctx.fps as u128;
+	let mut epoch = None;
+	let mut next_rtp_ticks = 0u64;
 
 	// Driven by the message channel: one `Frame` per submitted frame. When the
 	// encoding thread drops its sender, this loop ends after the last frame.
@@ -317,8 +319,14 @@ async fn run_packet_consumer(
 		let encoded_bytes = packet.data.len();
 		let is_key_frame = packet.is_key_frame;
 
-		// Calculate RTP timestamp from PTS (convert to 90kHz clock).
-		let rtp_timestamp = (packet.pts * 90000 / ctx.fps as u64) as u32;
+		// Clients take the RTP timestamp (90 kHz) as the frame's presentation time.
+		let epoch = *epoch.get_or_insert(frame_context.created_at);
+		let since_epoch = frame_context.created_at.duration_since(epoch);
+		// A re-encoded frame is stamped when it is encoded, which can be later
+		// than the capture time of a frame still in the queue.
+		let rtp_ticks = ((since_epoch.as_micros() * 90_000 / 1_000_000) as u64).max(next_rtp_ticks);
+		next_rtp_ticks = rtp_ticks + 1;
+		let rtp_timestamp = rtp_ticks as u32;
 		frame_number += 1;
 
 		let t_start = std::time::Instant::now();
