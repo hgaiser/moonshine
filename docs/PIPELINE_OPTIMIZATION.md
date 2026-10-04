@@ -70,8 +70,8 @@ rendering; the GLES fence wait and encoding consume the same frame budget rather
 than extending it. Completion-based pipeline latency remains measured separately. Failed rendering/completion stops capture rather than publishing
 or recycling a buffer with uncertain GPU ownership.
 
-A visible cursor no longer forces composition for H.264/HEVC/AV1: see
-[late cursor composition](COMPOSITOR.md#late-cursor-composition). Commits are
+A visible cursor or Steam notification no longer forces composition: see
+[late cursor composition](COMPOSITOR.md#late-composition-cursor-and-steam-notifications). Commits are
 latched only once their DMA-BUF finished rendering
 ([buffer readiness](COMPOSITOR.md#buffer-readiness)), so direct export never
 hands the encoder a frame still queued behind a game's GPU work.

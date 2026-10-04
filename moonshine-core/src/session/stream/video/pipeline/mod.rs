@@ -18,7 +18,10 @@ use async_shutdown::ShutdownManager;
 use tokio::sync::{broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeState};
+use crate::session::compositor::admission::OverlayCaps;
+use crate::session::compositor::frame::{
+	FrameColorSpace, FrameOverlay, HdrMetadata, HdrModeState, MAX_OVERLAYS, OverlayContent,
+};
 use crate::session::lifecycle::{StartWaiter, WorkerGuard};
 use crate::session::manager::SessionShutdownReason;
 
@@ -63,15 +66,43 @@ const MAX_FRAMES_IN_FLIGHT: usize = 3;
 /// consumer of the capture channel declares its own.
 struct OverlaySupport<'a>(&'a crate::session::compositor::admission::CaptureReceiver);
 impl<'a> OverlaySupport<'a> {
-	fn declare(rx: &'a crate::session::compositor::admission::CaptureReceiver, supported: bool) -> Self {
-		rx.set_overlay_supported(supported);
+	fn declare(rx: &'a crate::session::compositor::admission::CaptureReceiver, caps: OverlayCaps) -> Self {
+		rx.set_overlay_caps(caps);
 		Self(rx)
 	}
 }
 impl Drop for OverlaySupport<'_> {
 	fn drop(&mut self) {
-		self.0.set_overlay_supported(false);
+		self.0.set_overlay_caps(OverlayCaps::NONE);
 	}
+}
+
+/// Import a single-plane client DMA-BUF layer through the frame importer.
+fn import_overlay(
+	importer: &mut DmaBufImporter,
+	dmabuf: &smithay::backend::allocator::dmabuf::Dmabuf,
+) -> Result<(Arc<CachedImport>, bool), String> {
+	use smithay::backend::allocator::Buffer;
+	use std::os::fd::AsFd;
+	let modifier: u64 = dmabuf.format().modifier.into();
+	let plane = dmabuf
+		.handles()
+		.zip(dmabuf.offsets())
+		.zip(dmabuf.strides())
+		.map(|((fd, offset), stride)| DmaBufPlane {
+			fd: fd.as_fd().as_raw_fd(),
+			offset,
+			stride,
+			modifier,
+		})
+		.next()
+		.ok_or("layer DMA-BUF has no planes")?;
+	let format = drm_fourcc_to_input(dmabuf.format().code as u32).1;
+	// The frame owns a strong reference to `dmabuf`, so the descriptor stays
+	// open for this call; the importer duplicates what it keeps.
+	importer
+		.import_or_reuse(plane.fd, dmabuf.width(), dmabuf.height(), format, &[plane])
+		.map_err(|e| e.to_string())
 }
 
 fn conventional_can_admit(in_flight: &AtomicUsize) -> bool {
@@ -934,8 +965,8 @@ impl VideoPipelineInner {
 			);
 		}
 
-		// PyroWave composites the cursor inside its 1:1 scaler input fetch.
-		let _overlay_support = OverlaySupport::declare(frame_rx, true);
+		// PyroWave composites layers inside its 1:1 scaler input fetch.
+		let _overlay_support = OverlaySupport::declare(frame_rx, OverlayCaps::PIXELS.union(OverlayCaps::DMABUF));
 
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
 		packetizer.set_pyrowave_dialect(ctx.pyrowave_dialect);
@@ -995,7 +1026,7 @@ impl VideoPipelineInner {
 			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
 			let stale_frames_dropped = 0u32;
 			let (encoded, created_at, pacing_origin, buffer_index, channel_wait) = if let Some(frame) = received {
-				if frame.overlay.is_some() && (frame.width != ctx.width || frame.height != ctx.height) {
+				if frame.has_overlays() && (frame.width != ctx.width || frame.height != ctx.height) {
 					// Overlays are composited only into unscaled input. A capture
 					// that raced an extent change is dropped rather than encoded
 					// without its cursor; the next one is composited by GLES.
@@ -1309,7 +1340,14 @@ impl VideoPipelineInner {
 			);
 			None
 		};
-		let _overlay_support = OverlaySupport::declare(frame_rx, input_converter.is_some());
+		let _overlay_support = OverlaySupport::declare(
+			frame_rx,
+			if input_converter.is_some() {
+				OverlayCaps::PIXELS.union(OverlayCaps::DMABUF)
+			} else {
+				OverlayCaps::NONE
+			},
+		);
 		let mut convert_window = convert::ConvertWindow::default();
 
 		// Converter per input format, plus the source import whose view it caches.
@@ -1648,19 +1686,71 @@ impl VideoPipelineInner {
 					if let Some((cs, full_range, sdr_white_nits)) = frame_color {
 						converter.set_color(cs, full_range, sdr_white_nits);
 					}
+					// DMA-BUF layers go through the same identity-checked import
+					// cache as the game source; the `Arc`s pin them for the call.
+					let mut layer_imports: [Option<(Arc<CachedImport>, bool)>; MAX_OVERLAYS] = Default::default();
+					let mut import_failed = None;
+					for (slot, layer) in frame.overlays.iter().enumerate() {
+						if let Some(FrameOverlay {
+							content: OverlayContent::Dmabuf { dmabuf, .. },
+							..
+						}) = layer
+						{
+							match import_overlay(importer, dmabuf) {
+								Ok(import) => layer_imports[slot] = Some(import),
+								Err(e) => import_failed = Some(e),
+							}
+						}
+					}
+					if let Some(e) = import_failed {
+						let failure = EncodeFailure::new(
+							EncodeStage::Import,
+							Recovery::DropFrame,
+							SourceAccess::NotSubmitted,
+							format!("failed to import overlay DMA-BUF: {e}"),
+						);
+						apply_failure(&mut failures, &failure, Some(&frame.consumed))?;
+						continue;
+					}
+					let layers: convert::Layers<'_> = std::array::from_fn(|slot| {
+						let layer = frame.overlays[slot].as_ref()?;
+						let input = match &layer.content {
+							OverlayContent::Pixels(image) => convert::LayerInput::Pixels(image),
+							OverlayContent::Dmabuf { dmabuf, opaque } => {
+								let (import, first_use) = layer_imports[slot].as_ref()?;
+								convert::LayerInput::Imported {
+									import,
+									format: drm_fourcc_to_input(
+										smithay::backend::allocator::Buffer::format(dmabuf).code as u32,
+									)
+									.1,
+									first_use: *first_use,
+									opaque: *opaque,
+								}
+							},
+						};
+						Some(convert::Layer {
+							input,
+							x: layer.x,
+							y: layer.y,
+							width: layer.width(),
+							height: layer.height(),
+							opacity: layer.opacity,
+						})
+					});
 					converter
 						.convert(
 							&source_import,
 							import_vk_format,
 							needs_transition,
-							frame.overlay.as_ref(),
+							&layers,
 							encoder.input_image(),
 						)
 						.map(|outcome| {
-							convert_window.record(outcome.gpu_ns, frame.overlay.is_some());
+							convert_window.record(outcome.gpu_ns, frame.has_overlays());
 						})
 						.map_err(PixelForgeError::Vulkan)
-				} else if frame.overlay.is_some() {
+				} else if frame.has_overlays() {
 					// Captured while this consumer still advertised overlays (an
 					// epoch switch raced the capture). Never encode it without its
 					// cursor: drop it; the next capture is composited by GLES.

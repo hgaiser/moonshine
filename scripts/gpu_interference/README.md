@@ -30,3 +30,11 @@ probe also starves, so stream FPS there is bounded by the content's completed
 frame rate, not only by Pyroshine. Compare probe FPS/1% lows against
 `probe-alone` runs taken before and after the matrix. Run nothing else on the
 GPU, and avoid compiling during measurements.
+
+Steam notification stand-in: `game-with-notification.sh [W H]` runs vkcube and,
+once XWayland is up, `notifier.py` — a small X11 window carrying
+`STEAM_OVERLAY=1` (what the compositor classifies as a Steam notification),
+redrawn at 60 Hz like Steam's toast animation. XWayland delivers it as a
+DMA-BUF. Pass it as the streamed application, e.g.
+`runbench.py ... --app "scripts/gpu_interference/game-with-notification.sh 3840 2160"`,
+or as the command of `moonshine-bench --cycles/--reconnect-cycles`.

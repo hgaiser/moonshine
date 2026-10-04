@@ -21,11 +21,11 @@ use super::format::{
 };
 use super::pipeline::dmabuf::{ImportCacheStats, same_open_file};
 use super::pipeline::failure::{EncodeFailure, EncodeStage, Recovery, SourceAccess};
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, OverlayFormat};
+use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, MAX_OVERLAYS, OverlayContent, OverlayFormat};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
-pub(crate) const SOURCE_REVISION: &str = "e9b20be1517635975d46cdd076ed0b71f9b0ce8a";
+pub(crate) const SOURCE_REVISION: &str = "4cff7867e603de5c9ab983fc762aad84d37c7dd6";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
 const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 const QUALITY_REFERENCE_4K_420_SDR_BYTES: u64 = 400_000;
@@ -54,7 +54,7 @@ pub(crate) fn quality_reference_frame_bytes(
 	}
 	usize::try_from(bytes).unwrap_or(usize::MAX) & !3
 }
-const API_VERSION: (u32, u32, u32) = (0, 8, 0);
+const API_VERSION: (u32, u32, u32) = (0, 9, 0);
 
 type ResultCode = i32;
 const SUCCESS: ResultCode = 0;
@@ -129,6 +129,17 @@ struct Overlay {
 	x: i32,
 	y: i32,
 	generation: u64,
+}
+
+/// `pyrowave_overlay_layer` (API 0.9).
+#[repr(C)]
+struct OverlayLayer {
+	pixels: *const Overlay,
+	view: ImageView,
+	x: i32,
+	y: i32,
+	opacity: f32,
+	opaque: bool,
 }
 
 #[repr(C)]
@@ -257,12 +268,13 @@ type EncodeScaled = unsafe extern "C" fn(
 	*const ScaledEncodeInfo,
 	*const RateControl,
 ) -> ResultCode;
-type EncodeScaledOverlay = unsafe extern "C" fn(
+type EncodeScaledLayers = unsafe extern "C" fn(
 	EncoderHandle,
 	*const c_void,
 	*const c_void,
 	*const ScaledEncodeInfo,
-	*const Overlay,
+	*const OverlayLayer,
+	u32,
 	*const RateControl,
 ) -> ResultCode;
 type ComputeNumPackets = unsafe extern "C" fn(EncoderHandle, usize, *mut usize) -> ResultCode;
@@ -283,7 +295,7 @@ struct Api {
 	destroy_image: DestroyImage,
 	get_image_view: GetImageView,
 	encode_scaled: EncodeScaled,
-	encode_scaled_overlay: EncodeScaledOverlay,
+	encode_scaled_layers: EncodeScaledLayers,
 	compute_num_packets: ComputeNumPackets,
 	packetize: Packetize,
 }
@@ -306,7 +318,7 @@ impl Api {
 					continue;
 				},
 			};
-			// SAFETY: symbol types mirror pyrowave.h at the pinned 0.8.0 revision.
+			// SAFETY: symbol types mirror pyrowave.h at the pinned 0.9.0 revision.
 			unsafe {
 				let version = *library
 					.get::<GetApiVersion>(b"pyrowave_get_api_version\0")
@@ -345,9 +357,9 @@ impl Api {
 					destroy_image: symbol!("pyrowave_image_destroy", DestroyImage),
 					get_image_view: symbol!("pyrowave_image_get_image_view", GetImageView),
 					encode_scaled: symbol!("pyrowave_encoder_encode_gpu_scaled_synchronous", EncodeScaled),
-					encode_scaled_overlay: symbol!(
-						"pyrowave_encoder_encode_gpu_scaled_overlay_synchronous",
-						EncodeScaledOverlay
+					encode_scaled_layers: symbol!(
+						"pyrowave_encoder_encode_gpu_scaled_layers_synchronous",
+						EncodeScaledLayers
 					),
 					compute_num_packets: symbol!("pyrowave_encoder_compute_num_packets", ComputeNumPackets),
 					packetize: symbol!("pyrowave_encoder_packetize", Packetize),
@@ -513,21 +525,75 @@ struct ImportedImage {
 	layouts: Vec<(u32, u32)>,
 }
 
+/// A DMA-BUF to import: a frame's source or a late-composition layer. The
+/// borrowed descriptors stay open for the borrow (owned by the frame).
+struct DmabufDesc<'a> {
+	planes: [(std::os::fd::BorrowedFd<'a>, u32, u32); 4],
+	plane_count: usize,
+	width: u32,
+	height: u32,
+	fourcc: u32,
+	modifier: u64,
+}
+
+impl<'a> DmabufDesc<'a> {
+	fn planes(&self) -> &[(std::os::fd::BorrowedFd<'a>, u32, u32)] {
+		&self.planes[..self.plane_count]
+	}
+
+	fn from_frame(frame: &'a ExportedFrame) -> Option<Self> {
+		let first = frame.planes().next()?;
+		let mut planes = [(first.fd, 0, 0); 4];
+		let mut plane_count = 0;
+		for plane in frame.planes().take(4) {
+			planes[plane_count] = (plane.fd, plane.offset, plane.stride);
+			plane_count += 1;
+		}
+		Some(Self {
+			planes,
+			plane_count,
+			width: frame.width,
+			height: frame.height,
+			fourcc: frame.format,
+			modifier: frame.modifier,
+		})
+	}
+
+	fn from_dmabuf(dmabuf: &'a smithay::backend::allocator::dmabuf::Dmabuf) -> Option<Self> {
+		use smithay::backend::allocator::Buffer;
+		let first = dmabuf.handles().next()?;
+		let mut planes = [(first, 0, 0); 4];
+		let mut plane_count = 0;
+		for ((fd, offset), stride) in dmabuf.handles().zip(dmabuf.offsets()).zip(dmabuf.strides()).take(4) {
+			planes[plane_count] = (fd, offset, stride);
+			plane_count += 1;
+		}
+		Some(Self {
+			planes,
+			plane_count,
+			width: dmabuf.width(),
+			height: dmabuf.height(),
+			fourcc: dmabuf.format().code as u32,
+			modifier: dmabuf.format().modifier.into(),
+		})
+	}
+}
+
 impl ImportedImage {
-	fn matches(&self, frame: &ExportedFrame, format: vk::Format) -> bool {
-		self.width == frame.width
-			&& self.height == frame.height
+	fn matches(&self, desc: &DmabufDesc<'_>, format: vk::Format) -> bool {
+		self.width == desc.width
+			&& self.height == desc.height
 			&& self.format == format
-			&& self.modifier == frame.modifier
+			&& self.modifier == desc.modifier
 			&& self
 				.layouts
 				.iter()
 				.copied()
-				.eq(frame.planes().map(|p| (p.offset, p.stride)))
-			&& frame
+				.eq(desc.planes().iter().map(|&(_, offset, stride)| (offset, stride)))
+			&& desc
 				.planes()
-				.next()
-				.is_some_and(|plane| same_open_file(self.identity_fd.as_raw_fd(), plane.fd.as_raw_fd()))
+				.first()
+				.is_some_and(|(fd, _, _)| same_open_file(self.identity_fd.as_raw_fd(), fd.as_raw_fd()))
 	}
 }
 
@@ -720,7 +786,7 @@ impl PyroWaveEncoder {
 
 	/// Import (or reuse) the frame's source. Nothing reading the source is
 	/// submitted here, so every failure leaves it unreferenced by the GPU.
-	fn import(&mut self, frame: &ExportedFrame) -> Result<ImageView, EncodeFailure> {
+	fn import(&mut self, desc: &DmabufDesc<'_>) -> Result<ImageView, EncodeFailure> {
 		let rejected = |message: String| {
 			EncodeFailure::new(
 				EncodeStage::Import,
@@ -730,23 +796,25 @@ impl PyroWaveEncoder {
 			)
 		};
 		// Borrowed from the frame's source lease: open and unrecycled for this call.
-		let mut planes = frame.planes();
-		let Some(first) = planes.next() else {
+		let Some(&(first_fd, _, _)) = desc.planes().first() else {
 			return Err(rejected("compositor exported a DMA-BUF without planes".to_string()));
 		};
-		if planes.any(|plane| !same_open_file(first.fd.as_raw_fd(), plane.fd.as_raw_fd())) {
+		if desc.planes()[1..]
+			.iter()
+			.any(|(fd, _, _)| !same_open_file(first_fd.as_raw_fd(), fd.as_raw_fd()))
+		{
 			return Err(rejected(
 				"PyroWave cannot import a DMA-BUF whose planes use different file descriptions".to_string(),
 			));
 		}
-		let source_fd = first.fd;
-		let format = drm_fourcc_to_vk(frame.format).map_err(rejected)?;
+		let source_fd = first_fd;
+		let format = drm_fourcc_to_vk(desc.fourcc).map_err(rejected)?;
 		let fd = source_fd.as_raw_fd();
 		let now = Instant::now();
 		let reuse = self
 			.images
 			.get(fd, now)
-			.is_some_and(|image| image.matches(frame, format));
+			.is_some_and(|image| image.matches(desc, format));
 		if reuse {
 			self.images.stats.hit += 1;
 		} else {
@@ -761,16 +829,17 @@ impl PyroWaveEncoder {
 				.try_clone_to_owned()
 				.map_err(|e| rejected(format!("duplicating DMA-BUF import fd: {e}")))?
 				.into_raw_fd();
-			let plane_layouts: Vec<vk::SubresourceLayout> = frame
+			let plane_layouts: Vec<vk::SubresourceLayout> = desc
 				.planes()
-				.map(|plane| {
+				.iter()
+				.map(|&(_, offset, stride)| {
 					vk::SubresourceLayout::default()
-						.offset(plane.offset as u64)
-						.row_pitch(plane.stride as u64)
+						.offset(offset as u64)
+						.row_pitch(stride as u64)
 				})
 				.collect();
 			let mut modifier = vk::ImageDrmFormatModifierExplicitCreateInfoEXT::default()
-				.drm_format_modifier(frame.modifier)
+				.drm_format_modifier(desc.modifier)
 				.plane_layouts(&plane_layouts);
 			let mut external = vk::ExternalMemoryImageCreateInfo::default()
 				.handle_types(vk::ExternalMemoryHandleTypeFlags::DMA_BUF_EXT);
@@ -779,8 +848,8 @@ impl PyroWaveEncoder {
 				.image_type(vk::ImageType::TYPE_2D)
 				.format(format)
 				.extent(vk::Extent3D {
-					width: frame.width,
-					height: frame.height,
+					width: desc.width,
+					height: desc.height,
 					depth: 1,
 				})
 				.mip_levels(1)
@@ -821,11 +890,15 @@ impl PyroWaveEncoder {
 					device: Rc::clone(&self.device),
 					handle,
 					identity_fd,
-					width: frame.width,
-					height: frame.height,
+					width: desc.width,
+					height: desc.height,
 					format,
-					modifier: frame.modifier,
-					layouts: frame.planes().map(|p| (p.offset, p.stride)).collect(),
+					modifier: desc.modifier,
+					layouts: desc
+						.planes()
+						.iter()
+						.map(|&(_, offset, stride)| (offset, stride))
+						.collect(),
 				},
 				now,
 			);
@@ -874,7 +947,16 @@ impl PyroWaveEncoder {
 			}
 			self.scaling_logged = true;
 		}
-		let view = self.import(frame)?;
+		let view = DmabufDesc::from_frame(frame)
+			.ok_or_else(|| {
+				EncodeFailure::new(
+					EncodeStage::Import,
+					Recovery::DropFrame,
+					SourceAccess::NotSubmitted,
+					"compositor exported a DMA-BUF without planes",
+				)
+			})
+			.and_then(|desc| self.import(&desc))?;
 		let imported = std::time::Instant::now();
 		let input_color_space = match frame.color_space {
 			FrameColorSpace::Srgb => vk::ColorSpaceKHR::SRGB_NONLINEAR,
@@ -907,34 +989,85 @@ impl PyroWaveEncoder {
 		let rate = RateControl {
 			maximum_bitstream_size: self.maximum_frame_bytes,
 		};
-		let overlay = frame.overlay.as_ref().map(|overlay| Overlay {
-			pixels: overlay.image.pixels.as_ptr().cast(),
-			width: overlay.image.width,
-			height: overlay.image.height,
-			stride: overlay.image.width * 4,
-			format: match overlay.image.format {
-				OverlayFormat::Rgba8 => vk::Format::R8G8B8A8_UNORM,
-				OverlayFormat::Bgra8 => vk::Format::B8G8R8A8_UNORM,
-			},
-			x: overlay.x,
-			y: overlay.y,
-			generation: overlay.image.generation,
+		// Late-composition layers, bottom to top. CPU texels are passed by
+		// pointer (copied during the call); DMA-BUF layers go through the same
+		// identity-checked import cache as frame sources.
+		let mut pixels = [const { None::<Overlay> }; MAX_OVERLAYS];
+		let mut layers = [const { None::<OverlayLayer> }; MAX_OVERLAYS];
+		let mut layer_count = 0;
+		for layer in frame.overlays() {
+			let (pixel_ref, view, opaque) = match &layer.content {
+				OverlayContent::Pixels(image) => {
+					pixels[layer_count] = Some(Overlay {
+						pixels: image.pixels.as_ptr().cast(),
+						width: image.width,
+						height: image.height,
+						stride: image.width * 4,
+						format: match image.format {
+							OverlayFormat::Rgba8 => vk::Format::R8G8B8A8_UNORM,
+							OverlayFormat::Bgra8 => vk::Format::B8G8R8A8_UNORM,
+						},
+						x: layer.x,
+						y: layer.y,
+						generation: image.generation,
+					});
+					(true, ImageView::default(), false)
+				},
+				OverlayContent::Dmabuf { dmabuf, opaque } => {
+					let desc = DmabufDesc::from_dmabuf(dmabuf).ok_or_else(|| {
+						EncodeFailure::new(
+							EncodeStage::Import,
+							Recovery::DropFrame,
+							SourceAccess::NotSubmitted,
+							"overlay DMA-BUF has no planes",
+						)
+					})?;
+					(false, self.import(&desc)?, *opaque)
+				},
+			};
+			layers[layer_count] = Some(OverlayLayer {
+				pixels: if pixel_ref {
+					pixels[layer_count]
+						.as_ref()
+						.map_or(ptr::null(), |p| p as *const Overlay)
+				} else {
+					ptr::null()
+				},
+				view,
+				x: layer.x,
+				y: layer.y,
+				opacity: layer.opacity,
+				opaque,
+			});
+			layer_count += 1;
+		}
+		let layers: [OverlayLayer; MAX_OVERLAYS] = layers.map(|layer| {
+			layer.unwrap_or(OverlayLayer {
+				pixels: ptr::null(),
+				view: ImageView::default(),
+				x: 0,
+				y: 0,
+				opacity: 0.0,
+				opaque: false,
+			})
 		});
 		// SAFETY: all referenced objects remain alive until packetize waits for
 		// this submission below. External DMA-BUF images are documented GENERAL.
 		// Overlay pixels are copied by the library during the call.
 		check_frame(
 			unsafe {
-				match &overlay {
-					Some(overlay) => (self.device.api.encode_scaled_overlay)(
+				if layer_count == 0 {
+					(self.device.api.encode_scaled)(self.handle, ptr::null(), ptr::null(), &scaling, &rate)
+				} else {
+					(self.device.api.encode_scaled_layers)(
 						self.handle,
 						ptr::null(),
 						ptr::null(),
 						&scaling,
-						overlay,
+						layers.as_ptr(),
+						layer_count as u32,
 						&rate,
-					),
-					None => (self.device.api.encode_scaled)(self.handle, ptr::null(), ptr::null(), &scaling, &rate),
+					)
 				}
 			},
 			EncodeStage::Submit,
@@ -1178,7 +1311,7 @@ mod tests {
 		assert_eq!(SOURCE_URL, "https://github.com/karsyboy/pyrowave");
 		assert_eq!(SOURCE_REVISION.len(), 40);
 		assert!(SOURCE_REVISION.chars().all(|c| c.is_ascii_hexdigit()));
-		assert_eq!(API_VERSION, (0, 8, 0));
+		assert_eq!(API_VERSION, (0, 9, 0));
 		let nix_dependency = include_str!("../../../../../nix/pyrowave.nix");
 		assert!(nix_dependency.contains(SOURCE_URL));
 		assert!(nix_dependency.contains(SOURCE_REVISION));

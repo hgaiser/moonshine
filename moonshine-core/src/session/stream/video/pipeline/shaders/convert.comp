@@ -1,7 +1,7 @@
 #version 450
 // RGB -> encoder-input YCbCr conversion for the conventional (Vulkan Video)
-// codecs, optionally compositing one premultiplied-alpha overlay (the
-// compositor cursor) while sampling the source.
+// codecs, optionally compositing up to two premultiplied-alpha layers (a Steam
+// notification, then the cursor) while sampling the source.
 //
 // Numerically mirrors Pixelforge's `color_convert.comp` (same coefficients,
 // transfer functions, per-sample clamping, 2x2 chroma box filter and
@@ -22,9 +22,13 @@ layout(push_constant) uniform PushConstants {
     uint color_space;    // 0=BT.709, 1=BT.2020, 2=sRGB->BT.2020+PQ, 3=scRGB linear->BT.2020+PQ
     uint full_range;
     float sdr_white_nits;
-    // Overlay rectangle in output pixels: [x0, y0) .. [x0 + w, y0 + h). w == 0 disables it.
-    ivec2 overlay_origin;
-    uvec2 overlay_size;
+    // Layer rectangles in output pixels (x, y, width, height), bottom to top;
+    // width 0 disables a layer.
+    ivec4 layer_rect[2];
+    // GLES element alpha per layer.
+    vec2 layer_opacity;
+    // Non-zero: ignore the texel alpha (X formats).
+    uvec2 layer_opaque;
 } params;
 
 layout(binding = 0) uniform sampler2D inputImage;
@@ -33,8 +37,9 @@ layout(std430, binding = 1) writeonly buffer OutputBuffer {
     uint output_data[];
 };
 
-// Premultiplied RGBA overlay sampled 1:1 with texelFetch.
-layout(binding = 2) uniform sampler2D overlayImage;
+// Premultiplied layers sampled 1:1 with texelFetch.
+layout(binding = 2) uniform sampler2D layerImage0;
+layout(binding = 3) uniform sampler2D layerImage1;
 
 const float BT709_Y_R = 0.2126;
 const float BT709_Y_G = 0.7152;
@@ -86,16 +91,26 @@ vec3 bt709_to_bt2020(vec3 rgb709) {
     );
 }
 
+// GLES draws a texture element as texel * alpha (premultiplied) with
+// ONE, ONE_MINUS_SRC_ALPHA blending; X formats sample alpha as one.
+vec3 blend_layer(vec3 dst, ivec2 coord, uint i) {
+    ivec4 rect = params.layer_rect[i];
+    ivec2 rel = coord - rect.xy;
+    if (rect.z == 0 || any(lessThan(rel, ivec2(0))) || any(greaterThanEqual(rel, rect.zw)))
+        return dst;
+    vec4 o = i == 0u ? texelFetch(layerImage0, rel, 0) : texelFetch(layerImage1, rel, 0);
+    if (params.layer_opaque[i] != 0u)
+        o.a = 1.0;
+    o *= params.layer_opacity[i];
+    return o.rgb + dst * (1.0 - o.a);
+}
+
 vec3 read_rgb(ivec2 coord) {
     vec4 rgba = texelFetch(inputImage, coord, 0);
     // Late composition happens in the source's encoding, exactly where the
-    // GLES compositor blends a premultiplied cursor into its output buffer.
-    ivec2 rel = coord - params.overlay_origin;
-    if (params.overlay_size.x != 0u && all(greaterThanEqual(rel, ivec2(0))) &&
-        all(lessThan(uvec2(rel), params.overlay_size))) {
-        vec4 o = texelFetch(overlayImage, rel, 0);
-        rgba.rgb = o.rgb + rgba.rgb * (1.0 - o.a);
-    }
+    // GLES compositor blends these elements into its output buffer.
+    rgba.rgb = blend_layer(rgba.rgb, coord, 0u);
+    rgba.rgb = blend_layer(rgba.rgb, coord, 1u);
     if (params.color_space == 2u) {
         vec3 linear_709 = srgb_to_linear(rgba.rgb);
         vec3 linear_2020 = bt709_to_bt2020(linear_709);

@@ -27,7 +27,7 @@ use ash::vk;
 use pixelforge::{ColorSpace, OutputFormat, VideoContext};
 
 use super::dmabuf::CachedImport;
-use crate::session::compositor::frame::{FrameOverlay, OverlayFormat};
+use crate::session::compositor::frame::{MAX_OVERLAYS, OverlayFormat, OverlayImage};
 
 /// Precompiled from `shaders/convert.comp` by `scripts/build-shaders.sh`.
 const CONVERT_SPIRV: &[u8] = include_bytes!("shaders/convert.spv");
@@ -61,9 +61,38 @@ struct PushConstants {
 	color_space: u32,
 	full_range: u32,
 	sdr_white_nits: f32,
-	overlay_origin: [i32; 2],
-	overlay_size: [u32; 2],
+	_padding: [u32; 2],
+	layer_rect: [[i32; 4]; MAX_OVERLAYS],
+	layer_opacity: [f32; MAX_OVERLAYS],
+	layer_opaque: [u32; MAX_OVERLAYS],
 }
+
+/// Where a late-composition layer's texels come from.
+pub(crate) enum LayerInput<'a> {
+	/// CPU texels, uploaded once per content generation.
+	Pixels(&'a OverlayImage),
+	/// An imported client DMA-BUF, read in place like the game source.
+	Imported {
+		import: &'a Arc<CachedImport>,
+		format: vk::Format,
+		first_use: bool,
+		/// Ignore the alpha channel (X formats).
+		opaque: bool,
+	},
+}
+
+/// One layer composited over the source, at `(x, y)` in output pixels.
+pub(crate) struct Layer<'a> {
+	pub input: LayerInput<'a>,
+	pub x: i32,
+	pub y: i32,
+	pub width: u32,
+	pub height: u32,
+	pub opacity: f32,
+}
+
+/// Layers bottom to top (notification, cursor).
+pub(crate) type Layers<'a> = [Option<Layer<'a>>; MAX_OVERLAYS];
 
 /// Whether the packed word layout can represent `width` x `height`.
 pub(crate) fn supports_extent(width: u32, height: u32) -> bool {
@@ -159,7 +188,7 @@ fn find_memory_type(context: &VideoContext, type_bits: u32, required: vk::Memory
 		.ok_or_else(|| format!("no memory type with {required:?}"))
 }
 
-/// GPU-resident copy of the current overlay image (the cursor).
+/// GPU-resident copy of one layer's CPU texels.
 struct OverlayTexture {
 	image: vk::Image,
 	memory: vk::DeviceMemory,
@@ -175,6 +204,21 @@ struct OverlayTexture {
 	needs_init: bool,
 }
 
+impl OverlayTexture {
+	const EMPTY: Self = Self {
+		image: vk::Image::null(),
+		memory: vk::DeviceMemory::null(),
+		views: [vk::ImageView::null(); 2],
+		staging: vk::Buffer::null(),
+		staging_memory: vk::DeviceMemory::null(),
+		staging_ptr: std::ptr::null_mut(),
+		width: 0,
+		height: 0,
+		generation: None,
+		needs_init: true,
+	};
+}
+
 /// Five-second conversion summary for `log_stats`.
 #[derive(Default)]
 pub(crate) struct ConvertWindow {
@@ -182,19 +226,19 @@ pub(crate) struct ConvertWindow {
 	frames: u64,
 	gpu_ns: u64,
 	gpu_samples: u64,
-	late_cursor_frames: u64,
+	late_layer_frames: u64,
 	/// Frames dropped because they carried an overlay this converter cannot draw.
 	pub overlay_drops: u64,
 }
 
 impl ConvertWindow {
-	pub(crate) fn record(&mut self, gpu_ns: Option<u64>, overlay: bool) {
+	pub(crate) fn record(&mut self, gpu_ns: Option<u64>, layered: bool) {
 		self.frames += 1;
 		if let Some(ns) = gpu_ns {
 			self.gpu_ns += ns;
 			self.gpu_samples += 1;
 		}
-		self.late_cursor_frames += u64::from(overlay);
+		self.late_layer_frames += u64::from(layered);
 	}
 
 	pub(crate) fn maybe_log(&mut self, async_compute: Option<bool>) {
@@ -207,7 +251,7 @@ impl ConvertWindow {
 			async_compute = async_compute.unwrap_or(false),
 			converted_frames = self.frames,
 			convert_gpu_us = (self.gpu_samples != 0).then(|| self.gpu_ns as f64 / self.gpu_samples as f64 / 1e3),
-			late_cursor_frames = self.late_cursor_frames,
+			late_layer_frames = self.late_layer_frames,
 			overlay_drops = self.overlay_drops,
 			"Video conversion summary"
 		);
@@ -245,7 +289,8 @@ pub(crate) struct InputConverter {
 	descriptor_set: vk::DescriptorSet,
 	output_buffer: vk::Buffer,
 	output_memory: vk::DeviceMemory,
-	overlay: OverlayTexture,
+	/// Upload textures for CPU-texel layers, one per layer slot.
+	layer_textures: [OverlayTexture; MAX_OVERLAYS],
 	/// Views of recently used source images. The `Arc` pins each image for as
 	/// long as its view exists; entries the importer no longer holds are
 	/// dropped first.
@@ -318,18 +363,7 @@ impl InputConverter {
 			descriptor_set: vk::DescriptorSet::null(),
 			output_buffer: vk::Buffer::null(),
 			output_memory: vk::DeviceMemory::null(),
-			overlay: OverlayTexture {
-				image: vk::Image::null(),
-				memory: vk::DeviceMemory::null(),
-				views: [vk::ImageView::null(); 2],
-				staging: vk::Buffer::null(),
-				staging_memory: vk::DeviceMemory::null(),
-				staging_ptr: std::ptr::null_mut(),
-				width: 0,
-				height: 0,
-				generation: None,
-				needs_init: true,
-			},
+			layer_textures: [OverlayTexture::EMPTY; MAX_OVERLAYS],
 			views: Vec::new(),
 			command_pool: vk::CommandPool::null(),
 			command_buffer: vk::CommandBuffer::null(),
@@ -340,8 +374,10 @@ impl InputConverter {
 		};
 		// Partially created objects are released by Drop on error.
 		converter.create_resources(timestamps)?;
-		// A 1x1 transparent overlay keeps binding 2 valid without a cursor.
-		converter.ensure_overlay_capacity(1, 1)?;
+		// 1x1 placeholders keep the layer bindings valid without layers.
+		for slot in 0..MAX_OVERLAYS {
+			converter.ensure_overlay_capacity(slot, 1, 1)?;
+		}
 		Ok(converter)
 	}
 
@@ -367,6 +403,11 @@ impl InputConverter {
 				.descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
 				.descriptor_count(1)
 				.stage_flags(vk::ShaderStageFlags::COMPUTE),
+			vk::DescriptorSetLayoutBinding::default()
+				.binding(3)
+				.descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+				.descriptor_count(1)
+				.stage_flags(vk::ShaderStageFlags::COMPUTE),
 		];
 		let push_range = vk::PushConstantRange::default()
 			.stage_flags(vk::ShaderStageFlags::COMPUTE)
@@ -374,7 +415,7 @@ impl InputConverter {
 		let pool_sizes = [
 			vk::DescriptorPoolSize::default()
 				.ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-				.descriptor_count(2),
+				.descriptor_count(1 + MAX_OVERLAYS as u32),
 			vk::DescriptorPoolSize::default()
 				.ty(vk::DescriptorType::STORAGE_BUFFER)
 				.descriptor_count(1),
@@ -520,21 +561,22 @@ impl InputConverter {
 		self.sdr_white_nits = sdr_white_nits;
 	}
 
-	/// (Re)allocate the overlay texture and its staging buffer for `width` x `height`.
-	fn ensure_overlay_capacity(&mut self, width: u32, height: u32) -> Result<(), String> {
-		if self.overlay.width >= width && self.overlay.height >= height && self.overlay.image != vk::Image::null() {
+	/// (Re)allocate a slot's upload texture and staging buffer for `width` x `height`.
+	fn ensure_overlay_capacity(&mut self, slot: usize, width: u32, height: u32) -> Result<(), String> {
+		let texture = &self.layer_textures[slot];
+		if texture.width >= width && texture.height >= height && texture.image != vk::Image::null() {
 			return Ok(());
 		}
-		let width = width.max(self.overlay.width).max(1);
-		let height = height.max(self.overlay.height).max(1);
-		self.destroy_overlay();
+		let width = width.max(texture.width).max(1);
+		let height = height.max(texture.height).max(1);
+		self.destroy_overlay(slot);
 		let device = self.context.device().clone();
 		let err = |what: &'static str| move |e: vk::Result| format!("overlay {what}: {e}");
-		// SAFETY: objects are created on this device, recorded in `self.overlay`
+		// SAFETY: objects are created on this device, recorded in `self.layer_textures`
 		// immediately, and only destroyed after the GPU finished with them
 		// (every conversion waits for its fence before returning).
 		unsafe {
-			self.overlay.image = device
+			self.layer_textures[slot].image = device
 				.create_image(
 					&vk::ImageCreateInfo::default()
 						.image_type(vk::ImageType::TYPE_2D)
@@ -555,13 +597,13 @@ impl InputConverter {
 					None,
 				)
 				.map_err(err("image"))?;
-			let requirements = device.get_image_memory_requirements(self.overlay.image);
+			let requirements = device.get_image_memory_requirements(self.layer_textures[slot].image);
 			let memory_type = find_memory_type(
 				&self.context,
 				requirements.memory_type_bits,
 				vk::MemoryPropertyFlags::DEVICE_LOCAL,
 			)?;
-			self.overlay.memory = device
+			self.layer_textures[slot].memory = device
 				.allocate_memory(
 					&vk::MemoryAllocateInfo::default()
 						.allocation_size(requirements.size)
@@ -570,17 +612,17 @@ impl InputConverter {
 				)
 				.map_err(err("memory"))?;
 			device
-				.bind_image_memory(self.overlay.image, self.overlay.memory, 0)
+				.bind_image_memory(self.layer_textures[slot].image, self.layer_textures[slot].memory, 0)
 				.map_err(err("bind memory"))?;
 			// RGBA (xcursor) and BGRA (wl_shm ARGB8888) views of the same texels.
-			for (slot, format) in [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM]
+			for (view_index, format) in [vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM]
 				.into_iter()
 				.enumerate()
 			{
-				self.overlay.views[slot] = device
+				self.layer_textures[slot].views[view_index] = device
 					.create_image_view(
 						&vk::ImageViewCreateInfo::default()
-							.image(self.overlay.image)
+							.image(self.layer_textures[slot].image)
 							.view_type(vk::ImageViewType::TYPE_2D)
 							.format(format)
 							.subresource_range(color_range()),
@@ -589,7 +631,7 @@ impl InputConverter {
 					.map_err(err("view"))?;
 			}
 			let staging_size = u64::from(width) * u64::from(height) * 4;
-			self.overlay.staging = device
+			self.layer_textures[slot].staging = device
 				.create_buffer(
 					&vk::BufferCreateInfo::default()
 						.size(staging_size)
@@ -598,13 +640,13 @@ impl InputConverter {
 					None,
 				)
 				.map_err(err("staging buffer"))?;
-			let requirements = device.get_buffer_memory_requirements(self.overlay.staging);
+			let requirements = device.get_buffer_memory_requirements(self.layer_textures[slot].staging);
 			let memory_type = find_memory_type(
 				&self.context,
 				requirements.memory_type_bits,
 				vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
 			)?;
-			self.overlay.staging_memory = device
+			self.layer_textures[slot].staging_memory = device
 				.allocate_memory(
 					&vk::MemoryAllocateInfo::default()
 						.allocation_size(requirements.size)
@@ -613,11 +655,15 @@ impl InputConverter {
 				)
 				.map_err(err("staging memory"))?;
 			device
-				.bind_buffer_memory(self.overlay.staging, self.overlay.staging_memory, 0)
+				.bind_buffer_memory(
+					self.layer_textures[slot].staging,
+					self.layer_textures[slot].staging_memory,
+					0,
+				)
 				.map_err(err("bind staging memory"))?;
-			self.overlay.staging_ptr = device
+			self.layer_textures[slot].staging_ptr = device
 				.map_memory(
-					self.overlay.staging_memory,
+					self.layer_textures[slot].staging_memory,
 					0,
 					vk::WHOLE_SIZE,
 					vk::MemoryMapFlags::empty(),
@@ -625,41 +671,41 @@ impl InputConverter {
 				.map_err(err("map staging memory"))?
 				.cast();
 			// Transparent until the first real upload.
-			std::ptr::write_bytes(self.overlay.staging_ptr, 0, staging_size as usize);
+			std::ptr::write_bytes(self.layer_textures[slot].staging_ptr, 0, staging_size as usize);
 		}
-		self.overlay.width = width;
-		self.overlay.height = height;
-		self.overlay.generation = None;
-		self.overlay.needs_init = true;
+		self.layer_textures[slot].width = width;
+		self.layer_textures[slot].height = height;
+		self.layer_textures[slot].generation = None;
+		self.layer_textures[slot].needs_init = true;
 		Ok(())
 	}
 
-	fn destroy_overlay(&mut self) {
+	fn destroy_overlay(&mut self, slot: usize) {
 		let device = self.context.device();
 		// SAFETY: callers only reach this after the last submission completed.
 		unsafe {
-			for view in &mut self.overlay.views {
+			for view in &mut self.layer_textures[slot].views {
 				if *view != vk::ImageView::null() {
 					device.destroy_image_view(*view, None);
 					*view = vk::ImageView::null();
 				}
 			}
-			if self.overlay.image != vk::Image::null() {
-				device.destroy_image(self.overlay.image, None);
-				self.overlay.image = vk::Image::null();
+			if self.layer_textures[slot].image != vk::Image::null() {
+				device.destroy_image(self.layer_textures[slot].image, None);
+				self.layer_textures[slot].image = vk::Image::null();
 			}
-			if self.overlay.memory != vk::DeviceMemory::null() {
-				device.free_memory(self.overlay.memory, None);
-				self.overlay.memory = vk::DeviceMemory::null();
+			if self.layer_textures[slot].memory != vk::DeviceMemory::null() {
+				device.free_memory(self.layer_textures[slot].memory, None);
+				self.layer_textures[slot].memory = vk::DeviceMemory::null();
 			}
-			if self.overlay.staging != vk::Buffer::null() {
-				device.destroy_buffer(self.overlay.staging, None);
-				self.overlay.staging = vk::Buffer::null();
+			if self.layer_textures[slot].staging != vk::Buffer::null() {
+				device.destroy_buffer(self.layer_textures[slot].staging, None);
+				self.layer_textures[slot].staging = vk::Buffer::null();
 			}
-			if self.overlay.staging_memory != vk::DeviceMemory::null() {
-				device.free_memory(self.overlay.staging_memory, None);
-				self.overlay.staging_memory = vk::DeviceMemory::null();
-				self.overlay.staging_ptr = std::ptr::null_mut();
+			if self.layer_textures[slot].staging_memory != vk::DeviceMemory::null() {
+				device.free_memory(self.layer_textures[slot].staging_memory, None);
+				self.layer_textures[slot].staging_memory = vk::DeviceMemory::null();
+				self.layer_textures[slot].staging_ptr = std::ptr::null_mut();
 			}
 		}
 	}
@@ -702,99 +748,132 @@ impl InputConverter {
 		Ok(view)
 	}
 
-	/// Stage `overlay`'s pixels when its content changed. Returns the view to sample.
-	/// `Some(true)` means the staging buffer holds new content to upload.
-	fn prepare_overlay(&mut self, overlay: Option<&FrameOverlay>) -> Result<(vk::ImageView, Option<bool>), String> {
-		let Some(overlay) = overlay else {
-			return Ok((self.overlay.views[0], None));
-		};
-		let image = &overlay.image;
-		self.ensure_overlay_capacity(image.width, image.height)?;
-		let upload = self.overlay.generation != Some(image.generation);
+	/// Stage `image` in `slot` when its content changed. Returns the view to
+	/// sample and whether the staging buffer holds new content to upload.
+	fn prepare_pixels(&mut self, slot: usize, image: &OverlayImage) -> Result<(vk::ImageView, bool), String> {
+		self.ensure_overlay_capacity(slot, image.width, image.height)?;
+		let texture = &mut self.layer_textures[slot];
+		let upload = texture.generation != Some(image.generation);
 		if upload {
 			let row = image.width as usize * 4;
-			let stride = self.overlay.width as usize * 4;
-			// SAFETY: the staging buffer holds overlay.width x overlay.height
+			let stride = texture.width as usize * 4;
+			// SAFETY: the staging buffer holds texture.width x texture.height
 			// texels, at least the image's extent; no GPU work reads it now.
 			unsafe {
 				for y in 0..image.height as usize {
 					std::ptr::copy_nonoverlapping(
 						image.pixels[y * row..].as_ptr(),
-						self.overlay.staging_ptr.add(y * stride),
+						texture.staging_ptr.add(y * stride),
 						row,
 					);
 				}
 			}
-			self.overlay.generation = Some(image.generation);
+			texture.generation = Some(image.generation);
 		}
 		let view = match image.format {
-			OverlayFormat::Rgba8 => self.overlay.views[0],
-			OverlayFormat::Bgra8 => self.overlay.views[1],
+			OverlayFormat::Rgba8 => texture.views[0],
+			OverlayFormat::Bgra8 => texture.views[1],
 		};
-		Ok((view, Some(upload)))
+		Ok((view, upload))
 	}
 
-	/// Convert `source` (optionally compositing `overlay`) into `target`, the
-	/// encoder's input image, and wait for completion. On success the source is
-	/// no longer read by the GPU. `target` is left in VIDEO_ENCODE_SRC layout.
+	/// Convert `source` into `target`, the encoder's input image, compositing
+	/// `layers` bottom to top, and wait for completion. On success no GPU work
+	/// reads the source or any imported layer any more. `target` is left in
+	/// VIDEO_ENCODE_SRC layout.
 	pub(crate) fn convert(
 		&mut self,
 		source: &Arc<CachedImport>,
 		source_format: vk::Format,
 		first_use: bool,
-		overlay: Option<&FrameOverlay>,
+		layers: &Layers<'_>,
 		target: vk::Image,
 	) -> Result<ConvertOutcome, vk::Result> {
 		let source_view = self
 			.source_view(source, source_format)
 			.map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
-		let (overlay_view, overlay_upload) = self
-			.prepare_overlay(overlay)
-			.map_err(|_| vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
-		let device = self.context.device().clone();
-		let cmd = self.command_buffer;
-		let source_image = source.image();
-
-		let push = PushConstants {
+		let mut push = PushConstants {
 			width: self.width,
 			height: self.height,
 			output_format: self.output_format_code,
 			color_space: color_space_code(self.color_space),
 			full_range: u32::from(self.full_range),
 			sdr_white_nits: self.sdr_white_nits,
-			overlay_origin: overlay.map_or([0, 0], |o| [o.x, o.y]),
-			overlay_size: overlay.map_or([0, 0], |o| [o.image.width, o.image.height]),
+			_padding: [0; 2],
+			layer_rect: [[0; 4]; MAX_OVERLAYS],
+			layer_opacity: [0.0; MAX_OVERLAYS],
+			layer_opaque: [0; MAX_OVERLAYS],
 		};
+		// Per slot: the view to bind, whether staged texels must be uploaded,
+		// and an imported image with its first-use flag (needs acquire/release).
+		let mut layer_views = [vk::ImageView::null(); MAX_OVERLAYS];
+		let mut uploads = [false; MAX_OVERLAYS];
+		let mut imported: [Option<(vk::Image, bool)>; MAX_OVERLAYS] = [None; MAX_OVERLAYS];
+		for (slot, layer) in layers.iter().enumerate() {
+			let Some(layer) = layer else {
+				// Placeholder: never sampled while the rectangle width is zero.
+				layer_views[slot] = self.layer_textures[slot].views[0];
+				continue;
+			};
+			push.layer_rect[slot] = [layer.x, layer.y, layer.width as i32, layer.height as i32];
+			push.layer_opacity[slot] = layer.opacity;
+			match &layer.input {
+				LayerInput::Pixels(image) => {
+					let (view, upload) = self
+						.prepare_pixels(slot, image)
+						.map_err(|_| vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
+					layer_views[slot] = view;
+					uploads[slot] = upload;
+				},
+				LayerInput::Imported {
+					import,
+					format,
+					first_use,
+					opaque,
+				} => {
+					layer_views[slot] = self
+						.source_view(import, *format)
+						.map_err(|_| vk::Result::ERROR_INITIALIZATION_FAILED)?;
+					imported[slot] = Some((import.image(), *first_use));
+					push.layer_opaque[slot] = u32::from(*opaque);
+				},
+			}
+		}
+		let device = self.context.device().clone();
+		let cmd = self.command_buffer;
+		let source_image = source.image();
 
 		// SAFETY: all handles belong to this device; the command buffer is not
 		// pending (the previous submission was waited for); descriptor updates
 		// happen while no submission uses the set.
 		unsafe {
+			let image_info = |view, layout| {
+				vk::DescriptorImageInfo::default()
+					.sampler(self.sampler)
+					.image_view(view)
+					.image_layout(layout)
+			};
+			// Imported layers are sampled in GENERAL (see the barrier below).
+			let layer_layout = |slot: usize| {
+				if imported[slot].is_some() {
+					vk::ImageLayout::GENERAL
+				} else {
+					vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+				}
+			};
 			let image_infos = [
-				vk::DescriptorImageInfo::default()
-					.sampler(self.sampler)
-					.image_view(source_view)
-					.image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
-				vk::DescriptorImageInfo::default()
-					.sampler(self.sampler)
-					.image_view(overlay_view)
-					.image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+				image_info(source_view, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+				image_info(layer_views[0], layer_layout(0)),
+				image_info(layer_views[1], layer_layout(1)),
 			];
-			device.update_descriptor_sets(
-				&[
-					vk::WriteDescriptorSet::default()
-						.dst_set(self.descriptor_set)
-						.dst_binding(0)
-						.descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-						.image_info(&image_infos[0..1]),
-					vk::WriteDescriptorSet::default()
-						.dst_set(self.descriptor_set)
-						.dst_binding(2)
-						.descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
-						.image_info(&image_infos[1..2]),
-				],
-				&[],
-			);
+			let writes = [(0u32, 0usize), (2, 1), (3, 2)].map(|(binding, info)| {
+				vk::WriteDescriptorSet::default()
+					.dst_set(self.descriptor_set)
+					.dst_binding(binding)
+					.descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+					.image_info(std::slice::from_ref(&image_infos[info]))
+			});
+			device.update_descriptor_sets(&writes, &[]);
 
 			device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
 			device.begin_command_buffer(
@@ -808,32 +887,54 @@ impl InputConverter {
 
 			// Same ownership protocol as Pixelforge's converter: the first use of
 			// an imported (EXCLUSIVE) DMA-BUF acquires it from the external
-			// owner; later uses start from the GENERAL layout left below.
-			let source_barrier = vk::ImageMemoryBarrier::default()
-				.old_layout(if first_use {
-					vk::ImageLayout::UNDEFINED
+			// owner; later uses start from the GENERAL layout left below. Imported
+			// layers are client DMA-BUFs and follow the same protocol.
+			let acquire = |image: vk::Image, first_use: bool| {
+				vk::ImageMemoryBarrier::default()
+					.old_layout(if first_use {
+						vk::ImageLayout::UNDEFINED
+					} else {
+						vk::ImageLayout::GENERAL
+					})
+					.new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+					.src_queue_family_index(if first_use {
+						vk::QUEUE_FAMILY_EXTERNAL
+					} else {
+						vk::QUEUE_FAMILY_IGNORED
+					})
+					.dst_queue_family_index(if first_use {
+						self.queue_family
+					} else {
+						vk::QUEUE_FAMILY_IGNORED
+					})
+					.image(image)
+					.subresource_range(color_range())
+					.src_access_mask(if first_use {
+						vk::AccessFlags::empty()
+					} else {
+						vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
+					})
+					.dst_access_mask(vk::AccessFlags::SHADER_READ)
+			};
+			// Layers are other clients' buffers (e.g. XWayland's). Any layout
+			// transition after the first acquire can make the driver treat the
+			// buffer as written, and implicit sync then waits for the owner's
+			// own pending reads, which queue behind a GPU-bound game. Sample
+			// them in GENERAL with a memory dependency only.
+			let layer_barrier = |image: vk::Image, layer_first_use: bool| {
+				let barrier = acquire(image, layer_first_use).new_layout(vk::ImageLayout::GENERAL);
+				if layer_first_use {
+					barrier
 				} else {
-					vk::ImageLayout::GENERAL
-				})
-				.new_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-				.src_queue_family_index(if first_use {
-					vk::QUEUE_FAMILY_EXTERNAL
-				} else {
-					vk::QUEUE_FAMILY_IGNORED
-				})
-				.dst_queue_family_index(if first_use {
-					self.queue_family
-				} else {
-					vk::QUEUE_FAMILY_IGNORED
-				})
-				.image(source_image)
-				.subresource_range(color_range())
-				.src_access_mask(if first_use {
-					vk::AccessFlags::empty()
-				} else {
-					vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE
-				})
-				.dst_access_mask(vk::AccessFlags::SHADER_READ);
+					barrier.old_layout(vk::ImageLayout::GENERAL)
+				}
+			};
+			let mut acquires = [acquire(source_image, first_use); 1 + MAX_OVERLAYS];
+			let mut acquire_count = 1;
+			for (image, layer_first_use) in imported.iter().flatten() {
+				acquires[acquire_count] = layer_barrier(*image, *layer_first_use);
+				acquire_count += 1;
+			}
 			device.cmd_pipeline_barrier(
 				cmd,
 				vk::PipelineStageFlags::ALL_COMMANDS,
@@ -841,95 +942,97 @@ impl InputConverter {
 				vk::DependencyFlags::empty(),
 				&[],
 				&[],
-				&[source_barrier],
+				&acquires[..acquire_count],
 			);
-			let overlay_barrier = |old, new, src, dst| {
-				vk::ImageMemoryBarrier::default()
-					.old_layout(old)
-					.new_layout(new)
-					.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.image(self.overlay.image)
-					.subresource_range(color_range())
-					.src_access_mask(src)
-					.dst_access_mask(dst)
-			};
-			if overlay_upload == Some(true) {
-				let old = if self.overlay.needs_init {
-					vk::ImageLayout::UNDEFINED
-				} else {
-					vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+			for (slot, &upload) in uploads.iter().enumerate() {
+				let texture = &self.layer_textures[slot];
+				let texture_barrier = |old, new, src, dst| {
+					vk::ImageMemoryBarrier::default()
+						.old_layout(old)
+						.new_layout(new)
+						.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+						.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+						.image(texture.image)
+						.subresource_range(color_range())
+						.src_access_mask(src)
+						.dst_access_mask(dst)
 				};
-				device.cmd_pipeline_barrier(
-					cmd,
-					vk::PipelineStageFlags::COMPUTE_SHADER,
-					vk::PipelineStageFlags::TRANSFER,
-					vk::DependencyFlags::empty(),
-					&[],
-					&[],
-					&[overlay_barrier(
-						old,
+				if upload {
+					let old = if texture.needs_init {
+						vk::ImageLayout::UNDEFINED
+					} else {
+						vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL
+					};
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::COMPUTE_SHADER,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[],
+						&[texture_barrier(
+							old,
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							vk::AccessFlags::SHADER_READ,
+							vk::AccessFlags::TRANSFER_WRITE,
+						)],
+					);
+					let region = vk::BufferImageCopy {
+						buffer_offset: 0,
+						buffer_row_length: texture.width,
+						buffer_image_height: 0,
+						image_subresource: vk::ImageSubresourceLayers {
+							aspect_mask: vk::ImageAspectFlags::COLOR,
+							mip_level: 0,
+							base_array_layer: 0,
+							layer_count: 1,
+						},
+						image_offset: vk::Offset3D::default(),
+						image_extent: vk::Extent3D {
+							width: texture.width,
+							height: texture.height,
+							depth: 1,
+						},
+					};
+					device.cmd_copy_buffer_to_image(
+						cmd,
+						texture.staging,
+						texture.image,
 						vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-						vk::AccessFlags::SHADER_READ,
-						vk::AccessFlags::TRANSFER_WRITE,
-					)],
-				);
-				let region = vk::BufferImageCopy {
-					buffer_offset: 0,
-					buffer_row_length: self.overlay.width,
-					buffer_image_height: 0,
-					image_subresource: vk::ImageSubresourceLayers {
-						aspect_mask: vk::ImageAspectFlags::COLOR,
-						mip_level: 0,
-						base_array_layer: 0,
-						layer_count: 1,
-					},
-					image_offset: vk::Offset3D::default(),
-					image_extent: vk::Extent3D {
-						width: self.overlay.width,
-						height: self.overlay.height,
-						depth: 1,
-					},
-				};
-				device.cmd_copy_buffer_to_image(
-					cmd,
-					self.overlay.staging,
-					self.overlay.image,
-					vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-					&[region],
-				);
-				device.cmd_pipeline_barrier(
-					cmd,
-					vk::PipelineStageFlags::TRANSFER,
-					vk::PipelineStageFlags::COMPUTE_SHADER,
-					vk::DependencyFlags::empty(),
-					&[],
-					&[],
-					&[overlay_barrier(
-						vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-						vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-						vk::AccessFlags::TRANSFER_WRITE,
-						vk::AccessFlags::SHADER_READ,
-					)],
-				);
-				self.overlay.needs_init = false;
-			} else if self.overlay.needs_init {
-				// Placeholder only: never sampled while overlay_size is zero.
-				device.cmd_pipeline_barrier(
-					cmd,
-					vk::PipelineStageFlags::TOP_OF_PIPE,
-					vk::PipelineStageFlags::COMPUTE_SHADER,
-					vk::DependencyFlags::empty(),
-					&[],
-					&[],
-					&[overlay_barrier(
-						vk::ImageLayout::UNDEFINED,
-						vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
-						vk::AccessFlags::empty(),
-						vk::AccessFlags::SHADER_READ,
-					)],
-				);
-				self.overlay.needs_init = false;
+						&[region],
+					);
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TRANSFER,
+						vk::PipelineStageFlags::COMPUTE_SHADER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[],
+						&[texture_barrier(
+							vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+							vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+							vk::AccessFlags::TRANSFER_WRITE,
+							vk::AccessFlags::SHADER_READ,
+						)],
+					);
+				} else if texture.needs_init {
+					// Placeholder contents are irrelevant; only the layout matters.
+					device.cmd_pipeline_barrier(
+						cmd,
+						vk::PipelineStageFlags::TOP_OF_PIPE,
+						vk::PipelineStageFlags::COMPUTE_SHADER,
+						vk::DependencyFlags::empty(),
+						&[],
+						&[],
+						&[texture_barrier(
+							vk::ImageLayout::UNDEFINED,
+							vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+							vk::AccessFlags::empty(),
+							vk::AccessFlags::SHADER_READ,
+						)],
+					);
+				}
+				self.layer_textures[slot].needs_init = false;
 			}
 
 			device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
@@ -992,6 +1095,18 @@ impl InputConverter {
 				vk::ImageLayout::TRANSFER_DST_OPTIMAL,
 				&copy_regions(self.output_format, self.width, self.height),
 			);
+			// Sampled images return to GENERAL for their next use.
+			let release = |image: vk::Image| {
+				vk::ImageMemoryBarrier::default()
+					.old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+					.new_layout(vk::ImageLayout::GENERAL)
+					.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+					.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+					.image(image)
+					.subresource_range(color_range())
+					.src_access_mask(vk::AccessFlags::SHADER_READ)
+					.dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+			};
 			let post = [
 				vk::ImageMemoryBarrier::default()
 					.src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -1002,16 +1117,10 @@ impl InputConverter {
 					.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
 					.image(target)
 					.subresource_range(color_range()),
-				vk::ImageMemoryBarrier::default()
-					.old_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-					.new_layout(vk::ImageLayout::GENERAL)
-					.src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-					.image(source_image)
-					.subresource_range(color_range())
-					.src_access_mask(vk::AccessFlags::SHADER_READ)
-					.dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE),
+				release(source_image),
 			];
+			// Imported layers already are in GENERAL.
+			let post_count = 2;
 			device.cmd_pipeline_barrier(
 				cmd,
 				vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1019,7 +1128,7 @@ impl InputConverter {
 				vk::DependencyFlags::empty(),
 				&[],
 				&[],
-				&post,
+				&post[..post_count],
 			);
 			if self.query_pool != vk::QueryPool::null() {
 				device.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, self.query_pool, 1);
@@ -1063,7 +1172,9 @@ impl Drop for InputConverter {
 			for (_, view) in self.views.drain(..) {
 				device.destroy_image_view(view, None);
 			}
-			self.destroy_overlay();
+			for slot in 0..MAX_OVERLAYS {
+				self.destroy_overlay(slot);
+			}
 			if self.query_pool != vk::QueryPool::null() {
 				device.destroy_query_pool(self.query_pool, None);
 			}
@@ -1158,7 +1269,6 @@ mod tests {
 #[cfg(test)]
 mod gpu_fixture {
 	use super::*;
-	use crate::session::compositor::frame::OverlayImage;
 	use pixelforge::{
 		Codec, ColorConverter, ColorConverterConfig, EncodeBitDepth, EncodeConfig, Encoder, InputFormat, PixelFormat,
 		VideoContextBuilder,
@@ -1580,7 +1690,9 @@ mod gpu_fixture {
 							full_range,
 						)
 						.unwrap();
-						packed.convert(&source, vk_format, false, None, target).unwrap();
+						packed
+							.convert(&source, vk_format, false, &[None, None], target)
+							.unwrap();
 						let actual = read_buffer(&context, packed.output_buffer, size);
 						let expected = if output_format == OutputFormat::YUV444 {
 							pixelforge_yuv444_defect(&expected, &actual, (w * h) as usize, &mut failures)
@@ -1643,7 +1755,7 @@ mod gpu_fixture {
 				reference_ns += t.elapsed().as_nanos();
 				let t = std::time::Instant::now();
 				gpu_ns += packed
-					.convert(&source, vk::Format::R8G8B8A8_UNORM, false, None, target)
+					.convert(&source, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
 					.unwrap()
 					.gpu_ns
 					.unwrap_or(0);
@@ -1659,7 +1771,10 @@ mod gpu_fixture {
 	}
 
 	/// Late composition must equal GLES-style premultiplied source-over
-	/// blending in the frame's encoding followed by the same conversion.
+	/// blending in the frame's encoding followed by the same conversion: a
+	/// notification layer read from an imported image (X format, so its alpha
+	/// bytes are ignored) at 75% window opacity, partly off the right edge,
+	/// then a cursor with every alpha level, partly off the left edge.
 	fn overlay_matches_cpu_composition(context: &VideoContext, failures: &mut Vec<String>) {
 		let (w, h) = (256u32, 128u32);
 		let mut rng = Rng(42);
@@ -1667,7 +1782,6 @@ mod gpu_fixture {
 		let encoder = Encoder::new(context.clone(), config).unwrap();
 		let target = encoder.input_image();
 		let source_bytes = random_source(&mut rng, vk::Format::R8G8B8A8_UNORM, w, h);
-		// Premultiplied cursor with every alpha level, partly off the left edge.
 		let (cw, ch, cx, cy) = (32u32, 24u32, -5i32, 37i32);
 		let mut cursor = vec![0u8; (cw * ch * 4) as usize];
 		for (i, texel) in cursor.as_chunks_mut::<4>().0.iter_mut().enumerate() {
@@ -1677,23 +1791,51 @@ mod gpu_fixture {
 			}
 			texel[3] = a;
 		}
+		// BGRX texels with garbage in the X byte.
+		let (nw, nh, nx, ny, opacity) = (120u32, 60u32, 180i32, 30i32, 0.75f32);
+		let notification: Vec<u8> = (0..nw * nh * 4).map(|_| rng.next() as u8).collect();
+
+		// Reference: blend each layer into an 8-bit buffer, as GLES draws into
+		// an 8-bit target, then convert with Pixelforge.
+		let blend =
+			|dst: &mut [u8], (ox, oy): (i32, i32), (ow, oh): (u32, u32), texel: &dyn Fn(u32, u32) -> [f32; 4]| {
+				for y in 0..oh as i32 {
+					for x in 0..ow as i32 {
+						let (px, py) = (ox + x, oy + y);
+						if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+							continue;
+						}
+						let o = texel(x as u32, y as u32);
+						let d = &mut dst[((py as u32 * w + px as u32) * 4) as usize..][..4];
+						for c in 0..3 {
+							let v = o[c] + f32::from(d[c]) / 255.0 * (1.0 - o[3]);
+							d[c] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
+						}
+					}
+				}
+			};
 		let mut composited = source_bytes.clone();
-		for y in 0..ch as i32 {
-			for x in 0..cw as i32 {
-				let (px, py) = (cx + x, cy + y);
-				if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
-					continue;
-				}
-				let o = &cursor[((y as u32 * cw + x as u32) * 4) as usize..][..4];
-				let d = &mut composited[((py as u32 * w + px as u32) * 4) as usize..][..4];
-				let a = f32::from(o[3]) / 255.0;
-				for c in 0..3 {
-					let v = f32::from(o[c]) / 255.0 + f32::from(d[c]) / 255.0 * (1.0 - a);
-					d[c] = (v * 255.0).round().clamp(0.0, 255.0) as u8;
-				}
-			}
-		}
+		blend(&mut composited, (nx, ny), (nw, nh), &|x, y| {
+			let t = &notification[((y * nw + x) * 4) as usize..][..4];
+			// BGRA bytes -> RGB, alpha forced to one, times window opacity.
+			[
+				f32::from(t[2]) / 255.0 * opacity,
+				f32::from(t[1]) / 255.0 * opacity,
+				f32::from(t[0]) / 255.0 * opacity,
+				opacity,
+			]
+		});
+		blend(&mut composited, (cx, cy), (cw, ch), &|x, y| {
+			let t = &cursor[((y * cw + x) * 4) as usize..][..4];
+			[
+				f32::from(t[0]) / 255.0,
+				f32::from(t[1]) / 255.0,
+				f32::from(t[2]) / 255.0,
+				f32::from(t[3]) / 255.0,
+			]
+		});
 		let plain = source_image(context, w, h, vk::Format::R8G8B8A8_UNORM, &source_bytes);
+		let notification_image = source_image(context, nw, nh, vk::Format::B8G8R8A8_UNORM, &notification);
 		let reference_source = source_image(context, w, h, vk::Format::R8G8B8A8_UNORM, &composited);
 		let mut reference = ColorConverter::new(
 			context.clone(),
@@ -1715,31 +1857,51 @@ mod gpu_fixture {
 			false,
 		)
 		.unwrap();
-		let overlay = FrameOverlay {
-			image: Arc::new(OverlayImage {
-				generation: 1,
+		let cursor_image = OverlayImage {
+			generation: 1,
+			width: cw,
+			height: ch,
+			format: OverlayFormat::Rgba8,
+			pixels: cursor.into_boxed_slice(),
+		};
+		let layers: Layers<'_> = [
+			Some(Layer {
+				input: LayerInput::Imported {
+					import: &notification_image,
+					format: vk::Format::B8G8R8A8_UNORM,
+					first_use: false,
+					opaque: true,
+				},
+				x: nx,
+				y: ny,
+				width: nw,
+				height: nh,
+				opacity,
+			}),
+			Some(Layer {
+				input: LayerInput::Pixels(&cursor_image),
+				x: cx,
+				y: cy,
 				width: cw,
 				height: ch,
-				format: OverlayFormat::Rgba8,
-				pixels: cursor.into_boxed_slice(),
+				opacity: 1.0,
 			}),
-			x: cx,
-			y: cy,
-		};
+		];
 		packed
-			.convert(&plain, vk::Format::R8G8B8A8_UNORM, false, Some(&overlay), target)
+			.convert(&plain, vk::Format::R8G8B8A8_UNORM, false, &layers, target)
 			.unwrap();
 		let actual = read_buffer(context, packed.output_buffer, size);
 		let (diff, max) = compare(&expected, &actual, false);
-		eprintln!("overlay NV12: {diff} differing samples, max {max}");
-		// The reference quantizes the blend to 8 bits first (as an 8-bit GLES
-		// target does); the late path blends in float. One code of difference.
-		if max > 1 {
-			failures.push(format!("overlay NV12 max difference {max}"));
+		eprintln!("notification + cursor layers NV12: {diff} differing samples, max {max}");
+		// The reference rounds to 8 bits after each layer (as an 8-bit GLES
+		// target does); the late path blends in float. Overlapping layers can
+		// accumulate one code of rounding each.
+		if max > 2 {
+			failures.push(format!("layered NV12 max difference {max}"));
 		}
-		// Without an overlay the same converter must not draw one.
+		// Without layers the same converter must not draw any.
 		packed
-			.convert(&plain, vk::Format::R8G8B8A8_UNORM, false, None, target)
+			.convert(&plain, vk::Format::R8G8B8A8_UNORM, false, &[None, None], target)
 			.unwrap();
 		let without = read_buffer(context, packed.output_buffer, size);
 		let mut plain_reference = ColorConverter::new(
@@ -1752,9 +1914,9 @@ mod gpu_fixture {
 			.unwrap();
 		let plain_expected = read_buffer(context, plain_reference.output_buffer(), size);
 		let (diff, max) = compare(&plain_expected, &without, false);
-		eprintln!("overlay removed NV12: {diff} differing samples, max {max}");
+		eprintln!("layers removed NV12: {diff} differing samples, max {max}");
 		if max > 1 {
-			failures.push(format!("overlay removal max difference {max}"));
+			failures.push(format!("layer removal max difference {max}"));
 		}
 	}
 }
