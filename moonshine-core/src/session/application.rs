@@ -484,7 +484,15 @@ async fn wait_for_unit_terminal_state(
 					.deserialize()
 					.map_err(|e| tracing::error!("Failed to deserialize UnitRemoved signal: {e}"))?;
 				if id == unit_name {
-					return Ok("removed".to_string());
+					// Reloading systemd emits UnitRemoved even for running units.
+					match current_unit_state(conn, unit_path).await {
+						Ok(state) => {
+							if let Some(state) = terminal_state(state.as_str()) {
+								return Ok(state.to_string());
+							}
+						},
+						Err(()) => return Ok("removed".to_string()),
+					}
 				}
 			},
 		}
