@@ -1,6 +1,6 @@
 # PyroWave compatibility and bandwidth calibration
 
-Native wire-v1 has exactly one production path: the pinned C API 0.7.0 encoder
+Native wire-v1 has exactly one production path: the pinned C API 0.8.0 encoder
 returns a contiguous frame; the existing GameStream packetizer applies sequencing,
 FEC and encryption; Moonlight reassembles a complete decode unit; the native
 decoder validates and consumes that frame. No record adapter, partial delivery,

@@ -17,8 +17,10 @@ entry as the GitHub release notes. See [release preparation](../CONTRIBUTING.md#
 ### Changed
 
 - Convert H.264/HEVC/AV1 input with a Pyroshine-owned compute shader instead of Pixelforge's converter. It produces the same encoder input (bit-identical in GPU fixture comparisons for NV12, P010 and 10-bit 4:4:4 from 8-bit, 10-bit and FP16 sources in every color mode), but writes whole words instead of per-byte global atomics and needs no buffer clear: 4K NV12 conversion measured 73 µs of GPU time against about 200 µs per synchronous Pixelforge conversion on an RX 9070 XT. It runs on the dedicated compute queue by default (`[stream.video] conversion_queue`). Pixelforge's converter remains the fallback for widths that are not a multiple of four or odd heights.
-- Keep fullscreen games on the direct-export path while the mouse cursor is visible. For H.264/HEVC/AV1 the cursor is composited by the conversion shader (premultiplied, at the same position GLES would draw it) instead of rendering the whole scene through GLES first. Scaled, transformed, cropped, DMA-BUF or multi-surface cursors, other overlays, and PyroWave still use full composition; the cursor is always part of the encoded video.
+- Keep fullscreen games on the direct-export path while the mouse cursor is visible. For H.264/HEVC/AV1 the cursor is composited by the conversion shader, and for PyroWave by its scaler (premultiplied, at the same position GLES would draw it), instead of rendering the whole scene through GLES first. At 4K120 HDR 4:4:4 PyroWave with a moving cursor this halved Pyroshine's graphics-engine time (12.6% to 6.2%). Scaled, transformed, cropped, DMA-BUF or multi-surface cursors and other overlays still use full composition; the cursor is always part of the encoded video.
 - Latch a surface commit only once its DMA-BUF has finished rendering, as other Wayland compositors do. Capturing a buffer whose GPU work was still queued made every consumer wait on it, which stalled the encoder behind a GPU-bound game. `MOONSHINE_DISABLE_READY_LATCH=1` restores immediate latching for diagnosis.
+
+- Require PyroWave C API 0.8 (fork revision `e9b20be`), which adds 1:1 scaler overlays and times the bitstream readback copy; the bundled 4:4:4 payload fix is now part of the fork, so `nix/patches/pyrowave-444-payload.patch` is removed.
 
 ### Fixed
 

@@ -77,8 +77,8 @@ metadata; no new color conversion or SDR intermediate is introduced.
 
 A visible cursor is the only scene element that can be composited after
 capture. When the active consumer declares overlay support
-(`CaptureReceiver::set_overlay_supported`, currently the conventional codecs'
-packed converter) and the scene *without* the cursor is directly exportable,
+(`CaptureReceiver::set_overlay_supported`: the conventional codecs' packed
+converter, and PyroWave's 1:1 scaler since C API 0.8) and the scene *without* the cursor is directly exportable,
 the compositor exports the game's DMA-BUF with an `ExportedFrame::overlay`: the
 cursor's premultiplied texels plus its output position. The position is the
 one `render_and_export` would draw at (named cursors at the pointer, client
@@ -90,11 +90,15 @@ encoder uploads once per content generation.
 Only 1:1 cursors qualify: the default xcursor, or a client `wl_shm`
 ARGB/XRGB8888 cursor surface without subsurfaces, buffer scale 1, normal
 transform and no viewport crop or scale. Anything else (DMA-BUF cursors,
-scaling, fractional scale, overlays, PyroWave sessions, extents the packed
-converter cannot represent) uses GLES composition as before; the counters still
+scaling, fractional scale, overlays, extents the packed converter cannot
+represent) uses GLES composition as before; the counters still
 report `direct_reject_cursor`. A frame that carries an overlay to a consumer
 that no longer composites one (a racing epoch switch) is dropped, never encoded
-without its cursor. `late_cursor_frames` in `Video capture resources` and the
+without its cursor. PyroWave blends the cursor in its scaler's unscaled input
+fetch; that specialization may round differently from the plain scaler at the
+level of relaxed-precision arithmetic (62-71 dB PSNR in the fork's overlay
+test), while binary-alpha cursors decode identically to pre-composited input
+under the same variant. `late_cursor_frames` in `Video capture resources` and the
 `Video conversion summary` count late-composited frames.
 
 ### Buffer readiness

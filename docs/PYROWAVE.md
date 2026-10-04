@@ -18,8 +18,8 @@ The only supported PyroWave source is:
 
 - repository: `https://github.com/karsyboy/pyrowave`
 - branch: `master` (the build uses the detached revision below, not the moving branch)
-- revision: `e344479d6c0439e346c788a918ad5645713f7573`
-- C API: 0.7.0
+- revision: `e9b20be1517635975d46cdd076ed0b71f9b0ce8a`
+- C API: 0.8.0
 - Granite: `1b2d1801d2910fb09ebcded2f0bb3a3a781103b5`
 - Volk: `47cddf7ed97b94118a08aacb548a411188e016cc`
 - Vulkan-Headers: `6802bb4733b63ed5efd3adb308a6c885ef180ea1`
@@ -38,9 +38,12 @@ At runtime Pyroshine normally searches the loader paths for
 `libpyrowave-shared.so.0` and then `libpyrowave-shared.so`. Administrators and
 developers may set `MOONSHINE_PYROWAVE_LIBRARY` to one explicit library path
 for packaging tests or diagnostics. When set, no fallback path is attempted;
-the library must expose exactly C API 0.7.0.
+the library must expose exactly C API 0.8.0.
 
-Both build paths apply the maintained patches in `nix/patches/`. When updating
+Both build paths apply the maintained patches in `nix/patches/`: the Granite
+scaler's SDR normalization and 1:1 overlay support, in that order. The fork
+carries the same files and its generated `shaders/slangmosh_scaler.hpp` is
+built from them. When updating
 pins, review whether each patch remains needed, keep the script/Nix patch sets
 aligned, and run packet validation plus the explicit C API load test documented
 in [CONTRIBUTING.md](../CONTRIBUTING.md#validation). A library load test does not
@@ -57,7 +60,7 @@ PyroWave-aware wire-v1 extension uses orthogonal chroma and HDR bits:
 | `0x01000000` | PyroWave 4:4:4 |
 | `0x02000000` | PyroWave HDR10 (with either advertised chroma mode) |
 
-The server advertises a chroma bit only after loading API 0.7.0, matching
+The server advertises a chroma bit only after loading API 0.8.0, matching
 PyroWave to the capture-verified Vulkan adapter, confirming external-memory
 interoperability, and creating the corresponding SDR encoder. It advertises the
 shared HDR bit only when every advertised chroma mode also passes its 10-bit
@@ -197,6 +200,11 @@ application -> Pyroshine compositor GBM image -> DMA-BUF fd
             -> imported VkImage in GENERAL layout -> GPU scaler/color transform
             -> GPU wavelet encode -> persistently mapped encoded bitstream
 ```
+
+A visible cursor that can be [late-composited](COMPOSITOR.md#late-cursor-composition)
+travels with the frame as premultiplied texels and is passed to
+`pyrowave_encoder_encode_gpu_scaled_overlay_synchronous`, which uploads it only
+when its generation changes and blends it 1:1 before color conversion.
 
 There is no CPU framebuffer readback or CPU RGB/YUV conversion. Pyroshine must
 copy the compressed bitstream to host memory to send it over UDP. Imported

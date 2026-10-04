@@ -58,6 +58,22 @@ use pixelforge::{
 /// GPU fed plus one slot of slack, bounding useful work to three frames even under network stalls.
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
+/// Declares whether this consumer composites frame overlays (late cursor
+/// composition) and withdraws the declaration on every exit; the next
+/// consumer of the capture channel declares its own.
+struct OverlaySupport<'a>(&'a crate::session::compositor::admission::CaptureReceiver);
+impl<'a> OverlaySupport<'a> {
+	fn declare(rx: &'a crate::session::compositor::admission::CaptureReceiver, supported: bool) -> Self {
+		rx.set_overlay_supported(supported);
+		Self(rx)
+	}
+}
+impl Drop for OverlaySupport<'_> {
+	fn drop(&mut self) {
+		self.0.set_overlay_supported(false);
+	}
+}
+
 fn conventional_can_admit(in_flight: &AtomicUsize) -> bool {
 	in_flight.load(Ordering::Relaxed) < MAX_FRAMES_IN_FLIGHT
 }
@@ -918,6 +934,9 @@ impl VideoPipelineInner {
 			);
 		}
 
+		// PyroWave composites the cursor inside its 1:1 scaler input fetch.
+		let _overlay_support = OverlaySupport::declare(frame_rx, true);
+
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
 		packetizer.set_pyrowave_dialect(ctx.pyrowave_dialect);
 		let mut fec_feedback_rx = self.fec_feedback_rx.clone();
@@ -976,9 +995,10 @@ impl VideoPipelineInner {
 			let _capture_credit = received.as_mut().and_then(|frame| frame.capture_credit.take());
 			let stale_frames_dropped = 0u32;
 			let (encoded, created_at, pacing_origin, buffer_index, channel_wait) = if let Some(frame) = received {
-				if frame.overlay.is_some() {
-					// PyroWave never advertises late composition; this capture
-					// raced an epoch switch. Drop it rather than lose the cursor.
+				if frame.overlay.is_some() && (frame.width != ctx.width || frame.height != ctx.height) {
+					// Overlays are composited only into unscaled input. A capture
+					// that raced an extent change is dropped rather than encoded
+					// without its cursor; the next one is composited by GLES.
 					frame.consumed.store(true, Ordering::Release);
 					continue;
 				}
@@ -1289,15 +1309,7 @@ impl VideoPipelineInner {
 			);
 			None
 		};
-		frame_rx.set_overlay_supported(input_converter.is_some());
-		// Withdraw overlay support on every exit; the next consumer re-declares it.
-		struct OverlaySupport<'a>(&'a crate::session::compositor::admission::CaptureReceiver);
-		impl Drop for OverlaySupport<'_> {
-			fn drop(&mut self) {
-				self.0.set_overlay_supported(false);
-			}
-		}
-		let _overlay_support = OverlaySupport(frame_rx);
+		let _overlay_support = OverlaySupport::declare(frame_rx, input_converter.is_some());
 		let mut convert_window = convert::ConvertWindow::default();
 
 		// Converter per input format, plus the source import whose view it caches.

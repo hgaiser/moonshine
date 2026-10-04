@@ -10,7 +10,7 @@ let
   # Authoritative Pyroshine source. Never replace this with Themaister's
   # upstream repository: the fork carries the color-metadata API used here.
   sourceUrl = "https://github.com/karsyboy/pyrowave";
-  sourceRevision = "e344479d6c0439e346c788a918ad5645713f7573";
+  sourceRevision = "e9b20be1517635975d46cdd076ed0b71f9b0ce8a";
   graniteRevision = "1b2d1801d2910fb09ebcded2f0bb3a3a781103b5";
   volkRevision = "47cddf7ed97b94118a08aacb548a411188e016cc";
   vulkanHeadersRevision = "6802bb4733b63ed5efd3adb308a6c885ef180ea1";
@@ -34,10 +34,11 @@ let
 in
 stdenv.mkDerivation {
   pname = "pyrowave-pyroshine";
-  version = "0.7.0-${builtins.substring 0 8 sourceRevision}";
+  version = "0.8.0-${builtins.substring 0 8 sourceRevision}";
   inherit src;
 
-  patches = [ ./patches/pyrowave-444-payload.patch ./patches/granite-sdr-normalization.patch ];
+  # Granite patches in the fork's order; the fork applies the same files.
+  patches = [ ./patches/granite-sdr-normalization.patch ./patches/granite-scaler-overlay.patch ];
 
   nativeBuildInputs = [
     cmake

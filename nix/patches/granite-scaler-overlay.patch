@@ -1,0 +1,134 @@
+diff --git a/Granite/assets/shaders/util/scaler.comp b/Granite/assets/shaders/util/scaler.comp
+index 7fca0dc..ed5d39f 100644
+--- a/Granite/assets/shaders/util/scaler.comp
++++ b/Granite/assets/shaders/util/scaler.comp
+@@ -12,6 +12,7 @@ const int CONTROL_CLAMP_COORD_BIT = 1 << 3;
+ const int CONTROL_CHROMA_SUBSAMPLE_BIT = 1 << 4;
+ const int CONTROL_PRIMARY_CONVERSION_BIT = 1 << 5;
+ const int CONTROL_DITHER_BIT = 1 << 6;
++const int CONTROL_OVERLAY_BIT = 1 << 7;
+ layout(constant_id = 0) const int CONTROL = 0;
+ 
+ const bool SKIP_RESCALE = (CONTROL & CONTROL_SKIP_RESCALE_BIT) != 0;
+@@ -21,6 +22,7 @@ const bool CLAMP_COORD = (CONTROL & CONTROL_CLAMP_COORD_BIT) != 0;
+ const bool CHROMA_SUBSAMPLE = (CONTROL & CONTROL_CHROMA_SUBSAMPLE_BIT) != 0;
+ const bool PRIMARY_CONVERSION = (CONTROL & CONTROL_PRIMARY_CONVERSION_BIT) != 0;
+ const bool DITHER = (CONTROL & CONTROL_DITHER_BIT) != 0;
++const bool OVERLAY = (CONTROL & CONTROL_OVERLAY_BIT) != 0;
+ 
+ const int TRANSFER_IDENTITY = 0;
+ const int TRANSFER_SRGB = 1;
+@@ -62,6 +64,9 @@ layout(set = 0, binding = 4) uniform UBO
+ 
+ layout(set = 0, binding = 5) writeonly uniform mediump image2D uChromaPlane2;
+ layout(set = 0, binding = 6) writeonly uniform mediump image2D uChromaPlane3;
++// Premultiplied overlay composited 1:1 over the input before any transfer
++// function, as a compositor blends into its output buffer.
++layout(set = 0, binding = 7) uniform mediump texture2D uOverlay;
+ 
+ ivec2 unswizzle8x8(uint index)
+ {
+@@ -85,10 +90,26 @@ layout(push_constant) uniform Registers
+     vec2 crop_bias;
+     vec2 crop_scale;
+     float dither_strength;
++    ivec2 overlay_offset;
++    ivec2 overlay_size;
+ } registers;
+ 
+ #include "../inc/srgb.h"
+ 
++f16vec4 apply_overlay(f16vec4 v, ivec2 input_coord)
++{
++    if (OVERLAY)
++    {
++        ivec2 rel = input_coord - registers.overlay_offset;
++        if (all(greaterThanEqual(rel, ivec2(0))) && all(lessThan(rel, registers.overlay_size)))
++        {
++            f16vec4 o = f16vec4(texelFetch(uOverlay, rel, 0));
++            v.rgb = o.rgb + v.rgb * (float16_t(1.0) - o.a);
++        }
++    }
++    return v;
++}
++
+ f16vec4 apply_eotf(f16vec4 v)
+ {
+     if (EOTF == TRANSFER_SRGB)
+@@ -274,6 +295,8 @@ void main()
+         else
+         {
+             final_result = f16vec4(texelFetch(uTexture, coord + registers.crop_offset, 0));
++            // The host only enables overlays for unsampled 1:1 input.
++            final_result = apply_overlay(final_result, coord + registers.crop_offset);
+         }
+ 
+         final_result = apply_eotf(final_result);
+diff --git a/Granite/video/scaler.cpp b/Granite/video/scaler.cpp
+index 41110be..7406ff9 100644
+--- a/Granite/video/scaler.cpp
++++ b/Granite/video/scaler.cpp
+@@ -66,7 +66,8 @@ enum
+ 	CONTROL_CLAMP_COORD_BIT = 1 << 3,
+ 	CONTROL_CHROMA_SUBSAMPLE_BIT = 1 << 4,
+ 	CONTROL_PRIMARY_CONVERSION_BIT = 1 << 5,
+-	CONTROL_DITHER_BIT = 1 << 6
++	CONTROL_DITHER_BIT = 1 << 6,
++	CONTROL_OVERLAY_BIT = 1 << 7
+ };
+ 
+ enum
+@@ -196,6 +197,9 @@ void VideoScaler::rescale(CommandBuffer &cmd, const RescaleInfo &info)
+ 		vec2 crop_bias;
+ 		vec2 crop_scale;
+ 		float dither_strength;
++		float padding;
++		ivec2 overlay_offset;
++		ivec2 overlay_size;
+ 	};
+ 
+ 	Push push = {};
+@@ -322,6 +326,18 @@ void VideoScaler::rescale(CommandBuffer &cmd, const RescaleInfo &info)
+ 		}
+ 	}
+ 
++	if (info.overlay)
++	{
++		if ((flags & CONTROL_SKIP_RESCALE_BIT) == 0 || (flags & CONTROL_SAMPLED_SCALING_BIT) != 0)
++		{
++			LOGE("Overlays require identity, unsampled scaling.\n");
++			return;
++		}
++		flags |= CONTROL_OVERLAY_BIT;
++		push.overlay_offset = ivec2(info.overlay_offset.x, info.overlay_offset.y);
++		push.overlay_size = ivec2(int(info.overlay->get_view_width()), int(info.overlay->get_view_height()));
++	}
++
+ 	if (oetf == eotf && (flags & CONTROL_SKIP_RESCALE_BIT) != 0)
+ 	{
+ 		eotf = TRANSFER_IDENTITY;
+@@ -402,6 +418,8 @@ void VideoScaler::rescale(CommandBuffer &cmd, const RescaleInfo &info)
+ 		ubo->primary_transform[2] = vec4(sdr_scale * conv[2], 0.0f);
+ 	}
+ 
++	// Never sampled without CONTROL_OVERLAY_BIT, but the binding must be valid.
++	cmd.set_texture(0, 7, info.overlay ? *info.overlay : *info.input);
+ 	cmd.set_unorm_storage_texture(0, 5, *info.output_planes[info.num_output_planes >= 2 ? 1 : 0]);
+ 	cmd.set_unorm_storage_texture(0, 6, *info.output_planes[info.num_output_planes >= 3 ? 2 : 0]);
+ 
+diff --git a/Granite/video/scaler.hpp b/Granite/video/scaler.hpp
+index ddbf279..16b1c88 100644
+--- a/Granite/video/scaler.hpp
++++ b/Granite/video/scaler.hpp
+@@ -47,6 +47,11 @@ public:
+ 
+ 		bool skip_dither;
+ 		bool force_linear_filtering;
++
++		// Optional premultiplied overlay blended 1:1 at overlay_offset (input
++		// texels) before color conversion. Requires identity, unsampled scaling.
++		const Vulkan::ImageView *overlay;
++		VkOffset2D overlay_offset;
+ 	};
+ 
+ 	void set_ycbcr_chroma_midpoint(float midpoint);

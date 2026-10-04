@@ -21,11 +21,11 @@ use super::format::{
 };
 use super::pipeline::dmabuf::{ImportCacheStats, same_open_file};
 use super::pipeline::failure::{EncodeFailure, EncodeStage, Recovery, SourceAccess};
-use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace};
+use crate::session::compositor::frame::{ExportedFrame, FrameColorSpace, OverlayFormat};
 use serde::{Deserialize, Serialize};
 
 pub(crate) const SOURCE_URL: &str = "https://github.com/karsyboy/pyrowave";
-pub(crate) const SOURCE_REVISION: &str = "e344479d6c0439e346c788a918ad5645713f7573";
+pub(crate) const SOURCE_REVISION: &str = "e9b20be1517635975d46cdd076ed0b71f9b0ce8a";
 /// Wire-v1 clients cap a reassembled PyroWave frame at 3 MiB.
 const PYROWAVE_MAX_FRAME_BYTES: usize = 3 * 1024 * 1024;
 const QUALITY_REFERENCE_4K_420_SDR_BYTES: u64 = 400_000;
@@ -54,7 +54,7 @@ pub(crate) fn quality_reference_frame_bytes(
 	}
 	usize::try_from(bytes).unwrap_or(usize::MAX) & !3
 }
-const API_VERSION: (u32, u32, u32) = (0, 7, 0);
+const API_VERSION: (u32, u32, u32) = (0, 8, 0);
 
 type ResultCode = i32;
 const SUCCESS: ResultCode = 0;
@@ -116,6 +116,19 @@ struct ScaledEncodeInfo {
 	force_linear_filtering: bool,
 	skip_dither: bool,
 	crop_rect: *const vk::Rect2D,
+}
+
+/// `pyrowave_overlay` (API 0.8): premultiplied 8-bit texels blended 1:1.
+#[repr(C)]
+struct Overlay {
+	pixels: *const c_void,
+	width: u32,
+	height: u32,
+	stride: u32,
+	format: vk::Format,
+	x: i32,
+	y: i32,
+	generation: u64,
 }
 
 #[repr(C)]
@@ -182,18 +195,21 @@ type ReportPerformance =
 #[derive(Default, Debug)]
 struct GpuTimings {
 	stages: [Option<f64>; 6],
+	/// Device-to-host bitstream/metadata copy; reported by libraries that
+	/// time it and kept out of the exclusive shader-stage sum.
+	readback: Option<f64>,
 }
 impl GpuTimings {
 	fn record(&mut self, message: &str) {
 		let Some((tag, value)) = message.split_once(": ") else {
 			return;
 		};
-		let Some(index) = ["DWT", "Quant", "Analyze", "Resolve", "Packing", "scale"]
+		let index = ["DWT", "Quant", "Analyze", "Resolve", "Packing", "scale"]
 			.iter()
-			.position(|t| *t == tag)
-		else {
+			.position(|t| *t == tag);
+		if index.is_none() && tag != "Readback" {
 			return;
-		};
+		}
 		let Some(ms) = value
 			.strip_suffix(" ms per frame")
 			.and_then(|v| v.parse::<f64>().ok())
@@ -201,7 +217,10 @@ impl GpuTimings {
 		else {
 			return;
 		};
-		self.stages[index] = Some(ms);
+		match index {
+			Some(index) => self.stages[index] = Some(ms),
+			None => self.readback = Some(ms),
+		}
 	}
 	fn total(&self) -> Option<f64> {
 		self.stages.iter().copied().sum()
@@ -238,6 +257,14 @@ type EncodeScaled = unsafe extern "C" fn(
 	*const ScaledEncodeInfo,
 	*const RateControl,
 ) -> ResultCode;
+type EncodeScaledOverlay = unsafe extern "C" fn(
+	EncoderHandle,
+	*const c_void,
+	*const c_void,
+	*const ScaledEncodeInfo,
+	*const Overlay,
+	*const RateControl,
+) -> ResultCode;
 type ComputeNumPackets = unsafe extern "C" fn(EncoderHandle, usize, *mut usize) -> ResultCode;
 type Packetize = unsafe extern "C" fn(EncoderHandle, *mut Packet, usize, *mut usize, *mut c_void, usize) -> ResultCode;
 
@@ -256,6 +283,7 @@ struct Api {
 	destroy_image: DestroyImage,
 	get_image_view: GetImageView,
 	encode_scaled: EncodeScaled,
+	encode_scaled_overlay: EncodeScaledOverlay,
 	compute_num_packets: ComputeNumPackets,
 	packetize: Packetize,
 }
@@ -278,7 +306,7 @@ impl Api {
 					continue;
 				},
 			};
-			// SAFETY: symbol types mirror pyrowave.h at the pinned 0.7.0 revision.
+			// SAFETY: symbol types mirror pyrowave.h at the pinned 0.8.0 revision.
 			unsafe {
 				let version = *library
 					.get::<GetApiVersion>(b"pyrowave_get_api_version\0")
@@ -317,6 +345,10 @@ impl Api {
 					destroy_image: symbol!("pyrowave_image_destroy", DestroyImage),
 					get_image_view: symbol!("pyrowave_image_get_image_view", GetImageView),
 					encode_scaled: symbol!("pyrowave_encoder_encode_gpu_scaled_synchronous", EncodeScaled),
+					encode_scaled_overlay: symbol!(
+						"pyrowave_encoder_encode_gpu_scaled_overlay_synchronous",
+						EncodeScaledOverlay
+					),
 					compute_num_packets: symbol!("pyrowave_encoder_compute_num_packets", ComputeNumPackets),
 					packetize: symbol!("pyrowave_encoder_packetize", Packetize),
 					_library: library,
@@ -875,10 +907,36 @@ impl PyroWaveEncoder {
 		let rate = RateControl {
 			maximum_bitstream_size: self.maximum_frame_bytes,
 		};
+		let overlay = frame.overlay.as_ref().map(|overlay| Overlay {
+			pixels: overlay.image.pixels.as_ptr().cast(),
+			width: overlay.image.width,
+			height: overlay.image.height,
+			stride: overlay.image.width * 4,
+			format: match overlay.image.format {
+				OverlayFormat::Rgba8 => vk::Format::R8G8B8A8_UNORM,
+				OverlayFormat::Bgra8 => vk::Format::B8G8R8A8_UNORM,
+			},
+			x: overlay.x,
+			y: overlay.y,
+			generation: overlay.image.generation,
+		});
 		// SAFETY: all referenced objects remain alive until packetize waits for
 		// this submission below. External DMA-BUF images are documented GENERAL.
+		// Overlay pixels are copied by the library during the call.
 		check_frame(
-			unsafe { (self.device.api.encode_scaled)(self.handle, ptr::null(), ptr::null(), &scaling, &rate) },
+			unsafe {
+				match &overlay {
+					Some(overlay) => (self.device.api.encode_scaled_overlay)(
+						self.handle,
+						ptr::null(),
+						ptr::null(),
+						&scaling,
+						overlay,
+						&rate,
+					),
+					None => (self.device.api.encode_scaled)(self.handle, ptr::null(), ptr::null(), &scaling, &rate),
+				}
+			},
 			EncodeStage::Submit,
 			SourceAccess::NotSubmitted,
 			"submitting the PyroWave GPU encode",
@@ -986,6 +1044,7 @@ impl PyroWaveEncoder {
 		);
 		let s = stats.stages;
 		tracing::info!(dwt_gpu_ms = ?s[0], quant_gpu_ms = ?s[1], analyze_gpu_ms = ?s[2], resolve_gpu_ms = ?s[3], packing_gpu_ms = ?s[4], scaler_conversion_gpu_ms = ?s[5],
+			readback_gpu_ms = ?stats.readback,
 			pyrowave_stage_gpu_ms_per_encoded_frame = ?stats.total(),
             pyrowave_stage_gpu_ms_per_delivered_frame = ?stats.total().filter(|_| delivered_fps > 0.0).map(|ms| ms * encoded_fps / delivered_fps),
             estimated_stage_gpu_ms_per_delivered_second = ?stats.total().map(|ms| ms * encoded_fps),
@@ -1119,7 +1178,7 @@ mod tests {
 		assert_eq!(SOURCE_URL, "https://github.com/karsyboy/pyrowave");
 		assert_eq!(SOURCE_REVISION.len(), 40);
 		assert!(SOURCE_REVISION.chars().all(|c| c.is_ascii_hexdigit()));
-		assert_eq!(API_VERSION, (0, 7, 0));
+		assert_eq!(API_VERSION, (0, 8, 0));
 		let nix_dependency = include_str!("../../../../../nix/pyrowave.nix");
 		assert!(nix_dependency.contains(SOURCE_URL));
 		assert!(nix_dependency.contains(SOURCE_REVISION));
@@ -1208,6 +1267,13 @@ mod tests {
 			timings.record(&format!("{tag}: 0.100 ms per frame"));
 		}
 		assert!((timings.total().unwrap() - 0.6).abs() < 1e-9);
+		assert!(timings.readback.is_none(), "older libraries do not time the readback");
+		timings.record("Readback: 0.250 ms per frame");
+		assert_eq!(timings.readback, Some(0.25));
+		assert!(
+			(timings.total().unwrap() - 0.6).abs() < 1e-9,
+			"readback stays out of the shader-stage sum"
+		);
 	}
 }
 
