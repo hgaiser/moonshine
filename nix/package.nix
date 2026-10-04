@@ -1,6 +1,7 @@
 {
   lib,
   rustPlatform,
+  fetchgit,
   addDriverRunpath,
   cmake,
   pkg-config,
@@ -41,40 +42,42 @@ let
   # keeps full git checkouts so that works everywhere else, but nix vendoring
   # extracts just the crate, so the path escapes the vendor tree and cmake
   # finds no CMakeLists.txt. Graft the full repo into the vendored crate (see
-  # postPatch) and aim build.rs at it. The rev is parsed out of Cargo.lock so
-  # dependency bumps upstream are picked up without touching the nix code.
+  # postPatch) and aim build.rs at it. The rev is parsed out of Cargo.lock, and
+  # the fetch is the one importCargoLock makes for the crate, so they share a
+  # hash and a store path.
   inputtinoLockEntry =
     lib.findFirst (p: p.name == "inputtino-sys")
       (throw "inputtino-sys not found in Cargo.lock; drop the graft in nix/package.nix")
       (lib.importTOML ../Cargo.lock).package;
   # e.g. "git+https://github.com/games-on-whales/inputtino#<rev>"
   inputtinoMatch = builtins.match "git\\+([^?#]+)(\\?[^#]*)?#(.+)" inputtinoLockEntry.source;
-  inputtinoRepo = builtins.fetchGit {
+  inputtinoRepo = fetchgit {
     url = builtins.elemAt inputtinoMatch 0;
     rev = builtins.elemAt inputtinoMatch 2;
-    allRefs = true;
+    sha256 = gitDepHashes."inputtino-sys-${inputtinoLockEntry.version}";
+  };
+
+  # Without a hash a git dependency needs builtins.fetchGit, which runs at eval
+  # time and knows only the rev: its store path cannot be computed up front, so
+  # no substituter or binary cache can serve it and every fresh evaluator (a CI
+  # container) clones the repo again. A stale hash fails the build and prints
+  # the right one.
+  gitDepHashes = {
+    "ash-0.38.0+1.4.329" = "sha256-apzc//AZqS3F4e4Epm3Dl20ZkkMKUvLjyxv7ZwJh1Jw=";
+    "inputtino-sys-0.1.0" = "sha256-xzDsJggQVX5e1twwNvqw5hDXei6OMYA4s5zU4zfp/H0=";
+    "pixelforge-0.9.1" = "sha256-irzJsRwpj6HdaJ5IKx4X86BPdjXr7XJtCsHwL9vnQCQ=";
+    "smithay-0.7.0" = "sha256-fptVzfBHApVohO2yvTxbsXGxKHiJ5Brk84x4YkHtp6k=";
   };
 in
 rustPlatform.buildRustPackage {
   pname = "moonshine";
   inherit version src;
 
-  # No vendor hash to maintain: crates.io checksums come straight from
-  # Cargo.lock, and git dependencies are fetched at eval time by the rev the
-  # lockfile pins (allowBuiltinFetchGit), so the lockfile the maintainers
-  # already keep up to date is the single source of truth.
+  # crates.io checksums come straight from Cargo.lock; only git dependencies
+  # need a hash (gitDepHashes)
   cargoLock = {
     lockFile = ../Cargo.lock;
-    allowBuiltinFetchGit = true;
-    outputHashes = {
-      # Exception: ash's pinned rev sits on an unmerged PR branch, unreachable
-      # from any ref, so the builtin git fetcher (which only fetches refs)
-      # cannot get it and this fixed hash is needed. If the ash pin changes
-      # this fails loudly: a rev bump prints the correct new hash in the
-      # mismatch error, and once the pin moves to a rev on a normal branch or
-      # tag this entry can simply be deleted.
-      "ash-0.38.0+1.4.329" = "sha256-apzc//AZqS3F4e4Epm3Dl20ZkkMKUvLjyxv7ZwJh1Jw=";
-    };
+    outputHashes = gitDepHashes;
   };
 
   # The inputtino graft described above. The cargo setup hook has already
