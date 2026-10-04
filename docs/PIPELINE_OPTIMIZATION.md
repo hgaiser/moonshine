@@ -70,11 +70,31 @@ rendering; the GLES fence wait and encoding consume the same frame budget rather
 than extending it. Completion-based pipeline latency remains measured separately. Failed rendering/completion stops capture rather than publishing
 or recycling a buffer with uncertain GPU ownership.
 
+A visible cursor no longer forces composition for H.264/HEVC/AV1: see
+[late cursor composition](COMPOSITOR.md#late-cursor-composition). Commits are
+latched only once their DMA-BUF finished rendering
+([buffer readiness](COMPOSITOR.md#buffer-readiness)), so direct export never
+hands the encoder a frame still queued behind a game's GPU work.
+
 Do not relax direct eligibility just because PyroWave has a scaler: compositor
 transforms include aspect fitting, offset, borders and sampling filters. Direct
 scaling needs an explicit transform contract and pixel comparisons.
 
 ## Encoding, caches and queue selection
+
+Conventional conversion uses `pipeline/convert.rs`: one compute dispatch writes
+Pixelforge's packed NV12/P010/4:4:4 layout as whole words (4x2 pixels per
+invocation, no atomics or buffer clear), optionally compositing the cursor,
+then one buffer-to-image copy fills the encoder input slot. Its arithmetic
+mirrors Pixelforge's shader; the GPU fixture
+`packed_converter_matches_pixelforge_on_gpu` compares both converters' output
+for every format, color mode and range. It submits to the dedicated compute
+family by default (`conversion_queue`); Pixelforge shares the input image
+concurrently with that family. The conversion still ends with a CPU fence wait
+before `Encoder::encode`, whose API takes no wait semaphore, and releases the
+source only after that wait. Pixelforge's converter is the fallback for widths
+not divisible by four and odd heights. Edit `pipeline/shaders/convert.comp`
+and regenerate the embedded SPIR-V with `scripts/build-shaders.sh`.
 
 Conventional encoding uses Pixelforge's asynchronous pipeline with three owned
 completion credits spanning submission, readback, packetization, queue residence

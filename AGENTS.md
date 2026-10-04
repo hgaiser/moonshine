@@ -44,7 +44,7 @@ Other workspace and integration areas:
   swapchain behavior and routing presentation to the compositor over Wayland.
   Its `protocols/` bindings must agree with compositor-side protocol handling.
 - `moonshine-tools/`: developer tools, including the `moonshine-bench` pipeline benchmark.
-- `scripts/`: pinned PyroWave build helper and changelog tooling/tests.
+- `scripts/`: pinned PyroWave build helper, embedded SPIR-V regeneration (`build-shaders.sh`) and changelog tooling/tests.
 - `dist/`, `nfpm.yaml`, `.github/workflows/release.yaml`: native/portable packaging,
   installers, systemd, Vulkan manifests, device permissions and system policy.
 - `nix/`, `flake.nix`: Nix package, dependency build, development shell and service module.

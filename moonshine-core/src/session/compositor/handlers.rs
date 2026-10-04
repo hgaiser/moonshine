@@ -340,6 +340,59 @@ impl ShmHandler for MoonshineCompositor {
 
 // -- Compositor Handler --
 
+/// Apply a commit only once the GPU has finished writing its new DMA-BUF.
+///
+/// Wayland clients commit right after submitting rendering, before the GPU
+/// executes it. Latching such a buffer immediately makes every consumer wait
+/// on its implicit fence: GLES composition stalls the compositor thread and
+/// direct export stalls the encoder until the frame finishes rendering. A
+/// GPU-bound game keeps one or two frames queued, so the stream ran at a
+/// fraction of the refresh rate. The blocker defers this surface's commit
+/// (and its frame callbacks) until the buffer is readable, so captures always
+/// latch the newest *completed* frame — the behavior of Smithay's Anvil,
+/// Mutter and KWin. `MOONSHINE_DISABLE_READY_LATCH=1` restores immediate
+/// latching for diagnosis.
+fn latch_when_ready(surface: &WlSurface) {
+	use smithay::wayland::compositor::{
+		BufferAssignment, SurfaceAttributes, add_blocker, add_pre_commit_hook, with_states,
+	};
+	static DISABLED: OnceLock<bool> = OnceLock::new();
+	if *DISABLED.get_or_init(|| std::env::var_os("MOONSHINE_DISABLE_READY_LATCH").is_some_and(|v| v == "1")) {
+		return;
+	}
+	add_pre_commit_hook::<MoonshineCompositor, _>(surface, |state, _display, surface| {
+		let dmabuf = with_states(surface, |data| {
+			data.cached_state
+				.get::<SurfaceAttributes>()
+				.pending()
+				.buffer
+				.as_ref()
+				.and_then(|assignment| match assignment {
+					BufferAssignment::NewBuffer(buffer) => smithay::wayland::dmabuf::get_dmabuf(buffer).cloned().ok(),
+					_ => None,
+				})
+		});
+		let Some(dmabuf) = dmabuf else {
+			return;
+		};
+		// An already-signalled buffer yields a source that fires immediately.
+		let Ok((blocker, source)) = dmabuf.generate_blocker(smithay::reexports::calloop::Interest::READ) else {
+			return;
+		};
+		let Some(client) = surface.client() else {
+			return;
+		};
+		let registered = state.handle.insert_source(source, move |_, _, state| {
+			let display = state.display_handle.clone();
+			state.client_compositor_state(&client).blocker_cleared(state, &display);
+			Ok(())
+		});
+		if registered.is_ok() {
+			add_blocker(surface, blocker);
+		}
+	});
+}
+
 impl CompositorHandler for MoonshineCompositor {
 	fn compositor_state(&mut self) -> &mut CompositorState {
 		&mut self.compositor_state
@@ -358,6 +411,10 @@ impl CompositorHandler for MoonshineCompositor {
 			return &state.compositor_state;
 		}
 		unreachable!("Client has neither ClientState nor XWaylandClientData");
+	}
+
+	fn new_surface(&mut self, surface: &WlSurface) {
+		latch_when_ready(surface);
 	}
 
 	fn commit(&mut self, surface: &WlSurface) {
