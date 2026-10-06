@@ -26,7 +26,7 @@ use tokio::net::TcpListener;
 
 use crate::{
 	ShutdownReason,
-	app_scanner::{self, ApplicationScannerConfig},
+	app_scanner::{self, ApplicationScanner, ApplicationScannerConfig},
 	clients::ClientManager,
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys, application::ApplicationConfig,
@@ -87,8 +87,9 @@ pub struct Webserver {
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
 	configured_applications: Vec<ApplicationConfig>,
-	application_scanners: Vec<ApplicationScannerConfig>,
-	/// Configured and scanned applications, refreshed on every app list request.
+	/// Scanners that add dynamically discovered applications.
+	application_scanners: Arc<RwLock<Vec<ApplicationScanner>>>,
+	/// Configured and scanned applications, refreshed when a scanner's source data changed.
 	applications: Arc<RwLock<Vec<ApplicationConfig>>>,
 	unique_id: String,
 	client_manager: ClientManager,
@@ -118,16 +119,19 @@ impl Webserver {
 		session_manager: SessionManager,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
+		let mut application_scanners: Vec<ApplicationScanner> =
+			application_scanners.into_iter().map(ApplicationScanner::new).collect();
+
 		let server = Self {
 			name,
 			rtsp_port,
 			webserver_config,
 			applications: Arc::new(RwLock::new(app_scanner::load_applications(
 				&applications,
-				&application_scanners,
+				&mut application_scanners,
 			))),
 			configured_applications: applications,
-			application_scanners,
+			application_scanners: Arc::new(RwLock::new(application_scanners)),
 			unique_id,
 			client_manager,
 			session_manager,
@@ -444,16 +448,36 @@ impl Webserver {
 	}
 
 	async fn app_list(&self) -> Response<Full<Bytes>> {
-		// Rescan so newly installed games show up without restarting moonshine.
-		let configured_applications = self.configured_applications.clone();
-		let application_scanners = self.application_scanners.clone();
-		match tokio::task::spawn_blocking(move || {
-			app_scanner::load_applications(&configured_applications, &application_scanners)
-		})
-		.await
-		{
-			Ok(applications) => *self.applications.write().unwrap_or_else(PoisonError::into_inner) = applications,
-			Err(e) => tracing::warn!("Failed to rescan applications: {e}"),
+		// Rescan so newly installed games show up without restarting moonshine,
+		// but only when a scanner's source data changed since the last scan.
+		let needs_reload = {
+			let scanners = self.application_scanners.read().unwrap_or_else(PoisonError::into_inner);
+			scanners.iter().any(ApplicationScanner::needs_reload)
+		};
+
+		if needs_reload {
+			let configured_applications = self.configured_applications.clone();
+			let mut scanners = self
+				.application_scanners
+				.read()
+				.unwrap_or_else(PoisonError::into_inner)
+				.clone();
+
+			match tokio::task::spawn_blocking(move || {
+				let applications = app_scanner::load_applications(&configured_applications, &mut scanners);
+				(applications, scanners)
+			})
+			.await
+			{
+				Ok((applications, scanners)) => {
+					*self.applications.write().unwrap_or_else(PoisonError::into_inner) = applications;
+					*self
+						.application_scanners
+						.write()
+						.unwrap_or_else(PoisonError::into_inner) = scanners;
+				},
+				Err(e) => tracing::warn!("Failed to rescan applications: {e}"),
+			}
 		}
 
 		let mut response = "<root status_code=\"200\">".to_string();

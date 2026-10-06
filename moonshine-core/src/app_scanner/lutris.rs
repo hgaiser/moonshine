@@ -1,8 +1,9 @@
-use std::{collections::HashSet, path::PathBuf};
+use std::{collections::HashSet, path::PathBuf, time::SystemTime};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use super::latest_modified;
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +46,14 @@ fn default_pga_db() -> PathBuf {
 fn is_valid_slug(slug: &str) -> bool {
 	slug.chars()
 		.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Modified timestamp of the Lutris database.
+pub(crate) fn source_modified(config: &LutrisApplicationScannerConfig) -> Option<SystemTime> {
+	let binding = config.pga_db.to_string_lossy();
+	let expanded = shellexpand::full(&binding).ok()?;
+
+	latest_modified(&[PathBuf::from(expanded.as_ref())], usize::MAX, |_| true)
 }
 
 pub(crate) fn scan_lutris_applications(config: &LutrisApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
