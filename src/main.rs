@@ -1,4 +1,3 @@
-use moonshine_core::app_scanner;
 use moonshine_core::healthcheck;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -55,7 +54,7 @@ async fn main() -> Result<(), ()> {
 	init_tracing();
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
-	let mut config = Config::load_or_create(&config_path)?;
+	let config = Config::load_or_create(&config_path)?;
 
 	// Standalone healthcheck subcommand — run checks and exit.
 	if let Some(Command::Healthcheck) = args.command {
@@ -67,11 +66,6 @@ async fn main() -> Result<(), ()> {
 	}
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
-
-	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
-	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
-	config.applications.extend(scanned_applications);
-	app_scanner::resolve_missing_boxart(&mut config.applications);
 
 	tracing::debug!("Waiting for D-Bus session bus...");
 	wait_for_dbus().await?;
@@ -236,6 +230,7 @@ impl Moonshine {
 				config.stream.port,
 				config.webserver.clone(),
 				config.applications.clone(),
+				config.application_scanners.clone(),
 				supported_codecs,
 				hdr_supported,
 				client_manager.persistent_state().get_uuid()?.to_string(),

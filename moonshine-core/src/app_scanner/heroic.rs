@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::latest_modified;
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -186,6 +188,25 @@ struct HeroicInstalledGame {
 	is_dlc: bool,
 }
 
+/// Modified timestamp of the most recently changed file the scan reads.
+///
+/// Covers the store library caches, the sideload library, and every store's
+/// installed games manifest.
+pub(crate) fn source_modified(config: &HeroicApplicationScannerConfig) -> Option<SystemTime> {
+	let binding = config.config_dir.to_string_lossy();
+	let Ok(expanded) = shellexpand::full(&binding) else {
+		return None;
+	};
+	let config_dir = PathBuf::from(expanded.as_ref());
+
+	latest_modified(&[config_dir], usize::MAX, |path| {
+		let filename = path.file_name().and_then(|filename| filename.to_str());
+		filename.is_some_and(|filename| {
+			filename.ends_with(LIBRARY_SUFFIX) || filename == "library.json" || filename == "installed.json"
+		})
+	})
+}
+
 pub(crate) fn scan_heroic_applications(config: &HeroicApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
 	let config_dir = &config.config_dir;
 
@@ -359,6 +380,8 @@ fn find_boxart(config_dir: &Path, game: &HeroicGame) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
 	use std::fs;
+	use std::thread::sleep;
+	use std::time::Duration;
 
 	use tempfile::tempdir;
 
@@ -720,5 +743,33 @@ mod tests {
 
 		let applications = scan_heroic_applications(&scanner_config(config_dir)).unwrap();
 		assert!(applications.is_empty());
+	}
+
+	#[test]
+	fn source_modified_tracks_library_changes() {
+		let tempdir = tempdir().unwrap();
+		let config_dir = tempdir.path();
+		let config = scanner_config(config_dir.to_path_buf());
+
+		assert_eq!(source_modified(&config), None);
+
+		write_library(
+			config_dir,
+			"store_cache/legendary_library.json",
+			r#"{"library": [{"app_name": "epic-id", "title": "Epic Game", "runner": "legendary", "is_installed": true}]}"#,
+		);
+		let modified = source_modified(&config).unwrap();
+
+		sleep(Duration::from_millis(10));
+		write_library(
+			config_dir,
+			"store_cache/legendary_library.json",
+			r#"{"library": [{"app_name": "epic-id", "title": "Renamed", "runner": "legendary", "is_installed": true}]}"#,
+		);
+		assert!(source_modified(&config).unwrap() > modified);
+
+		// An installed games manifest counts too.
+		write_library(config_dir, "gog_store/installed.json", r#"{"installed": []}"#);
+		assert!(source_modified(&config).unwrap() > modified);
 	}
 }

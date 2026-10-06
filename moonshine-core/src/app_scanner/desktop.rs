@@ -4,10 +4,12 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use super::latest_modified;
 use crate::session::application::ApplicationConfig;
 
 fn default_true() -> bool {
@@ -105,6 +107,22 @@ pub(crate) fn scan_desktop_applications(
 	}
 
 	Ok(applications)
+}
+
+/// Modified timestamp of the most recently changed `.desktop` file in the
+/// configured directories.
+pub(crate) fn source_modified(config: &DesktopApplicationScannerConfig) -> Option<SystemTime> {
+	let directories: Vec<PathBuf> = config
+		.directories
+		.iter()
+		.filter_map(|directory| expand_path(directory))
+		.collect();
+
+	latest_modified(&directories, usize::MAX, |path| {
+		path.extension()
+			.and_then(|extension| extension.to_str())
+			.is_some_and(|extension| extension.eq_ignore_ascii_case("desktop"))
+	})
 }
 
 fn parse_desktop_application(
@@ -668,6 +686,8 @@ mod tests {
 	#[cfg(unix)]
 	use std::os::unix::fs::PermissionsExt;
 	use std::sync::Mutex;
+	use std::thread::sleep;
+	use std::time::Duration;
 
 	use tempfile::tempdir;
 
@@ -908,5 +928,24 @@ TryExec=moonshine-test
 			Some(value) => unsafe { env::set_var("PATH", value) },
 			None => unsafe { env::remove_var("PATH") },
 		}
+	}
+
+	#[test]
+	fn source_modified_tracks_desktop_file_changes() {
+		let tempdir = tempdir().unwrap();
+		let config = scanner_config(vec![tempdir.path().to_path_buf()]);
+
+		assert_eq!(source_modified(&config), None);
+
+		let desktop_file = tempdir.path().join("app.desktop");
+		write_file(&desktop_file, "[Desktop Entry]\nType=Application\nName=App\nExec=app\n");
+		let modified = source_modified(&config).unwrap();
+
+		sleep(Duration::from_millis(10));
+		write_file(
+			&desktop_file,
+			"[Desktop Entry]\nType=Application\nName=App\nExec=app2\n",
+		);
+		assert!(source_modified(&config).unwrap() > modified);
 	}
 }

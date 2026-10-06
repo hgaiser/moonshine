@@ -1,12 +1,14 @@
 use std::{
 	path::{Path, PathBuf},
 	str::FromStr,
+	time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
 use steamlocate::SteamDir;
 use walkdir::WalkDir;
 
+use super::latest_modified;
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -133,6 +135,35 @@ pub(crate) fn scan_steam_applications(config: &SteamApplicationScannerConfig) ->
 	Ok(applications)
 }
 
+/// Modified timestamp of the most recently changed file the scan reads.
+///
+/// That is the library list (`steamapps/libraryfolders.vdf`) and every game
+/// manifest (`steamapps/appmanifest_*.acf`) in each library. The steamapps
+/// directories are only searched one level deep, so game data and Proton
+/// prefixes are never walked.
+pub(crate) fn source_modified(config: &SteamApplicationScannerConfig) -> Option<SystemTime> {
+	// Expand the library path.
+	let library_str = config.library.to_string_lossy();
+	let Ok(library) = shellexpand::full(&library_str) else {
+		return None;
+	};
+	let Ok(steam_dir) = SteamDir::from_dir(Path::new(&*library)) else {
+		return None;
+	};
+
+	let mut steamapps_directories = vec![steam_dir.path().join("steamapps")];
+	if let Ok(libraries) = steam_dir.libraries() {
+		steamapps_directories.extend(libraries.flatten().map(|library| library.path().join("steamapps")));
+	}
+
+	latest_modified(&steamapps_directories, 1, |path| {
+		let filename = path.file_name().and_then(|filename| filename.to_str());
+		filename.is_some_and(|filename| {
+			filename == "libraryfolders.vdf" || (filename.starts_with("appmanifest_") && filename.ends_with(".acf"))
+		})
+	})
+}
+
 fn search_file(directory: &Path, filename: &str) -> Option<PathBuf> {
 	let binding = directory.to_string_lossy();
 	let directory = match shellexpand::full(&binding) {
@@ -158,4 +189,67 @@ fn search_file(directory: &Path, filename: &str) -> Option<PathBuf> {
 	}
 
 	None
+}
+
+#[cfg(test)]
+mod tests {
+	use std::fs;
+	use std::thread::sleep;
+	use std::time::Duration;
+
+	use tempfile::tempdir;
+
+	use super::*;
+
+	fn scanner_config(library: PathBuf) -> SteamApplicationScannerConfig {
+		SteamApplicationScannerConfig {
+			library,
+			command: vec!["/usr/bin/steam".to_string(), "steam://rungameid/{game_id}".to_string()],
+			pre_command: vec![],
+			post_command: vec![],
+			stdout: None,
+			stderr: None,
+			launch_timeout_secs: 2,
+		}
+	}
+
+	fn write_library_folders(steam_dir: &Path) {
+		let steamapps = steam_dir.join("steamapps");
+		fs::create_dir_all(&steamapps).unwrap();
+		fs::write(
+			steamapps.join("libraryfolders.vdf"),
+			format!(
+				"\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n",
+				steam_dir.display()
+			),
+		)
+		.unwrap();
+	}
+
+	#[test]
+	fn source_modified_tracks_manifest_changes() {
+		let tempdir = tempdir().unwrap();
+		let steam_dir = tempdir.path().join("Steam");
+		write_library_folders(&steam_dir);
+
+		let config = scanner_config(steam_dir.clone());
+
+		// With only the library list present, that file decides the timestamp.
+		let modified = source_modified(&config).unwrap();
+
+		fs::write(steam_dir.join("steamapps").join("appmanifest_400.acf"), "manifest").unwrap();
+		assert!(source_modified(&config).unwrap() > modified);
+
+		sleep(Duration::from_millis(10));
+		fs::write(steam_dir.join("steamapps").join("appmanifest_400.acf"), "changed").unwrap();
+		assert!(source_modified(&config).unwrap() > modified);
+	}
+
+	#[test]
+	fn source_modified_is_none_without_a_steam_directory() {
+		let tempdir = tempdir().unwrap();
+		let config = scanner_config(tempdir.path().join("missing"));
+
+		assert_eq!(source_modified(&config), None);
+	}
 }
