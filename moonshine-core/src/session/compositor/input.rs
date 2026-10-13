@@ -725,7 +725,11 @@ fn normalized_pointer_location(state: &MoonshineCompositor, x: f32, y: f32) -> P
 		.unwrap_or((state.width as i32, state.height as i32).into());
 	let max_x = output_size.w.saturating_sub(1).max(0) as f64;
 	let max_y = output_size.h.saturating_sub(1).max(0) as f64;
-	Point::from((x.clamp(0.0, 1.0) as f64 * max_x, y.clamp(0.0, 1.0) as f64 * max_y))
+	// Input is in output coordinates; the scene may be scaled.
+	state.output_to_scene(Point::from((
+		x.clamp(0.0, 1.0) as f64 * max_x,
+		y.clamp(0.0, 1.0) as f64 * max_y,
+	)))
 }
 
 /// Clamp the cursor position to the output bounds, expanded to include
@@ -741,11 +745,13 @@ fn clamp_cursor(state: &mut MoonshineCompositor) {
 		.map(|m| m.size)
 		.unwrap_or((state.width as i32, state.height as i32).into());
 
-	// Start with output bounds.
-	let mut min_x: f64 = 0.0;
-	let mut min_y: f64 = 0.0;
-	let mut max_x: f64 = (output_size.w - 1) as f64;
-	let mut max_y: f64 = (output_size.h - 1) as f64;
+	// Start with output bounds, mapped into the (possibly scaled) scene.
+	let top_left = state.output_to_scene(Point::from((0.0, 0.0)));
+	let bottom_right = state.output_to_scene(Point::from(((output_size.w - 1) as f64, (output_size.h - 1) as f64)));
+	let mut min_x = top_left.x;
+	let mut min_y = top_left.y;
+	let mut max_x = bottom_right.x;
+	let mut max_y = bottom_right.y;
 
 	// Expand bounds to include the override window's geometry if active.
 	// This allows the cursor to move within the dropdown area.

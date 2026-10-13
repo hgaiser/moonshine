@@ -63,6 +63,15 @@ impl OutputScale {
 		(self.scale_x - 1.0).abs() < f64::EPSILON && (self.scale_y - 1.0).abs() < f64::EPSILON
 	}
 
+	/// Map a point in output pixels back to scene coordinates, where `origin`
+	/// is the scene position of the scaled window.
+	pub fn to_scene(self, point: (f64, f64), origin: (f64, f64)) -> (f64, f64) {
+		(
+			(point.0 - self.offset_x) / self.scale_x + origin.0,
+			(point.1 - self.offset_y) / self.scale_y + origin.1,
+		)
+	}
+
 	/// Compute the scale for a `source` window size within `output`, centering
 	/// the scaled result.
 	pub fn for_source(
@@ -221,5 +230,22 @@ mod tests {
 	fn zero_source_is_identity() {
 		let scale = OutputScale::for_source(UpscaleScaler::Fit, 1920.0, 1200.0, 0.0, 0.0, f64::MAX, 1.0);
 		assert!(scale.is_identity());
+	}
+
+	#[test]
+	fn to_scene_inverts_fit_scaling() {
+		// 2560x1440 scene fitted to a 3840x2160 output.
+		let scale = OutputScale::for_source(UpscaleScaler::Auto, 3840.0, 2160.0, 2560.0, 1440.0, f64::MAX, 1.0);
+		assert_eq!(scale.to_scene((0.0, 0.0), (0.0, 0.0)), (0.0, 0.0));
+		assert_eq!(scale.to_scene((3840.0, 2160.0), (0.0, 0.0)), (2560.0, 1440.0));
+		assert_eq!(scale.to_scene((1920.0, 1080.0), (0.0, 0.0)), (1280.0, 720.0));
+	}
+
+	#[test]
+	fn to_scene_applies_letterbox_offset_and_origin() {
+		// 1280x600 window at (10, 20) on a 1920x1200 output: 150px bars top and bottom.
+		let scale = OutputScale::for_source(UpscaleScaler::Fit, 1920.0, 1200.0, 1280.0, 600.0, f64::MAX, 1.0);
+		assert_eq!(scale.to_scene((0.0, 150.0), (10.0, 20.0)), (10.0, 20.0));
+		assert_eq!(scale.to_scene((1920.0, 1050.0), (10.0, 20.0)), (1290.0, 620.0));
 	}
 }

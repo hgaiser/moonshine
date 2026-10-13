@@ -11,6 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Support nested desktop compositors: advertise `wp_single_pixel_buffer` (required by KDE Plasma's kwin) and `xdg-decoration` with server-side decorations, so nested compositors such as COSMIC draw no title bar that offsets the output and cursor.
 
+### Fixed
+
+- Use a surface's displayed (viewport) size as the output scaling source instead of its buffer size.
+- Map touch and pen input and the cursor bounds through the output scaling, like absolute mouse input.
+
 ## [v0.16.1] - 13-09-2026
 
 ### Added

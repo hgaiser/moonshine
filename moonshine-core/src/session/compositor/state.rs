@@ -826,7 +826,7 @@ impl MoonshineCompositor {
 		let out = self.output_rect();
 		let geo = window.geometry();
 
-		// The scaling source is the committed buffer size when available rather
+		// The scaling source is the displayed content size when available rather
 		// than the window geometry: a window can present a swapchain larger than
 		// itself (e.g. borderless fullscreen at another resolution).
 		let (mut source_w, mut source_h) = self.window_source_size(window).unwrap_or((geo.size.w, geo.size.h));
@@ -885,10 +885,9 @@ impl MoonshineCompositor {
 		let Some((scale, origin)) = self.compute_output_scale() else {
 			return point;
 		};
-		smithay::utils::Point::from((
-			(point.x - scale.offset_x) / scale.scale_x + origin.x as f64,
-			(point.y - scale.offset_y) / scale.scale_y + origin.y as f64,
-		))
+		scale
+			.to_scene((point.x, point.y), (origin.x as f64, origin.y as f64))
+			.into()
 	}
 
 	/// Scene-space per output-pixel ratio for relative input, inverting the
@@ -900,25 +899,27 @@ impl MoonshineCompositor {
 		}
 	}
 
-	/// Committed buffer size of the window's content, if any.
+	/// Displayed size of the window's content, if any.
 	///
 	/// A window whose content is overridden by the WSI presents the override
-	/// surface, so its buffer is the override's.
+	/// surface, so its size is the override's.
 	fn window_source_size(&self, window: &smithay::desktop::Window) -> Option<(i32, i32)> {
 		if let Some(x11_id) = window.x11_surface().map(|x| x.window_id())
 			&& let Some((surface, render_window)) = self.override_surface.as_ref()
 			&& *render_window == x11_id
 			&& surface.alive()
-			&& let Some(size) = Self::surface_buffer_size(surface)
+			&& let Some(size) = Self::surface_display_size(surface)
 		{
 			return Some(size);
 		}
-		window.wl_surface().as_deref().and_then(Self::surface_buffer_size)
+		window.wl_surface().as_deref().and_then(Self::surface_display_size)
 	}
 
-	/// The committed buffer size of a `wl_surface`, in buffer pixels.
-	fn surface_buffer_size(surface: &WlSurface) -> Option<(i32, i32)> {
-		with_renderer_surface_state(surface, |st| st.buffer_size().map(|s| (s.w, s.h))).flatten()
+	/// The logical size a `wl_surface` is displayed at: its viewport
+	/// destination if set (a scaled client renders a larger buffer into a
+	/// smaller surface), otherwise its committed buffer size.
+	fn surface_display_size(surface: &WlSurface) -> Option<(i32, i32)> {
+		with_renderer_surface_state(surface, |st| st.surface_size().map(|s| (s.w, s.h))).flatten()
 	}
 
 	/// Raise/lower the Steam overlay above/below the game when `STEAM_OVERLAY`
