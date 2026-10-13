@@ -15,6 +15,7 @@ use smithay::input::pointer::{CursorImageStatus, MotionEvent, PointerHandle};
 use smithay::input::tablet::TabletSeatHandler;
 use smithay::input::{Seat, SeatHandler, SeatState};
 use smithay::output::Output;
+use smithay::reexports::wayland_protocols::xdg::decoration::zv1::server::zxdg_toplevel_decoration_v1::Mode as DecorationMode;
 use smithay::reexports::wayland_protocols::xdg::shell::server::xdg_toplevel::State as XdgToplevelState;
 use smithay::reexports::wayland_server::Resource;
 use smithay::reexports::wayland_server::protocol::wl_buffer;
@@ -29,6 +30,7 @@ use smithay::wayland::output::OutputHandler;
 use smithay::wayland::pointer_constraints::{ConstraintRemove, PointerConstraintsHandler, with_pointer_constraint};
 use smithay::wayland::selection::SelectionHandler;
 use smithay::wayland::selection::data_device::{DataDeviceHandler, DataDeviceState, WaylandDndGrabHandler};
+use smithay::wayland::shell::xdg::decoration::XdgDecorationHandler;
 use smithay::wayland::shell::xdg::{PopupSurface, PositionerState, ToplevelSurface, XdgShellHandler, XdgShellState};
 use smithay::wayland::shm::{ShmHandler, ShmState};
 use smithay::wayland::xdg_activation::{
@@ -1943,6 +1945,32 @@ impl XdgShellHandler for MoonshineCompositor {
 }
 
 // -- Seat Handler --
+
+/// Always request server-side decorations. Moonshine draws none, so the
+/// client renders without a frame and fills the output (a nested desktop's
+/// title bar would otherwise offset its content and the pointer).
+fn force_server_side_decorations(toplevel: &ToplevelSurface) {
+	toplevel.with_pending_state(|state| {
+		state.decoration_mode = Some(DecorationMode::ServerSide);
+	});
+	if toplevel.is_initial_configure_sent() {
+		toplevel.send_pending_configure();
+	}
+}
+
+impl XdgDecorationHandler for MoonshineCompositor {
+	fn new_decoration(&mut self, toplevel: ToplevelSurface) {
+		force_server_side_decorations(&toplevel);
+	}
+
+	fn request_mode(&mut self, toplevel: ToplevelSurface, _mode: DecorationMode) {
+		force_server_side_decorations(&toplevel);
+	}
+
+	fn unset_mode(&mut self, toplevel: ToplevelSurface) {
+		force_server_side_decorations(&toplevel);
+	}
+}
 
 impl SeatHandler for MoonshineCompositor {
 	type KeyboardFocus = KeyboardFocusTarget;

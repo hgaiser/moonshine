@@ -514,6 +514,10 @@ impl MoonshineCompositor {
 		TabletManagerState::new::<Self>(&display_handle);
 		let viewporter_state = smithay::wayland::viewporter::ViewporterState::new::<Self>(&display_handle);
 		smithay::wayland::presentation::PresentationState::new::<Self>(&display_handle, 1);
+		// Required by nested compositors such as kwin's Wayland backend.
+		smithay::wayland::single_pixel_buffer::SinglePixelBufferState::new::<Self>(&display_handle);
+		// Lets nested compositors and toolkits skip client-side title bars.
+		smithay::wayland::shell::xdg::decoration::XdgDecorationState::new::<Self>(&display_handle);
 		let clock = Clock::new();
 
 		let mut xkb_config = XkbConfig::default();
