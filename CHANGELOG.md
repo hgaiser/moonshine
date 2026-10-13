@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - Support nested desktop compositors: advertise `wp_single_pixel_buffer` (required by KDE Plasma's kwin) and `xdg-decoration` with server-side decorations, so nested compositors such as COSMIC draw no title bar that offsets the output and cursor.
+- Add a per-application `steam_mode` option overriding `compositor.steam_mode`, so non-Steam applications such as a nested desktop get focus and keyboard input.
 
 ### Fixed
 

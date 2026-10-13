@@ -47,6 +47,12 @@ pub struct ApplicationConfig {
 	/// Seconds to wait for the application to reach an active state after launch.
 	#[serde(default = "default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Overrides `compositor.steam_mode` for this application. Disable it for
+	/// applications that are not Steam or a Steam game, such as a nested
+	/// desktop, which Steam's window filtering would otherwise never focus.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub steam_mode: Option<bool>,
 }
 
 impl Default for ApplicationConfig {
@@ -60,6 +66,7 @@ impl Default for ApplicationConfig {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: default_launch_timeout(),
+			steam_mode: None,
 		}
 	}
 }
@@ -830,5 +837,14 @@ mod tests {
 			split_standard_io(&Some("fd:stdout".to_string())),
 			("fd".to_string(), Some(("FileDescriptorName", "stdout".to_string())))
 		);
+	}
+
+	#[test]
+	fn test_steam_mode_is_optional() {
+		let unset: super::ApplicationConfig = toml::from_str("title = \"Game\"\ncommand = [\"game\"]").unwrap();
+		assert_eq!(unset.steam_mode, None);
+		let off: super::ApplicationConfig =
+			toml::from_str("title = \"Desktop\"\ncommand = [\"d\"]\nsteam_mode = false").unwrap();
+		assert_eq!(off.steam_mode, Some(false));
 	}
 }

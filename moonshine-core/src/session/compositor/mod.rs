@@ -122,6 +122,8 @@ pub(crate) struct CompositorContext {
 	pub height: u32,
 	pub refresh_rate: u32,
 	pub hdr: bool,
+	/// Per-application override of `steam_mode`.
+	pub steam_mode: Option<bool>,
 }
 
 /// Information sent from the compositor thread once XWayland is ready.
@@ -163,6 +165,7 @@ impl From<&SessionContext> for CompositorContext {
 			height: ctx.resolution.1,
 			refresh_rate: ctx.refresh_rate,
 			hdr: ctx.hdr,
+			steam_mode: ctx.application.steam_mode,
 		}
 	}
 }
@@ -413,7 +416,7 @@ fn run_compositor(
 		ready_tx,
 		&render_node,
 		hdr,
-		config.steam_mode,
+		context.steam_mode.unwrap_or(config.steam_mode),
 		config.virtual_connector_strategy,
 		config.keyboard.clone(),
 	);

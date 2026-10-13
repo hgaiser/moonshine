@@ -161,11 +161,14 @@ Add the desktop environment as a regular application. For example, to stream a f
 [[application]]
 title = "COSMIC Desktop"
 command = ["/usr/bin/start-cosmic"]
+steam_mode = false
 ```
 
 ### Details
 
 Launching a desktop environment as an application turns the stream into a full remote desktop: the compositor boots inside Moonshine's headless compositor, and you use the desktop's own keybindings to launch programs. Other compositors work the same way, e.g. `["/usr/bin/sway"]`.
+
+`steam_mode = false` lets the desktop get focus and keyboard input: with Steam mode on (the default), only Steam and Steam game windows can.
 
 ## Debug a failing application
 
