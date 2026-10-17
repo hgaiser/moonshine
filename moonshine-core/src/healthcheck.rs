@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use pixelforge::{Codec, VideoContext, VideoContextBuilder};
 
 use crate::config::Config;
+use crate::session::stream::video::KcmpProbe;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckOutcome {
@@ -850,59 +851,50 @@ fn check_inhibit(report: &mut HealthReport) {
 }
 
 fn check_kcmp(report: &mut HealthReport) {
+	/// Explains the fallback when `kcmp(2)` is unavailable.
+	const FALLBACK: &str = "  The DMA-BUF import cache compares inode numbers instead (needs Linux 5.3 or later).";
+
 	let start = Instant::now();
+	let probe = KcmpProbe::get();
+	let duration_ms = u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX);
 
-	/// `KCMP_FILE` — not exposed by `libc` or glibc.
-	const KCMP_FILE: libc::c_int = 0;
-
-	// SAFETY: uses /dev/null fds; syscall with scalar arguments.
-	let result = unsafe {
-		let a = std::fs::File::open("/dev/null");
-		let b = std::fs::File::open("/dev/null");
-		match (a, b) {
-			(Ok(a), Ok(b)) => libc::syscall(
-				libc::SYS_kcmp,
-				libc::getpid(),
-				libc::getpid(),
-				KCMP_FILE,
-				a.as_raw_fd() as libc::c_ulong,
-				b.as_raw_fd() as libc::c_ulong,
-			),
-			(Err(e), _) | (_, Err(e)) => {
-				report.add_failed(
-					"kcmp(2)",
-					format!("  Cannot open /dev/null for kcmp(2) probe: {e}"),
-					start.elapsed().as_millis() as u64,
-				);
-				return;
-			},
-		}
+	let error = match probe {
+		KcmpProbe::Available => {
+			report.add_passed("kcmp(2)", "Available".into(), duration_ms);
+			return;
+		},
+		KcmpProbe::NoProbeFile(e) => {
+			report.add_failed(
+				"kcmp(2)",
+				format!("  Cannot open /dev/null for kcmp(2) probe: {e}"),
+				duration_ms,
+			);
+			return;
+		},
+		KcmpProbe::Unavailable(error) => error,
 	};
 
-	if result < 0 {
-		let error = std::io::Error::last_os_error();
-		let hint = match error.raw_os_error() {
-			Some(libc::ENOSYS) => {
-				"  Kernel was compiled without CONFIG_CHECKPOINT_RESTORE.\n  \
-				kcmp(2) is required for DMA-BUF import cache validation.\n  \
-				Rebuild your kernel with CONFIG_CHECKPOINT_RESTORE=y."
-			},
-			Some(libc::EPERM) => {
-				"  kcmp(2) is blocked by a seccomp filter (e.g. Flatpak/container).\n  \
-				kcmp(2) is required for DMA-BUF import cache validation.\n  \
-				Run outside the sandbox or adjust the seccomp profile."
-			},
-			_ => "  kcmp(2) is required for DMA-BUF import cache validation.",
-		};
-		report.add_failed(
+	match error.raw_os_error() {
+		Some(libc::ENOSYS) => report.add_warn(
 			"kcmp(2)",
-			format!("  kcmp(2) not available: {error}\n{hint}"),
-			start.elapsed().as_millis() as u64,
-		);
-		return;
+			format!(
+				"  kcmp(2) not available: {error}\n  Kernel was compiled without CONFIG_CHECKPOINT_RESTORE.\n{FALLBACK}"
+			),
+			duration_ms,
+		),
+		Some(libc::EPERM) => report.add_warn(
+			"kcmp(2)",
+			format!(
+				"  kcmp(2) not available: {error}\n  kcmp(2) is blocked by a seccomp filter (e.g. Flatpak/container).\n{FALLBACK}"
+			),
+			duration_ms,
+		),
+		_ => report.add_failed(
+			"kcmp(2)",
+			format!("  kcmp(2) not available: {error}\n  kcmp(2) is required for DMA-BUF import cache validation."),
+			duration_ms,
+		),
 	}
-
-	report.add_passed("kcmp(2)", "Available".into(), start.elapsed().as_millis() as u64);
 }
 
 // ---------------------------------------------------------------------------
