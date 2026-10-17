@@ -29,6 +29,7 @@ use crate::session::stream::video::{
 	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
 };
 
+pub(crate) use dmabuf::KcmpProbe;
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
