@@ -1,5 +1,6 @@
 {
   lib,
+  stdenv,
   rustPlatform,
   addDriverRunpath,
   cmake,
@@ -29,7 +30,6 @@ let
       ../src
       ../moonshine-core
       ../moonshine-tools
-      ../moonshine-wsi
       ../assets
       ../dist
     ];
@@ -53,6 +53,67 @@ let
     url = builtins.elemAt inputtinoMatch 0;
     rev = builtins.elemAt inputtinoMatch 2;
     allRefs = true;
+  };
+
+  # ferriscope's Vulkan WSI layer routes a game's swapchain frames straight
+  # into the compositor (bypassing Xwayland) and carries HDR and pacing. It
+  # lives in the ferriscope repository next to ferriscope-core, but only
+  # ferriscope-core is a dependency, so the vendored sources above do not
+  # contain it. Build it from the same ferriscope revision Cargo.lock pins, so
+  # the layer always matches the compositor linked into moonshine.
+  ferriscopeLockEntry =
+    lib.findFirst (p: p.name == "ferriscope-core")
+      (throw "ferriscope-core not found in Cargo.lock")
+      (lib.importTOML ../Cargo.lock).package;
+  # e.g. "git+https://github.com/hgaiser/ferriscope?rev=<rev>#<rev>"
+  ferriscopeMatch = builtins.match "git\\+([^?#]+)(\\?[^#]*)?#(.+)" ferriscopeLockEntry.source;
+  ferriscopeRepo = builtins.fetchGit {
+    url = builtins.elemAt ferriscopeMatch 0;
+    rev = builtins.elemAt ferriscopeMatch 2;
+    allRefs = true;
+  };
+
+  # The architecture name the layer's manifest carries (ferriscope's
+  # tools/install-wsi.sh fills in the same @ARCH@).
+  wsiArch = stdenv.hostPlatform.uname.processor;
+
+  ferriscope-wsi = rustPlatform.buildRustPackage {
+    pname = "ferriscope-wsi";
+    inherit (ferriscopeLockEntry) version;
+    src = ferriscopeRepo;
+
+    # ferriscope's own lockfile; its git dependencies are fetched by the rev it
+    # pins, as for moonshine's.
+    cargoLock = {
+      lockFile = "${ferriscopeRepo}/Cargo.lock";
+      allowBuiltinFetchGit = true;
+    };
+
+    # Only the layer: the compositor itself is already part of moonshine.
+    cargoBuildFlags = [
+      "-p"
+      "ferriscope-wsi"
+    ];
+
+    # The layer's tests need a GPU and a compositor.
+    doCheck = false;
+
+    # cargoInstallHook has placed the cdylib in $out/lib; fail loudly if it is
+    # missing. The implicit-layer manifest names the library by its store path.
+    postInstall = ''
+      test -f $out/lib/libferriscope_wsi.so
+      install -d $out/share/vulkan/implicit_layer.d
+      sed -e "s|@ARCH@|${wsiArch}|g" \
+        -e "s|@LIBRARY_PATH@|$out/lib/libferriscope_wsi.so|g" \
+        tools/wsi/VkLayer_FERRISCOPE_wsi.json.in \
+        > $out/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.${wsiArch}.json
+    '';
+
+    meta = {
+      description = "ferriscope's Vulkan WSI layer";
+      homepage = "https://github.com/hgaiser/ferriscope";
+      license = lib.licenses.bsd2;
+    };
   };
 in
 rustPlatform.buildRustPackage {
@@ -91,9 +152,7 @@ rustPlatform.buildRustPackage {
       --replace-fail 'println!("cargo:rustc-link-lib=c++");' ""
   '';
 
-  # A bare `cargo build` only builds the root package; the workspace also
-  # produces libmoonshine_wsi.so, the Vulkan implicit layer that routes a
-  # game's swapchain frames into moonshine's headless compositor.
+  # A bare `cargo build` only builds the root package.
   cargoBuildFlags = [ "--workspace" ];
 
   nativeBuildInputs = [
@@ -123,17 +182,11 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   postInstall = ''
-    # cargoInstallHook has placed the moonshine binary in $out/bin and the
-    # moonshine-wsi cdylib in $out/lib; fail loudly if the layer is missing
-    # (e.g. --workspace stopped covering it).
-    test -f $out/lib/libmoonshine_wsi.so
-
-    # Vulkan implicit-layer manifest, pointed at the store path.
-    install -Dm644 dist/VkLayer_moonshine_wsi.json \
-      $out/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
-    substituteInPlace $out/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json \
-      --replace-fail /usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so \
-      $out/lib/libmoonshine_wsi.so
+    # ferriscope's Vulkan implicit-layer manifest. It names the layer library
+    # by its ferriscope-wsi store path, which keeps that path alive, so the
+    # manifest is all moonshine needs to carry.
+    install -Dm644 -t $out/share/vulkan/implicit_layer.d \
+      ${ferriscope-wsi}/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.${wsiArch}.json
 
     # Input-group access + active-seat ACLs for /dev/uinput and /dev/uhid,
     # picked up by services.udev.packages.
@@ -161,6 +214,10 @@ rustPlatform.buildRustPackage {
     } $out/bin/moonshine
     addDriverRunpath $out/bin/moonshine
   '';
+
+  passthru = {
+    inherit ferriscope-wsi;
+  };
 
   meta = {
     description = "Streaming server for Moonlight clients, written in Rust";

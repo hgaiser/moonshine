@@ -14,7 +14,7 @@ use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::{
 	frame::{HdrMetadata, HdrModeState},
-	input::CompositorInputEvent,
+	input::CompositorInput,
 };
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::audio::AudioStartHandle;
@@ -288,10 +288,10 @@ impl ControlStream {
 	pub fn new(
 		config: ControlStreamConfig,
 		address: String,
-		input_tx: calloop::channel::Sender<CompositorInputEvent>,
+		compositor_input: CompositorInput,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		let input_handler = InputHandler::new(input_tx, stop_session_manager.clone(), config.gamepad.clone())?;
+		let input_handler = InputHandler::new(compositor_input, stop_session_manager.clone(), config.gamepad.clone())?;
 
 		let socket_address = SocketAddr::new(
 			address

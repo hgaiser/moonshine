@@ -20,20 +20,21 @@ contents:
     dst: /usr/bin/moonshine
   - src: ./dist/start-moonshine.sh
     dst: /usr/bin/start-moonshine.sh
-  - src: ./target/release/libmoonshine_wsi.so
-    dst: /usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so
   - src: ./dist/60-moonshine.rules
     dst: /usr/lib/udev/rules.d/60-moonshine.rules
   - src: ./dist/moonshine-modules.conf
     dst: /usr/lib/modules-load.d/moonshine.conf
   - src: ./dist/moonshine@.service
     dst: /usr/lib/systemd/system/moonshine@.service
-  - src: ./dist/VkLayer_moonshine_wsi.json
-    dst: /usr/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
   - src: ./dist/50-moonshine-inhibit-sleep.rules
     dst: /usr/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
   - src: ./dist/moonshine-sysusers.conf
     dst: /usr/lib/sysusers.d/moonshine.conf
+  # ferriscope's WSI layer, staged by dist/install-wsi.sh.
+  - src: ./target/wsi-stage/usr/lib/ferriscope/libferriscope_wsi.so
+    dst: /usr/lib/ferriscope/libferriscope_wsi.so
+  - src: ./target/wsi-stage/usr/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json
+    dst: /usr/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json
   # License locations differ per distro.
   - src: ./LICENSE
     dst: /usr/share/licenses/moonshine/LICENSE
