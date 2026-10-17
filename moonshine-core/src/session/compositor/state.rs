@@ -1968,7 +1968,11 @@ impl MoonshineCompositor {
 			"Spawning XWayland"
 		);
 
-		let (xwayland, client) = match XWayland::spawn(
+		// Plain `spawn` clears the environment, which drops the variables that
+		// let Xwayland find a GPU driver installed outside the default paths.
+		// Without them it falls back to software rendering and has no
+		// hardware GLX.
+		let (xwayland, client) = match XWayland::spawn_with_inherited_env(
 			&self.display_handle,
 			None,
 			std::env::var("MOONSHINE_WAYLAND_DEBUG")
