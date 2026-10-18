@@ -118,6 +118,7 @@ The following dependencies are required to build and run:
 sudo pacman -S --asdeps \
    clang \
    cmake \
+   jq \
    libc++ \
    rust
 
@@ -129,7 +130,8 @@ sudo pacman -S \
    libxkbcommon \
    mesa \
    opus \
-   wayland
+   wayland \
+   xorg-xwayland
 ```
 
 Then build:
@@ -149,9 +151,8 @@ sudo modprobe uinput uhid
 sudo install -Dm644 dist/60-moonshine.rules /usr/lib/udev/rules.d/60-moonshine.rules
 sudo udevadm control --reload-rules
 
-# Install the Vulkan WSI layer for game rendering
-sudo install -Dm755 target/release/libmoonshine_wsi.so /usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so
-sudo install -Dm644 dist/VkLayer_moonshine_wsi.json /usr/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
+# Install ferriscope's Vulkan WSI layer for game rendering
+dist/install-wsi.sh   # builds as you, asks for sudo only to install
 ```
 
 Then run:
@@ -185,12 +186,14 @@ Each application runs in its own isolated streaming session. Add them to `config
 title = "Steam"
 boxart = "/path/to/steam.png"  # optional
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
+steam_integration = true
 ```
 
 - `title`: The name shown in Moonlight.
 - `boxart` (optional): Path to a cover image.
 - `command`: The command to run. First entry is the executable, the rest are arguments.
 - `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. Runs synchronously — the session waits for all to finish.
+- `steam_integration` (optional): Steam integration, as gamescope's `-e`; off by default. Turn it on for Steam (Big Picture), so its overlay and focus work. With it on, only Steam and Steam game windows can take focus, so leave it off for anything launched directly. Games from the Steam application scanner have it on.
 - `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. Runs synchronously — the server waits for all to finish.
 
 Example:
@@ -199,6 +202,7 @@ Example:
 [[application]]
 title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
+steam_integration = true
 pre_command = [
     ["/usr/bin/systemctl", "stop", "conflicting.service"],
 ]

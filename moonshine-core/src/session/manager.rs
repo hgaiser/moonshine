@@ -483,6 +483,14 @@ fn spawn_session_watchdog(inner: &Arc<Mutex<SessionManagerInner>>, guard: &mut S
 	let inner = inner.clone();
 	let stop = guard.stop.clone();
 	let shutdown = guard.shutdown.clone();
+	// Hold the application's shutdown open until the session has fully stopped:
+	// the process exits once it completes, and exiting while the session's
+	// threads are still tearing down (the encoder's Vulkan device, the
+	// compositor's GL renderer) crashes in NVIDIA's exit handlers.
+	let delay = shutdown
+		.delay_shutdown_token()
+		.inspect_err(|e| tracing::warn!("Failed to delay shutdown for the session: {e:?}"))
+		.ok();
 	let handle = tokio::spawn(async move {
 		tokio::select! {
 			reason = stop.wait_shutdown_triggered() => {
@@ -499,12 +507,24 @@ fn spawn_session_watchdog(inner: &Arc<Mutex<SessionManagerInner>>, guard: &mut S
 		}
 
 		// First drop the session so that the application exits as soon as possible.
+		// `reset_session` aborts the watchdog's handle, and this task is the
+		// watchdog: detach the handle first, or the abort would cancel the wait
+		// below.
 		{
-			inner.lock().await.reset_session();
+			let mut guard = inner.lock().await;
+			drop(guard.stop_watcher.take());
+			guard.reset_session();
 		}
 
 		// Then wait for the session to shut down.
-		stop.wait_shutdown_complete().await;
+		let timeout = std::time::Duration::from_secs(SESSION_SHUTDOWN_TIMEOUT_SECS);
+		if tokio::time::timeout(timeout, stop.wait_shutdown_complete())
+			.await
+			.is_err()
+		{
+			tracing::error!("Session shutdown timed out after {SESSION_SHUTDOWN_TIMEOUT_SECS}s.");
+		}
+		drop(delay);
 	});
 	guard.stop_watcher = Some(handle);
 }

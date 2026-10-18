@@ -24,6 +24,7 @@ Add a `pre_command` that shuts down any running desktop Steam before the stream 
 [[application]]
 title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
+steam_integration = true
 pre_command = [
     ["/usr/bin/bash", "-c", "if pgrep -x steam >/dev/null; then /usr/bin/steam -shutdown &>/dev/null; for i in $(seq 1 30); do ! pgrep -x steam >/dev/null && break; sleep 1; done; fi"],
 ]
@@ -128,6 +129,7 @@ command = [
 	"com.valvesoftware.Steam",
 	"steam://open/bigpicture",
 ]
+steam_integration = true
 ```
 
 For games launched through Steam's application scanner:
@@ -167,6 +169,8 @@ command = ["/usr/bin/start-cosmic"]
 
 Launching a desktop environment as an application turns the stream into a full remote desktop: the compositor boots inside Moonshine's headless compositor, and you use the desktop's own keybindings to launch programs. Other compositors work the same way, e.g. `["/usr/bin/sway"]`.
 
+Leave Steam integration off (the default) for a desktop: with `steam_integration = true`, only Steam and Steam game windows get focus and keyboard input.
+
 ## Debug a failing application
 
 ### How to
@@ -177,6 +181,7 @@ Set the application's `stdout` and `stderr` to `"journal"` so its output is capt
 [[application]]
 title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
+steam_integration = true
 stdout = "journal"
 stderr = "journal"
 ```

@@ -152,6 +152,7 @@ if [[ "$UNINSTALL" == "true" ]]; then
   sudo rm -f /etc/modules-load.d/moonshine.conf
   sudo rm -f /etc/sysusers.d/moonshine.conf
   sudo rm -f /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
+  sudo rm -f /etc/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json
   sudo rm -f /etc/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
   sudo rm -f /etc/profile.d/moonshine.sh
   sudo rm -f /etc/atomic-update.conf.d/moonshine.conf
@@ -243,16 +244,19 @@ CMDS=(
   "mkdir -p /etc/udev/rules.d"
   "mkdir -p /etc/modules-load.d"
   "mkdir -p /etc/sysusers.d"
-  "mkdir -p /etc/vulkan/implicit_layer.d"
   "mkdir -p /etc/polkit-1/rules.d"
+  "mkdir -p /etc/vulkan/implicit_layer.d"
   # Deploy moonshine binary
   "cp '${S}/bin/moonshine' '${MOONSHINE_HOME}/bin/moonshine'"
   "chmod 755 '${MOONSHINE_HOME}/bin/moonshine'"
 
-  # Deploy Vulkan WSI layer
-  "mkdir -p '${MOONSHINE_HOME}/lib'"
-  "cp '${S}/lib/moonshine/vulkan-layers/libmoonshine_wsi.so' '${MOONSHINE_HOME}/lib/libmoonshine_wsi.so'"
-  "chmod 755 '${MOONSHINE_HOME}/lib/libmoonshine_wsi.so'"
+  # Remove the moonshine-wsi layer of older releases; ferriscope-wsi replaces it
+  "rm -f /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json '${MOONSHINE_HOME}/lib/libmoonshine_wsi.so'"
+
+  # Deploy the ferriscope WSI layer; its manifest names the library under /usr,
+  # so point it at the copy here
+  "install -Dm755 '${S}/lib/ferriscope/libferriscope_wsi.so' '${MOONSHINE_HOME}/lib/ferriscope/libferriscope_wsi.so'"
+  "sed 's|/usr/lib/ferriscope/|${MOONSHINE_HOME}/lib/ferriscope/|' '${S}/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json' > /etc/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json"
 
   # Deploy the install script itself for future upgrades/uninstall
   "cp '${S}/bin/moonshine-install.sh' '${MOONSHINE_HOME}/bin/moonshine-install.sh'"
@@ -273,9 +277,6 @@ CMDS=(
 
   # Deploy sysusers config
   "cp '${S}/share/moonshine/moonshine-sysusers.conf' /etc/sysusers.d/moonshine.conf"
-
-  # Deploy Vulkan layer manifest with library_path patched
-  "sed 's|/usr/lib/moonshine/vulkan-layers/libmoonshine_wsi.so|${MOONSHINE_HOME}/lib/libmoonshine_wsi.so|' '${S}/share/moonshine/VkLayer_moonshine_wsi.json' > /etc/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json"
 
   # Deploy polkit sleep-inhibit rules
   "cp '${S}/share/moonshine/50-moonshine-inhibit-sleep.rules' /etc/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules"

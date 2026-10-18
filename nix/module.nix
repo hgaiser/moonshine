@@ -35,10 +35,9 @@ let
   # library path, so the whole package has no business being in there. The
   # manifest names the layer library by absolute store path, so it is all that
   # needs to go.
-  wsiLayer = pkgs.runCommand "moonshine-wsi-layer" { } ''
-    install -Dm644 \
-      ${cfg.package}/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json \
-      $out/share/vulkan/implicit_layer.d/VkLayer_moonshine_wsi.json
+  wsiLayer = pkgs.runCommand "ferriscope-wsi-layer" { } ''
+    install -Dm644 -t $out/share/vulkan/implicit_layer.d \
+      ${cfg.package}/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.*.json
   '';
 in
 {
@@ -138,23 +137,20 @@ in
     # is how the polkit rule below gets picked up.
     environment.systemPackages = [ cfg.package ];
 
-    # The moonshine-wsi Vulkan layer routes a game's swapchain frames into
-    # moonshine's compositor. It is an *implicit* layer, so the loader has to
-    # find its manifest by scanning, and a store path is only scanned when it
-    # is listed in XDG_DATA_DIRS. Nothing here has that: a systemd system
-    # service gets no XDG_DATA_DIRS, and neither does the user instance that
-    # launches the games when it was started by lingering rather than by a
-    # graphical login. Without it everything silently falls back to rendering
-    # through XWayland.
+    # ferriscope's WSI layer routes a game's swapchain frames into the
+    # compositor. It is an *implicit* layer, so the loader has to find its
+    # manifest by scanning, and a store path is only scanned when it is listed
+    # in XDG_DATA_DIRS. Nothing here has that: a systemd system service gets no
+    # XDG_DATA_DIRS, and neither does the user instance that launches the games
+    # when it was started by lingering rather than by a graphical login.
+    # Without it everything silently falls back to rendering through Xwayland.
     #
     # nixpkgs builds the loader with SYSCONFDIR=/run/opengl-driver/share, which
     # it always scans, environment or not. So install the layer there: the
     # NixOS counterpart of the /etc/vulkan/implicit_layer.d drop that upstream's
-    # install script does on atomic distributions. Only the 64-bit driver path,
-    # because the layer is built for the host architecture and there is no
-    # 32-bit build to put in extraPackages32. Nothing is lost: where the
-    # manifest sits in an arch-agnostic directory (/usr/share on deb/rpm), a
-    # 32-bit loader finds it and skips it over the ELF class anyway.
+    # install script does on atomic distributions. Only the 64-bit driver path:
+    # the layer is built for the host architecture only, and a 32-bit game
+    # presents through Xwayland, as it does under gamescope.
     hardware.graphics = {
       # Needed regardless of the layer: this option is what creates
       # /run/opengl-driver, which is where the package resolves its Vulkan

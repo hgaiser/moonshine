@@ -1,853 +1,151 @@
-//! Input event processing for the compositor.
+//! Input from the Moonlight control stream, in the compositor seat's terms.
 //!
-//! Input events from the Moonlight control stream are sent to the compositor
-//! via a `calloop::channel`. The compositor injects them directly into the
-//! Smithay `Seat` — no libei or EIS socket needed.
+//! The control stream sends events straight to ferriscope's seat through
+//! [`CompositorInput`]. Keys, buttons and relative motion pass through as they
+//! are; the helpers here convert the events whose units differ: absolute
+//! motion and touch (client screen or normalised coordinates to output
+//! coordinates) and scroll (Moonlight's 120 units per detent to wheel notches).
 
-use smithay::backend::input::{
-	Axis, ButtonState, InputTime, KeyState, TabletToolCapabilities, TabletToolDescriptor, TabletToolType, TouchSlot,
-};
-use smithay::desktop::WindowSurfaceType;
-use smithay::input::keyboard::{FilterResult, KeyboardHandle, Keycode};
-use smithay::input::pointer::{AxisFrame, ButtonEvent, MotionEvent, RelativeMotionEvent};
-use smithay::input::tablet::TabletSeatTrait;
-use smithay::input::tablet::tool::{
-	AxisFrame as TabletAxisFrame, ButtonEvent as TabletButtonEvent, DownEvent as TabletDownEvent,
-	MotionEvent as TabletMotionEvent, ProximityInEvent, ProximityOutEvent, TabletToolHandle, UpEvent as TabletUpEvent,
-};
-use smithay::input::touch::{DownEvent as TouchDownEvent, MotionEvent as TouchMotionEvent, UpEvent as TouchUpEvent};
-use smithay::utils::{Logical, Point, SERIAL_COUNTER};
-use smithay::wayland::pointer_constraints::{PointerConstraint, with_pointer_constraint};
+use std::sync::{Arc, OnceLock};
 
-use crate::session::compositor::state::MoonshineCompositor;
+use ferriscope_core::{InputEvent, InputSender};
 
-/// Input events sent from the control stream to the compositor.
+/// The compositor's seat, connected once the compositor has launched.
 ///
-/// These are transport-level events that cross the tokio→calloop boundary.
-/// They carry only primitive data (keycodes, coordinates, button codes) so
-/// they can be `Send` without any Wayland object references.
-#[derive(Debug)]
-pub(crate) enum CompositorInputEvent {
-	/// A key was pressed. `keycode` is a Linux evdev keycode.
-	KeyDown {
-		keycode: u32,
-	},
-	/// A key was released. `keycode` is a Linux evdev keycode.
-	KeyUp {
-		keycode: u32,
-	},
-	/// Absolute pointer motion. Coordinates are in pixels relative to the
-	/// Moonlight client's screen dimensions.
-	MouseMoveAbsolute {
-		x: i16,
-		y: i16,
-		screen_width: i16,
-		screen_height: i16,
-	},
-	/// Relative pointer motion in pixels.
-	MouseMoveRelative {
-		dx: i16,
-		dy: i16,
-	},
-	/// A mouse button was pressed. `button` is a Linux button code (e.g. BTN_LEFT = 0x110).
-	MouseButtonDown {
-		button: u32,
-	},
-	/// A mouse button was released.
-	MouseButtonUp {
-		button: u32,
-	},
-	/// Vertical scroll. Positive = scroll up, negative = scroll down.
-	ScrollVertical {
-		amount: i16,
-	},
-	/// Horizontal scroll.
-	ScrollHorizontal {
-		amount: i16,
-	},
-	/// Native touchscreen contact in normalized video coordinates.
-	TouchDown {
-		slot: u32,
-		x: f32,
-		y: f32,
-	},
-	TouchMove {
-		slot: u32,
-		x: f32,
-		y: f32,
-	},
-	TouchUp {
-		slot: u32,
-	},
-	TouchCancelAll,
-	/// Native pen input in normalized video coordinates.
-	Pen {
-		event_kind: u8,
-		tool_kind: u8,
-		buttons: u8,
-		x: f32,
-		y: f32,
-		pressure_or_distance: f32,
-		rotation: u16,
-		tilt: u8,
-	},
-	/// Text received from the Moonlight clipboard ("type clipboard text").
-	/// Committed to the focused client via the text-input protocol.
-	TypeText {
-		text: String,
-	},
+/// Events sent before then, or after the compositor stopped, are dropped.
+#[derive(Clone)]
+pub(crate) struct CompositorInput {
+	sender: Arc<OnceLock<InputSender>>,
+	/// The compositor output size, which absolute and touch input map onto.
+	width: u32,
+	height: u32,
 }
 
-/// Process an input event received from the Moonlight control stream.
-///
-/// Called on the compositor's calloop thread when the channel source fires.
-/// Events are injected directly into the Smithay Seat — no libei needed
-/// since we *are* the compositor.
-pub(crate) fn process_input(event: CompositorInputEvent, state: &mut MoonshineCompositor) {
-	let serial = SERIAL_COUNTER.next_serial();
-	let time = InputTime::from_millis(state.clock.now().as_millis());
-
-	// specific pointer events (non-keyboard) should reset the cursor inactivity timer
-	match event {
-		CompositorInputEvent::KeyDown { .. }
-		| CompositorInputEvent::KeyUp { .. }
-		| CompositorInputEvent::TypeText { .. }
-		| CompositorInputEvent::TouchDown { .. }
-		| CompositorInputEvent::TouchMove { .. }
-		| CompositorInputEvent::TouchUp { .. }
-		| CompositorInputEvent::TouchCancelAll => {},
-		_ => state.last_pointer_activity = Some(std::time::Instant::now()),
+impl CompositorInput {
+	pub(crate) fn new(width: u32, height: u32) -> Self {
+		Self {
+			sender: Arc::default(),
+			width,
+			height,
+		}
 	}
 
-	match event {
-		CompositorInputEvent::KeyDown { keycode } => {
-			tracing::trace!(target: "input", "Key down: {keycode}");
+	/// Connect the launched compositor's seat.
+	pub(super) fn connect(&self, sender: InputSender) {
+		let _ = self.sender.set(sender);
+	}
 
-			if let Some(keyboard) = state.seat.get_keyboard() {
-				keyboard.input::<(), _>(
-					state,
-					Keycode::from(keycode + 8),
-					KeyState::Pressed,
-					serial,
-					time,
-					|_, _, _| FilterResult::Forward,
-				);
-			}
-		},
-		CompositorInputEvent::KeyUp { keycode } => {
-			tracing::trace!(target: "input", "Key up: {keycode}");
+	/// Send one event to the seat.
+	pub(crate) fn send(&self, event: InputEvent) {
+		if let Some(sender) = self.sender.get() {
+			let _ = sender.send(event);
+		}
+	}
 
-			if let Some(keyboard) = state.seat.get_keyboard() {
-				keyboard.input::<(), _>(
-					state,
-					Keycode::from(keycode + 8),
-					KeyState::Released,
-					serial,
-					time,
-					|_, _, _| FilterResult::Forward,
-				);
-			}
-		},
-		CompositorInputEvent::TypeText { text } => {
-			if state.pending_text.len() < MAX_PENDING_TEXT {
-				state.pending_text.push_str(&text);
-				if state.pending_text.len() >= MAX_PENDING_TEXT {
-					tracing::warn!("Clipboard text exceeds {MAX_PENDING_TEXT} bytes, ignoring the rest.");
-				}
-			}
-		},
-		CompositorInputEvent::MouseMoveAbsolute {
-			x,
-			y,
-			screen_width,
-			screen_height,
-		} => {
-			tracing::trace!(target: "input", "Mouse absolute: ({x}, {y}) screen: ({screen_width}x{screen_height})");
-			let output_size = state
-				.output
-				.current_mode()
-				.map(|m| m.size)
-				.unwrap_or((state.width as i32, state.height as i32).into());
+	/// Send one touch event. `wl_touch` clients act on `frame`, and each
+	/// Moonlight touch event is one complete frame.
+	pub(crate) fn send_touch(&self, event: InputEvent) {
+		self.send(event);
+		self.send(InputEvent::TouchFrame);
+	}
 
-			let new_x = if screen_width > 0 {
-				x as f64 / screen_width as f64 * output_size.w as f64
+	/// Absolute pointer motion from a position on the client's screen of
+	/// `screen_width` × `screen_height`, rescaled to the output.
+	pub(crate) fn pointer_motion(&self, x: i16, y: i16, screen_width: i16, screen_height: i16) -> InputEvent {
+		let scale = |value: i16, screen: i16, output: u32| {
+			if screen > 0 {
+				f64::from(value) / f64::from(screen) * f64::from(output)
 			} else {
-				x as f64
-			};
-			let new_y = if screen_height > 0 {
-				y as f64 / screen_height as f64 * output_size.h as f64
-			} else {
-				y as f64
-			};
-
-			// Input is in output coordinates; the scene may be scaled.
-			state.cursor_position = state.output_to_scene(Point::from((new_x, new_y)));
-			clamp_cursor(state);
-
-			let under = find_surface_under(state);
-			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.motion(
-				state,
-				under,
-				&MotionEvent {
-					location: state.cursor_position,
-					serial,
-					time,
-				},
-			);
-			pointer.frame(state);
-		},
-		CompositorInputEvent::MouseMoveRelative { dx, dy } => {
-			tracing::trace!(target: "input", "Mouse relative: ({dx}, {dy})");
-
-			let (rx, ry) = state.scene_input_ratio();
-			let delta = Point::from((dx as f64 * rx, dy as f64 * ry));
-			let pointer = state.seat.get_pointer().expect("pointer should exist");
-
-			// Check for pointer constraints (lock/confine).
-			let mut pointer_locked = false;
-			let under = find_surface_under(state);
-
-			if let Some((ref surface, ref _surface_loc)) = under {
-				with_pointer_constraint(surface, &pointer, |constraint| match constraint {
-					Some(constraint) if constraint.is_active() => match &*constraint {
-						PointerConstraint::Locked(_) => {
-							pointer_locked = true;
-						},
-						PointerConstraint::Confined(_) => {},
-					},
-					_ => {},
-				});
+				f64::from(value)
 			}
+		};
+		InputEvent::PointerMotion {
+			x: scale(x, screen_width, self.width),
+			y: scale(y, screen_height, self.height),
+		}
+	}
 
-			pointer.relative_motion(
-				state,
-				under.clone(),
-				&RelativeMotionEvent {
-					delta,
-					delta_unaccel: delta,
-					time,
-				},
-			);
-
-			state.cursor_position += delta;
-			clamp_cursor(state);
-
-			if pointer_locked {
-				pointer.frame(state);
-				return;
-			}
-
-			pointer.motion(
-				state,
-				under,
-				&MotionEvent {
-					location: state.cursor_position,
-					serial,
-					time,
-				},
-			);
-			pointer.frame(state);
-		},
-		CompositorInputEvent::MouseButtonDown { button } => {
-			tracing::trace!(target: "input", "Mouse button down: {button:#x}");
-
-			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.button(
-				state,
-				&ButtonEvent {
-					serial,
-					time,
-					button,
-					state: ButtonState::Pressed,
-				},
-			);
-			pointer.frame(state);
-		},
-		CompositorInputEvent::MouseButtonUp { button } => {
-			tracing::trace!(target: "input", "Mouse button up: {button:#x}");
-
-			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.button(
-				state,
-				&ButtonEvent {
-					serial,
-					time,
-					button,
-					state: ButtonState::Released,
-				},
-			);
-			pointer.frame(state);
-		},
-		CompositorInputEvent::ScrollVertical { amount } => {
-			tracing::trace!(target: "input", "Scroll vertical: {amount}");
-
-			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.axis(
-				state,
-				AxisFrame::new(time)
-					.value(Axis::Vertical, -(amount as f64) / 120.0 * 15.0)
-					.v120(Axis::Vertical, -amount as i32),
-			);
-			pointer.frame(state);
-		},
-		CompositorInputEvent::ScrollHorizontal { amount } => {
-			tracing::trace!(target: "input", "Scroll horizontal: {amount}");
-
-			let pointer = state.seat.get_pointer().expect("pointer should exist");
-			pointer.axis(
-				state,
-				AxisFrame::new(time)
-					.value(Axis::Horizontal, amount as f64 / 120.0 * 15.0)
-					.v120(Axis::Horizontal, amount as i32),
-			);
-			pointer.frame(state);
-		},
-		CompositorInputEvent::TouchDown { slot, x, y } => {
-			let location = normalized_pointer_location(state, x, y);
-			let under = find_surface_at(state, location);
-			if let Some(touch) = state.seat.get_touch() {
-				touch.down(
-					state,
-					under,
-					&TouchDownEvent {
-						slot: TouchSlot::from(Some(slot)),
-						location,
-						serial,
-						time,
-					},
-				);
-				touch.frame(state);
-			}
-		},
-		CompositorInputEvent::TouchMove { slot, x, y } => {
-			let location = normalized_pointer_location(state, x, y);
-			let under = find_surface_at(state, location);
-			if let Some(touch) = state.seat.get_touch() {
-				touch.motion(
-					state,
-					under,
-					&TouchMotionEvent {
-						slot: TouchSlot::from(Some(slot)),
-						location,
-						time,
-					},
-				);
-				touch.frame(state);
-			}
-		},
-		CompositorInputEvent::TouchUp { slot } => {
-			if let Some(touch) = state.seat.get_touch() {
-				touch.up(
-					state,
-					&TouchUpEvent {
-						slot: TouchSlot::from(Some(slot)),
-						serial,
-						time,
-					},
-				);
-				touch.frame(state);
-			}
-		},
-		CompositorInputEvent::TouchCancelAll => {
-			if let Some(touch) = state.seat.get_touch() {
-				touch.cancel(state);
-			}
-		},
-		CompositorInputEvent::Pen {
-			event_kind,
-			tool_kind,
-			buttons,
-			x,
-			y,
-			pressure_or_distance,
-			rotation,
-			tilt,
-		} => process_pen_input(
-			state,
-			PenInput {
-				event_kind,
-				tool_kind,
-				buttons,
-				x,
-				y,
-				pressure_or_distance,
-				rotation,
-				tilt,
-			},
-			serial,
-			time,
-		),
+	/// A touch or pen position in normalised video coordinates, in output
+	/// coordinates. ferriscope applies the same output fill as for the pointer.
+	pub(crate) fn touch_point(&self, x: f32, y: f32) -> (f64, f64) {
+		(
+			f64::from(x) * f64::from(self.width),
+			f64::from(y) * f64::from(self.height),
+		)
 	}
 }
 
-/// Modifier keys used to type a code point through the "Ctrl+Shift+U" Unicode
-/// input method. These are xkb keycodes (evdev keycode + 8) for standard keys.
-const KEY_LEFTCTRL: u32 = 37; // evdev 29
-const KEY_LEFTSHIFT: u32 = 50; // evdev 42
-const KEY_U: u32 = 30; // evdev 22
-const KEY_ENTER: u32 = 36; // evdev 28
-
-/// Upper bound on queued clipboard text, to bound memory on a huge payload.
-const MAX_PENDING_TEXT: usize = 64 * 1024;
-
-/// Number of characters typed per frame tick.
-const CHARS_PER_TICK: usize = 8;
-
-/// Type a bounded batch of the queued clipboard text.
+/// A scroll of `amount` in Moonlight's high-resolution units (120 per detent,
+/// positive up or right) as wheel notches in the Wayland `wl_pointer.axis`
+/// sign convention (positive down or right), so the vertical sign is flipped.
 ///
-/// A paste arrives as one `TypeText` event per code point. Injecting each in
-/// its own compositor callback (and flushing after every one) backpressures
-/// the single calloop thread and starves the frame timer, stalling the stream.
-/// Instead the text is queued and typed in bounded batches on successive frame
-/// ticks, so the compositor always returns to render between batches.
-pub(crate) fn drain_pending_text(state: &mut MoonshineCompositor) {
-	if state.pending_text.is_empty() {
-		return;
-	}
-
-	// Split off at most `CHARS_PER_TICK` characters, on a char boundary, so a
-	// Ctrl+Shift+U sequence is never split mid-character.
-	let end = state
-		.pending_text
-		.char_indices()
-		.nth(CHARS_PER_TICK)
-		.map(|(i, _)| i)
-		.unwrap_or(state.pending_text.len());
-	let remainder = state.pending_text.split_off(end);
-	let batch = std::mem::replace(&mut state.pending_text, remainder);
-
-	tracing::debug!(target: "input", "Typing queued clipboard text.");
-	let time = InputTime::from_millis(state.clock.now().as_millis());
-	type_text(state, &batch, time);
-	let _ = state.display_handle.flush_clients();
-}
-
-/// Type `text` by synthesizing the "Ctrl+Shift+U <hex> Enter" Unicode input
-/// sequence for each code point.
-///
-/// This is layout-independent in that it relies on the application's input
-/// method (GTK/Qt/IBus) rather than the keyboard layout. It only works in apps
-/// that implement that input method; games and bare X11 apps receive the
-/// keystrokes literally.
-fn type_text(state: &mut MoonshineCompositor, text: &str, time: InputTime) {
-	let Some(keyboard) = state.seat.get_keyboard() else {
-		return;
-	};
-
-	for codepoint in text.chars() {
-		type_codepoint(state, &keyboard, codepoint, time);
+/// ferriscope expands a notch to exactly one continuous `wl_pointer.axis` unit
+/// and 120 `axis_value120`, matching gamescope (`wlserver_mousewheel`,
+/// `wlserver.cpp:3131-3138`).
+pub(crate) fn scroll(amount: i16, horizontal: bool) -> InputEvent {
+	let notches = f64::from(amount) / 120.0;
+	InputEvent::PointerAxis {
+		horizontal,
+		value: if horizontal { notches } else { -notches },
 	}
 }
 
-/// Type a single code point via Ctrl+Shift+U.
-fn type_codepoint(
-	state: &mut MoonshineCompositor,
-	keyboard: &KeyboardHandle<MoonshineCompositor>,
-	codepoint: char,
-	time: InputTime,
-) {
-	// Ctrl+Shift+U opens the Unicode input method. The modifiers are released
-	// before the hex digits, which are typed unmodified.
-	inject_key(state, keyboard, Keycode::new(KEY_LEFTCTRL), KeyState::Pressed, time);
-	inject_key(state, keyboard, Keycode::new(KEY_LEFTSHIFT), KeyState::Pressed, time);
-	tap_key(state, keyboard, Keycode::new(KEY_U), time);
-	inject_key(state, keyboard, Keycode::new(KEY_LEFTSHIFT), KeyState::Released, time);
-	inject_key(state, keyboard, Keycode::new(KEY_LEFTCTRL), KeyState::Released, time);
+#[cfg(test)]
+mod tests {
+	use super::*;
 
-	for digit in format!("{:X}", codepoint as u32).chars() {
-		tap_key(state, keyboard, hex_keycode(digit), time);
-	}
-
-	// Enter commits the code point.
-	tap_key(state, keyboard, Keycode::new(KEY_ENTER), time);
-}
-
-/// Map an uppercase hex digit to the xkb keycode of its standard key.
-fn hex_keycode(digit: char) -> Keycode {
-	let evdev = match digit {
-		'0' => 11,
-		'1' => 2,
-		'2' => 3,
-		'3' => 4,
-		'4' => 5,
-		'5' => 6,
-		'6' => 7,
-		'7' => 8,
-		'8' => 9,
-		'9' => 10,
-		'A' => 30,
-		'B' => 48,
-		'C' => 46,
-		'D' => 32,
-		'E' => 18,
-		'F' => 33,
-		_ => unreachable!("not a hex digit: {digit}"),
-	};
-	Keycode::new(evdev + 8)
-}
-
-fn tap_key(
-	state: &mut MoonshineCompositor,
-	keyboard: &KeyboardHandle<MoonshineCompositor>,
-	keycode: Keycode,
-	time: InputTime,
-) {
-	inject_key(state, keyboard, keycode, KeyState::Pressed, time);
-	inject_key(state, keyboard, keycode, KeyState::Released, time);
-}
-
-fn inject_key(
-	state: &mut MoonshineCompositor,
-	keyboard: &KeyboardHandle<MoonshineCompositor>,
-	keycode: Keycode,
-	key_state: KeyState,
-	time: InputTime,
-) {
-	keyboard.input::<(), _>(
-		state,
-		keycode,
-		key_state,
-		SERIAL_COUNTER.next_serial(),
-		time,
-		|_, _, _| FilterResult::Forward,
-	);
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PenInput {
-	event_kind: u8,
-	tool_kind: u8,
-	buttons: u8,
-	x: f32,
-	y: f32,
-	pressure_or_distance: f32,
-	rotation: u16,
-	tilt: u8,
-}
-
-const POINTER_EVENT_HOVER: u8 = 0x00;
-const POINTER_EVENT_DOWN: u8 = 0x01;
-const POINTER_EVENT_UP: u8 = 0x02;
-const POINTER_EVENT_MOVE: u8 = 0x03;
-const POINTER_EVENT_CANCEL: u8 = 0x04;
-const POINTER_EVENT_BUTTON_ONLY: u8 = 0x05;
-const POINTER_EVENT_HOVER_LEAVE: u8 = 0x06;
-const POINTER_EVENT_CANCEL_ALL: u8 = 0x07;
-
-const PEN_TOOL_ERASER: u8 = 0x02;
-const ROTATION_UNKNOWN: u16 = 0xFFFF;
-const TILT_UNKNOWN: u8 = 0xFF;
-
-fn pen_tool_descriptor(tool_kind: u8) -> TabletToolDescriptor {
-	let is_eraser = tool_kind == PEN_TOOL_ERASER;
-	TabletToolDescriptor {
-		tool_type: if is_eraser {
-			TabletToolType::Eraser
-		} else {
-			TabletToolType::Pen
-		},
-		hardware_serial: u64::from(tool_kind),
-		hardware_id_wacom: 0,
-		capabilities: TabletToolCapabilities::PRESSURE
-			| TabletToolCapabilities::DISTANCE
-			| TabletToolCapabilities::TILT,
-	}
-}
-
-fn get_pen_tool(state: &mut MoonshineCompositor, tool_kind: u8) -> TabletToolHandle<MoonshineCompositor> {
-	let tablet_seat = state.seat.tablet_seat();
-	let descriptor = pen_tool_descriptor(tool_kind);
-	if let Some(tool) = tablet_seat.get_tool(&descriptor) {
-		return tool;
-	}
-
-	tablet_seat.add_tool(&descriptor)
-}
-
-fn release_pen(state: &mut MoonshineCompositor, time: InputTime) {
-	let Some(tool_kind) = state.active_pen_tool_kind.take() else {
-		state.pen_buttons = 0;
-		return;
-	};
-
-	if let Some(tool) = state.seat.tablet_seat().get_tool(&pen_tool_descriptor(tool_kind)) {
-		// `proximity_out` internally releases any pressed buttons and lifts the tip.
-		tool.proximity_out(
-			state,
-			&ProximityOutEvent {
-				serial: SERIAL_COUNTER.next_serial(),
-				time,
-			},
+	#[test]
+	fn rescales_absolute_motion_to_output() {
+		let input = CompositorInput::new(1920, 1080);
+		assert_eq!(
+			input.pointer_motion(50, 100, 100, 200),
+			InputEvent::PointerMotion { x: 960.0, y: 540.0 }
+		);
+		// Without a screen size the position is taken as is.
+		assert_eq!(
+			input.pointer_motion(50, 100, 0, 0),
+			InputEvent::PointerMotion { x: 50.0, y: 100.0 }
 		);
 	}
-	state.pen_buttons = 0;
-}
 
-fn sync_pen_buttons(
-	state: &mut MoonshineCompositor,
-	tool: &TabletToolHandle<MoonshineCompositor>,
-	old_buttons: u8,
-	new_buttons: u8,
-	time: InputTime,
-) {
-	const BUTTONS: [(u8, u32); 3] = [
-		(0x01, 0x14B), // BTN_STYLUS
-		(0x02, 0x14C), // BTN_STYLUS2
-		(0x04, 0x149), // BTN_STYLUS3
-	];
-
-	for (mask, button) in BUTTONS {
-		if old_buttons & mask != new_buttons & mask {
-			let button_state = if new_buttons & mask != 0 {
-				ButtonState::Pressed
-			} else {
-				ButtonState::Released
-			};
-			tool.button(
-				state,
-				&TabletButtonEvent {
-					serial: SERIAL_COUNTER.next_serial(),
-					button,
-					state: button_state,
-					time,
-				},
-			);
-		}
-	}
-}
-
-fn process_pen_input(
-	state: &mut MoonshineCompositor,
-	event: PenInput,
-	serial: smithay::utils::Serial,
-	time: InputTime,
-) {
-	if matches!(
-		event.event_kind,
-		POINTER_EVENT_CANCEL | POINTER_EVENT_HOVER_LEAVE | POINTER_EVENT_CANCEL_ALL
-	) {
-		release_pen(state, time);
-		return;
-	}
-
-	if event.event_kind == POINTER_EVENT_BUTTON_ONLY {
-		if let Some(tool_kind) = state.active_pen_tool_kind {
-			let tool = get_pen_tool(state, tool_kind);
-			sync_pen_buttons(state, &tool, state.pen_buttons, event.buttons, time);
-			state.pen_buttons = event.buttons;
-		}
-		return;
-	}
-
-	if state
-		.active_pen_tool_kind
-		.is_some_and(|active| active != event.tool_kind)
-	{
-		release_pen(state, time);
-	}
-
-	let tool = get_pen_tool(state, event.tool_kind);
-	let Some(tablet) = state.seat.tablet_seat().get_tablet(&state.pen_tablet_descriptor) else {
-		return;
-	};
-	let location = normalized_pointer_location(state, event.x, event.y);
-	let focus = find_surface_at(state, location);
-	state.cursor_position = location;
-
-	if state.active_pen_tool_kind.is_none() {
-		if focus.is_none() {
-			return;
-		}
-		tool.proximity_in(
-			state,
-			focus.clone(),
-			tablet,
-			&ProximityInEvent {
-				location,
-				axis: None,
-				serial,
-				time,
-			},
+	#[test]
+	fn maps_scroll_to_pointer_axis_with_wayland_sign() {
+		// One detent up: Moonlight positive, flipped to Wayland's positive-down.
+		assert_eq!(
+			scroll(120, false),
+			InputEvent::PointerAxis {
+				horizontal: false,
+				value: -1.0
+			}
 		);
-		state.active_pen_tool_kind = Some(event.tool_kind);
-	}
-
-	let value = event.pressure_or_distance.clamp(0.0, 1.0) as f64;
-	let mut axis = TabletAxisFrame::new();
-	if event.event_kind == POINTER_EVENT_HOVER {
-		axis = axis.distance(value);
-	} else {
-		axis = axis.pressure(value);
-	}
-
-	if event.rotation != ROTATION_UNKNOWN && event.tilt != TILT_UNKNOWN {
-		let angle = (event.rotation as f64).to_radians();
-		let magnitude = f64::from(event.tilt.min(90));
-		axis = axis.tilt(magnitude * angle.sin(), -magnitude * angle.cos());
-	}
-	tool.axis(state, axis);
-
-	tool.motion(state, focus, &TabletMotionEvent { location, serial, time });
-	sync_pen_buttons(state, &tool, state.pen_buttons, event.buttons, time);
-	state.pen_buttons = event.buttons;
-
-	match event.event_kind {
-		POINTER_EVENT_DOWN | POINTER_EVENT_MOVE => {
-			tool.down(
-				state,
-				&TabletDownEvent {
-					serial: SERIAL_COUNTER.next_serial(),
-					time,
-				},
-			);
-		},
-		POINTER_EVENT_UP => {
-			tool.up(
-				state,
-				&TabletUpEvent {
-					serial: SERIAL_COUNTER.next_serial(),
-					time,
-				},
-			);
-		},
-		_ => {},
-	}
-
-	tool.frame(state, time);
-}
-
-fn normalized_pointer_location(state: &MoonshineCompositor, x: f32, y: f32) -> Point<f64, Logical> {
-	let output_size = state
-		.output
-		.current_mode()
-		.map(|mode| mode.size)
-		.unwrap_or((state.width as i32, state.height as i32).into());
-	let max_x = output_size.w.saturating_sub(1).max(0) as f64;
-	let max_y = output_size.h.saturating_sub(1).max(0) as f64;
-	Point::from((x.clamp(0.0, 1.0) as f64 * max_x, y.clamp(0.0, 1.0) as f64 * max_y))
-}
-
-/// Clamp the cursor position to the output bounds, expanded to include
-/// the override window's geometry if one is active.
-///
-/// Gamescope: expands cursor bounds when a dropdown/override window is active
-/// so the cursor can move within the dropdown area without being clamped
-/// to the output bounds.
-fn clamp_cursor(state: &mut MoonshineCompositor) {
-	let output_size = state
-		.output
-		.current_mode()
-		.map(|m| m.size)
-		.unwrap_or((state.width as i32, state.height as i32).into());
-
-	// Start with output bounds.
-	let mut min_x: f64 = 0.0;
-	let mut min_y: f64 = 0.0;
-	let mut max_x: f64 = (output_size.w - 1) as f64;
-	let mut max_y: f64 = (output_size.h - 1) as f64;
-
-	// Expand bounds to include the override window's geometry if active.
-	// This allows the cursor to move within the dropdown area.
-	if let Some(ref override_win) = state.override_window
-		&& let Some(geo) = state.space.element_geometry(override_win)
-	{
-		let override_min_x = geo.loc.x as f64;
-		let override_min_y = geo.loc.y as f64;
-		let override_max_x = (geo.loc.x + geo.size.w - 1) as f64;
-		let override_max_y = (geo.loc.y + geo.size.h - 1) as f64;
-		min_x = min_x.min(override_min_x);
-		min_y = min_y.min(override_min_y);
-		max_x = max_x.max(override_max_x);
-		max_y = max_y.max(override_max_y);
-	}
-
-	state.cursor_position.x = state.cursor_position.x.clamp(min_x, max_x);
-	state.cursor_position.y = state.cursor_position.y.clamp(min_y, max_y);
-}
-
-/// Find the Wayland surface under the current cursor position.
-///
-/// Priority order:
-/// 1. If override_window (dropdown) is active AND override_surface is NOT
-///    active, route to the dropdown.  When the WSI bypass is active the
-///    renderer replaces the entire space with the bypass surface, so
-///    dropdown windows are not rendered — routing to them would make them
-///    receive clicks while being invisible.
-/// 2. If override_surface is active (WSI bypass), route to the focused game window.
-/// 3. Otherwise, find the surface under the cursor normally.
-fn find_surface_under(
-	state: &MoonshineCompositor,
-) -> Option<(
-	<MoonshineCompositor as smithay::input::SeatHandler>::PointerFocus,
-	Point<f64, Logical>,
-)> {
-	find_surface_at(state, state.cursor_position)
-}
-
-fn find_surface_at(
-	state: &MoonshineCompositor,
-	position: Point<f64, Logical>,
-) -> Option<(
-	<MoonshineCompositor as smithay::input::SeatHandler>::PointerFocus,
-	Point<f64, Logical>,
-)> {
-	// Priority 1: Override window (dropdown) is active — route to it.
-	// Only do this when the WSI bypass surface is NOT active.  When
-	// override_surface is active the renderer replaces the entire space
-	// with the bypass surface, so dropdown windows are not rendered —
-	// routing to them would make invisible windows intercept clicks.
-	if state.override_window.is_some()
-		&& !state.is_override_active()
-		&& let Some(ref override_win) = state.override_window
-	{
-		let override_loc = state.space.element_geometry(override_win)?.loc;
-		let pos_within_override = position - override_loc.to_f64();
-		if let Some((surface, surface_offset)) = override_win.surface_under(pos_within_override, WindowSurfaceType::ALL)
-		{
-			return Some((surface, surface_offset.to_f64() + override_loc.to_f64()));
-		}
-	}
-
-	// Priority 2: WSI override surface active — route to the focused game window.
-	if state.is_override_active() {
-		if let Some(wid) = state.focused_x11_window {
-			// XWayland path: find the focused X11 window and route events there.
-			for window in state.space.elements() {
-				if let Some(x11) = window.x11_surface()
-					&& x11.window_id() == wid
-				{
-					let window_loc = state.space.element_geometry(window)?.loc;
-					let pos_within_window = position - window_loc.to_f64();
-					// Try finding a sub-surface under the cursor first.
-					if let Some((surface, surface_offset)) =
-						window.surface_under(pos_within_window, WindowSurfaceType::ALL)
-					{
-						return Some((surface, surface_offset.to_f64() + window_loc.to_f64()));
-					}
-					// If the X11 window has no buffer (ICD renders to the
-					// bypass surface), use the toplevel wl_surface directly
-					// so pointer events still reach XWayland.
-					if let Some(wl_surface) = x11.wl_surface() {
-						return Some((wl_surface, window_loc.to_f64()));
-					}
-					return None;
-				}
+		assert_eq!(
+			scroll(-120, false),
+			InputEvent::PointerAxis {
+				horizontal: false,
+				value: 1.0
 			}
-			return None;
-		} else {
-			// Native Wayland path (x11_win == 0): the override surface is a
-			// fullscreen bypass surface at the output origin.  Route pointer
-			// events directly to it so the application receives input.
-			if let Some((ref override_surface, _)) = state.override_surface {
-				return Some((override_surface.clone(), Point::from((0.0, 0.0))));
+		);
+		// Horizontal is already right-positive in both conventions (no flip).
+		assert_eq!(
+			scroll(60, true),
+			InputEvent::PointerAxis {
+				horizontal: true,
+				value: 0.5
 			}
-		}
+		);
 	}
 
-	// Priority 3: Normal cursor-based surface finding.
-	let (window, window_loc) = state.space.element_under(position)?;
-	let pos_within_window = position - window_loc.to_f64();
-	let (surface, surface_offset) = window.surface_under(pos_within_window, WindowSurfaceType::ALL)?;
-	Some((surface, surface_offset.to_f64() + window_loc.to_f64()))
+	#[test]
+	fn touch_is_scaled_from_normalized_to_output_coordinates() {
+		assert_eq!(CompositorInput::new(1920, 1080).touch_point(0.5, 0.25), (960.0, 270.0));
+	}
+
+	#[test]
+	fn events_before_launch_are_dropped() {
+		// Not connected yet: sending must not panic or block.
+		CompositorInput::new(1920, 1080).send(InputEvent::Key {
+			code: 30,
+			pressed: true,
+		});
+	}
 }
