@@ -1,16 +1,15 @@
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use strum_macros::Display;
 use tokio::net::UdpSocket;
-use tokio::sync::Notify;
 use tokio::sync::mpsc;
 
 use crate::session::SessionKeysReceiver;
 use crate::session::manager::SessionShutdownReason;
+use crate::session::stream::{StartSignal, StartWaiter};
 
 use self::encoder::AudioEncoder;
 use self::pulse_server::{CAPTURE_SAMPLE_RATE, PulseServer};
@@ -173,32 +172,6 @@ pub struct AudioStreamContext {
 	pub encrypt_audio: bool,
 }
 
-/// Handle returned by `AudioStream::start` that gates the encoder and packet handler.
-///
-/// The encoder and packet handler are spawned immediately but block on a `Notify`
-/// until `trigger()` is called. PulseServer starts immediately (it just mixes audio,
-/// no network impact).
-pub(crate) struct AudioStartHandle {
-	notify: Arc<Notify>,
-}
-
-impl AudioStartHandle {
-	/// Signal the encoder and packet handler to begin processing.
-	pub fn trigger(&self) {
-		// Call notify_one() twice instead of notify_waiters() because
-		// Notify only wakes tasks already .awaiting; notify_waiters()
-		// is a no-op if no task is waiting yet.  notify_one() stores
-		// a permit so the next notified().await completes immediately.
-		self.notify.notify_one();
-		self.notify.notify_one();
-	}
-
-	/// Clone the start notify for external triggering (e.g. bench binary).
-	pub fn clone_start_notify(&self) -> Arc<Notify> {
-		self.notify.clone()
-	}
-}
-
 pub(crate) struct AudioStream {
 	pulse_socket: UnixListener,
 	pub pulse_socket_path: PathBuf,
@@ -244,18 +217,18 @@ impl AudioStream {
 		})
 	}
 
-	pub fn start(self, context: AudioStreamContext, keys_rx: SessionKeysReceiver) -> Result<AudioStartHandle, ()> {
+	pub fn start(self, context: AudioStreamContext, keys_rx: SessionKeysReceiver) -> Result<StartSignal, ()> {
 		// Apply QoS to UDP socket.
 		if context.qos {
 			let _ = self.udp_socket.set_tos_v4(224);
 		}
 
-		// Create the notify gate for encoder and packet handler.
-		let start_notify = Arc::new(Notify::new());
+		// Gate for encoder and packet handler.
+		let start = StartSignal::new();
 
-		// Create packet channel and spawn handler — gated behind start_notify.
+		// Create packet channel and spawn handler — gated behind start.
 		let (packet_tx, packet_rx) = mpsc::channel::<Vec<u8>>(10);
-		spawn_handle_audio_packets(packet_rx, self.udp_socket, start_notify.clone(), self.stop.clone());
+		spawn_handle_audio_packets(packet_rx, self.udp_socket, start.waiter(), self.stop.clone());
 
 		// Create frame channels for PulseServer and encoder communication.
 		let (frame_tx, frame_rx) = crossbeam_channel::bounded(3);
@@ -273,7 +246,7 @@ impl AudioStream {
 		)
 		.map_err(|e| tracing::error!("Failed to create PulseServer: {e}"))?;
 
-		// Spawn audio encoder — gated behind start_notify.
+		// Spawn audio encoder — gated behind start.
 		AudioEncoder::spawn(
 			CAPTURE_SAMPLE_RATE,
 			&context.audio_config.stream_config,
@@ -283,21 +256,23 @@ impl AudioStream {
 			context.encrypt_audio,
 			packet_tx,
 			self.stop.clone(),
-			start_notify.clone(),
+			start.waiter(),
 		)?;
 
-		Ok(AudioStartHandle { notify: start_notify })
+		Ok(start)
 	}
 }
 
 fn spawn_handle_audio_packets(
 	mut packet_rx: mpsc::Receiver<Vec<u8>>,
 	socket: UdpSocket,
-	start: Arc<Notify>,
+	mut start: StartWaiter,
 	stop: ShutdownManager<SessionShutdownReason>,
 ) {
 	tokio::spawn(async move {
-		start.notified().await;
+		if !start.wait(&stop).await {
+			return;
+		}
 
 		let mut buf = [0; 1024];
 		let mut client_address = None;
@@ -345,4 +320,23 @@ fn spawn_handle_audio_packets(
 
 		tracing::debug!("Audio packet stream stopped.");
 	});
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[tokio::test]
+	async fn shutdown_before_start_releases_packet_handler() {
+		let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let (packet_tx, packet_rx) = mpsc::channel(1);
+		let start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		spawn_handle_audio_packets(packet_rx, socket, start.waiter(), stop.clone());
+
+		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
+		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
+			.await
+			.expect("packet handler kept its socket after shutdown");
+	}
 }
