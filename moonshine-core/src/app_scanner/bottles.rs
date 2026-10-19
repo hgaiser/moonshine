@@ -553,6 +553,29 @@ mod tests {
 	}
 
 	#[test]
+	fn source_fingerprint_tracks_library_and_bottle_changes() {
+		let tempdir = tempdir().unwrap();
+		let data_dir = tempdir.path();
+		let config = scanner_config(data_dir.to_path_buf());
+
+		let empty = source_fingerprint(&config);
+
+		write_library(data_dir, LIBRARY_ENTRY);
+		let with_library = source_fingerprint(&config);
+		assert_ne!(with_library, empty);
+
+		// A bottle counts through its bottle.yml; deleting it must be noticed even though the
+		// library file is unchanged.
+		let gaming = make_bottle(data_dir, "Gaming");
+		fs::write(gaming.join("bottle.yml"), "Name: Gaming\n").unwrap();
+		let with_bottle = source_fingerprint(&config);
+		assert_ne!(with_bottle, with_library);
+
+		fs::remove_file(gaming.join("bottle.yml")).unwrap();
+		assert_eq!(source_fingerprint(&config), with_library);
+	}
+
+	#[test]
 	fn scans_bottle_entry_with_grid_boxart() {
 		let tempdir = tempdir().unwrap();
 		let data_dir = tempdir.path();

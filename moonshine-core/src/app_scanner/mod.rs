@@ -205,25 +205,6 @@ fn unique_title(title: &str, used: &mut HashSet<String>) -> String {
 	candidate
 }
 
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn unique_title_suffixes_repeats() {
-		let mut used = HashSet::new();
-		assert_eq!(unique_title("Hades", &mut used), "Hades");
-		assert_eq!(unique_title("hades", &mut used), "hades (2)");
-		assert_eq!(unique_title("Hades", &mut used), "Hades (3)");
-	}
-
-	#[test]
-	fn unique_title_avoids_titles_that_already_look_suffixed() {
-		let mut used = HashSet::from([title_key("Hades"), title_key("Hades (2)")]);
-		assert_eq!(unique_title("Hades", &mut used), "Hades (3)");
-	}
-}
-
 /// Combine the configured applications with freshly scanned ones and resolve missing boxart.
 pub(crate) fn load_applications(
 	configured_applications: &[ApplicationConfig],
@@ -294,6 +275,20 @@ mod tests {
 	}
 
 	#[test]
+	fn unique_title_suffixes_repeats() {
+		let mut used = HashSet::new();
+		assert_eq!(unique_title("Hades", &mut used), "Hades");
+		assert_eq!(unique_title("hades", &mut used), "hades (2)");
+		assert_eq!(unique_title("Hades", &mut used), "Hades (3)");
+	}
+
+	#[test]
+	fn unique_title_avoids_titles_that_already_look_suffixed() {
+		let mut used = HashSet::from([title_key("Hades"), title_key("Hades (2)")]);
+		assert_eq!(unique_title("Hades", &mut used), "Hades (3)");
+	}
+
+	#[test]
 	fn a_scanner_needs_a_reload_until_it_has_scanned() {
 		let tempdir = tempdir().unwrap();
 		write_desktop_entry(tempdir.path(), "game.desktop", "game");
@@ -301,7 +296,7 @@ mod tests {
 		let mut scanners = vec![desktop_scanner(tempdir.path().to_path_buf())];
 		assert!(scanners[0].needs_reload());
 
-		assert_eq!(scan_applications(&mut scanners).len(), 1);
+		assert_eq!(scan_applications(&mut scanners, &[]).len(), 1);
 		assert!(!scanners[0].needs_reload());
 	}
 
@@ -311,14 +306,14 @@ mod tests {
 		write_desktop_entry(tempdir.path(), "game.desktop", "game");
 
 		let mut scanners = vec![desktop_scanner(tempdir.path().to_path_buf())];
-		assert_eq!(scan_applications(&mut scanners).len(), 1);
+		assert_eq!(scan_applications(&mut scanners, &[]).len(), 1);
 		assert!(!scanners[0].needs_reload());
 
 		sleep(Duration::from_millis(10));
 		write_desktop_entry(tempdir.path(), "other.desktop", "other");
 
 		assert!(scanners[0].needs_reload());
-		assert_eq!(scan_applications(&mut scanners).len(), 2);
+		assert_eq!(scan_applications(&mut scanners, &[]).len(), 2);
 		assert!(!scanners[0].needs_reload());
 	}
 
@@ -330,14 +325,14 @@ mod tests {
 		write_desktop_entry(tempdir.path(), "new.desktop", "new");
 
 		let mut scanners = vec![desktop_scanner(tempdir.path().to_path_buf())];
-		assert_eq!(scan_applications(&mut scanners).len(), 2);
+		assert_eq!(scan_applications(&mut scanners, &[]).len(), 2);
 		assert!(!scanners[0].needs_reload());
 
 		// The newest file stays, so the latest timestamp alone would not notice.
 		fs::remove_file(tempdir.path().join("old.desktop")).unwrap();
 
 		assert!(scanners[0].needs_reload());
-		assert_eq!(scan_applications(&mut scanners).len(), 1);
+		assert_eq!(scan_applications(&mut scanners, &[]).len(), 1);
 	}
 
 	#[test]
@@ -347,7 +342,7 @@ mod tests {
 		fs::write(&db, b"not a database").unwrap();
 
 		let mut scanners = vec![lutris_scanner(db)];
-		assert!(scan_applications(&mut scanners).is_empty());
+		assert!(scan_applications(&mut scanners, &[]).is_empty());
 		assert!(scanners[0].needs_reload());
 	}
 }
