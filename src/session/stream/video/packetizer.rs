@@ -24,6 +24,11 @@ const PAYLOAD_OFFSET: usize = NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE;
 /// Size of the per-shard encryption prefix: iv(12) + frameNumber(4) + tag(16).
 const ENC_PREFIX_SIZE: usize = 12 + 4 + 16;
 
+/// Two-bit current and last block indices in `multiFecBlocks`.
+const MAX_FEC_BLOCKS: usize = 4;
+/// Ten-bit data count in `fecInfo`; zero does not represent 1024.
+const MAX_DATA_SHARDS_PER_BLOCK: usize = 1023;
+
 #[repr(u8)]
 enum RtpFlag {
 	ContainsPicData = 0x1,
@@ -231,20 +236,32 @@ impl Packetizer {
 
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
+		if nr_data_shards > MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK {
+			tracing::warn!("Encoded frame {frame_number} needs {nr_data_shards} packets, exceeding the wire limit.");
+			return Err(());
+		}
 
 		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
 		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
+		// Preserve the protected layout while the last block is representable.
+		// Otherwise balance four unprotected blocks, as a count above 1023
+		// would truncate on the wire and prevent reconstruction without loss.
+		let (nr_data_shards_per_block, fec_percentage, minimum_fec_packets) =
+			if nr_data_shards > (MAX_FEC_BLOCKS - 1) * nr_data_shards_per_block + MAX_DATA_SHARDS_PER_BLOCK {
+				(nr_data_shards.div_ceil(MAX_FEC_BLOCKS), 0, 0)
+			} else {
+				(nr_data_shards_per_block, fec_percentage, minimum_fec_packets)
+			};
 
 		// We need to subtract number of data shards by 1, otherwise you can get a situation where
 		// there are for example 100 data shards allowed per block and also 100 data shards available.
 		// In this case, nr_blocks = 100 / 100 + 1 = 2, but we only need to send 1 block.
 		// Subtracting the value of nr_data_shards by 1 avoids this situation.
 		let nr_blocks = (nr_data_shards - 1) / nr_data_shards_per_block + 1;
-		let last_block_index = (nr_blocks.min(4) as u8 - 1) << 6; // TODO: Why the bit shift? To 'force' a limit of 4 blocks?
+		// Last block occupies bits 6-7, current block bits 4-5.
+		let last_block_index = (nr_blocks.min(MAX_FEC_BLOCKS) as u8 - 1) << 6;
 
-		tracing::trace!(
-			"Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block."
-		);
+		tracing::trace!("Sending a max of {nr_data_shards_per_block} data shards per FEC block.");
 		tracing::trace!("Sending {nr_blocks} blocks of video data.");
 
 		// Accumulate all blocks into a single batch.
@@ -257,16 +274,13 @@ impl Packetizer {
 		let mut total_fec_headers_us = 0u128;
 		let mut total_extend_us = 0u128;
 
-		for block_index in 0..nr_blocks {
+		for block_index in 0..nr_blocks.min(MAX_FEC_BLOCKS) {
 			let start = block_index * nr_data_shards_per_block;
-			let mut end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
-
-			if block_index == 3 {
-				tracing::debug!(
-					"Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC."
-				);
-				end = nr_data_shards;
-			}
+			let end = if block_index == MAX_FEC_BLOCKS - 1 {
+				nr_data_shards
+			} else {
+				((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards)
+			};
 
 			let nr_data_shards = end - start;
 			assert!(nr_data_shards != 0);
@@ -414,10 +428,6 @@ impl Packetizer {
 			total_extend_us += t_extend.elapsed().as_micros();
 
 			tracing::trace!("Finished sending frame {frame_number}.");
-
-			if block_index == 3 {
-				break;
-			}
 		}
 
 		tracing::trace!(
@@ -444,5 +454,88 @@ impl Packetizer {
 				encoder
 			},
 		})
+	}
+}
+
+#[cfg(test)]
+mod fec_tests {
+	use super::*;
+
+	fn packetizer(encrypted: bool) -> Packetizer {
+		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
+			remote_input_key: vec![0x42; 16],
+			remote_input_key_id: 1,
+		});
+		Packetizer::new(encrypted, keys)
+	}
+
+	fn frame(data_shards: usize) -> Vec<u8> {
+		(0..data_shards * 64 - VIDEO_FRAME_HEADER_SIZE)
+			.map(|index| (index % 251) as u8)
+			.collect()
+	}
+
+	fn reassemble(batch: &ShardBatch, encrypted: bool) -> Vec<u8> {
+		let cipher = Aes128Gcm::new_from_slice(&[0x42; 16]).unwrap();
+		let mut bytes = Vec::new();
+		let mut last_payload = 0;
+		let mut data_packets = 0;
+		for wire in batch.as_bytes().chunks_exact(batch.shard_size()) {
+			let mut packet = if encrypted { wire[32..].to_vec() } else { wire.to_vec() };
+			if encrypted {
+				cipher
+					.decrypt_in_place_detached(
+						Nonce::from_slice(&wire[..12]),
+						b"",
+						&mut packet,
+						aes_gcm::Tag::from_slice(&wire[16..32]),
+					)
+					.unwrap();
+			}
+			let fec = u32::from_le_bytes(packet[28..32].try_into().unwrap());
+			if (fec >> 12) & 0x3ff >= fec >> 22 {
+				continue;
+			}
+			if data_packets == 0 {
+				last_payload = u32::from_le_bytes(packet[36..40].try_into().unwrap()) as usize;
+			}
+			bytes.extend_from_slice(&packet[32..]);
+			data_packets += 1;
+		}
+		let payload = batch.shard_size() - if encrypted { 64 } else { 32 };
+		bytes.truncate((data_packets - 1) * payload + last_payload);
+		bytes.drain(..8);
+		bytes
+	}
+
+	#[test]
+	fn oversized_frames_preserve_every_byte_without_packet_loss() {
+		// Cover the fourth block's ten-bit count boundary at 20% FEC,
+		// including the adjacent boundary when parity rounds upward.
+		for shards in [1659, 1660, 1663, 2000, 4092] {
+			for tail in [0, 13] {
+				let mut data = frame(shards);
+				data.truncate(data.len() - tail);
+				for encrypted in [false, true] {
+					let batch = packetizer(encrypted)
+						.packetize(&data, true, 80, 2, 20, 1, &mut 0, 0, 0)
+						.unwrap();
+					let received = reassemble(&batch, encrypted);
+					assert_eq!(received.len(), data.len(), "{shards} data packets, tail {tail}");
+					assert!(received == data, "{shards} data packets, tail {tail}: bytes differ");
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn oversized_frames_beyond_the_wire_limit_do_not_consume_sequence_numbers() {
+		let mut sequence = 77;
+		assert!(
+			packetizer(false)
+				.packetize(&frame(4093), true, 80, 2, 20, 1, &mut sequence, 0, 0)
+				.is_err()
+		);
+		assert_eq!(sequence, 77);
 	}
 }
