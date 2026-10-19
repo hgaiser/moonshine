@@ -510,6 +510,8 @@ mod fec_tests {
 		let mut bytes = Vec::new();
 		let mut last_payload = 0;
 		let mut data_packets = 0;
+		let mut highest_block = 0;
+		let mut declared_last_block = None;
 		for wire in batch.as_bytes().chunks_exact(batch.shard_size()) {
 			let mut packet = if encrypted { wire[32..].to_vec() } else { wire.to_vec() };
 			if encrypted {
@@ -522,6 +524,9 @@ mod fec_tests {
 					)
 					.unwrap();
 			}
+			let last_block = packet[27] >> 6;
+			assert_eq!(*declared_last_block.get_or_insert(last_block), last_block);
+			highest_block = highest_block.max((packet[27] >> 4) & 3);
 			let fec = u32::from_le_bytes(packet[28..32].try_into().unwrap());
 			if (fec >> 12) & 0x3ff >= fec >> 22 {
 				continue;
@@ -532,6 +537,7 @@ mod fec_tests {
 			bytes.extend_from_slice(&packet[32..]);
 			data_packets += 1;
 		}
+		assert_eq!(declared_last_block, Some(highest_block));
 		let payload = batch.shard_size() - if encrypted { 64 } else { 32 };
 		bytes.truncate((data_packets - 1) * payload + last_payload);
 		bytes.drain(..8);
@@ -599,9 +605,7 @@ mod fec_tests {
 					data + parity,
 					"{data_shards} data shards, minimum {minimum}"
 				);
-				if parity == 0 {
-					continue;
-				}
+				assert!(parity > 0, "{data_shards} data shards, minimum {minimum}");
 				assert!(data + parity <= 255);
 				let expected = packets[0][PAYLOAD_OFFSET..].to_vec();
 				let mut received: Vec<_> = packets.iter().cloned().map(Some).collect();
