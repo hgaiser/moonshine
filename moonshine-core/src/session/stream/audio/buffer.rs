@@ -173,8 +173,12 @@ impl PlaybackBuffer {
 		true
 	}
 
+	/// Drops all queued audio, including what the resampler's filter still holds.
 	pub fn clear(&mut self) {
-		self.buffer_mut().inner.clear()
+		self.buffer_mut().inner.clear();
+		if let RateConvert::Resample { resampler, .. } = &mut self.convert {
+			resampler.reset();
+		}
 	}
 }
 
@@ -487,6 +491,28 @@ mod tests {
 			);
 			assert!(result.is_err(), "rate {rate} was accepted");
 		}
+	}
+
+	/// After a flush, nothing the resampler's filter still held may leak into the next audio.
+	#[test]
+	fn clear_flushes_the_resampler_state() {
+		let mut buf = playback(f32_stream(2, 44100), pulse::ChannelMap::stereo(), AudioChannels::Stereo);
+		write_f32(&mut buf, 441, |i| {
+			let x = (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / 44100.0).sin() * 0.5;
+			vec![x, x]
+		});
+		let mut out = vec![0.0f32; 240 * 2];
+		assert!(buf.drain_and_mix(240, &mut out, &[1.0, 1.0]));
+
+		buf.clear();
+		write_f32(&mut buf, 441, |_| vec![0.0, 0.0]);
+		out.iter_mut().for_each(|s| *s = 0.0);
+		assert!(buf.drain_and_mix(240, &mut out, &[1.0, 1.0]));
+		assert!(
+			out.iter().all(|s| s.abs() < 1e-6),
+			"audio from before the flush leaked through: {:?}",
+			&out[..8]
+		);
 	}
 
 	/// Passthrough (matching rate) must be effectively lossless.
