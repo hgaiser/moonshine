@@ -4,7 +4,6 @@ use std::{
 	net::{IpAddr, SocketAddr, ToSocketAddrs},
 	path::PathBuf,
 	str::FromStr,
-	sync::{Arc, PoisonError, RwLock},
 };
 
 use async_shutdown::ShutdownManager;
@@ -26,7 +25,7 @@ use tokio::net::TcpListener;
 
 use crate::{
 	ShutdownReason,
-	app_scanner::{self, ApplicationScanner, ApplicationScannerConfig},
+	app_scanner::{ApplicationManager, ApplicationScannerConfig},
 	clients::ClientManager,
 	session::{
 		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys, application::ApplicationConfig,
@@ -86,11 +85,7 @@ pub struct Webserver {
 	name: String,
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
-	configured_applications: Vec<ApplicationConfig>,
-	/// Scanners that add dynamically discovered applications.
-	application_scanners: Arc<RwLock<Vec<ApplicationScanner>>>,
-	/// Configured and scanned applications, refreshed when a scanner's source data changed.
-	applications: Arc<RwLock<Vec<ApplicationConfig>>>,
+	application_manager: ApplicationManager,
 	unique_id: String,
 	client_manager: ClientManager,
 	session_manager: SessionManager,
@@ -119,19 +114,11 @@ impl Webserver {
 		session_manager: SessionManager,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
-		let mut application_scanners: Vec<ApplicationScanner> =
-			application_scanners.into_iter().map(ApplicationScanner::new).collect();
-
 		let server = Self {
 			name,
 			rtsp_port,
 			webserver_config,
-			applications: Arc::new(RwLock::new(app_scanner::load_applications(
-				&applications,
-				&mut application_scanners,
-			))),
-			configured_applications: applications,
-			application_scanners: Arc::new(RwLock::new(application_scanners)),
+			application_manager: ApplicationManager::new(applications, application_scanners),
 			unique_id,
 			client_manager,
 			session_manager,
@@ -441,47 +428,12 @@ impl Webserver {
 		Ok(response)
 	}
 
-	/// Find an application by ID in the most recently scanned list.
-	fn find_application(&self, application_id: i32) -> Option<ApplicationConfig> {
-		let applications = self.applications.read().unwrap_or_else(PoisonError::into_inner);
-		applications.iter().find(|a| a.id() == application_id).cloned()
-	}
-
 	async fn app_list(&self) -> Response<Full<Bytes>> {
-		// Rescan so newly installed games show up without restarting moonshine,
-		// but only when a scanner's source data changed since the last scan.
-		let needs_reload = {
-			let scanners = self.application_scanners.read().unwrap_or_else(PoisonError::into_inner);
-			scanners.iter().any(ApplicationScanner::needs_reload)
-		};
-
-		if needs_reload {
-			let configured_applications = self.configured_applications.clone();
-			let mut scanners = self
-				.application_scanners
-				.read()
-				.unwrap_or_else(PoisonError::into_inner)
-				.clone();
-
-			match tokio::task::spawn_blocking(move || {
-				let applications = app_scanner::load_applications(&configured_applications, &mut scanners);
-				(applications, scanners)
-			})
-			.await
-			{
-				Ok((applications, scanners)) => {
-					*self.applications.write().unwrap_or_else(PoisonError::into_inner) = applications;
-					*self
-						.application_scanners
-						.write()
-						.unwrap_or_else(PoisonError::into_inner) = scanners;
-				},
-				Err(e) => tracing::warn!("Failed to rescan applications: {e}"),
-			}
-		}
+		// Rescan so newly installed games show up without restarting moonshine.
+		self.application_manager.refresh().await;
 
 		let mut response = "<root status_code=\"200\">".to_string();
-		for application in self.applications.read().unwrap_or_else(PoisonError::into_inner).iter() {
+		for application in self.application_manager.applications().iter() {
 			response += "<App>";
 
 			let hdr_supported = u8::from(self.hdr_supported);
@@ -519,7 +471,7 @@ impl Webserver {
 			},
 		};
 
-		let application = match self.find_application(application_id) {
+		let application = match self.application_manager.find(application_id) {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);
@@ -845,7 +797,7 @@ impl Webserver {
 		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);
 		let hdr = hdr_mode != 0;
 
-		let application = match self.find_application(application_id) {
+		let application = match self.application_manager.find(application_id) {
 			Some(application) => application,
 			None => {
 				let message = format!("Couldn't find application with ID {}.", application_id - 1);

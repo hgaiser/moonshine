@@ -17,7 +17,10 @@ pub mod bottles;
 pub mod desktop;
 pub mod heroic;
 pub mod lutris;
+pub mod manager;
 pub mod steam;
+
+pub use manager::ApplicationManager;
 
 use crate::session::application::ApplicationConfig;
 
@@ -222,7 +225,7 @@ mod tests {
 }
 
 /// Combine the configured applications with freshly scanned ones and resolve missing boxart.
-pub fn load_applications(
+pub(crate) fn load_applications(
 	configured_applications: &[ApplicationConfig],
 	application_scanners: &mut [ApplicationScanner],
 ) -> Vec<ApplicationConfig> {
