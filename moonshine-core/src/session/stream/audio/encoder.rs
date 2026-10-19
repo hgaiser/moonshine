@@ -6,6 +6,7 @@ use crate::crypto::encrypt_cbc;
 use crate::session::SessionKeysReceiver;
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::RtpHeader;
+use crate::session::stream::StartWaiter;
 
 use crate::session::stream::audio::OpusStreamConfig;
 use crate::session::stream::audio::pulse_server::AudioFrame;
@@ -38,7 +39,7 @@ impl AudioEncoder {
 		encrypt: bool,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop: ShutdownManager<SessionShutdownReason>,
-		start: tokio::sync::watch::Receiver<bool>,
+		start: StartWaiter,
 	) -> Result<(), ()> {
 		tracing::debug!("Starting audio encoder.");
 		tracing::debug!(
@@ -105,7 +106,7 @@ impl AudioEncoderInner {
 		encrypt: bool,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop: ShutdownManager<SessionShutdownReason>,
-		mut start: tokio::sync::watch::Receiver<bool>,
+		mut start: StartWaiter,
 	) {
 		// Trigger session shutdown when the audio encoder stops.
 		let _session_stop_token = stop.trigger_shutdown_token(SessionShutdownReason::AudioEncoderStopped);
@@ -116,10 +117,7 @@ impl AudioEncoderInner {
 			.enable_all()
 			.build()
 			.expect("Failed to build tokio runtime for audio encoder");
-		if !matches!(
-			rt.block_on(stop.wrap_cancel(start.wait_for(|started| *started))),
-			Ok(Ok(_))
-		) {
+		if !rt.block_on(start.wait(&stop)) {
 			tracing::debug!("Audio encoder stopped before start signal.");
 			return;
 		}

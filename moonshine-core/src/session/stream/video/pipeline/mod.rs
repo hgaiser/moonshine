@@ -21,6 +21,7 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::CompositorFrames;
 use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeState, color_space, hdr_metadata};
 use crate::session::manager::SessionShutdownReason;
+use crate::session::stream::StartWaiter;
 
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::shard_batch::ShardBatch;
@@ -458,7 +459,7 @@ impl VideoPipeline {
 		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		start: watch::Receiver<bool>,
+		start: StartWaiter,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
@@ -516,7 +517,7 @@ impl VideoPipelineInner {
 		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		mut start: watch::Receiver<bool>,
+		mut start: StartWaiter,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 	) {
 		tracing::debug!("Starting video pipeline.");
@@ -531,10 +532,7 @@ impl VideoPipelineInner {
 			.enable_all()
 			.build()
 			.expect("Failed to build tokio runtime for video pipeline");
-		if !matches!(
-			rt.block_on(stop_session_manager.wrap_cancel(start.wait_for(|started| *started))),
-			Ok(Ok(_))
-		) {
+		if !rt.block_on(start.wait(&stop_session_manager)) {
 			tracing::debug!("Video pipeline stopped before start signal.");
 			return;
 		}

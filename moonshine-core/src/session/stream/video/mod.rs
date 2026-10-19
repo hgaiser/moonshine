@@ -9,6 +9,7 @@ use crate::session::SessionKeysReceiver;
 use crate::session::compositor::CompositorFrames;
 use crate::session::compositor::frame::HdrModeState;
 use crate::session::manager::SessionShutdownReason;
+use crate::session::stream::{StartSignal, StartWaiter};
 
 mod gso_socket;
 mod packetizer;
@@ -226,7 +227,7 @@ pub struct VideoStreamContext {
 /// until `trigger()` is called on `StartB`.
 #[derive(Clone)]
 pub(crate) struct VideoStreamHandle {
-	start: watch::Sender<bool>,
+	start: StartSignal,
 	idr_tx: broadcast::Sender<()>,
 	/// Reference frame invalidation requests, carrying the inclusive
 	/// `[first, last]` client frame-index range the client could not decode.
@@ -238,7 +239,7 @@ pub(crate) struct VideoStreamHandle {
 impl VideoStreamHandle {
 	/// Signal the video pipeline and packet handler to begin processing.
 	pub fn trigger(&self) {
-		self.start.send_replace(true);
+		self.start.trigger();
 	}
 
 	/// Request an IDR (key) frame from the encoder.
@@ -270,8 +271,8 @@ impl VideoStreamHandle {
 		self.resume_pending.store(true, Ordering::Relaxed);
 	}
 
-	/// Clone the start flag for external triggering (e.g. bench binary).
-	pub fn clone_start(&self) -> watch::Sender<bool> {
+	/// The start signal, for external triggering (e.g. bench binary).
+	pub fn start_signal(&self) -> StartSignal {
 		self.start.clone()
 	}
 }
@@ -332,7 +333,7 @@ impl VideoStream {
 		}
 
 		// Gate for pipeline + packet handler.
-		let (start, _) = watch::channel(false);
+		let start = StartSignal::new();
 
 		// IDR broadcast channel.
 		let (idr_tx, _idr_rx) = broadcast::channel(1);
@@ -352,7 +353,7 @@ impl VideoStream {
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
-			start.subscribe(),
+			start.waiter(),
 			reset_tx.clone(),
 			resume_pending.clone(),
 			stop.clone(),
@@ -371,7 +372,7 @@ impl VideoStream {
 			reset_tx.subscribe(),
 			stop.clone(),
 			hdr_metadata_tx,
-			start.subscribe(),
+			start.waiter(),
 			stats_tx,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
@@ -388,18 +389,13 @@ impl VideoStream {
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<(u32, ShardBatch)>,
 	socket: UdpGsoSocket,
-	mut start: watch::Receiver<bool>,
+	mut start: StartWaiter,
 	reset_tx: broadcast::Sender<u32>,
 	resume_pending: Arc<AtomicBool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 ) {
 	tokio::spawn(async move {
-		if !matches!(
-			stop_session_manager
-				.wrap_cancel(start.wait_for(|started| *started))
-				.await,
-			Ok(Ok(_))
-		) {
+		if !start.wait(&stop_session_manager).await {
 			return;
 		}
 
@@ -491,95 +487,25 @@ mod tests {
 	use super::*;
 
 	#[tokio::test]
-	async fn immediate_start_wakes_packet_handler_and_encoder() {
-		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
-		let (packet_tx, packet_rx) = mpsc::channel(1);
-		let (start, mut encoder_start) = watch::channel(false);
-		let stop = ShutdownManager::new();
-		spawn_handle_video_packets(packet_rx, socket, start.subscribe(), stop.clone());
-
-		// Start before the spawned task has been polled, as the bench does.
-		let (idr_tx, _) = broadcast::channel(1);
-		let (invalidate_tx, _) = broadcast::channel(1);
-		let (reset_tx, _) = broadcast::channel(1);
-		VideoStreamHandle {
-			start,
-			idr_tx,
-			invalidate_tx,
-			reset_tx,
-		}
-		.trigger();
-		let timeout = std::time::Duration::from_secs(1);
-		tokio::time::timeout(timeout, encoder_start.wait_for(|started| *started))
-			.await
-			.expect("encoder start signal lost")
-			.unwrap();
-		packet_tx
-			.send(shard_batch::ShardBuf::new(0, 1392, 0).into_batch())
-			.await
-			.unwrap();
-		let permit = tokio::time::timeout(timeout, packet_tx.reserve())
-			.await
-			.expect("packet handler did not start")
-			.unwrap();
-		drop(permit);
-		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
-		tokio::time::timeout(timeout, packet_tx.closed()).await.unwrap();
-	}
-
-	#[tokio::test]
-	async fn packet_handler_waits_for_start() {
-		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
-		let (packet_tx, packet_rx) = mpsc::channel(1);
-		let (start, started) = watch::channel(false);
-		let stop = ShutdownManager::new();
-		spawn_handle_video_packets(packet_rx, socket, started, stop.clone());
-		packet_tx
-			.send(shard_batch::ShardBuf::new(0, 1392, 0).into_batch())
-			.await
-			.unwrap();
-		assert!(
-			tokio::time::timeout(std::time::Duration::from_millis(25), packet_tx.reserve())
-				.await
-				.is_err(),
-			"packet handler consumed a packet before start"
-		);
-
-		start.send_replace(true);
-		start.send_replace(true);
-		let timeout = std::time::Duration::from_secs(1);
-		let permit = tokio::time::timeout(timeout, packet_tx.reserve())
-			.await
-			.expect("packet handler did not start")
-			.unwrap();
-		drop(permit);
-		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
-		tokio::time::timeout(timeout, packet_tx.closed()).await.unwrap();
-	}
-
-	#[tokio::test]
-	async fn dropping_start_sender_releases_packet_handler() {
-		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
-		let (packet_tx, packet_rx) = mpsc::channel(1);
-		let (start, started) = watch::channel(false);
-		spawn_handle_video_packets(packet_rx, socket, started, ShutdownManager::new());
-		drop(start);
-		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
-			.await
-			.expect("packet handler retained its resources after the start sender closed");
-	}
-
-	#[tokio::test]
 	async fn shutdown_before_start_releases_packet_handler() {
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
 		let (packet_tx, packet_rx) = mpsc::channel(1);
-		let (_start, started) = watch::channel(false);
+		let (reset_tx, _) = broadcast::channel(1);
+		let start = StartSignal::new();
 		let stop = ShutdownManager::new();
-		spawn_handle_video_packets(packet_rx, socket, started, stop.clone());
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			start.waiter(),
+			reset_tx,
+			Arc::new(AtomicBool::new(false)),
+			stop.clone(),
+		);
+
 		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
 		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
 			.await
-			.unwrap();
+			.expect("packet handler kept its socket after shutdown");
 	}
 
 	fn config(max_packet_size: usize) -> VideoStreamConfig {

@@ -12,6 +12,7 @@ use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
 use crate::session::SessionState;
 use crate::session::compositor::CompositorConfig;
+use crate::session::stream::StartSignal;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
@@ -90,10 +91,10 @@ struct SessionManagerInner {
 	stop_watcher: Option<tokio::task::JoinHandle<()>>,
 
 	/// Starts the video pipeline (used by bench / external callers).
-	video_start: Option<tokio::sync::watch::Sender<bool>>,
+	video_start: Option<StartSignal>,
 
 	/// Starts the audio pipeline (used by bench / external callers).
-	audio_start: Option<tokio::sync::watch::Sender<bool>>,
+	audio_start: Option<StartSignal>,
 
 	/// Shutdown manager for the entire application.
 	shutdown: ShutdownManager<ShutdownReason>,
@@ -207,7 +208,7 @@ impl SessionManager {
 	pub async fn trigger_streams_start(&self) {
 		let inner = self.inner.lock().await;
 		for start in [&inner.video_start, &inner.audio_start].into_iter().flatten() {
-			start.send_replace(true);
+			start.trigger();
 		}
 	}
 
