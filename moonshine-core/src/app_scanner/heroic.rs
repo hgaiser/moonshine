@@ -1,11 +1,10 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use super::latest_modified;
+use super::{SourceFingerprint, source_fingerprint as fingerprint};
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -188,18 +187,18 @@ struct HeroicInstalledGame {
 	is_dlc: bool,
 }
 
-/// Modified timestamp of the most recently changed file the scan reads.
+/// Fingerprint of the files the scan reads.
 ///
 /// Covers the store library caches, the sideload library, and every store's
 /// installed games manifest.
-pub(crate) fn source_modified(config: &HeroicApplicationScannerConfig) -> Option<SystemTime> {
+pub(crate) fn source_fingerprint(config: &HeroicApplicationScannerConfig) -> SourceFingerprint {
 	let binding = config.config_dir.to_string_lossy();
 	let Ok(expanded) = shellexpand::full(&binding) else {
-		return None;
+		return SourceFingerprint::default();
 	};
 	let config_dir = PathBuf::from(expanded.as_ref());
 
-	latest_modified(&[config_dir], usize::MAX, |path| {
+	fingerprint(&[config_dir], usize::MAX, |path| {
 		let filename = path.file_name().and_then(|filename| filename.to_str());
 		filename.is_some_and(|filename| {
 			filename.ends_with(LIBRARY_SUFFIX) || filename == "library.json" || filename == "installed.json"
@@ -747,19 +746,20 @@ mod tests {
 	}
 
 	#[test]
-	fn source_modified_tracks_library_changes() {
+	fn source_fingerprint_tracks_library_changes() {
 		let tempdir = tempdir().unwrap();
 		let config_dir = tempdir.path();
 		let config = scanner_config(config_dir.to_path_buf());
 
-		assert_eq!(source_modified(&config), None);
+		let empty = source_fingerprint(&config);
 
 		write_library(
 			config_dir,
 			"store_cache/legendary_library.json",
 			r#"{"library": [{"app_name": "epic-id", "title": "Epic Game", "runner": "legendary", "is_installed": true}]}"#,
 		);
-		let modified = source_modified(&config).unwrap();
+		let created = source_fingerprint(&config);
+		assert_ne!(created, empty);
 
 		sleep(Duration::from_millis(10));
 		write_library(
@@ -767,10 +767,26 @@ mod tests {
 			"store_cache/legendary_library.json",
 			r#"{"library": [{"app_name": "epic-id", "title": "Renamed", "runner": "legendary", "is_installed": true}]}"#,
 		);
-		assert!(source_modified(&config).unwrap() > modified);
+		let changed = source_fingerprint(&config);
+		assert_ne!(changed, created);
 
 		// An installed games manifest counts too.
 		write_library(config_dir, "gog_store/installed.json", r#"{"installed": []}"#);
-		assert!(source_modified(&config).unwrap() > modified);
+		assert_ne!(source_fingerprint(&config), changed);
+	}
+
+	#[test]
+	fn source_fingerprint_notices_a_deleted_manifest() {
+		let tempdir = tempdir().unwrap();
+		let config_dir = tempdir.path();
+		let config = scanner_config(config_dir.to_path_buf());
+
+		write_library(config_dir, "gog_store/installed.json", r#"{"installed": []}"#);
+		sleep(Duration::from_millis(10));
+		write_library(config_dir, "store_cache/gog_library.json", r#"{"games": []}"#);
+		let both = source_fingerprint(&config);
+
+		fs::remove_file(config_dir.join("gog_store/installed.json")).unwrap();
+		assert_ne!(source_fingerprint(&config), both);
 	}
 }

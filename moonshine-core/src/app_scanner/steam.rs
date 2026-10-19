@@ -1,14 +1,13 @@
 use std::{
 	path::{Path, PathBuf},
 	str::FromStr,
-	time::SystemTime,
 };
 
 use serde::{Deserialize, Serialize};
 use steamlocate::SteamDir;
 use walkdir::WalkDir;
 
-use super::latest_modified;
+use super::{SourceFingerprint, source_fingerprint as fingerprint};
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,20 +136,20 @@ pub(crate) fn scan_steam_applications(config: &SteamApplicationScannerConfig) ->
 	Ok(applications)
 }
 
-/// Modified timestamp of the most recently changed file the scan reads.
+/// Fingerprint of the files the scan reads.
 ///
 /// That is the library list (`steamapps/libraryfolders.vdf`) and every game
 /// manifest (`steamapps/appmanifest_*.acf`) in each library. The steamapps
 /// directories are only searched one level deep, so game data and Proton
 /// prefixes are never walked.
-pub(crate) fn source_modified(config: &SteamApplicationScannerConfig) -> Option<SystemTime> {
+pub(crate) fn source_fingerprint(config: &SteamApplicationScannerConfig) -> SourceFingerprint {
 	// Expand the library path.
 	let library_str = config.library.to_string_lossy();
 	let Ok(library) = shellexpand::full(&library_str) else {
-		return None;
+		return SourceFingerprint::default();
 	};
 	let Ok(steam_dir) = SteamDir::from_dir(Path::new(&*library)) else {
-		return None;
+		return SourceFingerprint::default();
 	};
 
 	let mut steamapps_directories = vec![steam_dir.path().join("steamapps")];
@@ -158,7 +157,7 @@ pub(crate) fn source_modified(config: &SteamApplicationScannerConfig) -> Option<
 		steamapps_directories.extend(libraries.flatten().map(|library| library.path().join("steamapps")));
 	}
 
-	latest_modified(&steamapps_directories, 1, |path| {
+	fingerprint(&steamapps_directories, 1, |path| {
 		let filename = path.file_name().and_then(|filename| filename.to_str());
 		filename.is_some_and(|filename| {
 			filename == "libraryfolders.vdf" || (filename.starts_with("appmanifest_") && filename.ends_with(".acf"))
@@ -229,29 +228,49 @@ mod tests {
 	}
 
 	#[test]
-	fn source_modified_tracks_manifest_changes() {
+	fn source_fingerprint_tracks_manifest_changes() {
 		let tempdir = tempdir().unwrap();
 		let steam_dir = tempdir.path().join("Steam");
 		write_library_folders(&steam_dir);
 
 		let config = scanner_config(steam_dir.clone());
 
-		// With only the library list present, that file decides the timestamp.
-		let modified = source_modified(&config).unwrap();
+		// With only the library list present, that file decides the fingerprint.
+		let initial = source_fingerprint(&config);
 
-		fs::write(steam_dir.join("steamapps").join("appmanifest_400.acf"), "manifest").unwrap();
-		assert!(source_modified(&config).unwrap() > modified);
+		let manifest = steam_dir.join("steamapps").join("appmanifest_400.acf");
+		fs::write(&manifest, "manifest").unwrap();
+		let installed = source_fingerprint(&config);
+		assert_ne!(installed, initial);
 
 		sleep(Duration::from_millis(10));
-		fs::write(steam_dir.join("steamapps").join("appmanifest_400.acf"), "changed").unwrap();
-		assert!(source_modified(&config).unwrap() > modified);
+		fs::write(&manifest, "changed").unwrap();
+		assert_ne!(source_fingerprint(&config), installed);
 	}
 
 	#[test]
-	fn source_modified_is_none_without_a_steam_directory() {
+	fn source_fingerprint_notices_an_uninstalled_game() {
+		let tempdir = tempdir().unwrap();
+		let steam_dir = tempdir.path().join("Steam");
+		write_library_folders(&steam_dir);
+		let config = scanner_config(steam_dir.clone());
+
+		let steamapps = steam_dir.join("steamapps");
+		fs::write(steamapps.join("appmanifest_400.acf"), "old").unwrap();
+		sleep(Duration::from_millis(10));
+		fs::write(steamapps.join("appmanifest_500.acf"), "new").unwrap();
+		let both = source_fingerprint(&config);
+
+		// Uninstalling the older game leaves the newest timestamp untouched.
+		fs::remove_file(steamapps.join("appmanifest_400.acf")).unwrap();
+		assert_ne!(source_fingerprint(&config), both);
+	}
+
+	#[test]
+	fn source_fingerprint_is_empty_without_a_steam_directory() {
 		let tempdir = tempdir().unwrap();
 		let config = scanner_config(tempdir.path().join("missing"));
 
-		assert_eq!(source_modified(&config), None);
+		assert_eq!(source_fingerprint(&config), SourceFingerprint::default());
 	}
 }

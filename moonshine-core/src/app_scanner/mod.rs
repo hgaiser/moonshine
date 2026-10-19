@@ -1,4 +1,6 @@
 use std::collections::HashSet;
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -39,62 +41,64 @@ pub enum ApplicationScannerConfig {
 	Bottles(BottlesApplicationScannerConfig),
 }
 
+/// Fingerprint of the files a scanner reads: their paths and modified timestamps.
+///
+/// Comparing fingerprints detects files that were added, changed or deleted. The
+/// default fingerprint stands for "no source files".
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SourceFingerprint(u64);
+
 /// An application scanner that tracks the state of its source data.
 #[derive(Clone, Debug)]
 pub struct ApplicationScanner {
 	config: ApplicationScannerConfig,
 
-	/// Modified timestamp of the source data, captured just before the last scan.
-	last_scan_modified: Option<SystemTime>,
+	/// Fingerprint of the source data, captured just before the last scan.
+	last_scan_fingerprint: Option<SourceFingerprint>,
 }
 
 impl ApplicationScanner {
 	pub fn new(config: ApplicationScannerConfig) -> Self {
 		Self {
 			config,
-			last_scan_modified: None,
+			last_scan_fingerprint: None,
 		}
 	}
 
 	/// Cheaply check whether the source data changed since the last scan.
 	///
-	/// Compares the modified timestamps of the files the scanner reads against
-	/// those recorded during the last scan, so scans can be skipped entirely
-	/// while nothing changed.
+	/// Compares a fingerprint of the files the scanner reads against the one
+	/// recorded during the last scan, so scans can be skipped entirely while
+	/// nothing changed.
 	pub fn needs_reload(&self) -> bool {
-		self.source_modified() != self.last_scan_modified
+		Some(self.source_fingerprint()) != self.last_scan_fingerprint
 	}
 
-	/// Modified timestamp of the source data this scanner reads.
-	///
-	/// Returns `None` when there is no source data (yet).
-	fn source_modified(&self) -> Option<SystemTime> {
+	/// Fingerprint of the source data this scanner reads.
+	fn source_fingerprint(&self) -> SourceFingerprint {
 		match &self.config {
-			ApplicationScannerConfig::Steam(config) => steam::source_modified(config),
-			ApplicationScannerConfig::Desktop(config) => desktop::source_modified(config),
-			ApplicationScannerConfig::Lutris(config) => lutris::source_modified(config),
-			ApplicationScannerConfig::Heroic(config) => heroic::source_modified(config),
-			ApplicationScannerConfig::Bottles(config) => bottles::source_modified(config),
+			ApplicationScannerConfig::Steam(config) => steam::source_fingerprint(config),
+			ApplicationScannerConfig::Desktop(config) => desktop::source_fingerprint(config),
+			ApplicationScannerConfig::Lutris(config) => lutris::source_fingerprint(config),
+			ApplicationScannerConfig::Heroic(config) => heroic::source_fingerprint(config),
+			ApplicationScannerConfig::Bottles(config) => bottles::source_fingerprint(config),
 		}
 	}
 }
 
-/// Modified timestamp of a file, or `None` when it cannot be read.
-fn modified_time(path: &Path) -> Option<SystemTime> {
-	path.metadata().and_then(|metadata| metadata.modified()).ok()
-}
-
-/// Latest modified timestamp of the matching files under `roots`.
+/// Fingerprint of the matching files under `roots`.
 ///
 /// Directories are searched recursively, up to `max_depth` (1 = direct
 /// children only). Scanners match the files they read with `matches`, so the
-/// walk never has to open a file to decide whether a reload is needed.
-pub(crate) fn latest_modified(
+/// walk never has to open a file to decide whether a reload is needed. The
+/// fingerprint covers every matching path, not just the newest timestamp, so
+/// deleting a file changes it too.
+pub(crate) fn source_fingerprint(
 	roots: &[PathBuf],
 	max_depth: usize,
 	matches: impl Fn(&Path) -> bool,
-) -> Option<SystemTime> {
-	let mut latest = None;
+) -> SourceFingerprint {
+	let mut files: Vec<(PathBuf, Option<SystemTime>)> = Vec::new();
 
 	for root in roots {
 		for entry in WalkDir::new(root)
@@ -104,17 +108,22 @@ pub(crate) fn latest_modified(
 			.filter_map(|entry| entry.ok())
 			.filter(|entry| entry.file_type().is_file())
 		{
-			if !matches(entry.path()) {
-				continue;
-			}
-
-			if let Some(modified) = modified_time(entry.path()) {
-				latest = latest.max(Some(modified));
+			if matches(entry.path()) {
+				let modified = entry.metadata().ok().and_then(|metadata| metadata.modified().ok());
+				files.push((entry.into_path(), modified));
 			}
 		}
 	}
 
-	latest
+	if files.is_empty() {
+		return SourceFingerprint::default();
+	}
+
+	// Walk order is not stable across directories, so sort before hashing.
+	files.sort();
+	let mut hasher = DefaultHasher::new();
+	files.hash(&mut hasher);
+	SourceFingerprint(hasher.finish())
 }
 
 /// Scan all configured application scanners.
@@ -132,9 +141,9 @@ pub fn scan_applications(
 	let mut used_titles: HashSet<String> = configured.iter().map(|app| title_key(&app.title)).collect();
 
 	for application_scanner in application_scanners {
-		// Capture the timestamp before scanning: if the source data changes
+		// Capture the fingerprint before scanning: if the source data changes
 		// while scanning, the next check still reports that a reload is needed.
-		let source_modified = application_scanner.source_modified();
+		let source_fingerprint = application_scanner.source_fingerprint();
 
 		let scanned_applications = match &application_scanner.config {
 			ApplicationScannerConfig::Steam(config) => match steam::scan_steam_applications(config) {
@@ -159,7 +168,7 @@ pub fn scan_applications(
 			},
 		};
 
-		application_scanner.last_scan_modified = source_modified;
+		application_scanner.last_scan_fingerprint = Some(source_fingerprint);
 
 		for mut application in scanned_applications {
 			let dedupe_key = (title_key(&application.title), application.command.join("\u{1f}"));
@@ -308,6 +317,24 @@ mod tests {
 		assert!(scanners[0].needs_reload());
 		assert_eq!(scan_applications(&mut scanners).len(), 2);
 		assert!(!scanners[0].needs_reload());
+	}
+
+	#[test]
+	fn a_scanner_needs_a_reload_when_a_source_file_was_deleted() {
+		let tempdir = tempdir().unwrap();
+		write_desktop_entry(tempdir.path(), "old.desktop", "old");
+		sleep(Duration::from_millis(10));
+		write_desktop_entry(tempdir.path(), "new.desktop", "new");
+
+		let mut scanners = vec![desktop_scanner(tempdir.path().to_path_buf())];
+		assert_eq!(scan_applications(&mut scanners).len(), 2);
+		assert!(!scanners[0].needs_reload());
+
+		// The newest file stays, so the latest timestamp alone would not notice.
+		fs::remove_file(tempdir.path().join("old.desktop")).unwrap();
+
+		assert!(scanners[0].needs_reload());
+		assert_eq!(scan_applications(&mut scanners).len(), 1);
 	}
 
 	#[test]

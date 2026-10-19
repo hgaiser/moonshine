@@ -1,9 +1,9 @@
-use std::{collections::HashSet, path::PathBuf, time::SystemTime};
+use std::{collections::HashSet, path::PathBuf};
 
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
-use super::latest_modified;
+use super::{SourceFingerprint, source_fingerprint as fingerprint};
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -48,12 +48,14 @@ fn is_valid_slug(slug: &str) -> bool {
 		.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
-/// Modified timestamp of the Lutris database.
-pub(crate) fn source_modified(config: &LutrisApplicationScannerConfig) -> Option<SystemTime> {
+/// Fingerprint of the Lutris database.
+pub(crate) fn source_fingerprint(config: &LutrisApplicationScannerConfig) -> SourceFingerprint {
 	let binding = config.pga_db.to_string_lossy();
-	let expanded = shellexpand::full(&binding).ok()?;
+	let Ok(expanded) = shellexpand::full(&binding) else {
+		return SourceFingerprint::default();
+	};
 
-	latest_modified(&[PathBuf::from(expanded.as_ref())], usize::MAX, |_| true)
+	fingerprint(&[PathBuf::from(expanded.as_ref())], usize::MAX, |_| true)
 }
 
 pub(crate) fn scan_lutris_applications(config: &LutrisApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {

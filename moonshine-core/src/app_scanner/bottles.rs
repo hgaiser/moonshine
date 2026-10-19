@@ -1,10 +1,9 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use super::latest_modified;
+use super::{SourceFingerprint, source_fingerprint as fingerprint};
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -159,16 +158,18 @@ struct UmuGameConfig {
 	state: Option<String>,
 }
 
-/// Modified timestamp of the most recently changed file the scan reads.
+/// Fingerprint of the files the scan reads.
 ///
 /// That is the library (`library.yml`) and each bottle's `bottle.yml`, whose presence tells
 /// whether the bottle still exists.
-pub(crate) fn source_modified(config: &BottlesApplicationScannerConfig) -> Option<SystemTime> {
+pub(crate) fn source_fingerprint(config: &BottlesApplicationScannerConfig) -> SourceFingerprint {
 	let binding = config.data_dir.to_string_lossy();
-	let expanded = shellexpand::full(&binding).ok()?;
+	let Ok(expanded) = shellexpand::full(&binding) else {
+		return SourceFingerprint::default();
+	};
 	let data_dir = PathBuf::from(expanded.as_ref());
 
-	latest_modified(&[data_dir.join(LIBRARY_YML), data_dir.join(BOTTLES_DIR)], 2, |path| {
+	fingerprint(&[data_dir.join(LIBRARY_YML), data_dir.join(BOTTLES_DIR)], 2, |path| {
 		path.file_name()
 			.is_some_and(|name| name == LIBRARY_YML || name == "bottle.yml")
 	})
