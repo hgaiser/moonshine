@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use walkdir::WalkDir;
 
+use super::{SourceFingerprint, source_fingerprint as fingerprint};
 use crate::session::application::ApplicationConfig;
 
 fn default_true() -> bool {
@@ -105,6 +106,21 @@ pub(crate) fn scan_desktop_applications(
 	}
 
 	Ok(applications)
+}
+
+/// Fingerprint of the `.desktop` files in the configured directories.
+pub(crate) fn source_fingerprint(config: &DesktopApplicationScannerConfig) -> SourceFingerprint {
+	let directories: Vec<PathBuf> = config
+		.directories
+		.iter()
+		.filter_map(|directory| expand_path(directory))
+		.collect();
+
+	fingerprint(&directories, usize::MAX, |path| {
+		path.extension()
+			.and_then(|extension| extension.to_str())
+			.is_some_and(|extension| extension.eq_ignore_ascii_case("desktop"))
+	})
 }
 
 fn parse_desktop_application(
@@ -669,6 +685,8 @@ mod tests {
 	#[cfg(unix)]
 	use std::os::unix::fs::PermissionsExt;
 	use std::sync::Mutex;
+	use std::thread::sleep;
+	use std::time::Duration;
 
 	use tempfile::tempdir;
 
@@ -909,5 +927,44 @@ TryExec=moonshine-test
 			Some(value) => unsafe { env::set_var("PATH", value) },
 			None => unsafe { env::remove_var("PATH") },
 		}
+	}
+
+	#[test]
+	fn source_fingerprint_tracks_desktop_file_changes() {
+		let tempdir = tempdir().unwrap();
+		let config = scanner_config(vec![tempdir.path().to_path_buf()]);
+
+		let empty = source_fingerprint(&config);
+
+		let desktop_file = tempdir.path().join("app.desktop");
+		write_file(&desktop_file, "[Desktop Entry]\nType=Application\nName=App\nExec=app\n");
+		let created = source_fingerprint(&config);
+		assert_ne!(created, empty);
+
+		sleep(Duration::from_millis(10));
+		write_file(
+			&desktop_file,
+			"[Desktop Entry]\nType=Application\nName=App\nExec=app2\n",
+		);
+		assert_ne!(source_fingerprint(&config), created);
+	}
+
+	#[test]
+	fn source_fingerprint_notices_a_deleted_desktop_file() {
+		let tempdir = tempdir().unwrap();
+		let config = scanner_config(vec![tempdir.path().to_path_buf()]);
+
+		write_file(
+			&tempdir.path().join("old.desktop"),
+			"[Desktop Entry]\nType=Application\nName=Old\nExec=old\n",
+		);
+		sleep(Duration::from_millis(10));
+		let newer = tempdir.path().join("new.desktop");
+		write_file(&newer, "[Desktop Entry]\nType=Application\nName=New\nExec=new\n");
+		let both = source_fingerprint(&config);
+
+		// Deleting the older file leaves the newest timestamp untouched.
+		fs::remove_file(tempdir.path().join("old.desktop")).unwrap();
+		assert_ne!(source_fingerprint(&config), both);
 	}
 }

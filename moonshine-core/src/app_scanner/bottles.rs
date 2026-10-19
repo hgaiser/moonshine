@@ -3,6 +3,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::{SourceFingerprint, source_fingerprint as fingerprint};
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -155,6 +156,23 @@ struct BottlesEntryBottle {
 struct UmuGameConfig {
 	#[serde(default)]
 	state: Option<String>,
+}
+
+/// Fingerprint of the files the scan reads.
+///
+/// That is the library (`library.yml`) and each bottle's `bottle.yml`, whose presence tells
+/// whether the bottle still exists.
+pub(crate) fn source_fingerprint(config: &BottlesApplicationScannerConfig) -> SourceFingerprint {
+	let binding = config.data_dir.to_string_lossy();
+	let Ok(expanded) = shellexpand::full(&binding) else {
+		return SourceFingerprint::default();
+	};
+	let data_dir = PathBuf::from(expanded.as_ref());
+
+	fingerprint(&[data_dir.join(LIBRARY_YML), data_dir.join(BOTTLES_DIR)], 2, |path| {
+		path.file_name()
+			.is_some_and(|name| name == LIBRARY_YML || name == "bottle.yml")
+	})
 }
 
 pub(crate) fn scan_bottles_applications(
@@ -532,6 +550,29 @@ mod tests {
 		let dir = data_dir.join(UMU_DIR).join(UMU_GAMES_DIR).join(source_id);
 		fs::create_dir_all(&dir).unwrap();
 		fs::write(dir.join(UMU_GAME_CONFIG), format!("state: {state}\n")).unwrap();
+	}
+
+	#[test]
+	fn source_fingerprint_tracks_library_and_bottle_changes() {
+		let tempdir = tempdir().unwrap();
+		let data_dir = tempdir.path();
+		let config = scanner_config(data_dir.to_path_buf());
+
+		let empty = source_fingerprint(&config);
+
+		write_library(data_dir, LIBRARY_ENTRY);
+		let with_library = source_fingerprint(&config);
+		assert_ne!(with_library, empty);
+
+		// A bottle counts through its bottle.yml; deleting it must be noticed even though the
+		// library file is unchanged.
+		let gaming = make_bottle(data_dir, "Gaming");
+		fs::write(gaming.join("bottle.yml"), "Name: Gaming\n").unwrap();
+		let with_bottle = source_fingerprint(&config);
+		assert_ne!(with_bottle, with_library);
+
+		fs::remove_file(gaming.join("bottle.yml")).unwrap();
+		assert_eq!(source_fingerprint(&config), with_library);
 	}
 
 	#[test]

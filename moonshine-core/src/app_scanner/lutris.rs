@@ -3,6 +3,7 @@ use std::{collections::HashSet, path::PathBuf};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
+use super::{SourceFingerprint, source_fingerprint as fingerprint};
 use crate::session::application::ApplicationConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -45,6 +46,16 @@ fn default_pga_db() -> PathBuf {
 fn is_valid_slug(slug: &str) -> bool {
 	slug.chars()
 		.all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// Fingerprint of the Lutris database.
+pub(crate) fn source_fingerprint(config: &LutrisApplicationScannerConfig) -> SourceFingerprint {
+	let binding = config.pga_db.to_string_lossy();
+	let Ok(expanded) = shellexpand::full(&binding) else {
+		return SourceFingerprint::default();
+	};
+
+	fingerprint(&[PathBuf::from(expanded.as_ref())], usize::MAX, |_| true)
 }
 
 pub(crate) fn scan_lutris_applications(config: &LutrisApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
