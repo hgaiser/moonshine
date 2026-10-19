@@ -65,7 +65,7 @@ pub(crate) fn pulse_create_stream_cmd(
 	flags: StreamFlags,
 	buff_attr: BufferAttr,
 ) {
-	tracing::info!(
+	tracing::debug!(
 		"Audio playback {owner} opened, media {:?}: app {:?} {} Hz {} ch -> sink {} Hz {} ch [{}]{}, buffer target={}B min_req={}B prebuf={}B, muted={}",
 		prop_str(stream_props, Prop::MediaName).unwrap_or(""),
 		stream_spec.format,
@@ -96,5 +96,5 @@ pub(crate) fn pulse_stream_closed(
 	let bytes_per_sec =
 		stream_spec.sample_rate as u64 * stream_spec.channels as u64 * stream_spec.format.bytes_per_sample() as u64;
 	let played_secs = played_bytes as f64 / bytes_per_sec.max(1) as f64;
-	tracing::info!("Audio playback {owner} closed ({reason}) after {open_for:.3?}, played {played_secs:.3}s of audio");
+	tracing::debug!("Audio playback {owner} closed ({reason}) after {open_for:.3?}, played {played_secs:.3}s of audio");
 }
