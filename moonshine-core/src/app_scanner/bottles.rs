@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -196,11 +196,10 @@ pub(crate) fn scan_bottles_applications(
 		}
 	}
 
-	// Directory and map order are arbitrary, so sort for a stable application
-	// list and deterministic title disambiguation.
+	// Directory and map order are arbitrary, so sort for a stable application list.
 	entries.sort_by_key(entry_sort_key);
 
-	let mut applications: Vec<(ApplicationConfig, String)> = Vec::new();
+	let mut applications: Vec<ApplicationConfig> = Vec::new();
 	let mut skipped = 0;
 
 	for entry in entries {
@@ -250,9 +249,11 @@ pub(crate) fn scan_bottles_applications(
 
 			let command = substitute(&config.umu_command, &[("{umu_game}", source_id), ("{name}", name)]);
 
-			applications.push((
-				build_application(config, name, command, find_boxart(&data_dir, &entry, None)),
-				"UMU".to_string(),
+			applications.push(build_application(
+				config,
+				name,
+				command,
+				find_boxart(&data_dir, &entry, None),
 			));
 		} else {
 			let Some(bottle_name) = entry
@@ -286,49 +287,18 @@ pub(crate) fn scan_bottles_applications(
 				&[("{bottle}", bottle_name), ("{program_id}", id), ("{name}", name)],
 			);
 
-			applications.push((
-				build_application(config, name, command, find_boxart(&data_dir, &entry, Some(&bottle_dir))),
-				bottle_name.to_string(),
+			applications.push(build_application(
+				config,
+				name,
+				command,
+				find_boxart(&data_dir, &entry, Some(&bottle_dir)),
 			));
 		}
 	}
 
-	// Moonshine derives an application's client-visible id from its title, so
-	// two entries sharing a title would collide. Keep the first (sorted)
-	// occurrence plain and suffix the rest, keeping every application
-	// launchable.
-	let mut used_titles: HashSet<String> = HashSet::new();
-	let mut result = Vec::with_capacity(applications.len());
-	for (mut application, disambiguator) in applications {
-		application.title = unique_title(&application.title, &disambiguator, &mut used_titles);
-		result.push(application);
-	}
+	tracing::debug!("Scanned {} Bottles games ({} skipped).", applications.len(), skipped);
 
-	tracing::debug!("Scanned {} Bottles games ({} skipped).", result.len(), skipped);
-
-	Ok(result)
-}
-
-/// Make a title unique among the ones already emitted.
-///
-/// The first occurrence keeps its title. Later ones gain ` (bottle)`; when that
-/// is taken too (three entries sharing a title inside one bottle, or several
-/// UMU entries), an occurrence count is appended so titles stay unique.
-fn unique_title(base: &str, disambiguator: &str, used: &mut HashSet<String>) -> String {
-	let mut candidate = base.to_string();
-
-	if used.contains(&candidate.trim().to_ascii_lowercase()) {
-		candidate = format!("{base} ({disambiguator})");
-
-		let mut occurrence = 1;
-		while used.contains(&candidate.trim().to_ascii_lowercase()) {
-			occurrence += 1;
-			candidate = format!("{base} ({disambiguator} {occurrence})");
-		}
-	}
-
-	used.insert(candidate.trim().to_ascii_lowercase());
-	candidate
+	Ok(applications)
 }
 
 fn entry_sort_key(entry: &BottlesLibraryEntry) -> (String, String, String, String) {
@@ -338,9 +308,7 @@ fn entry_sort_key(entry: &BottlesLibraryEntry) -> (String, String, String, Strin
 		.and_then(|bottle| bottle.name.clone())
 		.unwrap_or_default();
 	let source_id = entry.source_id.clone().unwrap_or_default();
-	// The id breaks ties: two entries sharing a name and a bottle would otherwise
-	// compare equal, leaving the library map's arbitrary order to decide which of
-	// them keeps the plain title (and with it the client-visible id).
+	// The id breaks ties so entries sharing a name and a bottle still sort stably.
 	(
 		entry.name.clone().unwrap_or_default(),
 		bottle,
@@ -720,36 +688,6 @@ umu-entry:
 	}
 
 	#[test]
-	fn disambiguates_duplicate_titles_with_the_bottle_name() {
-		let tempdir = tempdir().unwrap();
-		let data_dir = tempdir.path();
-		write_library(
-			data_dir,
-			r#"
-first:
-  bottle:
-    name: Gaming
-    path: Gaming
-  id: one
-  name: Hades
-second:
-  bottle:
-    name: Work
-    path: Work
-  id: two
-  name: Hades
-"#,
-		);
-		make_bottle(data_dir, "Gaming");
-		make_bottle(data_dir, "Work");
-
-		let applications = scan_bottles_applications(&scanner_config(data_dir.to_path_buf())).unwrap();
-
-		let titles: Vec<&str> = applications.iter().map(|app| app.title.as_str()).collect();
-		assert_eq!(titles, vec!["Hades", "Hades (Work)"]);
-	}
-
-	#[test]
 	fn falls_back_to_the_entry_icon_for_boxart() {
 		let tempdir = tempdir().unwrap();
 		let data_dir = tempdir.path();
@@ -895,41 +833,6 @@ bad:
 
 		assert_eq!(applications.len(), 1);
 		assert_eq!(applications[0].title, "Hades");
-	}
-
-	#[test]
-	fn keeps_a_third_same_titled_entry_distinct() {
-		let tempdir = tempdir().unwrap();
-		let data_dir = tempdir.path();
-		write_library(
-			data_dir,
-			r#"
-first:
-  bottle:
-    name: Gaming
-    path: Gaming
-  id: a
-  name: Hades
-second:
-  bottle:
-    name: Gaming
-    path: Gaming
-  id: b
-  name: Hades
-third:
-  bottle:
-    name: Gaming
-    path: Gaming
-  id: c
-  name: Hades
-"#,
-		);
-		make_bottle(data_dir, "Gaming");
-
-		let applications = scan_bottles_applications(&scanner_config(data_dir.to_path_buf())).unwrap();
-
-		let titles: Vec<&str> = applications.iter().map(|app| app.title.as_str()).collect();
-		assert_eq!(titles, vec!["Hades", "Hades (Gaming)", "Hades (Gaming 2)"]);
 	}
 
 	#[test]
