@@ -259,7 +259,7 @@ impl Buffer {
 }
 
 fn read_sample<R: io::Read>(fmt: pulse::SampleFormat, mut r: R) -> Option<f32> {
-	use dasp::Sample;
+	use dasp_sample::Sample;
 
 	match fmt {
 		pulse::SampleFormat::Float32Le => r.read_f32::<LE>().ok(),
@@ -446,7 +446,7 @@ mod tests {
 		out
 	}
 
-	/// Resampling 44.1 kHz → 48 kHz must stay high fidelity. The old dasp Sinc path
+	/// Resampling 44.1 kHz → 48 kHz must stay high fidelity. The old dasp sinc interpolator
 	/// collapsed to ~21 dB SNR (audibly robotic in games, especially dialog)
 	/// rubato keeps it well above 60 dB. Guards against a resampler-quality regression.
 	#[test]
