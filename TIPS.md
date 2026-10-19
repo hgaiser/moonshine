@@ -158,7 +158,7 @@ Flatpak uses the host's D-Bus session bus to communicate with portal backends. W
 
 ### How to
 
-Launch `bottles-cli` through Flatpak, wrapped with `dbus-run-session`:
+Wrap the `command` with `dbus-run-session`, as for Flatpak Steam above:
 
 ```toml
 [[application_scanner]]
@@ -177,7 +177,7 @@ umu_command = [
 
 ### Details
 
-The root cause is the same as for Flatpak Steam above: the portal backend overrides the `WAYLAND_DISPLAY`/`DISPLAY` variables Moonshine sets, so the game renders on the host's desktop. `dbus-run-session` hides the portal, and Flatpak falls back to Moonshine's environment.
+The root cause is the same as for Flatpak Steam: the portal backend overrides the `WAYLAND_DISPLAY`/`DISPLAY` variables Moonshine sets, so the game renders on the host's desktop. `dbus-run-session` hides the portal, and Flatpak falls back to Moonshine's environment.
 
 ## Run a desktop environment for a full remote desktop
 

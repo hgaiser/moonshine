@@ -197,7 +197,7 @@ pub(crate) fn scan_bottles_applications(
 	}
 
 	// Directory and map order are arbitrary, so sort for a stable application list.
-	entries.sort_by_key(entry_sort_key);
+	entries.sort_by_cached_key(EntrySortKey::new);
 
 	let mut applications: Vec<ApplicationConfig> = Vec::new();
 	let mut skipped = 0;
@@ -266,7 +266,7 @@ pub(crate) fn scan_bottles_applications(
 				continue;
 			};
 
-			let Some(bottle_dir) = bottle_dir(&data_dir, &entry.bottle) else {
+			let Some(bottle_dir) = bottle_dir(&data_dir, entry.bottle.as_ref()) else {
 				skipped += 1;
 				continue;
 			};
@@ -301,20 +301,29 @@ pub(crate) fn scan_bottles_applications(
 	Ok(applications)
 }
 
-fn entry_sort_key(entry: &BottlesLibraryEntry) -> (String, String, String, String) {
-	let bottle = entry
-		.bottle
-		.as_ref()
-		.and_then(|bottle| bottle.name.clone())
-		.unwrap_or_default();
-	let source_id = entry.source_id.clone().unwrap_or_default();
-	// The id breaks ties so entries sharing a name and a bottle still sort stably.
-	(
-		entry.name.clone().unwrap_or_default(),
-		bottle,
-		source_id,
-		entry.id.clone().unwrap_or_default(),
-	)
+/// Orders entries by name, then bottle, then UMU source id, then id, so the
+/// application list is stable even when names and bottles repeat.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct EntrySortKey {
+	name: String,
+	bottle: String,
+	source_id: String,
+	id: String,
+}
+
+impl EntrySortKey {
+	fn new(entry: &BottlesLibraryEntry) -> Self {
+		Self {
+			name: entry.name.clone().unwrap_or_default(),
+			bottle: entry
+				.bottle
+				.as_ref()
+				.and_then(|bottle| bottle.name.clone())
+				.unwrap_or_default(),
+			source_id: entry.source_id.clone().unwrap_or_default(),
+			id: entry.id.clone().unwrap_or_default(),
+		}
+	}
 }
 
 /// Resolve a bottle's prefix directory, handling bottles created with a
@@ -323,8 +332,9 @@ fn entry_sort_key(entry: &BottlesLibraryEntry) -> (String, String, String, Strin
 /// A relative path has to stay a plain directory name: it comes from
 /// `library.yml`, and joining `..` onto the data directory would point the scan
 /// at an unrelated part of the filesystem.
-fn bottle_dir(data_dir: &Path, bottle: &Option<BottlesEntryBottle>) -> Option<PathBuf> {
-	let path = bottle.as_ref()?.path.as_deref().or(bottle.as_ref()?.name.as_deref())?;
+fn bottle_dir(data_dir: &Path, bottle: Option<&BottlesEntryBottle>) -> Option<PathBuf> {
+	let bottle = bottle?;
+	let path = bottle.path.as_deref().or(bottle.name.as_deref())?;
 	let path = Path::new(path);
 
 	if path.is_absolute() {
