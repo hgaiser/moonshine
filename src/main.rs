@@ -68,7 +68,7 @@ async fn main() -> Result<(), ()> {
 
 	tracing::debug!("Using configuration:\n{:#?}", config);
 
-	let scanned_applications = app_scanner::scan_applications(&config.application_scanners);
+	let scanned_applications = app_scanner::scan_applications(&config.application_scanners, &config.applications);
 	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
 	config.applications.extend(scanned_applications);
 	app_scanner::resolve_missing_boxart(&mut config.applications);
