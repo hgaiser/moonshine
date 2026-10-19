@@ -10,6 +10,9 @@ use rubato::audioadapter_buffers::direct::InterleavedSlice;
 
 use crate::session::stream::audio::{AudioChannels, SinkSpec};
 
+/// Highest stream sample rate PulseAudio allows (`PA_RATE_MAX`).
+const MAX_STREAM_RATE: u32 = 48_000 * 8;
+
 /// Raw bytes from an app's playback stream go in; frames in the sink's
 /// channel layout and rate come out.
 pub(crate) struct PlaybackBuffer {
@@ -33,34 +36,43 @@ enum RateConvert {
 }
 
 impl PlaybackBuffer {
-	pub fn passthrough(stream_spec: pulse::SampleSpec, stream_map: pulse::ChannelMap, sink_spec: SinkSpec) -> Self {
-		Self {
-			stream_spec,
-			sink_spec,
-			buffer: Buffer::new(stream_spec, stream_map),
-			convert: RateConvert::Passthrough,
-		}
-	}
-
-	pub fn resample(
+	/// Creates a buffer for a stream, resampling only when its rate differs from the sink's.
+	///
+	/// Fails for stream rates that cannot be resampled to the sink rate, so a misbehaving
+	/// client can be rejected instead of taking the audio thread down.
+	pub fn new(
 		stream_spec: pulse::SampleSpec,
 		stream_map: pulse::ChannelMap,
 		sink_spec: SinkSpec,
 		clock_rate: u32,
-	) -> Self {
-		let num_frames = (sink_spec.sample_rate / clock_rate) as usize;
-		let resampler = new_resampler(stream_spec, sink_spec, num_frames);
-		let convert = RateConvert::Resample {
-			input_frames: vec![0.0; resampler.input_frames_max() * sink_spec.channels as usize],
-			resampled_frames: vec![0.0; num_frames * sink_spec.channels as usize],
-			resampler: Box::new(resampler),
+	) -> Result<Self, String> {
+		let convert = if stream_spec.sample_rate == sink_spec.sample_rate {
+			RateConvert::Passthrough
+		} else {
+			if stream_spec.sample_rate == 0 || stream_spec.sample_rate > MAX_STREAM_RATE {
+				return Err(format!("unsupported sample rate {} Hz", stream_spec.sample_rate));
+			}
+
+			let num_frames = (sink_spec.sample_rate / clock_rate) as usize;
+			let resampler = new_resampler(stream_spec, sink_spec, num_frames).map_err(|e| {
+				format!(
+					"cannot resample {} Hz to {} Hz: {e}",
+					stream_spec.sample_rate, sink_spec.sample_rate
+				)
+			})?;
+			RateConvert::Resample {
+				input_frames: vec![0.0; resampler.input_frames_max() * sink_spec.channels as usize],
+				resampled_frames: vec![0.0; num_frames * sink_spec.channels as usize],
+				resampler: Box::new(resampler),
+			}
 		};
-		Self {
+
+		Ok(Self {
 			stream_spec,
 			sink_spec,
 			buffer: Buffer::new(stream_spec, stream_map),
 			convert,
-		}
+		})
 	}
 
 	pub fn stream_spec(&self) -> pulse::SampleSpec {
@@ -117,7 +129,13 @@ impl PlaybackBuffer {
 				resampled_frames,
 			} => {
 				if resampler.output_frames_max() != num_frames {
-					**resampler = new_resampler(self.stream_spec, self.sink_spec, num_frames);
+					match new_resampler(self.stream_spec, self.sink_spec, num_frames) {
+						Ok(new) => **resampler = new,
+						Err(err) => {
+							tracing::error!("Failed to rebuild the audio resampler: {err}");
+							return false;
+						},
+					}
 					input_frames.resize(resampler.input_frames_max() * sink_channels as usize, 0.0);
 					resampled_frames.resize(num_frames * sink_channels as usize, 0.0);
 				}
@@ -160,7 +178,11 @@ impl PlaybackBuffer {
 	}
 }
 
-fn new_resampler(stream_spec: pulse::SampleSpec, sink_spec: SinkSpec, num_frames: usize) -> rubato::Async<f32> {
+fn new_resampler(
+	stream_spec: pulse::SampleSpec,
+	sink_spec: SinkSpec,
+	num_frames: usize,
+) -> Result<rubato::Async<f32>, rubato::ResamplerConstructionError> {
 	rubato::Async::<f32>::new_sinc(
 		sink_spec.sample_rate as f64 / stream_spec.sample_rate as f64,
 		1.0, // The ratio never changes
@@ -169,7 +191,6 @@ fn new_resampler(stream_spec: pulse::SampleSpec, sink_spec: SinkSpec, num_frames
 		sink_spec.channels as usize,
 		rubato::FixedAsync::Output,
 	)
-	.expect("valid resampler parameters")
 }
 
 /// Raw bytes from the app, decoded according to the stream's spec.
@@ -403,12 +424,7 @@ mod tests {
 		stream_map: pulse::ChannelMap,
 		sink_channels: AudioChannels,
 	) -> PlaybackBuffer {
-		let sink = SinkSpec::new(sink_channels);
-		if stream.sample_rate == sink.sample_rate {
-			PlaybackBuffer::passthrough(stream, stream_map, sink)
-		} else {
-			PlaybackBuffer::resample(stream, stream_map, sink, DEFAULT_CLOCK_RATE_HZ)
-		}
+		PlaybackBuffer::new(stream, stream_map, SinkSpec::new(sink_channels), DEFAULT_CLOCK_RATE_HZ).unwrap()
 	}
 
 	/// Push a 1 kHz tone at `src_rate`/`fmt` through the buffer to the 48 kHz
@@ -456,6 +472,21 @@ mod tests {
 		// Skip resampler startup latency before measuring.
 		let snr = snr_db(&out[9600 * 2..], 1000.0, 48000.0);
 		assert!(snr > 60.0, "resampled SNR too low: {snr:.1} dB");
+	}
+
+	/// A client can ask for any rate; ones that cannot be resampled to the sink rate must be
+	/// refused, not crash the audio thread.
+	#[test]
+	fn unusable_stream_rates_are_rejected() {
+		for rate in [0, 48_000 * 8 + 1, u32::MAX] {
+			let result = PlaybackBuffer::new(
+				f32_stream(2, rate),
+				pulse::ChannelMap::stereo(),
+				SinkSpec::new(AudioChannels::Stereo),
+				DEFAULT_CLOCK_RATE_HZ,
+			);
+			assert!(result.is_err(), "rate {rate} was accepted");
+		}
 	}
 
 	/// Passthrough (matching rate) must be effectively lossless.

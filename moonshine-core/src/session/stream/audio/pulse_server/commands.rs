@@ -152,11 +152,19 @@ pub(super) fn handle_command(
 			let volume = cvolume_to_linear(&cvolume, server.sink_spec.channels);
 			let muted = params.flags.start_muted == Some(true);
 
-			let buffer = if server.sink_spec.sample_rate == stream_spec.sample_rate {
-				PlaybackBuffer::passthrough(stream_spec, stream_channel_map, server.sink_spec)
-			} else {
-				PlaybackBuffer::resample(stream_spec, stream_channel_map, server.sink_spec, server.clock_rate_hz)
-			};
+			let buffer =
+				match PlaybackBuffer::new(stream_spec, stream_channel_map, server.sink_spec, server.clock_rate_hz) {
+					Ok(buffer) => buffer,
+					Err(err) => {
+						tracing::warn!("rejecting playback stream: {err}");
+						pulse::write_error(
+							&mut ClientWriter(&mut client.outgoing),
+							seq,
+							&pulse::PulseError::NotSupported,
+						)?;
+						return Ok(());
+					},
+				};
 			let mut stream = PlaybackStream {
 				stream_index: server.next_stream_index,
 				state: StreamState::Prebuffering(buffer_attr.pre_buffering as u64),
