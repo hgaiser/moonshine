@@ -74,6 +74,7 @@ uuid = { version = "1.23.3", features = ["v4"] }
 walkdir = "2.5.0"
 which = "8.0.3"
 x509-parser = "0.18.1"
+yaml_serde = "0.10"
 zbus = { version = "5.16.0", features = ["blocking"] }
 zvariant = "5.12.0"
 

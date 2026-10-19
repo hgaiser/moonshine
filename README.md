@@ -281,6 +281,27 @@ Box art is automatically loaded from Heroic's `images-cache/` directory for any 
 The default configuration directory is `~/.config/heroic`, falling back to `~/.var/app/com.heroicgameslauncher.hgl/config/heroic` when only the Flatpak is installed.
 You can override it with the `config_dir` option.
 
+**Bottles scanner** — finds games and applications in the [Bottles](https://github.com/bottlesdevs/Bottles) Library tab:
+
+```toml
+[[application_scanner]]
+type = "bottles"
+command = ["bottles-cli", "run", "-b", "{bottle}", "--program-id", "{program_id}"]
+umu_command = ["bottles-cli", "umu", "run", "--game", "{umu_game}"]
+```
+
+Only entries you added to Bottles' Library ("Add to Library" on a program) are exposed — not every program Bottles discovers. UMU entries appear once Bottles reports them as ready, and Steam shortcuts in the Library are skipped. `umu_command` is optional: without it, UMU entries are skipped.
+
+> **Limitation:** Bottles launches executables that live outside the bottle (e.g. on a separate game drive) through `wine start`, which exits immediately, so Moonshine ends the session shortly after launch. Games installed inside the bottle prefix are unaffected.
+
+`{bottle}` is the bottle's name, `{program_id}` the program's internal id, `{name}` the entry's display name, and `{umu_game}` the id of a game managed through Bottles' UMU integration.
+Commands are resolved against Moonshine's own `PATH`, so a bare `bottles-cli` only works for a natively installed Bottles. For Flatpak Bottles, see [TIPS.md](TIPS.md#run-flatpak-bottles-inside-moonshines-compositor).
+
+The default data directory is the first of `~/.local/share/bottles` and `~/.var/app/com.usebottles.bottles/data/bottles` that contains a `library.yml` — leftover data from an uninstalled native Bottles does not shadow the Flatpak install.
+You can override it with the `data_dir` option.
+
+Box art is automatically loaded from Bottles' grid images when available, falling back to the program's icon.
+
 ## Tips & Tricks
 
 See [TIPS.md](TIPS.md) for practical recipes and workarounds.
