@@ -31,8 +31,8 @@ use crate::session::stream::video::{
 use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
-	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorSpace, EncodeConfig, EncodeFuture, Encoder,
-	EncoderTuningMode, InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext,
+	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorRange, ColorSpec, EncodeConfig, EncodeFuture,
+	Encoder, EncoderTuningMode, InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext,
 	VideoContextBuilder,
 };
 
@@ -50,10 +50,24 @@ use pixelforge::{
 /// GPU fed plus one slot of slack, bounding added latency to ~3 frames.
 const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
-/// scRGB reference white: linear value 1.0 maps to 80 cd/m² (IEC 61966-2-2).
-const SCRGB_REFERENCE_WHITE_NITS: f32 = 80.0;
-/// SDR reference white for HDR transport, per ITU-R BT.2408 (203 cd/m²).
-const BT2408_SDR_REFERENCE_NITS: f32 = 203.0;
+/// Point a converter at a new source and target.
+///
+/// pixelforge only allows a source to reach targets it can convert to, and checks
+/// each setter on its own: anything can become PQ, but an sRGB target needs an sRGB
+/// source. Order the two so the converter never passes through an invalid pair.
+fn set_converter_colors(
+	converter: &mut ColorConverter,
+	source: ColorSpec,
+	target: ColorSpec,
+) -> Result<(), PixelForgeError> {
+	if target == ColorSpec::Bt2020Pq {
+		converter.set_target(target)?;
+		converter.set_source(source)
+	} else {
+		converter.set_source(source)?;
+		converter.set_target(target)
+	}
+}
 
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
@@ -223,8 +237,9 @@ enum ConsumerMessage {
 	Frame(FrameContext, EncodeFuture),
 	/// Reset the RTP/frame counters (client reconnect/resume), so subsequent
 	/// packets restart from frame 1. Ordered with `Frame` messages so it takes
-	/// effect before any frame submitted after the reset.
-	ResetCounters,
+	/// effect before any frame submitted after the reset. Carries the reset's
+	/// epoch, which tags later packet batches so stale ones can be dropped.
+	ResetCounters(u32),
 }
 
 /// Decrements the in-flight frame counter when dropped, on every exit path of a
@@ -254,7 +269,7 @@ impl Drop for InFlightGuard {
 #[allow(clippy::too_many_arguments)]
 async fn run_packet_consumer(
 	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
-	packet_tx: mpsc::Sender<ShardBatch>,
+	packet_tx: mpsc::Sender<(u32, ShardBatch)>,
 	stats_tx: broadcast::Sender<FrameStats>,
 	in_flight: Arc<AtomicUsize>,
 	idr_tx: broadcast::Sender<()>,
@@ -264,6 +279,7 @@ async fn run_packet_consumer(
 ) {
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
+	let mut reset_epoch = 0u32;
 	let mut latency_samples: Vec<LatencySample> = Vec::with_capacity(512);
 	let mut last_summary_time = std::time::Instant::now();
 	let frame_interval_us = 1_000_000 / ctx.fps as u128;
@@ -272,9 +288,10 @@ async fn run_packet_consumer(
 	// encoding thread drops its sender, this loop ends after the last frame.
 	while let Some(msg) = ctx_rx.recv().await {
 		let (frame_context, future) = match msg {
-			ConsumerMessage::ResetCounters => {
+			ConsumerMessage::ResetCounters(epoch) => {
 				frame_number = 0;
 				sequence_number = 0;
+				reset_epoch = epoch;
 				continue;
 			},
 			ConsumerMessage::Frame(frame_context, future) => (frame_context, future),
@@ -359,7 +376,7 @@ async fn run_packet_consumer(
 		// session is already tearing down. Stop the consumer; the encoding thread
 		// then sees its `frame_ctx_tx` fail and exits too, which drops the
 		// video-pipeline shutdown token and tears the session down.
-		if packet_tx.send(shards).await.is_err() {
+		if packet_tx.send((reset_epoch, shards)).await.is_err() {
 			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
 			break;
 		}
@@ -434,11 +451,11 @@ impl VideoPipeline {
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: broadcast::Receiver<()>,
+		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
@@ -492,11 +509,11 @@ impl VideoPipelineInner {
 		self,
 		runtime: tokio::runtime::Handle,
 		frames: CompositorFrames,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		reset_request_rx: broadcast::Receiver<()>,
+		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start_notify: Arc<Notify>,
@@ -604,7 +621,19 @@ impl VideoPipelineInner {
 		.with_virtual_buffer_size_ms(1000 / ctx.fps)
 		.with_initial_virtual_buffer_size_ms(0);
 
-		let encoder = Encoder::new(context.clone(), config).map_err(|e| format!("Failed to create encoder: {e}"))?;
+		// The healthcheck doesn't advertise formats the GPU can't encode, so only a client
+		// that requested one anyway should get the "unsupported" hint.
+		let encoder = Encoder::new(context.clone(), config).map_err(|e| {
+			let hint = if context.supports_encode_format(codec, pixel_format, bit_depth) {
+				""
+			} else {
+				" (this GPU does not support this format, try disabling YUV 4:4:4 or HDR in the client)"
+			};
+			format!(
+				"Failed to create {codec:?} encoder ({:?}, {:?}): {e}{hint}",
+				ctx.chroma_sampling_type, ctx.dynamic_range
+			)
+		})?;
 
 		Ok((context, encoder))
 	}
@@ -616,11 +645,11 @@ impl VideoPipelineInner {
 		frames: CompositorFrames,
 		context: VideoContext,
 		mut encoder: Encoder,
-		packet_tx: mpsc::Sender<ShardBatch>,
+		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
-		mut reset_request_rx: broadcast::Receiver<()>,
+		mut reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -675,6 +704,11 @@ impl VideoPipelineInner {
 		let mut last_drop_warn: Option<std::time::Instant> = None;
 
 		// Determine output YUV format based on chroma sampling and dynamic range.
+		let color_range = if ctx.full_range {
+			ColorRange::Full
+		} else {
+			ColorRange::Limited
+		};
 		let output_format = match (ctx.chroma_sampling_type, ctx.dynamic_range) {
 			(VideoChromaSampling::Yuv420, VideoDynamicRange::Sdr) => OutputFormat::NV12,
 			(VideoChromaSampling::Yuv420, VideoDynamicRange::Hdr) => OutputFormat::P010,
@@ -738,18 +772,19 @@ impl VideoPipelineInner {
 			// ("Your network connection isn't performing well"). Reset the frame and RTP
 			// sequence counters and force an IDR so the resumed client sees a clean stream
 			// starting from frame 1.
-			let mut pending_reset = false;
+			let mut pending_reset = None;
 			loop {
 				match reset_request_rx.try_recv() {
-					Ok(()) => pending_reset = true,
-					Err(broadcast::error::TryRecvError::Lagged(_)) => pending_reset = true,
+					Ok(epoch) => pending_reset = Some(epoch),
+					// The newest epoch is still queued; the next try_recv returns it.
+					Err(broadcast::error::TryRecvError::Lagged(_)) => continue,
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
 			}
-			if pending_reset {
+			if let Some(epoch) = pending_reset {
 				tracing::info!("Resetting video frame counter for resumed client and forcing IDR.");
 				// Counters live on the consumer task; reset them in order.
-				let _ = frame_ctx_tx.blocking_send(ConsumerMessage::ResetCounters);
+				let _ = frame_ctx_tx.blocking_send(ConsumerMessage::ResetCounters(epoch));
 				// The next submitted frame becomes the consumer's frame 1 of the
 				// new epoch; anchor the invalidation index mapping to it.
 				frame_number_base = submitted_count;
@@ -953,14 +988,21 @@ impl VideoPipelineInner {
 				let (converter, cached_source) = match color_converters.entry(fourcc) {
 					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
 					std::collections::hash_map::Entry::Vacant(e) => {
-						let (color_space, full_range) = match ctx.dynamic_range {
-							VideoDynamicRange::Sdr => (ColorSpace::Bt709, ctx.full_range),
-							VideoDynamicRange::Hdr => (ColorSpace::Bt2020, ctx.full_range),
+						// Start from the session's own colour space; an HDR session
+						// re-points the source and target per frame below.
+						let color = match ctx.dynamic_range {
+							VideoDynamicRange::Sdr => ColorSpec::Srgb,
+							VideoDynamicRange::Hdr => ColorSpec::Bt2020Pq,
 						};
-						let mut config =
-							ColorConverterConfig::new(ctx.width, ctx.height, frame_input_format, output_format);
-						config.color_space = color_space;
-						config.full_range = full_range;
+						let config = ColorConverterConfig::new(
+							ctx.width,
+							ctx.height,
+							frame_input_format,
+							output_format,
+							color,
+							color,
+							color_range,
+						);
 						match ColorConverter::new(context.clone(), config) {
 							Ok(conv) => {
 								tracing::debug!("Created color converter for input format {frame_input_format:?}");
@@ -980,49 +1022,30 @@ impl VideoPipelineInner {
 				// dynamic VUI switching in the encoder.
 				if ctx.dynamic_range == VideoDynamicRange::Hdr {
 					let frame_cs = color_space(&frame.info.colour);
-					// `sdr_white_nits` only matters for the scRGB path: per IEC 61966-2-2,
-					// scRGB 1.0 == 80 cd/m². The other paths ignore it.
-					let (cs, full_range, color_desc, sdr_white_nits) = match frame_cs {
-						FrameColorSpace::Srgb => (
-							ColorSpace::Bt709,
-							ctx.full_range,
-							ColorDescription::bt709().with_full_range(ctx.full_range),
-							BT2408_SDR_REFERENCE_NITS,
-						),
-						FrameColorSpace::Bt2020Pq => (
-							ColorSpace::Bt2020,
-							ctx.full_range,
-							ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
-							BT2408_SDR_REFERENCE_NITS,
-						),
-						FrameColorSpace::ScrgbLinear => (
-							ColorSpace::Bt709LinearToBt2020Pq,
-							ctx.full_range,
-							ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
-							SCRGB_REFERENCE_WHITE_NITS,
-						),
+					// What the frame holds, and what the stream becomes. SDR frames are
+					// encoded as BT.709 and HDR frames as BT.2020+PQ, with dynamic VUI
+					// switching in the encoder. scRGB's and SDR's reference whites are
+					// pixelforge's per-source defaults (80 and 203 nits).
+					let (source, target) = match frame_cs {
+						FrameColorSpace::Srgb => (ColorSpec::Srgb, ColorSpec::Srgb),
+						FrameColorSpace::Bt2020Pq => (ColorSpec::Bt2020Pq, ColorSpec::Bt2020Pq),
+						FrameColorSpace::ScrgbLinear => (ColorSpec::Bt709Linear, ColorSpec::Bt2020Pq),
 					};
+					set_converter_colors(converter, source, target)
+						.map_err(|e| format!("Failed to update color converter: {e}"))?;
+					converter.set_range(color_range);
 
-					// Switch encoder VUI first. Only update the converter if
-					// the encoder switch succeeds, so that the converter's
-					// color space stays in sync with the encoder's VUI.
+					// The converter derives the stream description from its target and
+					// range, so the encoder is told exactly what the shader writes.
+					let color_desc = converter.color_description();
 					if encoder_color_desc != Some(color_desc) {
 						tracing::debug!(
 							"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
 						);
-						match encoder.set_color_description(color_desc) {
-							Ok(()) => {
-								encoder_color_desc = Some(color_desc);
-								converter.set_color_space(cs);
-								converter.set_full_range(full_range);
-								converter.set_sdr_reference_white_nits(sdr_white_nits);
-							},
-							Err(e) => return Err(format!("Failed to update encoder color description: {e}")),
-						}
-					} else {
-						converter.set_color_space(cs);
-						converter.set_full_range(full_range);
-						converter.set_sdr_reference_white_nits(sdr_white_nits);
+						encoder
+							.set_color_description(color_desc)
+							.map_err(|e| format!("Failed to update encoder color description: {e}"))?;
+						encoder_color_desc = Some(color_desc);
 					}
 				}
 
@@ -1141,7 +1164,7 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
-	use super::{BT2408_SDR_REFERENCE_NITS, SCRGB_REFERENCE_WHITE_NITS, drm_fourcc_to_input, is_device_lost};
+	use super::{drm_fourcc_to_input, is_device_lost};
 	use ash::vk;
 	use pixelforge::{InputFormat, PixelForgeError};
 
@@ -1215,13 +1238,5 @@ mod tests {
 		assert!(!is_device_lost(&PixelForgeError::CommandBuffer(
 			"submit failed".to_string()
 		)));
-	}
-
-	#[test]
-	fn sdr_reference_white_constants_match_specs() {
-		// scRGB (IEC 61966-2-2): 1.0 == 80 cd/m².
-		assert_eq!(SCRGB_REFERENCE_WHITE_NITS, 80.0);
-		// ITU-R BT.2408: 203 cd/m² diffuse white for SDR-in-HDR.
-		assert_eq!(BT2408_SDR_REFERENCE_NITS, 203.0);
 	}
 }

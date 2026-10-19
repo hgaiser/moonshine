@@ -410,7 +410,7 @@ impl Packetizer {
 			}
 
 			let t_extend = Instant::now();
-			all_shards.extend_from(&shard_buf.into_batch());
+			all_shards.extend(shard_buf.into_batch());
 			total_extend_us += t_extend.elapsed().as_micros();
 
 			tracing::trace!("Finished sending frame {frame_number}.");
