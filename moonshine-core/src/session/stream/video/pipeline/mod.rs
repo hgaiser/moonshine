@@ -621,12 +621,13 @@ impl VideoPipelineInner {
 		.with_virtual_buffer_size_ms(1000 / ctx.fps)
 		.with_initial_virtual_buffer_size_ms(0);
 
-		// 4:4:4 is advertised for every supported codec, but some encoders (e.g. AMD VCN) only have 4:2:0 profiles.
+		// The healthcheck doesn't advertise formats the GPU can't encode, so only a client
+		// that requested one anyway should get the "unsupported" hint.
 		let encoder = Encoder::new(context.clone(), config).map_err(|e| {
-			let hint = if ctx.chroma_sampling_type == VideoChromaSampling::Yuv444 {
-				" (this GPU may not support 4:4:4 encoding, try disabling YUV 4:4:4 in the client)"
-			} else {
+			let hint = if context.supports_encode_format(codec, pixel_format, bit_depth) {
 				""
+			} else {
+				" (this GPU does not support this format, try disabling YUV 4:4:4 or HDR in the client)"
 			};
 			format!(
 				"Failed to create {codec:?} encoder ({:?}, {:?}): {e}{hint}",
