@@ -2486,7 +2486,6 @@ dependencies = [
  "steamlocate",
  "strum_macros",
  "tempfile",
- "thiserror 2.0.19",
  "tokio",
  "tokio-enet",
  "tokio-rustls",

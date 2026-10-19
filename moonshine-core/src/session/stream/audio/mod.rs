@@ -1,13 +1,12 @@
 use std::ffi::CStr;
+use std::fmt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
-use pulse::sample_spec::MAX_CHANNELS;
 use pulseaudio::protocol as pulse;
 use serde::{Deserialize, Serialize};
 use strum_macros::Display;
-use thiserror::Error;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 
@@ -46,29 +45,41 @@ pub enum AudioChannels {
 	Surround71 = 8,
 }
 
-#[derive(Debug, Error)]
-pub enum AudioChannelError {
-	#[error("Unsupported number of channels: {0}")]
-	Unsupported(u8),
-	#[error("Requested `{0}` channels, but max is {MAX_CHANNELS}")]
-	OutOfBounds(u8),
+/// The client asked for a channel count the sink does not support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioChannelError(pub u8);
+
+impl fmt::Display for AudioChannelError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "Unsupported number of channels: {}", self.0)
+	}
 }
+
+impl std::error::Error for AudioChannelError {}
 
 impl TryFrom<u8> for AudioChannels {
 	type Error = AudioChannelError;
 
 	fn try_from(val: u8) -> Result<Self, Self::Error> {
 		match val {
+			2 => Ok(Self::Stereo),
 			6 => Ok(Self::Surround51),
 			8 => Ok(Self::Surround71),
-			2 => Ok(Self::Stereo),
-			_ if val > MAX_CHANNELS => Err(AudioChannelError::OutOfBounds(val)),
-			_ => Err(AudioChannelError::Unsupported(val)),
+			_ => Err(AudioChannelError(val)),
 		}
 	}
 }
 
 impl AudioChannels {
+	/// Parse the channel count a client asked for, warning and falling back to stereo when the
+	/// sink does not support it.
+	pub fn from_wire_or_stereo(count: u8) -> Self {
+		Self::try_from(count).unwrap_or_else(|err| {
+			tracing::warn!("{err}, falling back to stereo");
+			Self::Stereo
+		})
+	}
+
 	pub fn map(&self) -> pulse::ChannelMap {
 		match self {
 			AudioChannels::Surround51 => pulse::ChannelMap::new([
