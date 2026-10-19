@@ -152,7 +152,7 @@ pub(super) fn handle_command(
 			let volume = cvolume_to_linear(&cvolume, server.sink_spec.channels);
 			let muted = params.flags.start_muted == Some(true);
 
-			let buffer = if server.sink_spec.sample_rate as u32 == stream_spec.sample_rate {
+			let buffer = if server.sink_spec.sample_rate == stream_spec.sample_rate {
 				PlaybackBuffer::passthrough(stream_spec, stream_channel_map, server.sink_spec)
 			} else {
 				PlaybackBuffer::resample(stream_spec, stream_channel_map, server.sink_spec, server.clock_rate_hz)

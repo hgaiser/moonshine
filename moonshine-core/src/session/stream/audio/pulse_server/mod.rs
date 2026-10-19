@@ -12,7 +12,7 @@ use mio::net::UnixListener;
 use pulseaudio::protocol::{self as pulse};
 
 use super::buffer::PlaybackBuffer;
-use super::{AudioChannels, SinkSpec, log};
+use super::{AudioChannels, SINK_SAMPLE_RATE, SinkSpec, log};
 use crate::session::manager::SessionShutdownReason;
 
 type Error = Box<dyn std::error::Error + Send + Sync>;
@@ -24,9 +24,6 @@ const CLOCK: mio::Token = mio::Token(1);
 /// client has stopped reading; the stuck client is dropped rather than letting
 /// the buffer grow unboundedly, and the session survives.
 const MAX_OUTGOING_BUFFER: usize = 64 * 1024 * 1024;
-
-/// The server emits samples at this rate to the encoder.
-pub(crate) const OUTPUT_SAMPLE_RATE: u32 = 48000;
 
 /// Clock tick rate. Determines audio frame size sent to the encoder.
 /// For 5ms frames: 200 Hz; for 10ms frames: 100 Hz.
@@ -265,7 +262,7 @@ impl PulseServer {
 		format_props.set(pulse::Prop::FormatSampleFormat, c"float32le");
 		format_props.set(
 			pulse::Prop::FormatRate,
-			std::ffi::CString::new(OUTPUT_SAMPLE_RATE.to_string()).unwrap(),
+			std::ffi::CString::new(SINK_SAMPLE_RATE.to_string()).unwrap(),
 		);
 
 		let default_format_info = pulse::FormatInfo {
@@ -540,7 +537,7 @@ impl PulseServer {
 		let mut done_draining = Vec::new();
 
 		let capture_ts = self.epoch.elapsed().as_millis() as u64;
-		let num_frames = self.server_state.sink_spec.sample_rate as u32 / self.server_state.clock_rate_hz;
+		let num_frames = self.server_state.sink_spec.sample_rate / self.server_state.clock_rate_hz;
 		let encode_len = num_frames * self.server_state.sink_spec.channels as u32;
 
 		let mut frame = match self.frame_recycle_rx.try_recv() {

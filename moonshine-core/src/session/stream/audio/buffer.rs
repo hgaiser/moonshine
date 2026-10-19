@@ -48,7 +48,7 @@ impl PlaybackBuffer {
 		sink_spec: SinkSpec,
 		clock_rate: u32,
 	) -> Self {
-		let num_frames = (sink_spec.sample_rate as u32 / clock_rate) as usize;
+		let num_frames = (sink_spec.sample_rate / clock_rate) as usize;
 		let resampler = new_resampler(stream_spec, sink_spec, num_frames);
 		let convert = RateConvert::Resample {
 			input_frames: vec![0.0; resampler.input_frames_max() * sink_spec.channels as usize],
@@ -162,7 +162,7 @@ impl PlaybackBuffer {
 
 fn new_resampler(stream_spec: pulse::SampleSpec, sink_spec: SinkSpec, num_frames: usize) -> rubato::Async<f32> {
 	rubato::Async::<f32>::new_sinc(
-		sink_spec.sample_rate as u32 as f64 / stream_spec.sample_rate as f64,
+		sink_spec.sample_rate as f64 / stream_spec.sample_rate as f64,
 		1.0, // The ratio never changes
 		&rubato::SincInterpolationParameters::default(),
 		num_frames,
@@ -404,7 +404,7 @@ mod tests {
 		sink_channels: AudioChannels,
 	) -> PlaybackBuffer {
 		let sink = SinkSpec::new(sink_channels);
-		if stream.sample_rate == sink.sample_rate as u32 {
+		if stream.sample_rate == sink.sample_rate {
 			PlaybackBuffer::passthrough(stream, stream_map, sink)
 		} else {
 			PlaybackBuffer::resample(stream, stream_map, sink, DEFAULT_CLOCK_RATE_HZ)

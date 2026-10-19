@@ -71,9 +71,9 @@ pub(crate) fn pulse_create_stream_cmd(
 		stream_spec.format,
 		stream_spec.sample_rate,
 		stream_spec.channels,
-		sink_spec.sample_rate as usize,
+		sink_spec.sample_rate,
 		sink_spec.channels as u8,
-		if stream_spec.sample_rate == sink_spec.sample_rate as u32 {
+		if stream_spec.sample_rate == sink_spec.sample_rate {
 			"passthrough"
 		} else {
 			"resampling"

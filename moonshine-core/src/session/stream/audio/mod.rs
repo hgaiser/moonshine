@@ -15,7 +15,7 @@ use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::{StartSignal, StartWaiter};
 
 use self::encoder::AudioEncoder;
-use self::pulse_server::{OUTPUT_SAMPLE_RATE, PulseServer};
+use self::pulse_server::PulseServer;
 
 mod buffer;
 mod encoder;
@@ -131,10 +131,9 @@ impl AudioChannels {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SinkSampleRate {
-	S48k = 48000,
-}
+/// The rate the sink runs at, and the one the encoder expects. Streams at any other rate are
+/// resampled to it.
+pub(crate) const SINK_SAMPLE_RATE: u32 = 48_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SinkSpec {
@@ -143,7 +142,7 @@ pub struct SinkSpec {
 	/// Number of independent channels.
 	pub channels: AudioChannels,
 	/// Number of samples per second (and per channel).
-	pub sample_rate: SinkSampleRate,
+	pub sample_rate: u32,
 }
 
 impl SinkSpec {
@@ -151,7 +150,7 @@ impl SinkSpec {
 		Self {
 			format: pulse::SampleFormat::Float32Le,
 			channels,
-			sample_rate: SinkSampleRate::S48k,
+			sample_rate: SINK_SAMPLE_RATE,
 		}
 	}
 
@@ -159,7 +158,7 @@ impl SinkSpec {
 		pulse::SampleSpec {
 			format: self.format,
 			channels: self.channels as u8,
-			sample_rate: self.sample_rate as u32,
+			sample_rate: self.sample_rate,
 		}
 	}
 }
@@ -363,7 +362,7 @@ impl AudioStream {
 
 		// Spawn audio encoder — gated behind start.
 		AudioEncoder::spawn(
-			OUTPUT_SAMPLE_RATE,
+			SINK_SAMPLE_RATE,
 			&context.audio_config.stream_config,
 			frame_rx,
 			frame_recycle_tx,
