@@ -1163,15 +1163,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "dlib"
-version = "0.5.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab8ecd87370524b461f8557c119c405552c396ed91fc0a8eec68679eab26f94a"
-dependencies = [
- "libloading",
-]
-
-[[package]]
 name = "downcast-rs"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1389,6 +1380,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a86d2bb0db9647ee5dece2ea54a808c14428db009ad751f95b091598835cd0b"
 dependencies = [
  "rayon",
+]
+
+[[package]]
+name = "ferriscope-core"
+version = "0.1.0"
+source = "git+https://github.com/hgaiser/ferriscope?rev=833978d7e0b51e44cc50b674f7bccf7c418a7b6d#833978d7e0b51e44cc50b674f7bccf7c418a7b6d"
+dependencies = [
+ "bitflags",
+ "smithay",
+ "thiserror 2.0.19",
+ "tracing",
+ "wayland-backend",
+ "wayland-scanner",
+ "wayland-server",
 ]
 
 [[package]]
@@ -2374,7 +2379,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "async-shutdown",
  "clap",
@@ -2387,22 +2392,21 @@ dependencies = [
 
 [[package]]
 name = "moonshine-core"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm",
  "ash",
  "async-shutdown",
  "aws-lc-rs",
- "bitflags",
  "byteorder",
  "bytes",
- "calloop",
  "cbc",
  "crossbeam-channel",
  "dasp",
  "dirs",
  "fec-rs",
+ "ferriscope-core",
  "futures-util",
  "gethostname",
  "hex",
@@ -2449,17 +2453,15 @@ dependencies = [
  "url",
  "uuid",
  "walkdir",
- "wayland-scanner",
  "which 8.0.5",
  "x509-parser",
- "xcursor",
  "zbus",
  "zvariant",
 ]
 
 [[package]]
 name = "moonshine-tools"
-version = "0.16.0"
+version = "0.16.1"
 dependencies = [
  "async-shutdown",
  "clap",
@@ -2467,17 +2469,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "moonshine-wsi"
-version = "0.16.0"
-dependencies = [
- "ash",
- "libc",
- "wayland-backend",
- "wayland-client",
- "wayland-scanner",
 ]
 
 [[package]]
@@ -3510,12 +3501,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "scoped-tls"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e1cf6437eb19a8f4a6cc0f7dca544973b0b78843adbfeb3683d1a94a0024a294"
-
-[[package]]
 name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4374,21 +4359,8 @@ dependencies = [
  "cc",
  "downcast-rs",
  "rustix 1.1.4",
- "scoped-tls",
  "smallvec",
  "wayland-sys",
-]
-
-[[package]]
-name = "wayland-client"
-version = "0.31.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e3c36a0f861ad76d0901f2800b46321410d9f73f2ea88aac0650d86c32688073"
-dependencies = [
- "bitflags",
- "rustix 1.1.4",
- "wayland-backend",
- "wayland-scanner",
 ]
 
 [[package]]
@@ -4459,8 +4431,6 @@ version = "0.31.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d8eab23fefc9e41f8e841df4a9c707e8a8c4ed26e944ef69297184de2785e3be"
 dependencies = [
- "dlib",
- "log",
  "pkg-config",
 ]
 
@@ -4804,12 +4774,6 @@ dependencies = [
  "thiserror 2.0.19",
  "time",
 ]
-
-[[package]]
-name = "xcursor"
-version = "0.3.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bec9e4a500ca8864c5b47b8b482a73d62e4237670e5b5f1d6b9e3cae50f28f2b"
 
 [[package]]
 name = "xkbcommon"

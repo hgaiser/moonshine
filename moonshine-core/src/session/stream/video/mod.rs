@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Notify, broadcast, mpsc, watch};
 
 use crate::session::SessionKeysReceiver;
-use crate::session::compositor::frame::{ExportedFrame, HdrModeState};
+use crate::session::compositor::CompositorFrames;
+use crate::session::compositor::frame::HdrModeState;
 use crate::session::manager::SessionShutdownReason;
 
 mod gso_socket;
@@ -282,7 +283,7 @@ impl VideoStreamHandle {
 
 pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
-	frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+	frames: CompositorFrames,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
 }
@@ -291,7 +292,7 @@ impl VideoStream {
 	pub async fn new(
 		config: VideoStreamConfig,
 		address: String,
-		frame_rx: std::sync::mpsc::Receiver<ExportedFrame>,
+		frames: CompositorFrames,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
@@ -309,7 +310,7 @@ impl VideoStream {
 
 		Ok(Self {
 			socket,
-			frame_rx,
+			frames,
 			hdr_metadata_tx,
 			stats_tx,
 		})
@@ -325,7 +326,7 @@ impl VideoStream {
 	) -> Result<VideoStreamHandle, ()> {
 		let Self {
 			socket,
-			frame_rx,
+			frames,
 			hdr_metadata_tx,
 			stats_tx,
 		} = self;
@@ -364,7 +365,7 @@ impl VideoStream {
 
 		// Spawn pipeline thread — gated behind start_notify.
 		VideoPipeline::new(
-			frame_rx,
+			frames,
 			config,
 			context,
 			keys_rx,

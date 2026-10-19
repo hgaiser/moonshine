@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
+use ferriscope_core::{InputEvent as SeatEvent, PenEvent, PenTool, pen_tilt};
 use strum_macros::FromRepr;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -10,8 +11,8 @@ use tokio::sync::mpsc;
 use self::gamepad::Gamepad;
 use self::gamepad::GamepadConfig;
 use self::remap::{HoldToHome, HoldTransition};
-use self::touch::{Pen, PointerEventKind, Touch};
-use crate::session::compositor::input::CompositorInputEvent;
+use self::touch::{Pen, PenToolKind, PointerEventKind, Touch};
+use crate::session::compositor::input::{CompositorInput, scroll};
 use crate::session::manager::SessionShutdownReason;
 
 use self::{
@@ -136,13 +137,13 @@ impl InputEvent {
 }
 
 pub(crate) struct InputHandler {
-	input_tx: calloop::channel::Sender<CompositorInputEvent>,
+	compositor: CompositorInput,
 	gamepad_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
 }
 
 impl InputHandler {
 	pub fn new(
-		input_tx: calloop::channel::Sender<CompositorInputEvent>,
+		compositor: CompositorInput,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		gamepad_config: GamepadConfig,
 	) -> Result<Self, ()> {
@@ -164,104 +165,79 @@ impl InputHandler {
 			});
 		});
 
-		Ok(Self { input_tx, gamepad_tx })
+		Ok(Self { compositor, gamepad_tx })
 	}
 
 	async fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
 		match event {
 			InputEvent::KeyDown(key) => {
-				if let Some(keycode) = key.to_linux_keycode() {
-					tracing::trace!("Pressing key: {key:?} (keycode: {keycode})");
-					let _ = self.input_tx.send(CompositorInputEvent::KeyDown { keycode });
+				if let Some(code) = key.to_linux_keycode() {
+					tracing::trace!("Pressing key: {key:?} (keycode: {code})");
+					self.compositor.send(SeatEvent::Key { code, pressed: true });
 				}
 			},
 			InputEvent::KeyUp(key) => {
-				if let Some(keycode) = key.to_linux_keycode() {
-					tracing::trace!("Releasing key: {key:?} (keycode: {keycode})");
-					let _ = self.input_tx.send(CompositorInputEvent::KeyUp { keycode });
+				if let Some(code) = key.to_linux_keycode() {
+					tracing::trace!("Releasing key: {key:?} (keycode: {code})");
+					self.compositor.send(SeatEvent::Key { code, pressed: false });
 				}
 			},
 			InputEvent::MouseMoveAbsolute(event) => {
 				tracing::trace!("Absolute mouse movement: {event:?}");
-				let _ = self.input_tx.send(CompositorInputEvent::MouseMoveAbsolute {
-					x: event.x,
-					y: event.y,
-					screen_width: event.screen_width,
-					screen_height: event.screen_height,
-				});
+				self.compositor.send(self.compositor.pointer_motion(
+					event.x,
+					event.y,
+					event.screen_width,
+					event.screen_height,
+				));
 			},
 			InputEvent::MouseMoveRelative(event) => {
 				tracing::trace!("Moving mouse relative: {event:?}");
-				let _ = self.input_tx.send(CompositorInputEvent::MouseMoveRelative {
-					dx: event.x,
-					dy: event.y,
+				self.compositor.send(SeatEvent::PointerMotionDelta {
+					dx: f64::from(event.x),
+					dy: f64::from(event.y),
 				});
 			},
 			InputEvent::MouseButtonDown(button) => {
 				tracing::trace!("Pressing mouse button: {button:?}");
-				let button_code: u32 = button.into();
-				let _ = self
-					.input_tx
-					.send(CompositorInputEvent::MouseButtonDown { button: button_code });
+				let code: u32 = button.into();
+				self.compositor.send(SeatEvent::PointerButton { code, pressed: true });
 			},
 			InputEvent::MouseButtonUp(button) => {
 				tracing::trace!("Releasing mouse button: {button:?}");
-				let button_code: u32 = button.into();
-				let _ = self
-					.input_tx
-					.send(CompositorInputEvent::MouseButtonUp { button: button_code });
+				let code: u32 = button.into();
+				self.compositor.send(SeatEvent::PointerButton { code, pressed: false });
 			},
 			InputEvent::MouseScrollVertical(event) => {
 				tracing::trace!("Scrolling vertically: {event:?}");
-				let _ = self
-					.input_tx
-					.send(CompositorInputEvent::ScrollVertical { amount: event.amount });
+				self.compositor.send(scroll(event.amount, false));
 			},
 			InputEvent::MouseScrollHorizontal(event) => {
 				tracing::trace!("Scrolling horizontally: {event:?}");
-				let _ = self
-					.input_tx
-					.send(CompositorInputEvent::ScrollHorizontal { amount: event.amount });
+				self.compositor.send(scroll(event.amount, true));
 			},
 			InputEvent::Touch(event) => {
 				tracing::trace!("Touch input: {event:?}");
-				let compositor_event = match event.event_kind {
-					PointerEventKind::Down => Some(CompositorInputEvent::TouchDown {
-						slot: event.pointer_id,
-						x: event.x,
-						y: event.y,
-					}),
-					PointerEventKind::Move => Some(CompositorInputEvent::TouchMove {
-						slot: event.pointer_id,
-						x: event.x,
-						y: event.y,
-					}),
-					PointerEventKind::Up | PointerEventKind::Cancel => {
-						Some(CompositorInputEvent::TouchUp { slot: event.pointer_id })
-					},
-					PointerEventKind::CancelAll => Some(CompositorInputEvent::TouchCancelAll),
+				let slot = event.pointer_id;
+				let (x, y) = self.compositor.touch_point(event.x, event.y);
+				let seat_event = match event.event_kind {
+					PointerEventKind::Down => Some(SeatEvent::TouchDown { slot, x, y }),
+					PointerEventKind::Move => Some(SeatEvent::TouchMotion { slot, x, y }),
+					PointerEventKind::Up | PointerEventKind::Cancel => Some(SeatEvent::TouchUp { slot }),
+					PointerEventKind::CancelAll => Some(SeatEvent::TouchCancel),
 					PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => None,
 				};
-				if let Some(event) = compositor_event {
-					let _ = self.input_tx.send(event);
+				if let Some(seat_event) = seat_event {
+					self.compositor.send_touch(seat_event);
 				}
 			},
 			InputEvent::Pen(event) => {
 				tracing::trace!("Pen input: {event:?}");
-				let _ = self.input_tx.send(CompositorInputEvent::Pen {
-					event_kind: event.event_kind as u8,
-					tool_kind: event.tool_kind as u8,
-					buttons: event.buttons,
-					x: event.x,
-					y: event.y,
-					pressure_or_distance: event.pressure_or_distance,
-					rotation: event.rotation,
-					tilt: event.tilt,
-				});
+				self.compositor.send(pen_event(&self.compositor, &event));
 			},
 			InputEvent::Utf8Text(text) => {
-				tracing::debug!("Typing clipboard text.");
-				let _ = self.input_tx.send(CompositorInputEvent::TypeText { text });
+				tracing::trace!("Typing clipboard text.");
+				self.compositor.send(SeatEvent::Text(text));
 			},
 			// Gamepad events: forward to gamepad handler thread.
 			gamepad_event => {
@@ -602,6 +578,47 @@ async fn run_timer_task(gamepads: Arc<Mutex<[Option<GamepadSlot>; 16]>>, wake: A
 	}
 }
 
+/// Moonlight's "rotation unknown" value (`LI_ROT_UNKNOWN`).
+const PEN_ROTATION_UNKNOWN: u16 = 0xFFFF;
+/// Moonlight's "tilt unknown" value (`LI_TILT_UNKNOWN`).
+const PEN_TILT_UNKNOWN: u8 = 0xFF;
+
+/// A Moonlight pen event as the compositor seat's pen event.
+///
+/// Hover reports the distance and a touching pen (down, move) the pressure,
+/// both in `0..=1`; a lifted pen (up) reports neither. Cancel and leaving
+/// hover range end the pen's proximity.
+fn pen_event(compositor: &CompositorInput, pen: &Pen) -> SeatEvent {
+	let buttons = u32::from(pen.buttons);
+	let kind = match pen.event_kind {
+		PointerEventKind::Cancel | PointerEventKind::HoverLeave | PointerEventKind::CancelAll => {
+			return SeatEvent::PenLeave;
+		},
+		PointerEventKind::ButtonOnly => return SeatEvent::PenButtons { buttons },
+		kind @ (PointerEventKind::Hover | PointerEventKind::Down | PointerEventKind::Up | PointerEventKind::Move) => {
+			kind
+		},
+	};
+	let (x, y) = compositor.touch_point(pen.x, pen.y);
+	let contact = matches!(kind, PointerEventKind::Down | PointerEventKind::Move);
+	let value = f64::from(pen.pressure_or_distance);
+	let tilt = (pen.rotation != PEN_ROTATION_UNKNOWN && pen.tilt != PEN_TILT_UNKNOWN)
+		.then(|| pen_tilt(f64::from(pen.rotation), f64::from(pen.tilt)));
+	SeatEvent::Pen(PenEvent {
+		tool: match pen.tool_kind {
+			PenToolKind::Eraser => PenTool::Eraser,
+			PenToolKind::Pen | PenToolKind::Unknown => PenTool::Pen,
+		},
+		x,
+		y,
+		contact,
+		pressure: contact.then_some(value),
+		distance: (kind == PointerEventKind::Hover).then_some(value),
+		tilt,
+		buttons,
+	})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::InputEvent;
@@ -619,5 +636,75 @@ mod tests {
 	fn rejects_empty_utf8_text_event() {
 		let payload = [0x17, 0x00, 0x00, 0x00];
 		assert!(InputEvent::from_bytes(&payload).is_err());
+	}
+
+	fn pen(event_kind: super::PointerEventKind, tool_kind: super::PenToolKind) -> super::Pen {
+		super::Pen {
+			event_kind,
+			tool_kind,
+			buttons: 0b10,
+			x: 0.5,
+			y: 0.25,
+			pressure_or_distance: 0.75,
+			rotation: 90,
+			tilt: 30,
+		}
+	}
+
+	#[test]
+	fn pen_contact_carries_pressure_and_output_coordinates() {
+		use super::{PenToolKind, PointerEventKind, SeatEvent};
+		let compositor = super::CompositorInput::new(1920, 1080);
+		let SeatEvent::Pen(event) = super::pen_event(&compositor, &pen(PointerEventKind::Move, PenToolKind::Pen))
+		else {
+			panic!("expected a pen event");
+		};
+		assert_eq!((event.x, event.y), (960.0, 270.0));
+		assert!(event.contact);
+		assert_eq!(event.pressure, Some(0.75));
+		assert_eq!(event.distance, None);
+		assert_eq!(event.buttons, 0b10);
+		let (tx, ty) = event.tilt.expect("rotation and tilt are known");
+		assert!((tx - 30.0).abs() < 1e-9 && ty.abs() < 1e-9);
+	}
+
+	#[test]
+	fn pen_hover_carries_distance_and_unknown_tilt_is_none() {
+		use super::{PenToolKind, PointerEventKind, SeatEvent};
+		let compositor = super::CompositorInput::new(1920, 1080);
+		let mut hover = pen(PointerEventKind::Hover, PenToolKind::Eraser);
+		hover.tilt = super::PEN_TILT_UNKNOWN;
+		let SeatEvent::Pen(event) = super::pen_event(&compositor, &hover) else {
+			panic!("expected a pen event");
+		};
+		assert_eq!(event.tool, ferriscope_core::PenTool::Eraser);
+		assert!(!event.contact);
+		assert_eq!((event.pressure, event.distance), (None, Some(0.75)));
+		assert_eq!(event.tilt, None);
+	}
+
+	#[test]
+	fn pen_lift_buttons_and_leave_map_to_their_events() {
+		use super::{PenToolKind, PointerEventKind, SeatEvent};
+		let compositor = super::CompositorInput::new(1920, 1080);
+		let SeatEvent::Pen(up) = super::pen_event(&compositor, &pen(PointerEventKind::Up, PenToolKind::Pen)) else {
+			panic!("expected a pen event");
+		};
+		assert!(!up.contact);
+		assert_eq!((up.pressure, up.distance), (None, None));
+		assert_eq!(
+			super::pen_event(&compositor, &pen(PointerEventKind::ButtonOnly, PenToolKind::Pen)),
+			SeatEvent::PenButtons { buttons: 0b10 }
+		);
+		for kind in [
+			PointerEventKind::Cancel,
+			PointerEventKind::HoverLeave,
+			PointerEventKind::CancelAll,
+		] {
+			assert_eq!(
+				super::pen_event(&compositor, &pen(kind, PenToolKind::Pen)),
+				SeatEvent::PenLeave
+			);
+		}
 	}
 }

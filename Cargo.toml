@@ -1,9 +1,9 @@
 [workspace]
-members = [".", "moonshine-core", "moonshine-tools", "moonshine-wsi"]
+members = [".", "moonshine-core", "moonshine-tools"]
 resolver = "2"
 
 [workspace.package]
-version = "0.16.0"
+version = "0.16.1"
 
 [package]
 name = "moonshine"

@@ -27,16 +27,17 @@
         default = moonshine;
       });
 
-      # NixOS service: `services.moonshine.*` (see nix/module.nix). The
-      # package defaults to this flake's build; no overlay required.
+      # NixOS service: `services.moonshine.*` (see nix/module.nix). No
+      # overlay required. The default package is built against the host's
+      # pkgs, not this flake's pinned nixpkgs: mesa and Vulkan drivers are
+      # loaded at runtime from the host's /run/opengl-driver, and they break
+      # if moonshine was linked against an older glibc than they were.
       nixosModules = {
         moonshine =
           { pkgs, lib, ... }:
           {
             imports = [ ./nix/module.nix ];
-            services.moonshine.package =
-              lib.mkDefault
-                self.packages.${pkgs.stdenv.hostPlatform.system}.moonshine;
+            services.moonshine.package = lib.mkDefault (pkgs.callPackage ./nix/package.nix { });
           };
         default = self.nixosModules.moonshine;
       };

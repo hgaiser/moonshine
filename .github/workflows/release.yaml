@@ -43,9 +43,12 @@ jobs:
     - name: Build
       run: cargo build --release --workspace
 
+    - name: Build the WSI layer
+      run: DESTDIR=./target/wsi-stage ./dist/install-wsi.sh
+
     - name: Strip and fixup
       run: |
-        strip ./target/release/moonshine ./target/release/libmoonshine_wsi.so
+        strip ./target/release/moonshine ./target/wsi-stage/usr/lib/ferriscope/libferriscope_wsi.so
         # Remove libunwind — pulled in transitively via libc++ on Ubuntu but
         # never called at runtime (no C++ exceptions in the code path).
         # Can be removed if inputtino-sys is changed to link -lc++ statically
@@ -60,12 +63,12 @@ jobs:
     - name: Package portable tarball
       run: |
         STAGE="$RUNNER_TEMP/moonshine"
-        mkdir -p "$STAGE/bin" "$STAGE/lib/moonshine/vulkan-layers" "$STAGE/share/moonshine"
+        mkdir -p "$STAGE/bin" "$STAGE/share/moonshine"
         cp ./target/release/moonshine "$STAGE/bin/"
-        cp ./target/release/libmoonshine_wsi.so "$STAGE/lib/moonshine/vulkan-layers/"
+        cp -r ./target/wsi-stage/usr/lib ./target/wsi-stage/usr/share "$STAGE/"
         cp ./dist/start-moonshine.sh ./dist/60-moonshine.rules ./dist/50-moonshine-inhibit-sleep.rules \
            ./dist/moonshine-modules.conf ./dist/moonshine-sysusers.conf \
-           ./dist/moonshine@.service ./dist/VkLayer_moonshine_wsi.json \
+           ./dist/moonshine@.service \
            ./dist/moonshine-atomic-update.conf "$STAGE/share/moonshine/"
         cp ./dist/moonshine-install.sh "$STAGE/bin/"
         cp README.md LICENSE "$STAGE/"

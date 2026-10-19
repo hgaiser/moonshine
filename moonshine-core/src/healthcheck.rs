@@ -1069,7 +1069,7 @@ fn check_wsi_layer(report: &mut HealthReport) {
 
 	let found = layers.iter().any(|l| {
 		l.layer_name_as_c_str()
-			.is_ok_and(|name| name.to_bytes() == b"VK_LAYER_MOONSHINE_wsi")
+			.is_ok_and(|name| name.to_bytes() == b"VK_LAYER_FERRISCOPE_wsi_x86_64")
 	});
 
 	if found {
@@ -1077,7 +1077,7 @@ fn check_wsi_layer(report: &mut HealthReport) {
 	} else {
 		report.add_warn(
 			"WSI layer",
-			"  Not found in Vulkan instance layers.\n  Install the moonshine-wsi Vulkan layer.\n  Games will render through XWayland (higher latency, no direct scanout).".into(),
+			"  Not found in Vulkan instance layers.\n  Install the ferriscope-wsi Vulkan layer (ferriscope: tools/install-wsi.sh).\n  Games will render through XWayland (higher latency, no direct scanout).".into(),
 			start.elapsed().as_millis() as u64,
 		);
 	}
