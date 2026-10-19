@@ -29,6 +29,26 @@ const MAX_FEC_BLOCKS: usize = 4;
 /// Ten-bit data count in `fecInfo`; zero does not represent 1024.
 const MAX_DATA_SHARDS_PER_BLOCK: usize = 1023;
 
+/// Choose the wire percentage first: Moonlight derives parity as
+/// ceil(data * percentage / 100). Some counts cannot be expressed by an
+/// eight-bit percentage, so the client minimum is bounded by both limits.
+fn fec_parameters(data_shards: usize, percentage: u8, minimum: u32) -> (usize, usize) {
+	let max_parity = MAX_SHARDS.saturating_sub(data_shards);
+	let minimum = (minimum as usize).min(max_parity);
+	let minimum_percentage = if minimum == 0 {
+		0
+	} else {
+		(minimum - 1) * 100 / data_shards + 1
+	};
+	let max_percentage = (max_parity * 100 / data_shards).min(u8::MAX as usize);
+	let percentage = (percentage as usize).max(minimum_percentage).min(max_percentage);
+	((data_shards * percentage).div_ceil(100), percentage)
+}
+
+fn data_shards_per_block(percentage: u8) -> usize {
+	MAX_SHARDS * 100 / (100 + percentage as usize)
+}
+
 #[repr(u8)]
 enum RtpFlag {
 	ContainsPicData = 0x1,
@@ -167,13 +187,10 @@ impl Packetizer {
 	/// Pre-create FEC encoders for all possible block sizes to avoid
 	/// expensive ReedSolomon matrix construction during frame processing.
 	pub fn warm_up(&mut self, fec_percentage: u8, minimum_fec_packets: u32) {
-		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
+		let nr_data_shards_per_block = data_shards_per_block(fec_percentage);
 
 		for nr_data_shards in 1..=nr_data_shards_per_block {
-			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize)
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
+			let (nr_parity_shards, _) = fec_parameters(nr_data_shards, fec_percentage, minimum_fec_packets);
 			if nr_parity_shards > 0 {
 				let _ = self.get_fec_encoder(nr_data_shards, nr_parity_shards);
 			}
@@ -241,8 +258,7 @@ impl Packetizer {
 			return Err(());
 		}
 
-		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
+		let nr_data_shards_per_block = data_shards_per_block(fec_percentage);
 		// Preserve the protected layout while the last block is representable.
 		// Otherwise balance four unprotected blocks, as a count above 1023
 		// would truncate on the wire and prevent reconstruction without loss.
@@ -285,9 +301,8 @@ impl Packetizer {
 			let nr_data_shards = end - start;
 			assert!(nr_data_shards != 0);
 
-			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize)
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
+			let (nr_parity_shards, fec_percentage) =
+				fec_parameters(nr_data_shards, fec_percentage, minimum_fec_packets);
 
 			let t_fec_encoder = Instant::now();
 			let encoder = if nr_parity_shards > 0 {
@@ -296,9 +311,6 @@ impl Packetizer {
 				None
 			};
 			total_fec_encoder_us += t_fec_encoder.elapsed().as_micros();
-
-			// Recompute the actual FEC percentage in case of a rounding error or when there are 0 parity shards.
-			let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
 
 			tracing::trace!(
 				"Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards."
@@ -460,6 +472,7 @@ impl Packetizer {
 #[cfg(test)]
 mod fec_tests {
 	use super::*;
+	use std::collections::BTreeMap;
 
 	fn packetizer(encrypted: bool) -> Packetizer {
 		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
@@ -473,6 +486,23 @@ mod fec_tests {
 		(0..data_shards * 64 - VIDEO_FRAME_HEADER_SIZE)
 			.map(|index| (index % 251) as u8)
 			.collect()
+	}
+
+	#[test]
+	fn fec_parameters_fit_the_percentage_and_encoder_limits() {
+		for data in 1..=1023 {
+			for requested in 0..=u8::MAX {
+				for minimum in [0, 2, 255, u32::MAX] {
+					let (parity, percentage) = fec_parameters(data, requested, minimum);
+					assert!(percentage <= 255);
+					assert_eq!(parity, (data * percentage).div_ceil(100));
+					assert!(parity == 0 || data + parity <= 255);
+				}
+			}
+		}
+		assert_eq!(fec_parameters(213, 20, 0), (41, 19));
+		assert_eq!(fec_parameters(1, 20, 2), (2, 101));
+		assert_eq!(fec_parameters(1, 20, u32::MAX), (3, 255));
 	}
 
 	fn reassemble(batch: &ShardBatch, encrypted: bool) -> Vec<u8> {
@@ -537,5 +567,51 @@ mod fec_tests {
 				.is_err()
 		);
 		assert_eq!(sequence, 77);
+	}
+
+	#[test]
+	fn emitted_parity_matches_the_receivers_count_and_recovers_a_packet() {
+		for (data_shards, percentage, minimum) in [
+			(213, 20, 0),
+			(258, 20, 2),
+			(137, 20, 0),
+			(1, 20, 2),
+			(1, 255, 8),
+			(40, 0, 2),
+			(40, 20, u32::MAX),
+			(600, 100, 2),
+		] {
+			let batch = packetizer(false)
+				.packetize(&frame(data_shards), true, 80, minimum, percentage, 1, &mut 0, 0, 0)
+				.unwrap();
+			let mut blocks = BTreeMap::<u8, Vec<Vec<u8>>>::new();
+			for packet in batch.as_bytes().chunks_exact(batch.shard_size()) {
+				blocks.entry((packet[27] >> 4) & 3).or_default().push(packet.to_vec());
+			}
+			for packets in blocks.values() {
+				let fec_info = u32::from_le_bytes(packets[0][28..32].try_into().unwrap());
+				let data = (fec_info >> 22) as usize;
+				let percentage = ((fec_info >> 4) & 0xff) as usize;
+				// Moonlight derives this count from the advertised percentage.
+				let parity = (data * percentage).div_ceil(100);
+				assert_eq!(
+					packets.len(),
+					data + parity,
+					"{data_shards} data shards, minimum {minimum}"
+				);
+				if parity == 0 {
+					continue;
+				}
+				assert!(data + parity <= 255);
+				let expected = packets[0][PAYLOAD_OFFSET..].to_vec();
+				let mut received: Vec<_> = packets.iter().cloned().map(Some).collect();
+				received[0] = None;
+				ReedSolomon::new(data, parity)
+					.unwrap()
+					.reconstruct_data(&mut received)
+					.unwrap();
+				assert_eq!(&received[0].as_ref().unwrap()[PAYLOAD_OFFSET..], expected);
+			}
+		}
 	}
 }
