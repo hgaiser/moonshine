@@ -177,8 +177,8 @@ dependencies = [
 
 [[package]]
 name = "ash"
-version = "0.38.0+1.4.329"
-source = "git+https://github.com/ash-rs/ash?rev=55dd56906bbb5760e9e9e6c56f45be67f67e0649#55dd56906bbb5760e9e9e6c56f45be67f67e0649"
+version = "0.38.0+1.4.352"
+source = "git+https://github.com/ash-rs/ash?rev=f4c2ca3e4f6b998d5254ad101a32f024d87cdec2#f4c2ca3e4f6b998d5254ad101a32f024d87cdec2"
 dependencies = [
  "libloading",
 ]
@@ -2831,11 +2831,12 @@ dependencies = [
 
 [[package]]
 name = "pixelforge"
-version = "0.9.1"
-source = "git+https://github.com/hgaiser/pixelforge?tag=v0.9.1#2ee4d7ac6e470cc34270e48d6e9d6f3fc1d7c379"
+version = "0.10.0"
+source = "git+https://github.com/hgaiser/pixelforge?tag=v0.10.0#4f3ff5e963a733e4036fd0bcb62df33daeb4ca94"
 dependencies = [
  "ash",
  "futures-channel",
+ "futures-core",
  "thiserror 2.0.19",
  "tracing",
 ]
