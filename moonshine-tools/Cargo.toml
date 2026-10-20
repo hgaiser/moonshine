@@ -9,7 +9,7 @@ path = "src/bin/bench.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
-moonshine-core = { path = "../moonshine-core" }
+moonshine = { path = "..", default-features = false }
 async-shutdown = "0.2.2"
 tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "signal", "time"] }
 tracing = "0.1.44"

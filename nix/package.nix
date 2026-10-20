@@ -28,7 +28,6 @@ let
       ../Cargo.toml
       ../Cargo.lock
       ../src
-      ../moonshine-core
       ../moonshine-tools
       ../assets
       ../dist

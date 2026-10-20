@@ -620,7 +620,7 @@ impl Webserver {
 			})
 			.filter(|id| !id.is_empty())
 			.unwrap_or_else(|| "0123456789ABCDEF".to_string());
-		let content = include_bytes!("../../../assets/pin.html");
+		let content = include_bytes!("../../assets/pin.html");
 		let html = String::from_utf8_lossy(content);
 		let html = html.replace("{{UNIQUE_ID}}", &unique_id);
 		let mut response = Response::new(Full::new(Bytes::from(html)));

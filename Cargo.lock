@@ -2307,19 +2307,6 @@ dependencies = [
 name = "moonshine"
 version = "0.16.1"
 dependencies = [
- "async-shutdown",
- "clap",
- "moonshine-core",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "zbus",
-]
-
-[[package]]
-name = "moonshine-core"
-version = "0.16.1"
-dependencies = [
  "aes 0.9.2",
  "aes-gcm",
  "arrayvec",
@@ -2329,6 +2316,7 @@ dependencies = [
  "byteorder",
  "bytes",
  "cbc",
+ "clap",
  "crossbeam-channel",
  "dasp_sample",
  "dirs",
@@ -2378,6 +2366,7 @@ dependencies = [
  "tokio-rustls",
  "toml",
  "tracing",
+ "tracing-subscriber",
  "url",
  "uuid",
  "walkdir",
@@ -2394,7 +2383,7 @@ version = "0.16.1"
 dependencies = [
  "async-shutdown",
  "clap",
- "moonshine-core",
+ "moonshine",
  "tokio",
  "tracing",
  "tracing-subscriber",
