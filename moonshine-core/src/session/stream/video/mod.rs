@@ -16,8 +16,7 @@ mod packetizer;
 mod pipeline;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
-use pipeline::VideoPipeline;
-use shard_batch::ShardBatch;
+use pipeline::{MAX_FRAMES_IN_FLIGHT, PacketBatch, VideoPipeline};
 
 /// Configuration for the video stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -346,8 +345,9 @@ impl VideoStream {
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
 		let resume_pending = Arc::new(AtomicBool::new(false));
 
-		// Packet channel.
-		let (packet_tx, packet_rx) = mpsc::channel::<(u32, ShardBatch)>(128);
+		// Packet channel. Each batch holds its frame's in-flight slot until it is
+		// sent, so the channel never holds more than the in-flight limit.
+		let (packet_tx, packet_rx) = mpsc::channel::<PacketBatch>(MAX_FRAMES_IN_FLIGHT);
 
 		// Spawn packet handler — gated behind start.
 		spawn_handle_video_packets(
@@ -387,7 +387,7 @@ impl VideoStream {
 }
 
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<(u32, ShardBatch)>,
+	mut packet_rx: mpsc::Receiver<PacketBatch>,
 	socket: UdpGsoSocket,
 	mut start: StartWaiter,
 	reset_tx: broadcast::Sender<u32>,
@@ -414,18 +414,20 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Ok(Some((epoch, batch))) => {
+						// `batch` holds its frame's in-flight slot until this arm ends,
+						// i.e. until the frame is sent or dropped.
+						Ok(Some(batch)) => {
 							if let Some(addr) = client_address {
 								// Frames from before a resume's reset would reach the new client
 								// with old frame numbers, making it drop the reset frames as stale.
-								if epoch < reset_epoch || batch.shard_count() == 0 {
+								if batch.epoch < reset_epoch || batch.shards.shard_count() == 0 {
 									continue;
 								}
 
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
 								match stop_session_manager
-									.wrap_cancel(socket.send_batch(&batch, addr))
+									.wrap_cancel(socket.send_batch(&batch.shards, addr))
 									.await
 								{
 									Ok(failed_chunks) => {
