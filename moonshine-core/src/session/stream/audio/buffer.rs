@@ -597,8 +597,8 @@ mod tests {
 
 		let mut out = vec![0.0f32; 240 * 2];
 		assert!(buf.drain_and_mix(240, &mut out, &[1.0, 1.0]));
-		for frame in out.chunks_exact(2) {
-			assert_eq!(frame, [0.5, 0.0]);
+		for frame in out.as_chunks::<2>().0 {
+			assert_eq!(*frame, [0.5, 0.0]);
 		}
 		assert!(buf.is_empty());
 	}
@@ -615,8 +615,8 @@ mod tests {
 
 		let mut out = vec![0.0f32; 240 * 2];
 		assert!(buf.drain_and_mix(240, &mut out, &[1.0, 1.0]));
-		for frame in out.chunks_exact(2) {
-			assert_eq!(frame, [0.5 * GAIN_CENTER; 2]);
+		for frame in out.as_chunks::<2>().0 {
+			assert_eq!(*frame, [0.5 * GAIN_CENTER; 2]);
 		}
 		assert!(buf.is_empty());
 	}
@@ -633,8 +633,8 @@ mod tests {
 
 		let mut out = vec![0.0f32; 240 * 6];
 		assert!(buf.drain_and_mix(240, &mut out, &[1.0; 6]));
-		for frame in out.chunks_exact(6) {
-			assert_eq!(frame, [0.5, 0.25, 0.0, 0.0, 0.0, 0.0]);
+		for frame in out.as_chunks::<6>().0 {
+			assert_eq!(*frame, [0.5, 0.25, 0.0, 0.0, 0.0, 0.0]);
 		}
 	}
 
@@ -646,8 +646,8 @@ mod tests {
 
 		let mut out = vec![0.0f32; 240 * 2];
 		assert!(buf.drain_and_mix(240, &mut out, &[1.0, 1.0]));
-		for (i, frame) in out.chunks_exact(2).enumerate() {
-			assert_eq!(frame, [i as f32 / 240.0; 2]);
+		for (i, frame) in out.as_chunks::<2>().0.iter().enumerate() {
+			assert_eq!(*frame, [i as f32 / 240.0; 2]);
 		}
 		assert!(buf.is_empty());
 	}
