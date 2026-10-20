@@ -57,13 +57,13 @@ let
 
   # ferriscope's Vulkan WSI layer routes a game's swapchain frames straight
   # into the compositor (bypassing Xwayland) and carries HDR and pacing. It
-  # lives in the ferriscope repository next to ferriscope-core, but only
-  # ferriscope-core is a dependency, so the vendored sources above do not
+  # lives in the ferriscope repository next to the ferriscope crate, but only
+  # the ferriscope crate is a dependency, so the vendored sources above do not
   # contain it. Build it from the same ferriscope revision Cargo.lock pins, so
   # the layer always matches the compositor linked into moonshine.
   ferriscopeLockEntry =
-    lib.findFirst (p: p.name == "ferriscope-core")
-      (throw "ferriscope-core not found in Cargo.lock")
+    lib.findFirst (p: p.name == "ferriscope")
+      (throw "ferriscope not found in Cargo.lock")
       (lib.importTOML ../Cargo.lock).package;
   # e.g. "git+https://github.com/hgaiser/ferriscope?rev=<rev>#<rev>"
   ferriscopeMatch = builtins.match "git\\+([^?#]+)(\\?[^#]*)?#(.+)" ferriscopeLockEntry.source;

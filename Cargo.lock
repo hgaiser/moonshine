@@ -1303,9 +1303,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "ferriscope-core"
+name = "ferriscope"
 version = "0.1.0"
-source = "git+https://github.com/hgaiser/ferriscope?rev=833978d7e0b51e44cc50b674f7bccf7c418a7b6d#833978d7e0b51e44cc50b674f7bccf7c418a7b6d"
+source = "git+https://github.com/hgaiser/ferriscope?rev=a8acd19eeb787334bbe200a247b7ff8d5b208220#a8acd19eeb787334bbe200a247b7ff8d5b208220"
 dependencies = [
  "bitflags",
  "smithay",
@@ -2333,7 +2333,7 @@ dependencies = [
  "dasp_sample",
  "dirs",
  "fec-rs",
- "ferriscope-core",
+ "ferriscope",
  "futures-util",
  "gethostname",
  "hex",

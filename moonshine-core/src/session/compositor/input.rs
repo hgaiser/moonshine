@@ -8,7 +8,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use ferriscope_core::{InputEvent, InputSender};
+use ferriscope::{InputEvent, InputSender};
 
 /// The compositor's seat, connected once the compositor has launched.
 ///

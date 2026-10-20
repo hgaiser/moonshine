@@ -841,7 +841,7 @@ impl VideoPipelineInner {
 			// Try to receive a frame from compositor (with timeout).
 			let received_frame = match frames.recv_timeout(frame_interval) {
 				Ok(frame) => Some(frame),
-				Err(ferriscope_core::RecvTimeoutError::Timeout) => {
+				Err(ferriscope::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
 					// If we have a pending IDR request and have encoded before,
 					// re-encode the encoder's input image (still contains
@@ -879,7 +879,7 @@ impl VideoPipelineInner {
 					}
 					None
 				},
-				Err(ferriscope_core::RecvTimeoutError::Disconnected) => {
+				Err(ferriscope::RecvTimeoutError::Disconnected) => {
 					tracing::debug!("Frame channel disconnected - compositor stopped");
 					let _ = stop_session_manager.trigger_shutdown(SessionShutdownReason::CompositorStopped);
 					break;
@@ -907,7 +907,7 @@ impl VideoPipelineInner {
 				let t1_received = std::time::Instant::now();
 
 				// ferriscope only delivers DMA-BUF frames to embedders.
-				let ferriscope_core::FrameData::DmaBuf(dmabuf_frame) = &frame.data;
+				let ferriscope::FrameData::DmaBuf(dmabuf_frame) = &frame.data;
 				let dmabuf = &dmabuf_frame.dmabuf;
 				let fourcc = dmabuf.format().code as u32;
 				let modifier = u64::from(dmabuf.format().modifier);

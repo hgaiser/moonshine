@@ -88,8 +88,8 @@ impl HdrMetadata {
 }
 
 /// The encoder colour space for ferriscope's frame colour description.
-pub(crate) fn color_space(colour: &ferriscope_core::ColourMetadata) -> FrameColorSpace {
-	use ferriscope_core::{ColourPrimaries, TransferFunction};
+pub(crate) fn color_space(colour: &ferriscope::ColourMetadata) -> FrameColorSpace {
+	use ferriscope::{ColourPrimaries, TransferFunction};
 	match (colour.transfer, colour.primaries) {
 		(TransferFunction::Pq, ColourPrimaries::Bt2020) => FrameColorSpace::Bt2020Pq,
 		(TransferFunction::Linear, ColourPrimaries::Bt709) => FrameColorSpace::ScrgbLinear,
@@ -101,12 +101,12 @@ pub(crate) fn color_space(colour: &ferriscope_core::ColourMetadata) -> FrameColo
 ///
 /// An HDR frame without mastering metadata gets [`HdrMetadata::fallback`],
 /// keeping any content light level the application sent.
-pub(crate) fn hdr_metadata(colour: &ferriscope_core::ColourMetadata) -> Option<HdrMetadata> {
+pub(crate) fn hdr_metadata(colour: &ferriscope::ColourMetadata) -> Option<HdrMetadata> {
 	if color_space(colour) == FrameColorSpace::Srgb {
 		return None;
 	}
 	// CIE xy in 0.00002 units, luminance in 0.0001 cd/m².
-	let xy = |c: ferriscope_core::Chromaticity| ((c.x * 50_000.0).round() as u16, (c.y * 50_000.0).round() as u16);
+	let xy = |c: ferriscope::Chromaticity| ((c.x * 50_000.0).round() as u16, (c.y * 50_000.0).round() as u16);
 	let mut metadata = match colour.mastering {
 		Some(mastering) => HdrMetadata {
 			display_primaries: [xy(mastering.red), xy(mastering.green), xy(mastering.blue)],
@@ -131,7 +131,7 @@ mod tests {
 
 	#[test]
 	fn frame_colour_maps_to_the_encoder_colour_space_and_metadata() {
-		use ferriscope_core::{
+		use ferriscope::{
 			Chromaticity, ColourMetadata, ColourPrimaries, ContentLightLevel, MasteringDisplay, TransferFunction,
 		};
 		let sdr = ColourMetadata::default();

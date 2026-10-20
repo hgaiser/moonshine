@@ -38,13 +38,13 @@ fi
 ferriscope=${FERRISCOPE_SRC:-}
 if [ -z "$ferriscope" ]; then
 	manifest=$(cd "$root" && cargo metadata --format-version 1 --locked |
-		jq -r '.packages[] | select(.name == "ferriscope-core") | .manifest_path')
+		jq -r '.packages[] | select(.name == "ferriscope") | .manifest_path')
 	if [ -z "$manifest" ]; then
-		echo "ferriscope-core is not in Cargo.lock" >&2
+		echo "ferriscope is not in Cargo.lock" >&2
 		exit 1
 	fi
-	# .../crates/ferriscope-core/Cargo.toml -> the ferriscope checkout.
-	ferriscope=$(dirname "$(dirname "$(dirname "$manifest")")")
+	# .../ferriscope/Cargo.toml -> the ferriscope checkout.
+	ferriscope=$(dirname "$(dirname "$manifest")")
 fi
 
 CARGO_TARGET_DIR=$root/target/ferriscope-wsi "$ferriscope/tools/install-wsi.sh" --prefix "$prefix"
