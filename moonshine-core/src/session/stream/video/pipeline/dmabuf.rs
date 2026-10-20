@@ -10,23 +10,52 @@
 //! Kernel fd recycling is caught by a two-layer check on every cache hit:
 //! 1. Import parameters (format, dimensions, modifier) — catches genuine
 //!    reconfigurations (e.g. PQ → scRGB HDR switch).
-//! 2. `kcmp(2)` open-file-description comparison — catches a recycled fd number
-//!    pointing at a new buffer whose parameters happen to be identical.
+//! 2. Buffer identity — catches a recycled fd number pointing at a new buffer
+//!    whose parameters happen to be identical.
 //!
-//! Each cache entry holds a `dup` of its fd for the `kcmp(2)` comparison.
+//! The buffer identity check uses one of two methods. [`KcmpProbe`] picks the
+//! method once per process:
+//! - `kcmp(2)` (preferred). It checks whether two fds share one open file
+//!   description, the kernel's `struct file`. All DMA-BUF fds in a session are
+//!   dups of the exporter's single `struct file`, so this means "same buffer".
+//! - Inode comparison (fallback). `fstat(2)` returns the device and inode
+//!   number of the file behind an fd. Since Linux 5.3, each DMA-BUF has its own
+//!   inode on the kernel's dmabuf pseudo-filesystem, so equal numbers mean the
+//!   same buffer. Moonshine uses this method when a seccomp filter blocks
+//!   `kcmp(2)` (Podman's default profile, Flatpak) or the kernel lacks it.
+//!
+//! Each cache entry holds a `dup` of its fd. The `dup` keeps the buffer alive,
+//! so its inode stays in use and `kcmp(2)` has an fd to compare against.
+//!
+//! The inode method has one limitation. The kernel numbers these inodes with a
+//! 32-bit counter (`get_next_ino`), shared with pipes, sockets and other
+//! pseudo-files. After about 4 billion new inodes the counter wraps, and a new
+//! buffer could get the inode number of a live entry. By accident, the risk is
+//! negligible: an entry expires after `CACHE_TTL` (2 seconds), and a hit also
+//! needs matching import parameters.
+//!
+//! A local process can force a collision on purpose. It can advance the
+//! counter by creating pipes, then send a new buffer at the same fd number. The
+//! result is only a stale frame from a buffer the session already provided.
+//! The old buffer stays alive and the import parameters match, so memory
+//! safety and confidentiality are not affected. `kcmp(2)` cannot be fooled
+//! this way, which is why it is preferred.
 //!
 //! Entries are refcounted: consumers (e.g. `ColorConverter`) hold an `Arc` so
 //! an image is never destroyed while they cache a view of it.
 //!
-//! The startup healthcheck verifies `kcmp(2)` is available; startup is refused
-//! without it.
+//! The startup healthcheck reports which method is in use. It warns, but does
+//! not refuse startup, when `kcmp(2)` is unavailable.
 
 use ash::vk;
 use pixelforge::VideoContext;
 use std::collections::HashMap;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::fs::File;
+use std::io;
+use std::mem::MaybeUninit;
+use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::io::{BorrowedFd, IntoRawFd};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use tracing::{debug, trace};
 
@@ -85,44 +114,132 @@ pub(crate) struct CachedImport {
 	image: vk::Image,
 	memory: vk::DeviceMemory,
 	params: ImportParams,
-	/// Duplicate of the DMA-BUF fd, held for `kcmp(2)` identity checks.
+	/// Duplicate of the DMA-BUF fd. It keeps the buffer alive for identity checks.
 	fd: OwnedFd,
+	/// How a later hit checks that its fd still refers to this buffer.
+	identity: Identity,
 	/// TTL timestamp; `Mutex` lets a cache hit refresh it through a shared `Arc`.
 	last_used: Mutex<Instant>,
 	/// Own context clone so `Drop` can free resources after the importer is gone.
 	context: VideoContext,
 }
 
-/// Check whether two fds refer to the same open file description via `kcmp(2)`.
+/// How the cache checks that two fds refer to the same DMA-BUF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompareMethod {
+	/// Compare open file descriptions with `kcmp(2)`.
+	Kcmp,
+	/// Compare device and inode numbers from `fstat(2)`.
+	Inode,
+}
+
+/// Result of the one-time `kcmp(2)` probe.
 ///
-/// All DMA-BUF fds in a session are dups of the exporter's single `struct file`,
-/// so "same open file description" means "same buffer".
-///
-/// The startup healthcheck guarantees `kcmp(2)` is available, so this never
-/// returns an error at runtime.
-pub(crate) fn same_open_file(a: RawFd, b: RawFd) -> bool {
+/// The cache and the startup healthcheck read the same result, so the
+/// healthcheck reports the method the cache really uses.
+#[derive(Debug)]
+pub(crate) enum KcmpProbe {
+	/// `kcmp(2)` works.
+	Available,
+	/// `kcmp(2)` failed with this error.
+	Unavailable(io::Error),
+	/// The probe could not open `/dev/null` to test `kcmp(2)`.
+	NoProbeFile(io::Error),
+}
+
+impl KcmpProbe {
+	/// Probe `kcmp(2)` on first call and return the stored result after that.
+	pub(crate) fn get() -> &'static Self {
+		static PROBE: OnceLock<KcmpProbe> = OnceLock::new();
+		PROBE.get_or_init(|| match File::open("/dev/null") {
+			Ok(file) => match kcmp_file(file.as_fd(), file.as_fd()) {
+				Ok(_) => Self::Available,
+				Err(e) => Self::Unavailable(e),
+			},
+			Err(e) => Self::NoProbeFile(e),
+		})
+	}
+
+	/// The comparison method this result selects. Any probe failure selects
+	/// the inode method, so the cache always has a working method.
+	pub(crate) fn method(&self) -> CompareMethod {
+		match self {
+			Self::Available => CompareMethod::Kcmp,
+			Self::Unavailable(_) | Self::NoProbeFile(_) => CompareMethod::Inode,
+		}
+	}
+}
+
+/// Check with `kcmp(2)` whether two fds share one open file description.
+fn kcmp_file(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> io::Result<bool> {
 	/// `KCMP_FILE` — not exposed by `libc` or glibc.
 	const KCMP_FILE: libc::c_int = 0;
 
-	// SAFETY: syscall with scalar arguments; fds are only compared, not accessed.
-	let result = unsafe {
-		libc::syscall(
-			libc::SYS_kcmp,
-			libc::getpid(),
-			libc::getpid(),
-			KCMP_FILE,
-			a as libc::c_ulong,
-			b as libc::c_ulong,
-		)
-	};
+	// The kernel reads the fds as `unsigned long`. A `BorrowedFd` is never negative.
+	let [a, b] = [a, b].map(|fd| libc::c_ulong::from(fd.as_raw_fd().unsigned_abs()));
 
-	assert!(
-		result >= 0,
-		"kcmp(2) failed unexpectedly — the startup healthcheck should have caught this"
-	);
+	// SAFETY: syscall with scalar arguments; fds are only compared, not accessed.
+	let result = unsafe { libc::syscall(libc::SYS_kcmp, libc::getpid(), libc::getpid(), KCMP_FILE, a, b) };
+	if result < 0 {
+		return Err(io::Error::last_os_error());
+	}
 
 	// 0 = identical, 1/2 = ordering between distinct files.
-	result == 0
+	Ok(result == 0)
+}
+
+/// Identity of a DMA-BUF: the device and inode number of its file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BufferId {
+	dev: libc::dev_t,
+	ino: libc::ino_t,
+}
+
+impl BufferId {
+	/// Read the identity of the file behind `fd` with `fstat(2)`.
+	fn of(fd: BorrowedFd<'_>) -> io::Result<Self> {
+		let mut stat = MaybeUninit::<libc::stat>::uninit();
+		// SAFETY: `fd` is open, and `stat` has room for a `struct stat`.
+		if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
+			return Err(io::Error::last_os_error());
+		}
+		// SAFETY: `fstat` succeeded, so it filled in `stat`.
+		let stat = unsafe { stat.assume_init() };
+		Ok(Self {
+			dev: stat.st_dev,
+			ino: stat.st_ino,
+		})
+	}
+}
+
+/// What a cache entry keeps to recognise its buffer on a later hit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Identity {
+	/// Compare the entry's fd with the new fd using `kcmp(2)`.
+	OpenFile,
+	/// Compare with the buffer's identity, read when the entry was created.
+	Inode(BufferId),
+}
+
+impl Identity {
+	/// Record the identity of the buffer behind `fd` for `method`.
+	fn read(method: CompareMethod, fd: BorrowedFd<'_>) -> io::Result<Self> {
+		match method {
+			CompareMethod::Kcmp => Ok(Self::OpenFile),
+			CompareMethod::Inode => BufferId::of(fd).map(Self::Inode),
+		}
+	}
+
+	/// Check whether `fd` refers to the buffer behind `own`, the entry's fd.
+	///
+	/// An error counts as a different buffer. The cache then imports the
+	/// buffer again instead of reusing an image that may be wrong.
+	fn matches(self, own: BorrowedFd<'_>, fd: BorrowedFd<'_>) -> bool {
+		match self {
+			Self::OpenFile => kcmp_file(own, fd).unwrap_or(false),
+			Self::Inode(id) => BufferId::of(fd).is_ok_and(|other| other == id),
+		}
+	}
 }
 
 impl CachedImport {
@@ -132,8 +249,8 @@ impl CachedImport {
 	}
 
 	/// Check whether `fd` refers to the same DMA-BUF this entry was imported from.
-	fn is_same_buffer(&self, fd: RawFd) -> bool {
-		same_open_file(self.fd.as_raw_fd(), fd)
+	fn is_same_buffer(&self, fd: BorrowedFd<'_>) -> bool {
+		self.identity.matches(self.fd.as_fd(), fd)
 	}
 
 	/// Refresh the TTL timestamp.
@@ -165,6 +282,8 @@ impl Drop for CachedImport {
 pub(crate) struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
+	/// Buffer identity method, chosen once by [`KcmpProbe`].
+	method: CompareMethod,
 	/// Per-fd cache; `is_same_buffer` catches recycled fds. `Arc`s are shared
 	/// with consumers that keep the image alive while caching a view of it.
 	cache: HashMap<RawFd, Arc<CachedImport>>,
@@ -178,10 +297,13 @@ impl DmaBufImporter {
 	/// Create a new DMA-BUF importer.
 	pub fn new(context: VideoContext) -> Result<Self, String> {
 		let external_memory_fd = ash::khr::external_memory_fd::Device::load(context.instance(), context.device());
+		let method = KcmpProbe::get().method();
+		debug!("DMA-BUF import cache identity method: {method:?}");
 
 		Ok(Self {
 			context,
 			external_memory_fd,
+			method,
 			cache: HashMap::new(),
 			retired: Vec::new(),
 			calls_since_sweep: 0,
@@ -206,10 +328,13 @@ impl DmaBufImporter {
 
 		let params = ImportParams::new(width, height, format, planes);
 
+		// SAFETY: the caller keeps `fd` open for the duration of this call.
+		let borrowed_fd = unsafe { BorrowedFd::borrow_raw(fd) };
+
 		let now = Instant::now();
 		if let Some(cached) = self.cache.get(&fd)
 			&& cached.params == params
-			&& cached.is_same_buffer(fd)
+			&& cached.is_same_buffer(borrowed_fd)
 		{
 			cached.touch(now);
 			return Ok((Arc::clone(cached), false));
@@ -230,10 +355,12 @@ impl DmaBufImporter {
 			width, height, format, planes[0].stride, planes[0].modifier
 		);
 
-		// Keep a dup for `kcmp(2)` identity comparison.
-		let owned_fd = unsafe { BorrowedFd::borrow_raw(fd) }
+		// Keep a dup so the buffer stays alive for identity checks.
+		let owned_fd = borrowed_fd
 			.try_clone_to_owned()
 			.map_err(|e| format!("Failed to duplicate DMA-BUF FD for the import cache: {e}"))?;
+		let identity = Identity::read(self.method, owned_fd.as_fd())
+			.map_err(|e| format!("Failed to read DMA-BUF identity for the import cache: {e}"))?;
 
 		let (image, memory) = self.import_internal(width, height, format, planes)?;
 
@@ -242,6 +369,7 @@ impl DmaBufImporter {
 			memory,
 			params,
 			fd: owned_fd,
+			identity,
 			last_used: Mutex::new(now),
 			context: self.context.clone(),
 		});
@@ -412,9 +540,10 @@ impl Drop for DmaBufImporter {
 
 #[cfg(test)]
 mod tests {
-	use super::{DmaBufPlane, ImportParams, same_open_file};
+	use super::{CompareMethod, DmaBufPlane, Identity, ImportParams, KcmpProbe};
 	use ash::vk;
-	use std::os::fd::AsRawFd;
+	use std::io;
+	use std::os::fd::{AsFd, FromRawFd, OwnedFd};
 
 	fn plane(offset: u32, stride: u32) -> DmaBufPlane {
 		DmaBufPlane {
@@ -447,15 +576,47 @@ mod tests {
 		assert_ne!(a, b);
 	}
 
-	#[test]
-	fn kcmp_distinguishes_open_file_descriptions() {
-		let a = std::fs::File::open("/dev/null").unwrap();
-		// Same open file description (shared `struct file`).
-		let dup = a.try_clone().unwrap();
-		// Different open file description, same inode (separate `open(2)`).
-		let other = std::fs::File::open("/dev/null").unwrap();
+	/// Create an anonymous in-memory file. Like a DMA-BUF, each memfd has its
+	/// own inode on a kernel pseudo-filesystem and its own open file description.
+	fn memfd() -> OwnedFd {
+		// SAFETY: the name is a valid C string, and no flags are set.
+		let fd = unsafe { libc::memfd_create(c"moonshine-test".as_ptr(), 0) };
+		assert!(fd >= 0, "memfd_create failed: {}", io::Error::last_os_error());
+		// SAFETY: `fd` is a new fd that nothing else owns.
+		unsafe { OwnedFd::from_raw_fd(fd) }
+	}
 
-		assert!(same_open_file(a.as_raw_fd(), dup.as_raw_fd()));
-		assert!(!same_open_file(a.as_raw_fd(), other.as_raw_fd()));
+	#[test]
+	fn identity_methods_distinguish_buffers() {
+		let buffer = memfd();
+		// Same buffer: shares the open file description and the inode.
+		let dup = buffer.try_clone().unwrap();
+		// Different buffer: its own open file description and inode.
+		let other = memfd();
+
+		// Some sandboxes block kcmp(2), e.g. Podman's default seccomp profile.
+		// Test it only where the probe found it.
+		let kcmp_available = KcmpProbe::get().method() == CompareMethod::Kcmp;
+		if !kcmp_available {
+			eprintln!(
+				"kcmp(2) unavailable ({:?}); testing the inode method only",
+				KcmpProbe::get()
+			);
+		}
+		let methods = [CompareMethod::Kcmp, CompareMethod::Inode]
+			.into_iter()
+			.filter(|&method| method == CompareMethod::Inode || kcmp_available);
+
+		for method in methods {
+			let identity = Identity::read(method, buffer.as_fd()).unwrap();
+			assert!(
+				identity.matches(buffer.as_fd(), dup.as_fd()),
+				"{method:?}: dup must match"
+			);
+			assert!(
+				!identity.matches(buffer.as_fd(), other.as_fd()),
+				"{method:?}: other buffer must not match"
+			);
+		}
 	}
 }

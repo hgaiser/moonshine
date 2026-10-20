@@ -16,6 +16,7 @@ mod packetizer;
 mod pipeline;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
+pub(crate) use pipeline::KcmpProbe;
 use pipeline::VideoPipeline;
 use shard_batch::ShardBatch;
 
