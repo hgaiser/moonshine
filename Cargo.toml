@@ -36,7 +36,7 @@ crossbeam-channel = "0.5.15"
 dasp_sample = "0.11.0"
 dirs = "6.0.0"
 fec-rs = { version = "0.1.0", features = ["parallel"] }
-ferriscope = { git = "https://github.com/hgaiser/ferriscope", rev = "a8acd19eeb787334bbe200a247b7ff8d5b208220", default-features = false }
+ferriscope = { git = "https://github.com/hgaiser/ferriscope", rev = "28721e1116b2078dbe3d7a0397598933e84a4d48", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"
