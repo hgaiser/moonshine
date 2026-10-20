@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "moonshine-tools"]
+members = [".", "tools"]
 resolver = "2"
 
 [workspace.package]
