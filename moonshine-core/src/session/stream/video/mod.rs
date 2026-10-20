@@ -345,8 +345,8 @@ impl VideoStream {
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
 		let resume_pending = Arc::new(AtomicBool::new(false));
 
-		// Packet channel. Each batch holds its frame's in-flight slot until it is
-		// sent, so the channel never holds more than the in-flight limit.
+		// Packet channel. Each queued batch holds its frame's in-flight slot, so the
+		// channel never holds more than the in-flight limit.
 		let (packet_tx, packet_rx) = mpsc::channel::<PacketBatch>(MAX_FRAMES_IN_FLIGHT);
 
 		// Spawn packet handler — gated behind start.
@@ -414,20 +414,22 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						// `batch` holds its frame's in-flight slot until this arm ends,
-						// i.e. until the frame is sent or dropped.
 						Ok(Some(batch)) => {
+							// Taking the batch frees its frame's in-flight slot, so a slow
+							// send doesn't hold back encoding; a stall still fills the
+							// slots with the batches queued behind it.
+							let (epoch, shards) = batch.into_parts();
 							if let Some(addr) = client_address {
 								// Frames from before a resume's reset would reach the new client
 								// with old frame numbers, making it drop the reset frames as stale.
-								if batch.epoch < reset_epoch || batch.shards.shard_count() == 0 {
+								if epoch < reset_epoch || shards.shard_count() == 0 {
 									continue;
 								}
 
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
 								match stop_session_manager
-									.wrap_cancel(socket.send_batch(&batch.shards, addr))
+									.wrap_cancel(socket.send_batch(&shards, addr))
 									.await
 								{
 									Ok(failed_chunks) => {
@@ -508,6 +510,45 @@ mod tests {
 		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
 			.await
 			.expect("packet handler kept its socket after shutdown");
+	}
+
+	#[tokio::test]
+	async fn stalled_sender_fills_in_flight_slots() {
+		use std::sync::atomic::AtomicUsize;
+
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let (packet_tx, packet_rx) = mpsc::channel(MAX_FRAMES_IN_FLIGHT);
+		let (reset_tx, _) = broadcast::channel(1);
+		let start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		// Until started, the sender doesn't drain the channel, like a stalled socket.
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			start.waiter(),
+			reset_tx,
+			Arc::new(AtomicBool::new(false)),
+			stop.clone(),
+		);
+
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		for _ in 0..MAX_FRAMES_IN_FLIGHT {
+			packet_tx.try_send(PacketBatch::holding_slot(&in_flight)).unwrap();
+		}
+		// Queued frames keep their slots, so the encoding thread's gate closes and
+		// it drops captures instead of the queue growing.
+		assert_eq!(in_flight.load(Ordering::Relaxed), MAX_FRAMES_IN_FLIGHT);
+		assert_eq!(packet_tx.capacity(), 0);
+
+		// Once the sender drains the queue, the slots free up.
+		start.trigger();
+		tokio::time::timeout(std::time::Duration::from_secs(1), async {
+			while in_flight.load(Ordering::Relaxed) > 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("sender kept in-flight slots after taking their batches");
 	}
 
 	fn config(max_packet_size: usize) -> VideoStreamConfig {
