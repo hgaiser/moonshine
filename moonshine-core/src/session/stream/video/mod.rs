@@ -331,6 +331,10 @@ impl VideoStream {
 			let _ = socket.set_tos_v4(160);
 		}
 
+		// Room for a keyframe burst, which is several times the average frame,
+		// plus its FEC: a quarter second of video at the target bitrate.
+		socket.request_send_buffer(context.bitrate / 8 / 4);
+
 		// Gate for pipeline + packet handler.
 		let start = StartSignal::new();
 
