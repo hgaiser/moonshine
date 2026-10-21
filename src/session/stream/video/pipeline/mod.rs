@@ -38,7 +38,7 @@ use pixelforge::{
 };
 
 /// Maximum number of frames in flight (submitted to the encoder but not yet
-/// packetized and sent) before we start dropping new captures.
+/// taken by the network sender) before we start dropping new captures.
 ///
 /// This is the pipeline's backpressure policy, chosen for low latency: rather
 /// than block the encoding thread and let already-captured frames queue up
@@ -49,7 +49,7 @@ use pixelforge::{
 /// discarding an already-encoded packet, which would break decoding until the
 /// next IDR. Sized just above pixelforge's encode pipeline depth (2) to keep the
 /// GPU fed plus one slot of slack, bounding added latency to ~3 frames.
-const MAX_FRAMES_IN_FLIGHT: usize = 3;
+pub(super) const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 /// Point a converter at a new source and target.
 ///
@@ -243,10 +243,46 @@ enum ConsumerMessage {
 	ResetCounters(u32),
 }
 
-/// Decrements the in-flight frame counter when dropped, on every exit path of a
-/// consumer-loop iteration (success or early `continue`). This is what tells the
-/// encoding thread a slot has freed up so it can stop dropping new captures.
+/// Decrements the in-flight frame counter when dropped: on an early `continue`
+/// in the consumer loop, or when the network sender takes the frame's
+/// [`PacketBatch`]. This is what tells the encoding thread a slot has freed up
+/// so it can stop dropping new captures.
 struct InFlightGuard(Arc<AtomicUsize>);
+
+/// A packetized frame on its way to the network sender.
+///
+/// The batch holds its frame's in-flight slot while it waits in the send queue,
+/// so a sender that stops draining (a stalled socket) fills the slots and the
+/// encoding thread drops new captures instead of frames queueing up behind the
+/// socket. The sender releases the slot as it takes the batch with
+/// [`PacketBatch::into_parts`], so the send itself (e.g. waiting for a large
+/// keyframe to fit in the socket buffer) doesn't count against the limit.
+pub(super) struct PacketBatch {
+	epoch: u32,
+	shards: ShardBatch,
+	in_flight: InFlightGuard,
+}
+
+impl PacketBatch {
+	/// Release the frame's in-flight slot and return the reset epoch the frame
+	/// was packetized in (see [`ConsumerMessage::ResetCounters`]) and its shards.
+	pub(super) fn into_parts(self) -> (u32, ShardBatch) {
+		drop(self.in_flight);
+		(self.epoch, self.shards)
+	}
+
+	/// An empty batch holding a new in-flight slot, as the encoding thread and
+	/// the consumer would produce it.
+	#[cfg(test)]
+	pub(super) fn holding_slot(in_flight: &Arc<AtomicUsize>) -> Self {
+		in_flight.fetch_add(1, Ordering::Relaxed);
+		Self {
+			epoch: 0,
+			shards: ShardBatch::empty(),
+			in_flight: InFlightGuard(in_flight.clone()),
+		}
+	}
+}
 
 impl Drop for InFlightGuard {
 	fn drop(&mut self) {
@@ -264,13 +300,14 @@ impl Drop for InFlightGuard {
 /// the encoding thread's next loop iteration. Pairing is implicit — each message
 /// carries both the context and the future for the same frame.
 ///
-/// `in_flight` counts frames submitted but not yet finished here; each fully
-/// processed (or dropped) frame decrements it via [`InFlightGuard`], which is the
-/// signal the encoding thread's drop-to-catch-up gate reads.
+/// `in_flight` counts frames submitted but not yet taken by the network sender;
+/// each frame's [`InFlightGuard`] decrements it when the sender takes the frame
+/// (or when the frame is dropped here), which is the signal the encoding
+/// thread's drop-to-catch-up gate reads.
 #[allow(clippy::too_many_arguments)]
 async fn run_packet_consumer(
 	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
-	packet_tx: mpsc::Sender<(u32, ShardBatch)>,
+	packet_tx: mpsc::Sender<PacketBatch>,
 	stats_tx: broadcast::Sender<FrameStats>,
 	in_flight: Arc<AtomicUsize>,
 	idr_tx: broadcast::Sender<()>,
@@ -300,9 +337,10 @@ async fn run_packet_consumer(
 			ConsumerMessage::Frame(frame_context, future) => (frame_context, future),
 		};
 
-		// This frame is in flight until the iteration ends; release its slot on
-		// every exit path (including the early `continue`s below).
-		let _in_flight = InFlightGuard(in_flight.clone());
+		// This frame is in flight until the network sender takes its batch: the
+		// slot travels with the batch below, and the early `continue`s release it
+		// here.
+		let in_flight_slot = InFlightGuard(in_flight.clone());
 
 		let t_wait_started = std::time::Instant::now();
 		let consumer_queue_dur = t_wait_started.saturating_duration_since(frame_context.submitted_at);
@@ -385,7 +423,12 @@ async fn run_packet_consumer(
 		// session is already tearing down. Stop the consumer; the encoding thread
 		// then sees its `frame_ctx_tx` fail and exits too, which drops the
 		// video-pipeline shutdown token and tears the session down.
-		if packet_tx.send((reset_epoch, shards)).await.is_err() {
+		let batch = PacketBatch {
+			epoch: reset_epoch,
+			shards,
+			in_flight: in_flight_slot,
+		};
+		if packet_tx.send(batch).await.is_err() {
 			tracing::debug!("Couldn't send packet batch, video packet channel closed.");
 			break;
 		}
@@ -460,7 +503,7 @@ impl VideoPipeline {
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
-		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
+		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
@@ -518,7 +561,7 @@ impl VideoPipelineInner {
 		self,
 		runtime: tokio::runtime::Handle,
 		frames: CompositorFrames,
-		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
+		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
@@ -651,7 +694,7 @@ impl VideoPipelineInner {
 		frames: CompositorFrames,
 		context: VideoContext,
 		mut encoder: Encoder,
-		packet_tx: mpsc::Sender<(u32, ShardBatch)>,
+		packet_tx: mpsc::Sender<PacketBatch>,
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
@@ -677,13 +720,17 @@ impl VideoPipelineInner {
 		// packetizes/sends — so packets go out as soon as the GPU finishes,
 		// independent of this loop's cadence.
 		//
-		// `in_flight` counts frames submitted but not yet finished by the consumer.
-		// The encoding thread reads it to decide when to drop new captures (see
-		// `MAX_FRAMES_IN_FLIGHT`); the consumer decrements it per frame. The channel
+		// `in_flight` counts frames submitted but not yet taken by the network
+		// sender. The encoding thread reads it to decide when to drop new captures
+		// (see `MAX_FRAMES_IN_FLIGHT`); a frame's slot is released when the sender
+		// takes its batch, or when the consumer drops it. The channel
 		// is sized just above that gate so it never actually blocks the producer —
 		// admission is governed by the drop gate, not by the channel filling.
 		let in_flight = Arc::new(AtomicUsize::new(0));
 		let (frame_ctx_tx, frame_ctx_rx) = mpsc::channel::<ConsumerMessage>(MAX_FRAMES_IN_FLIGHT + 2);
+		// Lets the drop warning tell a backed-up send queue (network) from frames
+		// still encoding (GPU). Weak, so it doesn't keep the channel open.
+		let send_queue = packet_tx.downgrade();
 		let consumer = {
 			let ctx = self.context.clone();
 			let config = self.config.clone();
@@ -865,7 +912,8 @@ impl VideoPipelineInner {
 									inject_hdr,
 									hdr_metadata: last_hdr_state.metadata,
 								};
-								// Count this frame in flight; the consumer decrements when done.
+								// Count this frame in flight; released when the network sender takes
+								// it or the consumer drops it.
 								in_flight.fetch_add(1, Ordering::Relaxed);
 								submitted_count += 1;
 								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
@@ -895,10 +943,21 @@ impl VideoPipelineInner {
 				// gated — the client needs that keyframe.
 				if in_flight.load(Ordering::Relaxed) >= MAX_FRAMES_IN_FLIGHT {
 					if last_drop_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
-						tracing::warn!(
-							"Video encode backpressure: packet consumer is behind; dropping captured \
-							 frames before encode to stay realtime."
-						);
+						// Batches waiting for the sender hold slots only until it takes them,
+						// so any queued batch means the socket isn't draining.
+						let queued = send_queue.upgrade().map_or(0, |tx| tx.max_capacity() - tx.capacity());
+						if queued > 0 {
+							tracing::warn!(
+								queued,
+								"Video send backpressure: the network isn't keeping up; dropping \
+								 captured frames before encode to stay realtime."
+							);
+						} else {
+							tracing::warn!(
+								"Video encode backpressure: the encoder isn't keeping up; dropping \
+								 captured frames before encode to stay realtime."
+							);
+						}
 						last_drop_warn = Some(std::time::Instant::now());
 					}
 					continue;
@@ -1125,7 +1184,8 @@ impl VideoPipelineInner {
 							inject_hdr,
 							hdr_metadata: last_hdr_state.metadata,
 						};
-						// Count this frame in flight; the consumer decrements when done.
+						// Count this frame in flight; released when the network sender takes
+						// it or the consumer drops it.
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
 						if frame_ctx_tx
