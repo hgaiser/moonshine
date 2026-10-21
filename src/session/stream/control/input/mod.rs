@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
-use ferriscope_core::{InputEvent as SeatEvent, PenEvent, PenTool, pen_tilt};
+use ferriscope::{InputEvent as SeatEvent, PenEvent, PenTool, pen_tilt};
 use strum_macros::FromRepr;
 use tokio::sync::Mutex;
 use tokio::sync::Notify;
@@ -677,7 +677,7 @@ mod tests {
 		let SeatEvent::Pen(event) = super::pen_event(&compositor, &hover) else {
 			panic!("expected a pen event");
 		};
-		assert_eq!(event.tool, ferriscope_core::PenTool::Eraser);
+		assert_eq!(event.tool, ferriscope::PenTool::Eraser);
 		assert!(!event.contact);
 		assert_eq!((event.pressure, event.distance), (None, Some(0.75)));
 		assert_eq!(event.tilt, None);

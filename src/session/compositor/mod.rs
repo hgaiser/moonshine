@@ -1,4 +1,4 @@
-//! Embedded headless compositor for Moonshine, backed by `ferriscope-core`.
+//! Embedded headless compositor for Moonshine, backed by `ferriscope`.
 //!
 //! ferriscope runs the Wayland/Xwayland server, the render loop and the DMA-BUF
 //! pool. This module turns Moonshine's configuration and the client's session
@@ -15,7 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
-use ferriscope_core::{Compositor as FerriscopeCompositor, FrameReceiver};
+use ferriscope::{Compositor as FerriscopeCompositor, FrameReceiver};
 use serde::{Deserialize, Serialize};
 
 use crate::session::SessionContext;
@@ -50,7 +50,7 @@ impl Default for KeyboardConfig {
 	}
 }
 
-impl From<&KeyboardConfig> for ferriscope_core::KeyboardConfig {
+impl From<&KeyboardConfig> for ferriscope::KeyboardConfig {
 	fn from(config: &KeyboardConfig) -> Self {
 		Self {
 			rules: String::new(),
@@ -164,7 +164,7 @@ impl From<&SessionContext> for CompositorContext {
 	}
 }
 
-/// Build the `ferriscope-core` config for one session.
+/// Build the `ferriscope` config for one session.
 ///
 /// Moonshine spawns the hosted application itself (`Application::spawn`) once
 /// the display is ready, so ferriscope must not spawn one (`command: None`).
@@ -176,9 +176,9 @@ fn build_ferriscope_config(
 	config: &CompositorConfig,
 	context: &CompositorContext,
 	render_node: std::path::PathBuf,
-) -> ferriscope_core::CompositorConfig {
+) -> ferriscope::CompositorConfig {
 	let steam = context.steam_integration;
-	ferriscope_core::CompositorConfig {
+	ferriscope::CompositorConfig {
 		width: context.width,
 		height: context.height,
 		rate: context.refresh_rate as f64,
@@ -189,14 +189,14 @@ fn build_ferriscope_config(
 		// HDR output needs both the host configuration and a client that can
 		// display it.
 		hdr: config.hdr && context.hdr,
-		seat: ferriscope_core::SeatConfig {
+		seat: ferriscope::SeatConfig {
 			keyboard: (&config.keyboard).into(),
-			..ferriscope_core::SeatConfig::default()
+			..ferriscope::SeatConfig::default()
 		},
-		output: ferriscope_core::FrameOutput::Channel(ferriscope_core::ChannelOutput {
+		output: ferriscope::FrameOutput::Channel(ferriscope::ChannelOutput {
 			pool_size: config.pool_size.max(1),
 		}),
-		..ferriscope_core::CompositorConfig::default()
+		..ferriscope::CompositorConfig::default()
 	}
 }
 
@@ -376,7 +376,7 @@ mod tests {
 		assert!(forwarded.xwayland);
 		assert!(matches!(
 			&forwarded.output,
-			ferriscope_core::FrameOutput::Channel(c) if c.pool_size == 3
+			ferriscope::FrameOutput::Channel(c) if c.pool_size == 3
 		));
 		assert!(forwarded.command.is_none(), "Moonshine spawns the app, not ferriscope");
 	}
@@ -390,7 +390,7 @@ mod tests {
 			|config: &CompositorConfig| match build_ferriscope_config(config, &context(), "/dev/dri/renderD128".into())
 				.output
 			{
-				ferriscope_core::FrameOutput::Channel(channel) => channel.pool_size,
+				ferriscope::FrameOutput::Channel(channel) => channel.pool_size,
 				output => panic!("unexpected output {output:?}"),
 			};
 		assert_eq!(pool(&CompositorConfig::default()), 3);

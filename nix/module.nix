@@ -97,7 +97,7 @@ in
     logFilter = lib.mkOption {
       type = lib.types.str;
       default = "moonshine=info";
-      example = "moonshine=info,moonshine_core::tls=error";
+      example = "moonshine=info,moonshine::tls=error";
       description = ''
         Value for `MOONSHINE_LOG` (env_logger-style filter). The example
         additionally silences the WARN logged for every dropped TLS probe —

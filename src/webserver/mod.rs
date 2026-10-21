@@ -620,7 +620,7 @@ impl Webserver {
 			})
 			.filter(|id| !id.is_empty())
 			.unwrap_or_else(|| "0123456789ABCDEF".to_string());
-		let content = include_bytes!("../../../assets/pin.html");
+		let content = include_bytes!("../../assets/pin.html");
 		let html = String::from_utf8_lossy(content);
 		let html = html.replace("{{UNIQUE_ID}}", &unique_id);
 		let mut response = Response::new(Full::new(Bytes::from(html)));
@@ -791,7 +791,7 @@ impl Webserver {
 			.remove("surroundAudioInfo")
 			.and_then(|s| s.parse().ok())
 			.unwrap_or(196610); // Default: stereo (0x30002)
-		let audio_channels = AudioChannels::from((surround_audio_info & 0xFFFF) as u8);
+		let audio_channels = AudioChannels::from_wire_or_stereo((surround_audio_info & 0xFFFF) as u8);
 		let audio_channel_mask = surround_audio_info >> 16;
 
 		let hdr_mode: u32 = params.remove("hdrMode").and_then(|s| s.parse().ok()).unwrap_or(0);

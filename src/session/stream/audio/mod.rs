@@ -1,7 +1,10 @@
+use std::ffi::CStr;
+use std::fmt;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
 use async_shutdown::ShutdownManager;
+use pulseaudio::protocol as pulse;
 use serde::{Deserialize, Serialize};
 use strum_macros::Display;
 use tokio::net::UdpSocket;
@@ -12,10 +15,11 @@ use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::{StartSignal, StartWaiter};
 
 use self::encoder::AudioEncoder;
-use self::pulse_server::{CAPTURE_SAMPLE_RATE, PulseServer};
+use self::pulse_server::PulseServer;
 
 mod buffer;
 mod encoder;
+mod log;
 mod pulse_server;
 
 /// Configuration for the audio stream.
@@ -33,7 +37,7 @@ impl Default for AudioStreamConfig {
 }
 
 /// Number of audio channels requested by the client.
-#[derive(Clone, Copy, Debug, Default, Display, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default, Display, PartialEq, Eq, PartialOrd)]
 pub enum AudioChannels {
 	#[default]
 	Stereo = 2,
@@ -41,12 +45,120 @@ pub enum AudioChannels {
 	Surround71 = 8,
 }
 
-impl From<u8> for AudioChannels {
-	fn from(value: u8) -> Self {
-		match value {
-			6 => Self::Surround51,
-			8 => Self::Surround71,
-			_ => Self::Stereo,
+/// The client asked for a channel count the sink does not support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioChannelError(pub u8);
+
+impl fmt::Display for AudioChannelError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(f, "Unsupported number of channels: {}", self.0)
+	}
+}
+
+impl std::error::Error for AudioChannelError {}
+
+impl TryFrom<u8> for AudioChannels {
+	type Error = AudioChannelError;
+
+	fn try_from(val: u8) -> Result<Self, Self::Error> {
+		match val {
+			2 => Ok(Self::Stereo),
+			6 => Ok(Self::Surround51),
+			8 => Ok(Self::Surround71),
+			_ => Err(AudioChannelError(val)),
+		}
+	}
+}
+
+impl AudioChannels {
+	/// Parse the channel count a client asked for, warning and falling back to stereo when the
+	/// sink does not support it.
+	pub fn from_wire_or_stereo(count: u8) -> Self {
+		Self::try_from(count).unwrap_or_else(|err| {
+			tracing::warn!("{err}, falling back to stereo");
+			Self::Stereo
+		})
+	}
+
+	pub fn map(&self) -> pulse::ChannelMap {
+		match self {
+			AudioChannels::Surround51 => pulse::ChannelMap::new([
+				pulse::ChannelPosition::FrontLeft,
+				pulse::ChannelPosition::FrontRight,
+				pulse::ChannelPosition::FrontCenter,
+				pulse::ChannelPosition::Lfe,
+				pulse::ChannelPosition::RearLeft,
+				pulse::ChannelPosition::RearRight,
+			]),
+			AudioChannels::Surround71 => pulse::ChannelMap::new([
+				pulse::ChannelPosition::FrontLeft,
+				pulse::ChannelPosition::FrontRight,
+				pulse::ChannelPosition::FrontCenter,
+				pulse::ChannelPosition::Lfe,
+				pulse::ChannelPosition::RearLeft,
+				pulse::ChannelPosition::RearRight,
+				pulse::ChannelPosition::SideLeft,
+				pulse::ChannelPosition::SideRight,
+			]),
+			AudioChannels::Stereo => pulse::ChannelMap::stereo(),
+		}
+	}
+
+	pub fn map_cstr(&self) -> &CStr {
+		match self {
+			AudioChannels::Surround51 => c"front-left,front-right,front-center,lfe,rear-left,rear-right",
+			AudioChannels::Surround71 => {
+				c"front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right"
+			},
+			AudioChannels::Stereo => c"front-left,front-right",
+		}
+	}
+
+	pub fn port_as_cstr(&self) -> &CStr {
+		match self {
+			AudioChannels::Surround51 => c"Surround 5.1 Output",
+			AudioChannels::Surround71 => c"Surround 7.1 Output",
+			AudioChannels::Stereo => c"Stereo Output",
+		}
+	}
+
+	pub fn count_as_cstr(&self) -> &CStr {
+		match self {
+			AudioChannels::Surround51 => c"6",
+			AudioChannels::Surround71 => c"8",
+			AudioChannels::Stereo => c"2",
+		}
+	}
+}
+
+/// The rate the sink runs at, and the one the encoder expects. Streams at any other rate are
+/// resampled to it.
+pub(crate) const SINK_SAMPLE_RATE: u32 = 48_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SinkSpec {
+	/// Format / Encoding of individual samples.
+	pub format: pulse::SampleFormat,
+	/// Number of independent channels.
+	pub channels: AudioChannels,
+	/// Number of samples per second (and per channel).
+	pub sample_rate: u32,
+}
+
+impl SinkSpec {
+	pub fn new(channels: AudioChannels) -> Self {
+		Self {
+			format: pulse::SampleFormat::Float32Le,
+			channels,
+			sample_rate: SINK_SAMPLE_RATE,
+		}
+	}
+
+	pub fn as_pulse_spec(&self) -> pulse::SampleSpec {
+		pulse::SampleSpec {
+			format: self.format,
+			channels: self.channels as u8,
+			sample_rate: self.sample_rate,
 		}
 	}
 }
@@ -218,6 +330,8 @@ impl AudioStream {
 	}
 
 	pub fn start(self, context: AudioStreamContext, keys_rx: SessionKeysReceiver) -> Result<StartSignal, ()> {
+		log::stream_start(&context);
+
 		// Apply QoS to UDP socket.
 		if context.qos {
 			let _ = self.udp_socket.set_tos_v4(224);
@@ -238,7 +352,7 @@ impl AudioStream {
 		PulseServer::spawn(
 			self.pulse_socket,
 			self.pulse_socket_path.clone(),
-			context.audio_config.channels as u8,
+			context.audio_config.channels,
 			context.packet_duration_ms,
 			frame_tx,
 			frame_recycle_rx,
@@ -248,7 +362,7 @@ impl AudioStream {
 
 		// Spawn audio encoder — gated behind start.
 		AudioEncoder::spawn(
-			CAPTURE_SAMPLE_RATE,
+			SINK_SAMPLE_RATE,
 			&context.audio_config.stream_config,
 			frame_rx,
 			frame_recycle_tx,
