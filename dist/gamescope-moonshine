@@ -1,0 +1,87 @@
+#!/bin/bash
+set -euo pipefail
+
+SCALE_FACTOR=1
+FORCE_GAMESCOPE=0
+GAMESCOPE_ARGS=()
+
+usage() {
+    cat <<EOF
+Usage: $0 [--scale FACTOR] [--force] [GAMESCOPE_ARGS...] -- COMMAND [ARGS...]
+
+  --scale FACTOR    Factor for the internal render resolution relative to
+                    the real (client) resolution (default: 1)
+  --force           Use gamescope even if the Moonshine variables are not set
+  GAMESCOPE_ARGS     Any additional arguments passed through to gamescope
+  --                 Separates the options from the command to run
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --scale)
+            [[ $# -ge 2 ]] || { echo "Error: --scale requires a value" >&2; exit 1; }
+            SCALE_FACTOR="$2"
+            shift 2
+            ;;
+        --scale=*)
+            SCALE_FACTOR="${1#*=}"
+            shift
+            ;;
+        --force)
+            FORCE_GAMESCOPE=1
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --)
+            shift
+            break
+            ;;
+        *)
+            GAMESCOPE_ARGS+=("$1")
+            shift
+            ;;
+    esac
+done
+
+if [[ $# -eq 0 ]]; then
+    echo "Error: no command to run was given." >&2
+    usage
+    exit 1
+fi
+
+COMMAND=("$@")
+
+# Count how many of the three Moonshine variables are set
+defined_count=0
+[[ -n "${MOONSHINE_CLIENT_WIDTH:-}" ]] && ((defined_count++))
+[[ -n "${MOONSHINE_CLIENT_HEIGHT:-}" ]] && ((defined_count++))
+[[ -n "${MOONSHINE_CLIENT_FRAMERATE:-}" ]] && ((defined_count++))
+
+if [[ $defined_count -eq 1 || $defined_count -eq 2 ]]; then
+    echo "Error: MOONSHINE_CLIENT_WIDTH, MOONSHINE_CLIENT_HEIGHT and MOONSHINE_CLIENT_FRAMERATE must either all be set or none of them (currently set: $defined_count of 3)." >&2
+    exit 1
+fi
+
+# Case: no variables set and no --force -> run without gamescope
+if [[ $defined_count -eq 0 && $FORCE_GAMESCOPE -eq 0 ]]; then
+    exec "${COMMAND[@]}"
+fi
+
+RES_ARGS=()
+RATE_ARGS=()
+
+# Case: all three variables set -> set real + render resolution and framerate
+if [[ $defined_count -eq 3 ]]; then
+    RENDER_WIDTH=$(awk -v w="$MOONSHINE_CLIENT_WIDTH" -v f="$SCALE_FACTOR" 'BEGIN { printf "%.0f", w * f }')
+    RENDER_HEIGHT=$(awk -v h="$MOONSHINE_CLIENT_HEIGHT" -v f="$SCALE_FACTOR" 'BEGIN { printf "%.0f", h * f }')
+    RES_ARGS=(-W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w "$RENDER_WIDTH" -h "$RENDER_HEIGHT")
+    RATE_ARGS=(-r "$MOONSHINE_CLIENT_FRAMERATE")
+fi
+# (Case: no variables set but --force -> RES_ARGS/RATE_ARGS stay empty,
+#  gamescope then decides resolution/framerate on its own)
+
+exec gamescope "${RES_ARGS[@]}" "${RATE_ARGS[@]}" -f -b "${GAMESCOPE_ARGS[@]}" -- "${COMMAND[@]}"
