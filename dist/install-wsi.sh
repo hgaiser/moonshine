@@ -43,8 +43,8 @@ if [ -z "$ferriscope" ]; then
 		echo "ferriscope is not in Cargo.lock" >&2
 		exit 1
 	fi
-	# .../ferriscope/Cargo.toml -> the ferriscope checkout.
-	ferriscope=$(dirname "$(dirname "$manifest")")
+	# .../Cargo.toml -> the ferriscope checkout.
+	ferriscope=$(dirname "$manifest")
 fi
 
 CARGO_TARGET_DIR=$root/target/ferriscope-wsi "$ferriscope/tools/install-wsi.sh" --prefix "$prefix"
