@@ -68,7 +68,7 @@ impl UdpGsoSocket {
 	///
 	/// Best effort: a buffer the host already made larger is kept, and the
 	/// kernel caps the request at `net.core.wmem_max`. Logs what it grants.
-	pub fn request_send_buffer(&self, size: usize) {
+	pub fn grow_send_buffer(&self, size: usize) {
 		let socket = socket2::SockRef::from(&self.socket);
 		let current = match socket.send_buffer_size() {
 			Ok(reported) => usable_send_buffer(reported),
@@ -81,7 +81,15 @@ impl UdpGsoSocket {
 			tracing::debug!("Video socket send buffer: {} KiB", current / 1024);
 			return;
 		}
+		self.set_send_buffer(size);
+	}
 
+	/// Set the send buffer to `size` bytes, even below the host's default.
+	///
+	/// Best effort: the kernel caps the request at `net.core.wmem_max`. Logs what
+	/// it grants.
+	pub fn set_send_buffer(&self, size: usize) {
+		let socket = socket2::SockRef::from(&self.socket);
 		if let Err(e) = socket.set_send_buffer_size(size) {
 			tracing::warn!("Failed to set video socket send buffer size: {e}");
 			return;
@@ -180,16 +188,25 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn send_buffer_request_never_shrinks() {
+	async fn grow_send_buffer_never_shrinks() {
 		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
 		let initial = usable_send_buffer_size(&socket);
 
-		socket.request_send_buffer(initial / 2);
+		socket.grow_send_buffer(initial / 2);
 		assert_eq!(usable_send_buffer_size(&socket), initial);
 
 		// The kernel may cap the growth, but never below what we had.
-		socket.request_send_buffer(initial * 4);
+		socket.grow_send_buffer(initial * 4);
 		assert!(usable_send_buffer_size(&socket) >= initial);
+	}
+
+	#[tokio::test]
+	async fn set_send_buffer_can_shrink() {
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let initial = usable_send_buffer_size(&socket);
+
+		socket.set_send_buffer(initial / 4);
+		assert!(usable_send_buffer_size(&socket) < initial);
 	}
 
 	#[test]
