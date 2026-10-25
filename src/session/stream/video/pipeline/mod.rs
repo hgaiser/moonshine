@@ -49,6 +49,11 @@ use pixelforge::{
 /// discarding an already-encoded packet, which would break decoding until the
 /// next IDR. Sized just above pixelforge's encode pipeline depth (2) to keep the
 /// GPU fed plus one slot of slack, bounding added latency to ~3 frames.
+///
+/// This bounds queueing inside the application only. A frame leaves the count
+/// when the sender takes it, before it is written to the socket, so data the
+/// socket and the kernel below it still hold isn't counted here; the socket's
+/// share is bounded by its send buffer (see `VideoStreamConfig::send_buffer_size`).
 pub(super) const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
 /// Point a converter at a new source and target.
@@ -255,8 +260,10 @@ struct InFlightGuard(Arc<AtomicUsize>);
 /// so a sender that stops draining (a stalled socket) fills the slots and the
 /// encoding thread drops new captures instead of frames queueing up behind the
 /// socket. The sender releases the slot as it takes the batch with
-/// [`PacketBatch::into_parts`], so the send itself (e.g. waiting for a large
-/// keyframe to fit in the socket buffer) doesn't count against the limit.
+/// [`PacketBatch::into_parts`], before writing it to the socket, so the send
+/// itself (e.g. waiting for a large keyframe to fit in the socket buffer) and
+/// the data still queued in the socket afterwards don't count against the
+/// limit.
 pub(super) struct PacketBatch {
 	epoch: u32,
 	shards: ShardBatch,
@@ -266,6 +273,9 @@ pub(super) struct PacketBatch {
 impl PacketBatch {
 	/// Release the frame's in-flight slot and return the reset epoch the frame
 	/// was packetized in (see [`ConsumerMessage::ResetCounters`]) and its shards.
+	///
+	/// The slot is released here, when the sender dequeues the batch, not when
+	/// its shards are sent or leave the host.
 	pub(super) fn into_parts(self) -> (u32, ShardBatch) {
 		drop(self.in_flight);
 		(self.epoch, self.shards)
