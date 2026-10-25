@@ -50,6 +50,22 @@ pub struct VideoStreamConfig {
 	/// and 8-byte UDP headers and the 16-byte stream overhead).
 	#[serde(default)]
 	pub max_packet_size: usize,
+
+	/// Size of the video socket's send buffer, in bytes.
+	///
+	/// Data in the send buffer has already left the pipeline, so it isn't
+	/// covered by its frame dropping: when the host's own uplink is slower
+	/// than the bitrate, up to this much video can queue in the kernel. The
+	/// buffer only fills when that uplink is the bottleneck.
+	///
+	/// `0` sizes it to fit a keyframe burst (about eight average frames at the
+	/// stream's bitrate and frame rate), keeping a larger host default. A
+	/// non-zero value sets the size exactly, even below the host default: a
+	/// smaller buffer lowers the worst-case queueing, at the cost of keyframes
+	/// waiting for the socket to drain. The kernel caps it at
+	/// `net.core.wmem_max`.
+	#[serde(default)]
+	pub send_buffer_size: usize,
 }
 
 /// Smallest accepted packet size cap. Lower values would leave almost no room
@@ -85,8 +101,20 @@ impl Default for VideoStreamConfig {
 			encrypt: false,
 			log_frame_spikes: false,
 			max_packet_size: 0,
+			send_buffer_size: 0,
 		}
 	}
+}
+
+/// Average frames a keyframe burst spans, FEC included, for sizing the
+/// socket's send buffer when `send_buffer_size` is automatic.
+const KEYFRAME_BURST_FRAMES: usize = 8;
+
+/// Send buffer size that fits a keyframe burst at `bitrate` (bits per second)
+/// and `fps`.
+fn keyframe_burst_bytes(bitrate: usize, fps: u32) -> usize {
+	let fps = usize::try_from(fps.max(1)).unwrap_or(usize::MAX);
+	bitrate / 8 / fps * KEYFRAME_BURST_FRAMES
 }
 
 /// Per-frame encoding statistics emitted by the video pipeline.
@@ -332,8 +360,12 @@ impl VideoStream {
 		}
 
 		// Room for a keyframe burst, which is several times the average frame,
-		// plus its FEC: a quarter second of video at the target bitrate.
-		socket.request_send_buffer(context.bitrate / 8 / 4);
+		// unless configured otherwise.
+		if config.send_buffer_size == 0 {
+			socket.grow_send_buffer(keyframe_burst_bytes(context.bitrate, context.fps));
+		} else {
+			socket.set_send_buffer(config.send_buffer_size);
+		}
 
 		// Gate for pipeline + packet handler.
 		let start = StartSignal::new();
@@ -553,6 +585,16 @@ mod tests {
 		})
 		.await
 		.expect("sender kept in-flight slots after taking their batches");
+	}
+
+	#[test]
+	fn keyframe_burst_scales_with_frame_size() {
+		// 80 Mbps at 60 fps: ~166 KB average frames.
+		assert_eq!(keyframe_burst_bytes(80_000_000, 60), 166_666 * KEYFRAME_BURST_FRAMES);
+		// Doubling the frame rate halves the frames, and the burst.
+		assert_eq!(keyframe_burst_bytes(80_000_000, 120), 83_333 * KEYFRAME_BURST_FRAMES);
+		// A zero frame rate doesn't divide by zero.
+		assert_eq!(keyframe_burst_bytes(8_000, 0), 1_000 * KEYFRAME_BURST_FRAMES);
 	}
 
 	fn config(max_packet_size: usize) -> VideoStreamConfig {
