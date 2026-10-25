@@ -3,6 +3,7 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+mod adapt;
 mod dmabuf;
 mod fence;
 mod hdr_sei;
@@ -278,6 +279,10 @@ enum ConsumerMessage {
 /// [`PacketBatch`]. This is what tells the encoding thread a slot has freed up
 /// so it can stop dropping new captures.
 struct InFlightGuard(Arc<AtomicUsize>);
+
+/// Highest send-rate estimate of the loss adaptation, in percent of the bitrate:
+/// room above the bitrate to probe into before the first loss.
+const MAX_ESTIMATE_PERCENT: u32 = 400;
 
 /// A packetized frame on its way to the network sender.
 ///
@@ -805,6 +810,14 @@ impl VideoPipelineInner {
 		// Rate-limits the drop-to-catch-up warning.
 		let mut last_drop_warn: Option<std::time::Instant> = None;
 
+		// Skips captures while the client reports losses; see `LossAdaptation`.
+		let mut loss_adaptation = self
+			.config
+			.adapt_to_loss
+			.then(|| adapt::LossAdaptation::new(ctx.bitrate, MAX_ESTIMATE_PERCENT, std::time::Instant::now()));
+		// Rate-limits the loss-adaptation warning.
+		let mut last_adapt_warn: Option<std::time::Instant> = None;
+
 		// Determine output YUV format based on chroma sampling and dynamic range.
 		let color_range = if ctx.full_range {
 			ColorRange::Full
@@ -901,11 +914,17 @@ impl VideoPipelineInner {
 						tracing::debug!("IDR frame requested");
 						encoder.request_idr();
 						pending_idr = true;
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						tracing::debug!("IDR frame channel lagged by {n} messages.");
 						encoder.request_idr();
 						pending_idr = true;
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
@@ -923,12 +942,18 @@ impl VideoPipelineInner {
 							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
 						);
 						encoder.invalidate_reference_frames(first_display_order);
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
 						tracing::debug!("Invalidation channel lagged by {n} messages; forcing IDR.");
 						encoder.request_idr();
 						pending_idr = true;
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
@@ -1008,6 +1033,22 @@ impl VideoPipelineInner {
 							);
 						}
 						last_drop_warn = Some(std::time::Instant::now());
+					}
+					continue;
+				}
+
+				// Skip captures while the client's loss reports say the link carries
+				// less than the stream, but never one an IDR request is waiting on.
+				if !pending_idr
+					&& let Some(adaptation) = &mut loss_adaptation
+					&& !adaptation.admit(std::time::Instant::now())
+				{
+					if last_adapt_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+						tracing::warn!(
+							"Video stream is losing packets: sending {}% of frames to fit the network.",
+							adaptation.admitted_percent()
+						);
+						last_adapt_warn = Some(std::time::Instant::now());
 					}
 					continue;
 				}

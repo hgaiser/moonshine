@@ -67,6 +67,16 @@ pub struct VideoStreamConfig {
 	/// `net.core.wmem_max`.
 	#[serde(default)]
 	pub send_buffer_size: usize,
+
+	/// Whether to lower the frame rate while the client reports losses.
+	///
+	/// When a link further away gets slower than the stream, its packets are
+	/// dropped there and every frame breaks; nothing on the host notices but
+	/// the client, which asks for recovery frames. With this enabled, those
+	/// requests lower an estimate of the rate the link carries, which recovers
+	/// while the client stays quiet, and captures are skipped while it is below
+	/// the bitrate, trading frame rate for frames that arrive whole.
+	pub adapt_to_loss: bool,
 }
 
 /// Smallest accepted packet size cap. Lower values would leave almost no room
@@ -103,6 +113,7 @@ impl Default for VideoStreamConfig {
 			log_frame_spikes: false,
 			max_packet_size: 0,
 			send_buffer_size: 0,
+			adapt_to_loss: true,
 		}
 	}
 }
