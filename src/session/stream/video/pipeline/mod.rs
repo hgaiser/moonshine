@@ -561,6 +561,7 @@ impl VideoPipeline {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		fec_status_rx: broadcast::Receiver<(u16, u16)>,
 		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -590,6 +591,7 @@ impl VideoPipeline {
 					idr_tx,
 					idr_frame_request_rx,
 					invalidate_request_rx,
+					fec_status_rx,
 					reset_request_rx,
 					stop_session_manager,
 					hdr_metadata_tx,
@@ -619,6 +621,7 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		fec_status_rx: broadcast::Receiver<(u16, u16)>,
 		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -661,6 +664,7 @@ impl VideoPipelineInner {
 			idr_tx,
 			idr_frame_request_rx,
 			invalidate_request_rx,
+			fec_status_rx,
 			reset_request_rx,
 			stop_session_manager,
 			hdr_metadata_tx,
@@ -752,6 +756,7 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		mut fec_status_rx: broadcast::Receiver<(u16, u16)>,
 		mut reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -951,6 +956,24 @@ impl VideoPipelineInner {
 						tracing::debug!("Invalidation channel lagged by {n} messages; forcing IDR.");
 						encoder.request_idr();
 						pending_idr = true;
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
+					},
+					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
+				}
+			}
+
+			// Drain the client's FEC status reports into the loss adaptation.
+			loop {
+				match fec_status_rx.try_recv() {
+					Ok((missing, parity)) => {
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_fec_status(std::time::Instant::now(), missing, parity);
+						}
+					},
+					// Reports arriving faster than we drain them mean heavy loss.
+					Err(broadcast::error::TryRecvError::Lagged(_)) => {
 						if let Some(adaptation) = &mut loss_adaptation {
 							adaptation.on_loss(std::time::Instant::now());
 						}

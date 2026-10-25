@@ -30,6 +30,11 @@ const MIN_PERCENT: u64 = 25;
 /// stays quiet. While the estimate is below the bitrate, captures are skipped
 /// in proportion; the encoder's rate control budgets per frame, so skipping
 /// frames lowers the bitrate to fit.
+///
+/// The client's FEC status reports refine this: a frame it repaired using
+/// more than half its parity is as good as lost and cuts the estimate, while
+/// lighter repair only pauses probing, so the estimate backs off before
+/// frames break without reacting to random loss.
 pub(super) struct LossAdaptation {
 	/// Estimated rate the link carries, in bits per second.
 	rate: u64,
@@ -38,6 +43,8 @@ pub(super) struct LossAdaptation {
 	skip_below: u64,
 	increase_per_second: u64,
 	last_decrease: Option<Instant>,
+	/// When light repair last paused probing.
+	last_warning: Option<Instant>,
 	last_update: Instant,
 	/// Thousandths of a capture the rate allows; an admitted capture spends
 	/// 1000.
@@ -57,6 +64,7 @@ impl LossAdaptation {
 			skip_below: (bitrate / 100 * SKIP_BELOW_PERCENT).max(1),
 			increase_per_second: bitrate / 100 * INCREASE_PERCENT,
 			last_decrease: None,
+			last_warning: None,
 			last_update: now,
 			credit: 0,
 		}
@@ -73,6 +81,18 @@ impl LossAdaptation {
 		}
 		self.rate = (self.rate / 100 * DECREASE_PERCENT).max(self.min_rate);
 		self.last_decrease = Some(now);
+	}
+
+	/// React to the client repairing `missing` packets of a frame with
+	/// `parity` parity packets at `now` (or losing it): more than half the
+	/// parity is a cut, less pauses probing for [`HOLDOFF`].
+	pub(super) fn on_fec_status(&mut self, now: Instant, missing: u16, parity: u16) {
+		if u32::from(missing) * 2 > u32::from(parity) {
+			self.on_loss(now);
+		} else {
+			self.update(now);
+			self.last_warning = Some(now);
+		}
 	}
 
 	/// Whether to encode a capture at `now`, or skip it to fit the rate.
@@ -94,9 +114,17 @@ impl LossAdaptation {
 
 	/// Raise the rate for the time since the last update.
 	fn update(&mut self, now: Instant) {
-		let elapsed = now.saturating_duration_since(self.last_update);
+		let warned = self
+			.last_warning
+			.is_some_and(|last| now.saturating_duration_since(last) < HOLDOFF);
+		let elapsed = if warned {
+			Duration::ZERO
+		} else {
+			now.saturating_duration_since(self.last_update)
+		};
 		let calm = self
 			.last_decrease
+			.max(self.last_warning)
 			.map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
 		// 1 + 2 per second of calm, in thousandths.
 		let speedup = 1000 + 2 * calm.as_millis();
@@ -150,6 +178,23 @@ mod tests {
 		assert!(admitted < 60, "admitted {admitted} of 60");
 		// Never below the floor: a quarter of the bitrate, under 1.1x.
 		assert!(admitted >= 60 * 25 / 110);
+	}
+
+	#[test]
+	fn heavy_fec_repair_cuts_and_light_repair_holds() {
+		let start = Instant::now();
+		let mut adaptation = LossAdaptation::new(BITRATE, 200, start);
+		adaptation.on_loss(start);
+		let later = start + Duration::from_secs(1);
+		adaptation.update(later);
+		let probed = adaptation.rate;
+		// Repairing 2 of 10 parity packets holds the estimate...
+		adaptation.on_fec_status(later, 2, 10);
+		adaptation.update(later + Duration::from_millis(50));
+		assert_eq!(adaptation.rate, probed);
+		// ...repairing 6 of 10 cuts it.
+		adaptation.on_fec_status(later + Duration::from_millis(60), 6, 10);
+		assert!(adaptation.rate < probed);
 	}
 
 	#[test]

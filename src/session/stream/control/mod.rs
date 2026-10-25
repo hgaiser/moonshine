@@ -102,11 +102,18 @@ enum ControlMessage<'a> {
 	FrameStats,
 	InputData(&'a [u8]),
 	RequestIdrFrame,
-	InvalidateReferenceFrames { first: u32, last: u32 },
+	InvalidateReferenceFrames {
+		first: u32,
+		last: u32,
+	},
 	StartB,
 	RumbleTriggers,
 	SetMotionEvent,
-	SetRgbLed,
+	/// The FEC status of a frame the client had to repair or lost.
+	FrameFecStatus {
+		missing: u16,
+		parity: u16,
+	},
 	SetTriggerEffect,
 }
 
@@ -196,7 +203,27 @@ impl<'a> ControlMessage<'a> {
 			ControlMessageType::HdrMode => Ok(Self::HdrMode),
 			ControlMessageType::RumbleTriggers => Ok(Self::RumbleTriggers),
 			ControlMessageType::SetMotionEvent => Ok(Self::SetMotionEvent),
-			ControlMessageType::SetRgbLed => Ok(Self::SetRgbLed),
+			// Sent by us, 0x5502 sets a controller's RGB LED; sent by the client,
+			// it is Sunshine's per-frame FEC status, which Moonlight sends because
+			// our app version marks us as a Sunshine server. Body (packed, big
+			// endian): frameIndex(4), highestReceivedSequenceNumber(2),
+			// nextContiguousSequenceNumber(2), missingPacketsBeforeHighestReceived(2),
+			// totalDataPackets(2), totalParityPackets(2), receivedDataPackets(2),
+			// receivedParityPackets(2), fecPercentage(1), multiFecBlockIndex(1),
+			// multiFecBlockCount(1).
+			ControlMessageType::SetRgbLed => {
+				if buffer.len() < 4 + 21 {
+					tracing::debug!("Ignoring short frame FEC status message of {} bytes.", buffer.len());
+					return Err(());
+				}
+				let field = |at: usize| u16::from_be_bytes([buffer[4 + at], buffer[5 + at]]);
+				let (total_data, total_parity) = (field(10), field(12));
+				let (received_data, received_parity) = (field(14), field(16));
+				Ok(Self::FrameFecStatus {
+					missing: (total_data + total_parity).saturating_sub(received_data + received_parity),
+					parity: total_parity,
+				})
+			},
 			ControlMessageType::SetTriggerEffect => Ok(Self::SetTriggerEffect),
 		}
 	}
@@ -556,6 +583,9 @@ async fn run_control_loop(
 					ControlMessage::InvalidateReferenceFrames { first, last } => {
 						video_handle.invalidate_reference_frames(first, last);
 					},
+					ControlMessage::FrameFecStatus { missing, parity } => {
+						video_handle.report_fec_status(missing, parity);
+					},
 					ControlMessage::StartB => {
 						video_handle.trigger();
 						if !audio_triggered {
@@ -635,4 +665,26 @@ async fn run_control_loop(
 	// returns. Without this, the next session's control stream may
 	// fail to bind to the same port.
 	drop(host);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn client_fec_status_parses_as_repair_counts() {
+		// Type 0x5502 and length 21, little endian, then the big-endian body.
+		let mut message = vec![0x02, 0x55, 21, 0];
+		message.extend_from_slice(&7u32.to_be_bytes()); // frameIndex
+		message.extend_from_slice(&[0; 6]); // sequence numbers, missingPackets
+		for count in [10u16, 4, 8, 3] {
+			// totalData, totalParity, receivedData, receivedParity
+			message.extend_from_slice(&count.to_be_bytes());
+		}
+		message.extend_from_slice(&[20, 0, 1]); // fecPercentage, block index and count
+		match ControlMessage::from_bytes(&message) {
+			Ok(ControlMessage::FrameFecStatus { missing, parity }) => assert_eq!((missing, parity), (3, 4)),
+			other => panic!("expected a frame FEC status, got {other:?}"),
+		}
+	}
 }
