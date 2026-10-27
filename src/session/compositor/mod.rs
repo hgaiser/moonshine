@@ -279,7 +279,7 @@ impl Compositor {
 		// The supervisor holds a delay token until ferriscope has fully stopped,
 		// so the session's shutdown (and `stop_session`) waits for it. Without
 		// it Moonshine could exit while ferriscope's thread was still tearing
-		// down its GL renderer, and NVIDIA's EGL exit handler crashed it.
+		// down its renderer (with GL, NVIDIA's EGL exit handler crashed it).
 		let delay = stop.delay_shutdown_token().map_err(|e| {
 			tracing::error!("Failed to hold the session open for the compositor: {e:?}");
 		})?;
