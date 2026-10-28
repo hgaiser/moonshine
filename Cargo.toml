@@ -36,7 +36,7 @@ crossbeam-channel = "0.5.15"
 dasp_sample = "0.11.0"
 dirs = "6.0.0"
 fec-rs = { version = "0.1.0", features = ["parallel"] }
-ferriscope = { git = "https://github.com/hgaiser/ferriscope", rev = "a5b1205d7f7c1177a73b3b0896a97b17917c90a5", default-features = false }
+ferriscope = { git = "https://github.com/hgaiser/ferriscope", rev = "e4dcc887bf8b88142c504b53938467968cf21964", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"
@@ -70,11 +70,13 @@ serde_json = "1.0.149"
 sha2 = "0.11.0"
 shellexpand = "3.1.2"
 shlex = "2.0.1"
-smithay = { git = "https://github.com/Smithay/smithay", rev = "0ff00983b6007257a7a161a4fe8b14a778e2ac8f", default-features = false, features = [
+# The smithay fork with the Vulkan renderer, at the revision ferriscope uses: moonshine
+# exchanges smithay types (`Dmabuf`) with ferriscope, so both must use the same smithay.
+smithay = { git = "https://github.com/hgaiser/smithay", rev = "fa2f9e3bdc1be3d6da2a3837b33c684d0cdeea34", default-features = false, features = [
     "backend_drm",
     "backend_gbm",
-    "backend_egl",
-    "renderer_gl",
+    "backend_vulkan",
+    "renderer_vulkan",
     "wayland_frontend",
     "desktop",
     "xwayland",
