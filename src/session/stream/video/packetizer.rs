@@ -24,6 +24,27 @@ const PAYLOAD_OFFSET: usize = NV_PACKET_OFFSET + NV_VIDEO_PACKET_SIZE;
 /// Size of the per-shard encryption prefix: iv(12) + frameNumber(4) + tag(16).
 const ENC_PREFIX_SIZE: usize = 12 + 4 + 16;
 
+/// Two-bit current and last block indices in `multiFecBlocks`.
+const MAX_FEC_BLOCKS: usize = 4;
+/// Ten-bit data count in `fecInfo`; zero does not represent 1024.
+const MAX_DATA_SHARDS_PER_BLOCK: usize = 1023;
+
+/// Choose the wire percentage first: Moonlight derives parity as
+/// ceil(data * percentage / 100). Some counts cannot be expressed by an
+/// eight-bit percentage, so the client minimum is bounded by both limits.
+fn fec_parameters(data_shards: usize, percentage: u8, minimum: u32) -> (usize, usize) {
+	let max_parity = MAX_SHARDS.saturating_sub(data_shards);
+	let minimum = (minimum as usize).min(max_parity);
+	let minimum_percentage = if minimum == 0 {
+		0
+	} else {
+		(minimum - 1) * 100 / data_shards + 1
+	};
+	let max_percentage = (max_parity * 100 / data_shards).min(u8::MAX as usize);
+	let percentage = (percentage as usize).max(minimum_percentage).min(max_percentage);
+	((data_shards * percentage).div_ceil(100), percentage)
+}
+
 #[repr(u8)]
 enum RtpFlag {
 	ContainsPicData = 0x1,
@@ -161,14 +182,11 @@ impl Packetizer {
 
 	/// Pre-create FEC encoders for all possible block sizes to avoid
 	/// expensive ReedSolomon matrix construction during frame processing.
+	/// Frames that need more than four blocks have larger blocks with less
+	/// parity, so every size that can carry parity is covered.
 	pub fn warm_up(&mut self, fec_percentage: u8, minimum_fec_packets: u32) {
-		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
-
-		for nr_data_shards in 1..=nr_data_shards_per_block {
-			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize)
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
+		for nr_data_shards in 1..MAX_SHARDS {
+			let (nr_parity_shards, _) = fec_parameters(nr_data_shards, fec_percentage, minimum_fec_packets);
 			if nr_parity_shards > 0 {
 				let _ = self.get_fec_encoder(nr_data_shards, nr_parity_shards);
 			}
@@ -231,20 +249,21 @@ impl Packetizer {
 
 		let nr_data_shards = packet_data_len.div_ceil(requested_shard_payload_size);
 		assert!(nr_data_shards != 0);
+		if nr_data_shards > MAX_FEC_BLOCKS * MAX_DATA_SHARDS_PER_BLOCK {
+			tracing::warn!("Encoded frame {frame_number} needs {nr_data_shards} packets, exceeding the wire limit.");
+			return Err(());
+		}
 
-		let nr_parity_shards_per_block = MAX_SHARDS * fec_percentage as usize / (100 + fec_percentage as usize);
-		let nr_data_shards_per_block = MAX_SHARDS - nr_parity_shards_per_block;
+		// As few blocks as the percentage allows, split evenly so every block
+		// gets the same protection (RFC 5052, section 9.1). A frame that needs
+		// more than four blocks gets four larger ones, each with the parity that
+		// still fits, and none once a block is too large for any.
+		let data_shards_per_block = MAX_SHARDS * 100 / (100 + fec_percentage as usize);
+		let nr_blocks = nr_data_shards.div_ceil(data_shards_per_block).min(MAX_FEC_BLOCKS);
+		let (shards_per_block, larger_blocks) = (nr_data_shards / nr_blocks, nr_data_shards % nr_blocks);
+		// Last block occupies bits 6-7, current block bits 4-5.
+		let last_block_index = (nr_blocks as u8 - 1) << 6;
 
-		// We need to subtract number of data shards by 1, otherwise you can get a situation where
-		// there are for example 100 data shards allowed per block and also 100 data shards available.
-		// In this case, nr_blocks = 100 / 100 + 1 = 2, but we only need to send 1 block.
-		// Subtracting the value of nr_data_shards by 1 avoids this situation.
-		let nr_blocks = (nr_data_shards - 1) / nr_data_shards_per_block + 1;
-		let last_block_index = (nr_blocks.min(4) as u8 - 1) << 6; // TODO: Why the bit shift? To 'force' a limit of 4 blocks?
-
-		tracing::trace!(
-			"Sending a max of {nr_data_shards_per_block} data shards and {nr_parity_shards_per_block} parity shards per block."
-		);
 		tracing::trace!("Sending {nr_blocks} blocks of video data.");
 
 		// Accumulate all blocks into a single batch.
@@ -258,22 +277,14 @@ impl Packetizer {
 		let mut total_extend_us = 0u128;
 
 		for block_index in 0..nr_blocks {
-			let start = block_index * nr_data_shards_per_block;
-			let mut end = ((block_index + 1) * nr_data_shards_per_block).min(nr_data_shards);
-
-			if block_index == 3 {
-				tracing::debug!(
-					"Trying to create {nr_blocks} blocks, but we are limited to 4 blocks so we are sending all remaining packets without FEC."
-				);
-				end = nr_data_shards;
-			}
+			let start = block_index * shards_per_block + block_index.min(larger_blocks);
+			let end = start + shards_per_block + usize::from(block_index < larger_blocks);
 
 			let nr_data_shards = end - start;
 			assert!(nr_data_shards != 0);
 
-			let nr_parity_shards = (nr_data_shards * fec_percentage as usize / 100)
-				.max(minimum_fec_packets as usize)
-				.min(MAX_SHARDS.saturating_sub(nr_data_shards));
+			let (nr_parity_shards, fec_percentage) =
+				fec_parameters(nr_data_shards, fec_percentage, minimum_fec_packets);
 
 			let t_fec_encoder = Instant::now();
 			let encoder = if nr_parity_shards > 0 {
@@ -282,9 +293,6 @@ impl Packetizer {
 				None
 			};
 			total_fec_encoder_us += t_fec_encoder.elapsed().as_micros();
-
-			// Recompute the actual FEC percentage in case of a rounding error or when there are 0 parity shards.
-			let fec_percentage = nr_parity_shards * 100 / nr_data_shards;
 
 			tracing::trace!(
 				"Sending block {block_index} with {nr_data_shards} data shards and {nr_parity_shards} parity shards."
@@ -414,10 +422,6 @@ impl Packetizer {
 			total_extend_us += t_extend.elapsed().as_micros();
 
 			tracing::trace!("Finished sending frame {frame_number}.");
-
-			if block_index == 3 {
-				break;
-			}
 		}
 
 		tracing::trace!(
@@ -444,5 +448,93 @@ impl Packetizer {
 				encoder
 			},
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::collections::BTreeMap;
+
+	fn packetizer() -> Packetizer {
+		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
+			remote_input_key: vec![0x42; 16],
+			remote_input_key_id: 1,
+		});
+		Packetizer::new(false, keys)
+	}
+
+	/// A frame that exactly fills `data_shards` packets of 80 bytes.
+	fn frame(data_shards: usize) -> Vec<u8> {
+		(0..data_shards * 64 - VIDEO_FRAME_HEADER_SIZE)
+			.map(|index| (index % 251) as u8)
+			.collect()
+	}
+
+	/// The packets of each block, data first, in block order.
+	fn blocks(batch: &ShardBatch) -> Vec<Vec<&[u8]>> {
+		let mut blocks = BTreeMap::<u8, Vec<&[u8]>>::new();
+		for packet in batch.as_bytes().chunks_exact(batch.shard_size()) {
+			blocks.entry((packet[27] >> 4) & 3).or_default().push(packet);
+		}
+		blocks.into_values().collect()
+	}
+
+	/// A block's data count and the parity Moonlight derives from its advertised percentage.
+	fn counts(packet: &[u8]) -> (usize, usize) {
+		let fec_info = u32::from_le_bytes(packet[28..32].try_into().unwrap()) as usize;
+		let (data, percentage) = (fec_info >> 22, (fec_info >> 4) & 0xff);
+		(data, (data * percentage).div_ceil(100))
+	}
+
+	#[test]
+	fn frames_are_split_evenly_across_blocks() {
+		for (shards, layout) in [
+			(600, vec![(200, 40); 3]),
+			(900, vec![(225, 30); 4]),
+			(1009, vec![(253, 0), (252, 3), (252, 3), (252, 3)]),
+			(4092, vec![(1023, 0); 4]),
+		] {
+			let data = frame(shards);
+			let batch = packetizer().packetize(&data, true, 80, 2, 20, 1, &mut 0, 0, 0).unwrap();
+			let blocks = blocks(&batch);
+			let wire: Vec<_> = blocks.iter().map(|block| counts(block[0])).collect();
+			assert_eq!(wire, layout, "{shards} data packets");
+			let sent: Vec<u8> = blocks
+				.iter()
+				.flat_map(|block| &block[..counts(block[0]).0])
+				.flat_map(|packet| &packet[PAYLOAD_OFFSET..])
+				.copied()
+				.collect();
+			assert!(sent[VIDEO_FRAME_HEADER_SIZE..] == data[..], "{shards} data packets");
+		}
+	}
+
+	#[test]
+	fn oversized_frame_does_not_consume_sequence_numbers() {
+		let mut sequence = 77;
+		let result = packetizer().packetize(&frame(4093), true, 80, 2, 20, 1, &mut sequence, 0, 0);
+		assert!(result.is_err());
+		assert_eq!(sequence, 77);
+	}
+
+	#[test]
+	fn parity_matches_the_advertised_percentage() {
+		for (data_shards, percentage, minimum) in
+			[(213, 20, 0), (1, 20, 2), (40, 0, 2), (40, 20, u32::MAX), (600, 100, 2)]
+		{
+			let batch = packetizer()
+				.packetize(&frame(data_shards), true, 80, minimum, percentage, 1, &mut 0, 0, 0)
+				.unwrap();
+			for block in blocks(&batch) {
+				let (data, parity) = counts(block[0]);
+				assert_eq!(
+					block.len(),
+					data + parity,
+					"{data_shards} data packets, minimum {minimum}"
+				);
+				assert!(parity > 0, "{data_shards} data packets, minimum {minimum}");
+			}
+		}
 	}
 }
