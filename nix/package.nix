@@ -14,6 +14,7 @@
   vulkan-loader,
   wayland,
   libglvnd,
+  shaderc,
 }:
 
 let
@@ -166,6 +167,12 @@ rustPlatform.buildRustPackage {
     vulkan-loader
     wayland
   ];
+
+  # smithay's Vulkan renderer (pulled in for ferriscope) compiles its shaders
+  # with shaderc at build time. Without a system library shaderc-sys falls
+  # back to building it from source, which needs git and network access, so
+  # point it at nixpkgs'.
+  env.SHADERC_LIB_DIR = "${lib.getLib shaderc}/lib";
 
   # The tests exercise the compositor/encoder paths and expect devices
   # (GPU, uinput) that the build sandbox does not have.
