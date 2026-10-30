@@ -83,10 +83,16 @@ Every 5 seconds, a summary is printed with:
 - **Total latency** — avg/min/max and p50/p95/p99 time for the full pipeline per frame
 - **Submit latency** — avg/min/max and p50/p95/p99 CPU time spent submitting a frame to the asynchronous encoder
 - **Encode wait latency** — avg/min/max and p50/p95/p99 time waiting for the asynchronous encode/readback future
+- **GPU encode time (optional)** — timestamp-query duration of the GPU's video encode work, when the video queue supports timestamps; excludes color conversion, readback, and packet transport
+- **Bitstream ready (optional)** — pixelforge wall-clock time from encode submission to completion of readback; excludes any time the Moonshine consumer spends waiting to process an already-ready future
 - **Breakdown** — avg time per stage: channel wait, DMA-BUF import, color conversion, submit, encode wait, packetization, send; consumer queue is reported as a diagnostic included inside encode wait
 - **Key frames** — number of keyframes emitted
 
 At the end of the run, a final summary covers the entire session (excluding the warmup period).
+
+GPU timing results report their sample count explicitly. When Vulkan's video encode queue does not support timestamp queries, both additional metrics are unavailable (not zero), and the benchmark states that no GPU timestamp samples were collected. Neither metric should be added to `total` or `encode_wait`: they overlap existing pipeline windows.
+
+These measurements stop at Moonshine's packet queue; they do not include time waiting in the UDP sender, network transit, client decoding, or display. See upstream sender-queue work in PR #243 for the next stage.
 
 With `--matrix`, each combination prints the same per-run summaries and the command finishes with a consolidated latency distribution table plus an average pipeline breakdown table. Matrix mode uses fixed target FPS values of 60, 120, and 360. If `--duration` is left at `0`, matrix mode defaults to 8 seconds per combination so the matrix completes.
 

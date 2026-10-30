@@ -106,8 +106,16 @@ pub struct FrameStats {
 	pub submit: std::time::Duration,
 	/// Time between submit completion and the packet consumer awaiting the encode future.
 	pub consumer_queue: std::time::Duration,
-	/// Time from submit completion until the asynchronous encode/readback future has resolved.
+	/// Elapsed wall time from submit completion until the consumer obtains the encoded packet.
+	/// Includes time queued before the consumer polls the encode future.
 	pub encode_wait: std::time::Duration,
+	/// GPU video encode command duration, when the video queue supports timestamps.
+	/// This excludes conversion, queueing, and bitstream readback.
+	pub gpu_encode: Option<std::time::Duration>,
+	/// Pixelforge's wall time from encode submission until bitstream readback finishes.
+	/// Available when the video queue supports timestamps. This includes GPU
+	/// scheduling and readback, but not the consumer's post-completion scheduling.
+	pub bitstream_ready: Option<std::time::Duration>,
 	/// Time spent packetizing the encoded data.
 	pub packetize: std::time::Duration,
 	/// Time spent sending the packets over the channel.
