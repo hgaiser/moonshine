@@ -35,6 +35,10 @@ pub struct HeroicApplicationScannerConfig {
 	/// Seconds to wait for each scanned application to reach an active state after launch.
 	#[serde(default = "crate::session::application::default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Extra environment variables for each scanned application.
+	#[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+	pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Directory Heroic writes its per store library caches into.
@@ -275,6 +279,7 @@ pub(crate) fn scan_heroic_applications(config: &HeroicApplicationScannerConfig) 
 				stdout: config.stdout.clone(),
 				stderr: config.stderr.clone(),
 				launch_timeout_secs: config.launch_timeout_secs,
+				env: config.env.clone(),
 				steam_integration: false,
 			};
 
@@ -399,6 +404,7 @@ mod tests {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: 2,
+			env: Default::default(),
 		}
 	}
 

@@ -112,6 +112,7 @@ mod tests {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: 2,
+			env: Default::default(),
 		})
 	}
 

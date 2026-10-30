@@ -132,6 +132,7 @@ impl Default for Config {
 				stdout: None,
 				stderr: None,
 				launch_timeout_secs: 2,
+				env: Default::default(),
 			})],
 			compositor: CompositorConfig::default(),
 			inhibit_sleep: true,

@@ -37,6 +37,10 @@ pub struct SteamApplicationScannerConfig {
 	/// Seconds to wait for each scanned application to reach an active state after launch.
 	#[serde(default = "crate::session::application::default_launch_timeout")]
 	pub launch_timeout_secs: u64,
+
+	/// Extra environment variables for each scanned application.
+	#[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+	pub env: std::collections::BTreeMap<String, String>,
 }
 
 pub(crate) fn scan_steam_applications(config: &SteamApplicationScannerConfig) -> Result<Vec<ApplicationConfig>, ()> {
@@ -104,6 +108,7 @@ pub(crate) fn scan_steam_applications(config: &SteamApplicationScannerConfig) ->
 				stdout: config.stdout.clone(),
 				stderr: config.stderr.clone(),
 				launch_timeout_secs: config.launch_timeout_secs,
+				env: config.env.clone(),
 				// Steam launches these, so Steam's focus contract applies.
 				steam_integration: true,
 			};
@@ -211,6 +216,7 @@ mod tests {
 			stdout: None,
 			stderr: None,
 			launch_timeout_secs: 2,
+			env: Default::default(),
 		}
 	}
 
