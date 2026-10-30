@@ -98,16 +98,16 @@ impl UdpGsoSocket {
 				segment_size: Some(shard_size),
 				src_ip: None,
 			};
-			let result = loop {
-				match self.udp_state.try_send(UdpSockRef::from(&self.socket), &transmit) {
-					// A frame burst can outrun the socket buffer; wait for it to
-					// drain and resend the same chunk instead of degrading.
-					Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-						self.socket.writable().await.ok();
-					},
-					other => break other,
-				}
-			};
+			// Use Tokio's readiness-aware raw-I/O wrapper: a GSO send can
+			// return WouldBlock when the socket buffer is full, and async_io
+			// clears stale writable readiness before waiting again. Simply
+			// awaiting writable() after a raw try_send would spin on that flag.
+			let result = self
+				.socket
+				.async_io(tokio::io::Interest::WRITABLE, || {
+					self.udp_state.try_send(UdpSockRef::from(&self.socket), &transmit)
+				})
+				.await;
 			if let Err(e) = result {
 				failed_chunks += 1;
 				tracing::debug!("GSO send failed ({e}), falling back to per-shard sends for this chunk");
