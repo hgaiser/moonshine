@@ -51,9 +51,17 @@
           # so `cargo test`/`cargo build` need libc++ to link — same reason
           # upstream's Arch build deps list libc++ next to gcc-libs.
           buildInputs = [ pkgs.llvmPackages.libcxx ];
+          # Cargo-built binaries dlopen these before package RUNPATH setup.
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+            pkgs.libglvnd
+            pkgs.vulkan-loader
+          ];
           packages = with pkgs; [
             rustfmt
             clippy
+            python3 # Hardware-independent smoke verifier and CI tests
+            vulkan-tools
+            xwayland
           ];
         };
       });

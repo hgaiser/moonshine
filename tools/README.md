@@ -2,6 +2,24 @@
 
 Utilities for testing and benchmarking Moonshine.
 
+## Portable host verification
+
+The [verification harness](verification/README.md) wraps `moonshine-bench` in an opt-in, bounded test that checks for **completed encoded frames**, captures a machine-readable JSON report and raw logs, and refuses to run when the video UDP port is already occupied.
+
+```sh
+cargo build --release -p moonshine-tools
+python3 tools/verification/verify_video.py doctor
+python3 tools/verification/verify_video.py smoke
+```
+
+It requires a host with accessible Vulkan Video hardware and a rendering workload (default: `vkcube`). Its parser/verdict tests run without GPU in standard CI:
+
+```sh
+python3 -m unittest discover -s tools/verification -p 'test_*.py'
+```
+
+The [host-verification skill](../.agents/skills/verify-moonshine/SKILL.md) records the scope, evidence, cleanup, and feature map. This harness is **not** a real Moonlight client test.
+
 ## moonshine-bench
 
 Benchmarks Moonshine's video encoding pipeline by spawning an application inside a headless compositor, running the full encode path, and collecting per-frame timing statistics.
