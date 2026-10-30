@@ -158,6 +158,9 @@ struct StatsSummary {
 	total: LatencyDistribution,
 	submit: LatencyDistribution,
 	encode_wait: LatencyDistribution,
+	gpu_encode: Option<LatencyDistribution>,
+	bitstream_ready: Option<LatencyDistribution>,
+	gpu_timing_samples: usize,
 	avg_channel_wait_us: f64,
 	avg_import_us: f64,
 	avg_convert_us: f64,
@@ -220,6 +223,8 @@ struct StatsAccumulator {
 	total_samples_us: Vec<u64>,
 	submit_samples_us: Vec<u64>,
 	encode_wait_samples_us: Vec<u64>,
+	gpu_encode_samples_us: Vec<u64>,
+	bitstream_ready_samples_us: Vec<u64>,
 	key_frames: u64,
 	encoded_bytes: u64,
 	start: Instant,
@@ -243,6 +248,8 @@ impl StatsAccumulator {
 			total_samples_us: Vec::new(),
 			submit_samples_us: Vec::new(),
 			encode_wait_samples_us: Vec::new(),
+			gpu_encode_samples_us: Vec::new(),
+			bitstream_ready_samples_us: Vec::new(),
 			key_frames: 0,
 			encoded_bytes: 0,
 			start: now,
@@ -272,6 +279,12 @@ impl StatsAccumulator {
 		self.total_samples_us.push(total);
 		self.submit_samples_us.push(submit);
 		self.encode_wait_samples_us.push(encode_wait);
+		if let Some(gpu_encode) = stats.gpu_encode {
+			self.gpu_encode_samples_us.push(gpu_encode.as_micros() as u64);
+		}
+		if let Some(bitstream_ready) = stats.bitstream_ready {
+			self.bitstream_ready_samples_us.push(bitstream_ready.as_micros() as u64);
+		}
 		if stats.is_key_frame {
 			self.key_frames += 1;
 		}
@@ -301,6 +314,19 @@ impl StatsAccumulator {
 			total: LatencyDistribution::new(self.total_us, &self.total_samples_us),
 			submit: LatencyDistribution::new(self.submit_us, &self.submit_samples_us),
 			encode_wait: LatencyDistribution::new(self.encode_wait_us, &self.encode_wait_samples_us),
+			gpu_encode: (!self.gpu_encode_samples_us.is_empty()).then(|| {
+				LatencyDistribution::new(
+					self.gpu_encode_samples_us.iter().map(|&v| v as u128).sum(),
+					&self.gpu_encode_samples_us,
+				)
+			}),
+			bitstream_ready: (!self.bitstream_ready_samples_us.is_empty()).then(|| {
+				LatencyDistribution::new(
+					self.bitstream_ready_samples_us.iter().map(|&v| v as u128).sum(),
+					&self.bitstream_ready_samples_us,
+				)
+			}),
+			gpu_timing_samples: self.gpu_encode_samples_us.len(),
 			avg_channel_wait_us: self.channel_wait_us as f64 / self.count as f64,
 			avg_import_us: self.import_us as f64 / self.count as f64,
 			avg_convert_us: self.convert_us as f64 / self.count as f64,
@@ -357,6 +383,20 @@ impl StatsAccumulator {
 			summary.encode_wait.p95_us,
 			summary.encode_wait.p99_us
 		);
+		if let (Some(gpu), Some(ready)) = (&summary.gpu_encode, &summary.bitstream_ready) {
+			tracing::info!(
+				"  gpu_encode: samples={} avg={:.0}us p50={}us p95={}us; bitstream_ready: avg={:.0}us p50={}us p95={}us",
+				summary.gpu_timing_samples,
+				gpu.avg_us,
+				gpu.p50_us,
+				gpu.p95_us,
+				ready.avg_us,
+				ready.p50_us,
+				ready.p95_us
+			);
+		} else {
+			tracing::info!("  gpu_encode/bitstream_ready: unavailable (0 GPU timestamp samples)");
+		}
 		tracing::info!(
 			"  avg breakdown: ch_wait={avg_channel_wait:.0}us  import={avg_import:.0}us  convert={avg_convert:.0}us  submit={avg_submit:.0}us  enc_wait={avg_encode_wait:.0}us  pkt={avg_packetize:.0}us  send={avg_send:.0}us",
 			avg_channel_wait = summary.avg_channel_wait_us,
@@ -804,6 +844,38 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 		}
 	}
 
+	tracing::info!("Hardware timing (us/frame): GPU timestamp samples only; unavailable means unsupported, not zero");
+	tracing::info!(
+		"  {:<8} {:<10} {:>6} {:<5} {:>8} {:>20} {:>20}",
+		"label",
+		"resolution",
+		"target",
+		"codec",
+		"samples",
+		"gpu avg/p50/p95",
+		"ready avg/p50/p95"
+	);
+	for report in reports {
+		if let MatrixStatus::Ok(Some(summary)) | MatrixStatus::Interrupted(Some(summary)) = &report.status {
+			let format_timing = |distribution: &Option<LatencyDistribution>| {
+				distribution.as_ref().map_or_else(
+					|| "unavailable".to_string(),
+					|d| format!("{:.0}/{}/{}", d.avg_us, d.p50_us, d.p95_us),
+				)
+			};
+			tracing::info!(
+				"  {:<8} {:<10} {:>6} {:<5} {:>8} {:>20} {:>20}",
+				report.resolution_label,
+				report.resolution,
+				report.target_fps,
+				report.codec,
+				summary.gpu_timing_samples,
+				format_timing(&summary.gpu_encode),
+				format_timing(&summary.bitstream_ready),
+			);
+		}
+	}
+
 	tracing::info!(
 		"Average pipeline breakdown (us/frame): additive stages; delta = total - accounted; queue_diag is included in enc_wait"
 	);
@@ -851,4 +923,77 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 
 fn boxed_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 	Box::new(std::io::Error::other(message.into()))
+}
+
+#[cfg(test)]
+mod timing_tests {
+	use super::{FrameStats, StatsAccumulator};
+	use std::time::Duration;
+
+	fn frame(gpu_encode: Option<Duration>, bitstream_ready: Option<Duration>) -> FrameStats {
+		FrameStats {
+			channel_wait: Duration::ZERO,
+			import: Duration::ZERO,
+			convert: Duration::ZERO,
+			submit: Duration::ZERO,
+			consumer_queue: Duration::ZERO,
+			encode_wait: Duration::ZERO,
+			gpu_encode,
+			bitstream_ready,
+			packetize: Duration::ZERO,
+			send: Duration::ZERO,
+			total: Duration::ZERO,
+			encoded_bytes: 0,
+			is_key_frame: false,
+		}
+	}
+
+	#[test]
+	fn unavailable_gpu_timestamps_are_not_reported_as_zero_duration() {
+		let mut accumulator = StatsAccumulator::new();
+		accumulator.add(&frame(None, None));
+		let summary = accumulator.summary().expect("one frame was recorded");
+		assert_eq!(summary.gpu_timing_samples, 0);
+		assert!(summary.gpu_encode.is_none());
+		assert!(summary.bitstream_ready.is_none());
+	}
+
+	#[test]
+	fn gpu_timing_distributions_do_not_count_unavailable_frames() {
+		let mut accumulator = StatsAccumulator::new();
+		for n in [100, 200, 300, 400] {
+			accumulator.add(&frame(
+				Some(Duration::from_micros(n)),
+				Some(Duration::from_micros(n + 700)),
+			));
+		}
+		accumulator.add(&frame(None, None));
+		let summary = accumulator.summary().expect("five frames were recorded");
+		assert_eq!(summary.count, 5);
+		assert_eq!(summary.gpu_timing_samples, 4);
+		let gpu = summary.gpu_encode.expect("GPU timestamps should be available");
+		assert_eq!(gpu.avg_us, 250.0);
+		assert_eq!(gpu.p50_us, 200);
+		assert_eq!(gpu.p95_us, 400);
+		let ready = summary.bitstream_ready.expect("Readback timing should be available");
+		assert_eq!(ready.avg_us, 950.0);
+		assert_eq!(ready.p95_us, 1100);
+	}
+
+	#[test]
+	fn gpu_timing_percentiles_use_only_available_samples() {
+		let mut accumulator = StatsAccumulator::new();
+		accumulator.add(&frame(None, None));
+		accumulator.add(&frame(
+			Some(Duration::from_micros(1400)),
+			Some(Duration::from_micros(2700)),
+		));
+		let summary = accumulator.summary().expect("two frames were recorded");
+		assert_eq!(summary.gpu_timing_samples, 1);
+		let gpu = summary.gpu_encode.expect("one GPU timing sample");
+		assert_eq!(gpu.p50_us, 1400);
+		assert_eq!(gpu.avg_us, 1400.0);
+		let ready = summary.bitstream_ready.expect("one bitstream timing sample");
+		assert_eq!(ready.p50_us, 2700);
+	}
 }

@@ -121,6 +121,8 @@ struct LatencySample {
 	submit: std::time::Duration,
 	consumer_queue: std::time::Duration,
 	encode_wait: std::time::Duration,
+	gpu_encode: Option<std::time::Duration>,
+	bitstream_ready: Option<std::time::Duration>,
 	packetize: std::time::Duration,
 	send: std::time::Duration,
 	total: std::time::Duration,
@@ -163,6 +165,19 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 	let mut encode_waits: Vec<u64> = samples.iter().map(|s| s.encode_wait.as_micros() as u64).collect();
 	encode_waits.sort_unstable();
 
+	// Pixelforge reports these only when video-queue GPU timestamps are supported.
+	// A missing sample must not be interpreted as zero GPU time.
+	let mut gpu_encodes: Vec<u64> = samples
+		.iter()
+		.filter_map(|s| s.gpu_encode.map(|d| d.as_micros() as u64))
+		.collect();
+	gpu_encodes.sort_unstable();
+	let mut bitstream_readies: Vec<u64> = samples
+		.iter()
+		.filter_map(|s| s.bitstream_ready.map(|d| d.as_micros() as u64))
+		.collect();
+	bitstream_readies.sort_unstable();
+
 	let mut packetizes: Vec<u64> = samples.iter().map(|s| s.packetize.as_micros() as u64).collect();
 	packetizes.sort_unstable();
 
@@ -172,6 +187,10 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 	let p50 = |v: &[u64]| v[v.len() / 2];
 	let p95 = |v: &[u64]| v[(v.len() as f64 * 0.95) as usize];
 	let p99 = |v: &[u64]| v[(v.len() as f64 * 0.99) as usize];
+	let gpu_encode_p50_us = (!gpu_encodes.is_empty()).then(|| p50(&gpu_encodes));
+	let gpu_encode_p95_us = (!gpu_encodes.is_empty()).then(|| p95(&gpu_encodes));
+	let bitstream_ready_p50_us = (!bitstream_readies.is_empty()).then(|| p50(&bitstream_readies));
+	let bitstream_ready_p95_us = (!bitstream_readies.is_empty()).then(|| p95(&bitstream_readies));
 
 	tracing::debug!(
 		frames = n,
@@ -197,6 +216,11 @@ fn log_latency_summary(samples: &[LatencySample], elapsed: std::time::Duration) 
 		encode_wait_p50_us = p50(&encode_waits),
 		encode_wait_p95_us = p95(&encode_waits),
 		encode_wait_p99_us = p99(&encode_waits),
+		gpu_timing_samples = gpu_encodes.len(),
+		gpu_encode_p50_us = ?gpu_encode_p50_us,
+		gpu_encode_p95_us = ?gpu_encode_p95_us,
+		bitstream_ready_p50_us = ?bitstream_ready_p50_us,
+		bitstream_ready_p95_us = ?bitstream_ready_p95_us,
 		packetize_p50_us = p50(&packetizes),
 		send_p50_us = p50(&sends),
 		send_p95_us = p95(&sends),
@@ -339,6 +363,16 @@ async fn run_packet_consumer(
 			packet.data = hdr_sei::inject_hdr_metadata(&packet.data, &m, ctx.video_format);
 		}
 
+		// GPU hardware time and submit-to-bitstream-ready wall time come from
+		// pixelforge. Neither is interchangeable with the async future's wait.
+		let gpu_encode = packet
+			.stats
+			.as_ref()
+			.map(|stats| std::time::Duration::from_nanos(stats.gpu_time_ns));
+		let bitstream_ready = packet
+			.stats
+			.as_ref()
+			.map(|stats| std::time::Duration::from_nanos(stats.wall_latency_ns));
 		let encoded_bytes = packet.data.len();
 		let is_key_frame = packet.is_key_frame;
 
@@ -424,6 +458,8 @@ async fn run_packet_consumer(
 			submit: frame_context.submit,
 			consumer_queue: consumer_queue_dur,
 			encode_wait: encode_wait_dur,
+			gpu_encode,
+			bitstream_ready,
 			packetize: packetize_dur,
 			send: send_dur,
 			total,
@@ -438,6 +474,8 @@ async fn run_packet_consumer(
 			submit: frame_context.submit,
 			consumer_queue: consumer_queue_dur,
 			encode_wait: encode_wait_dur,
+			gpu_encode,
+			bitstream_ready,
 			packetize: packetize_dur,
 			send: send_dur,
 			total,
