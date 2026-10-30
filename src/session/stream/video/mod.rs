@@ -54,11 +54,19 @@ pub struct VideoStreamConfig {
 	pub max_packet_size: usize,
 }
 
-/// Smallest accepted packet size cap. Lower values would leave almost no room
-/// for payload after the 16-byte NV video header, so they are ignored.
+/// Smallest reasonable client-requested packet size. Smaller packets leave
+/// too little room for video payload after the protocol headers.
 const MIN_PACKET_SIZE: usize = 200;
+/// Largest stream packet size fitting one IPv6 UDP datagram without jumbograms:
+/// 65_535 - 40 (IPv6) - 8 (UDP) - 16 (stream overhead).
+pub(super) const MAX_PACKET_SIZE: usize = 65_471;
 
 impl VideoStreamConfig {
+	/// Validate a negotiated packet size before forwarding it to the packetizer.
+	pub(crate) fn valid_packet_size(requested: usize) -> bool {
+		(MIN_PACKET_SIZE..=MAX_PACKET_SIZE).contains(&requested)
+	}
+
 	/// Clamp a client-requested video packet size to `max_packet_size`.
 	///
 	/// A client only asks for what it believes it can receive, so a request
@@ -513,6 +521,16 @@ mod tests {
 		VideoStreamConfig {
 			max_packet_size,
 			..Default::default()
+		}
+	}
+
+	#[test]
+	fn rejects_invalid_negotiated_packet_sizes() {
+		for bad in [0, 16, 17, 199, MAX_PACKET_SIZE + 1, usize::MAX] {
+			assert!(!VideoStreamConfig::valid_packet_size(bad), "accepted {bad}");
+		}
+		for good in [MIN_PACKET_SIZE, 1200, 1392, MAX_PACKET_SIZE] {
+			assert!(VideoStreamConfig::valid_packet_size(good), "rejected {good}");
 		}
 	}
 
