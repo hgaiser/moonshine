@@ -9,7 +9,9 @@ pub(super) const FENCE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Wait until a sync file fd signals (becomes readable).
 ///
-/// Returns `Err` if it did not signal within `timeout` or `poll(2)` failed.
+/// Returns `Err` on timeout, poll failure, or any event other than a
+/// successfully signalled fence. In particular, POLLERR/POLLHUP/POLLNVAL
+/// are not evidence that GPU work has completed.
 pub(super) fn wait_sync_file(fd: RawFd, timeout: Duration) -> Result<(), String> {
 	let deadline = Instant::now() + timeout;
 	loop {
@@ -23,7 +25,18 @@ pub(super) fn wait_sync_file(fd: RawFd, timeout: Duration) -> Result<(), String>
 		// SAFETY: `pollfd` is a valid, initialised struct and the count is 1.
 		let result = unsafe { libc::poll(&mut pollfd, 1, millis) };
 		match result {
-			1.. => return Ok(()),
+			1.. => {
+				// poll() counts descriptors with errors, hangups and invalid fds
+				// as ready. Only POLLIN proves a sync_file fence is signalled.
+				let failures = pollfd.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL);
+				if failures != 0 {
+					return Err(format!("acquire fence poll reported failure flags: {failures:#x}"));
+				}
+				if pollfd.revents & libc::POLLIN != 0 {
+					return Ok(());
+				}
+				return Err(format!("acquire fence poll reported unexpected events: {:#x}", pollfd.revents));
+			},
 			0 => return Err(format!("acquire fence did not signal within {timeout:?}")),
 			_ => {
 				let error = std::io::Error::last_os_error();
@@ -38,6 +51,27 @@ pub(super) fn wait_sync_file(fd: RawFd, timeout: Duration) -> Result<(), String>
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn wait_sync_file_rejects_invalid_descriptor() {
+		// poll() returns a positive count with POLLNVAL, not -1.
+		// Use an fd above the process limit to avoid races with parallel tests
+		// reopening a recently closed descriptor.
+		let error = wait_sync_file(i32::MAX, Duration::from_millis(20)).unwrap_err();
+		assert!(error.contains("failure flags"), "{error}");
+	}
+
+	#[test]
+	fn wait_sync_file_rejects_hangup_without_signal() {
+		// A pipe with no writer reports POLLHUP; that is not POLLIN.
+		let mut fds = [0 as RawFd; 2];
+		assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+		let (read, write) = (fds[0], fds[1]);
+		unsafe { libc::close(write) };
+		let error = wait_sync_file(read, Duration::from_millis(20)).unwrap_err();
+		assert!(error.contains("failure flags"), "{error}");
+		unsafe { libc::close(read) };
+	}
 
 	#[test]
 	fn wait_sync_file_returns_once_readable() {
