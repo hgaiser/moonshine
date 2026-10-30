@@ -313,6 +313,10 @@ impl RtspServer {
 			},
 		};
 		let packet_size = self.video_config.clamp_packet_size(requested_packet_size);
+		if !VideoStreamConfig::valid_packet_size(packet_size) {
+			tracing::warn!("Rejected invalid client video packet size: {packet_size}");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		}
 		if packet_size != requested_packet_size {
 			tracing::info!("Clamping client video packet size from {requested_packet_size} to {packet_size} bytes.");
 		}

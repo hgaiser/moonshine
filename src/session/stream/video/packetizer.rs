@@ -204,6 +204,12 @@ impl Packetizer {
 			is_key_frame
 		);
 
+		// RTSP validates negotiated sizes; reject invalid direct callers as well
+		// to avoid subtraction underflow, division by zero, or oversized UDP shards.
+		if requested_packet_size <= NV_VIDEO_PACKET_SIZE || requested_packet_size > super::MAX_PACKET_SIZE {
+			tracing::warn!("Invalid video packet size: {requested_packet_size}");
+			return Err(());
+		}
 		let requested_shard_payload_size = requested_packet_size - NV_VIDEO_PACKET_SIZE;
 		let packet_data_len = VIDEO_FRAME_HEADER_SIZE + encoded_data.len();
 		let last_shard_size = packet_data_len % requested_shard_payload_size;
@@ -444,5 +450,25 @@ impl Packetizer {
 				encoder
 			},
 		})
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn invalid_packet_sizes_fail_without_advancing_sequence_numbers() {
+		let (_, keys) = tokio::sync::watch::channel(crate::session::SessionKeyData {
+			remote_input_key: vec![0x42; 16],
+			remote_input_key_id: 1,
+		});
+		let mut packetizer = Packetizer::new(false, keys);
+		for size in [0, NV_VIDEO_PACKET_SIZE, super::super::MAX_PACKET_SIZE + 1, usize::MAX] {
+			let mut sequence = 77;
+			let result = packetizer.packetize(&[0u8; 4], true, size, 0, 20, 1, &mut sequence, 0, 0);
+			assert!(result.is_err(), "packet size {size}");
+			assert_eq!(sequence, 77);
+		}
 	}
 }
