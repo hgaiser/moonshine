@@ -33,6 +33,9 @@ jobs:
             components: rustfmt
             run: cargo fmt --all -- --check
             deps: false
+          - name: Verification helper tests
+            run: python3 -m unittest discover -s tools/verification -p 'test_*.py'
+            deps: false
           - name: Documentation
             run: RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --workspace --all-features
             deps: true
