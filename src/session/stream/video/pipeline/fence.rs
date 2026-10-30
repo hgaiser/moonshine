@@ -35,7 +35,10 @@ pub(super) fn wait_sync_file(fd: RawFd, timeout: Duration) -> Result<(), String>
 				if pollfd.revents & libc::POLLIN != 0 {
 					return Ok(());
 				}
-				return Err(format!("acquire fence poll reported unexpected events: {:#x}", pollfd.revents));
+				return Err(format!(
+					"acquire fence poll reported unexpected events: {:#x}",
+					pollfd.revents
+				));
 			},
 			0 => return Err(format!("acquire fence did not signal within {timeout:?}")),
 			_ => {
