@@ -725,6 +725,12 @@ async fn run_benchmark(
 	let _ = session_manager.stop_session().await;
 
 	tracing::info!("Done.");
+	// A successful process exit without encoded frames is not a successful
+	// video benchmark. In matrix mode, report this run as failed rather than
+	// silently treating it as an empty successful cell.
+	if summary.is_none() && !interrupted {
+		return Err(boxed_error("No frames were encoded during benchmark session"));
+	}
 	Ok(BenchmarkReport {
 		resolution_label,
 		resolution: format!("{}x{}", width, height),
