@@ -52,6 +52,18 @@ pub struct VideoStreamConfig {
 	/// and 8-byte UDP headers and the 16-byte stream overhead).
 	#[serde(default)]
 	pub max_packet_size: usize,
+
+	/// Let the encoder convert RGB frames to YUV itself
+	/// (`VK_VALVE_video_encode_rgb_conversion`) where the device supports it,
+	/// instead of the color converter. Only 4:2:0 streams qualify, and in an HDR
+	/// stream only HDR10 frames (10-bit BT.2020 PQ). Set to `false` to always use
+	/// the color converter.
+	#[serde(default = "default_encoder_rgb_conversion")]
+	pub encoder_rgb_conversion: bool,
+}
+
+fn default_encoder_rgb_conversion() -> bool {
+	true
 }
 
 /// Smallest accepted packet size cap. Lower values would leave almost no room
@@ -87,6 +99,7 @@ impl Default for VideoStreamConfig {
 			encrypt: false,
 			log_frame_spikes: false,
 			max_packet_size: 0,
+			encoder_rgb_conversion: default_encoder_rgb_conversion(),
 		}
 	}
 }

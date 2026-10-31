@@ -5,6 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Let the encoder convert RGB frames to YUV itself where the device supports `VK_VALVE_video_encode_rgb_conversion` (4:2:0 streams; in HDR streams, HDR10 frames), skipping the color converter. Disable with `stream.video.encoder_rgb_conversion = false`.
+
 ## [v0.16.1] - 13-09-2026
 
 ### Added
