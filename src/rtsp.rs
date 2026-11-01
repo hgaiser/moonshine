@@ -28,11 +28,23 @@ use crate::session::stream::video::VideoStreamContext;
 /// per-read buffer is not a limit: an incomplete request is retried with a
 /// growing String. Keep generous headroom for clients with extra SDP fields.
 const MAX_RTSP_REQUEST_BYTES: usize = 64 * 1024;
+/// Absolute deadline for receiving one RTSP request, including all partial reads.
+const RTSP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn rtsp_request_fits(current: usize, incoming: usize) -> bool {
 	current
 		.checked_add(incoming)
 		.is_some_and(|size| size <= MAX_RTSP_REQUEST_BYTES)
+}
+
+async fn read_rtsp_chunk<R: tokio::io::AsyncRead + Unpin>(
+	reader: &mut R,
+	buffer: &mut [u8],
+	deadline: tokio::time::Instant,
+) -> std::io::Result<usize> {
+	tokio::time::timeout_at(deadline, reader.read(buffer))
+		.await
+		.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "RTSP request deadline exceeded"))?
 }
 
 #[repr(u8)]
@@ -515,11 +527,11 @@ impl RtspServer {
 		}
 
 		let mut message_buffer = String::new();
+		let deadline = tokio::time::Instant::now() + RTSP_REQUEST_TIMEOUT;
 
 		let message = loop {
 			let mut buffer = [0u8; 2048];
-			let bytes_read = connection
-				.read(&mut buffer)
+			let bytes_read = read_rtsp_chunk(&mut connection, &mut buffer, deadline)
 				.await
 				.map_err(|e| tracing::warn!("Failed to read from connection '{}': {}", address, e))?;
 			if bytes_read == 0 {
@@ -649,5 +661,17 @@ mod tests {
 		assert!(!rtsp_request_fits(MAX_RTSP_REQUEST_BYTES - 2048, 2049));
 		assert!(!rtsp_request_fits(MAX_RTSP_REQUEST_BYTES, 1));
 		assert!(!rtsp_request_fits(usize::MAX, 1));
+	}
+
+	#[tokio::test]
+	async fn partial_reads_do_not_reset_request_deadline() {
+		let (mut reader, mut writer) = tokio::io::duplex(16);
+		writer.write_all(b"RT").await.unwrap();
+		let mut buffer = [0u8; 16];
+		let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+
+		assert_eq!(read_rtsp_chunk(&mut reader, &mut buffer, deadline).await.unwrap(), 2);
+		let error = read_rtsp_chunk(&mut reader, &mut buffer, deadline).await.unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
 	}
 }
