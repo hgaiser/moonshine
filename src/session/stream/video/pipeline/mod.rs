@@ -30,12 +30,11 @@ use crate::session::stream::video::{
 };
 
 pub(crate) use dmabuf::KcmpProbe;
-use dmabuf::{CachedImport, DmaBufImporter, DmaBufPlane};
+use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
-	Codec, ColorConverter, ColorConverterConfig, ColorDescription, ColorRange, ColorSpec, EncodeConfig, EncodeFuture,
-	Encoder, EncoderTuningMode, InputFormat, OutputFormat, PixelForgeError, PixelFormat, RateControlMode, VideoContext,
-	VideoContextBuilder,
+	Codec, ColorRange, ColorSpec, EncodeConfig, EncodeFuture, Encoder, EncoderTuningMode, Frame, InputFormat,
+	PixelForgeError, PixelFormat, RateControl, RgbSource, Source, StreamColor, VideoContext, VideoContextBuilder,
 };
 
 /// Maximum number of frames in flight (submitted to the encoder but not yet
@@ -56,25 +55,6 @@ use pixelforge::{
 /// socket and the kernel below it still hold isn't counted here; the socket's
 /// share is bounded by its send buffer (see `VideoStreamConfig::send_buffer_size`).
 pub(super) const MAX_FRAMES_IN_FLIGHT: usize = 3;
-
-/// Point a converter at a new source and target.
-///
-/// pixelforge only allows a source to reach targets it can convert to, and checks
-/// each setter on its own: anything can become PQ, but an sRGB target needs an sRGB
-/// source. Order the two so the converter never passes through an invalid pair.
-fn set_converter_colors(
-	converter: &mut ColorConverter,
-	source: ColorSpec,
-	target: ColorSpec,
-) -> Result<(), PixelForgeError> {
-	if target == ColorSpec::Bt2020Pq {
-		converter.set_target(target)?;
-		converter.set_source(source)
-	} else {
-		converter.set_source(source)?;
-		converter.set_target(target)
-	}
-}
 
 /// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
 /// and Vulkan import format.
@@ -101,19 +81,39 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	}
 }
 
-/// Whether a pixelforge error indicates Vulkan device loss.
-///
-/// Device loss is unrecoverable on the existing device: every subsequent GPU
-/// operation fails the same way, so the encoding loop must exit (shutting the
-/// session down) instead of retrying forever and freezing the stream.
-fn is_device_lost(e: &PixelForgeError) -> bool {
-	match e {
-		PixelForgeError::Vulkan(result) => *result == vk::Result::ERROR_DEVICE_LOST,
-		// Other variants (e.g. CommandBuffer) stringify the underlying
-		// vk::Result, whose ash display text is "The logical device has been
-		// lost. See <...>".
-		_ => e.to_string().contains("device has been lost"),
+/// The colour range a session's stream uses.
+fn range(full_range: bool) -> ColorRange {
+	if full_range {
+		ColorRange::Full
+	} else {
+		ColorRange::Limited
 	}
+}
+
+/// What a session's frames hold and what its stream says, before any frame
+/// says otherwise: sRGB as BT.709, or PQ as HDR10.
+fn session_colors(dynamic_range: VideoDynamicRange, full_range: bool) -> (ColorSpec, StreamColor) {
+	let range = range(full_range);
+	match dynamic_range {
+		VideoDynamicRange::Sdr => (ColorSpec::Srgb, StreamColor::Sdr { range }),
+		VideoDynamicRange::Hdr => (ColorSpec::Bt2020Pq, StreamColor::Hdr10 { range }),
+	}
+}
+
+/// What an HDR session's frame holds, and what the stream becomes for it: SDR
+/// frames stay BT.709, HDR frames become BT.2020+PQ.
+fn frame_colors(frame: FrameColorSpace, full_range: bool) -> (ColorSpec, StreamColor) {
+	let range = range(full_range);
+	match frame {
+		FrameColorSpace::Srgb => (ColorSpec::Srgb, StreamColor::Sdr { range }),
+		FrameColorSpace::Bt2020Pq => (ColorSpec::Bt2020Pq, StreamColor::Hdr10 { range }),
+		FrameColorSpace::ScrgbLinear => (ColorSpec::Bt709Linear, StreamColor::Hdr10 { range }),
+	}
+}
+
+/// Whether the encoder currently writes an HDR10 stream.
+fn is_hdr(encoder: &Encoder) -> bool {
+	matches!(encoder.config().color, StreamColor::Hdr10 { .. })
 }
 
 pub(crate) struct VideoPipeline {}
@@ -248,7 +248,7 @@ struct FrameContext {
 	channel_wait: std::time::Duration,
 	import: std::time::Duration,
 	convert: std::time::Duration,
-	/// Time spent in the `encode` submit call.
+	/// Time spent in the `submit` call.
 	submit: std::time::Duration,
 	/// When the submit call returned and the frame was ready for packet consumption.
 	submitted_at: std::time::Instant,
@@ -694,11 +694,10 @@ impl VideoPipelineInner {
 			VideoDynamicRange::Hdr => pixelforge::EncodeBitDepth::Ten,
 		};
 
-		// Select color description for VUI signaling.
-		let color_description = match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription::bt709().with_full_range(ctx.full_range),
-			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
-		};
+		// The stream's colour, and the RGB frames the compositor hands over. The
+		// frames' real format and colour space are only known per frame; the
+		// encoding loop reconfigures the encoder to them as they arrive.
+		let (source, color) = session_colors(ctx.dynamic_range, ctx.full_range);
 
 		// Create encode configuration.
 		let config = match codec {
@@ -709,12 +708,13 @@ impl VideoPipelineInner {
 		.with_encoder_tuning_mode(EncoderTuningMode::LowLatency)
 		.with_pixel_format(pixel_format)
 		.with_bit_depth(bit_depth)
-		.with_color_description(color_description)
-		.with_rate_control(RateControlMode::Cbr)
-		.with_target_bitrate(ctx.bitrate as u32)
+		.with_source(Source::Rgb(RgbSource::new(InputFormat::BGRx, source)))
+		.with_color(color)
+		.with_rate_control(RateControl::Cbr {
+			bitrate: ctx.bitrate as u32,
+		})
 		.with_frame_rate(ctx.fps, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
-		.with_b_frames(0) // No B-frames for low latency
 		.with_max_reference_frames(ctx.max_reference_frames)
 		.with_virtual_buffer_size_ms(1000 / ctx.fps)
 		.with_initial_virtual_buffer_size_ms(0);
@@ -762,7 +762,7 @@ impl VideoPipelineInner {
 		let mut packetizer = Packetizer::new(ctx.encrypt_video, self.keys_rx.clone());
 		packetizer.warm_up(self.config.fec_percentage, ctx.minimum_fec_packets);
 
-		// The encoder is asynchronous: each `encode()` returns a future that
+		// The encoder is asynchronous: each `submit()` returns a future that
 		// resolves with that frame's packet once the GPU finishes. We hand each
 		// future, together with its per-frame context, to a dedicated consumer
 		// thread (in submission order via `frame_ctx_tx`) which awaits it and
@@ -805,23 +805,6 @@ impl VideoPipelineInner {
 		// Rate-limits the drop-to-catch-up warning.
 		let mut last_drop_warn: Option<std::time::Instant> = None;
 
-		// Determine output YUV format based on chroma sampling and dynamic range.
-		let color_range = if ctx.full_range {
-			ColorRange::Full
-		} else {
-			ColorRange::Limited
-		};
-		let output_format = match (ctx.chroma_sampling_type, ctx.dynamic_range) {
-			(VideoChromaSampling::Yuv420, VideoDynamicRange::Sdr) => OutputFormat::NV12,
-			(VideoChromaSampling::Yuv420, VideoDynamicRange::Hdr) => OutputFormat::P010,
-			(VideoChromaSampling::Yuv444, VideoDynamicRange::Sdr) => OutputFormat::YUV444,
-			(VideoChromaSampling::Yuv444, VideoDynamicRange::Hdr) => OutputFormat::YUV444P10,
-		};
-
-		// Converter per input format, plus the source import whose view it caches.
-		let mut color_converters: std::collections::HashMap<u32, (ColorConverter, Option<Arc<CachedImport>>)> =
-			std::collections::HashMap::new();
-
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
 		let mut last_frame_time = std::time::Instant::now();
@@ -851,15 +834,6 @@ impl VideoPipelineInner {
 			enabled: ctx.dynamic_range == VideoDynamicRange::Hdr,
 			metadata: None,
 		};
-
-		// Track the encoder's current VUI color description, initialized
-		// to match what the encoder was created with. When the required
-		// color_desc differs, we call set_color_description() to update
-		// the SPS/sequence header.
-		let mut encoder_color_desc: Option<ColorDescription> = Some(match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => ColorDescription::bt709().with_full_range(ctx.full_range),
-			VideoDynamicRange::Hdr => ColorDescription::bt2020_pq().with_full_range(ctx.full_range),
-		});
 
 		while !stop_session_manager.is_shutdown_triggered() {
 			let mut pending_idr = false;
@@ -939,17 +913,16 @@ impl VideoPipelineInner {
 				Ok(frame) => Some(frame),
 				Err(ferriscope::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
-					// If we have a pending IDR request and have encoded before,
-					// re-encode the encoder's input image (still contains
-					// the last frame's data after color conversion).
+					// If we have a pending IDR request, re-encode the last frame,
+					// which the encoder still holds in its input image.
 					if pending_idr && has_encoded {
 						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
-						match encoder.encode(encoder.input_image()) {
+						match encoder.repeat() {
 							Ok(future) => {
 								let submitted_at = std::time::Instant::now();
-								let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
+								let inject_hdr = is_hdr(&encoder);
 								let frame_context = FrameContext {
 									created_at: now,
 									sequence: None,
@@ -966,6 +939,9 @@ impl VideoPipelineInner {
 								in_flight.fetch_add(1, Ordering::Relaxed);
 								submitted_count += 1;
 								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
+							},
+							Err(PixelForgeError::DeviceLost) => {
+								return Err("Failed to re-encode frame for IDR request: the GPU was lost".to_string());
 							},
 							Err(e) => tracing::warn!("Failed to re-encode frame for IDR request: {e}"),
 						}
@@ -1075,116 +1051,50 @@ impl VideoPipelineInner {
 				let (frame_input_format, import_vk_format) = drm_fourcc_to_input(fourcc);
 
 				// Import the DMA-BUF (reuses cached VkImage for known DMA-BUF fds).
-				// The `Arc` pins the image while the converter caches a view of it.
-				let (source_import, needs_transition) =
-					match importer.import_or_reuse(planes[0].fd, width, height, import_vk_format, planes) {
-						Ok(result) => result,
-						Err(e) => {
-							tracing::warn!("Failed to import DMA-BUF: {e}");
-							continue;
-						},
-					};
-				let source_image = source_import.image();
-
-				// First-time imports are in UNDEFINED layout; the converter
-				// will handle the transition inside its command buffer.
-				// Cached imports were left in GENERAL by the previous convert.
-				let src_layout = if needs_transition {
-					vk::ImageLayout::UNDEFINED
-				} else {
-					vk::ImageLayout::GENERAL
+				// The `Arc` keeps the image alive while the encoder reads it.
+				let import = match importer.import_or_reuse(planes[0].fd, width, height, import_vk_format, planes) {
+					Ok(import) => import,
+					Err(e) => {
+						tracing::warn!("Failed to import DMA-BUF: {e}");
+						continue;
+					},
 				};
 
 				let t2_imported = std::time::Instant::now();
 
-				// Get (or build) a converter for this input format. Cached per
-				// format so switching render paths doesn't rebuild one each frame.
-				let (converter, cached_source) = match color_converters.entry(fourcc) {
-					std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
-					std::collections::hash_map::Entry::Vacant(e) => {
-						// Start from the session's own colour space; an HDR session
-						// re-points the source and target per frame below.
-						let color = match ctx.dynamic_range {
-							VideoDynamicRange::Sdr => ColorSpec::Srgb,
-							VideoDynamicRange::Hdr => ColorSpec::Bt2020Pq,
-						};
-						let config = ColorConverterConfig::new(
-							ctx.width,
-							ctx.height,
-							frame_input_format,
-							output_format,
-							color,
-							color,
-							color_range,
-						);
-						match ColorConverter::new(context.clone(), config) {
-							Ok(conv) => {
-								tracing::debug!("Created color converter for input format {frame_input_format:?}");
-								e.insert((conv, None))
-							},
-							Err(e) => {
-								tracing::warn!("Failed to create color converter: {e}");
-								continue;
-							},
-						}
-					},
+				// Tell the encoder what this frame is, and what the stream says about
+				// it. Both can change between frames (the render path, or HDR content
+				// starting and stopping), and the encoder only does work when they do.
+				// In an HDR session, SDR frames are encoded as BT.709 and HDR frames as
+				// BT.2020+PQ, with dynamic VUI switching in the encoder. scRGB's and
+				// SDR's reference whites are pixelforge's per-source defaults (80 and
+				// 203 nits).
+				let (frame_source, stream_color) = match ctx.dynamic_range {
+					VideoDynamicRange::Sdr => session_colors(ctx.dynamic_range, ctx.full_range),
+					VideoDynamicRange::Hdr => frame_colors(color_space(&frame.info.colour), ctx.full_range),
 				};
-
-				// In HDR mode, select per-frame color space and encoder VUI
-				// based on the frame's actual color space. SDR frames are
-				// encoded as BT.709 and HDR frames as BT.2020+PQ, with
-				// dynamic VUI switching in the encoder.
-				if ctx.dynamic_range == VideoDynamicRange::Hdr {
-					let frame_cs = color_space(&frame.info.colour);
-					// What the frame holds, and what the stream becomes. SDR frames are
-					// encoded as BT.709 and HDR frames as BT.2020+PQ, with dynamic VUI
-					// switching in the encoder. scRGB's and SDR's reference whites are
-					// pixelforge's per-source defaults (80 and 203 nits).
-					let (source, target) = match frame_cs {
-						FrameColorSpace::Srgb => (ColorSpec::Srgb, ColorSpec::Srgb),
-						FrameColorSpace::Bt2020Pq => (ColorSpec::Bt2020Pq, ColorSpec::Bt2020Pq),
-						FrameColorSpace::ScrgbLinear => (ColorSpec::Bt709Linear, ColorSpec::Bt2020Pq),
-					};
-					set_converter_colors(converter, source, target)
-						.map_err(|e| format!("Failed to update color converter: {e}"))?;
-					converter.set_range(color_range);
-
-					// The converter derives the stream description from its target and
-					// range, so the encoder is told exactly what the shader writes.
-					let color_desc = converter.color_description();
-					if encoder_color_desc != Some(color_desc) {
-						tracing::debug!(
-							"Switching encoder color description to {color_desc:?} (frame_cs: {frame_cs:?})"
-						);
-						encoder
-							.set_color_description(color_desc)
-							.map_err(|e| format!("Failed to update encoder color description: {e}"))?;
-						encoder_color_desc = Some(color_desc);
-					}
+				let was_hdr = is_hdr(&encoder);
+				encoder
+					.reconfigure(
+						Source::Rgb(RgbSource::new(frame_input_format, frame_source)),
+						stream_color,
+					)
+					.map_err(|e| format!("Failed to reconfigure the encoder for the frame: {e}"))?;
+				if is_hdr(&encoder) != was_hdr {
+					tracing::debug!(
+						"Switched encoder to {stream_color:?} for a {frame_input_format:?} {frame_source:?} frame (conversion \
+						 {:?})",
+						encoder.conversion()
+					);
 				}
 
-				// Retain the source image; the converter caches a view of it.
-				*cached_source = Some(Arc::clone(&source_import));
-
-				// Convert to YUV.
-				if let Err(e) = converter.convert(source_image, src_layout, encoder.input_image()) {
-					if is_device_lost(&e) {
-						return Err(format!("GPU color conversion failed: {e}"));
-					}
-					tracing::warn!("GPU color conversion failed: {e}");
-					continue;
-				}
-
-				// The DMA-BUF content has been read into the encoder's input
-				// image: dropping the frame returns its buffer to the compositor.
 				let frame_hdr_metadata = hdr_metadata(&frame.info.colour);
-				drop(frame);
 
 				// Forward HDR mode state changes to the control stream.
 				// In HDR sessions, `enabled` reflects whether the current
 				// frame is encoded as BT.2020+PQ (true) or BT.709 (false).
 				if ctx.dynamic_range == VideoDynamicRange::Hdr {
-					let hdr_enabled = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
+					let hdr_enabled = is_hdr(&encoder);
 					let new_state = HdrModeState {
 						enabled: hdr_enabled,
 						metadata: frame_hdr_metadata,
@@ -1207,12 +1117,14 @@ impl VideoPipelineInner {
 					}
 				}
 
+				// The colour conversion runs on the GPU as part of the submit below;
+				// `convert` covers telling the encoder what the frame is.
 				let t3_converted = std::time::Instant::now();
 
-				// Encode the converted image. This is asynchronous: it submits the
-				// frame without blocking; the encoded packet is produced by the
-				// readback thread and handled by the consumer thread.
-				let encode_result = encoder.encode(encoder.input_image());
+				// Encode the frame. This is asynchronous: it submits the conversion
+				// and the encode without blocking; the encoded packet is produced by
+				// the readback thread and handled by the consumer thread.
+				let encode_result = encoder.submit(Frame::image(import.source()));
 
 				let t4_encoded = std::time::Instant::now();
 
@@ -1221,7 +1133,7 @@ impl VideoPipelineInner {
 						// Hand this frame's context plus its packet future to the
 						// consumer thread, which awaits the future, injects HDR SEI if
 						// needed, packetizes and sends it, and records stats.
-						let inject_hdr = encoder_color_desc.is_some_and(|desc| desc.is_hdr());
+						let inject_hdr = is_hdr(&encoder);
 						let frame_context = FrameContext {
 							created_at: captured_at,
 							sequence: Some(sequence),
@@ -1237,20 +1149,29 @@ impl VideoPipelineInner {
 						// it or the consumer drops it.
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
-						if frame_ctx_tx
+						let consumer_gone = frame_ctx_tx
 							.blocking_send(ConsumerMessage::Frame(frame_context, future))
-							.is_err()
-						{
+							.is_err();
+
+						// The encoder reads the frame after `submit` returns. Once it
+						// has, dropping the frame returns its buffer to the compositor.
+						// The encode itself is already queued, so this wait does not
+						// delay the frame; it is the colour conversion, well under a
+						// frame interval.
+						if let Err(e) = import.source().wait_released() {
+							tracing::warn!("Failed to wait for the encoder to read a frame: {e}");
+						}
+						drop(frame);
+
+						if consumer_gone {
 							tracing::debug!("Packet consumer gone; stopping encoding loop.");
 							break;
 						}
 					},
-					Err(e) => {
-						if is_device_lost(&e) {
-							return Err(format!("Failed to encode frame: {e}"));
-						}
-						tracing::warn!("Failed to encode frame: {e}");
+					Err(PixelForgeError::DeviceLost) => {
+						return Err("Failed to encode frame: the GPU was lost".to_string());
 					},
+					Err(e) => tracing::warn!("Failed to encode frame: {e}"),
 				}
 
 				if !pending_idr {
@@ -1279,9 +1200,9 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
-	use super::{drm_fourcc_to_input, is_device_lost};
+	use super::drm_fourcc_to_input;
 	use ash::vk;
-	use pixelforge::{InputFormat, PixelForgeError};
+	use pixelforge::InputFormat;
 
 	// DRM fourccs — kept in the test module to document the byte ordering
 	// explicitly and guard against accidental typos in the production match.
@@ -1333,25 +1254,5 @@ mod tests {
 		let (fmt, vk) = drm_fourcc_to_input(0xDEADBEEF);
 		assert_eq!(fmt, InputFormat::BGRx);
 		assert_eq!(vk, vk::Format::B8G8R8A8_UNORM);
-	}
-
-	#[test]
-	fn device_lost_is_detected_in_both_error_shapes() {
-		// Structured variant.
-		assert!(is_device_lost(&PixelForgeError::Vulkan(vk::Result::ERROR_DEVICE_LOST)));
-		// String variant: pixelforge wraps the vk::Result display text, e.g.
-		// CommandBuffer("The logical device has been lost. See <...>") —
-		// the shape observed when a stale DMA-BUF import faults the GPU.
-		assert!(is_device_lost(&PixelForgeError::CommandBuffer(
-			vk::Result::ERROR_DEVICE_LOST.to_string()
-		)));
-	}
-
-	#[test]
-	fn recoverable_errors_are_not_device_lost() {
-		assert!(!is_device_lost(&PixelForgeError::Vulkan(vk::Result::TIMEOUT)));
-		assert!(!is_device_lost(&PixelForgeError::CommandBuffer(
-			"submit failed".to_string()
-		)));
 	}
 }
