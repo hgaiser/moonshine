@@ -17,8 +17,7 @@ mod pipeline;
 mod shard_batch;
 use gso_socket::UdpGsoSocket;
 pub(crate) use pipeline::KcmpProbe;
-use pipeline::VideoPipeline;
-use shard_batch::ShardBatch;
+use pipeline::{MAX_FRAMES_IN_FLIGHT, PacketBatch, VideoPipeline};
 
 /// Configuration for the video stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,6 +51,22 @@ pub struct VideoStreamConfig {
 	/// and 8-byte UDP headers and the 16-byte stream overhead).
 	#[serde(default)]
 	pub max_packet_size: usize,
+
+	/// Size of the video socket's send buffer, in bytes.
+	///
+	/// Data in the send buffer has already left the pipeline, so it isn't
+	/// covered by its frame dropping: when the host's own uplink is slower
+	/// than the bitrate, up to this much video can queue in the kernel. The
+	/// buffer only fills when that uplink is the bottleneck.
+	///
+	/// `0` sizes it to fit a keyframe burst (about eight average frames at the
+	/// stream's bitrate and frame rate), keeping a larger host default. A
+	/// non-zero value sets the size exactly, even below the host default: a
+	/// smaller buffer lowers the worst-case queueing, at the cost of keyframes
+	/// waiting for the socket to drain. The kernel caps it at
+	/// `net.core.wmem_max`.
+	#[serde(default)]
+	pub send_buffer_size: usize,
 }
 
 /// Smallest accepted packet size cap. Lower values would leave almost no room
@@ -87,8 +102,20 @@ impl Default for VideoStreamConfig {
 			encrypt: false,
 			log_frame_spikes: false,
 			max_packet_size: 0,
+			send_buffer_size: 0,
 		}
 	}
+}
+
+/// Average frames a keyframe burst spans, FEC included, for sizing the
+/// socket's send buffer when `send_buffer_size` is automatic.
+const KEYFRAME_BURST_FRAMES: usize = 8;
+
+/// Send buffer size that fits a keyframe burst at `bitrate` (bits per second)
+/// and `fps`.
+fn keyframe_burst_bytes(bitrate: usize, fps: u32) -> usize {
+	let fps = usize::try_from(fps.max(1)).unwrap_or(usize::MAX);
+	bitrate / 8 / fps * KEYFRAME_BURST_FRAMES
 }
 
 /// Per-frame encoding statistics emitted by the video pipeline.
@@ -333,6 +360,14 @@ impl VideoStream {
 			let _ = socket.set_tos_v4(160);
 		}
 
+		// Room for a keyframe burst, which is several times the average frame,
+		// unless configured otherwise.
+		if config.send_buffer_size == 0 {
+			socket.grow_send_buffer(keyframe_burst_bytes(context.bitrate, context.fps));
+		} else {
+			socket.set_send_buffer(config.send_buffer_size);
+		}
+
 		// Gate for pipeline + packet handler.
 		let start = StartSignal::new();
 
@@ -347,8 +382,9 @@ impl VideoStream {
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
 		let resume_pending = Arc::new(AtomicBool::new(false));
 
-		// Packet channel.
-		let (packet_tx, packet_rx) = mpsc::channel::<(u32, ShardBatch)>(128);
+		// Packet channel. Each queued batch holds its frame's in-flight slot, so the
+		// channel never holds more than the in-flight limit.
+		let (packet_tx, packet_rx) = mpsc::channel::<PacketBatch>(MAX_FRAMES_IN_FLIGHT);
 
 		// Spawn packet handler — gated behind start.
 		spawn_handle_video_packets(
@@ -388,7 +424,7 @@ impl VideoStream {
 }
 
 fn spawn_handle_video_packets(
-	mut packet_rx: mpsc::Receiver<(u32, ShardBatch)>,
+	mut packet_rx: mpsc::Receiver<PacketBatch>,
 	socket: UdpGsoSocket,
 	mut start: StartWaiter,
 	reset_tx: broadcast::Sender<u32>,
@@ -415,18 +451,22 @@ fn spawn_handle_video_packets(
 			tokio::select! {
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
-						Ok(Some((epoch, batch))) => {
+						Ok(Some(batch)) => {
+							// Taking the batch frees its frame's in-flight slot, so a slow
+							// send doesn't hold back encoding; a stall still fills the
+							// slots with the batches queued behind it.
+							let (epoch, shards) = batch.into_parts();
 							if let Some(addr) = client_address {
 								// Frames from before a resume's reset would reach the new client
 								// with old frame numbers, making it drop the reset frames as stale.
-								if epoch < reset_epoch || batch.shard_count() == 0 {
+								if epoch < reset_epoch || shards.shard_count() == 0 {
 									continue;
 								}
 
 								// Sends are wrapped in wrap_cancel so a socket that
 								// stops draining cannot block session shutdown.
 								match stop_session_manager
-									.wrap_cancel(socket.send_batch(&batch, addr))
+									.wrap_cancel(socket.send_batch(&shards, addr))
 									.await
 								{
 									Ok(failed_chunks) => {
@@ -507,6 +547,55 @@ mod tests {
 		tokio::time::timeout(std::time::Duration::from_secs(1), packet_tx.closed())
 			.await
 			.expect("packet handler kept its socket after shutdown");
+	}
+
+	#[tokio::test]
+	async fn stalled_sender_fills_in_flight_slots() {
+		use std::sync::atomic::AtomicUsize;
+
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let (packet_tx, packet_rx) = mpsc::channel(MAX_FRAMES_IN_FLIGHT);
+		let (reset_tx, _) = broadcast::channel(1);
+		let start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		// Until started, the sender doesn't drain the channel, like a stalled socket.
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			start.waiter(),
+			reset_tx,
+			Arc::new(AtomicBool::new(false)),
+			stop.clone(),
+		);
+
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		for _ in 0..MAX_FRAMES_IN_FLIGHT {
+			packet_tx.try_send(PacketBatch::holding_slot(&in_flight)).unwrap();
+		}
+		// Queued frames keep their slots, so the encoding thread's gate closes and
+		// it drops captures instead of the queue growing.
+		assert_eq!(in_flight.load(Ordering::Relaxed), MAX_FRAMES_IN_FLIGHT);
+		assert_eq!(packet_tx.capacity(), 0);
+
+		// Once the sender drains the queue, the slots free up.
+		start.trigger();
+		tokio::time::timeout(std::time::Duration::from_secs(1), async {
+			while in_flight.load(Ordering::Relaxed) > 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("sender kept in-flight slots after taking their batches");
+	}
+
+	#[test]
+	fn keyframe_burst_scales_with_frame_size() {
+		// 80 Mbps at 60 fps: ~166 KB average frames.
+		assert_eq!(keyframe_burst_bytes(80_000_000, 60), 166_666 * KEYFRAME_BURST_FRAMES);
+		// Doubling the frame rate halves the frames, and the burst.
+		assert_eq!(keyframe_burst_bytes(80_000_000, 120), 83_333 * KEYFRAME_BURST_FRAMES);
+		// A zero frame rate doesn't divide by zero.
+		assert_eq!(keyframe_burst_bytes(8_000, 0), 1_000 * KEYFRAME_BURST_FRAMES);
 	}
 
 	fn config(max_packet_size: usize) -> VideoStreamConfig {

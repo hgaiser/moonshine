@@ -19,6 +19,12 @@ fn gso_segments_per_send(max_gso_segments: usize, shard_size: usize) -> usize {
 		.max(1)
 }
 
+/// The usable size of a send buffer whose `SO_SNDBUF` reads as `reported`:
+/// the kernel reports double, keeping the other half for bookkeeping.
+fn usable_send_buffer(reported: usize) -> usize {
+	reported / 2
+}
+
 /// UDP socket for the video stream, with Generic Segmentation Offload.
 ///
 /// Wraps a `tokio::net::UdpSocket` and quinn-udp's `UdpSocketState` so shard
@@ -55,6 +61,49 @@ impl UdpGsoSocket {
 	/// Apply QoS marking (IPv4 ToS) to sent packets.
 	pub fn set_tos_v4(&self, tos: u32) -> std::io::Result<()> {
 		self.socket.set_tos_v4(tos)
+	}
+
+	/// Grow the send buffer to `size` bytes if it is smaller, so a frame burst
+	/// fits without the sender waiting for the socket to drain.
+	///
+	/// Best effort: a buffer the host already made larger is kept, and the
+	/// kernel caps the request at `net.core.wmem_max`. Logs what it grants.
+	pub fn grow_send_buffer(&self, size: usize) {
+		let socket = socket2::SockRef::from(&self.socket);
+		let current = match socket.send_buffer_size() {
+			Ok(reported) => usable_send_buffer(reported),
+			Err(e) => {
+				tracing::warn!("Failed to read video socket send buffer size: {e}");
+				return;
+			},
+		};
+		if current >= size {
+			tracing::debug!("Video socket send buffer: {} KiB", current / 1024);
+			return;
+		}
+		self.set_send_buffer(size);
+	}
+
+	/// Set the send buffer to `size` bytes, even below the host's default.
+	///
+	/// Best effort: the kernel caps the request at `net.core.wmem_max`. Logs what
+	/// it grants.
+	pub fn set_send_buffer(&self, size: usize) {
+		let socket = socket2::SockRef::from(&self.socket);
+		if let Err(e) = socket.set_send_buffer_size(size) {
+			tracing::warn!("Failed to set video socket send buffer size: {e}");
+			return;
+		}
+		match socket.send_buffer_size().map(usable_send_buffer) {
+			Ok(granted) if granted < size => tracing::info!(
+				"Video socket send buffer capped at {} KiB (requested {} KiB); raise net.core.wmem_max so \
+				 large frames don't wait for the socket to drain.",
+				granted / 1024,
+				size / 1024
+			),
+			Ok(granted) => tracing::debug!("Video socket send buffer: {} KiB", granted / 1024),
+			Err(e) => tracing::warn!("Failed to read video socket send buffer size: {e}"),
+		}
 	}
 
 	/// Receive a datagram (e.g. the client's `PING`).
@@ -133,6 +182,32 @@ impl UdpGsoSocket {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn usable_send_buffer_size(socket: &UdpGsoSocket) -> usize {
+		usable_send_buffer(socket2::SockRef::from(&socket.socket).send_buffer_size().unwrap())
+	}
+
+	#[tokio::test]
+	async fn grow_send_buffer_never_shrinks() {
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let initial = usable_send_buffer_size(&socket);
+
+		socket.grow_send_buffer(initial / 2);
+		assert_eq!(usable_send_buffer_size(&socket), initial);
+
+		// The kernel may cap the growth, but never below what we had.
+		socket.grow_send_buffer(initial * 4);
+		assert!(usable_send_buffer_size(&socket) >= initial);
+	}
+
+	#[tokio::test]
+	async fn set_send_buffer_can_shrink() {
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let initial = usable_send_buffer_size(&socket);
+
+		socket.set_send_buffer(initial / 4);
+		assert!(usable_send_buffer_size(&socket) < initial);
+	}
 
 	#[test]
 	fn gso_segment_count_cap_binds() {
