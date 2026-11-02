@@ -111,6 +111,34 @@ fn is_device_lost(e: &PixelForgeError) -> bool {
 	}
 }
 
+/// What the encoding loop does after an encode fails.
+#[derive(Debug, PartialEq, Eq)]
+enum EncodeFailure {
+	/// End the session: the GPU is gone.
+	Fatal,
+	/// Rebuild the encoder, skip the frame, and only then return its buffer.
+	Rebuild,
+	/// Skip the frame and keep the encoder.
+	Skip,
+}
+
+/// After `encode` or `encode_after` fails. Losing the device ends the session.
+/// When the encoder reads the frame itself (RGB input), the error may have come
+/// after its copy of the frame was submitted, and its upload state can't be
+/// trusted with the next frame: rebuilding it waits for its queues (dropping an
+/// encoder idles them), so the frame's buffer goes back to the compositor only
+/// once the GPU is done with it. On the converter path the conversion already
+/// finished with the buffer.
+fn on_encode_failure(device_lost: bool, encoder_reads_frame: bool) -> EncodeFailure {
+	if device_lost {
+		EncodeFailure::Fatal
+	} else if encoder_reads_frame {
+		EncodeFailure::Rebuild
+	} else {
+		EncodeFailure::Skip
+	}
+}
+
 /// The YUV format and color the encoder converts a frame to when it takes the
 /// frame as RGB, or `None` to run the color converter first. The encoder applies
 /// only the YUV matrix, so only 4:2:0 streams qualify, and in an HDR stream only
@@ -1240,6 +1268,29 @@ impl VideoPipelineInner {
 				} else {
 					encoder.encode(encoder.input_image())
 				};
+				if let Err(e) = &encode_result {
+					match on_encode_failure(is_device_lost(e), unread_frame.is_some()) {
+						EncodeFailure::Fatal => {
+							let message = format!("Failed to encode frame: {e}");
+							// The encoder waits for (or abandons) its GPU work as it's dropped.
+							drop(encoder);
+							drop(unread_frame);
+							return Err(message);
+						},
+						EncodeFailure::Rebuild => {
+							tracing::warn!("Failed to encode frame, rebuilding the encoder: {e}");
+							// The old encoder is dropped, idling its queues, when it's replaced.
+							(encoder, rgb_input) = self.new_encoder(&context, rgb_input)?;
+							encoder_color_desc = Some(self.color_description());
+							frame_number_base -= submitted_count as i64;
+							submitted_count = 0;
+							has_encoded = false;
+							drop(unread_frame);
+							continue;
+						},
+						EncodeFailure::Skip => {},
+					}
+				}
 				drop(unread_frame);
 
 				let t4_encoded = std::time::Instant::now();
@@ -1272,12 +1323,7 @@ impl VideoPipelineInner {
 							break;
 						}
 					},
-					Err(e) => {
-						if is_device_lost(&e) {
-							return Err(format!("Failed to encode frame: {e}"));
-						}
-						tracing::warn!("Failed to encode frame: {e}");
-					},
+					Err(e) => tracing::warn!("Failed to encode frame: {e}"),
 				}
 
 				if !pending_idr {
@@ -1306,7 +1352,10 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
-	use super::{drm_fourcc_to_input, invalidation_display_order, is_device_lost, rgb_encode_target};
+	use super::{
+		EncodeFailure, drm_fourcc_to_input, invalidation_display_order, is_device_lost, on_encode_failure,
+		rgb_encode_target,
+	};
 	use crate::session::compositor::frame::FrameColorSpace;
 	use crate::session::stream::video::{VideoChromaSampling, VideoDynamicRange};
 	use ash::vk;
@@ -1468,5 +1517,16 @@ mod tests {
 		// Frames the old encoder produced clamp to 0, which forces an IDR.
 		assert_eq!(invalidation_display_order(base, 1), 0);
 		assert_eq!(invalidation_display_order(base, 300), 0);
+	}
+
+	#[test]
+	fn failed_encodes() {
+		// Losing the device ends the session, whichever path the frame took.
+		assert_eq!(on_encode_failure(true, true), EncodeFailure::Fatal);
+		assert_eq!(on_encode_failure(true, false), EncodeFailure::Fatal);
+		// The encoder may still be reading an RGB frame: rebuild before returning it.
+		assert_eq!(on_encode_failure(false, true), EncodeFailure::Rebuild);
+		// The converter already finished with the frame.
+		assert_eq!(on_encode_failure(false, false), EncodeFailure::Skip);
 	}
 }
