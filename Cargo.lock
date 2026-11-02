@@ -2757,6 +2757,7 @@ dependencies = [
 [[package]]
 name = "pixelforge"
 version = "0.10.0"
+source = "git+https://github.com/hgaiser/pixelforge?branch=feat%2Fsource-description#2bd685e1c366b5c79beca14acfd6bf67e947c35a"
 dependencies = [
  "ash 0.38.0+1.4.352",
  "futures-channel",
