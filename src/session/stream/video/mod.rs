@@ -120,9 +120,13 @@ fn keyframe_burst_bytes(bitrate: usize, fps: u32) -> usize {
 
 /// Per-frame encoding statistics emitted by the video pipeline.
 ///
-/// Sent via `broadcast` channel, receivable through `SessionManager::bench_stats_receiver()`.
+/// Sent in `StreamEvent::Frame`.
 #[derive(Clone, Debug)]
 pub struct FrameStats {
+	/// The frame's number on the wire (its frame index), which the client sees too.
+	pub frame_number: u32,
+	/// When the frame was captured, by the wall clock.
+	pub captured_at: std::time::SystemTime,
 	/// Time the frame spent waiting in the compositor's output channel.
 	pub channel_wait: std::time::Duration,
 	/// Time spent importing the DMA-BUF into Vulkan.
@@ -145,9 +149,57 @@ pub struct FrameStats {
 	pub encoded_bytes: usize,
 	/// Whether this frame is a key (IDR) frame.
 	pub is_key_frame: bool,
+	/// The color space of the captured content; `None` for an IDR re-encode, which captured nothing.
+	pub(crate) content: Option<crate::session::compositor::frame::FrameColorSpace>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// A video stream's start, frames and end, in that order.
+///
+/// Sent via `broadcast` channel, receivable through `SessionManager::bench_stats_receiver()`.
+#[derive(Clone, Debug)]
+pub enum StreamEvent {
+	/// The encoder for a new stream is ready.
+	Started(StreamInfo),
+	/// A frame was encoded and sent.
+	Frame(FrameStats),
+	/// The stream ended, after its last frame.
+	Stopped,
+}
+
+/// The video stream as negotiated with the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct StreamInfo {
+	/// Width in pixels.
+	pub width: u32,
+	/// Height in pixels.
+	pub height: u32,
+	/// Frames per second.
+	pub fps: u32,
+	/// Target bitrate in bits per second.
+	pub bitrate: usize,
+	#[serde(rename = "codec")]
+	pub video_format: VideoFormat,
+	pub dynamic_range: VideoDynamicRange,
+	#[serde(rename = "chroma")]
+	pub chroma_sampling_type: VideoChromaSampling,
+}
+
+impl From<&VideoStreamContext> for StreamInfo {
+	fn from(context: &VideoStreamContext) -> Self {
+		Self {
+			width: context.width,
+			height: context.height,
+			fps: context.fps,
+			bitrate: context.bitrate,
+			video_format: context.video_format,
+			dynamic_range: context.dynamic_range,
+			chroma_sampling_type: context.chroma_sampling_type,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VideoFormat {
 	#[default]
 	H264,
@@ -168,7 +220,8 @@ impl TryFrom<u32> for VideoFormat {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VideoDynamicRange {
 	#[default]
 	Sdr,
@@ -187,7 +240,8 @@ impl TryFrom<u32> for VideoDynamicRange {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VideoChromaSampling {
 	#[default]
 	Yuv420,
@@ -309,7 +363,7 @@ pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
 	frames: CompositorFrames,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
-	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
 }
 
 impl VideoStream {
@@ -319,7 +373,7 @@ impl VideoStream {
 		frames: CompositorFrames,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 

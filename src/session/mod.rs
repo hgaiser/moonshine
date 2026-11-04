@@ -11,7 +11,7 @@ use crate::session::stream::audio::AudioStream;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStream;
 use crate::session::stream::control::ControlStreamContext;
-use crate::session::stream::video::FrameStats;
+use crate::session::stream::video::StreamEvent;
 use crate::session::stream::video::VideoStream;
 use crate::session::stream::video::VideoStreamContext;
 use crate::session::stream::video::VideoStreamHandle;
@@ -149,7 +149,7 @@ impl InitializedSession {
 		address: String,
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
 	) -> Result<Self, ()> {
 		// Create HDR metadata watch channel.
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));

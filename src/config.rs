@@ -8,6 +8,7 @@ pub use crate::session::application::ApplicationConfig;
 use crate::session::compositor::CompositorConfig;
 use crate::session::stream::StreamConfig;
 pub use crate::session::stream::control::input::gamepad::GamepadConfig;
+pub use crate::stats_socket::StatsConfig;
 use crate::webserver::WebserverConfig;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -47,6 +48,10 @@ pub struct Config {
 	/// `false` to disable.
 	#[serde(default = "default_inhibit_sleep")]
 	pub inhibit_sleep: bool,
+
+	/// Statistics for monitoring and benchmark tools.
+	#[serde(default, skip_serializing_if = "StatsConfig::is_default")]
+	pub stats: StatsConfig,
 }
 
 fn default_inhibit_sleep() -> bool {
@@ -101,6 +106,13 @@ impl Config {
 			.map_err(|e| tracing::warn!("Failed to expand private key path: {e}"))?;
 		self.webserver.private_key = private_key_path.to_string().into();
 
+		if let Some(socket) = &self.stats.socket {
+			let path = shellexpand::full(&socket.to_string_lossy())
+				.map_err(|e| tracing::warn!("Failed to expand statistics socket path: {e}"))?
+				.to_string();
+			self.stats.socket = Some(path.into());
+		}
+
 		Ok(())
 	}
 }
@@ -136,6 +148,7 @@ impl Default for Config {
 			})],
 			compositor: CompositorConfig::default(),
 			inhibit_sleep: true,
+			stats: StatsConfig::default(),
 		}
 	}
 }
