@@ -15,12 +15,12 @@ use moonshine::session::stream::audio::AudioConfig;
 use moonshine::session::stream::audio::AudioStreamConfig;
 use moonshine::session::stream::audio::AudioStreamContext;
 use moonshine::session::stream::control::ControlStreamConfig;
-use moonshine::session::stream::video::FrameStats;
 use moonshine::session::stream::video::VideoChromaSampling;
 use moonshine::session::stream::video::VideoDynamicRange;
 use moonshine::session::stream::video::VideoFormat;
 use moonshine::session::stream::video::VideoStreamConfig;
 use moonshine::session::stream::video::VideoStreamContext;
+use moonshine::session::stream::video::{FrameStats, StreamEvent};
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -694,7 +694,9 @@ async fn run_benchmark(
 			biased;
 			result = stats_rx.recv() => {
 				match result {
-					Ok(stats) => {
+					// The stream's start and end are clear from the session itself.
+					Ok(StreamEvent::Started(_) | StreamEvent::Stopped) => {},
+					Ok(StreamEvent::Frame(stats)) => {
 						if Instant::now() >= warmup_deadline {
 							if args.verbose {
 								tracing::info!(

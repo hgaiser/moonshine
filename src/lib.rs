@@ -10,6 +10,7 @@ pub mod healthcheck;
 pub mod rtsp;
 pub mod session;
 pub(crate) mod state;
+pub mod stats_socket;
 pub mod tls;
 pub mod webserver;
 

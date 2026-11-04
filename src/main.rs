@@ -211,6 +211,9 @@ impl Moonshine {
 			shutdown.clone(),
 		)?;
 		let client_manager = ClientManager::new(cert.clone(), pkey.clone())?;
+		if let Some(path) = &config.stats.socket {
+			moonshine::stats_socket::spawn(path.clone(), &session_manager, shutdown.clone())?;
+		}
 
 		Ok(Self {
 			_rtsp_server: RtspServer::new(

@@ -4,7 +4,6 @@ use async_shutdown::ShutdownManager;
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::ShutdownReason;
-use crate::session::FrameStats;
 use crate::session::InitializedSession;
 use crate::session::SessionContext;
 use crate::session::SessionKeyData;
@@ -16,6 +15,7 @@ use crate::session::stream::StartSignal;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
+use crate::session::stream::video::StreamEvent;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 
@@ -85,7 +85,7 @@ struct SessionManagerInner {
 	audio_stream_context: Option<AudioStreamContext>,
 
 	/// Broadcast sender for per-frame encoding statistics.
-	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
 
 	/// Watchdog task for monitoring unexpected session shutdowns.
 	stop_watcher: Option<tokio::task::JoinHandle<()>>,
@@ -144,7 +144,7 @@ impl Drop for SessionManagerInner {
 #[derive(Clone)]
 pub struct SessionManager {
 	inner: Arc<Mutex<SessionManagerInner>>,
-	stats_tx: broadcast::Sender<FrameStats>,
+	stats_tx: broadcast::Sender<StreamEvent>,
 }
 
 impl SessionManager {
@@ -192,11 +192,12 @@ impl SessionManager {
 		Ok(Self { inner, stats_tx })
 	}
 
-	/// Returns a receiver for per-frame encoding statistics.
+	/// Returns a receiver for video statistics: each stream's start with its parameters, every
+	/// frame's timings, and the stream's end.
 	///
 	/// Call **before** `initialize_session()` to receive stats from the start.
 	/// Multiple receivers can be created — each receives a copy of every message.
-	pub fn bench_stats_receiver(&self) -> tokio::sync::broadcast::Receiver<FrameStats> {
+	pub fn bench_stats_receiver(&self) -> tokio::sync::broadcast::Receiver<StreamEvent> {
 		self.stats_tx.subscribe()
 	}
 
