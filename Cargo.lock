@@ -2391,6 +2391,8 @@ dependencies = [
  "async-shutdown",
  "clap",
  "moonshine",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",

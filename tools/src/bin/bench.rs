@@ -24,6 +24,12 @@ use moonshine::session::stream::video::VideoStreamContext;
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+	Text,
+	Json,
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "moonshine-bench", about = "Benchmark Moonshine's encoding pipeline")]
 struct Args {
@@ -65,6 +71,10 @@ struct Args {
 	/// Print per-frame stats to stderr instead of periodic summary.
 	#[arg(long)]
 	verbose: bool,
+
+	/// Emit one final machine-readable JSON object on stdout (logs remain on stderr).
+	#[arg(long, value_enum, default_value = "text")]
+	output: OutputFormat,
 }
 
 fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
@@ -107,7 +117,7 @@ fn percentiles(samples: &[u64]) -> (u64, u64, u64) {
 	)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 struct LatencyDistribution {
 	avg_us: f64,
 	min_us: u64,
@@ -150,7 +160,7 @@ impl LatencyDistribution {
 	}
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 struct StatsSummary {
 	count: u64,
 	fps: f64,
@@ -424,6 +434,49 @@ impl StatsAccumulator {
 	}
 }
 
+
+fn single_report_json(report: &BenchmarkReport) -> serde_json::Value {
+	let status = if report.interrupted {
+		"interrupted"
+	} else if report.summary.is_some() {
+		"ok"
+	} else {
+		"no_frames"
+	};
+	serde_json::json!({
+		"mode": "single",
+		"status": status,
+		"resolution": report.resolution,
+		"target_fps": report.target_fps,
+		"codec": report.codec,
+		"summary": report.summary,
+	})
+}
+
+fn matrix_report_json(reports: &[MatrixReport], interrupted: bool) -> serde_json::Value {
+	let runs: Vec<_> = reports
+		.iter()
+		.map(|report| {
+			let (status, summary, error): (&str, Option<&StatsSummary>, Option<&str>) = match &report.status {
+				MatrixStatus::Ok(Some(summary)) => ("ok", Some(summary), None),
+				MatrixStatus::Ok(None) => ("no_frames", None, None),
+				MatrixStatus::Failed(error) => ("failed", None, Some(error.as_str())),
+				MatrixStatus::Interrupted(summary) => ("interrupted", summary.as_ref(), None),
+			};
+			serde_json::json!({
+				"status": status,
+				"resolution_label": report.resolution_label,
+				"resolution": report.resolution,
+				"target_fps": report.target_fps,
+				"codec": report.codec,
+				"summary": summary,
+				"error": error,
+			})
+		})
+		.collect();
+	serde_json::json!({ "mode": "matrix", "interrupted": interrupted, "runs": runs })
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
 	tracing_subscriber::registry()
@@ -446,7 +499,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-	run_benchmark(args, "", &args.resolution, args.fps, &args.codec, args.duration).await?;
+	let report = run_benchmark(args, "", &args.resolution, args.fps, &args.codec, args.duration).await?;
+	if args.output == OutputFormat::Json {
+		println!("{}", serde_json::to_string(&single_report_json(&report))?);
+	}
 	Ok(())
 }
 
@@ -526,7 +582,11 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 		}
 	}
 
-	print_matrix_summary(&reports);
+	if args.output == OutputFormat::Json {
+		println!("{}", serde_json::to_string(&matrix_report_json(&reports, interrupted))?);
+	} else {
+		print_matrix_summary(&reports);
+	}
 
 	if interrupted {
 		return Err(boxed_error("Matrix benchmark interrupted"));
@@ -995,5 +1055,70 @@ mod timing_tests {
 		assert_eq!(gpu.avg_us, 1400.0);
 		let ready = summary.bitstream_ready.expect("one bitstream timing sample");
 		assert_eq!(ready.p50_us, 2700);
+	}
+}
+
+#[cfg(test)]
+mod json_output_tests {
+	use super::{BenchmarkReport, MatrixReport, MatrixStatus, StatsAccumulator, single_report_json, matrix_report_json};
+
+	#[test]
+	fn empty_session_is_explicit_in_json() {
+		let report = BenchmarkReport {
+			resolution_label: "",
+			resolution: "1920x1080".to_string(),
+			target_fps: 60,
+			codec: "h264".to_string(),
+			summary: None,
+			interrupted: false,
+		};
+		let value = single_report_json(&report);
+		assert_eq!(value["mode"], "single");
+		assert_eq!(value["status"], "no_frames");
+		assert!(value["summary"].is_null());
+	}
+
+	#[test]
+	fn absent_gpu_timing_is_null_not_zero() {
+		let mut accumulator = StatsAccumulator::new();
+		// No recorded frames means no GPU timing samples and no report summary.
+		assert!(accumulator.summary().is_none());
+		let report = BenchmarkReport {
+			resolution_label: "",
+			resolution: "1920x1080".to_string(),
+			target_fps: 60,
+			codec: "h264".to_string(),
+			summary: accumulator.summary(),
+			interrupted: true,
+		};
+		let value = single_report_json(&report);
+		assert_eq!(value["status"], "interrupted");
+		assert!(value["summary"].is_null());
+	}
+
+	#[test]
+	fn matrix_json_preserves_per_case_failures() {
+		let reports = [
+			MatrixReport {
+				resolution_label: "1080p",
+				resolution: "1920x1080".to_string(),
+				target_fps: 60,
+				codec: "hevc".to_string(),
+				status: MatrixStatus::Failed("encoder unavailable".to_string()),
+			},
+			MatrixReport {
+				resolution_label: "4k",
+				resolution: "3840x2160".to_string(),
+				target_fps: 120,
+				codec: "av1".to_string(),
+				status: MatrixStatus::Ok(None),
+			},
+		];
+		let value = matrix_report_json(&reports, false);
+		assert_eq!(value["mode"], "matrix");
+		assert_eq!(value["runs"][0]["status"], "failed");
+		assert_eq!(value["runs"][0]["error"], "encoder unavailable");
+		assert_eq!(value["runs"][1]["status"], "no_frames");
+		assert!(value["runs"][1]["summary"].is_null());
 	}
 }

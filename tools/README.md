@@ -35,6 +35,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
+| `--output <text|json>` | `text` | Write one final JSON result to stdout; benchmark logs stay on stderr |
 
 ### Examples
 
@@ -105,3 +106,24 @@ With `--matrix`, each combination prints the same per-run summaries and the comm
 5. Collects `FrameStats` from each encoded frame via a broadcast channel
 6. After the warmup period, accumulates and reports statistics
 7. Stops after the specified duration or on Ctrl+C
+
+### JSON output
+
+Use `--output json` when another tool needs frame counts, FPS, bitrate and
+latency distributions without parsing log text:
+
+```bash
+moonshine-bench --duration 10 --output json /usr/bin/vkcube > result.json
+```
+
+The stdout result contains `mode` (`single` or `matrix`), per-run `status`,
+resolution, target FPS, codec, and `summary`. A successful single run uses
+`status: "ok"`. A session without encoded frames has `status: "no_frames"`
+and `summary: null`. Matrix output includes a `runs` array with each case's
+status, measurements and any error. Unavailable GPU encode and bitstream-ready
+timing distributions are JSON `null`, never zero-duration measurements.
+
+The standard human-readable logging remains on stderr. JSON output does not
+measure network transit, client decoding or presentation. The exit-status fix
+for zero-frame sessions is proposed separately in PR #247; until that change
+merges, the JSON `no_frames` status must be checked explicitly.
