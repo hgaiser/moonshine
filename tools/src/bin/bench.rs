@@ -434,7 +434,6 @@ impl StatsAccumulator {
 	}
 }
 
-
 fn single_report_json(report: &BenchmarkReport) -> serde_json::Value {
 	let status = if report.interrupted {
 		"interrupted"
