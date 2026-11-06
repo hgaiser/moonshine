@@ -413,14 +413,8 @@ async fn run_packet_consumer(
 
 		// GPU hardware time and submit-to-bitstream-ready wall time come from
 		// pixelforge. Neither is interchangeable with the async future's wait.
-		let gpu_encode = packet
-			.stats
-			.as_ref()
-			.map(|stats| std::time::Duration::from_nanos(stats.gpu_time_ns));
-		let bitstream_ready = packet
-			.stats
-			.as_ref()
-			.map(|stats| std::time::Duration::from_nanos(stats.wall_latency_ns));
+		let gpu_encode = packet.stats.gpu_time_ns.map(std::time::Duration::from_nanos);
+		let bitstream_ready = Some(std::time::Duration::from_nanos(packet.stats.wall_latency_ns));
 		let encoded_bytes = packet.data.len();
 		let is_key_frame = packet.is_key_frame();
 
