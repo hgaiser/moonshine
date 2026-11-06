@@ -7,7 +7,7 @@ mod dmabuf;
 mod fence;
 mod hdr_sei;
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsFd, AsRawFd};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
@@ -1015,7 +1015,7 @@ impl VideoPipelineInner {
 				// Wait for the compositor's render to finish before reading the
 				// buffer. `None` means it already had.
 				if let Some(fence) = &dmabuf_frame.acquire_fence
-					&& let Err(e) = fence::wait_sync_file(fence.as_raw_fd(), fence::FENCE_TIMEOUT)
+					&& let Err(e) = fence::wait_sync_file(fence.as_fd(), fence::FENCE_TIMEOUT)
 				{
 					tracing::warn!("Dropping frame: {e}");
 					continue;

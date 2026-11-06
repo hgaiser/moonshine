@@ -2,7 +2,7 @@ use std::ffi::{CStr, CString};
 use std::io::IsTerminal;
 use std::io::Write;
 use std::os::linux::fs::MetadataExt;
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -330,19 +330,10 @@ fn is_member_of_group(name: &str) -> bool {
 	let Some(gid) = group_gid(name) else {
 		return false;
 	};
-	if unsafe { libc::getgid() } == gid {
+	if rustix::process::getgid().as_raw() == gid {
 		return true;
 	}
-	let n = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-	if n <= 0 {
-		return false;
-	}
-	let mut groups = vec![0 as libc::gid_t; n as usize];
-	let n = unsafe { libc::getgroups(groups.len() as libc::c_int, groups.as_mut_ptr()) };
-	if n < 0 {
-		return false;
-	}
-	groups.iter().take(n as usize).any(|&g| g == gid)
+	rustix::process::getgroups().is_ok_and(|groups| groups.iter().any(|g| g.as_raw() == gid))
 }
 
 fn check_render_nodes(report: &mut HealthReport, _gpu_config: &Option<String>) -> Option<PathBuf> {
@@ -876,7 +867,7 @@ fn check_inhibit(report: &mut HealthReport) {
 		},
 	};
 
-	let raw = match msg.data().fds().first().map(|fd| fd.as_raw_fd()) {
+	let fd = match msg.data().fds().first() {
 		Some(fd) => fd,
 		None => {
 			report.add_warn(
@@ -888,16 +879,14 @@ fn check_inhibit(report: &mut HealthReport) {
 		},
 	};
 
-	let duped = unsafe { libc::dup(raw) };
-	if duped < 0 {
+	let Ok(_fd) = rustix::io::dup(fd) else {
 		report.add_warn(
 			"Sleep inhibit",
 			"  Failed to duplicate inhibit file descriptor.".into(),
 			start.elapsed().as_millis() as u64,
 		);
 		return;
-	}
-	let _fd = unsafe { OwnedFd::from_raw_fd(duped) };
+	};
 
 	report.add_passed(
 		"Sleep inhibit",

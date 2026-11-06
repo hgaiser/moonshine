@@ -54,7 +54,6 @@ use pixelforge::{Handoff, SourceImage, VideoContext};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::io::{BorrowedFd, IntoRawFd};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -197,23 +196,17 @@ fn kcmp_file(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> io::Result<bool> {
 /// Identity of a DMA-BUF: the device and inode number of its file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BufferId {
-	dev: libc::dev_t,
-	ino: libc::ino_t,
+	dev: u64,
+	ino: u64,
 }
 
 impl BufferId {
 	/// Read the identity of the file behind `fd` with `fstat(2)`.
 	fn of(fd: BorrowedFd<'_>) -> io::Result<Self> {
-		let mut stat = MaybeUninit::<libc::stat>::uninit();
-		// SAFETY: `fd` is open, and `stat` has room for a `struct stat`.
-		if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
-			return Err(io::Error::last_os_error());
-		}
-		// SAFETY: `fstat` succeeded, so it filled in `stat`.
-		let stat = unsafe { stat.assume_init() };
+		let stat = rustix::fs::fstat(fd)?;
 		Ok(Self {
-			dev: stat.st_dev,
-			ino: stat.st_ino,
+			dev: stat.st_dev as u64,
+			ino: stat.st_ino as u64,
 		})
 	}
 }
@@ -564,8 +557,7 @@ impl Drop for DmaBufImporter {
 mod tests {
 	use super::{CompareMethod, DmaBufPlane, Identity, ImportParams, KcmpProbe};
 	use ash::vk;
-	use std::io;
-	use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+	use std::os::fd::{AsFd, OwnedFd};
 
 	fn plane(offset: u32, stride: u32) -> DmaBufPlane {
 		DmaBufPlane {
@@ -601,11 +593,7 @@ mod tests {
 	/// Create an anonymous in-memory file. Like a DMA-BUF, each memfd has its
 	/// own inode on a kernel pseudo-filesystem and its own open file description.
 	fn memfd() -> OwnedFd {
-		// SAFETY: the name is a valid C string, and no flags are set.
-		let fd = unsafe { libc::memfd_create(c"moonshine-test".as_ptr(), 0) };
-		assert!(fd >= 0, "memfd_create failed: {}", io::Error::last_os_error());
-		// SAFETY: `fd` is a new fd that nothing else owns.
-		unsafe { OwnedFd::from_raw_fd(fd) }
+		rustix::fs::memfd_create("moonshine-test", rustix::fs::MemfdFlags::empty()).expect("memfd_create failed")
 	}
 
 	#[test]
