@@ -765,6 +765,9 @@ async fn run_benchmark(
 	let _ = session_manager.stop_session().await;
 
 	tracing::info!("Done.");
+	if summary.is_none() && !interrupted {
+		return Err(boxed_error("No frames were encoded during benchmark session"));
+	}
 	Ok(BenchmarkReport {
 		resolution_label,
 		resolution: format!("{}x{}", width, height),
