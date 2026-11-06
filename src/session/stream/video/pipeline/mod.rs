@@ -33,8 +33,8 @@ pub(crate) use dmabuf::KcmpProbe;
 use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
-	Codec, ColorRange, ColorSpec, EncodeConfig, EncodeFuture, Encoder, EncoderTuningMode, Frame, InputFormat,
-	PixelForgeError, PixelFormat, RateControl, RgbSource, Source, StreamColor, VideoContext, VideoContextBuilder,
+	ChromaFormat, Codec, ColorRange, ColorSpec, EncodeConfig, EncodeFuture, Encoder, EncoderTuningMode, Frame,
+	PixelForgeError, RateControl, RgbFormat, RgbSource, Source, StreamColor, VideoContext, VideoContextBuilder,
 };
 
 /// Maximum number of frames in flight (submitted to the encoder but not yet
@@ -56,9 +56,9 @@ use pixelforge::{
 /// share is bounded by its send buffer (see `VideoStreamConfig::send_buffer_size`).
 pub(super) const MAX_FRAMES_IN_FLIGHT: usize = 3;
 
-/// Map a DRM fourcc format code to the corresponding pixelforge InputFormat
+/// Map a DRM fourcc format code to the corresponding pixelforge RgbFormat
 /// and Vulkan import format.
-fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
+fn drm_fourcc_to_input(fourcc: u32) -> (RgbFormat, vk::Format) {
 	// DRM fourcc values (from drm_fourcc.h):
 	// ARGB8888 = 0x34325241, XRGB8888 = 0x34325258
 	// ABGR8888 = 0x34324241, XBGR8888 = 0x34324258
@@ -72,12 +72,12 @@ fn drm_fourcc_to_input(fourcc: u32) -> (InputFormat, vk::Format) {
 	// fallback (8-bit BGRA) produces rainbow corruption when 10-bit
 	// packed data is read as 8-bit channels.
 	match fourcc {
-		0x34324241 | 0x34324258 => (InputFormat::RGBA, vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
+		0x34324241 | 0x34324258 => (RgbFormat::RGBA, vk::Format::R8G8B8A8_UNORM), // ABGR/XBGR8888
 		0x30334241 | 0x30334258 => {
-			(InputFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32) // ABGR/XBGR 2101010
+			(RgbFormat::ABGR2101010, vk::Format::A2B10G10R10_UNORM_PACK32) // ABGR/XBGR 2101010
 		},
-		0x48344241 | 0x48344258 => (InputFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT), // ABGR/XBGR16161616F
-		_ => (InputFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                               // ARGB/XRGB8888 (fallback)
+		0x48344241 | 0x48344258 => (RgbFormat::RGBA16F, vk::Format::R16G16B16A16_SFLOAT), // ABGR/XBGR16161616F
+		_ => (RgbFormat::BGRx, vk::Format::B8G8R8A8_UNORM),                               // ARGB/XRGB8888 (fallback)
 	}
 }
 
@@ -403,7 +403,7 @@ async fn run_packet_consumer(
 
 		// Inject HDR metadata into the bitstream on key frames, but only when
 		// encoding as BT.2020+PQ. SDR frames encoded as BT.709 carry no HDR SEI.
-		if packet.is_key_frame && frame_context.inject_hdr {
+		if packet.is_key_frame() && frame_context.inject_hdr {
 			// Fall back to default HDR10 metadata when the content provides none
 			// (e.g. scRGB swapchains carry no mastering metadata), staying
 			// consistent with the control-stream HDR metadata.
@@ -422,7 +422,7 @@ async fn run_packet_consumer(
 			.as_ref()
 			.map(|stats| std::time::Duration::from_nanos(stats.wall_latency_ns));
 		let encoded_bytes = packet.data.len();
-		let is_key_frame = packet.is_key_frame;
+		let is_key_frame = packet.is_key_frame();
 
 		// Clients take the RTP timestamp (90 kHz) as the frame's presentation time.
 		let epoch = *epoch.get_or_insert(frame_context.created_at);
@@ -684,14 +684,14 @@ impl VideoPipelineInner {
 
 		// Convert pixel format.
 		let pixel_format = match ctx.chroma_sampling_type {
-			VideoChromaSampling::Yuv420 => PixelFormat::Yuv420,
-			VideoChromaSampling::Yuv444 => PixelFormat::Yuv444,
+			VideoChromaSampling::Yuv420 => ChromaFormat::Yuv420,
+			VideoChromaSampling::Yuv444 => ChromaFormat::Yuv444,
 		};
 
 		// Convert bit depth based on dynamic range.
 		let bit_depth = match ctx.dynamic_range {
-			VideoDynamicRange::Sdr => pixelforge::EncodeBitDepth::Eight,
-			VideoDynamicRange::Hdr => pixelforge::EncodeBitDepth::Ten,
+			VideoDynamicRange::Sdr => pixelforge::BitDepth::Eight,
+			VideoDynamicRange::Hdr => pixelforge::BitDepth::Ten,
 		};
 
 		// The stream's colour, and the RGB frames the compositor hands over. The
@@ -706,9 +706,9 @@ impl VideoPipelineInner {
 			Codec::AV1 => EncodeConfig::av1(ctx.width, ctx.height),
 		}
 		.with_encoder_tuning_mode(EncoderTuningMode::LowLatency)
-		.with_pixel_format(pixel_format)
+		.with_chroma_format(pixel_format)
 		.with_bit_depth(bit_depth)
-		.with_source(Source::Rgb(RgbSource::new(InputFormat::BGRx, source)))
+		.with_source(Source::Rgb(RgbSource::new(RgbFormat::BGRx, source)))
 		.with_color(color)
 		.with_rate_control(RateControl::Cbr {
 			bitrate: ctx.bitrate as u32,
@@ -1202,7 +1202,7 @@ impl VideoPipelineInner {
 mod tests {
 	use super::drm_fourcc_to_input;
 	use ash::vk;
-	use pixelforge::InputFormat;
+	use pixelforge::RgbFormat;
 
 	// DRM fourccs — kept in the test module to document the byte ordering
 	// explicitly and guard against accidental typos in the production match.
@@ -1220,7 +1220,7 @@ mod tests {
 		// map to R8G8B8A8_UNORM.
 		for fourcc in [ABGR8888, XBGR8888] {
 			let (fmt, vk) = drm_fourcc_to_input(fourcc);
-			assert_eq!(fmt, InputFormat::RGBA);
+			assert_eq!(fmt, RgbFormat::RGBA);
 			assert_eq!(vk, vk::Format::R8G8B8A8_UNORM);
 		}
 	}
@@ -1229,7 +1229,7 @@ mod tests {
 	fn drm_fourcc_abgr_xbgr_10bit_maps_to_a2b10g10r10() {
 		for fourcc in [ABGR2101010, XBGR2101010] {
 			let (fmt, vk) = drm_fourcc_to_input(fourcc);
-			assert_eq!(fmt, InputFormat::ABGR2101010);
+			assert_eq!(fmt, RgbFormat::ABGR2101010);
 			assert_eq!(vk, vk::Format::A2B10G10R10_UNORM_PACK32);
 		}
 	}
@@ -1242,7 +1242,7 @@ mod tests {
 		// fallback and produce garbled pixels.
 		for fourcc in [ABGR16161616F, XBGR16161616F] {
 			let (fmt, vk) = drm_fourcc_to_input(fourcc);
-			assert_eq!(fmt, InputFormat::RGBA16F);
+			assert_eq!(fmt, RgbFormat::RGBA16F);
 			assert_eq!(vk, vk::Format::R16G16B16A16_SFLOAT);
 		}
 	}
@@ -1252,7 +1252,7 @@ mod tests {
 		// Anything outside the known set must fall back to the 8-bit BGRx
 		// assumption — matches the `_ =>` arm in the production match.
 		let (fmt, vk) = drm_fourcc_to_input(0xDEADBEEF);
-		assert_eq!(fmt, InputFormat::BGRx);
+		assert_eq!(fmt, RgbFormat::BGRx);
 		assert_eq!(vk, vk::Format::B8G8R8A8_UNORM);
 	}
 }
