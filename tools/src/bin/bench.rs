@@ -987,7 +987,7 @@ fn boxed_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 
 #[cfg(test)]
 mod timing_tests {
-	use super::{FrameStats, StatsAccumulator};
+	use super::{BenchmarkReport, FrameStats, StatsAccumulator, single_report_json};
 	use std::time::Duration;
 
 	fn frame(gpu_encode: Option<Duration>, bitstream_ready: Option<Duration>) -> FrameStats {
@@ -1016,6 +1016,19 @@ mod timing_tests {
 		assert_eq!(summary.gpu_timing_samples, 0);
 		assert!(summary.gpu_encode.is_none());
 		assert!(summary.bitstream_ready.is_none());
+		let report = BenchmarkReport {
+			resolution_label: "",
+			resolution: "1920x1080".to_string(),
+			target_fps: 60,
+			codec: "h264".to_string(),
+			summary: Some(summary),
+			interrupted: false,
+		};
+		let json = single_report_json(&report);
+		assert_eq!(json["summary"]["count"], 1);
+		assert_eq!(json["summary"]["gpu_timing_samples"], 0);
+		assert!(json["summary"]["gpu_encode"].is_null());
+		assert!(json["summary"]["bitstream_ready"].is_null());
 	}
 
 	#[test]
@@ -1060,7 +1073,7 @@ mod timing_tests {
 
 #[cfg(test)]
 mod json_output_tests {
-	use super::{BenchmarkReport, MatrixReport, MatrixStatus, StatsAccumulator, single_report_json, matrix_report_json};
+	use super::{BenchmarkReport, MatrixReport, MatrixStatus, matrix_report_json, single_report_json};
 
 	#[test]
 	fn empty_session_is_explicit_in_json() {
@@ -1079,16 +1092,13 @@ mod json_output_tests {
 	}
 
 	#[test]
-	fn absent_gpu_timing_is_null_not_zero() {
-		let mut accumulator = StatsAccumulator::new();
-		// No recorded frames means no GPU timing samples and no report summary.
-		assert!(accumulator.summary().is_none());
+	fn interrupted_session_has_explicit_status() {
 		let report = BenchmarkReport {
 			resolution_label: "",
 			resolution: "1920x1080".to_string(),
 			target_fps: 60,
 			codec: "h264".to_string(),
-			summary: accumulator.summary(),
+			summary: None,
 			interrupted: true,
 		};
 		let value = single_report_json(&report);
