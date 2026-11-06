@@ -69,11 +69,21 @@ pub struct VideoStreamConfig {
 	pub send_buffer_size: usize,
 }
 
-/// Smallest accepted packet size cap. Lower values would leave almost no room
-/// for payload after the 16-byte NV video header, so they are ignored.
+/// Smallest accepted packet size. Lower values would leave almost no room for
+/// payload after the 16-byte NV video header, so a lower cap is ignored and a
+/// smaller client request is rejected.
 const MIN_PACKET_SIZE: usize = 200;
+/// Largest accepted packet size, so one stream packet fits an IPv6 UDP datagram:
+/// 65_535 - 40 (IPv6) - 8 (UDP) - 16 (stream overhead). The packetizer sizes its
+/// buffers from the client's value, so an unbounded request could exhaust memory.
+const MAX_PACKET_SIZE: usize = 65_471;
 
 impl VideoStreamConfig {
+	/// Whether a negotiated packet size is safe to packetize with.
+	pub(crate) fn valid_packet_size(size: usize) -> bool {
+		(MIN_PACKET_SIZE..=MAX_PACKET_SIZE).contains(&size)
+	}
+
 	/// Clamp a client-requested video packet size to `max_packet_size`.
 	///
 	/// A client only asks for what it believes it can receive, so a request
@@ -611,6 +621,18 @@ mod tests {
 			max_packet_size,
 			..Default::default()
 		}
+	}
+
+	#[test]
+	fn rejects_out_of_range_packet_sizes() {
+		assert!(!VideoStreamConfig::valid_packet_size(0));
+		assert!(!VideoStreamConfig::valid_packet_size(16));
+		assert!(!VideoStreamConfig::valid_packet_size(MIN_PACKET_SIZE - 1));
+		assert!(VideoStreamConfig::valid_packet_size(MIN_PACKET_SIZE));
+		assert!(VideoStreamConfig::valid_packet_size(1392));
+		assert!(VideoStreamConfig::valid_packet_size(MAX_PACKET_SIZE));
+		assert!(!VideoStreamConfig::valid_packet_size(MAX_PACKET_SIZE + 1));
+		assert!(!VideoStreamConfig::valid_packet_size(usize::MAX));
 	}
 
 	#[test]
