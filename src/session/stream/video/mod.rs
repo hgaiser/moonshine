@@ -67,6 +67,16 @@ pub struct VideoStreamConfig {
 	/// `net.core.wmem_max`.
 	#[serde(default)]
 	pub send_buffer_size: usize,
+
+	/// Whether to lower the frame rate while the client reports losses.
+	///
+	/// When a link further away gets slower than the stream, its packets are
+	/// dropped there and every frame breaks; nothing on the host notices but
+	/// the client, which asks for recovery frames. With this enabled, those
+	/// requests lower an estimate of the rate the link carries, which recovers
+	/// while the client stays quiet, and captures are skipped while it is below
+	/// the bitrate, trading frame rate for frames that arrive whole.
+	pub adapt_to_loss: bool,
 }
 
 /// Smallest accepted packet size. Lower values would leave almost no room for
@@ -113,6 +123,7 @@ impl Default for VideoStreamConfig {
 			log_frame_spikes: false,
 			max_packet_size: 0,
 			send_buffer_size: 0,
+			adapt_to_loss: true,
 		}
 	}
 }
@@ -278,6 +289,9 @@ pub(crate) struct VideoStreamHandle {
 	/// Reference frame invalidation requests, carrying the inclusive
 	/// `[first, last]` client frame-index range the client could not decode.
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
+	/// The client's FEC status reports, as `(missing, parity)` packets of a
+	/// frame it had to repair or lost.
+	fec_status_tx: broadcast::Sender<(u16, u16)>,
 	/// Set by a resume; the packet handler fires the reset on the client's next PING.
 	resume_pending: Arc<AtomicBool>,
 }
@@ -301,6 +315,12 @@ impl VideoStreamHandle {
 	/// reference survives — much cheaper than always re-sending a keyframe.
 	pub fn invalidate_reference_frames(&self, first: u32, last: u32) {
 		let _ = self.invalidate_tx.send((first, last));
+	}
+
+	/// Pass on the client's report that it had to recover `missing` packets of
+	/// a frame with `parity` parity packets, or lost it.
+	pub fn report_fec_status(&self, missing: u16, parity: u16) {
+		let _ = self.fec_status_tx.send((missing, parity));
 	}
 
 	/// Reset the stream's frame/sequence counters for a resuming client.
@@ -396,6 +416,10 @@ impl VideoStream {
 		// of loss reports; the encode loop drains all pending each iteration.
 		let (invalidate_tx, _invalidate_rx) = broadcast::channel(16);
 
+		// FEC status broadcast channel. The client batches its reports every
+		// 100 ms; the encode loop drains all pending each iteration.
+		let (fec_status_tx, _fec_status_rx) = broadcast::channel(64);
+
 		// Stream-reset broadcast channel (client reconnect/resume).
 		let (reset_tx, _reset_rx) = broadcast::channel(1);
 		let resume_pending = Arc::new(AtomicBool::new(false));
@@ -424,6 +448,7 @@ impl VideoStream {
 			idr_tx.clone(),
 			idr_tx.subscribe(),
 			invalidate_tx.subscribe(),
+			fec_status_tx.subscribe(),
 			reset_tx.subscribe(),
 			stop.clone(),
 			hdr_metadata_tx,
@@ -436,6 +461,7 @@ impl VideoStream {
 			start,
 			idr_tx,
 			invalidate_tx,
+			fec_status_tx,
 			resume_pending,
 		})
 	}
