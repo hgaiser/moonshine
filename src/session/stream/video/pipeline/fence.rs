@@ -12,7 +12,10 @@ pub(super) const FENCE_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// Wait until a sync file fd signals (becomes readable).
 ///
-/// Returns `Err` if it did not signal within `timeout` or `poll(2)` failed.
+/// Returns `Err` if it did not signal within `timeout`, `poll(2)` failed, or
+/// `poll(2)` reported an error or hangup instead of `POLLIN`. A sync file only
+/// ever reports `POLLIN`, also for a fence that signalled with an error, so
+/// this guards against descriptors that are not sync files.
 pub(super) fn wait_sync_file(fd: BorrowedFd<'_>, timeout: Duration) -> Result<(), String> {
 	let deadline = Instant::now() + timeout;
 	loop {
@@ -24,7 +27,17 @@ pub(super) fn wait_sync_file(fd: BorrowedFd<'_>, timeout: Duration) -> Result<()
 		let mut fds = [PollFd::new(&fd, PollFlags::IN)];
 		match poll(&mut fds, Some(&remaining)) {
 			Ok(0) => return Err(format!("acquire fence did not signal within {timeout:?}")),
-			Ok(_) => return Ok(()),
+			Ok(_) => {
+				// poll() counts a descriptor with an error or hangup as ready.
+				let revents = fds[0].revents();
+				if revents.intersects(PollFlags::ERR | PollFlags::HUP | PollFlags::NVAL) {
+					return Err(format!("poll on acquire fence reported {revents:?}"));
+				}
+				if revents.contains(PollFlags::IN) {
+					return Ok(());
+				}
+				return Err(format!("poll on acquire fence reported {revents:?}"));
+			},
 			Err(Errno::INTR) => {},
 			Err(error) => return Err(format!("poll on acquire fence failed: {error}")),
 		}
@@ -43,5 +56,14 @@ mod tests {
 		assert!(wait_sync_file(read.as_fd(), Duration::from_millis(20)).is_err());
 		assert_eq!(rustix::io::write(&write, &[1u8]).unwrap(), 1);
 		assert!(wait_sync_file(read.as_fd(), Duration::from_millis(20)).is_ok());
+	}
+
+	#[test]
+	fn wait_sync_file_rejects_hangup_without_signal() {
+		// A pipe with no writer reports POLLHUP, not POLLIN.
+		let (read, write) = rustix::pipe::pipe().unwrap();
+		drop(write);
+		let error = wait_sync_file(read.as_fd(), Duration::from_millis(20)).unwrap_err();
+		assert!(error.contains("HUP"), "{error}");
 	}
 }
