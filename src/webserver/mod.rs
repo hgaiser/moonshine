@@ -484,7 +484,7 @@ impl Webserver {
 			Some(boxart) => boxart,
 			None => {
 				let message = format!("No boxart defined for app '{}'.", application.title);
-				tracing::warn!("{message}");
+				tracing::debug!("{message}");
 				return bad_request(message);
 			},
 		};

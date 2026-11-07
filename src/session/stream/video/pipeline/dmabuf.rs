@@ -41,18 +41,19 @@
 //! safety and confidentiality are not affected. `kcmp(2)` cannot be fooled
 //! this way, which is why it is preferred.
 //!
-//! Entries are refcounted: consumers (e.g. `ColorConverter`) hold an `Arc` so
-//! an image is never destroyed while they cache a view of it.
+//! Entries are refcounted: the encoding loop holds an `Arc` while a frame it
+//! submitted may still be read. Each entry is also a pixelforge
+//! [`SourceImage`], which knows which frames read it; dropping the entry waits
+//! for them before the image is destroyed.
 //!
 //! The startup healthcheck reports which method is in use. It warns, but does
 //! not refuse startup, when `kcmp(2)` is unavailable.
 
 use ash::vk;
-use pixelforge::VideoContext;
+use pixelforge::{Handoff, SourceImage, VideoContext};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, AsRawFd, OwnedFd, RawFd};
 use std::os::unix::io::{BorrowedFd, IntoRawFd};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -111,6 +112,10 @@ impl ImportParams {
 
 /// Cached Vulkan resources for a single compositor buffer slot.
 pub(crate) struct CachedImport {
+	/// The image as an encoder source. A DMA-BUF is written outside this
+	/// device, so each frame acquires it from the foreign queue family and
+	/// releases it back.
+	source: SourceImage,
 	image: vk::Image,
 	memory: vk::DeviceMemory,
 	params: ImportParams,
@@ -191,23 +196,17 @@ fn kcmp_file(a: BorrowedFd<'_>, b: BorrowedFd<'_>) -> io::Result<bool> {
 /// Identity of a DMA-BUF: the device and inode number of its file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BufferId {
-	dev: libc::dev_t,
-	ino: libc::ino_t,
+	dev: u64,
+	ino: u64,
 }
 
 impl BufferId {
 	/// Read the identity of the file behind `fd` with `fstat(2)`.
 	fn of(fd: BorrowedFd<'_>) -> io::Result<Self> {
-		let mut stat = MaybeUninit::<libc::stat>::uninit();
-		// SAFETY: `fd` is open, and `stat` has room for a `struct stat`.
-		if unsafe { libc::fstat(fd.as_raw_fd(), stat.as_mut_ptr()) } < 0 {
-			return Err(io::Error::last_os_error());
-		}
-		// SAFETY: `fstat` succeeded, so it filled in `stat`.
-		let stat = unsafe { stat.assume_init() };
+		let stat = rustix::fs::fstat(fd)?;
 		Ok(Self {
-			dev: stat.st_dev,
-			ino: stat.st_ino,
+			dev: stat.st_dev as u64,
+			ino: stat.st_ino as u64,
 		})
 	}
 }
@@ -243,9 +242,9 @@ impl Identity {
 }
 
 impl CachedImport {
-	/// The imported Vulkan image.
-	pub(crate) fn image(&self) -> vk::Image {
-		self.image
+	/// The imported image, to submit to the encoder.
+	pub(crate) fn source(&self) -> &SourceImage {
+		&self.source
 	}
 
 	/// Check whether `fd` refers to the same DMA-BUF this entry was imported from.
@@ -266,7 +265,10 @@ impl CachedImport {
 
 impl Drop for CachedImport {
 	fn drop(&mut self) {
-		// SAFETY: runs when the last `Arc` drops, so nothing references the image.
+		// A frame submitted from it may still be reading it.
+		let _ = self.source.wait_released();
+		// SAFETY: runs when the last `Arc` drops, and the frames that read the
+		// image are done with it, so nothing references the image.
 		unsafe {
 			let device = self.context.device();
 			device.destroy_image(self.image, None);
@@ -277,8 +279,9 @@ impl Drop for CachedImport {
 
 /// Imports DMA-BUF fds into Vulkan images with a per-fd cache and TTL eviction.
 ///
-/// Layout transitions are deferred to the consumer (e.g. `ColorConverter`) to
-/// avoid a separate GPU submission per first-time import.
+/// Layout transitions and queue family transfers are done by the encoder, in
+/// the submission that reads the image, so a first-time import costs no
+/// separate GPU submission.
 pub(crate) struct DmaBufImporter {
 	context: VideoContext,
 	external_memory_fd: ash::khr::external_memory_fd::Device,
@@ -310,8 +313,8 @@ impl DmaBufImporter {
 		})
 	}
 
-	/// Import a DMA-BUF, reusing a cached import on hit. Returns
-	/// `(import, needs_transition)`; the `Arc` pins the image to the caller.
+	/// Import a DMA-BUF, reusing a cached import on hit. The `Arc` pins the
+	/// image to the caller.
 	pub fn import_or_reuse(
 		&mut self,
 		fd: RawFd,
@@ -319,7 +322,7 @@ impl DmaBufImporter {
 		height: u32,
 		format: vk::Format,
 		planes: &[DmaBufPlane],
-	) -> Result<(Arc<CachedImport>, bool), String> {
+	) -> Result<Arc<CachedImport>, String> {
 		self.calls_since_sweep += 1;
 		if self.calls_since_sweep >= SWEEP_INTERVAL_CALLS {
 			self.calls_since_sweep = 0;
@@ -337,7 +340,7 @@ impl DmaBufImporter {
 			&& cached.is_same_buffer(borrowed_fd)
 		{
 			cached.touch(now);
-			return Ok((Arc::clone(cached), false));
+			return Ok(Arc::clone(cached));
 		}
 
 		// Miss: retire the stale entry for TTL-deferred release.
@@ -363,8 +366,20 @@ impl DmaBufImporter {
 			.map_err(|e| format!("Failed to read DMA-BUF identity for the import cache: {e}"))?;
 
 		let (image, memory) = self.import_internal(width, height, format, planes)?;
+		let source = match SourceImage::new(&self.context, image, Handoff::External) {
+			Ok(source) => source,
+			Err(e) => {
+				// SAFETY: the image was just made and nothing uses it yet.
+				unsafe {
+					self.context.device().destroy_image(image, None);
+					self.context.device().free_memory(memory, None);
+				}
+				return Err(format!("Failed to register DMA-BUF import as an encoder source: {e}"));
+			},
+		};
 
 		let cached = Arc::new(CachedImport {
+			source,
 			image,
 			memory,
 			params,
@@ -374,7 +389,7 @@ impl DmaBufImporter {
 			context: self.context.clone(),
 		});
 		self.cache.insert(fd, Arc::clone(&cached));
-		Ok((cached, true))
+		Ok(cached)
 	}
 
 	/// Move TTL-expired entries to `retired` for one more `CACHE_TTL` before
@@ -542,8 +557,7 @@ impl Drop for DmaBufImporter {
 mod tests {
 	use super::{CompareMethod, DmaBufPlane, Identity, ImportParams, KcmpProbe};
 	use ash::vk;
-	use std::io;
-	use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+	use std::os::fd::{AsFd, OwnedFd};
 
 	fn plane(offset: u32, stride: u32) -> DmaBufPlane {
 		DmaBufPlane {
@@ -579,11 +593,7 @@ mod tests {
 	/// Create an anonymous in-memory file. Like a DMA-BUF, each memfd has its
 	/// own inode on a kernel pseudo-filesystem and its own open file description.
 	fn memfd() -> OwnedFd {
-		// SAFETY: the name is a valid C string, and no flags are set.
-		let fd = unsafe { libc::memfd_create(c"moonshine-test".as_ptr(), 0) };
-		assert!(fd >= 0, "memfd_create failed: {}", io::Error::last_os_error());
-		// SAFETY: `fd` is a new fd that nothing else owns.
-		unsafe { OwnedFd::from_raw_fd(fd) }
+		rustix::fs::memfd_create("moonshine-test", rustix::fs::MemfdFlags::empty()).expect("memfd_create failed")
 	}
 
 	#[test]

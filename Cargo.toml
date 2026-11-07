@@ -55,11 +55,12 @@ notify-rust = "4.17.0"
 open = "5.3.5"
 opus = "0.3.1"
 pkcs8 = "0.11.0"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.10.0", features = ["dmabuf"] }
+pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.11.0", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"
 rtsp-types = "0.1.3"
+rustix = { version = "1.1", features = ["event", "fs", "pipe", "process"] }
 rubato = "5.0.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 rustls = "0.23.40"
