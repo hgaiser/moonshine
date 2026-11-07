@@ -32,9 +32,11 @@ const MIN_PERCENT: u64 = 25;
 /// frames lowers the bitrate to fit.
 ///
 /// The client's FEC status reports refine this: a frame it repaired using
-/// more than half its parity is as good as lost and cuts the estimate, while
-/// lighter repair only pauses probing, so the estimate backs off before
-/// frames break without reacting to random loss.
+/// more than half its parity is as good as lost and cuts the estimate, so it
+/// backs off before frames break. Lighter repair is ignored, as it is what
+/// random loss looks like and the link may carry far more than the estimate:
+/// holding the probe back for it would keep the estimate down after a cut for
+/// as long as the loss lasts.
 pub(super) struct LossAdaptation {
 	/// Estimated rate the link carries, in bits per second.
 	rate: u64,
@@ -43,8 +45,6 @@ pub(super) struct LossAdaptation {
 	skip_below: u64,
 	increase_per_second: u64,
 	last_decrease: Option<Instant>,
-	/// When light repair last paused probing.
-	last_warning: Option<Instant>,
 	last_update: Instant,
 	/// Thousandths of a capture the rate allows; an admitted capture spends
 	/// 1000.
@@ -64,7 +64,6 @@ impl LossAdaptation {
 			skip_below: (bitrate / 100 * SKIP_BELOW_PERCENT).max(1),
 			increase_per_second: bitrate / 100 * INCREASE_PERCENT,
 			last_decrease: None,
-			last_warning: None,
 			last_update: now,
 			credit: 0,
 		}
@@ -85,13 +84,10 @@ impl LossAdaptation {
 
 	/// React to the client repairing `missing` packets of a frame with
 	/// `parity` parity packets at `now` (or losing it): more than half the
-	/// parity is a cut, less pauses probing for [`HOLDOFF`].
+	/// parity is a cut, less is ignored.
 	pub(super) fn on_fec_status(&mut self, now: Instant, missing: u16, parity: u16) {
 		if u32::from(missing) * 2 > u32::from(parity) {
 			self.on_loss(now);
-		} else {
-			self.update(now);
-			self.last_warning = Some(now);
 		}
 	}
 
@@ -114,17 +110,9 @@ impl LossAdaptation {
 
 	/// Raise the rate for the time since the last update.
 	fn update(&mut self, now: Instant) {
-		let warned = self
-			.last_warning
-			.is_some_and(|last| now.saturating_duration_since(last) < HOLDOFF);
-		let elapsed = if warned {
-			Duration::ZERO
-		} else {
-			now.saturating_duration_since(self.last_update)
-		};
+		let elapsed = now.saturating_duration_since(self.last_update);
 		let calm = self
 			.last_decrease
-			.max(self.last_warning)
 			.map_or(Duration::ZERO, |last| now.saturating_duration_since(last));
 		// 1 + 2 per second of calm, in thousandths.
 		let speedup = 1000 + 2 * calm.as_millis();
@@ -181,20 +169,37 @@ mod tests {
 	}
 
 	#[test]
-	fn heavy_fec_repair_cuts_and_light_repair_holds() {
+	fn heavy_fec_repair_cuts_and_light_repair_is_ignored() {
 		let start = Instant::now();
 		let mut adaptation = LossAdaptation::new(BITRATE, 200, start);
 		adaptation.on_loss(start);
-		let later = start + Duration::from_secs(1);
+		// Soon enough that the probe hasn't reached the ceiling yet.
+		let later = start + Duration::from_millis(300);
 		adaptation.update(later);
 		let probed = adaptation.rate;
-		// Repairing 2 of 10 parity packets holds the estimate...
+		// Repairing 2 of 10 parity packets doesn't stop the probe...
 		adaptation.on_fec_status(later, 2, 10);
 		adaptation.update(later + Duration::from_millis(50));
-		assert_eq!(adaptation.rate, probed);
+		assert!(adaptation.rate > probed);
 		// ...repairing 6 of 10 cuts it.
 		adaptation.on_fec_status(later + Duration::from_millis(60), 6, 10);
 		assert!(adaptation.rate < probed);
+	}
+
+	#[test]
+	fn light_repair_every_frame_does_not_stop_recovery() {
+		let start = Instant::now();
+		let mut adaptation = LossAdaptation::new(BITRATE, 200, start);
+		// Back off hard on a lost frame, then see light repair every 50 ms.
+		for i in 0..10 {
+			adaptation.on_loss(start + Duration::from_millis(150 * i));
+		}
+		assert!(adaptation.admitted_percent() < 50);
+		for i in 0..200 {
+			adaptation.on_fec_status(start + Duration::from_millis(1500 + 50 * i), 1, 4);
+		}
+		adaptation.update(start + Duration::from_millis(1500 + 50 * 200));
+		assert_eq!(adaptation.admitted_percent(), 100);
 	}
 
 	#[test]
