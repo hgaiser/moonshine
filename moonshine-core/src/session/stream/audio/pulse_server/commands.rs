@@ -612,7 +612,6 @@ fn configure_buffer(attr: &mut pulse::stream::BufferAttr, spec: &pulse::SampleSp
 		attr.target_length = attr
 			.target_length
 			.next_multiple_of(attr.minimum_request_length)
-			.max(len_10ms * 6)
 			.min(attr.max_length);
 
 		if attr.target_length < (attr.minimum_request_length * 2) {
@@ -682,5 +681,27 @@ fn sink_input_info_from_stream(stream: &PlaybackStream, client_id: u32) -> pulse
 		has_volume: true,
 		volume_writable: true,
 		..Default::default()
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn requested_target_length_is_kept() {
+		let spec = pulse::SampleSpec {
+			format: pulse::SampleFormat::Float32Le,
+			channels: 2,
+			sample_rate: 48000,
+		};
+		// The buffer attributes that Proton requests: 30 ms target, 10 ms minimum request.
+		let mut attr = pulse::stream::BufferAttr {
+			target_length: 11520,
+			minimum_request_length: 3840,
+			..Default::default()
+		};
+		configure_buffer(&mut attr, &spec);
+		assert_eq!(attr.target_length, 11520);
 	}
 }
