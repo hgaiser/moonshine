@@ -65,6 +65,10 @@ enum EncryptionFlags {
 	Audio = 0x04,
 }
 
+fn video_bitrate_bps(kbps: usize) -> Option<usize> {
+	kbps.checked_mul(1_000).filter(|bps| u32::try_from(*bps).is_ok())
+}
+
 #[derive(Clone)]
 pub struct RtspServer {
 	address: String,
@@ -333,6 +337,10 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
+		if fps == 0 {
+			tracing::warn!("Rejected zero client video frame rate");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		}
 		let requested_packet_size: usize = match get_sdp_attribute(&sdp_session, "x-nv-video[0].packetSize") {
 			Ok(packet_size) => packet_size,
 			Err(()) => {
@@ -348,14 +356,17 @@ impl RtspServer {
 		if packet_size != requested_packet_size {
 			tracing::info!("Clamping client video packet size from {requested_packet_size} to {packet_size} bytes.");
 		}
-		let mut bitrate = match get_sdp_attribute(&sdp_session, "x-ml-video.configuredBitrateKbps") {
+		let bitrate_kbps: usize = match get_sdp_attribute(&sdp_session, "x-ml-video.configuredBitrateKbps") {
 			Ok(bitrate) => bitrate,
 			Err(()) => {
 				tracing::warn!("Failed to parse x-ml-video.configuredBitrateKbps in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
-		bitrate *= 1000; // Convert from kbps to bps.
+		let Some(bitrate) = video_bitrate_bps(bitrate_kbps) else {
+			tracing::warn!("Client video bitrate {bitrate_kbps} kbps overflows bits per second");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		};
 		let minimum_fec_packets = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].fec.minRequiredFecPackets") {
 			Ok(minimum_fec_packets) => minimum_fec_packets,
 			Err(()) => {
@@ -685,5 +696,15 @@ mod tests {
 		assert_eq!(read_rtsp_chunk(&mut reader, &mut buffer, deadline).await.unwrap(), 2);
 		let error = read_rtsp_chunk(&mut reader, &mut buffer, deadline).await.unwrap_err();
 		assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+	}
+
+	#[test]
+	fn client_bitrate_conversion_rejects_overflow() {
+		assert_eq!(video_bitrate_bps(150_000), Some(150_000_000));
+		// The encoder accepts u32 bits/sec, so the RTSP value must fit this too.
+		let largest_kbps = (u32::MAX as usize) / 1_000;
+		assert_eq!(video_bitrate_bps(largest_kbps), Some(largest_kbps * 1_000));
+		assert_eq!(video_bitrate_bps(largest_kbps + 1), None);
+		assert_eq!(video_bitrate_bps(usize::MAX), None);
 	}
 }
