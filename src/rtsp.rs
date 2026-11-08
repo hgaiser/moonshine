@@ -29,6 +29,19 @@ const MAX_RTSP_REQUEST_BYTES: usize = 64 * 1024;
 /// Absolute deadline for receiving one RTSP request, including all partial reads.
 const RTSP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// Replace every occurrence of `from` in `haystack` with `to`.
+fn replace_bytes(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+	let mut result = Vec::with_capacity(haystack.len());
+	let mut rest = haystack;
+	while let Some(position) = rest.windows(from.len()).position(|window| window == from) {
+		result.extend_from_slice(&rest[..position]);
+		result.extend_from_slice(to);
+		rest = &rest[position + from.len()..];
+	}
+	result.extend_from_slice(rest);
+	result
+}
+
 async fn read_rtsp_chunk<R: tokio::io::AsyncRead + Unpin>(
 	reader: &mut R,
 	buffer: &mut [u8],
@@ -522,7 +535,7 @@ impl RtspServer {
 			},
 		}
 
-		let mut message_buffer = String::new();
+		let mut message_buffer = Vec::new();
 		let deadline = tokio::time::Instant::now() + RTSP_REQUEST_TIMEOUT;
 
 		let message = loop {
@@ -538,16 +551,13 @@ impl RtspServer {
 				tracing::warn!("Rejected RTSP request exceeding {MAX_RTSP_REQUEST_BYTES} bytes from {address}");
 				return Err(());
 			}
-			message_buffer.push_str(
-				std::str::from_utf8(&buffer[..bytes_read])
-					.map_err(|e| tracing::warn!("Failed to convert message to string: {e}"))?,
-			);
+			message_buffer.extend_from_slice(&buffer[..bytes_read]);
 
 			// Hacky workaround to fix rtsp_types parsing SETUP/PLAY requests from Moonlight.
-			let message_buffer = message_buffer.replace("streamid", "rtsp://localhost?streamid");
-			let message_buffer = message_buffer.replace("PLAY /", "PLAY rtsp://localhost/");
+			let message_buffer = replace_bytes(&message_buffer, b"streamid", b"rtsp://localhost?streamid");
+			let message_buffer = replace_bytes(&message_buffer, b"PLAY /", b"PLAY rtsp://localhost/");
 
-			tracing::trace!("Request: {}", message_buffer);
+			tracing::trace!("Request: {}", String::from_utf8_lossy(&message_buffer));
 			let result = rtsp_types::Message::parse(&message_buffer);
 
 			break match result {
@@ -649,6 +659,21 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn replace_bytes_matches_str_replace() {
+		let text = "PLAY / RTSP/1.0\r\nstreamid=0 streamid=1\r\n";
+		let replaced = replace_bytes(text.as_bytes(), b"streamid", b"rtsp://localhost?streamid");
+		assert_eq!(
+			replaced,
+			text.replace("streamid", "rtsp://localhost?streamid").as_bytes()
+		);
+		assert_eq!(replace_bytes(b"no match", b"PLAY /", b"x"), b"no match");
+		assert_eq!(
+			replace_bytes(&[0xff, b'P', b'L', b'A', b'Y', b' ', b'/'], b"PLAY /", b"Y"),
+			[0xff, b'Y']
+		);
+	}
 
 	#[tokio::test]
 	async fn partial_reads_do_not_reset_request_deadline() {
