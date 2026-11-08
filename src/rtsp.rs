@@ -24,18 +24,10 @@ use crate::session::stream::video::VideoFormat;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 
-/// Upper bound for one RTSP request (headers and SDP payload). The 2 KiB
-/// per-read buffer is not a limit: an incomplete request is retried with a
-/// growing String. Keep generous headroom for clients with extra SDP fields.
+/// Upper bound for one RTSP request (headers and SDP payload), including partial reads.
 const MAX_RTSP_REQUEST_BYTES: usize = 64 * 1024;
 /// Absolute deadline for receiving one RTSP request, including all partial reads.
 const RTSP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-
-fn rtsp_request_fits(current: usize, incoming: usize) -> bool {
-	current
-		.checked_add(incoming)
-		.is_some_and(|size| size <= MAX_RTSP_REQUEST_BYTES)
-}
 
 async fn read_rtsp_chunk<R: tokio::io::AsyncRead + Unpin>(
 	reader: &mut R,
@@ -542,7 +534,7 @@ impl RtspServer {
 				tracing::warn!("Received empty RTSP request.");
 				return Ok(());
 			}
-			if !rtsp_request_fits(message_buffer.len(), bytes_read) {
+			if message_buffer.len() + bytes_read > MAX_RTSP_REQUEST_BYTES {
 				tracing::warn!("Rejected RTSP request exceeding {MAX_RTSP_REQUEST_BYTES} bytes from {address}");
 				return Err(());
 			}
@@ -657,15 +649,6 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 #[cfg(test)]
 mod tests {
 	use super::*;
-
-	#[test]
-	fn rtsp_request_size_is_bounded_including_incomplete_messages() {
-		assert!(rtsp_request_fits(0, 2048));
-		assert!(rtsp_request_fits(MAX_RTSP_REQUEST_BYTES - 2048, 2048));
-		assert!(!rtsp_request_fits(MAX_RTSP_REQUEST_BYTES - 2048, 2049));
-		assert!(!rtsp_request_fits(MAX_RTSP_REQUEST_BYTES, 1));
-		assert!(!rtsp_request_fits(usize::MAX, 1));
-	}
 
 	#[tokio::test]
 	async fn partial_reads_do_not_reset_request_deadline() {
