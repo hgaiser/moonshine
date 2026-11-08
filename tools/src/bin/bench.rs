@@ -940,6 +940,9 @@ mod timing_tests {
 
 	fn frame(gpu_encode: Option<Duration>, bitstream_ready: Option<Duration>) -> FrameStats {
 		FrameStats {
+			frame_number: 0,
+			captured_at: std::time::UNIX_EPOCH,
+			content: None,
 			channel_wait: Duration::ZERO,
 			import: Duration::ZERO,
 			convert: Duration::ZERO,

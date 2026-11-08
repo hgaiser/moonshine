@@ -258,6 +258,8 @@ struct FrameContext {
 	inject_hdr: bool,
 	/// HDR mastering metadata to inject, if any.
 	hdr_metadata: Option<HdrMetadata>,
+	/// The color space of the captured frame; `None` for the IDR re-encode path.
+	content: Option<FrameColorSpace>,
 }
 
 /// Message from the encoding thread to the packet consumer thread, in
@@ -519,6 +521,9 @@ async fn run_packet_consumer(
 		let _ = stats_tx.send(StreamEvent::Frame {
 			generation,
 			stats: FrameStats {
+				frame_number,
+				captured_at: std::time::SystemTime::now() - frame_context.created_at.elapsed(),
+				content: frame_context.content,
 				channel_wait: frame_context.channel_wait,
 				import: frame_context.import,
 				convert: frame_context.convert,
@@ -979,6 +984,7 @@ impl VideoPipelineInner {
 									submitted_at,
 									inject_hdr,
 									hdr_metadata: last_hdr_state.metadata,
+									content: None,
 								};
 								// Count this frame in flight; released when the network sender takes
 								// it or the consumer drops it.
@@ -1115,9 +1121,10 @@ impl VideoPipelineInner {
 				// BT.2020+PQ, with dynamic VUI switching in the encoder. scRGB's and
 				// SDR's reference whites are pixelforge's per-source defaults (80 and
 				// 203 nits).
+				let content = color_space(&frame.info.colour);
 				let (frame_source, stream_color) = match ctx.dynamic_range {
 					VideoDynamicRange::Sdr => session_colors(ctx.dynamic_range, ctx.full_range),
-					VideoDynamicRange::Hdr => frame_colors(color_space(&frame.info.colour), ctx.full_range),
+					VideoDynamicRange::Hdr => frame_colors(content, ctx.full_range),
 				};
 				let was_hdr = is_hdr(&encoder);
 				encoder
@@ -1190,6 +1197,7 @@ impl VideoPipelineInner {
 							submitted_at: t4_encoded,
 							inject_hdr,
 							hdr_metadata: last_hdr_state.metadata,
+							content: Some(content),
 						};
 						// Count this frame in flight; released when the network sender takes
 						// it or the consumer drops it.

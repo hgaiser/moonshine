@@ -15,6 +15,8 @@ mod gso_socket;
 mod packetizer;
 mod pipeline;
 mod shard_batch;
+
+pub use crate::session::compositor::frame::FrameColorSpace;
 use gso_socket::UdpGsoSocket;
 pub(crate) use pipeline::KcmpProbe;
 use pipeline::{MAX_FRAMES_IN_FLIGHT, PacketBatch, VideoPipeline};
@@ -149,6 +151,12 @@ fn serialize_secs_opt<S: serde::Serializer>(
 	}
 }
 
+/// Writes a point in time as seconds since the Unix epoch.
+fn serialize_unix_secs<S: serde::Serializer>(time: &std::time::SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
+	let since_epoch = time.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+	serialize_secs(&since_epoch, serializer)
+}
+
 /// Per-frame encoding statistics emitted by the video pipeline.
 ///
 /// Sent in `StreamEvent::Frame`.
@@ -159,6 +167,16 @@ fn serialize_secs_opt<S: serde::Serializer>(
 /// stay internal needs `#[serde(skip)]`. `src/stats_socket.rs` locks the resulting format.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FrameStats {
+	/// The frame's number on the wire (its frame index), which the client sees too, so the two
+	/// sides' records of a frame can be matched.
+	pub frame_number: u32,
+	/// When the frame was captured, by the wall clock.
+	#[serde(serialize_with = "serialize_unix_secs")]
+	pub captured_at: std::time::SystemTime,
+	/// The color space of the captured content; `None` for a keyframe re-encoded without a new
+	/// capture.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub content: Option<FrameColorSpace>,
 	/// Time the frame spent waiting in the compositor's output channel.
 	#[serde(serialize_with = "serialize_secs")]
 	pub channel_wait: std::time::Duration,

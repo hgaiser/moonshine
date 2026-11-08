@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! {"type":"stream_started","generation":1,"stats_version":1,"width":1920,"height":1080,"fps":60,"bitrate":20000000,"codec":"hevc","dynamic_range":"sdr","chroma":"yuv420"}
-//! {"type":"frame","generation":1,"channel_wait":0.000041,"import":0.000028,"convert":0.00019,"submit":0.000035,"consumer_queue":0.000012,"encode_wait":0.00163,"gpu_encode":0.00112,"bitstream_ready":0.00145,"packetize":0.000022,"send":0.000048,"total":0.00201,"encoded_bytes":41666,"is_key_frame":false}
+//! {"type":"frame","generation":1,"frame_number":42,"captured_at":1793750400.5,"content":"srgb","channel_wait":0.000041,"import":0.000028,"convert":0.00019,"submit":0.000035,"consumer_queue":0.000012,"encode_wait":0.00163,"gpu_encode":0.00112,"bitstream_ready":0.00145,"packetize":0.000022,"send":0.000048,"total":0.00201,"encoded_bytes":41666,"is_key_frame":false}
 //! {"type":"stream_stopped","generation":1}
 //! {"type":"lagged","missed":12}
 //! ```
@@ -15,9 +15,12 @@
 //! messages; the current stream's `stream_started` (or `stream_stopped` between streams) follows
 //! it. `stream_started` carries `stats_version`, the format the stream's `frame` lines follow. A
 //! `frame` line is [`FrameStats`] written directly: its own field names, in declaration order,
-//! with every duration as seconds. Absent durations are omitted, which is how `gpu_encode` and
-//! `bitstream_ready` appear only when the video queue reports timestamps; both are parts of
-//! `encode_wait`, not extra stages.
+//! with every duration as seconds. `frame_number` is the frame index the client receives, so a
+//! reader can match the two sides' records of a frame; `captured_at` is when the frame was
+//! captured, in seconds since the Unix epoch; `content` is the captured content's color space,
+//! absent on a keyframe re-encoded without a new capture. Absent durations are omitted, which is
+//! how `gpu_encode` and `bitstream_ready` appear only when the video queue reports timestamps; both
+//! are parts of `encode_wait`, not extra stages.
 
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -327,6 +330,9 @@ mod tests {
 
 	fn stats() -> FrameStats {
 		FrameStats {
+			frame_number: 42,
+			captured_at: std::time::UNIX_EPOCH + Duration::from_millis(1_793_750_400_500),
+			content: Some(crate::session::stream::video::FrameColorSpace::Srgb),
 			channel_wait: Duration::from_micros(41),
 			import: Duration::from_micros(28),
 			convert: Duration::from_micros(190),
@@ -387,6 +393,7 @@ mod tests {
 		let mut without_gpu = stats();
 		without_gpu.gpu_encode = None;
 		without_gpu.bitstream_ready = None;
+		without_gpu.content = None;
 		let cases = [
 			(
 				Line::from(&started(1)),
@@ -394,15 +401,16 @@ mod tests {
 			),
 			(
 				Line::from(&frame(1)),
-				r#"{"type":"frame","generation":1,"channel_wait":0.000041,"import":0.000028,"convert":0.00019,"submit":0.000035,"consumer_queue":0.000012,"encode_wait":0.00163,"gpu_encode":0.00112,"bitstream_ready":0.00145,"packetize":0.000022,"send":0.000048,"total":0.00201,"encoded_bytes":41666,"is_key_frame":false}"#,
+				r#"{"type":"frame","generation":1,"frame_number":42,"captured_at":1793750400.5,"content":"srgb","channel_wait":0.000041,"import":0.000028,"convert":0.00019,"submit":0.000035,"consumer_queue":0.000012,"encode_wait":0.00163,"gpu_encode":0.00112,"bitstream_ready":0.00145,"packetize":0.000022,"send":0.000048,"total":0.00201,"encoded_bytes":41666,"is_key_frame":false}"#,
 			),
-			// Without GPU video queue timestamps, those two durations are left out.
+			// Without GPU video queue timestamps those two durations are left out, as is the content
+			// of a keyframe re-encoded without a new capture.
 			(
 				Line::Frame {
 					generation: 1,
 					stats: without_gpu,
 				},
-				r#"{"type":"frame","generation":1,"channel_wait":0.000041,"import":0.000028,"convert":0.00019,"submit":0.000035,"consumer_queue":0.000012,"encode_wait":0.00163,"packetize":0.000022,"send":0.000048,"total":0.00201,"encoded_bytes":41666,"is_key_frame":false}"#,
+				r#"{"type":"frame","generation":1,"frame_number":42,"captured_at":1793750400.5,"channel_wait":0.000041,"import":0.000028,"convert":0.00019,"submit":0.000035,"consumer_queue":0.000012,"encode_wait":0.00163,"packetize":0.000022,"send":0.000048,"total":0.00201,"encoded_bytes":41666,"is_key_frame":false}"#,
 			),
 			(Line::from(&stopped(1)), r#"{"type":"stream_stopped","generation":1}"#),
 			(Line::Lagged { missed: 12 }, r#"{"type":"lagged","missed":12}"#),
