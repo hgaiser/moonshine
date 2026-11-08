@@ -111,7 +111,7 @@ pub fn spawn(path: PathBuf, sessions: &SessionManager, shutdown: ShutdownManager
 	tracing::info!("Streaming video statistics on {}.", path.display());
 	let sessions = sessions.clone();
 	tokio::spawn(async move {
-		let accept = async move {
+		let accept = async {
 			loop {
 				match listener.accept().await {
 					Ok((stream, _)) => {
@@ -131,10 +131,12 @@ pub fn spawn(path: PathBuf, sessions: &SessionManager, shutdown: ShutdownManager
 		};
 		let _ = shutdown.wrap_cancel(accept).await;
 		// Only unlink the path if it is still the socket we bound. Another instance's socket at
-		// the same path is not ours to remove.
+		// the same path is not ours to remove. This happens while the listener is still open: it
+		// keeps our socket file's inode allocated, so no other file can have its number yet.
 		if owns(&path, dev, ino) {
 			let _ = std::fs::remove_file(&path);
 		}
+		drop(listener);
 	});
 	Ok(())
 }
@@ -149,7 +151,8 @@ struct BoundSocket {
 }
 
 /// Whether `path` is the socket file this instance bound, identified by the device and inode
-/// recorded when it was created. A socket bound at the same path by anyone else has other numbers.
+/// recorded when it was created. Only meaningful while our listener is open: once it closes, the
+/// inode can be freed and its number given to a new file, as ext4 readily does.
 fn owns(path: &Path, dev: u64, ino: u64) -> bool {
 	std::fs::symlink_metadata(path).is_ok_and(|meta| meta.dev() == dev && meta.ino() == ino)
 }
@@ -520,13 +523,17 @@ mod tests {
 		assert!(bind(&path).is_err());
 		assert!(owns(&path, first.dev, first.ino));
 
-		// Once the first instance's listener is gone its file is stale, as after a crash.
-		let (first_dev, first_ino) = (first.dev, first.ino);
-		drop(first);
+		// The path is removed from under the first instance and a second one binds it. The first
+		// instance's shutdown, which checks before closing its listener, must leave it alone.
+		std::fs::remove_file(&path).unwrap();
 		let second = bind(&path).unwrap();
-		// The first instance's shutdown must not unlink the second one's socket.
-		assert!(!owns(&path, first_dev, first_ino));
+		assert!(!owns(&path, first.dev, first.ino));
 		assert!(owns(&path, second.dev, second.ino));
+
+		// Once no listener is left the file is stale, as after a crash, and the next run replaces it.
+		drop(first);
+		drop(second);
+		assert!(bind(&path).is_ok());
 
 		let file = dir.path().join("not-a-socket");
 		std::fs::write(&file, "").unwrap();
