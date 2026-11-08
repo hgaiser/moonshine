@@ -128,36 +128,74 @@ fn keyframe_burst_bytes(bitrate: usize, fps: u32) -> usize {
 	bitrate / 8 / fps * KEYFRAME_BURST_FRAMES
 }
 
+/// Statistics line format a `frame` line follows. Version 1 is [`FrameStats`]'s fields in
+/// declaration order with their own names, every duration as seconds, absent durations omitted.
+pub const STATS_VERSION: u8 = 1;
+
+/// Writes a duration as seconds, the unit every duration in this format uses.
+fn serialize_secs<S: serde::Serializer>(duration: &std::time::Duration, serializer: S) -> Result<S::Ok, S::Error> {
+	serializer.serialize_f64(duration.as_secs_f64())
+}
+
+/// Writes an optional duration as seconds. Pair with `skip_serializing_if` so absent durations
+/// leave the record entirely.
+fn serialize_secs_opt<S: serde::Serializer>(
+	duration: &Option<std::time::Duration>,
+	serializer: S,
+) -> Result<S::Ok, S::Error> {
+	match duration {
+		Some(duration) => serialize_secs(duration, serializer),
+		None => serializer.serialize_none(),
+	}
+}
+
 /// Per-frame encoding statistics emitted by the video pipeline.
 ///
 /// Sent in `StreamEvent::Frame`.
-#[derive(Clone, Debug)]
+///
+/// This struct's serde representation is the statistics socket's wire format: fields are written
+/// with their own names in declaration order, durations as seconds, and an absent duration is
+/// omitted. A field added here is published on the socket by the same commit, so a field that must
+/// stay internal needs `#[serde(skip)]`. `src/stats_socket.rs` locks the resulting format.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FrameStats {
 	/// Time the frame spent waiting in the compositor's output channel.
+	#[serde(serialize_with = "serialize_secs")]
 	pub channel_wait: std::time::Duration,
 	/// Time spent importing the DMA-BUF into Vulkan.
+	#[serde(serialize_with = "serialize_secs")]
 	pub import: std::time::Duration,
 	/// Time spent on GPU color conversion.
+	#[serde(serialize_with = "serialize_secs")]
 	pub convert: std::time::Duration,
 	/// Time spent submitting the frame to the asynchronous encoder.
+	#[serde(serialize_with = "serialize_secs")]
 	pub submit: std::time::Duration,
 	/// Time between submit completion and the packet consumer awaiting the encode future.
+	#[serde(serialize_with = "serialize_secs")]
 	pub consumer_queue: std::time::Duration,
 	/// Elapsed wall time from submit completion until the consumer obtains the encoded packet.
 	/// Includes time queued before the consumer polls the encode future.
+	#[serde(serialize_with = "serialize_secs")]
 	pub encode_wait: std::time::Duration,
 	/// GPU video encode command duration, when the video queue supports timestamps.
-	/// This excludes conversion, queueing, and bitstream readback.
+	/// This excludes conversion, queueing, and bitstream readback, and is part of `encode_wait`.
+	#[serde(serialize_with = "serialize_secs_opt", skip_serializing_if = "Option::is_none")]
 	pub gpu_encode: Option<std::time::Duration>,
 	/// Pixelforge's wall time from encode submission until bitstream readback finishes.
 	/// Available when the video queue supports timestamps. This includes GPU
-	/// scheduling and readback, but not the consumer's post-completion scheduling.
+	/// scheduling and readback, but not the consumer's post-completion scheduling, and is part of
+	/// `encode_wait`.
+	#[serde(serialize_with = "serialize_secs_opt", skip_serializing_if = "Option::is_none")]
 	pub bitstream_ready: Option<std::time::Duration>,
 	/// Time spent packetizing the encoded data.
+	#[serde(serialize_with = "serialize_secs")]
 	pub packetize: std::time::Duration,
 	/// Time spent sending the packets over the channel.
+	#[serde(serialize_with = "serialize_secs")]
 	pub send: std::time::Duration,
 	/// Total end-to-end latency for this frame.
+	#[serde(serialize_with = "serialize_secs")]
 	pub total: std::time::Duration,
 	/// Number of bytes encoded for this frame.
 	pub encoded_bytes: usize,
@@ -168,14 +206,26 @@ pub struct FrameStats {
 /// A video stream's start, frames and end, in that order.
 ///
 /// Sent via `broadcast` channel, receivable through `SessionManager::bench_stats_receiver()`.
+/// Every event carries the `generation` of the stream it belongs to: a number that increases with
+/// each stream this session manager starts. A reader that missed events, or that joined a stream
+/// partway through, can place every event relative to the ones it has seen.
 #[derive(Clone, Debug)]
 pub enum StreamEvent {
 	/// The encoder for a new stream is ready.
-	Started(StreamInfo),
+	Started { generation: u64, info: StreamInfo },
 	/// A frame was encoded and sent.
-	Frame(FrameStats),
+	Frame { generation: u64, stats: FrameStats },
 	/// The stream ended, after its last frame.
-	Stopped,
+	Stopped { generation: u64 },
+}
+
+/// The video stream in progress, if any, and the generation of the most recent one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct StreamState {
+	/// The most recent stream's generation; 0 before the first stream.
+	pub generation: u64,
+	/// The stream in progress; `None` between streams.
+	pub info: Option<StreamInfo>,
 }
 
 /// The video stream as negotiated with the client.
@@ -376,6 +426,7 @@ pub(crate) struct VideoStream {
 	frames: CompositorFrames,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
+	stats_state: watch::Sender<StreamState>,
 }
 
 impl VideoStream {
@@ -386,6 +437,7 @@ impl VideoStream {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
+		stats_state: watch::Sender<StreamState>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 
@@ -403,6 +455,7 @@ impl VideoStream {
 			frames,
 			hdr_metadata_tx,
 			stats_tx,
+			stats_state,
 		})
 	}
 
@@ -419,6 +472,7 @@ impl VideoStream {
 			frames,
 			hdr_metadata_tx,
 			stats_tx,
+			stats_state,
 		} = self;
 
 		// Apply QoS to UDP socket.
@@ -477,6 +531,7 @@ impl VideoStream {
 			hdr_metadata_tx,
 			start.waiter(),
 			stats_tx,
+			stats_state,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 

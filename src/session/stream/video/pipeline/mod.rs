@@ -26,8 +26,8 @@ use crate::session::stream::StartWaiter;
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
-	FrameStats, StreamEvent, StreamInfo, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig,
-	VideoStreamContext,
+	FrameStats, StreamEvent, StreamInfo, StreamState, VideoChromaSampling, VideoDynamicRange, VideoFormat,
+	VideoStreamConfig, VideoStreamContext,
 };
 
 pub(crate) use dmabuf::KcmpProbe;
@@ -345,6 +345,7 @@ async fn run_packet_consumer(
 	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
 	packet_tx: mpsc::Sender<PacketBatch>,
 	stats_tx: broadcast::Sender<StreamEvent>,
+	generation: u64,
 	in_flight: Arc<AtomicUsize>,
 	idr_tx: broadcast::Sender<()>,
 	mut packetizer: Packetizer,
@@ -515,21 +516,24 @@ async fn run_packet_consumer(
 			is_key_frame,
 		});
 
-		let _ = stats_tx.send(StreamEvent::Frame(FrameStats {
-			channel_wait: frame_context.channel_wait,
-			import: frame_context.import,
-			convert: frame_context.convert,
-			submit: frame_context.submit,
-			consumer_queue: consumer_queue_dur,
-			encode_wait: encode_wait_dur,
-			gpu_encode,
-			bitstream_ready,
-			packetize: packetize_dur,
-			send: send_dur,
-			total,
-			encoded_bytes,
-			is_key_frame,
-		}));
+		let _ = stats_tx.send(StreamEvent::Frame {
+			generation,
+			stats: FrameStats {
+				channel_wait: frame_context.channel_wait,
+				import: frame_context.import,
+				convert: frame_context.convert,
+				submit: frame_context.submit,
+				consumer_queue: consumer_queue_dur,
+				encode_wait: encode_wait_dur,
+				gpu_encode,
+				bitstream_ready,
+				packetize: packetize_dur,
+				send: send_dur,
+				total,
+				encoded_bytes,
+				is_key_frame,
+			},
+		});
 
 		// Periodic summary every 5 seconds.
 		if last_summary_time.elapsed() >= std::time::Duration::from_secs(5) && !latency_samples.is_empty() {
@@ -556,6 +560,7 @@ impl VideoPipeline {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start: StartWaiter,
 		stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
+		stats_state: watch::Sender<StreamState>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -585,6 +590,7 @@ impl VideoPipeline {
 					hdr_metadata_tx,
 					start,
 					stats_tx,
+					stats_state,
 				);
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
@@ -593,12 +599,26 @@ impl VideoPipeline {
 	}
 }
 
-/// Sends `StreamEvent::Stopped` when dropped.
-struct StreamStoppedOnDrop(broadcast::Sender<StreamEvent>);
+/// Marks the stream ended and sends `StreamEvent::Stopped` when dropped, naming the stream.
+struct StreamStoppedOnDrop {
+	stats_tx: broadcast::Sender<StreamEvent>,
+	stats_state: watch::Sender<StreamState>,
+	generation: u64,
+}
 
 impl Drop for StreamStoppedOnDrop {
 	fn drop(&mut self) {
-		let _ = self.0.send(StreamEvent::Stopped);
+		// The state first, as for `Started`. A newer stream may already have replaced this one.
+		self.stats_state.send_if_modified(|state| {
+			let ours = state.generation == self.generation;
+			if ours {
+				state.info = None;
+			}
+			ours
+		});
+		let _ = self.stats_tx.send(StreamEvent::Stopped {
+			generation: self.generation,
+		});
 	}
 }
 
@@ -623,6 +643,7 @@ impl VideoPipelineInner {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		mut start: StartWaiter,
 		stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
+		stats_state: watch::Sender<StreamState>,
 	) {
 		tracing::debug!("Starting video pipeline.");
 
@@ -651,9 +672,22 @@ impl VideoPipelineInner {
 		};
 
 		// Stats readers learn the stream's parameters before its first frame, and that it ended
-		// once its last frame is sent, however the loop exits.
-		let _ = stats_tx.send(StreamEvent::Started(StreamInfo::from(&self.context)));
-		let _stopped = StreamStoppedOnDrop(stats_tx.clone());
+		// once its last frame is sent, however the loop exits. Every event this stream emits names
+		// it. The shared state is updated before each lifecycle event is broadcast, so a reader that
+		// subscribes and then reads the state sees every change one way or the other.
+		let info = StreamInfo::from(&self.context);
+		let mut generation = 0;
+		stats_state.send_modify(|state| {
+			state.generation += 1;
+			state.info = Some(info);
+			generation = state.generation;
+		});
+		let _ = stats_tx.send(StreamEvent::Started { generation, info });
+		let _stopped = StreamStoppedOnDrop {
+			stats_tx: stats_tx.clone(),
+			stats_state,
+			generation,
+		};
 
 		// Start the capture and encoding loop.
 		if let Err(e) = self.run_encoding_loop(
@@ -669,6 +703,7 @@ impl VideoPipelineInner {
 			stop_session_manager,
 			hdr_metadata_tx,
 			stats_tx,
+			generation,
 		) {
 			tracing::error!("Video encoding loop failed: {e}");
 		}
@@ -760,6 +795,7 @@ impl VideoPipelineInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
+		generation: u64,
 	) -> Result<(), String> {
 		let ctx = &self.context;
 
@@ -803,6 +839,7 @@ impl VideoPipelineInner {
 				frame_ctx_rx,
 				packet_tx,
 				stats_tx,
+				generation,
 				in_flight,
 				idr_tx.clone(),
 				packetizer,

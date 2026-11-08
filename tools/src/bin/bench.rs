@@ -695,8 +695,11 @@ async fn run_benchmark(
 			result = stats_rx.recv() => {
 				match result {
 					// The stream's start and end are clear from the session itself.
-					Ok(StreamEvent::Started(_) | StreamEvent::Stopped) => {},
-					Ok(StreamEvent::Frame(stats)) => {
+					Ok(StreamEvent::Started { .. } | StreamEvent::Stopped { .. }) => {},
+					Ok(StreamEvent::Frame {
+						stats,
+						..
+					}) => {
 						if Instant::now() >= warmup_deadline {
 							if args.verbose {
 								tracing::info!(
