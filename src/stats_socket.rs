@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! {"type":"stream_started","width":1920,"height":1080,"fps":60,"bitrate":20000000,"codec":"hevc","dynamic_range":"sdr","chroma":"yuv420"}
-//! {"type":"frame","frame_number":42,"captured_unix_us":1793750400000000,"content":"sdr","channel_wait_us":41,"import_us":28,"convert_us":190,"submit_us":35,"consumer_queue_us":12,"encode_wait_us":1630,"packetize_us":22,"send_us":48,"total_us":2010,"encoded_bytes":41666,"key_frame":false}
+//! {"type":"frame","channel_wait_us":41,"import_us":28,"convert_us":190,"submit_us":35,"consumer_queue_us":12,"encode_wait_us":1630,"packetize_us":22,"send_us":48,"total_us":2010,"encoded_bytes":41666,"key_frame":false}
 //! {"type":"stream_stopped"}
 //! {"type":"lagged","missed":12}
 //! ```
@@ -12,11 +12,7 @@
 //! A connection made during a stream starts with that stream's `stream_started`. `lagged` means
 //! the reader fell behind and missed that many messages; the current stream's `stream_started`
 //! (or `stream_stopped` between streams) follows it. The fields of `frame` are those of
-//! [`FrameStats`], in microseconds: `frame_number` is the frame index the client receives, so a
-//! reader can match the two sides' records of a frame, and `captured_unix_us` is when the frame was
-//! captured, in microseconds since the Unix epoch. `content` is the captured content's color space (`sdr`, `hdr10`
-//! or `scrgb`), absent on a keyframe re-encoded without a new capture, so a reader can count the stream's switches
-//! between them.
+//! [`FrameStats`], in microseconds.
 
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -29,7 +25,6 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{broadcast, watch};
 
 use crate::ShutdownReason;
-use crate::session::compositor::frame::FrameColorSpace;
 use crate::session::manager::SessionManager;
 use crate::session::stream::video::{FrameStats, StreamEvent, StreamInfo};
 
@@ -71,10 +66,6 @@ impl From<&StreamEvent> for Line {
 /// [`FrameStats`] as written: whole microseconds, with the unit in each name.
 #[derive(Debug, PartialEq, Serialize)]
 struct Frame {
-	frame_number: u32,
-	captured_unix_us: u64,
-	#[serde(skip_serializing_if = "Option::is_none")]
-	content: Option<&'static str>,
 	channel_wait_us: u64,
 	import_us: u64,
 	convert_us: u64,
@@ -94,13 +85,6 @@ impl From<&FrameStats> for Frame {
 			u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 		}
 		Frame {
-			frame_number: stats.frame_number,
-			content: stats.content.map(|c| match c {
-				FrameColorSpace::Srgb => "sdr",
-				FrameColorSpace::Bt2020Pq => "hdr10",
-				FrameColorSpace::ScrgbLinear => "scrgb",
-			}),
-			captured_unix_us: stats.captured_at.duration_since(std::time::UNIX_EPOCH).map_or(0, us),
 			channel_wait_us: us(stats.channel_wait),
 			import_us: us(stats.import),
 			convert_us: us(stats.convert),
@@ -244,9 +228,6 @@ mod tests {
 
 	fn frame(total_us: u64) -> FrameStats {
 		FrameStats {
-			frame_number: 42,
-			content: Some(FrameColorSpace::Srgb),
-			captured_at: std::time::UNIX_EPOCH + Duration::from_micros(1_793_750_400_000_000),
 			channel_wait: Duration::from_micros(41),
 			import: Duration::from_micros(28),
 			convert: Duration::from_micros(190),
@@ -280,7 +261,7 @@ mod tests {
 		let frame = serde_json::to_string(&Line::from(&StreamEvent::Frame(frame(2010)))).unwrap();
 		assert_eq!(
 			frame,
-			r#"{"type":"frame","frame_number":42,"captured_unix_us":1793750400000000,"content":"sdr","channel_wait_us":41,"import_us":28,"convert_us":190,"submit_us":35,"consumer_queue_us":12,"encode_wait_us":1630,"packetize_us":22,"send_us":48,"total_us":2010,"encoded_bytes":41666,"key_frame":false}"#
+			r#"{"type":"frame","channel_wait_us":41,"import_us":28,"convert_us":190,"submit_us":35,"consumer_queue_us":12,"encode_wait_us":1630,"packetize_us":22,"send_us":48,"total_us":2010,"encoded_bytes":41666,"key_frame":false}"#
 		);
 		assert_eq!(
 			serde_json::to_string(&Line::StreamStopped).unwrap(),

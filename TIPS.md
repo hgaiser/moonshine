@@ -242,4 +242,4 @@ Then read it, for example with `socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/moonshine/
 
 ### Details
 
-Every connection gets one JSON object per line: `stream_started` with the stream's resolution, frame rate, bitrate, codec, dynamic range and chroma, then a `frame` per encoded frame with its number (the frame index the client receives), when it was captured, the captured content's color space, and the time it spent in each pipeline stage, then `stream_stopped`. A connection made during a stream starts with that stream's `stream_started`. The socket is only accessible to the user Moonshine runs as, and the format is described in `src/stats_socket.rs`.
+Every connection gets one JSON object per line: `stream_started` with the stream's resolution, frame rate, bitrate, codec, dynamic range and chroma, then a `frame` per encoded frame with the time it spent in each pipeline stage, then `stream_stopped`. A connection made during a stream starts with that stream's `stream_started`. The socket is only accessible to the user Moonshine runs as, and the format is described in `src/stats_socket.rs`.

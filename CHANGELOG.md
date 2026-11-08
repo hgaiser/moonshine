@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- Update pixelforge to its single `Encoder::submit` API. The encoder converts each frame itself and its copy no longer waits on the CPU, which lowers capture-to-send latency by about 0.2 to 0.9 ms. A colour or format change of the captured frames reconfigures the encoder in one step.
+
+### Fixed
+
+- Re-encode the last frame, not the one before it, for an IDR request while no new frame arrives.
+
 ## [v0.16.1] - 13-09-2026
 
 ### Added

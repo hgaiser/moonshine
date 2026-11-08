@@ -69,11 +69,21 @@ pub struct VideoStreamConfig {
 	pub send_buffer_size: usize,
 }
 
-/// Smallest accepted packet size cap. Lower values would leave almost no room
-/// for payload after the 16-byte NV video header, so they are ignored.
+/// Smallest accepted packet size. Lower values would leave almost no room for
+/// payload after the 16-byte NV video header, so a lower cap is ignored and a
+/// smaller client request is rejected.
 const MIN_PACKET_SIZE: usize = 200;
+/// Largest accepted packet size, so one stream packet fits an IPv6 UDP datagram:
+/// 65_535 - 40 (IPv6) - 8 (UDP) - 16 (stream overhead). The packetizer sizes its
+/// buffers from the client's value, so an unbounded request could exhaust memory.
+const MAX_PACKET_SIZE: usize = 65_471;
 
 impl VideoStreamConfig {
+	/// Whether a negotiated packet size is safe to packetize with.
+	pub(crate) fn valid_packet_size(size: usize) -> bool {
+		(MIN_PACKET_SIZE..=MAX_PACKET_SIZE).contains(&size)
+	}
+
 	/// Clamp a client-requested video packet size to `max_packet_size`.
 	///
 	/// A client only asks for what it believes it can receive, so a request
@@ -123,10 +133,6 @@ fn keyframe_burst_bytes(bitrate: usize, fps: u32) -> usize {
 /// Sent in `StreamEvent::Frame`.
 #[derive(Clone, Debug)]
 pub struct FrameStats {
-	/// The frame's number on the wire (its frame index), which the client sees too.
-	pub frame_number: u32,
-	/// When the frame was captured, by the wall clock.
-	pub captured_at: std::time::SystemTime,
 	/// Time the frame spent waiting in the compositor's output channel.
 	pub channel_wait: std::time::Duration,
 	/// Time spent importing the DMA-BUF into Vulkan.
@@ -137,8 +143,16 @@ pub struct FrameStats {
 	pub submit: std::time::Duration,
 	/// Time between submit completion and the packet consumer awaiting the encode future.
 	pub consumer_queue: std::time::Duration,
-	/// Time from submit completion until the asynchronous encode/readback future has resolved.
+	/// Elapsed wall time from submit completion until the consumer obtains the encoded packet.
+	/// Includes time queued before the consumer polls the encode future.
 	pub encode_wait: std::time::Duration,
+	/// GPU video encode command duration, when the video queue supports timestamps.
+	/// This excludes conversion, queueing, and bitstream readback.
+	pub gpu_encode: Option<std::time::Duration>,
+	/// Pixelforge's wall time from encode submission until bitstream readback finishes.
+	/// Available when the video queue supports timestamps. This includes GPU
+	/// scheduling and readback, but not the consumer's post-completion scheduling.
+	pub bitstream_ready: Option<std::time::Duration>,
 	/// Time spent packetizing the encoded data.
 	pub packetize: std::time::Duration,
 	/// Time spent sending the packets over the channel.
@@ -149,8 +163,6 @@ pub struct FrameStats {
 	pub encoded_bytes: usize,
 	/// Whether this frame is a key (IDR) frame.
 	pub is_key_frame: bool,
-	/// The color space of the captured content; `None` for an IDR re-encode, which captured nothing.
-	pub(crate) content: Option<crate::session::compositor::frame::FrameColorSpace>,
 }
 
 /// A video stream's start, frames and end, in that order.
@@ -657,6 +669,18 @@ mod tests {
 			max_packet_size,
 			..Default::default()
 		}
+	}
+
+	#[test]
+	fn rejects_out_of_range_packet_sizes() {
+		assert!(!VideoStreamConfig::valid_packet_size(0));
+		assert!(!VideoStreamConfig::valid_packet_size(16));
+		assert!(!VideoStreamConfig::valid_packet_size(MIN_PACKET_SIZE - 1));
+		assert!(VideoStreamConfig::valid_packet_size(MIN_PACKET_SIZE));
+		assert!(VideoStreamConfig::valid_packet_size(1392));
+		assert!(VideoStreamConfig::valid_packet_size(MAX_PACKET_SIZE));
+		assert!(!VideoStreamConfig::valid_packet_size(MAX_PACKET_SIZE + 1));
+		assert!(!VideoStreamConfig::valid_packet_size(usize::MAX));
 	}
 
 	#[test]
