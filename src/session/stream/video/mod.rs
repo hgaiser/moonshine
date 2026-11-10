@@ -15,6 +15,8 @@ mod gso_socket;
 mod packetizer;
 mod pipeline;
 mod shard_batch;
+
+pub use crate::session::compositor::frame::FrameColorSpace;
 use gso_socket::UdpGsoSocket;
 pub(crate) use pipeline::KcmpProbe;
 use pipeline::{MAX_FRAMES_IN_FLIGHT, PacketBatch, VideoPipeline};
@@ -128,36 +130,91 @@ fn keyframe_burst_bytes(bitrate: usize, fps: u32) -> usize {
 	bitrate / 8 / fps * KEYFRAME_BURST_FRAMES
 }
 
+/// Statistics line format a `frame` line follows. Version 1 is [`FrameStats`]'s fields in
+/// declaration order with their own names, every duration as whole microseconds, absent durations
+/// omitted.
+pub const STATS_VERSION: u8 = 1;
+
+/// Writes a duration as whole microseconds, the unit every duration in this format uses.
+fn serialize_micros<S: serde::Serializer>(duration: &std::time::Duration, serializer: S) -> Result<S::Ok, S::Error> {
+	serializer.serialize_u64(u64::try_from(duration.as_micros()).unwrap_or(u64::MAX))
+}
+
+/// Writes an optional duration as whole microseconds. Pair with `skip_serializing_if` so absent
+/// durations leave the record entirely.
+fn serialize_micros_opt<S: serde::Serializer>(
+	duration: &Option<std::time::Duration>,
+	serializer: S,
+) -> Result<S::Ok, S::Error> {
+	match duration {
+		Some(duration) => serialize_micros(duration, serializer),
+		None => serializer.serialize_none(),
+	}
+}
+
+/// Writes a point in time as microseconds since the Unix epoch.
+fn serialize_unix_micros<S: serde::Serializer>(time: &std::time::SystemTime, serializer: S) -> Result<S::Ok, S::Error> {
+	let since_epoch = time.duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+	serialize_micros(&since_epoch, serializer)
+}
+
 /// Per-frame encoding statistics emitted by the video pipeline.
 ///
-/// Sent via `broadcast` channel, receivable through `SessionManager::bench_stats_receiver()`.
-#[derive(Clone, Debug)]
+/// Sent in `StreamEvent::Frame`.
+///
+/// This struct's serde representation is the statistics socket's wire format: fields are written
+/// with their own names in declaration order, durations as whole microseconds, and an absent duration is
+/// omitted. A field added here is published on the socket by the same commit, so a field that must
+/// stay internal needs `#[serde(skip)]`. `src/stats_socket.rs` locks the resulting format.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct FrameStats {
+	/// The frame's number on the wire (its frame index), which the client sees too, so the two
+	/// sides' records of a frame can be matched.
+	pub frame_number: u32,
+	/// When the frame was captured, by the wall clock.
+	#[serde(serialize_with = "serialize_unix_micros")]
+	pub captured_at: std::time::SystemTime,
+	/// The color space of the captured content; `None` for a keyframe re-encoded without a new
+	/// capture.
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub content: Option<FrameColorSpace>,
 	/// Time the frame spent waiting in the compositor's output channel.
+	#[serde(serialize_with = "serialize_micros")]
 	pub channel_wait: std::time::Duration,
 	/// Time spent importing the DMA-BUF into Vulkan.
+	#[serde(serialize_with = "serialize_micros")]
 	pub import: std::time::Duration,
 	/// Time spent on GPU color conversion.
+	#[serde(serialize_with = "serialize_micros")]
 	pub convert: std::time::Duration,
 	/// Time spent submitting the frame to the asynchronous encoder.
+	#[serde(serialize_with = "serialize_micros")]
 	pub submit: std::time::Duration,
 	/// Time between submit completion and the packet consumer awaiting the encode future.
+	#[serde(serialize_with = "serialize_micros")]
 	pub consumer_queue: std::time::Duration,
 	/// Elapsed wall time from submit completion until the consumer obtains the encoded packet.
 	/// Includes time queued before the consumer polls the encode future.
+	#[serde(serialize_with = "serialize_micros")]
 	pub encode_wait: std::time::Duration,
 	/// GPU video encode command duration, when the video queue supports timestamps.
-	/// This excludes conversion, queueing, and bitstream readback.
+	/// This excludes conversion, queueing, and bitstream readback, and is part of `encode_wait`.
+	#[serde(serialize_with = "serialize_micros_opt", skip_serializing_if = "Option::is_none")]
 	pub gpu_encode: Option<std::time::Duration>,
 	/// Pixelforge's wall time from encode submission until bitstream readback finishes.
 	/// Available when the video queue supports timestamps. This includes GPU
-	/// scheduling and readback, but not the consumer's post-completion scheduling.
+	/// scheduling and readback, but not the consumer's post-completion scheduling, and is part of
+	/// `encode_wait`.
+	#[serde(serialize_with = "serialize_micros_opt", skip_serializing_if = "Option::is_none")]
 	pub bitstream_ready: Option<std::time::Duration>,
 	/// Time spent packetizing the encoded data.
+	#[serde(serialize_with = "serialize_micros")]
 	pub packetize: std::time::Duration,
 	/// Time spent sending the packets over the channel.
+	#[serde(serialize_with = "serialize_micros")]
 	pub send: std::time::Duration,
 	/// Total end-to-end latency for this frame.
+	#[serde(serialize_with = "serialize_micros")]
 	pub total: std::time::Duration,
 	/// Number of bytes encoded for this frame.
 	pub encoded_bytes: usize,
@@ -165,7 +222,104 @@ pub struct FrameStats {
 	pub is_key_frame: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+/// A video stream's start, frames and end, in that order.
+///
+/// Receivable through `SessionManager::bench_stats_receiver()`.
+#[derive(Clone, Debug)]
+pub enum StreamEvent {
+	/// The encoder for a new stream is ready.
+	Started(StreamInfo),
+	/// A frame was encoded and sent.
+	Frame(FrameStats),
+	/// The stream ended, after its last frame.
+	Stopped,
+}
+
+/// Where the video pipeline sends its [`StreamEvent`]s. It also keeps the stream in progress, so
+/// a reader that joins partway through can be told what it missed.
+#[derive(Clone)]
+pub struct StatsSender {
+	events: broadcast::Sender<StreamEvent>,
+	/// The stream in progress. Locked while a stream's start or end is broadcast, and while a
+	/// reader reads it and subscribes, so a reader sees each start and end exactly once: in this,
+	/// or as an event.
+	current: Arc<std::sync::Mutex<Option<StreamInfo>>>,
+}
+
+impl StatsSender {
+	pub(crate) fn new(capacity: usize) -> Self {
+		Self {
+			events: broadcast::channel(capacity).0,
+			current: Default::default(),
+		}
+	}
+
+	/// Every event from now on.
+	pub(crate) fn subscribe(&self) -> broadcast::Receiver<StreamEvent> {
+		self.events.subscribe()
+	}
+
+	/// The stream in progress, if any, and every event after it.
+	pub(crate) fn join(&self) -> (Option<StreamInfo>, broadcast::Receiver<StreamEvent>) {
+		let current = self.lock_current();
+		(*current, self.events.subscribe())
+	}
+
+	pub(crate) fn started(&self, info: StreamInfo) {
+		let mut current = self.lock_current();
+		*current = Some(info);
+		let _ = self.events.send(StreamEvent::Started(info));
+	}
+
+	pub(crate) fn frame(&self, stats: FrameStats) {
+		let _ = self.events.send(StreamEvent::Frame(stats));
+	}
+
+	pub(crate) fn stopped(&self) {
+		let mut current = self.lock_current();
+		*current = None;
+		let _ = self.events.send(StreamEvent::Stopped);
+	}
+
+	fn lock_current(&self) -> std::sync::MutexGuard<'_, Option<StreamInfo>> {
+		self.current.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+}
+
+/// The video stream as negotiated with the client.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct StreamInfo {
+	/// Width in pixels.
+	pub width: u32,
+	/// Height in pixels.
+	pub height: u32,
+	/// Frames per second.
+	pub fps: u32,
+	/// Target bitrate in bits per second.
+	pub bitrate: usize,
+	#[serde(rename = "codec")]
+	pub video_format: VideoFormat,
+	pub dynamic_range: VideoDynamicRange,
+	#[serde(rename = "chroma")]
+	pub chroma_sampling_type: VideoChromaSampling,
+}
+
+impl From<&VideoStreamContext> for StreamInfo {
+	fn from(context: &VideoStreamContext) -> Self {
+		Self {
+			width: context.width,
+			height: context.height,
+			fps: context.fps,
+			bitrate: context.bitrate,
+			video_format: context.video_format,
+			dynamic_range: context.dynamic_range,
+			chroma_sampling_type: context.chroma_sampling_type,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VideoFormat {
 	#[default]
 	H264,
@@ -186,7 +340,8 @@ impl TryFrom<u32> for VideoFormat {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VideoDynamicRange {
 	#[default]
 	Sdr,
@@ -205,7 +360,8 @@ impl TryFrom<u32> for VideoDynamicRange {
 	}
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum VideoChromaSampling {
 	#[default]
 	Yuv420,
@@ -327,7 +483,7 @@ pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
 	frames: CompositorFrames,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
-	stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+	stats_tx: StatsSender,
 }
 
 impl VideoStream {
@@ -337,7 +493,7 @@ impl VideoStream {
 		frames: CompositorFrames,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: StatsSender,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video stream.");
 

@@ -14,6 +14,7 @@ See the [Configuration](../README.md#configuration) section of the README for th
 - [Run Flatpak Bottles inside Moonshine's compositor](#run-flatpak-bottles-inside-moonshines-compositor)
 - [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
 - [Debug a failing application](#debug-a-failing-application)
+- [Watch per-frame timings from another program](#watch-per-frame-timings-from-another-program)
 
 ## Close a desktop Steam before streaming Steam
 
@@ -225,3 +226,20 @@ You can also add `-e` to jump to the end of the log and `-f` to follow it live w
 By default Moonshine launches applications with `StandardOutput=null` and `StandardError=null`, so an application that fails to start produces no diagnostic output at all. Redirecting to the journal makes its stderr (where most crash output and backtraces land) visible, which is usually the fastest way to find out why the session failed to launch.
 
 These fields are also available on `[[application_scanner]]` configs for games launched through Steam/Lutris/Heroic. Instead of the journal you can also redirect to a file, e.g. `stdout = "file:/path/to/log.txt"`; any systemd `StandardOutput`/`StandardError` value (`journal`, `file:/path`, `append:/path`, `inherit`, ...) is accepted.
+
+## Watch per-frame timings from another program
+
+### How to
+
+Turn on the statistics socket in your configuration and restart Moonshine:
+
+```toml
+[stats]
+socket = "$XDG_RUNTIME_DIR/moonshine/stats.sock"
+```
+
+Then read it, for example with `socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/moonshine/stats.sock`.
+
+### Details
+
+Every connection gets one JSON object per line: `stream_started` with the statistics format version and the stream's resolution, frame rate, bitrate, codec, dynamic range and chroma, then a `frame` per encoded frame with its number (the frame index the client receives), when it was captured, the captured content's color space and the time it spent in each pipeline stage, then `stream_stopped`. A `frame` line is Moonshine's own per-frame statistics record, field names and all, with every duration in whole microseconds. `gpu_encode` and `bitstream_ready` appear only when the video queue reports timestamps, and are parts of `encode_wait` rather than extra stages. A connection made during a stream starts with that stream's `stream_started`. A reader that falls behind gets a `lagged` line saying how many messages it missed. The socket is only accessible to the user Moonshine runs as, and the format is described in `src/stats_socket.rs`.

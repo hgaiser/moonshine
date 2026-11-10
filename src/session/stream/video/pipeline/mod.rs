@@ -26,7 +26,8 @@ use crate::session::stream::StartWaiter;
 use crate::session::stream::video::packetizer::Packetizer;
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
-	FrameStats, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig, VideoStreamContext,
+	FrameStats, StatsSender, StreamInfo, VideoChromaSampling, VideoDynamicRange, VideoFormat, VideoStreamConfig,
+	VideoStreamContext,
 };
 
 pub(crate) use dmabuf::KcmpProbe;
@@ -257,6 +258,8 @@ struct FrameContext {
 	inject_hdr: bool,
 	/// HDR mastering metadata to inject, if any.
 	hdr_metadata: Option<HdrMetadata>,
+	/// The color space of the captured frame; `None` for the IDR re-encode path.
+	content: Option<FrameColorSpace>,
 }
 
 /// Message from the encoding thread to the packet consumer thread, in
@@ -343,7 +346,7 @@ impl Drop for InFlightGuard {
 async fn run_packet_consumer(
 	mut ctx_rx: mpsc::Receiver<ConsumerMessage>,
 	packet_tx: mpsc::Sender<PacketBatch>,
-	stats_tx: broadcast::Sender<FrameStats>,
+	stats_tx: StatsSender,
 	in_flight: Arc<AtomicUsize>,
 	idr_tx: broadcast::Sender<()>,
 	mut packetizer: Packetizer,
@@ -514,7 +517,10 @@ async fn run_packet_consumer(
 			is_key_frame,
 		});
 
-		let _ = stats_tx.send(FrameStats {
+		stats_tx.frame(FrameStats {
+			frame_number,
+			captured_at: std::time::SystemTime::now() - frame_context.created_at.elapsed(),
+			content: frame_context.content,
 			channel_wait: frame_context.channel_wait,
 			import: frame_context.import,
 			convert: frame_context.convert,
@@ -554,7 +560,7 @@ impl VideoPipeline {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start: StartWaiter,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: StatsSender,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -592,6 +598,15 @@ impl VideoPipeline {
 	}
 }
 
+/// Tells statistics readers the stream ended when dropped.
+struct StreamStoppedOnDrop(StatsSender);
+
+impl Drop for StreamStoppedOnDrop {
+	fn drop(&mut self) {
+		self.0.stopped();
+	}
+}
+
 struct VideoPipelineInner {
 	config: VideoStreamConfig,
 	context: VideoStreamContext,
@@ -612,7 +627,7 @@ impl VideoPipelineInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		mut start: StartWaiter,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: StatsSender,
 	) {
 		tracing::debug!("Starting video pipeline.");
 
@@ -639,6 +654,12 @@ impl VideoPipelineInner {
 				return;
 			},
 		};
+
+		// Stats readers learn the stream's parameters before its first frame, and that it ended
+		// once its last frame is sent, however the loop exits. The session doesn't finish stopping
+		// until this thread is done, so the next stream starts after this one has stopped.
+		stats_tx.started(StreamInfo::from(&self.context));
+		let _stopped = StreamStoppedOnDrop(stats_tx.clone());
 
 		// Start the capture and encoding loop.
 		if let Err(e) = self.run_encoding_loop(
@@ -744,7 +765,7 @@ impl VideoPipelineInner {
 		mut reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
-		stats_tx: tokio::sync::broadcast::Sender<FrameStats>,
+		stats_tx: StatsSender,
 	) -> Result<(), String> {
 		let ctx = &self.context;
 
@@ -927,6 +948,7 @@ impl VideoPipelineInner {
 									submitted_at,
 									inject_hdr,
 									hdr_metadata: last_hdr_state.metadata,
+									content: None,
 								};
 								// Count this frame in flight; released when the network sender takes
 								// it or the consumer drops it.
@@ -1063,9 +1085,10 @@ impl VideoPipelineInner {
 				// BT.2020+PQ, with dynamic VUI switching in the encoder. scRGB's and
 				// SDR's reference whites are pixelforge's per-source defaults (80 and
 				// 203 nits).
+				let content = color_space(&frame.info.colour);
 				let (frame_source, stream_color) = match ctx.dynamic_range {
 					VideoDynamicRange::Sdr => session_colors(ctx.dynamic_range, ctx.full_range),
-					VideoDynamicRange::Hdr => frame_colors(color_space(&frame.info.colour), ctx.full_range),
+					VideoDynamicRange::Hdr => frame_colors(content, ctx.full_range),
 				};
 				let was_hdr = is_hdr(&encoder);
 				encoder
@@ -1138,6 +1161,7 @@ impl VideoPipelineInner {
 							submitted_at: t4_encoded,
 							inject_hdr,
 							hdr_metadata: last_hdr_state.metadata,
+							content: Some(content),
 						};
 						// Count this frame in flight; released when the network sender takes
 						// it or the consumer drops it.
