@@ -3,24 +3,23 @@
 //! Enabled by setting `socket` in the configuration's `[stats]` table. Every connection receives:
 //!
 //! ```text
-//! {"type":"stream_started","generation":1,"stats_version":1,"width":1920,"height":1080,"fps":60,"bitrate":20000000,"codec":"hevc","dynamic_range":"sdr","chroma":"yuv420"}
-//! {"type":"frame","generation":1,"frame_number":42,"captured_at":1793750400.5,"content":"srgb","channel_wait":0.000041,"import":0.000028,"convert":0.00019,"submit":0.000035,"consumer_queue":0.000012,"encode_wait":0.00163,"gpu_encode":0.00112,"bitstream_ready":0.00145,"packetize":0.000022,"send":0.000048,"total":0.00201,"encoded_bytes":41666,"is_key_frame":false}
-//! {"type":"stream_stopped","generation":1}
+//! {"type":"stream_started","stats_version":1,"width":1920,"height":1080,"fps":60,"bitrate":20000000,"codec":"hevc","dynamic_range":"sdr","chroma":"yuv420"}
+//! {"type":"frame","frame_number":42,"captured_at":1793750400500000,"content":"srgb","channel_wait":41,"import":28,"convert":190,"submit":35,"consumer_queue":12,"encode_wait":1630,"gpu_encode":1120,"bitstream_ready":1450,"packetize":22,"send":48,"total":2010,"encoded_bytes":41666,"is_key_frame":false}
+//! {"type":"stream_stopped"}
 //! {"type":"lagged","missed":12}
 //! ```
 //!
-//! A connection starts with the current stream's `stream_started`, or `stream_stopped` naming the
-//! last stream when none is in progress. `generation` names the stream a line belongs to and
-//! increases with every stream. `lagged` means the reader fell behind and missed that many
-//! messages; the current stream's `stream_started` (or `stream_stopped` between streams) follows
-//! it. `stream_started` carries `stats_version`, the format the stream's `frame` lines follow. A
-//! `frame` line is [`FrameStats`] written directly: its own field names, in declaration order,
-//! with every duration as seconds. `frame_number` is the frame index the client receives, so a
-//! reader can match the two sides' records of a frame; `captured_at` is when the frame was
-//! captured, in seconds since the Unix epoch; `content` is the captured content's color space,
-//! absent on a keyframe re-encoded without a new capture. Absent durations are omitted, which is
-//! how `gpu_encode` and `bitstream_ready` appear only when the video queue reports timestamps; both
-//! are parts of `encode_wait`, not extra stages.
+//! A connection made during a stream starts with that stream's `stream_started`; after that it
+//! gets every event as it happens. `lagged` means the reader fell behind and missed that many
+//! messages, which may include a stream's start or end. `stream_started` carries `stats_version`,
+//! the format the stream's `frame` lines follow. A `frame` line is [`FrameStats`] written directly:
+//! its own field names, in declaration order, with every duration as whole microseconds.
+//! `frame_number` is the frame index the client receives, so a reader can match the two sides'
+//! records of a frame; `captured_at` is when the frame was captured, in microseconds since the Unix
+//! epoch; `content` is the captured content's color space, absent on a keyframe re-encoded without
+//! a new capture. Absent durations are omitted, which is how `gpu_encode` and `bitstream_ready`
+//! appear only when the video queue reports timestamps; both are parts of `encode_wait`, not extra
+//! stages.
 
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
@@ -30,11 +29,11 @@ use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncWriteExt;
 use tokio::net::{UnixListener, UnixStream};
-use tokio::sync::{broadcast, watch};
+use tokio::sync::broadcast;
 
 use crate::ShutdownReason;
 use crate::session::manager::SessionManager;
-use crate::session::stream::video::{FrameStats, STATS_VERSION, StreamEvent, StreamInfo, StreamState};
+use crate::session::stream::video::{FrameStats, STATS_VERSION, StreamEvent, StreamInfo};
 
 /// The `[stats]` table of the configuration.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -52,57 +51,36 @@ impl StatsConfig {
 }
 
 /// One line on the socket.
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Debug, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum Line {
 	StreamStarted {
-		generation: u64,
 		stats_version: u8,
 		#[serde(flatten)]
 		info: StreamInfo,
 	},
-	Frame {
-		generation: u64,
-		#[serde(flatten)]
-		stats: FrameStats,
-	},
-	StreamStopped {
-		generation: u64,
-	},
+	Frame(FrameStats),
+	StreamStopped,
 	Lagged {
 		missed: u64,
 	},
 }
 
-impl From<&StreamState> for Line {
-	fn from(state: &StreamState) -> Self {
-		match state.info {
-			Some(info) => Line::from(&StreamEvent::Started {
-				generation: state.generation,
-				info,
-			}),
-			None => Line::StreamStopped {
-				generation: state.generation,
-			},
+impl Line {
+	fn started(info: StreamInfo) -> Self {
+		Line::StreamStarted {
+			stats_version: STATS_VERSION,
+			info,
 		}
 	}
 }
 
-impl From<&StreamEvent> for Line {
-	fn from(event: &StreamEvent) -> Self {
+impl From<StreamEvent> for Line {
+	fn from(event: StreamEvent) -> Self {
 		match event {
-			StreamEvent::Started { generation, info } => Line::StreamStarted {
-				generation: *generation,
-				stats_version: STATS_VERSION,
-				info: *info,
-			},
-			StreamEvent::Frame { generation, stats } => Line::Frame {
-				generation: *generation,
-				stats: stats.clone(),
-			},
-			StreamEvent::Stopped { generation } => Line::StreamStopped {
-				generation: *generation,
-			},
+			StreamEvent::Started(info) => Line::started(info),
+			StreamEvent::Frame(stats) => Line::Frame(stats),
+			StreamEvent::Stopped => Line::StreamStopped,
 		}
 	}
 }
@@ -118,12 +96,8 @@ pub fn spawn(path: PathBuf, sessions: &SessionManager, shutdown: ShutdownManager
 			loop {
 				match listener.accept().await {
 					Ok((stream, _)) => {
-						// Subscribe before reading the current stream: the pipeline updates the
-						// state before broadcasting, so every change reaches this reader one way
-						// or the other.
-						let events = sessions.bench_stats_receiver();
-						let current = sessions.stats_state_receiver();
-						tokio::spawn(serve(stream, events, current));
+						let (current, events) = sessions.join_stats();
+						tokio::spawn(serve(stream, current, events));
 					},
 					Err(e) => {
 						tracing::warn!("Failed to accept a statistics connection: {e}");
@@ -229,76 +203,22 @@ fn listener_is_live(path: &Path) -> bool {
 	}
 }
 
-/// Which lines one reader gets: the stream it joined at, then every event except those it has in
-/// effect been told already.
-///
-/// The reader's event subscription is made before the state it joins at is read. An event the
-/// pipeline broadcast before that read is then already in the state, and one broadcast after is
-/// received; a change landing in between arrives both ways, and is written once. Events for a
-/// stream older than the one the reader was last told about are dropped.
-struct Reader {
-	/// The latest stream this reader has been told about, and whether it is still running.
-	told: StreamState,
-}
-
-impl Reader {
-	/// Join at `state`, with the line announcing it.
-	fn join(state: StreamState) -> (Self, Line) {
-		(Self { told: state }, Line::from(&state))
+/// Write statistics to one connection until it closes: the stream in progress, if any, then
+/// every event after it.
+async fn serve(mut stream: UnixStream, current: Option<StreamInfo>, mut events: broadcast::Receiver<StreamEvent>) {
+	if let Some(info) = current
+		&& write(&mut stream, &Line::started(info)).await.is_err()
+	{
+		return;
 	}
-
-	fn event(&mut self, event: &StreamEvent) -> Option<Line> {
-		let told = self.told;
-		let fresh = match *event {
-			StreamEvent::Started { generation, info } => {
-				let fresh = generation > told.generation;
-				if fresh {
-					self.told = StreamState {
-						generation,
-						info: Some(info),
-					};
-				}
-				fresh
-			},
-			StreamEvent::Frame { generation, .. } => generation == told.generation && told.info.is_some(),
-			StreamEvent::Stopped { generation } => {
-				let fresh = generation > told.generation || (generation == told.generation && told.info.is_some());
-				if fresh {
-					self.told = StreamState { generation, info: None };
-				}
-				fresh
-			},
-		};
-		fresh.then(|| Line::from(event))
-	}
-
-	/// The reader fell behind by `missed` events, which may include a stream starting or stopping:
-	/// say so, then where things are now.
-	fn lagged(&mut self, missed: u64, state: StreamState) -> [Line; 2] {
-		self.told = state;
-		[Line::Lagged { missed }, Line::from(&state)]
-	}
-}
-
-/// Write statistics to one connection until it closes, starting with the stream in progress.
-/// `events` must be subscribed before `current` is read; see [`Reader`].
-async fn serve(
-	mut stream: UnixStream,
-	mut events: broadcast::Receiver<StreamEvent>,
-	current: watch::Receiver<StreamState>,
-) {
-	let (mut reader, first) = Reader::join(*current.borrow());
-	let mut lines = vec![first];
 	loop {
-		for line in lines.drain(..) {
-			if write(&mut stream, &line).await.is_err() {
-				return;
-			}
-		}
-		match events.recv().await {
-			Ok(event) => lines.extend(reader.event(&event)),
-			Err(broadcast::error::RecvError::Lagged(missed)) => lines.extend(reader.lagged(missed, *current.borrow())),
+		let line = match events.recv().await {
+			Ok(event) => Line::from(event),
+			Err(broadcast::error::RecvError::Lagged(missed)) => Line::Lagged { missed },
 			Err(broadcast::error::RecvError::Closed) => return,
+		};
+		if write(&mut stream, &line).await.is_err() {
+			return;
 		}
 	}
 }
@@ -314,7 +234,7 @@ mod tests {
 	use tokio::io::{AsyncBufReadExt, BufReader};
 
 	use super::*;
-	use crate::session::stream::video::{VideoChromaSampling, VideoDynamicRange, VideoFormat};
+	use crate::session::stream::video::{StatsSender, VideoChromaSampling, VideoDynamicRange, VideoFormat};
 
 	fn info() -> StreamInfo {
 		StreamInfo {
@@ -349,35 +269,6 @@ mod tests {
 		}
 	}
 
-	fn started(generation: u64) -> StreamEvent {
-		StreamEvent::Started {
-			generation,
-			info: info(),
-		}
-	}
-
-	fn frame(generation: u64) -> StreamEvent {
-		StreamEvent::Frame {
-			generation,
-			stats: stats(),
-		}
-	}
-
-	fn stopped(generation: u64) -> StreamEvent {
-		StreamEvent::Stopped { generation }
-	}
-
-	fn live(generation: u64) -> StreamState {
-		StreamState {
-			generation,
-			info: Some(info()),
-		}
-	}
-
-	fn idle(generation: u64) -> StreamState {
-		StreamState { generation, info: None }
-	}
-
 	#[test]
 	fn configured_in_a_stats_table_and_absent_by_default() {
 		let config: crate::config::Config =
@@ -396,23 +287,20 @@ mod tests {
 		without_gpu.content = None;
 		let cases = [
 			(
-				Line::from(&started(1)),
-				r#"{"type":"stream_started","generation":1,"stats_version":1,"width":1920,"height":1080,"fps":60,"bitrate":20000000,"codec":"hevc","dynamic_range":"sdr","chroma":"yuv420"}"#,
+				Line::started(info()),
+				r#"{"type":"stream_started","stats_version":1,"width":1920,"height":1080,"fps":60,"bitrate":20000000,"codec":"hevc","dynamic_range":"sdr","chroma":"yuv420"}"#,
 			),
 			(
-				Line::from(&frame(1)),
-				r#"{"type":"frame","generation":1,"frame_number":42,"captured_at":1793750400.5,"content":"srgb","channel_wait":0.000041,"import":0.000028,"convert":0.00019,"submit":0.000035,"consumer_queue":0.000012,"encode_wait":0.00163,"gpu_encode":0.00112,"bitstream_ready":0.00145,"packetize":0.000022,"send":0.000048,"total":0.00201,"encoded_bytes":41666,"is_key_frame":false}"#,
+				Line::Frame(stats()),
+				r#"{"type":"frame","frame_number":42,"captured_at":1793750400500000,"content":"srgb","channel_wait":41,"import":28,"convert":190,"submit":35,"consumer_queue":12,"encode_wait":1630,"gpu_encode":1120,"bitstream_ready":1450,"packetize":22,"send":48,"total":2010,"encoded_bytes":41666,"is_key_frame":false}"#,
 			),
 			// Without GPU video queue timestamps those two durations are left out, as is the content
 			// of a keyframe re-encoded without a new capture.
 			(
-				Line::Frame {
-					generation: 1,
-					stats: without_gpu,
-				},
-				r#"{"type":"frame","generation":1,"frame_number":42,"captured_at":1793750400.5,"channel_wait":0.000041,"import":0.000028,"convert":0.00019,"submit":0.000035,"consumer_queue":0.000012,"encode_wait":0.00163,"packetize":0.000022,"send":0.000048,"total":0.00201,"encoded_bytes":41666,"is_key_frame":false}"#,
+				Line::Frame(without_gpu),
+				r#"{"type":"frame","frame_number":42,"captured_at":1793750400500000,"channel_wait":41,"import":28,"convert":190,"submit":35,"consumer_queue":12,"encode_wait":1630,"packetize":22,"send":48,"total":2010,"encoded_bytes":41666,"is_key_frame":false}"#,
 			),
-			(Line::from(&stopped(1)), r#"{"type":"stream_stopped","generation":1}"#),
+			(Line::StreamStopped, r#"{"type":"stream_stopped"}"#),
 			(Line::Lagged { missed: 12 }, r#"{"type":"lagged","missed":12}"#),
 		];
 		for (line, expected) in cases {
@@ -420,103 +308,44 @@ mod tests {
 		}
 	}
 
-	/// What a reader is handed after joining.
-	enum Step {
-		Event(StreamEvent),
-		/// The reader fell behind by this many events; the state is what it reads afterwards.
-		Lag(u64, StreamState),
-	}
-	use Step::{Event as E, Lag};
-
-	/// A line as `S`, `F` or `X` (started, frame, stopped) plus its stream's generation, or `L`
-	/// plus the number missed.
-	fn short(line: &Line) -> String {
-		match line {
-			Line::StreamStarted { generation, .. } => format!("S{generation}"),
-			Line::Frame { generation, .. } => format!("F{generation}"),
-			Line::StreamStopped { generation } => format!("X{generation}"),
-			Line::Lagged { missed } => format!("L{missed}"),
-		}
-	}
-
 	#[test]
-	fn a_reader_is_told_each_stream_once_and_in_order() {
-		let cases: Vec<(&str, StreamState, Vec<Step>, &[&str])> = vec![
-			(
-				"joins mid-stream",
-				live(1),
-				vec![E(frame(1)), E(frame(1)), E(stopped(1))],
-				&["S1", "F1", "F1", "X1"],
-			),
-			(
-				"joins before any stream",
-				idle(0),
-				vec![E(started(1)), E(frame(1))],
-				&["X0", "S1", "F1"],
-			),
-			(
-				"a stream starts as it joins: the state and the event both say so",
-				live(1),
-				vec![E(started(1)), E(frame(1))],
-				&["S1", "F1"],
-			),
-			(
-				"a stream stops as it joins: its last frame and its end are stale",
-				idle(1),
-				vec![E(frame(1)), E(stopped(1)), E(started(2))],
-				&["X1", "S2"],
-			),
-			(
-				"an older stream's tail arrives after the next one started",
-				live(2),
-				vec![E(frame(1)), E(stopped(1)), E(frame(2))],
-				&["S2", "F2"],
-			),
-			(
-				"falls behind across streams and is re-anchored to the live one",
-				live(1),
-				vec![E(frame(1)), Lag(7, live(3)), E(frame(3)), E(stopped(3))],
-				&["S1", "F1", "L7", "S3", "F3", "X3"],
-			),
-			(
-				"falls behind and a stream ended meanwhile",
-				live(1),
-				vec![Lag(5, idle(2)), E(frame(2)), E(started(3))],
-				&["S1", "L5", "X2", "S3"],
-			),
-		];
-		for (name, joined, steps, expected) in cases {
-			let (mut reader, first) = Reader::join(joined);
-			let mut lines = vec![first];
-			for step in steps {
-				match step {
-					E(event) => lines.extend(reader.event(&event)),
-					Lag(missed, state) => lines.extend(reader.lagged(missed, state)),
-				}
-			}
-			assert_eq!(lines.iter().map(short).collect::<Vec<_>>(), expected, "{name}");
-		}
+	fn a_reader_is_told_of_a_start_either_on_joining_or_as_an_event_never_both() {
+		let sender = StatsSender::new(4);
+		let (current, mut before) = sender.join();
+		assert_eq!(current, None);
+		sender.started(info());
+		let (current, mut during) = sender.join();
+		assert_eq!(current, Some(info()));
+		assert!(matches!(before.try_recv(), Ok(StreamEvent::Started(_))));
+		assert!(during.try_recv().is_err());
+
+		sender.stopped();
+		let (current, mut after) = sender.join();
+		assert_eq!(current, None);
+		assert!(matches!(during.try_recv(), Ok(StreamEvent::Stopped)));
+		assert!(after.try_recv().is_err());
 	}
 
 	#[tokio::test]
-	async fn a_connection_receives_json_lines_and_recovers_from_falling_behind() {
-		// Three frames into room for two: the reader has missed one before it starts. Nothing is
+	async fn a_connection_gets_the_stream_in_progress_then_its_events() {
+		// Three events into room for two: the reader has missed one before it starts. Nothing is
 		// sent once it runs, so how far behind it is can't race the test.
-		let (events_tx, events) = broadcast::channel(2);
-		for _ in 0..3 {
-			events_tx.send(frame(1)).unwrap();
-		}
-		let (_current_tx, current) = watch::channel(live(1));
+		let sender = StatsSender::new(2);
+		sender.started(info());
+		let (current, events) = sender.join();
+		sender.frame(stats());
+		sender.frame(stats());
+		sender.stopped();
 		let (client, server) = UnixStream::pair().unwrap();
-		tokio::spawn(serve(server, events, current));
+		tokio::spawn(serve(server, current, events));
 
 		let mut lines = BufReader::new(client).lines();
 		let mut types = Vec::new();
-		for _ in 0..5 {
+		for _ in 0..4 {
 			let line: serde_json::Value = serde_json::from_str(&lines.next_line().await.unwrap().unwrap()).unwrap();
 			types.push(line["type"].as_str().unwrap().to_string());
 		}
-		assert_eq!(types, ["stream_started", "lagged", "stream_started", "frame", "frame"]);
+		assert_eq!(types, ["stream_started", "lagged", "frame", "stream_stopped"]);
 	}
 
 	#[tokio::test]

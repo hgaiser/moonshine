@@ -17,7 +17,7 @@ use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStreamConfig;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
-use crate::session::stream::video::{StreamEvent, StreamState};
+use crate::session::stream::video::{StatsSender, StreamEvent, StreamInfo};
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
@@ -85,11 +85,7 @@ struct SessionManagerInner {
 	audio_stream_context: Option<AudioStreamContext>,
 
 	/// Broadcast sender for per-frame encoding statistics.
-	stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
-
-	/// The video stream in progress and the most recent stream's generation, kept by the video
-	/// pipeline alongside the events it broadcasts on `stats_tx`.
-	stats_state: watch::Sender<StreamState>,
+	stats_tx: StatsSender,
 
 	/// Watchdog task for monitoring unexpected session shutdowns.
 	stop_watcher: Option<tokio::task::JoinHandle<()>>,
@@ -148,8 +144,7 @@ impl Drop for SessionManagerInner {
 #[derive(Clone)]
 pub struct SessionManager {
 	inner: Arc<Mutex<SessionManagerInner>>,
-	stats_tx: broadcast::Sender<StreamEvent>,
-	stats_state: watch::Sender<StreamState>,
+	stats_tx: StatsSender,
 }
 
 impl SessionManager {
@@ -182,8 +177,7 @@ impl SessionManager {
 			keys_tx: None,
 			video_stream_context: None,
 			audio_stream_context: None,
-			stats_tx: tokio::sync::broadcast::channel(256).0,
-			stats_state: watch::channel(StreamState::default()).0,
+			stats_tx: StatsSender::new(256),
 			stop_watcher: None,
 			video_start: None,
 			audio_start: None,
@@ -193,14 +187,9 @@ impl SessionManager {
 		};
 
 		let stats_tx = inner.stats_tx.clone();
-		let stats_state = inner.stats_state.clone();
 		let inner = Arc::new(Mutex::new(inner));
 
-		Ok(Self {
-			inner,
-			stats_tx,
-			stats_state,
-		})
+		Ok(Self { inner, stats_tx })
 	}
 
 	/// Returns a receiver for video statistics: each stream's start with its parameters, every
@@ -212,13 +201,12 @@ impl SessionManager {
 		self.stats_tx.subscribe()
 	}
 
-	/// Returns the video stream in progress, if any, and the most recent stream's generation.
+	/// Returns the video stream in progress, if any, and a receiver for every event after it.
 	///
-	/// The pipeline updates this before broadcasting the matching `StreamEvent`, so a reader that
-	/// subscribes to `bench_stats_receiver()` first and then reads this misses nothing: an event
-	/// it doesn't receive is already reflected here.
-	pub fn stats_state_receiver(&self) -> watch::Receiver<StreamState> {
-		self.stats_state.subscribe()
+	/// Joining partway through a stream, the stream's start comes from the first and everything
+	/// after it from the second, with nothing missed or repeated.
+	pub fn join_stats(&self) -> (Option<StreamInfo>, broadcast::Receiver<StreamEvent>) {
+		self.stats_tx.join()
 	}
 
 	/// Trigger the video and audio pipelines to start encoding.
@@ -301,7 +289,6 @@ impl SessionManager {
 		let address = guard.address.clone();
 		let stop = guard.stop.clone();
 		let stats_tx = guard.stats_tx.clone();
-		let stats_state = guard.stats_state.clone();
 		let session = InitializedSession::new(
 			compositor_config,
 			video_config,
@@ -311,7 +298,6 @@ impl SessionManager {
 			context,
 			stop,
 			stats_tx,
-			stats_state,
 		)
 		.await?;
 		guard.session = Some(SessionState::Initialized(session));

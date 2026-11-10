@@ -11,10 +11,10 @@ use crate::session::stream::audio::AudioStream;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStream;
 use crate::session::stream::control::ControlStreamContext;
+use crate::session::stream::video::StatsSender;
 use crate::session::stream::video::VideoStream;
 use crate::session::stream::video::VideoStreamContext;
 use crate::session::stream::video::VideoStreamHandle;
-use crate::session::stream::video::{StreamEvent, StreamState};
 
 use self::application::Application;
 use self::application::ApplicationConfig;
@@ -149,8 +149,7 @@ impl InitializedSession {
 		address: String,
 		context: SessionContext,
 		stop: ShutdownManager<SessionShutdownReason>,
-		stats_tx: tokio::sync::broadcast::Sender<StreamEvent>,
-		stats_state: watch::Sender<StreamState>,
+		stats_tx: StatsSender,
 	) -> Result<Self, ()> {
 		// Create HDR metadata watch channel.
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
@@ -165,7 +164,6 @@ impl InitializedSession {
 			hdr_metadata_tx,
 			stop.clone(),
 			stats_tx,
-			stats_state,
 		)
 		.await?;
 		let control_stream = ControlStream::new(control_config, address, handles.input, stop.clone())?;
