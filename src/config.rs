@@ -52,6 +52,48 @@ pub struct Config {
 	/// Statistics for monitoring and benchmark tools.
 	#[serde(default, skip_serializing_if = "StatsConfig::is_default")]
 	pub stats: StatsConfig,
+
+	/// Titles of scanned applications that clients don't see.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub hidden_applications: Vec<String>,
+
+	/// The web control panel.
+	#[serde(default)]
+	pub ui: UiConfig,
+}
+
+/// The `[ui]` table: the web control panel.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UiConfig {
+	/// Whether to serve the control panel.
+	pub enabled: bool,
+
+	/// Port of the control panel.
+	pub port: u16,
+
+	/// Address ranges (CIDR) that can open the control panel.
+	///
+	/// Anyone in these ranges can change the configuration and add applications, which run
+	/// commands as the user Moonshine runs as. Only loopback is allowed by default.
+	pub allowed_networks: Vec<String>,
+
+	/// More host names the control panel can be opened by, such as the name of a reverse proxy.
+	///
+	/// The IP addresses, `localhost` and this computer's own name always work. Other names are
+	/// refused, so that a website cannot reach the control panel by DNS rebinding.
+	pub allowed_hosts: Vec<String>,
+}
+
+impl Default for UiConfig {
+	fn default() -> Self {
+		Self {
+			enabled: true,
+			port: 47990,
+			allowed_networks: vec!["127.0.0.1/32".to_string(), "::1/128".to_string()],
+			allowed_hosts: Vec::new(),
+		}
+	}
 }
 
 fn default_inhibit_sleep() -> bool {
@@ -149,6 +191,8 @@ impl Default for Config {
 			compositor: CompositorConfig::default(),
 			inhibit_sleep: true,
 			stats: StatsConfig::default(),
+			hidden_applications: Vec::new(),
+			ui: UiConfig::default(),
 		}
 	}
 }

@@ -155,6 +155,7 @@ async fn get_server_cert(
 			server_secret: None,
 			server_challenge: None,
 			client_hash: None,
+			since: std::time::SystemTime::now(),
 		};
 		let notify = pending_client.pin_notify.clone();
 

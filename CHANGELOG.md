@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Add a web control panel at http://localhost:47990, in the new `moonshine-ui` crate. It shows the stream with live graphs, the health checks and the logs, pairs and manages devices, edits applications, scanners and settings in `config.toml`, and restarts Moonshine. Configure it in the new `[ui]` table; by default only this computer can open it. To open it through a reverse proxy, list its name in `allowed_hosts`.
+- Add `hidden_applications` to hide scanned applications from clients.
+
 ### Changed
 
 - Update pixelforge to its single `Encoder::submit` API. The encoder converts each frame itself and its copy no longer waits on the CPU, which lowers capture-to-send latency by about 0.2 to 0.9 ms. A colour or format change of the captured frames reconfigures the encoder in one step.

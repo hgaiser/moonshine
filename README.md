@@ -189,10 +189,46 @@ cargo run --release -- /path/to/config.toml
 A configuration file is created automatically if the path you provide doesn't exist.
 When using the AUR package, it defaults to `$XDG_CONFIG_HOME/moonshine/config.toml`.
 
+### Control panel
+
+Moonshine has a web control panel at http://localhost:47990 . With it you can:
+
+- See the stream that runs now, with live graphs of latency, bitrate and frame rate, and stop it.
+- See the health checks, and run them again.
+- Pair new devices with their PIN, and rename or unpair paired devices.
+- Add and edit applications and scanners, and hide scanned applications from clients.
+- Change settings. Each setting shows if it applies now, at the next stream, or after a restart.
+- Read the logs, and download a report for bug reports.
+
+The control panel writes its changes to `config.toml` and keeps your comments in place.
+By default, only this computer can open it. To open it from other devices, add their address range:
+
+```toml
+[ui]
+port = 47990
+allowed_networks = ["127.0.0.1/32", "::1/128", "192.168.1.0/24"]
+```
+
+The control panel only answers to an IP address, `localhost` or this computer's name. To open it through a reverse proxy at another name, add that name to `allowed_hosts`, and add the address of the proxy to `allowed_networks`:
+
+```toml
+[ui]
+allowed_networks = ["127.0.0.1/32", "::1/128", "100.64.0.0/10"]
+allowed_hosts = ["moonshine.example.com"]
+```
+
+The control panel then sees the address of the proxy, not the address of the browser. So anyone who can reach the proxy can open the control panel. Put authentication on the proxy, or only make it reachable from networks you trust.
+
+> [!WARNING]
+> Anyone who can open the control panel can add applications, which run commands as your user. Only add address ranges that you trust. The control panel has no password.
+
+Set `enabled = false` in the `[ui]` table to turn the control panel off.
+
 ### Pairing with a client
 
 When you connect with Moonlight for the first time, it will show a PIN.
-A notification will appear on the host that you can click to open the pairing page, or you can visit it manually at http://localhost:47989/pin .
+Type it on the Clients page of the [control panel](#control-panel).
+A notification will also appear on the host that you can click to open the pairing page, or you can visit it manually at http://localhost:47989/pin .
 
 You can also pair from the command line:
 

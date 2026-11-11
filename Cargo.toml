@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "tools"]
+members = [".", "tools", "ui"]
 resolver = "2"
 
 [workspace.package]
@@ -11,10 +11,12 @@ version.workspace = true
 edition = "2024"
 
 [features]
-default = ["cli"]
+default = ["cli", "ui"]
 # The `moonshine` binary: command line and logging. Library users (such as
 # moonshine-tools) set `default-features = false` to skip its dependencies.
 cli = ["dep:clap", "dep:tracing-subscriber"]
+# The web control panel.
+ui = ["dep:moonshine-ui", "dep:toml_edit"]
 
 [[bin]]
 name = "moonshine"
@@ -50,6 +52,7 @@ libc = "0.2.186"
 mdns-sd = "0.20.0"
 mio = { version = "1.2.1", features = ["net", "os-ext", "os-poll"] }
 mio-timerfd = "0.2.0"
+moonshine-ui = { path = "ui", optional = true }
 network-interface = "2.0.5"
 notify-rust = "4.17.0"
 open = "5.3.5"
@@ -92,6 +95,7 @@ tokio = { version = "1.52.3", features = ["fs", "io-util", "macros", "net", "pro
 tokio-enet = "0.1.0"
 tokio-rustls = "0.26.4"
 toml = "1.1.2"
+toml_edit = { version = "0.25.13", optional = true }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"], optional = true }
 url = "2.5.8"
