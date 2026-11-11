@@ -1,6 +1,8 @@
+use std::collections::HashSet;
 use std::sync::{Arc, PoisonError, RwLock};
+use std::time::SystemTime;
 
-use super::{ApplicationScanner, ApplicationScannerConfig, load_applications};
+use super::{ApplicationScanner, ApplicationScannerConfig, CatalogEntry, load_catalog};
 use crate::session::application::ApplicationConfig;
 
 /// Keeps the list of configured and scanned applications up to date.
@@ -12,9 +14,18 @@ pub struct ApplicationManager {
 	inner: Arc<ApplicationManagerInner>,
 }
 
-struct ApplicationManagerInner {
+/// What the catalog is built from.
+#[derive(Clone)]
+struct Sources {
 	/// Applications from the configuration file, which scanning never changes.
 	configured_applications: Vec<ApplicationConfig>,
+
+	/// Titles of scanned applications that clients don't see.
+	hidden: HashSet<String>,
+}
+
+struct ApplicationManagerInner {
+	sources: RwLock<Sources>,
 
 	/// Scanners that add dynamically discovered applications.
 	///
@@ -23,7 +34,10 @@ struct ApplicationManagerInner {
 	scanners: tokio::sync::Mutex<Vec<ApplicationScanner>>,
 
 	/// Configured and scanned applications as of the most recent scan.
-	applications: RwLock<Vec<ApplicationConfig>>,
+	catalog: RwLock<Vec<CatalogEntry>>,
+
+	/// When the most recent scan finished.
+	scanned_at: RwLock<Option<SystemTime>>,
 }
 
 impl ApplicationManager {
@@ -31,14 +45,31 @@ impl ApplicationManager {
 	///
 	/// Blocks while scanning, so call it before serving requests.
 	pub fn new(configured_applications: Vec<ApplicationConfig>, scanners: Vec<ApplicationScannerConfig>) -> Self {
+		Self::with_hidden(configured_applications, scanners, Vec::new())
+	}
+
+	/// Create a manager whose scanned applications in `hidden` (by title) are hidden from clients,
+	/// and run the first scan.
+	///
+	/// Blocks while scanning, so call it before serving requests.
+	pub fn with_hidden(
+		configured_applications: Vec<ApplicationConfig>,
+		scanners: Vec<ApplicationScannerConfig>,
+		hidden: Vec<String>,
+	) -> Self {
+		let sources = Sources {
+			configured_applications,
+			hidden: hidden.into_iter().collect(),
+		};
 		let mut scanners: Vec<ApplicationScanner> = scanners.into_iter().map(ApplicationScanner::new).collect();
-		let applications = load_applications(&configured_applications, &mut scanners);
+		let catalog = load_catalog(&sources.configured_applications, &mut scanners, &sources.hidden);
 
 		Self {
 			inner: Arc::new(ApplicationManagerInner {
-				configured_applications,
+				sources: RwLock::new(sources),
 				scanners: tokio::sync::Mutex::new(scanners),
-				applications: RwLock::new(applications),
+				catalog: RwLock::new(catalog),
+				scanned_at: RwLock::new(Some(SystemTime::now())),
 			}),
 		}
 	}
@@ -52,41 +83,102 @@ impl ApplicationManager {
 		if !scanners.iter().any(ApplicationScanner::needs_reload) {
 			return;
 		}
+		self.rescan(&mut scanners).await;
+	}
 
-		let configured_applications = self.inner.configured_applications.clone();
+	/// Replace the configured applications, the scanners and the hidden titles, then scan again.
+	pub async fn reload(
+		&self,
+		configured_applications: Vec<ApplicationConfig>,
+		scanners: Vec<ApplicationScannerConfig>,
+		hidden: Vec<String>,
+	) {
+		let mut current = self.inner.scanners.lock().await;
+		*current = scanners.into_iter().map(ApplicationScanner::new).collect();
+		*self.inner.sources.write().unwrap_or_else(PoisonError::into_inner) = Sources {
+			configured_applications,
+			hidden: hidden.into_iter().collect(),
+		};
+		self.rescan(&mut current).await;
+	}
+
+	/// Replace the titles of the hidden applications, without scanning again.
+	pub fn set_hidden(&self, hidden: Vec<String>) {
+		let hidden: HashSet<String> = hidden.into_iter().collect();
+		for entry in self
+			.inner
+			.catalog
+			.write()
+			.unwrap_or_else(PoisonError::into_inner)
+			.iter_mut()
+		{
+			entry.hidden = entry.scanner.is_some() && hidden.contains(&entry.application.title);
+		}
+		self.inner
+			.sources
+			.write()
+			.unwrap_or_else(PoisonError::into_inner)
+			.hidden = hidden;
+	}
+
+	async fn rescan(&self, scanners: &mut Vec<ApplicationScanner>) {
+		let sources = self
+			.inner
+			.sources
+			.read()
+			.unwrap_or_else(PoisonError::into_inner)
+			.clone();
 		let mut scanned = scanners.clone();
 		match tokio::task::spawn_blocking(move || {
-			let applications = load_applications(&configured_applications, &mut scanned);
-			(applications, scanned)
+			let catalog = load_catalog(&sources.configured_applications, &mut scanned, &sources.hidden);
+			(catalog, scanned)
 		})
 		.await
 		{
-			Ok((applications, scanned)) => {
+			Ok((catalog, scanned)) => {
 				*scanners = scanned;
-				*self.inner.applications.write().unwrap_or_else(PoisonError::into_inner) = applications;
+				*self.inner.catalog.write().unwrap_or_else(PoisonError::into_inner) = catalog;
+				*self.inner.scanned_at.write().unwrap_or_else(PoisonError::into_inner) = Some(SystemTime::now());
 			},
 			Err(e) => tracing::warn!("Failed to rescan applications: {e}"),
 		}
 	}
 
-	/// The applications as of the most recent scan.
+	/// The applications clients see, as of the most recent scan.
 	pub fn applications(&self) -> Vec<ApplicationConfig> {
 		self.inner
-			.applications
+			.catalog
+			.read()
+			.unwrap_or_else(PoisonError::into_inner)
+			.iter()
+			.filter(|entry| !entry.hidden)
+			.map(|entry| entry.application.clone())
+			.collect()
+	}
+
+	/// Every configured and scanned application, hidden ones included, as of the most recent scan.
+	pub fn catalog(&self) -> Vec<CatalogEntry> {
+		self.inner
+			.catalog
 			.read()
 			.unwrap_or_else(PoisonError::into_inner)
 			.clone()
 	}
 
-	/// Find an application by ID in the most recent scan.
+	/// When the most recent scan finished.
+	pub fn scanned_at(&self) -> Option<SystemTime> {
+		*self.inner.scanned_at.read().unwrap_or_else(PoisonError::into_inner)
+	}
+
+	/// Find an application that clients can see by ID in the most recent scan.
 	pub fn find(&self, application_id: i32) -> Option<ApplicationConfig> {
 		self.inner
-			.applications
+			.catalog
 			.read()
 			.unwrap_or_else(PoisonError::into_inner)
 			.iter()
-			.find(|application| application.id() == application_id)
-			.cloned()
+			.find(|entry| !entry.hidden && entry.application.id() == application_id)
+			.map(|entry| entry.application.clone())
 	}
 }
 
@@ -159,6 +251,38 @@ mod tests {
 
 		assert_eq!(manager.find(alpha.id()).map(|app| app.title), Some("Alpha".to_string()));
 		assert!(manager.find(alpha.id().wrapping_add(1)).is_none());
+	}
+
+	#[tokio::test]
+	async fn hidden_applications_stay_in_the_catalog_only() {
+		let tempdir = tempdir().unwrap();
+		write_desktop_entry(tempdir.path(), "a.desktop", "Alpha");
+		write_desktop_entry(tempdir.path(), "b.desktop", "Beta");
+
+		let configured = ApplicationConfig {
+			title: "Alpha".to_string(),
+			..Default::default()
+		};
+		let manager = ApplicationManager::with_hidden(
+			vec![configured],
+			vec![desktop_scanner(tempdir.path().to_path_buf())],
+			vec!["Alpha".to_string(), "Beta".to_string()],
+		);
+
+		// Only scanned applications can be hidden; the configured one keeps its title, so the
+		// scanned one becomes "Alpha (2)".
+		assert_eq!(titles(&manager), ["Alpha", "Alpha (2)"]);
+		let beta = manager
+			.catalog()
+			.into_iter()
+			.find(|entry| entry.application.title == "Beta")
+			.unwrap();
+		assert!(beta.hidden);
+		assert_eq!(beta.scanner, Some(0));
+		assert!(manager.find(beta.application.id()).is_none());
+
+		manager.set_hidden(Vec::new());
+		assert_eq!(titles(&manager), ["Alpha", "Alpha (2)", "Beta"]);
 	}
 
 	#[tokio::test]
