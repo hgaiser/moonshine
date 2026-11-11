@@ -1,3 +1,5 @@
+![Moonshine](assets/banner-readme.png)
+
 [![CI](https://github.com/hgaiser/moonshine/actions/workflows/ci.yaml/badge.svg)](https://github.com/hgaiser/moonshine/actions)
 
 # Moonshine 🌙
