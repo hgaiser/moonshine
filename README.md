@@ -314,6 +314,35 @@ You can override it with the `data_dir` option.
 
 Box art is automatically loaded from Bottles' grid images when available, falling back to the program's icon.
 
+**Faugus scanner** — finds the games in your [Faugus Launcher](https://github.com/Faugus/faugus-launcher) library:
+
+```toml
+[[application_scanner]]
+type = "faugus"
+command = ["faugus-launcher", "--game", "{game_id}"]
+```
+
+`{game_id}` is the game's Faugus id.
+Each game starts in the folder holding its executable, as it does when launched from Faugus' window: `faugus-launcher --game` on its own keeps the caller's directory, and some games quit right away when started anywhere else.
+Moonshine does this by prefixing the command with `env -C <folder>`, so `env` looks the command up in the launched application's `PATH`, which can differ from Moonshine's own. An absolute path behaves the same either way.
+Hidden games are skipped unless you set `include_hidden = true`, and so are games using Faugus' Steam runner, which hands the game to Steam and exits shortly after; the Steam scanner launches those.
+Box art is automatically loaded from the game's cover in Faugus when available, falling back to its banner and then its icon.
+
+If you installed Faugus from Flathub, launch it through Flatpak, with the same `dbus-run-session` prefix as for Heroic:
+
+```toml
+[[application_scanner]]
+type = "faugus"
+command = [
+  "dbus-run-session", "--",
+  "flatpak", "run", "--command=/app/bin/faugus-launcher", "io.github.Faugus.faugus-launcher",
+  "--game", "{game_id}",
+]
+```
+
+The default data directory is the first of `~/.local/share/faugus-launcher` and `~/.var/app/io.github.Faugus.faugus-launcher/data/faugus-launcher` that contains a `games.json`, followed by the same under `~/.config` and `~/.var/app/io.github.Faugus.faugus-launcher/config`, where older Faugus releases kept their library.
+You can override it with the `data_dir` option.
+
 ## Tips & Tricks
 
 See [TIPS.md](TIPS.md) for practical recipes and workarounds.
