@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 
 - Update pixelforge to its single `Encoder::submit` API. The encoder converts each frame itself and its copy no longer waits on the CPU, which lowers capture-to-send latency by about 0.2 to 0.9 ms. A colour or format change of the captured frames reconfigures the encoder in one step.
+- Encode with variable bitrate capped at the target instead of constant bitrate, so frames that need fewer bits are no longer padded with filler data. The peak bitrate is unchanged.
 
 ### Fixed
 

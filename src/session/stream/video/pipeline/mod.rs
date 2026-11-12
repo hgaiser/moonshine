@@ -725,8 +725,11 @@ impl VideoPipelineInner {
 		.with_bit_depth(bit_depth)
 		.with_source(Source::Rgb(RgbSource::new(RgbFormat::BGRx, source)))
 		.with_color(color)
-		.with_rate_control(RateControl::Cbr {
-			bitrate: ctx.bitrate as u32,
+		// VBR capped at the target rather than CBR, which pads easy frames with
+		// filler up to the target. The 1-frame VBV below still caps every frame.
+		.with_rate_control(RateControl::Vbr {
+			target: ctx.bitrate as u32,
+			max: ctx.bitrate as u32,
 		})
 		.with_frame_rate(ctx.fps, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
