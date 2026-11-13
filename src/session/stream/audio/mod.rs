@@ -363,6 +363,7 @@ impl AudioStream {
 		// Spawn audio encoder — gated behind start.
 		AudioEncoder::spawn(
 			SINK_SAMPLE_RATE,
+			context.packet_duration_ms,
 			&context.audio_config.stream_config,
 			frame_rx,
 			frame_recycle_tx,
