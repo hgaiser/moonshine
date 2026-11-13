@@ -78,6 +78,8 @@ services.moonshine = {
 
 See all options at [search.nixos.org](https://search.nixos.org/options?channel=unstable&query=services.moonshine).
 
+#### Alternative: compiling latest commit on NixOS
+
 This repository is also a flake that builds from the latest commit. Add it to your system flake's inputs and import its module. See [nix/README.md](nix/README.md) for details.
 
 The flake module replaces the nixpkgs one, and its options are slightly different: `openFirewall` instead of `firewallInterfaces`, a `uid` option you may need to set if the user's uid isn't declared in your config, and the user isn't added to `input` for you.
