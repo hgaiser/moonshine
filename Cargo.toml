@@ -26,7 +26,7 @@ aes = "0.9.1"
 aes-gcm = "0.10.3"
 arrayvec = "0.7.8"
 async-shutdown = "0.2.2"
-ash = { git = "https://github.com/ash-rs/ash", rev = "f4c2ca3e4f6b998d5254ad101a32f024d87cdec2" }
+ash = { package = "pixelforge-ash", version = "0.38.1" }
 aws-lc-rs = "1.17.0"
 byteorder = "1.5.0"
 bytes = "1.11.1"
@@ -54,8 +54,7 @@ network-interface = "2.0.5"
 notify-rust = "4.17.0"
 open = "5.3.5"
 opus = "0.3.1"
-pkcs8 = "0.11.0"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.11.0", features = ["dmabuf"] }
+pixelforge = { version = "0.12.0", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"
