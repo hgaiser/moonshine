@@ -1,0 +1,25 @@
+name: Nix
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+jobs:
+  build:
+    name: Nix Build
+    # Same runner as ci.yaml.
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: DeterminateSystems/nix-installer-action@v23
+
+      # Caches store paths in the GitHub Actions cache, so unchanged
+      # dependencies (vendored crates, ferriscope-wsi, ...) aren't rebuilt.
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+
+      - name: Nix Build
+        run: nix build -L .#moonshine
