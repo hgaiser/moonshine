@@ -3,6 +3,7 @@
   stdenv,
   rustPlatform,
   addDriverRunpath,
+  aws-lc,
   cmake,
   pkg-config,
   libdrm,
@@ -15,6 +16,7 @@
   wayland,
   libglvnd,
   shaderc,
+  sqlite,
 }:
 
 let
@@ -148,7 +150,7 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     addDriverRunpath # see postFixup
-    cmake # inputtino-sys and aws-lc-sys build their C/C++ via cmake
+    cmake # inputtino-sys builds its C++ via cmake
     pkg-config
     rustPlatform.bindgenHook # inputtino-sys generates its bindings at build time
   ];
@@ -158,12 +160,14 @@ rustPlatform.buildRustPackage {
   dontUseCmakeConfigure = true;
 
   buildInputs = [
+    aws-lc
     libdrm
     libevdev
     libpulseaudio
     libxkbcommon
     libgbm # smithay's GPU buffer allocation (split out of mesa in nixpkgs)
     libopus
+    sqlite
     vulkan-loader
     wayland
   ];
