@@ -4,6 +4,10 @@ use std::{
 	net::{IpAddr, SocketAddr, ToSocketAddrs},
 	path::PathBuf,
 	str::FromStr,
+	sync::{
+		Arc,
+		atomic::{AtomicBool, Ordering},
+	},
 };
 
 use async_shutdown::ShutdownManager;
@@ -25,12 +29,9 @@ use tokio::net::TcpListener;
 
 use crate::{
 	ShutdownReason,
-	app_scanner::{ApplicationManager, ApplicationScannerConfig},
+	app_scanner::ApplicationManager,
 	clients::ClientManager,
-	session::{
-		APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys, application::ApplicationConfig,
-		manager::SessionManager,
-	},
+	session::{APP_LAUNCH_HTTP_TIMEOUT_SECS, SessionContext, SessionKeyData, SessionKeys, manager::SessionManager},
 	tls::TlsAcceptor,
 };
 
@@ -85,6 +86,7 @@ pub struct Webserver {
 	name: String,
 	rtsp_port: u16,
 	webserver_config: WebserverConfig,
+	pairing_enabled: Arc<AtomicBool>,
 	application_manager: ApplicationManager,
 	unique_id: String,
 	client_manager: ClientManager,
@@ -103,8 +105,7 @@ impl Webserver {
 		address: String,
 		rtsp_port: u16,
 		webserver_config: WebserverConfig,
-		applications: Vec<ApplicationConfig>,
-		application_scanners: Vec<ApplicationScannerConfig>,
+		application_manager: ApplicationManager,
 		supported_codecs: u32,
 		hdr_supported: bool,
 		unique_id: String,
@@ -117,8 +118,9 @@ impl Webserver {
 		let server = Self {
 			name,
 			rtsp_port,
+			pairing_enabled: Arc::new(AtomicBool::new(webserver_config.enable_pairing)),
 			webserver_config,
-			application_manager: ApplicationManager::new(applications, application_scanners),
+			application_manager,
 			unique_id,
 			client_manager,
 			session_manager,
@@ -315,6 +317,16 @@ impl Webserver {
 		Ok(server)
 	}
 
+	/// Whether new clients can pair.
+	pub fn pairing_enabled(&self) -> bool {
+		self.pairing_enabled.load(Ordering::Relaxed)
+	}
+
+	/// Allow or refuse new clients to pair. Paired clients are not affected.
+	pub fn set_pairing_enabled(&self, enabled: bool) {
+		self.pairing_enabled.store(enabled, Ordering::Relaxed);
+	}
+
 	async fn serve(
 		&self,
 		request: Request<hyper::body::Incoming>,
@@ -347,7 +359,7 @@ impl Webserver {
 					self.app_asset(params)
 				},
 				(&Method::GET, "/pair") => {
-					if !self.webserver_config.enable_pairing {
+					if !self.pairing_enabled() {
 						tracing::warn!("Pairing is disabled in configuration.");
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
@@ -367,7 +379,7 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
-					self.launch(params, local_address).await
+					self.launch(params, local_address, peer_cert_fingerprint).await
 				},
 				(&Method::GET, "/resume") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
@@ -390,7 +402,7 @@ impl Webserver {
 			match (request.method(), request.uri().path()) {
 				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
 				(&Method::GET, "/pair") => {
-					if !self.webserver_config.enable_pairing {
+					if !self.pairing_enabled() {
 						tracing::warn!("Pairing is disabled in configuration.");
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
@@ -406,13 +418,13 @@ impl Webserver {
 					.await
 				},
 				(&Method::GET, "/pin") => {
-					if !self.webserver_config.enable_pairing {
+					if !self.pairing_enabled() {
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
 					self.pin(params)
 				},
 				(&Method::POST, "/submit-pin") => {
-					if !self.webserver_config.enable_pairing {
+					if !self.pairing_enabled() {
 						return Ok(bad_request("Pairing is disabled.".to_string()));
 					}
 					self.submit_pin(request).await
@@ -692,6 +704,7 @@ impl Webserver {
 		&self,
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
+		peer_cert_fingerprint: Option<String>,
 	) -> Response<Full<Bytes>> {
 		let application_id = match params.remove("appid") {
 			Some(application_id) => application_id,
@@ -823,6 +836,7 @@ impl Webserver {
 		if initialize_result.is_err() {
 			return xml_error(400, "Failed to start session");
 		}
+		self.session_manager.set_session_client(peer_cert_fingerprint).await;
 
 		match tokio::time::timeout(
 			std::time::Duration::from_secs(APP_LAUNCH_HTTP_TIMEOUT_SECS),
@@ -967,7 +981,10 @@ impl Webserver {
 	fn verify_paired_client(&self, peer_cert_fingerprint: &Option<String>) -> Option<Response<Full<Bytes>>> {
 		match peer_cert_fingerprint {
 			Some(fingerprint) => match self.client_manager.is_cert_paired(fingerprint) {
-				Ok(true) => None,
+				Ok(true) => {
+					self.client_manager.record_seen(fingerprint);
+					None
+				},
 				Ok(false) => {
 					tracing::warn!("Client certificate not recognized (fingerprint: {fingerprint})");
 					Some(unauthorized("Client certificate is not from a paired client."))

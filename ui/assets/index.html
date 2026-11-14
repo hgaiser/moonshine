@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Moonshine</title>
+<link rel="stylesheet" href="/app.css">
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="mast">
+  <img src="/banner.png" alt="Pixel-art wizard holding a potion and a staff under a full moon">
+  <div class="mast-inner">
+    <div class="wordmark">moonshine</div>
+    <div class="host-line">
+      <span class="host" id="host-name"></span>
+      <span class="live off" id="live"><i></i><span id="live-text">Connecting…</span></span>
+    </div>
+  </div>
+  <div class="mast-tools">
+    <button class="mtool" id="theme-btn" title="Color theme">auto</button>
+    <button class="mtool" id="bell" aria-label="Notifications" aria-expanded="false" aria-controls="notif">
+      <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><rect x="7" y="1" width="2" height="2"/><rect x="6" y="3" width="4" height="1"/><rect x="5" y="4" width="6" height="1"/><rect x="4" y="5" width="8" height="5"/><rect x="3" y="10" width="10" height="1"/><rect x="2" y="11" width="12" height="1"/><rect x="7" y="13" width="2" height="2"/></svg>
+      <span class="count" id="bell-count" hidden>0</span>
+    </button>
+  </div>
+</header>
+<div class="notif" id="notif" hidden role="dialog" aria-label="Notifications"></div>
+
+<div class="shell">
+  <nav class="rail" aria-label="Pages">
+    <a href="#home" data-page="home">Home <span class="count warn" id="nav-health" hidden>0</span></a>
+    <a href="#clients" data-page="clients">Clients <span class="count info" id="nav-pair" hidden>0</span></a>
+    <a href="#apps" data-page="apps">Applications</a>
+    <a href="#config" data-page="config">Settings <span class="count info" id="nav-unsaved" hidden>0</span></a>
+    <a href="#logs" data-page="logs">Logs</a>
+    <div class="rail-foot" id="rail-foot"></div>
+  </nav>
+
+  <main>
+    <section class="page" id="page-home" hidden>
+      <div class="page-head"><h1>Home</h1></div>
+      <div class="home-grid">
+        <div class="panel session" id="session"></div>
+        <div class="home-side">
+          <div class="panel">
+            <div class="panel-head"><h2>Health</h2><button class="btn sm ghost" id="recheck">Check again</button></div>
+            <div class="health-sum" id="health-sum"></div>
+            <div class="health" id="health"></div>
+          </div>
+          <div class="panel">
+            <div class="panel-head"><h2>This computer</h2></div>
+            <div class="server-facts" id="server-facts"></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="page-clients" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Clients</h1>
+          <p>Devices that can stream from this computer. To add a device, select this computer in Moonlight, then type the PIN that Moonlight shows.</p>
+        </div>
+      </div>
+      <div class="panel" id="pair-panel"></div>
+      <div class="panel">
+        <div class="panel-head"><h2>Paired devices</h2><span class="muted num" id="client-count"></span></div>
+        <div class="list" id="client-list"></div>
+      </div>
+    </section>
+
+    <section class="page" id="page-apps" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Applications</h1>
+          <p>What clients see in their app list. Add your own applications, or let scanners find games and apps for you.</p>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="grow"><input class="search" id="app-search" type="search" placeholder="Search all applications" aria-label="Search applications"></div>
+        <label class="switch"><input type="checkbox" id="show-hidden"><span id="show-hidden-lbl">Show hidden</span></label>
+      </div>
+      <div id="app-list"></div>
+    </section>
+
+    <section class="page" id="page-config" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Settings</h1>
+          <p>Saved to config.toml. Your comments in the file stay in place. Each setting shows when a change takes effect.</p>
+        </div>
+      </div>
+      <div id="restart-slot"></div>
+      <div class="settings" id="settings"></div>
+      <div class="savebar" id="savebar" hidden>
+        <span id="savebar-text"></span>
+        <div style="display:flex; gap:8px; flex-wrap:wrap">
+          <button class="btn sm" id="discard">Discard</button>
+          <button class="btn sm primary" id="save">Save</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="page" id="page-logs" hidden>
+      <div class="page-head">
+        <div>
+          <h1>Logs</h1>
+          <p>The latest messages from Moonshine and ferriscope. For a bug report, download the report and attach it to the issue.</p>
+        </div>
+        <a class="btn link" id="report" href="/api/report" download="moonshine-report.txt">Download report</a>
+      </div>
+      <div class="toolbar">
+        <div class="grow"><input class="search" id="log-search" type="search" placeholder="Filter by text or target, e.g. ferriscope" aria-label="Filter logs"></div>
+        <div class="seg" id="log-level" role="group" aria-label="Minimum level">
+          <button aria-pressed="false" data-l="ERROR">Error</button>
+          <button aria-pressed="false" data-l="WARN">Warn</button>
+          <button aria-pressed="true" data-l="INFO">Info</button>
+          <button aria-pressed="false" data-l="DEBUG">Debug</button>
+        </div>
+        <label class="switch"><input type="checkbox" id="log-follow" checked><span>Follow</span></label>
+      </div>
+      <div class="log" id="log-box"><table><tbody id="log"></tbody></table></div>
+    </section>
+  </main>
+</div>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div id="modal-root"></div>
+</body>
+</html>

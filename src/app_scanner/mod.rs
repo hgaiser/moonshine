@@ -139,11 +139,23 @@ pub fn scan_applications(
 	application_scanners: &mut [ApplicationScanner],
 	configured: &[ApplicationConfig],
 ) -> Vec<ApplicationConfig> {
+	scan_applications_by_scanner(application_scanners, configured)
+		.into_iter()
+		.map(|(_, application)| application)
+		.collect()
+}
+
+/// Like [`scan_applications`], but each application comes with the index of the scanner that
+/// found it.
+pub(crate) fn scan_applications_by_scanner(
+	application_scanners: &mut [ApplicationScanner],
+	configured: &[ApplicationConfig],
+) -> Vec<(usize, ApplicationConfig)> {
 	let mut applications = Vec::new();
 	let mut dedupe_keys = HashSet::new();
 	let mut used_titles: HashSet<String> = configured.iter().map(|app| title_key(&app.title)).collect();
 
-	for application_scanner in application_scanners {
+	for (index, application_scanner) in application_scanners.iter_mut().enumerate() {
 		// Capture the fingerprint before scanning: if the source data changes
 		// while scanning, the next check still reports that a reload is needed.
 		let source_fingerprint = application_scanner.source_fingerprint();
@@ -183,7 +195,7 @@ pub fn scan_applications(
 			}
 
 			application.title = unique_title(&application.title, &mut used_titles);
-			applications.push(application);
+			applications.push((index, application));
 		}
 	}
 
@@ -205,17 +217,43 @@ fn unique_title(title: &str, used: &mut HashSet<String>) -> String {
 	candidate
 }
 
+/// An application in the catalog: configured, or found by a scanner.
+#[derive(Clone, Debug)]
+pub struct CatalogEntry {
+	pub application: ApplicationConfig,
+
+	/// Index of the scanner that found the application, or `None` for a configured application.
+	pub scanner: Option<usize>,
+
+	/// Whether the user hid the application from clients. Only scanned applications can be hidden.
+	pub hidden: bool,
+}
+
 /// Combine the configured applications with freshly scanned ones and resolve missing boxart.
-pub(crate) fn load_applications(
+pub(crate) fn load_catalog(
 	configured_applications: &[ApplicationConfig],
 	application_scanners: &mut [ApplicationScanner],
-) -> Vec<ApplicationConfig> {
-	let mut applications = configured_applications.to_vec();
-	let scanned_applications = scan_applications(application_scanners, configured_applications);
+	hidden: &HashSet<String>,
+) -> Vec<CatalogEntry> {
+	let scanned_applications = scan_applications_by_scanner(application_scanners, configured_applications);
 	tracing::debug!("Adding scanned applications:\n{:#?}", scanned_applications);
-	applications.extend(scanned_applications);
+
+	let mut applications: Vec<ApplicationConfig> = configured_applications.to_vec();
+	let scanners: Vec<Option<usize>> = std::iter::repeat_n(None, applications.len())
+		.chain(scanned_applications.iter().map(|(index, _)| Some(*index)))
+		.collect();
+	applications.extend(scanned_applications.into_iter().map(|(_, application)| application));
 	resolve_missing_boxart(&mut applications);
+
 	applications
+		.into_iter()
+		.zip(scanners)
+		.map(|(application, scanner)| CatalogEntry {
+			hidden: scanner.is_some() && hidden.contains(&application.title),
+			application,
+			scanner,
+		})
+		.collect()
 }
 
 /// Resolve missing boxart for applications by searching for icons matching the application title.

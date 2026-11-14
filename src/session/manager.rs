@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use async_shutdown::ShutdownManager;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -20,6 +21,48 @@ use crate::session::stream::video::VideoStreamContext;
 use crate::session::stream::video::{StatsSender, StreamEvent, StreamInfo};
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
+
+/// Where a session is in its lifecycle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SessionPhase {
+	/// Created; the compositor and application are not started yet.
+	Initialized,
+	/// The compositor and application run; the client has not started the streams yet.
+	Launched,
+	/// The streams run.
+	Active,
+}
+
+/// A snapshot of the current session.
+#[derive(Clone, Debug)]
+pub struct SessionStatus {
+	pub phase: SessionPhase,
+
+	/// The session's application and the parameters the client asked for.
+	pub context: SessionContext,
+
+	/// Certificate fingerprint of the client that launched the session, if known.
+	pub client: Option<String>,
+
+	/// When the session was initialized.
+	pub started: SystemTime,
+
+	/// The video stream as negotiated with the client, once it runs.
+	pub stream: Option<StreamInfo>,
+}
+
+/// The settings a session is created with. Changes apply to the next session.
+#[derive(Clone, Debug)]
+pub struct SessionSettings {
+	pub compositor: CompositorConfig,
+	pub video: VideoStreamConfig,
+	pub audio: AudioStreamConfig,
+	pub control: ControlStreamConfig,
+	/// Time in seconds since last ping after which the stream closes.
+	pub stream_timeout: u64,
+	/// Whether to inhibit system sleep while a session is active.
+	pub inhibit_sleep: bool,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SessionShutdownReason {
@@ -96,6 +139,12 @@ struct SessionManagerInner {
 	/// Starts the audio pipeline (used by bench / external callers).
 	audio_start: Option<StartSignal>,
 
+	/// Certificate fingerprint of the client that launched the current session, if known.
+	session_client: Option<String>,
+
+	/// When the current session was initialized.
+	session_started: Option<SystemTime>,
+
 	/// Shutdown manager for the entire application.
 	shutdown: ShutdownManager<ShutdownReason>,
 
@@ -121,6 +170,8 @@ impl SessionManagerInner {
 		self.audio_stream_context = None;
 		self.video_start = None;
 		self.audio_start = None;
+		self.session_client = None;
+		self.session_started = None;
 		self.stop = ShutdownManager::new();
 	}
 }
@@ -181,6 +232,8 @@ impl SessionManager {
 			stop_watcher: None,
 			video_start: None,
 			audio_start: None,
+			session_client: None,
+			session_started: None,
 			shutdown: shutdown.clone(),
 			_trigger_token: trigger_token,
 			_delay_token: delay_token,
@@ -254,6 +307,43 @@ impl SessionManager {
 		}
 	}
 
+	/// A snapshot of the current session, if there is one.
+	pub async fn status(&self) -> Option<SessionStatus> {
+		let guard = self.inner.lock().await;
+		let session = guard.session.as_ref()?;
+		let phase = match session {
+			SessionState::Initialized(_) => SessionPhase::Initialized,
+			SessionState::Launched(_) => SessionPhase::Launched,
+			SessionState::Active(_) => SessionPhase::Active,
+		};
+		Some(SessionStatus {
+			phase,
+			context: session.context().clone(),
+			client: guard.session_client.clone(),
+			started: guard.session_started.unwrap_or_else(SystemTime::now),
+			stream: self.stats_tx.join().0,
+		})
+	}
+
+	/// Record which client launched the current session.
+	pub(crate) async fn set_session_client(&self, fingerprint: Option<String>) {
+		let mut guard = self.inner.lock().await;
+		if guard.session.is_some() {
+			guard.session_client = fingerprint;
+		}
+	}
+
+	/// Replace the settings that sessions are created with. A running session keeps its settings.
+	pub async fn update_settings(&self, settings: SessionSettings) {
+		let mut guard = self.inner.lock().await;
+		guard.compositor_config = settings.compositor;
+		guard.video_config = settings.video;
+		guard.audio_config = settings.audio;
+		guard.control_config = settings.control;
+		guard.stream_timeout = settings.stream_timeout;
+		guard.inhibit_sleep = settings.inhibit_sleep;
+	}
+
 	/// Get the current session context if there is an active session; otherwise return `None`.
 	pub async fn get_session_context(&self) -> Result<Option<SessionContext>, ()> {
 		let guard = self.inner.lock().await;
@@ -301,6 +391,7 @@ impl SessionManager {
 		)
 		.await?;
 		guard.session = Some(SessionState::Initialized(session));
+		guard.session_started = Some(SystemTime::now());
 
 		spawn_session_watchdog(&self.inner, &mut guard);
 		tracing::info!("Session initialized successfully, waiting to be launched.");
@@ -365,6 +456,7 @@ impl SessionManager {
 				},
 				Some(SessionState::Initialized(session)) => {
 					guard.session = Some(SessionState::Initialized(session));
+					guard.session_started = Some(SystemTime::now());
 					tracing::warn!("StartSession rejected: session not yet launched");
 					return Err(());
 				},
