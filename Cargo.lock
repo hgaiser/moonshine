@@ -550,15 +550,6 @@ dependencies = [
 
 [[package]]
 name = "block-buffer"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
-dependencies = [
- "generic-array",
-]
-
-[[package]]
-name = "block-buffer"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
@@ -658,14 +649,13 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "calloop"
-version = "0.14.4"
+version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7"
+checksum = "43b32313e937c8721c9d17ee9bf60699a6402b4b7c2cb6ac1bee0ffcaa4b4e5e"
 dependencies = [
  "bitflags",
  "polling",
  "rustix 1.1.4",
- "slab",
  "tracing",
 ]
 
@@ -1016,7 +1006,6 @@ version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
- "block-buffer 0.10.4",
  "const-oid 0.9.6",
  "crypto-common 0.1.7",
 ]
@@ -1027,7 +1016,7 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
- "block-buffer 0.12.1",
+ "block-buffer",
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
 ]
@@ -1297,16 +1286,63 @@ dependencies = [
 [[package]]
 name = "ferriscope"
 version = "0.1.0"
-source = "git+https://github.com/hgaiser/ferriscope?rev=67692fb92859e26926a3080b5ba8a6633e961a44#67692fb92859e26926a3080b5ba8a6633e961a44"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a1024687c401c539547955d733214bfaf6dc24d51ab4f9883bafcedc2b39d9b"
 dependencies = [
  "bitflags",
+ "ferriscope-smithay",
  "png",
- "smithay",
  "thiserror 2.0.19",
  "tracing",
  "wayland-backend",
  "wayland-scanner",
  "wayland-server",
+]
+
+[[package]]
+name = "ferriscope-smithay"
+version = "0.7.1+a9822e8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33aa07718272753efd2f6b613f75f6d23185118599f3e8b082d13453bc00de2d"
+dependencies = [
+ "appendlist",
+ "ash",
+ "bitflags",
+ "bytemuck",
+ "calloop",
+ "cc",
+ "cursor-icon",
+ "downcast-rs",
+ "drm",
+ "drm-ffi",
+ "drm-fourcc",
+ "drm-sys",
+ "encoding_rs",
+ "errno",
+ "gbm",
+ "glam",
+ "include_bytes_aligned",
+ "indexmap",
+ "libc",
+ "pkg-config",
+ "portable-atomic",
+ "profiling",
+ "rand 0.10.2",
+ "reis",
+ "rustix 1.1.4",
+ "scopeguard",
+ "shaderc",
+ "siphasher",
+ "smallvec",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "wayland-server",
+ "x11rb",
+ "xkbcommon",
 ]
 
 [[package]]
@@ -2312,6 +2348,7 @@ dependencies = [
  "dirs",
  "fec-rs",
  "ferriscope",
+ "ferriscope-smithay",
  "futures-util",
  "gethostname",
  "hex",
@@ -2344,10 +2381,9 @@ dependencies = [
  "sdp-types",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2",
  "shellexpand",
  "shlex 2.0.1",
- "smithay",
  "socket2",
  "steamlocate",
  "strum_macros",
@@ -3551,17 +3587,6 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
@@ -3660,6 +3685,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphasher"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3670,51 +3701,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-
-[[package]]
-name = "smithay"
-version = "0.7.0"
-source = "git+https://github.com/hgaiser/smithay?rev=fa2f9e3bdc1be3d6da2a3837b33c684d0cdeea34#fa2f9e3bdc1be3d6da2a3837b33c684d0cdeea34"
-dependencies = [
- "appendlist",
- "ash",
- "bitflags",
- "bytemuck",
- "calloop",
- "cc",
- "cursor-icon",
- "downcast-rs",
- "drm",
- "drm-ffi",
- "drm-fourcc",
- "drm-sys",
- "encoding_rs",
- "errno",
- "gbm",
- "glam",
- "include_bytes_aligned",
- "indexmap",
- "libc",
- "pkg-config",
- "portable-atomic",
- "profiling",
- "rand 0.10.2",
- "reis",
- "rustix 1.1.4",
- "scopeguard",
- "sha2 0.10.9",
- "shaderc",
- "smallvec",
- "tempfile",
- "thiserror 2.0.19",
- "tracing",
- "wayland-protocols",
- "wayland-protocols-misc",
- "wayland-protocols-wlr",
- "wayland-server",
- "x11rb",
- "xkbcommon",
-]
 
 [[package]]
 name = "socket-pktinfo"
@@ -4755,9 +4741,9 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "x11rb"
-version = "0.13.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9993aa5be5a26815fe2c3eacfc1fde061fc1a1f094bf1ad2a18bf9c495dd7414"
+checksum = "5a8885a854a8bfdf87a301e53e41b17c5f8f33639903131338b997b1eb614f44"
 dependencies = [
  "gethostname",
  "rustix 1.1.4",
@@ -4766,9 +4752,9 @@ dependencies = [
 
 [[package]]
 name = "x11rb-protocol"
-version = "0.13.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+checksum = "acf4d1bc32aa46eec18caa634ec3cf4c05bfa151f12b93b510b15190f69a1ca8"
 
 [[package]]
 name = "x509-parser"
