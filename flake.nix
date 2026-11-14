@@ -3,10 +3,21 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+
+    # The source of ferriscope's Vulkan WSI layer (see nix/package.nix). Keep
+    # the tag at the ferriscope version in Cargo.lock.
+    ferriscope = {
+      url = "github:hgaiser/ferriscope/v0.1.0";
+      flake = false;
+    };
   };
 
   outputs =
-    { self, nixpkgs }:
+    {
+      self,
+      nixpkgs,
+      ferriscope,
+    }:
     let
       inherit (nixpkgs) lib;
       systems = [
@@ -14,16 +25,17 @@
         "aarch64-linux"
       ];
       forAllSystems = f: lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+      callMoonshine = pkgs: pkgs.callPackage ./nix/package.nix { ferriscopeSrc = ferriscope; };
     in
     {
       # For consumers who want `pkgs.moonshine` available everywhere
       # (e.g. added next to a host in a NixOS flake's nixpkgs.overlays).
       overlays.default = final: _prev: {
-        moonshine = final.callPackage ./nix/package.nix { };
+        moonshine = callMoonshine final;
       };
 
       packages = forAllSystems (pkgs: rec {
-        moonshine = pkgs.callPackage ./nix/package.nix { };
+        moonshine = callMoonshine pkgs;
         default = moonshine;
       });
 
@@ -37,7 +49,7 @@
           { pkgs, lib, ... }:
           {
             imports = [ ./nix/module.nix ];
-            services.moonshine.package = lib.mkDefault (pkgs.callPackage ./nix/package.nix { });
+            services.moonshine.package = lib.mkDefault (callMoonshine pkgs);
           };
         default = self.nixosModules.moonshine;
       };
