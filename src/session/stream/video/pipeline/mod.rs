@@ -3,6 +3,7 @@
 //! This module handles video encoding with pixelforge
 //! and packetization for network transmission.
 
+mod adapt;
 mod dmabuf;
 mod fence;
 mod hdr_sei;
@@ -282,6 +283,10 @@ enum ConsumerMessage {
 /// so it can stop dropping new captures.
 struct InFlightGuard(Arc<AtomicUsize>);
 
+/// Highest send-rate estimate of the loss adaptation, in percent of the bitrate:
+/// room above the bitrate to probe into before the first loss.
+const MAX_ESTIMATE_PERCENT: u32 = 400;
+
 /// A packetized frame on its way to the network sender.
 ///
 /// The batch holds its frame's in-flight slot while it waits in the send queue,
@@ -556,6 +561,7 @@ impl VideoPipeline {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		fec_status_rx: broadcast::Receiver<(u16, u16)>,
 		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -585,6 +591,7 @@ impl VideoPipeline {
 					idr_tx,
 					idr_frame_request_rx,
 					invalidate_request_rx,
+					fec_status_rx,
 					reset_request_rx,
 					stop_session_manager,
 					hdr_metadata_tx,
@@ -623,6 +630,7 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		idr_frame_request_rx: broadcast::Receiver<()>,
 		invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		fec_status_rx: broadcast::Receiver<(u16, u16)>,
 		reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -671,6 +679,7 @@ impl VideoPipelineInner {
 			idr_tx,
 			idr_frame_request_rx,
 			invalidate_request_rx,
+			fec_status_rx,
 			reset_request_rx,
 			stop_session_manager,
 			hdr_metadata_tx,
@@ -762,6 +771,7 @@ impl VideoPipelineInner {
 		idr_tx: broadcast::Sender<()>,
 		mut idr_frame_request_rx: broadcast::Receiver<()>,
 		mut invalidate_request_rx: broadcast::Receiver<(u32, u32)>,
+		mut fec_status_rx: broadcast::Receiver<(u16, u16)>,
 		mut reset_request_rx: broadcast::Receiver<u32>,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
@@ -819,6 +829,14 @@ impl VideoPipelineInner {
 
 		// Rate-limits the drop-to-catch-up warning.
 		let mut last_drop_warn: Option<std::time::Instant> = None;
+
+		// Skips captures while the client reports losses; see `LossAdaptation`.
+		let mut loss_adaptation = self
+			.config
+			.adapt_to_loss
+			.then(|| adapt::LossAdaptation::new(ctx.bitrate, MAX_ESTIMATE_PERCENT, std::time::Instant::now()));
+		// Rate-limits the loss-adaptation warning.
+		let mut last_adapt_warn: Option<std::time::Instant> = None;
 
 		// Encoding loop - receives frames from compositor.
 		let frame_interval = std::time::Duration::from_secs_f64(1.0 / ctx.fps as f64);
@@ -890,11 +908,17 @@ impl VideoPipelineInner {
 						tracing::debug!("IDR frame requested");
 						encoder.request_idr();
 						pending_idr = true;
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						tracing::debug!("IDR frame channel lagged by {n} messages.");
 						encoder.request_idr();
 						pending_idr = true;
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
@@ -912,12 +936,36 @@ impl VideoPipelineInner {
 							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
 						);
 						encoder.invalidate_reference_frames(first_display_order);
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
 						tracing::debug!("Invalidation channel lagged by {n} messages; forcing IDR.");
 						encoder.request_idr();
 						pending_idr = true;
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
+					},
+					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
+				}
+			}
+
+			// Drain the client's FEC status reports into the loss adaptation.
+			loop {
+				match fec_status_rx.try_recv() {
+					Ok((missing, parity)) => {
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_fec_status(std::time::Instant::now(), missing, parity);
+						}
+					},
+					// Reports arriving faster than we drain them mean heavy loss.
+					Err(broadcast::error::TryRecvError::Lagged(_)) => {
+						if let Some(adaptation) = &mut loss_adaptation {
+							adaptation.on_loss(std::time::Instant::now());
+						}
 					},
 					Err(broadcast::error::TryRecvError::Closed | broadcast::error::TryRecvError::Empty) => break,
 				}
@@ -1000,6 +1048,22 @@ impl VideoPipelineInner {
 							);
 						}
 						last_drop_warn = Some(std::time::Instant::now());
+					}
+					continue;
+				}
+
+				// Skip captures while the client's loss reports say the link carries
+				// less than the stream, but never one an IDR request is waiting on.
+				if !pending_idr
+					&& let Some(adaptation) = &mut loss_adaptation
+					&& !adaptation.admit(std::time::Instant::now())
+				{
+					if last_adapt_warn.is_none_or(|t| t.elapsed() >= std::time::Duration::from_secs(1)) {
+						tracing::warn!(
+							"Video stream is losing packets: sending {}% of frames to fit the network.",
+							adaptation.admitted_percent()
+						);
+						last_adapt_warn = Some(std::time::Instant::now());
 					}
 					continue;
 				}
