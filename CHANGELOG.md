@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [v0.17.0] - 15-11-2026
+## [v0.17.1] - 15-11-2026
 
 ### Added
 
@@ -37,6 +37,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Ignore unit removal notifications during a systemd reload. (#231, @repparw)
 - Re-encode the last frame, not the one before it, for an IDR request while no new frame arrives.
 - Fix the Nix build and module. (#224, #242, #249, #262, #272, @scottjab, @keenanweaver, @hazel-ocean)
+- Build the WSI layer from ferriscope's git tag, since the crates.io package does not include it.
 
 ## [v0.16.1] - 13-09-2026
 
