@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.17.2] - 15-11-2026
+
+### Fixed
+
+- Restore the HEVC encode latency by updating pixelforge to v0.12.1. v0.17.1 encoded HEVC about ten times slower on NVIDIA (about 11 ms instead of 1 ms per 1080p frame), which raised the host processing latency.
+
 ## [v0.17.1] - 15-11-2026
 
 ### Added
