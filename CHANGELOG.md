@@ -7,17 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.17.0] - 15-11-2026
+
 ### Added
 
-- Add `stream.video.rate_control`: `"vbr"` encodes with variable bitrate capped at the target, so frames that need fewer bits aren't padded with filler data (as RADV does with the default, `"cbr"`). The peak bitrate is the same.
+- Add a Bottles application scanner. (#219, @evertonstz)
+- Add `env` to applications and scanners.
+- Add `stream.video.rate_control`; `"vbr"` stops RADV padding frames with filler data. (#271, @porkloin)
+- Add `stream.video.send_buffer_size`. (#243, @skewballfox)
+- Stream per-frame video statistics on a local socket. (#257, @porkloin)
 
 ### Changed
 
-- Update pixelforge to its single `Encoder::submit` API. The encoder converts each frame itself and its copy no longer waits on the CPU, which lowers capture-to-send latency by about 0.2 to 0.9 ms. A colour or format change of the captured frames reconfigures the encoder in one step.
+- Replace the built-in compositor with ferriscope and its Vulkan compute renderer. (#236)
+- Encode through pixelforge's `Encoder::submit` API, lowering capture-to-send latency by 0.2 to 0.9 ms. (#258)
+- Rescan applications on every app list request, only when their source changed. (#222, @scottjab)
+- Replace dasp with rubato for audio resampling. (#221, @karimElmougi)
 
 ### Fixed
 
+- Match FEC parity to the advertised percentage and split frames evenly across FEC blocks. (#241, @lutyjj)
+- Stamp frames with their capture time. (#230, @lutyjj)
+- Fall back to inode comparison when `kcmp(2)` is blocked. (#238, @skewballfox)
+- Reset a resumed stream once the client's new address is known, and drop stale frames. (#216, @urwrstkn8mare)
+- Only advertise codec modes the GPU can encode.
+- Validate the client's bitrate, frame rate and video packet size, and bound incomplete RTSP requests. (#252, #255, #256, @repparw)
+- Align audio RTP timestamps with the negotiated packet duration. (#261, @repparw)
+- Do the TLS handshake per connection, with a timeout. (#266, @leierx)
+- Ignore unit removal notifications during a systemd reload. (#231, @repparw)
 - Re-encode the last frame, not the one before it, for an IDR request while no new frame arrives.
+- Fix the Nix build and module. (#224, #242, #249, #262, #272, @scottjab, @keenanweaver, @hazel-ocean)
 
 ## [v0.16.1] - 13-09-2026
 
