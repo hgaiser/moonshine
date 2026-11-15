@@ -69,6 +69,25 @@ pub struct VideoStreamConfig {
 	/// `net.core.wmem_max`.
 	#[serde(default)]
 	pub send_buffer_size: usize,
+
+	/// How the encoder holds the stream to its bitrate.
+	#[serde(default)]
+	pub rate_control: RateControlMode,
+}
+
+/// How the encoder holds the stream to its bitrate. Either way, no frame goes
+/// over the per-frame budget (bitrate / frame rate).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RateControlMode {
+	/// Constant bitrate. Some drivers (RADV) pad frames that need fewer bits
+	/// with filler data up to the budget.
+	#[default]
+	Cbr,
+	/// Variable bitrate capped at the bitrate: frames that need fewer bits are
+	/// sent at their size, without filler. Needs a driver that supports VBR
+	/// encoding.
+	Vbr,
 }
 
 /// Smallest accepted packet size. Lower values would leave almost no room for
@@ -115,6 +134,7 @@ impl Default for VideoStreamConfig {
 			log_frame_spikes: false,
 			max_packet_size: 0,
 			send_buffer_size: 0,
+			rate_control: RateControlMode::default(),
 		}
 	}
 }
