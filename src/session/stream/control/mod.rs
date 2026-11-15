@@ -102,11 +102,21 @@ enum ControlMessage<'a> {
 	FrameStats,
 	InputData(&'a [u8]),
 	RequestIdrFrame,
-	InvalidateReferenceFrames { first: u32, last: u32 },
+	InvalidateReferenceFrames {
+		first: u32,
+		last: u32,
+	},
 	StartB,
 	RumbleTriggers,
 	SetMotionEvent,
-	SetRgbLed,
+	/// The FEC status of a frame the client had to repair or lost.
+	FrameFecStatus {
+		/// Data packets the client had to recover (or never got): the repair
+		/// the frame needed. Lost parity isn't counted, as the client never
+		/// needs all of it.
+		missing: u16,
+		parity: u16,
+	},
 	SetTriggerEffect,
 }
 
@@ -196,7 +206,26 @@ impl<'a> ControlMessage<'a> {
 			ControlMessageType::HdrMode => Ok(Self::HdrMode),
 			ControlMessageType::RumbleTriggers => Ok(Self::RumbleTriggers),
 			ControlMessageType::SetMotionEvent => Ok(Self::SetMotionEvent),
-			ControlMessageType::SetRgbLed => Ok(Self::SetRgbLed),
+			// Sent by us, 0x5502 sets a controller's RGB LED; sent by the client,
+			// it is Sunshine's per-frame FEC status, which Moonlight sends because
+			// our app version marks us as a Sunshine server. Body (packed, big
+			// endian): frameIndex(4), highestReceivedSequenceNumber(2),
+			// nextContiguousSequenceNumber(2), missingPacketsBeforeHighestReceived(2),
+			// totalDataPackets(2), totalParityPackets(2), receivedDataPackets(2),
+			// receivedParityPackets(2), fecPercentage(1), multiFecBlockIndex(1),
+			// multiFecBlockCount(1).
+			ControlMessageType::SetRgbLed => {
+				if buffer.len() < 4 + 21 {
+					tracing::debug!("Ignoring short frame FEC status message of {} bytes.", buffer.len());
+					return Err(());
+				}
+				let field = |at: usize| u16::from_be_bytes([buffer[4 + at], buffer[5 + at]]);
+				let (total_data, total_parity, received_data) = (field(10), field(12), field(14));
+				Ok(Self::FrameFecStatus {
+					missing: total_data.saturating_sub(received_data),
+					parity: total_parity,
+				})
+			},
 			ControlMessageType::SetTriggerEffect => Ok(Self::SetTriggerEffect),
 		}
 	}
@@ -556,6 +585,9 @@ async fn run_control_loop(
 					ControlMessage::InvalidateReferenceFrames { first, last } => {
 						video_handle.invalidate_reference_frames(first, last);
 					},
+					ControlMessage::FrameFecStatus { missing, parity } => {
+						video_handle.report_fec_status(missing, parity);
+					},
 					ControlMessage::StartB => {
 						video_handle.trigger();
 						if !audio_triggered {
@@ -635,4 +667,56 @@ async fn run_control_loop(
 	// returns. Without this, the next session's control stream may
 	// fail to bind to the same port.
 	drop(host);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	/// A client FEC status message (type 0x5502, length 21, little endian,
+	/// then the big-endian body).
+	fn fec_status(total_data: u16, total_parity: u16, received_data: u16, received_parity: u16) -> Vec<u8> {
+		let mut message = vec![0x02, 0x55, 21, 0];
+		message.extend_from_slice(&7u32.to_be_bytes()); // frameIndex
+		message.extend_from_slice(&[0; 6]); // sequence numbers, missingPackets
+		for count in [total_data, total_parity, received_data, received_parity] {
+			message.extend_from_slice(&count.to_be_bytes());
+		}
+		message.extend_from_slice(&[20, 0, 1]); // fecPercentage, block index and count
+		message
+	}
+
+	fn parse_fec_status(message: &[u8]) -> (u16, u16) {
+		match ControlMessage::from_bytes(message) {
+			Ok(ControlMessage::FrameFecStatus { missing, parity }) => (missing, parity),
+			other => panic!("expected a frame FEC status, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn client_fec_status_parses_as_repair_counts() {
+		assert_eq!(parse_fec_status(&fec_status(10, 4, 8, 3)), (2, 4));
+	}
+
+	#[test]
+	fn lost_parity_is_not_repair_demand() {
+		// 9 of 10 data and 1 of 4 parity arrived: one packet needed repair.
+		assert_eq!(parse_fec_status(&fec_status(10, 4, 9, 1)), (1, 4));
+		// All the data arrived, so nothing was repaired.
+		assert_eq!(parse_fec_status(&fec_status(10, 4, 10, 0)), (0, 4));
+	}
+
+	#[test]
+	fn unrecoverable_frame_reports_every_missing_data_packet() {
+		assert_eq!(parse_fec_status(&fec_status(10, 4, 3, 0)), (7, 4));
+	}
+
+	#[test]
+	fn extreme_counts_do_not_overflow() {
+		assert_eq!(
+			parse_fec_status(&fec_status(u16::MAX, u16::MAX, 0, 0)),
+			(u16::MAX, u16::MAX)
+		);
+		assert_eq!(parse_fec_status(&fec_status(0, 0, u16::MAX, u16::MAX)), (0, 0));
+	}
 }
