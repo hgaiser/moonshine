@@ -240,10 +240,10 @@ impl Webserver {
 						shutdown.wrap_trigger_shutdown(ShutdownReason::HttpsShutdown, async move {
 							let listener = bind_listener(https_address)
 								.map_err(|e| tracing::error!("Failed to bind to address '{:?}': {e}", https_address))?;
-							let acceptor = TlsAcceptor::from_config(
+							let acceptor = std::sync::Arc::new(TlsAcceptor::from_config(
 								server.webserver_config.certificate.clone(),
 								server.webserver_config.private_key.clone(),
-							)?;
+							)?);
 
 							tracing::debug!("HTTPS server listening for connections on {https_address}");
 							loop {
@@ -253,32 +253,43 @@ impl Webserver {
 									.map_err(|e| tracing::error!("Failed to accept connection: {e}"))?;
 								tracing::trace!("Accepted TLS connection from {address}.");
 
-								let address = connection.local_addr().ok().map(unmap_v4_mapped);
-								let mac_address = if let Some(address) = address {
-									get_mac_address(address.ip()).unwrap_or(None)
-								} else {
-									None
-								};
-
-								let connection = match acceptor.accept(connection).await {
-									Ok(connection) => connection,
-									Err(()) => continue,
-								};
-
-								// Extract peer certificate fingerprint from TLS connection for mTLS verification.
-								let peer_cert_fingerprint = connection
-									.get_ref()
-									.1
-									.peer_certificates()
-									.and_then(|certs| certs.first())
-									.map(|cert| hex::encode(Sha256::digest(cert.as_ref())));
-
-								let io = TokioIo::new(connection);
-
+								// Handshake in the connection's own task, so one stalled client can't block the listener.
 								tokio::spawn({
 									let server = server.clone();
 									let shutdown = server.shutdown.clone();
+									let acceptor = acceptor.clone();
 									async move {
+										let address = connection.local_addr().ok().map(unmap_v4_mapped);
+										let mac_address = if let Some(address) = address {
+											get_mac_address(address.ip()).unwrap_or(None)
+										} else {
+											None
+										};
+
+										let connection = match tokio::time::timeout(
+											std::time::Duration::from_secs(10),
+											acceptor.accept(connection),
+										)
+										.await
+										{
+											Ok(Ok(connection)) => connection,
+											Ok(Err(())) => return,
+											Err(_) => {
+												tracing::debug!("TLS handshake timed out.");
+												return;
+											},
+										};
+
+										// Extract peer certificate fingerprint from TLS connection for mTLS verification.
+										let peer_cert_fingerprint = connection
+											.get_ref()
+											.1
+											.peer_certificates()
+											.and_then(|certs| certs.first())
+											.map(|cert| hex::encode(Sha256::digest(cert.as_ref())));
+
+										let io = TokioIo::new(connection);
+
 										let _ = shutdown
 											.wrap_cancel(async move {
 												let _ = hyper::server::conn::http1::Builder::new()
