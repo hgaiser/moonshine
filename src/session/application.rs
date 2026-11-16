@@ -52,7 +52,9 @@ pub struct ApplicationConfig {
 	/// window is shown. Turn it on for Steam itself (Big Picture), so its
 	/// overlay and focus contract work; leave it off (the default) for anything
 	/// not launched through Steam, as with it on only Steam and Steam game
-	/// windows can take focus. Games from the Steam scanner have it on.
+	/// windows can take focus. With it off, the application does not get
+	/// `XDG_CURRENT_DESKTOP=gamescope` or `GAMESCOPE_WAYLAND_DISPLAY`, so Steam
+	/// acts as on a desktop. Games from the Steam scanner have it on.
 	#[serde(default, skip_serializing_if = "std::ops::Not::not")]
 	pub steam_integration: bool,
 
@@ -164,7 +166,7 @@ impl Application {
 			return Err(());
 		};
 		let args = &config.command[1..];
-		let envs = make_envs(&context, &config.env)?;
+		let envs = make_envs(&context, &config.env, config.steam_integration)?;
 
 		tracing::info!(program, ?args, "Launching application.");
 
@@ -227,7 +229,16 @@ impl Drop for Application {
 }
 
 /// Build environment variables for the application based on the context (e.g. display, PulseAudio socket).
-fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>) -> Result<Vec<String>, ()> {
+/// The variables that tell Steam it runs in a gamescope session. Without Steam
+/// integration Moonshine leaves them out, so Steam acts as on a desktop (its
+/// power menu has "Exit Big Picture Mode", not "Switch to Desktop").
+const GAMESCOPE_SESSION_ENV: &[&str] = &["XDG_CURRENT_DESKTOP", "GAMESCOPE_WAYLAND_DISPLAY"];
+
+fn make_envs(
+	context: &ApplicationContext,
+	config_env: &BTreeMap<String, String>,
+	steam_integration: bool,
+) -> Result<Vec<String>, ()> {
 	// Build environment variables as "KEY=value" strings for systemd.
 	let mut envs: Vec<String> = vec![
 		format!("PULSE_SERVER=unix:{}", context.pulse_socket_path.display()),
@@ -250,6 +261,9 @@ fn make_envs(context: &ApplicationContext, config_env: &BTreeMap<String, String>
 	// external-overlay mode, the ferriscope-wsi layer, and the HDR and
 	// capability variables it actually backs.
 	for (key, value) in &context.compositor_env {
+		if !steam_integration && GAMESCOPE_SESSION_ENV.contains(&key.as_str()) {
+			continue;
+		}
 		envs.push(format!("{key}={value}"));
 	}
 
@@ -867,10 +881,31 @@ mod tests {
 	fn application_env_comes_after_the_moonshine_variables() {
 		let env = BTreeMap::from([("COSMIC_BACKEND".to_string(), "winit".to_string())]);
 
-		let envs = make_envs(&test_context(), &env).unwrap();
+		let envs = make_envs(&test_context(), &env, false).unwrap();
 
 		assert_eq!(envs.last().map(String::as_str), Some("COSMIC_BACKEND=winit"));
 		assert!(envs.contains(&"DISPLAY=:0".to_string()));
+	}
+
+	#[test]
+	fn gamescope_session_env_follows_steam_integration() {
+		let context = ApplicationContext {
+			compositor_env: vec![
+				("XDG_CURRENT_DESKTOP".to_string(), "gamescope".to_string()),
+				("GAMESCOPE_WAYLAND_DISPLAY".to_string(), "wayland-1".to_string()),
+				("ENABLE_FERRISCOPE_WSI".to_string(), "1".to_string()),
+			],
+			..test_context()
+		};
+
+		let off = make_envs(&context, &BTreeMap::new(), false).unwrap();
+		assert!(!off.iter().any(|e| e.starts_with("XDG_CURRENT_DESKTOP=")));
+		assert!(!off.iter().any(|e| e.starts_with("GAMESCOPE_WAYLAND_DISPLAY=")));
+		assert!(off.contains(&"ENABLE_FERRISCOPE_WSI=1".to_string()));
+
+		let on = make_envs(&context, &BTreeMap::new(), true).unwrap();
+		assert!(on.contains(&"XDG_CURRENT_DESKTOP=gamescope".to_string()));
+		assert!(on.contains(&"GAMESCOPE_WAYLAND_DISPLAY=wayland-1".to_string()));
 	}
 
 	#[test]

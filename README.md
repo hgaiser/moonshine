@@ -217,7 +217,7 @@ steam_integration = true
 - `boxart` (optional): Path to a cover image.
 - `command`: The command to run. First entry is the executable, the rest are arguments.
 - `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. Runs synchronously — the session waits for all to finish.
-- `steam_integration` (optional): Steam integration, as gamescope's `-e`; off by default. Turn it on for Steam (Big Picture), so its overlay and focus work. With it on, only Steam and Steam game windows can take focus, so leave it off for anything launched directly. Games from the Steam application scanner have it on.
+- `steam_integration` (optional): Steam integration, as gamescope's `-e`; off by default. Turn it on for Steam (Big Picture), so its overlay and focus work. With it on, only Steam and Steam game windows can take focus, so leave it off for anything launched directly. With it off, Steam acts as on a desktop: its power menu has "Exit Big Picture Mode", not "Switch to Desktop". Games from the Steam application scanner have it on.
 - `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. Runs synchronously — the server waits for all to finish.
 
 Example:
