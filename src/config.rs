@@ -130,6 +130,7 @@ impl Default for Config {
 				title: "Steam".to_string(),
 				command: vec!["/usr/bin/steam".to_string(), "steam://open/bigpicture".to_string()],
 				boxart: None,
+				steam_integration: true,
 				..Default::default()
 			}],
 			application_scanners: vec![ApplicationScannerConfig::Steam(SteamApplicationScannerConfig {

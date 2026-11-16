@@ -53,6 +53,7 @@ Then import the module and enable the service in your configuration:
             "/run/current-system/sw/bin/steam"
             "steam://open/bigpicture"
           ];
+          steam_integration = true;
         }
       ];
     };
