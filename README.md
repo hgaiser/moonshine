@@ -71,6 +71,7 @@ services.moonshine = {
     {
       title = "Steam";
       command = [ "/run/current-system/sw/bin/steam" "steam://open/bigpicture" ];
+      steam_integration = true;
     }
   ];
   # Opens the ports on these interfaces only; see Security below.

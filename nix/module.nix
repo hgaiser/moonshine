@@ -81,6 +81,7 @@ in
             {
               title = "Steam";
               command = [ "/run/current-system/sw/bin/steam" "steam://open/bigpicture" ];
+              steam_integration = true;
             }
           ];
         }
