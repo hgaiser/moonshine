@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::RwLock;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use aes::Aes128;
 use aes::cipher::Array;
@@ -45,6 +46,50 @@ pub(crate) struct PendingClient {
 
 	/// Cryptographic hash.
 	pub(crate) client_hash: Option<Vec<u8>>,
+
+	/// When the client asked to pair.
+	pub(crate) since: SystemTime,
+}
+
+/// A device that asks to pair and waits for its PIN.
+#[derive(Clone, Debug)]
+pub struct PairingRequest {
+	/// The unique id the client sent. Many clients send the same id, so it only tells requests
+	/// apart while they wait.
+	pub id: String,
+
+	/// When the client asked to pair.
+	pub since: SystemTime,
+}
+
+/// A paired device.
+#[derive(Clone, Debug)]
+pub struct PairedDevice {
+	/// SHA-256 fingerprint of the device's certificate, as lowercase hex.
+	pub fingerprint: String,
+
+	/// Name the user gave the device. Empty until the user names it.
+	pub name: String,
+
+	/// When the device paired, if known.
+	pub paired_at: Option<SystemTime>,
+
+	/// When the device last made a request, if known.
+	pub last_seen: Option<SystemTime>,
+}
+
+/// How long a pairing request waits for its PIN before it is no longer listed.
+const PAIRING_REQUEST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// How often a device's last-seen time is saved to disk while it makes requests.
+const LAST_SEEN_SAVE_INTERVAL_SECS: u64 = 10 * 60;
+
+fn unix_secs(time: SystemTime) -> u64 {
+	time.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+fn from_unix_secs(secs: u64) -> Option<SystemTime> {
+	(secs != 0).then(|| UNIX_EPOCH + Duration::from_secs(secs))
 }
 
 /// Manages client pairing state and operations.
@@ -87,6 +132,66 @@ impl ClientManager {
 		})?;
 		inner.insert(pending_client.id.clone(), pending_client);
 		Ok(())
+	}
+
+	/// Devices that ask to pair and wait for their PIN, oldest first.
+	pub fn pairing_requests(&self) -> Vec<PairingRequest> {
+		let Ok(inner) = self.pending_clients.read() else {
+			return Vec::new();
+		};
+		let mut requests: Vec<PairingRequest> = inner
+			.values()
+			.filter(|client| client.key.is_none())
+			.filter(|client| client.since.elapsed().is_ok_and(|age| age < PAIRING_REQUEST_TIMEOUT))
+			.map(|client| PairingRequest {
+				id: client.id.clone(),
+				since: client.since,
+			})
+			.collect();
+		requests.sort_by_key(|request| request.since);
+		requests
+	}
+
+	/// The paired devices, newest first.
+	pub fn paired_devices(&self) -> Result<Vec<PairedDevice>, ()> {
+		Ok(self
+			.state
+			.paired_devices()?
+			.into_iter()
+			.map(|(fingerprint, record)| PairedDevice {
+				fingerprint,
+				name: record.name,
+				paired_at: from_unix_secs(record.paired_at),
+				last_seen: from_unix_secs(record.last_seen),
+			})
+			.collect())
+	}
+
+	/// Give a paired device a name. Returns whether the device is paired.
+	pub fn rename_device(&self, fingerprint: &str, name: &str) -> Result<bool, ()> {
+		let name = name.trim().to_string();
+		self.state
+			.update_device(fingerprint, |record| record.name = name, |_, _| true)
+	}
+
+	/// Unpair a device: it must pair again to stream. Returns whether the device was paired.
+	pub fn unpair_device(&self, fingerprint: &str) -> Result<bool, ()> {
+		self.state.remove_paired_cert(fingerprint)
+	}
+
+	/// Record that a paired device made a request.
+	pub(crate) fn record_seen(&self, fingerprint: &str) {
+		let now = unix_secs(SystemTime::now());
+		let _ = self.state.update_device(
+			fingerprint,
+			|record| record.last_seen = now,
+			|old, new| new.last_seen.saturating_sub(old.last_seen) >= LAST_SEEN_SAVE_INTERVAL_SECS,
+		);
+	}
+
+	/// Send the PIN for a pairing request.
+	pub fn submit_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
+		self.register_pin(id, pin)
 	}
 
 	pub(crate) fn register_pin(&self, id: &str, pin: &str) -> Result<(), ()> {
@@ -196,6 +301,16 @@ impl ClientManager {
 			self.state
 				.add_paired_cert(fp.clone())
 				.map_err(|_| tracing::warn!("Failed to persist paired certificate: {fp}"))?;
+			let now = unix_secs(SystemTime::now());
+			let _ = self.state.update_device(
+				fp,
+				|record| {
+					record.paired_at = now;
+					record.last_seen = now;
+				},
+				|_, _| true,
+			);
+			tracing::info!("Paired a new device ({}).", &fp[..fp.len().min(8)]);
 		}
 
 		let has_client = self

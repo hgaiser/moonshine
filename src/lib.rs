@@ -12,6 +12,8 @@ pub mod session;
 pub(crate) mod state;
 pub mod stats_socket;
 pub mod tls;
+#[cfg(feature = "ui")]
+pub mod ui;
 pub mod webserver;
 
 /// Reasons for initiating a global shutdown.

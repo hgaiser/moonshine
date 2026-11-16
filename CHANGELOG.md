@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a web control panel at http://localhost:47990, in the new `moonshine-ui` crate. It shows the stream with live graphs, the health checks and the logs, pairs and manages devices, edits applications, scanners and settings in `config.toml`, and restarts Moonshine. Configure it in the new `[ui]` table; by default only this computer can open it. To open it through a reverse proxy, list its name in `allowed_hosts`.
+- Add `hidden_applications` to hide scanned applications from clients.
 - Add a `working_directory` option to applications, the directory the application starts in. (#264)
 - Add a Faugus Launcher application scanner. Games start in the folder holding their executable, as they do from Faugus' own window. (#264, @istvnurbn)
 

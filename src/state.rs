@@ -1,8 +1,22 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
+
+/// What Moonshine remembers about a paired device, keyed by its certificate fingerprint.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DeviceRecord {
+	/// Name the user gave the device. Empty until the user names it.
+	pub name: String,
+
+	/// When the device paired, in seconds since the Unix epoch. Zero when unknown.
+	pub paired_at: u64,
+
+	/// When the device last made a request, in seconds since the Unix epoch. Zero when unknown.
+	pub last_seen: u64,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct StateData {
@@ -11,6 +25,8 @@ struct StateData {
 	clients: HashSet<String>,
 	#[serde(default)]
 	paired_certs: HashSet<String>,
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	devices: BTreeMap<String, DeviceRecord>,
 }
 
 impl StateData {
@@ -19,6 +35,7 @@ impl StateData {
 			unique_id: uuid::Uuid::new_v4().to_string(),
 			clients: Default::default(),
 			paired_certs: Default::default(),
+			devices: Default::default(),
 		}
 	}
 }
@@ -135,6 +152,67 @@ impl PersistentState {
 			tracing::warn!("Failed to add paired cert, already exists.");
 		}
 		Ok(inserted)
+	}
+
+	/// The paired certificates and what is known about each of them.
+	pub(crate) fn paired_devices(&self) -> Result<Vec<(String, DeviceRecord)>, ()> {
+		let data = self
+			.data
+			.read()
+			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+		let mut devices: Vec<(String, DeviceRecord)> = data
+			.paired_certs
+			.iter()
+			.map(|fingerprint| {
+				let record = data.devices.get(fingerprint).cloned().unwrap_or_default();
+				(fingerprint.clone(), record)
+			})
+			.collect();
+		devices.sort_by(|a, b| b.1.paired_at.cmp(&a.1.paired_at).then_with(|| a.0.cmp(&b.0)));
+		Ok(devices)
+	}
+
+	/// Change what is known about a paired certificate, then save when anything changed and
+	/// `persist` returns true for the old and new record.
+	pub(crate) fn update_device(
+		&self,
+		fingerprint: &str,
+		update: impl FnOnce(&mut DeviceRecord),
+		persist: impl FnOnce(&DeviceRecord, &DeviceRecord) -> bool,
+	) -> Result<bool, ()> {
+		let save = {
+			let mut data = self
+				.data
+				.write()
+				.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+			if !data.paired_certs.contains(fingerprint) {
+				return Ok(false);
+			}
+			let record = data.devices.entry(fingerprint.to_string()).or_default();
+			let old = record.clone();
+			update(record);
+			*record != old && persist(&old, record)
+		};
+		if save {
+			self.save()?;
+		}
+		Ok(true)
+	}
+
+	/// Forget a paired certificate. Returns whether it was paired.
+	pub(crate) fn remove_paired_cert(&self, fingerprint: &str) -> Result<bool, ()> {
+		let removed = {
+			let mut data = self
+				.data
+				.write()
+				.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+			data.devices.remove(fingerprint);
+			data.paired_certs.remove(fingerprint)
+		};
+		if removed {
+			self.save()?;
+		}
+		Ok(removed)
 	}
 
 	// pub fn remove_client(&self, client: String) -> Result<bool, ()> {

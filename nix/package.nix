@@ -25,7 +25,8 @@ let
 
   # Only what the build actually consumes, so touching flake.nix, the README,
   # or CI config doesn't rebuild the world. assets/ is required: the webserver
-  # embeds assets/pin.html via include_bytes!.
+  # embeds assets/pin.html via include_bytes!, and the control panel (ui/)
+  # embeds assets/banner-readme.png.
   src = lib.fileset.toSource {
     root = ../.;
     fileset = lib.fileset.unions [
@@ -33,6 +34,7 @@ let
       ../Cargo.lock
       ../src
       ../tools
+      ../ui
       ../assets
       ../dist
     ];

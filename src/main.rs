@@ -10,6 +10,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use moonshine::ShutdownReason;
+use moonshine::app_scanner::ApplicationManager;
 use moonshine::clients::ClientManager;
 use moonshine::config::Config;
 use moonshine::discovery::MdnsDiscovery;
@@ -51,7 +52,12 @@ fn default_config_path() -> PathBuf {
 async fn main() -> Result<(), ()> {
 	let args = Args::parse();
 
-	init_tracing();
+	#[cfg(feature = "ui")]
+	let logs = moonshine_ui::LogBuffer::new();
+	init_tracing(
+		#[cfg(feature = "ui")]
+		&logs,
+	);
 
 	let config_path = args.config.unwrap_or_else(default_config_path);
 	let config = Config::load_or_create(&config_path)?;
@@ -73,6 +79,7 @@ async fn main() -> Result<(), ()> {
 
 	// Run health checks unless the user explicitly disabled them.
 	// If health checks are disabled, we still probe the GPU for supported codecs and HDR support.
+	let mut health_report = None;
 	let (supported_codecs, hdr_supported, dma_buf_supported) = if args.no_health_check {
 		tracing::info!("Health checks disabled (--no-health-check); probing GPU capabilities only.");
 		let capabilities = tokio::task::spawn_blocking({
@@ -101,7 +108,9 @@ async fn main() -> Result<(), ()> {
 			return Err(());
 		}
 
-		(report.supported_codecs, report.hdr_supported, report.dma_buf_supported)
+		let capabilities = (report.supported_codecs, report.hdr_supported, report.dma_buf_supported);
+		health_report = Some(report);
+		capabilities
 	};
 
 	if !dma_buf_supported {
@@ -133,7 +142,36 @@ async fn main() -> Result<(), ()> {
 		}
 	});
 
-	let moonshine = Moonshine::new(config, supported_codecs, hdr_supported, shutdown.clone())?;
+	#[cfg_attr(not(feature = "ui"), allow(unused_mut))]
+	let mut moonshine = Moonshine::new(config.clone(), supported_codecs, hdr_supported, shutdown.clone())?;
+
+	#[cfg(feature = "ui")]
+	let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+	#[cfg(feature = "ui")]
+	{
+		moonshine._ui = moonshine::ui::spawn(moonshine::ui::UiContext {
+			config,
+			config_path,
+			session_manager: moonshine._session_manager.clone(),
+			client_manager: moonshine._client_manager.clone(),
+			application_manager: moonshine._application_manager.clone(),
+			webserver: moonshine._webserver.clone(),
+			health: health_report,
+			supported_codecs,
+			hdr_supported,
+			logs,
+			restart_requested: restart_requested.clone(),
+			shutdown: shutdown.clone(),
+		})
+		.await
+		.unwrap_or_else(|()| {
+			tracing::warn!("The control panel is not available.");
+			None
+		});
+	}
+	#[cfg(not(feature = "ui"))]
+	let _ = (health_report, config);
+
 	tracing::info!("Moonshine is ready and waiting for connections.");
 
 	shutdown.wait_shutdown_triggered().await;
@@ -141,14 +179,41 @@ async fn main() -> Result<(), ()> {
 
 	let exit_code = shutdown.wait_shutdown_complete().await;
 	tracing::debug!("Successfully waited for shutdown to complete.");
+
+	#[cfg(feature = "ui")]
+	if restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
+		restart();
+	}
+
 	std::process::exit(exit_code as i32);
 }
 
-fn init_tracing() {
-	tracing_subscriber::registry()
-		.with(tracing_subscriber::fmt::layer().with_ansi(std::io::stdout().is_terminal()))
-		.with(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("error")))
-		.init();
+/// Replace this process with a new Moonshine that has the same arguments.
+#[cfg(feature = "ui")]
+fn restart() {
+	use std::os::unix::process::CommandExt;
+
+	tracing::info!("Restarting Moonshine.");
+	let error = match std::env::current_exe() {
+		Ok(exe) => std::process::Command::new(exe).args(std::env::args_os().skip(1)).exec(),
+		Err(e) => e,
+	};
+	tracing::error!("Failed to restart Moonshine: {error}");
+}
+
+fn init_tracing(#[cfg(feature = "ui")] logs: &moonshine_ui::LogBuffer) {
+	use tracing_subscriber::Layer;
+
+	let terminal = tracing_subscriber::fmt::layer()
+		.with_ansi(std::io::stdout().is_terminal())
+		.with_filter(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("error")));
+	let registry = tracing_subscriber::registry().with(terminal);
+
+	// The control panel shows more than the terminal does by default.
+	#[cfg(feature = "ui")]
+	let registry = registry.with(logs.layer().with_filter(EnvFilter::new("info,moonshine=debug")));
+
+	registry.init();
 }
 
 async fn wait_for_dbus() -> Result<(), ()> {
@@ -186,8 +251,11 @@ pub struct Moonshine {
 	_rtsp_server: RtspServer,
 	_session_manager: SessionManager,
 	_client_manager: ClientManager,
+	_application_manager: ApplicationManager,
 	_webserver: Webserver,
 	_discovery: MdnsDiscovery,
+	#[cfg(feature = "ui")]
+	_ui: Option<moonshine_ui::UiServer>,
 }
 
 impl Moonshine {
@@ -214,6 +282,25 @@ impl Moonshine {
 		if let Some(path) = &config.stats.socket {
 			moonshine::stats_socket::spawn(path.clone(), &session_manager, shutdown.clone())?;
 		}
+		let application_manager = ApplicationManager::with_hidden(
+			config.applications.clone(),
+			config.application_scanners.clone(),
+			config.hidden_applications.clone(),
+		);
+		let webserver = Webserver::new(
+			config.name.clone(),
+			config.address.clone(),
+			config.stream.port,
+			config.webserver.clone(),
+			application_manager.clone(),
+			supported_codecs,
+			hdr_supported,
+			client_manager.persistent_state().get_uuid()?.to_string(),
+			cert,
+			client_manager.clone(),
+			session_manager.clone(),
+			shutdown.clone(),
+		)?;
 
 		Ok(Self {
 			_rtsp_server: RtspServer::new(
@@ -225,24 +312,13 @@ impl Moonshine {
 				session_manager.clone(),
 				shutdown.clone(),
 			),
-			_session_manager: session_manager.clone(),
-			_client_manager: client_manager.clone(),
-			_webserver: Webserver::new(
-				config.name.clone(),
-				config.address.clone(),
-				config.stream.port,
-				config.webserver.clone(),
-				config.applications.clone(),
-				config.application_scanners.clone(),
-				supported_codecs,
-				hdr_supported,
-				client_manager.persistent_state().get_uuid()?.to_string(),
-				cert,
-				client_manager,
-				session_manager,
-				shutdown.clone(),
-			)?,
+			_session_manager: session_manager,
+			_client_manager: client_manager,
+			_application_manager: application_manager,
+			_webserver: webserver,
 			_discovery: MdnsDiscovery::spawn(&config.address, config.webserver.port, &config.name),
+			#[cfg(feature = "ui")]
+			_ui: None,
 		})
 	}
 }
