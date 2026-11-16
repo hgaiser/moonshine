@@ -35,6 +35,7 @@ moonshine-bench [OPTIONS] <COMMAND>
 | `--warmup <N>` | `4` | Seconds to discard before recording stats |
 | `--hdr` | off | Enable HDR mode |
 | `--verbose` | off | Print per-frame stats instead of periodic summary |
+| `--output <text|json>` | `text` | With `json`, write one final JSON result to stdout. Logs always go to stderr |
 
 ### Examples
 
@@ -105,3 +106,36 @@ With `--matrix`, each combination prints the same per-run summaries and the comm
 5. Collects `FrameStats` from each encoded frame via a broadcast channel
 6. After the warmup period, accumulates and reports statistics
 7. Stops after the specified duration or on Ctrl+C
+
+### JSON output
+
+Use `--output json` when another tool needs frame counts, FPS, bitrate and
+latency distributions without parsing log text:
+
+```bash
+moonshine-bench --duration 10 --output json /usr/bin/vkcube > result.json
+```
+
+Logs go to stderr, in text and JSON mode, so stdout holds only the result.
+The result is printed for every run, also one that failed.
+
+The result has `version` (now `1`) and `mode` (`single` or `matrix`). A
+single run has its fields at the top level; a matrix has a `runs` array, with
+a `resolution_label` per run, and `interrupted`. Each run has:
+
+- `status`: `ok`, `no_frames` (the session encoded no frames), `failed`, or
+  `interrupted` (Ctrl+C).
+- `resolution`, `target_fps` and `codec`.
+- `summary`: the measurements, or `null` without frames. Its fields are those
+  of the final text summary; times are in microseconds (`_us`).
+- `error`: the reason for a `failed` run, otherwise `null`.
+
+Unavailable GPU encode and bitstream-ready timing distributions are `null`,
+never zero-duration measurements. `version` goes up when a field is removed or
+renamed, or changes meaning; new fields do not change it.
+
+The exit status is non-zero when a run failed or encoded no frames, and for an
+interrupted matrix. JSON output does not measure network transit, client
+decoding or presentation. For live per-frame data from a running server, use
+the stats socket instead (`socket` in the `[stats]` table of its
+configuration).

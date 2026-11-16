@@ -1,3 +1,4 @@
+use std::io::IsTerminal;
 use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
@@ -23,6 +24,12 @@ use moonshine::session::stream::video::VideoStreamContext;
 use moonshine::session::stream::video::{FrameStats, StreamEvent};
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+	Text,
+	Json,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "moonshine-bench", about = "Benchmark Moonshine's encoding pipeline")]
@@ -65,6 +72,10 @@ struct Args {
 	/// Print per-frame stats to stderr instead of periodic summary.
 	#[arg(long)]
 	verbose: bool,
+
+	/// Emit one final machine-readable JSON object on stdout (logs remain on stderr).
+	#[arg(long, value_enum, default_value = "text")]
+	output: OutputFormat,
 }
 
 fn parse_resolution(s: &str) -> Result<(u32, u32), String> {
@@ -107,7 +118,7 @@ fn percentiles(samples: &[u64]) -> (u64, u64, u64) {
 	)
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 struct LatencyDistribution {
 	avg_us: f64,
 	min_us: u64,
@@ -150,7 +161,7 @@ impl LatencyDistribution {
 	}
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 struct StatsSummary {
 	count: u64,
 	fps: f64,
@@ -195,15 +206,56 @@ struct BenchmarkReport {
 	interrupted: bool,
 }
 
-struct MatrixReport {
+/// The outcome of one benchmark run, in single and matrix mode.
+struct RunReport {
 	resolution_label: &'static str,
 	resolution: String,
 	target_fps: u32,
 	codec: String,
-	status: MatrixStatus,
+	status: RunStatus,
 }
 
-enum MatrixStatus {
+impl RunReport {
+	/// The report of a run of `codec` at `resolution` and `target_fps`, which
+	/// ended with `result`.
+	fn new(
+		result: Result<BenchmarkReport, Box<dyn std::error::Error>>,
+		resolution_label: &'static str,
+		resolution: &str,
+		target_fps: u32,
+		codec: &str,
+	) -> Self {
+		match result {
+			Ok(report) => Self {
+				resolution_label: report.resolution_label,
+				resolution: report.resolution,
+				target_fps: report.target_fps,
+				codec: report.codec,
+				status: if report.interrupted {
+					RunStatus::Interrupted(report.summary)
+				} else {
+					RunStatus::Ok(report.summary)
+				},
+			},
+			Err(err) => Self {
+				resolution_label,
+				resolution: resolution.to_string(),
+				target_fps,
+				codec: codec.to_string(),
+				status: RunStatus::Failed(err.to_string()),
+			},
+		}
+	}
+
+	/// Whether the run counts as a failure for the exit status: it failed, or
+	/// it encoded no frames.
+	fn is_failure(&self) -> bool {
+		matches!(self.status, RunStatus::Failed(_) | RunStatus::Ok(None))
+	}
+}
+
+enum RunStatus {
+	/// The run finished; `None` if it encoded no frames.
 	Ok(Option<StatsSummary>),
 	Failed(String),
 	Interrupted(Option<StatsSummary>),
@@ -424,10 +476,61 @@ impl StatsAccumulator {
 	}
 }
 
+/// Version of the JSON output. Raise it when a field is removed or renamed,
+/// or changes meaning; new fields do not change it.
+const JSON_OUTPUT_VERSION: u32 = 1;
+
+/// One run in the JSON output: the fields single and matrix mode share.
+fn run_json(report: &RunReport) -> serde_json::Value {
+	let (status, summary, error): (&str, Option<&StatsSummary>, Option<&str>) = match &report.status {
+		RunStatus::Ok(Some(summary)) => ("ok", Some(summary), None),
+		RunStatus::Ok(None) => ("no_frames", None, None),
+		RunStatus::Failed(error) => ("failed", None, Some(error.as_str())),
+		RunStatus::Interrupted(summary) => ("interrupted", summary.as_ref(), None),
+	};
+	serde_json::json!({
+		"status": status,
+		"resolution": report.resolution,
+		"target_fps": report.target_fps,
+		"codec": report.codec,
+		"summary": summary,
+		"error": error,
+	})
+}
+
+fn single_report_json(report: &RunReport) -> serde_json::Value {
+	let mut value = run_json(report);
+	value["version"] = JSON_OUTPUT_VERSION.into();
+	value["mode"] = "single".into();
+	value
+}
+
+fn matrix_report_json(reports: &[RunReport], interrupted: bool) -> serde_json::Value {
+	let runs: Vec<_> = reports
+		.iter()
+		.map(|report| {
+			let mut value = run_json(report);
+			value["resolution_label"] = report.resolution_label.into();
+			value
+		})
+		.collect();
+	serde_json::json!({
+		"version": JSON_OUTPUT_VERSION,
+		"mode": "matrix",
+		"interrupted": interrupted,
+		"runs": runs,
+	})
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	// Logs go to stderr, so stdout carries only the result in JSON mode.
 	tracing_subscriber::registry()
-		.with(tracing_subscriber::fmt::layer())
+		.with(
+			tracing_subscriber::fmt::layer()
+				.with_writer(std::io::stderr)
+				.with_ansi(std::io::stderr().is_terminal()),
+		)
 		.with(EnvFilter::try_from_env("MOONSHINE_LOG").unwrap_or_else(|_| EnvFilter::new("info")))
 		.init();
 
@@ -446,8 +549,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-	run_benchmark(args, "", &args.resolution, args.fps, &args.codec, args.duration).await?;
-	Ok(())
+	let result = run_benchmark(args, "", &args.resolution, args.fps, &args.codec, args.duration).await;
+	let report = RunReport::new(result, "", &args.resolution, args.fps, &args.codec);
+	// Also for a run that failed, so a consumer always gets a result.
+	if args.output == OutputFormat::Json {
+		println!("{}", serde_json::to_string(&single_report_json(&report))?);
+	}
+	match report.status {
+		RunStatus::Failed(err) => Err(boxed_error(err)),
+		RunStatus::Ok(None) => Err(boxed_error("No frames were encoded during benchmark session")),
+		RunStatus::Ok(Some(_)) | RunStatus::Interrupted(_) => Ok(()),
+	}
 }
 
 async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
@@ -484,58 +596,38 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 					codec
 				);
 
-				match run_benchmark(args, resolution_label, resolution, fps, codec, duration).await {
-					Ok(report) => {
-						interrupted = report.interrupted;
-						let status = if report.interrupted {
-							MatrixStatus::Interrupted(report.summary)
-						} else {
-							MatrixStatus::Ok(report.summary)
-						};
-						reports.push(MatrixReport {
-							resolution_label: report.resolution_label,
-							resolution: report.resolution,
-							target_fps: report.target_fps,
-							codec: report.codec,
-							status,
-						});
-
-						if interrupted {
-							break 'outer;
-						}
-					},
-					Err(err) => {
-						tracing::error!(
-							"Matrix run failed: {} {} {}fps {}: {}",
-							resolution_label,
-							resolution,
-							fps,
-							codec,
-							err
-						);
-						reports.push(MatrixReport {
-							resolution_label,
-							resolution: resolution.to_string(),
-							target_fps: fps,
-							codec: codec.to_string(),
-							status: MatrixStatus::Failed(err.to_string()),
-						});
-					},
+				let result = run_benchmark(args, resolution_label, resolution, fps, codec, duration).await;
+				let report = RunReport::new(result, resolution_label, resolution, fps, codec);
+				if let RunStatus::Failed(err) = &report.status {
+					tracing::error!(
+						"Matrix run failed: {} {} {}fps {}: {}",
+						resolution_label,
+						resolution,
+						fps,
+						codec,
+						err
+					);
+				}
+				interrupted = matches!(report.status, RunStatus::Interrupted(_));
+				reports.push(report);
+				if interrupted {
+					break 'outer;
 				}
 			}
 		}
 	}
 
-	print_matrix_summary(&reports);
+	if args.output == OutputFormat::Json {
+		println!("{}", serde_json::to_string(&matrix_report_json(&reports, interrupted))?);
+	} else {
+		print_matrix_summary(&reports);
+	}
 
 	if interrupted {
 		return Err(boxed_error("Matrix benchmark interrupted"));
 	}
 
-	let failures = reports
-		.iter()
-		.filter(|report| matches!(report.status, MatrixStatus::Failed(_)))
-		.count();
+	let failures = reports.iter().filter(|report| report.is_failure()).count();
 	if failures > 0 {
 		return Err(boxed_error(format!("{failures} matrix benchmark run(s) failed")));
 	}
@@ -767,9 +859,8 @@ async fn run_benchmark(
 	let _ = session_manager.stop_session().await;
 
 	tracing::info!("Done.");
-	if summary.is_none() && !interrupted {
-		return Err(boxed_error("No frames were encoded during benchmark session"));
-	}
+	// A session without frames is reported as such; the caller makes it a
+	// failure.
 	Ok(BenchmarkReport {
 		resolution_label,
 		resolution: format!("{}x{}", width, height),
@@ -780,7 +871,7 @@ async fn run_benchmark(
 	})
 }
 
-fn print_matrix_summary(reports: &[MatrixReport]) {
+fn print_matrix_summary(reports: &[RunReport]) {
 	tracing::info!("Moonshine benchmark matrix summary");
 	tracing::info!("Latency distributions (us): values are avg/p50/p95/p99/max");
 	tracing::info!(
@@ -800,8 +891,8 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 
 	for report in reports {
 		match &report.status {
-			MatrixStatus::Ok(Some(summary)) | MatrixStatus::Interrupted(Some(summary)) => {
-				let status = if matches!(&report.status, MatrixStatus::Ok(_)) {
+			RunStatus::Ok(Some(summary)) | RunStatus::Interrupted(Some(summary)) => {
+				let status = if matches!(&report.status, RunStatus::Ok(_)) {
 					"ok"
 				} else {
 					"interrupted"
@@ -821,8 +912,8 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 					summary.encode_wait.matrix_value(),
 				);
 			},
-			MatrixStatus::Ok(None) | MatrixStatus::Interrupted(None) => {
-				let status = if matches!(&report.status, MatrixStatus::Ok(_)) {
+			RunStatus::Ok(None) | RunStatus::Interrupted(None) => {
+				let status = if matches!(&report.status, RunStatus::Ok(_)) {
 					"no-frames"
 				} else {
 					"interrupted"
@@ -836,7 +927,7 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 					status
 				);
 			},
-			MatrixStatus::Failed(err) => {
+			RunStatus::Failed(err) => {
 				tracing::info!(
 					"  {:<8} {:<10} {:>6} {:<5} failed: {}",
 					report.resolution_label,
@@ -861,7 +952,7 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 		"ready avg/p50/p95"
 	);
 	for report in reports {
-		if let MatrixStatus::Ok(Some(summary)) | MatrixStatus::Interrupted(Some(summary)) = &report.status {
+		if let RunStatus::Ok(Some(summary)) | RunStatus::Interrupted(Some(summary)) = &report.status {
 			let format_timing = |distribution: &Option<LatencyDistribution>| {
 				distribution.as_ref().map_or_else(
 					|| "unavailable".to_string(),
@@ -903,7 +994,7 @@ fn print_matrix_summary(reports: &[MatrixReport]) {
 		"key"
 	);
 	for report in reports {
-		if let MatrixStatus::Ok(Some(summary)) | MatrixStatus::Interrupted(Some(summary)) = &report.status {
+		if let RunStatus::Ok(Some(summary)) | RunStatus::Interrupted(Some(summary)) = &report.status {
 			tracing::info!(
 				"  {:<8} {:<10} {:>6} {:<5} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>8.0} {:>10.0} {:>8.0} {:>8.0} {:>6}",
 				report.resolution_label,
@@ -932,7 +1023,7 @@ fn boxed_error(message: impl Into<String>) -> Box<dyn std::error::Error> {
 
 #[cfg(test)]
 mod timing_tests {
-	use super::{FrameStats, StatsAccumulator};
+	use super::{FrameStats, RunReport, RunStatus, StatsAccumulator, single_report_json};
 	use std::time::Duration;
 
 	fn frame(gpu_encode: Option<Duration>, bitstream_ready: Option<Duration>) -> FrameStats {
@@ -964,6 +1055,19 @@ mod timing_tests {
 		assert_eq!(summary.gpu_timing_samples, 0);
 		assert!(summary.gpu_encode.is_none());
 		assert!(summary.bitstream_ready.is_none());
+		let report = RunReport {
+			resolution_label: "",
+			resolution: "1920x1080".to_string(),
+			target_fps: 60,
+			codec: "h264".to_string(),
+			status: RunStatus::Ok(Some(summary)),
+		};
+		let json = single_report_json(&report);
+		assert_eq!(json["status"], "ok");
+		assert_eq!(json["summary"]["count"], 1);
+		assert_eq!(json["summary"]["gpu_timing_samples"], 0);
+		assert!(json["summary"]["gpu_encode"].is_null());
+		assert!(json["summary"]["bitstream_ready"].is_null());
 	}
 
 	#[test]
@@ -1003,5 +1107,89 @@ mod timing_tests {
 		assert_eq!(gpu.avg_us, 1400.0);
 		let ready = summary.bitstream_ready.expect("one bitstream timing sample");
 		assert_eq!(ready.p50_us, 2700);
+	}
+}
+
+#[cfg(test)]
+mod json_output_tests {
+	use super::{
+		BenchmarkReport, JSON_OUTPUT_VERSION, RunReport, RunStatus, boxed_error, matrix_report_json, single_report_json,
+	};
+
+	/// The report of a single run that ended with `result`.
+	fn single(result: Result<BenchmarkReport, Box<dyn std::error::Error>>) -> RunReport {
+		RunReport::new(result, "", "1920x1080", 60, "h264")
+	}
+
+	fn finished(interrupted: bool) -> Result<BenchmarkReport, Box<dyn std::error::Error>> {
+		Ok(BenchmarkReport {
+			resolution_label: "",
+			resolution: "1920x1080".to_string(),
+			target_fps: 60,
+			codec: "h264".to_string(),
+			summary: None,
+			interrupted,
+		})
+	}
+
+	#[test]
+	fn empty_session_is_explicit_in_json() {
+		let report = single(finished(false));
+		assert!(report.is_failure());
+		let value = single_report_json(&report);
+		assert_eq!(value["version"], JSON_OUTPUT_VERSION);
+		assert_eq!(value["mode"], "single");
+		assert_eq!(value["status"], "no_frames");
+		assert!(value["summary"].is_null());
+		assert!(value["error"].is_null());
+	}
+
+	#[test]
+	fn interrupted_session_has_explicit_status() {
+		let report = single(finished(true));
+		assert!(!report.is_failure());
+		let value = single_report_json(&report);
+		assert_eq!(value["status"], "interrupted");
+		assert!(value["summary"].is_null());
+	}
+
+	#[test]
+	fn failed_single_run_is_reported_in_json() {
+		let report = single(Err(boxed_error("compositor failed to start")));
+		assert!(report.is_failure());
+		let value = single_report_json(&report);
+		assert_eq!(value["status"], "failed");
+		assert_eq!(value["error"], "compositor failed to start");
+		assert_eq!(value["resolution"], "1920x1080");
+		assert_eq!(value["codec"], "h264");
+		assert!(value["summary"].is_null());
+	}
+
+	#[test]
+	fn matrix_json_preserves_per_case_failures() {
+		let reports = [
+			RunReport {
+				resolution_label: "1080p",
+				resolution: "1920x1080".to_string(),
+				target_fps: 60,
+				codec: "hevc".to_string(),
+				status: RunStatus::Failed("encoder unavailable".to_string()),
+			},
+			RunReport {
+				resolution_label: "4k",
+				resolution: "3840x2160".to_string(),
+				target_fps: 120,
+				codec: "av1".to_string(),
+				status: RunStatus::Ok(None),
+			},
+		];
+		let value = matrix_report_json(&reports, false);
+		assert_eq!(value["version"], JSON_OUTPUT_VERSION);
+		assert_eq!(value["mode"], "matrix");
+		assert_eq!(value["runs"][0]["resolution_label"], "1080p");
+		assert_eq!(value["runs"][0]["status"], "failed");
+		assert_eq!(value["runs"][0]["error"], "encoder unavailable");
+		assert_eq!(value["runs"][1]["status"], "no_frames");
+		assert!(value["runs"][1]["summary"].is_null());
 	}
 }
