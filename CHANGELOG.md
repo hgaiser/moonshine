@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a `working_directory` option to applications, the directory the application starts in. (#264)
 - Add a Faugus Launcher application scanner. Games start in the folder holding their executable, as they do from Faugus' own window. (#264, @istvnurbn)
 
 ## [v0.17.2] - 15-11-2026

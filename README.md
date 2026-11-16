@@ -216,6 +216,7 @@ steam_integration = true
 - `title`: The name shown in Moonlight.
 - `boxart` (optional): Path to a cover image.
 - `command`: The command to run. First entry is the executable, the rest are arguments.
+- `working_directory` (optional): The directory to start the application in, for example a game that loads its data from the directory it runs in. `~` and environment variables are expanded, and the directory has to exist. The `pre_command` and `post_command` commands run there too. Defaults to your home directory.
 - `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. Runs synchronously — the session waits for all to finish.
 - `steam_integration` (optional): Steam integration, as gamescope's `-e`; off by default. Turn it on for Steam (Big Picture), so its overlay and focus work. With it on, only Steam and Steam game windows can take focus, so leave it off for anything launched directly. With it off, Steam acts as on a desktop: its power menu has "Exit Big Picture Mode", not "Switch to Desktop". Games from the Steam application scanner have it on.
 - `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. Runs synchronously — the server waits for all to finish.
@@ -335,8 +336,7 @@ command = ["faugus-launcher", "--game", "{game_id}"]
 ```
 
 `{game_id}` is the game's Faugus id.
-Each game starts in the folder holding its executable, as it does when launched from Faugus' window: `faugus-launcher --game` on its own keeps the caller's directory, and some games quit right away when started anywhere else.
-Moonshine does this by prefixing the command with `env -C <folder>`, so `env` looks the command up in the launched application's `PATH`, which can differ from Moonshine's own. An absolute path behaves the same either way.
+Each game starts in the folder holding its executable (its `working_directory`), as it does when launched from Faugus' window: `faugus-launcher --game` on its own keeps the caller's directory, and some games quit right away when started anywhere else.
 Hidden games are skipped unless you set `include_hidden = true`, and so are games using Faugus' Steam runner, which hands the game to Steam and exits shortly after; the Steam scanner launches those.
 Box art is automatically loaded from the game's cover in Faugus when available, falling back to its banner and then its icon.
 

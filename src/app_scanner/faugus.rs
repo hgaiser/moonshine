@@ -200,22 +200,12 @@ pub(crate) fn scan_faugus_applications(config: &FaugusApplicationScannerConfig) 
 			continue;
 		}
 
-		let mut command: Vec<String> = config
+		let command: Vec<String> = config
 			.command
 			.iter()
 			.map(|arg| arg.replace("{game_id}", &game.game_id))
 			.collect();
-		if let Some(directory) = game_directory(&game) {
-			command.splice(
-				0..0,
-				[
-					"env".to_string(),
-					"-C".to_string(),
-					directory.to_string_lossy().into_owned(),
-				],
-			);
-		}
-
+		let working_directory = game_directory(&game);
 		let boxart = find_boxart(&data_dir, &game);
 
 		applications.push(ApplicationConfig {
@@ -223,6 +213,7 @@ pub(crate) fn scan_faugus_applications(config: &FaugusApplicationScannerConfig) 
 			pre_command: config.pre_command.clone(),
 			post_command: config.post_command.clone(),
 			command,
+			working_directory,
 			boxart,
 			stdout: config.stdout.clone(),
 			stderr: config.stderr.clone(),
@@ -355,20 +346,14 @@ mod tests {
 		assert_eq!(titles(&applications), ["Kane & Lynch: Dead Men"]);
 		assert_eq!(
 			applications[0].command,
-			[
-				"env",
-				"-C",
-				game_dir.to_str().unwrap(),
-				"/usr/bin/faugus-launcher",
-				"--game",
-				"kane-lynch-dead-men",
-			]
+			["/usr/bin/faugus-launcher", "--game", "kane-lynch-dead-men"]
 		);
+		assert_eq!(applications[0].working_directory, Some(game_dir));
 		assert!(!applications[0].steam_integration);
 	}
 
 	#[test]
-	fn keeps_the_command_as_is_without_a_game_directory() {
+	fn has_no_working_directory_without_a_game_directory() {
 		let tempdir = tempdir().unwrap();
 		let data_dir = tempdir.path().join("faugus-launcher");
 		write_library(
@@ -383,15 +368,10 @@ mod tests {
 		let applications = scan_faugus_applications(&scanner_config(data_dir)).unwrap();
 
 		assert_eq!(titles(&applications), ["No Path", "Gone", "Relative"]);
-		assert_eq!(
-			applications[0].command,
-			["/usr/bin/faugus-launcher", "--game", "no-path"]
-		);
+		for application in &applications {
+			assert_eq!(application.working_directory, None, "{}", application.title);
+		}
 		assert_eq!(applications[1].command, ["/usr/bin/faugus-launcher", "--game", "gone"]);
-		assert_eq!(
-			applications[2].command,
-			["/usr/bin/faugus-launcher", "--game", "relative"]
-		);
 	}
 
 	#[test]

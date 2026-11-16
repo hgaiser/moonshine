@@ -1,7 +1,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{BTreeMap, HashMap};
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
@@ -27,6 +27,13 @@ pub struct ApplicationConfig {
 
 	/// The command to run.
 	pub command: Vec<String>,
+
+	/// The directory to start the application in. `~` and environment
+	/// variables are expanded; the result has to be an absolute path to an
+	/// existing directory. If not set, the application starts in the home
+	/// directory.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub working_directory: Option<PathBuf>,
 
 	/// Commands to run before launching the application.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -70,6 +77,7 @@ impl Default for ApplicationConfig {
 			title: String::new(),
 			boxart: None,
 			command: Vec::new(),
+			working_directory: None,
 			pre_command: Vec::new(),
 			post_command: Vec::new(),
 			stdout: None,
@@ -125,6 +133,8 @@ pub(crate) struct LaunchOptions<'a> {
 	pub program: &'a str,
 	pub args: &'a [String],
 	pub envs: &'a [String],
+	/// The expanded, absolute working directory, if one is configured.
+	pub working_directory: Option<&'a str>,
 	pub timeout: Duration,
 	pub pre_commands: &'a Vec<Vec<String>>,
 	pub post_commands: &'a Vec<Vec<String>>,
@@ -167,6 +177,11 @@ impl Application {
 		};
 		let args = &config.command[1..];
 		let envs = make_envs(&context, &config.env, config.steam_integration)?;
+		let working_directory = config
+			.working_directory
+			.as_deref()
+			.map(resolve_working_directory)
+			.transpose()?;
 
 		tracing::info!(program, ?args, "Launching application.");
 
@@ -185,6 +200,7 @@ impl Application {
 			program,
 			args,
 			envs: &envs,
+			working_directory: working_directory.as_deref(),
 			timeout: Duration::from_secs(config.launch_timeout_secs),
 			pre_commands: &config.pre_command,
 			post_commands: &config.post_command,
@@ -544,6 +560,28 @@ fn terminal_state(state: &str) -> Option<&'static str> {
 	}
 }
 
+/// Expand a configured working directory and check it before launch.
+///
+/// systemd needs an absolute path, and fails the unit with a bare `CHDIR`
+/// status when the directory does not exist; checking here gives a clear error.
+fn resolve_working_directory(directory: &Path) -> Result<String, ()> {
+	let configured = directory.to_string_lossy();
+	let expanded = shellexpand::full(&configured)
+		.map_err(|e| tracing::error!("Failed to expand working directory {configured:?}: {e}"))?;
+	let path = Path::new(expanded.as_ref());
+	if !path.is_absolute() {
+		tracing::error!("Working directory {path:?} is not an absolute path.");
+		return Err(());
+	}
+	if !path.is_dir() {
+		tracing::error!("Working directory {path:?} does not exist or is not a directory.");
+		return Err(());
+	}
+	path.to_str()
+		.map(str::to_string)
+		.ok_or_else(|| tracing::error!("Working directory {path:?} is not valid UTF-8."))
+}
+
 /// Split a systemd `StandardOutput`/`StandardError` setting into the enum value
 /// and, for path-based settings, the companion path property.
 ///
@@ -631,6 +669,11 @@ async fn start_transient_service(conn: &Connection, options: &LaunchOptions<'_>)
 	}
 	if let Some((prop, path)) = stderr_path {
 		properties.push((format!("StandardError{prop}"), zvariant::Value::Str(path.into())));
+	}
+
+	// The pre and post commands run there too, as `ExecStartPre`/`ExecStopPost` do.
+	if let Some(directory) = options.working_directory {
+		properties.push(("WorkingDirectory".to_string(), zvariant::Value::Str(directory.into())));
 	}
 
 	// Only include ExecStartPre/ExecStopPost when non-empty: an empty a(sasb) array still
@@ -798,9 +841,37 @@ fn build_exec_array(entries: &[(String, Vec<String>, bool)]) -> Result<zvariant:
 
 #[cfg(test)]
 mod tests {
-	use super::{ApplicationConfig, ApplicationContext, make_envs, split_standard_io};
+	use super::{ApplicationConfig, ApplicationContext, make_envs, resolve_working_directory, split_standard_io};
 	use std::collections::{BTreeMap, HashMap};
-	use std::path::PathBuf;
+	use std::path::{Path, PathBuf};
+
+	#[test]
+	fn test_working_directory_is_optional() {
+		let unset: ApplicationConfig = toml::from_str("title = \"Game\"\ncommand = [\"g\"]").unwrap();
+		assert_eq!(unset.working_directory, None);
+		let set: ApplicationConfig =
+			toml::from_str("title = \"Game\"\ncommand = [\"g\"]\nworking_directory = \"~/Games/Game\"").unwrap();
+		assert_eq!(set.working_directory, Some(PathBuf::from("~/Games/Game")));
+	}
+
+	#[test]
+	fn test_working_directory_is_expanded_and_checked() {
+		let tempdir = tempfile::tempdir().unwrap();
+		let directory = tempdir.path().to_str().unwrap();
+		assert_eq!(resolve_working_directory(tempdir.path()), Ok(directory.to_string()));
+
+		let home = dirs::home_dir().unwrap();
+		assert_eq!(
+			resolve_working_directory(Path::new("~")),
+			Ok(home.to_str().unwrap().to_string())
+		);
+
+		assert!(resolve_working_directory(Path::new("relative/directory")).is_err());
+		assert!(resolve_working_directory(&tempdir.path().join("missing")).is_err());
+		let file = tempdir.path().join("file");
+		std::fs::write(&file, b"").unwrap();
+		assert!(resolve_working_directory(&file).is_err());
+	}
 
 	#[test]
 	fn test_steam_integration_defaults_to_off() {
