@@ -15,12 +15,12 @@ use moonshine::session::stream::audio::AudioConfig;
 use moonshine::session::stream::audio::AudioStreamConfig;
 use moonshine::session::stream::audio::AudioStreamContext;
 use moonshine::session::stream::control::ControlStreamConfig;
-use moonshine::session::stream::video::FrameStats;
 use moonshine::session::stream::video::VideoChromaSampling;
 use moonshine::session::stream::video::VideoDynamicRange;
 use moonshine::session::stream::video::VideoFormat;
 use moonshine::session::stream::video::VideoStreamConfig;
 use moonshine::session::stream::video::VideoStreamContext;
+use moonshine::session::stream::video::{FrameStats, StreamEvent};
 use tokio::signal;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -753,7 +753,9 @@ async fn run_benchmark(
 			biased;
 			result = stats_rx.recv() => {
 				match result {
-					Ok(stats) => {
+					// The stream's start and end are clear from the session itself.
+					Ok(StreamEvent::Started(_) | StreamEvent::Stopped) => {},
+					Ok(StreamEvent::Frame(stats)) => {
 						if Instant::now() >= warmup_deadline {
 							if args.verbose {
 								tracing::info!(
@@ -824,6 +826,9 @@ async fn run_benchmark(
 	let _ = session_manager.stop_session().await;
 
 	tracing::info!("Done.");
+	if summary.is_none() && !interrupted {
+		return Err(boxed_error("No frames were encoded during benchmark session"));
+	}
 	Ok(BenchmarkReport {
 		resolution_label,
 		resolution: format!("{}x{}", width, height),
@@ -991,6 +996,9 @@ mod timing_tests {
 
 	fn frame(gpu_encode: Option<Duration>, bitstream_ready: Option<Duration>) -> FrameStats {
 		FrameStats {
+			frame_number: 0,
+			captured_at: std::time::UNIX_EPOCH,
+			content: None,
 			channel_wait: Duration::ZERO,
 			import: Duration::ZERO,
 			convert: Duration::ZERO,

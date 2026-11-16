@@ -3,7 +3,7 @@ members = [".", "tools"]
 resolver = "2"
 
 [workspace.package]
-version = "0.16.1"
+version = "0.17.2"
 
 [package]
 name = "moonshine"
@@ -26,7 +26,7 @@ aes = "0.9.1"
 aes-gcm = "0.10.3"
 arrayvec = "0.7.8"
 async-shutdown = "0.2.2"
-ash = { git = "https://github.com/ash-rs/ash", rev = "f4c2ca3e4f6b998d5254ad101a32f024d87cdec2" }
+ash = { package = "pixelforge-ash", version = "0.38.1" }
 aws-lc-rs = "1.17.0"
 byteorder = "1.5.0"
 bytes = "1.11.1"
@@ -36,7 +36,7 @@ crossbeam-channel = "0.5.15"
 dasp_sample = "0.11.0"
 dirs = "6.0.0"
 fec-rs = { version = "0.1.0", features = ["parallel"] }
-ferriscope = { git = "https://github.com/hgaiser/ferriscope", rev = "e4dcc887bf8b88142c504b53938467968cf21964", default-features = false }
+ferriscope = { version = "0.1.0", default-features = false }
 futures-util = { version = "0.3", default-features = false, features = ["sink"] }
 gethostname = "1.1.0"
 hex = "0.4.3"
@@ -54,12 +54,12 @@ network-interface = "2.0.5"
 notify-rust = "4.17.0"
 open = "5.3.5"
 opus = "0.3.1"
-pkcs8 = "0.11.0"
-pixelforge = { git = "https://github.com/hgaiser/pixelforge", tag = "v0.10.0", features = ["dmabuf"] }
+pixelforge = { version = "0.12.1", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"
 rtsp-types = "0.1.3"
+rustix = { version = "1.1", features = ["event", "fs", "pipe", "process"] }
 rubato = "5.0.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 rustls = "0.23.40"
@@ -70,9 +70,9 @@ serde_json = "1.0.149"
 sha2 = "0.11.0"
 shellexpand = "3.1.2"
 shlex = "2.0.1"
-# The smithay fork with the Vulkan renderer, at the revision ferriscope uses: moonshine
-# exchanges smithay types (`Dmabuf`) with ferriscope, so both must use the same smithay.
-smithay = { git = "https://github.com/hgaiser/smithay", rev = "fa2f9e3bdc1be3d6da2a3837b33c684d0cdeea34", default-features = false, features = [
+# The smithay fork with the Vulkan renderer (`ferriscope-smithay`). Moonshine exchanges
+# smithay types (`Dmabuf`) with ferriscope, so both must use the same crate.
+smithay = { package = "ferriscope-smithay", version = "0.7.1", default-features = false, features = [
     "backend_drm",
     "backend_gbm",
     "backend_vulkan",

@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "ferriscope": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1794615961,
+        "narHash": "sha256-JvJgK9Gh9Poq201M5cGST+W8CNuWayynBBtd6b31TXE=",
+        "owner": "hgaiser",
+        "repo": "ferriscope",
+        "rev": "8638d7c425efb42443d0c1d3c20f98f4ad8ad12f",
+        "type": "github"
+      },
+      "original": {
+        "owner": "hgaiser",
+        "ref": "v0.1.0",
+        "repo": "ferriscope",
+        "type": "github"
+      }
+    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1793110635,
@@ -18,6 +35,7 @@
     },
     "root": {
       "inputs": {
+        "ferriscope": "ferriscope",
         "nixpkgs": "nixpkgs"
       }
     }

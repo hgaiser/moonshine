@@ -1,8 +1,9 @@
 //! The colour of a compositor frame, in the encoder's terms.
 
 /// Color space of the compositor output frame.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum FrameColorSpace {
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameColorSpace {
 	/// sRGB (BT.709 primaries, sRGB EOTF, BT.709 matrix).
 	#[default]
 	Srgb,

@@ -185,14 +185,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ash"
-version = "0.38.0+1.4.352"
-source = "git+https://github.com/ash-rs/ash?rev=f4c2ca3e4f6b998d5254ad101a32f024d87cdec2#f4c2ca3e4f6b998d5254ad101a32f024d87cdec2"
-dependencies = [
- "libloading",
-]
-
-[[package]]
 name = "asn1-rs"
 version = "0.7.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -558,15 +550,6 @@ dependencies = [
 
 [[package]]
 name = "block-buffer"
-version = "0.10.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3078c7629b62d3f0439517fa394996acacc5cbc91c5a20d8c658e77abd503a71"
-dependencies = [
- "generic-array",
-]
-
-[[package]]
-name = "block-buffer"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2f6c7dbe95a6ed67ad9f18e57daf93a2f034c524b99fd2b76d18fdfeb6660aa"
@@ -666,14 +649,13 @@ checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
 
 [[package]]
 name = "calloop"
-version = "0.14.4"
+version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4dbf9978365bac10f54d1d4b04f7ce4427e51f71d61f2fe15e3fed5166474df7"
+checksum = "43b32313e937c8721c9d17ee9bf60699a6402b4b7c2cb6ac1bee0ffcaa4b4e5e"
 dependencies = [
  "bitflags",
  "polling",
  "rustix 1.1.4",
- "slab",
  "tracing",
 ]
 
@@ -999,15 +981,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "der"
-version = "0.8.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a69dedd701da44b0536442edf09c81a64b0ab97a7a4a5e3d1971f00027cbc63d"
-dependencies = [
- "const-oid 0.10.2",
-]
-
-[[package]]
 name = "der-parser"
 version = "10.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1033,7 +1006,6 @@ version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9ed9a281f7bc9b7576e61468ba615a66a5c8cfdff42420a70aa82701a3b1e292"
 dependencies = [
- "block-buffer 0.10.4",
  "const-oid 0.9.6",
  "crypto-common 0.1.7",
 ]
@@ -1044,7 +1016,7 @@ version = "0.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f1dd6dbb5841937940781866fa1281a1ff7bd3bf827091440879f9994983d5c2"
 dependencies = [
- "block-buffer 0.12.1",
+ "block-buffer",
  "const-oid 0.10.2",
  "crypto-common 0.2.2",
 ]
@@ -1314,15 +1286,63 @@ dependencies = [
 [[package]]
 name = "ferriscope"
 version = "0.1.0"
-source = "git+https://github.com/hgaiser/ferriscope?rev=e4dcc887bf8b88142c504b53938467968cf21964#e4dcc887bf8b88142c504b53938467968cf21964"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2a1024687c401c539547955d733214bfaf6dc24d51ab4f9883bafcedc2b39d9b"
 dependencies = [
  "bitflags",
- "smithay",
+ "ferriscope-smithay",
+ "png",
  "thiserror 2.0.19",
  "tracing",
  "wayland-backend",
  "wayland-scanner",
  "wayland-server",
+]
+
+[[package]]
+name = "ferriscope-smithay"
+version = "0.7.1+a9822e8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33aa07718272753efd2f6b613f75f6d23185118599f3e8b082d13453bc00de2d"
+dependencies = [
+ "appendlist",
+ "ash",
+ "bitflags",
+ "bytemuck",
+ "calloop",
+ "cc",
+ "cursor-icon",
+ "downcast-rs",
+ "drm",
+ "drm-ffi",
+ "drm-fourcc",
+ "drm-sys",
+ "encoding_rs",
+ "errno",
+ "gbm",
+ "glam",
+ "include_bytes_aligned",
+ "indexmap",
+ "libc",
+ "pkg-config",
+ "portable-atomic",
+ "profiling",
+ "rand 0.10.2",
+ "reis",
+ "rustix 1.1.4",
+ "scopeguard",
+ "shaderc",
+ "siphasher",
+ "smallvec",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+ "wayland-protocols",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
+ "wayland-server",
+ "x11rb",
+ "xkbcommon",
 ]
 
 [[package]]
@@ -2312,12 +2332,11 @@ dependencies = [
 
 [[package]]
 name = "moonshine"
-version = "0.16.1"
+version = "0.17.2"
 dependencies = [
  "aes 0.9.2",
  "aes-gcm",
  "arrayvec",
- "ash 0.38.0+1.4.352",
  "async-shutdown",
  "aws-lc-rs",
  "byteorder",
@@ -2329,6 +2348,7 @@ dependencies = [
  "dirs",
  "fec-rs",
  "ferriscope",
+ "ferriscope-smithay",
  "futures-util",
  "gethostname",
  "hex",
@@ -2347,7 +2367,7 @@ dependencies = [
  "open",
  "opus",
  "pixelforge",
- "pkcs8 0.11.0",
+ "pixelforge-ash",
  "pulseaudio",
  "quinn-udp",
  "rcgen",
@@ -2355,15 +2375,15 @@ dependencies = [
  "rtsp-types",
  "rubato",
  "rusqlite",
+ "rustix 1.1.4",
  "rustls",
  "rustls-pemfile",
  "sdp-types",
  "serde",
  "serde_json",
- "sha2 0.11.0",
+ "sha2",
  "shellexpand",
  "shlex 2.0.1",
- "smithay",
  "socket2",
  "steamlocate",
  "strum_macros",
@@ -2386,7 +2406,7 @@ dependencies = [
 
 [[package]]
 name = "moonshine-tools"
-version = "0.16.1"
+version = "0.17.2"
 dependencies = [
  "async-shutdown",
  "clap",
@@ -2758,14 +2778,24 @@ dependencies = [
 
 [[package]]
 name = "pixelforge"
-version = "0.10.0"
-source = "git+https://github.com/hgaiser/pixelforge?tag=v0.10.0#4f3ff5e963a733e4036fd0bcb62df33daeb4ca94"
+version = "0.12.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4ce8009a1a87f39c04da89bd8883dca623e8b9aefbdf9bce4a7092bd9e5d6b7e"
 dependencies = [
- "ash 0.38.0+1.4.352",
  "futures-channel",
  "futures-core",
+ "pixelforge-ash",
  "thiserror 2.0.19",
  "tracing",
+]
+
+[[package]]
+name = "pixelforge-ash"
+version = "0.38.1+1.4.352.f4c2ca3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2d81c4ac49b6f49a334783c30092ad10953deb6345f6e0fc287ed49f47675232"
+dependencies = [
+ "libloading",
 ]
 
 [[package]]
@@ -2774,9 +2804,9 @@ version = "0.7.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8ffb9f10fa047879315e6625af03c164b16962a5368d724ed16323b68ace47f"
 dependencies = [
- "der 0.7.10",
- "pkcs8 0.10.2",
- "spki 0.7.3",
+ "der",
+ "pkcs8",
+ "spki",
 ]
 
 [[package]]
@@ -2785,18 +2815,8 @@ version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
 dependencies = [
- "der 0.7.10",
- "spki 0.7.3",
-]
-
-[[package]]
-name = "pkcs8"
-version = "0.11.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "451913da69c775a56034ea8d9003d27ee8948e12443eae7c038ba100a4f21cb7"
-dependencies = [
- "der 0.8.1",
- "spki 0.8.0",
+ "der",
+ "spki",
 ]
 
 [[package]]
@@ -3306,10 +3326,10 @@ dependencies = [
  "num-integer",
  "num-traits",
  "pkcs1",
- "pkcs8 0.10.2",
+ "pkcs8",
  "rand_core 0.6.4",
  "signature",
- "spki 0.7.3",
+ "spki",
  "subtle",
  "zeroize",
 ]
@@ -3569,17 +3589,6 @@ dependencies = [
 
 [[package]]
 name = "sha2"
-version = "0.10.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7507d819769d01a365ab707794a4084392c824f54a7a6a7862f8c3d0892b283"
-dependencies = [
- "cfg-if",
- "cpufeatures 0.2.17",
- "digest 0.10.7",
-]
-
-[[package]]
-name = "sha2"
 version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "446ba717509524cb3f22f17ecc096f10f4822d76ab5c0b9822c5f9c284e825f4"
@@ -3678,6 +3687,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "siphasher"
+version = "1.0.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "33f4fe9184a62d842c9ef383018f3306d8ba224fd9d836f56d7288308847c256"
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3688,51 +3703,6 @@ name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
-
-[[package]]
-name = "smithay"
-version = "0.7.0"
-source = "git+https://github.com/hgaiser/smithay?rev=fa2f9e3bdc1be3d6da2a3837b33c684d0cdeea34#fa2f9e3bdc1be3d6da2a3837b33c684d0cdeea34"
-dependencies = [
- "appendlist",
- "ash 0.38.0+1.3.281",
- "bitflags",
- "bytemuck",
- "calloop",
- "cc",
- "cursor-icon",
- "downcast-rs",
- "drm",
- "drm-ffi",
- "drm-fourcc",
- "drm-sys",
- "encoding_rs",
- "errno",
- "gbm",
- "glam",
- "include_bytes_aligned",
- "indexmap",
- "libc",
- "pkg-config",
- "portable-atomic",
- "profiling",
- "rand 0.10.2",
- "reis",
- "rustix 1.1.4",
- "scopeguard",
- "sha2 0.10.9",
- "shaderc",
- "smallvec",
- "tempfile",
- "thiserror 2.0.19",
- "tracing",
- "wayland-protocols",
- "wayland-protocols-misc",
- "wayland-protocols-wlr",
- "wayland-server",
- "x11rb",
- "xkbcommon",
-]
 
 [[package]]
 name = "socket-pktinfo"
@@ -3771,16 +3741,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d91ed6c858b01f942cd56b37a94b3e0a1798290327d1236e4d9cf4eaca44d29d"
 dependencies = [
  "base64ct",
- "der 0.7.10",
-]
-
-[[package]]
-name = "spki"
-version = "0.8.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d9efca8738c78ee9484207732f728b1ef517bbb1833d6fc0879ca898a522f6f"
-dependencies = [
- "der 0.8.1",
+ "der",
 ]
 
 [[package]]
@@ -4782,9 +4743,9 @@ checksum = "1ffae5123b2d3fc086436f8834ae3ab053a283cfac8fe0a0b8eaae044768a4c4"
 
 [[package]]
 name = "x11rb"
-version = "0.13.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9993aa5be5a26815fe2c3eacfc1fde061fc1a1f094bf1ad2a18bf9c495dd7414"
+checksum = "5a8885a854a8bfdf87a301e53e41b17c5f8f33639903131338b997b1eb614f44"
 dependencies = [
  "gethostname",
  "rustix 1.1.4",
@@ -4793,9 +4754,9 @@ dependencies = [
 
 [[package]]
 name = "x11rb-protocol"
-version = "0.13.2"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ea6fc2961e4ef194dcbfe56bb845534d0dc8098940c7e5c012a258bfec6701bd"
+checksum = "acf4d1bc32aa46eec18caa634ec3cf4c05bfa151f12b93b510b15190f69a1ca8"
 
 [[package]]
 name = "x509-parser"

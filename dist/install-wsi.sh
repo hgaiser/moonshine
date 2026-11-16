@@ -3,7 +3,7 @@
 #
 #   dist/install-wsi.sh [--prefix PREFIX]
 #
-# Builds the layer from the ferriscope revision in Cargo.lock, so the layer
+# Builds the layer from the ferriscope version in Cargo.lock, so the layer
 # matches the compositor linked into moonshine, and installs, under PREFIX
 # (default /usr):
 #   PREFIX/lib/ferriscope/libferriscope_wsi.so
@@ -14,8 +14,10 @@
 # a directory you cannot write. Packaging sets DESTDIR to install into a
 # staging directory instead of the system.
 #
-# FERRISCOPE_SRC overrides the ferriscope checkout (for a local ferriscope
-# that is not pushed yet). Needs cargo and jq.
+# The layer is not on crates.io. For a crates.io ferriscope, the script clones
+# its git tag (v<version>) into target/ferriscope-src. FERRISCOPE_SRC overrides
+# the ferriscope checkout (for a local ferriscope, or when packaging offline).
+# Needs cargo, jq and git.
 set -euo pipefail
 
 prefix=/usr
@@ -37,14 +39,29 @@ fi
 
 ferriscope=${FERRISCOPE_SRC:-}
 if [ -z "$ferriscope" ]; then
-	manifest=$(cd "$root" && cargo metadata --format-version 1 --locked |
-		jq -r '.packages[] | select(.name == "ferriscope") | .manifest_path')
-	if [ -z "$manifest" ]; then
+	package=$(cd "$root" && cargo metadata --format-version 1 --locked |
+		jq -r '.packages[] | select(.name == "ferriscope") | [.version, (.source // ""), .manifest_path] | @tsv')
+	if [ -z "$package" ]; then
 		echo "ferriscope is not in Cargo.lock" >&2
 		exit 1
 	fi
-	# .../Cargo.toml -> the ferriscope checkout.
-	ferriscope=$(dirname "$manifest")
+	IFS=$'\t' read -r version source manifest <<<"$package"
+	case $source in
+	registry+*)
+		# The crates.io package has no ferriscope-wsi: the layer is not
+		# published. Build it from the git tag of the same version.
+		ferriscope=$root/target/ferriscope-src/v$version
+		if [ ! -d "$ferriscope" ]; then
+			mkdir -p "$(dirname "$ferriscope")"
+			git clone --quiet --depth 1 --branch "v$version" \
+				https://github.com/hgaiser/ferriscope.git "$ferriscope"
+		fi
+		;;
+	*)
+		# A git dependency: its checkout has the layer.
+		ferriscope=$(dirname "$manifest")
+		;;
+	esac
 fi
 
 CARGO_TARGET_DIR=$root/target/ferriscope-wsi "$ferriscope/tools/install-wsi.sh" --prefix "$prefix"

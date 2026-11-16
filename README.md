@@ -1,3 +1,5 @@
+![Moonshine](assets/banner-readme.png)
+
 [![CI](https://github.com/hgaiser/moonshine/actions/workflows/ci.yaml/badge.svg)](https://github.com/hgaiser/moonshine/actions)
 
 # Moonshine 🌙
@@ -56,24 +58,36 @@ After installing, follow the [Enable the service](#enable-the-service) steps bel
 
 ### Nix
 
-This repository is also a nix flake, providing a package and a NixOS module that sets up the service for you.
-See [nix/README.md](nix/README.md) for instructions, or install just the package on any distro with:
+On NixOS, use the `services.moonshine` module. It installs the package and handles everything in [Enable the service](#enable-the-service), so skip those steps.
 
-```sh
-nix profile install github:hgaiser/moonshine
-```
-
-After installing, follow the [Enable the service](#enable-the-service) steps below (the NixOS module handles this for you when enabled).
-
-Moonshine is now directly packaged in nixpkgs, you can add it to your system packages or enable the module directly:
+Moonshine and its module are in nixpkgs:
 
 ```nix
-environment.systemPackages = with pkgs; [ moonshine ];
 services.moonshine = {
-	enable = true;
-	# Checkout more settings at https://search.nixos.org/options?query=moonshine
+  enable = true;
+  user = "alice"; # must be declared in users.users
+  # Required: the default application points at /usr/bin/steam, which doesn't exist on NixOS.
+  settings.application = [
+    {
+      title = "Steam";
+      command = [ "/run/current-system/sw/bin/steam" "steam://open/bigpicture" ];
+      steam_integration = true;
+    }
+  ];
+  # Opens the ports on these interfaces only; see Security below.
+  # firewallInterfaces = [ "tailscale0" ];
 };
 ```
+
+See all options at [search.nixos.org](https://search.nixos.org/options?channel=unstable&query=services.moonshine).
+
+#### Alternative: compiling latest commit on NixOS
+
+This repository is also a flake that builds from the latest commit. Add it to your system flake's inputs and import its module. See [nix/README.md](nix/README.md) for details.
+
+The flake module replaces the nixpkgs one, and its options are slightly different: `openFirewall` instead of `firewallInterfaces`, a `uid` option you may need to set if the user's uid isn't declared in your config, and the user isn't added to `input` for you.
+
+The flake package (`nix profile install github:hgaiser/moonshine`) has only the binary, udev rules and Vulkan layer. It doesn't include the systemd unit, so on other distros use one of the native packages above.
 
 ### Bazzite / Silverblue / Atomic distros
 
@@ -203,7 +217,7 @@ steam_integration = true
 - `boxart` (optional): Path to a cover image.
 - `command`: The command to run. First entry is the executable, the rest are arguments.
 - `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. Runs synchronously — the session waits for all to finish.
-- `steam_integration` (optional): Steam integration, as gamescope's `-e`; off by default. Turn it on for Steam (Big Picture), so its overlay and focus work. With it on, only Steam and Steam game windows can take focus, so leave it off for anything launched directly. Games from the Steam application scanner have it on.
+- `steam_integration` (optional): Steam integration, as gamescope's `-e`; off by default. Turn it on for Steam (Big Picture), so its overlay and focus work. With it on, only Steam and Steam game windows can take focus, so leave it off for anything launched directly. With it off, Steam acts as on a desktop: its power menu has "Exit Big Picture Mode", not "Switch to Desktop". Games from the Steam application scanner have it on.
 - `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. Runs synchronously — the server waits for all to finish.
 
 Example:

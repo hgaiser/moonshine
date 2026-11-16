@@ -1,4 +1,4 @@
-use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::unix::io::OwnedFd;
 
 use zbus::Connection;
 
@@ -53,13 +53,13 @@ impl SleepInhibitor {
 		// logind returns the inhibit handle as a file descriptor carried in the
 		// message header, not in the method body. Duplicate it so it survives
 		// independently of the message.
-		let raw = msg.data().fds().first().map(|fd| fd.as_raw_fd())?;
-		let duped = unsafe { libc::dup(raw) };
-		if duped < 0 {
-			tracing::warn!("Failed to duplicate sleep inhibit fd");
-			return None;
+		let fd = msg.data().fds().first()?;
+		match rustix::io::dup(fd) {
+			Ok(fd) => Some(Self { _fd: fd }),
+			Err(e) => {
+				tracing::warn!("Failed to duplicate sleep inhibit fd: {e}");
+				None
+			},
 		}
-		let fd = unsafe { OwnedFd::from_raw_fd(duped) };
-		Some(Self { _fd: fd })
 	}
 }

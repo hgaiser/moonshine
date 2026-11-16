@@ -3,7 +3,9 @@
   stdenv,
   rustPlatform,
   addDriverRunpath,
+  aws-lc,
   cmake,
+  ferriscopeSrc,
   pkg-config,
   libdrm,
   libevdev,
@@ -15,6 +17,7 @@
   wayland,
   libglvnd,
   shaderc,
+  sqlite,
 }:
 
 let
@@ -59,19 +62,24 @@ let
   # into the compositor (bypassing Xwayland) and carries HDR and pacing. It
   # lives in the ferriscope repository next to the ferriscope crate, but only
   # the ferriscope crate is a dependency, so the vendored sources above do not
-  # contain it. Build it from the same ferriscope revision Cargo.lock pins, so
-  # the layer always matches the compositor linked into moonshine.
+  # contain it. The crates.io release lacks it too. ferriscopeSrc is the
+  # ferriscope repository from the flake input. It must be the release that
+  # Cargo.lock pins, so the layer matches the compositor linked into moonshine.
   ferriscopeLockEntry =
     lib.findFirst (p: p.name == "ferriscope")
       (throw "ferriscope not found in Cargo.lock")
       (lib.importTOML ../Cargo.lock).package;
-  # e.g. "git+https://github.com/hgaiser/ferriscope?rev=<rev>#<rev>"
-  ferriscopeMatch = builtins.match "git\\+([^?#]+)(\\?[^#]*)?#(.+)" ferriscopeLockEntry.source;
-  ferriscopeRepo = builtins.fetchGit {
-    url = builtins.elemAt ferriscopeMatch 0;
-    rev = builtins.elemAt ferriscopeMatch 2;
-    allRefs = true;
-  };
+  ferriscopeSrcVersion = (lib.importTOML "${ferriscopeSrc}/Cargo.toml").workspace.package.version;
+  ferriscopeRepo =
+    if ferriscopeSrcVersion == ferriscopeLockEntry.version then
+      ferriscopeSrc
+    else
+      throw ''
+        Cargo.lock has ferriscope ${ferriscopeLockEntry.version}, but the
+        ferriscope flake input is ${ferriscopeSrcVersion}. Set the input's tag
+        in flake.nix to v${ferriscopeLockEntry.version}, then run
+        `nix flake update ferriscope`.
+      '';
 
   # The architecture name the layer's manifest carries (ferriscope's
   # tools/install-wsi.sh fills in the same @ARCH@).
@@ -148,7 +156,7 @@ rustPlatform.buildRustPackage {
 
   nativeBuildInputs = [
     addDriverRunpath # see postFixup
-    cmake # inputtino-sys and aws-lc-sys build their C/C++ via cmake
+    cmake # inputtino-sys builds its C++ via cmake
     pkg-config
     rustPlatform.bindgenHook # inputtino-sys generates its bindings at build time
   ];
@@ -158,12 +166,14 @@ rustPlatform.buildRustPackage {
   dontUseCmakeConfigure = true;
 
   buildInputs = [
+    aws-lc
     libdrm
     libevdev
     libpulseaudio
     libxkbcommon
     libgbm # smithay's GPU buffer allocation (split out of mesa in nixpkgs)
     libopus
+    sqlite
     vulkan-loader
     wayland
   ];

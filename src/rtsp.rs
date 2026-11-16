@@ -24,6 +24,34 @@ use crate::session::stream::video::VideoFormat;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 
+/// Upper bound for one RTSP request (headers and SDP payload), including partial reads.
+const MAX_RTSP_REQUEST_BYTES: usize = 64 * 1024;
+/// Absolute deadline for receiving one RTSP request, including all partial reads.
+const RTSP_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Replace every occurrence of `from` in `haystack` with `to`.
+fn replace_bytes(haystack: &[u8], from: &[u8], to: &[u8]) -> Vec<u8> {
+	let mut result = Vec::with_capacity(haystack.len());
+	let mut rest = haystack;
+	while let Some(position) = rest.windows(from.len()).position(|window| window == from) {
+		result.extend_from_slice(&rest[..position]);
+		result.extend_from_slice(to);
+		rest = &rest[position + from.len()..];
+	}
+	result.extend_from_slice(rest);
+	result
+}
+
+async fn read_rtsp_chunk<R: tokio::io::AsyncRead + Unpin>(
+	reader: &mut R,
+	buffer: &mut [u8],
+	deadline: tokio::time::Instant,
+) -> std::io::Result<usize> {
+	tokio::time::timeout_at(deadline, reader.read(buffer))
+		.await
+		.map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "RTSP request deadline exceeded"))?
+}
+
 #[repr(u8)]
 enum ServerCapabilities {
 	PenTouchEvents = 0x01,
@@ -35,6 +63,10 @@ enum EncryptionFlags {
 	ControlV2 = 0x01,
 	Video = 0x02,
 	Audio = 0x04,
+}
+
+fn video_bitrate_bps(kbps: usize) -> Option<usize> {
+	kbps.checked_mul(1_000).filter(|bps| u32::try_from(*bps).is_ok())
 }
 
 #[derive(Clone)]
@@ -305,6 +337,10 @@ impl RtspServer {
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
+		if fps == 0 {
+			tracing::warn!("Rejected zero client video frame rate");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		}
 		let requested_packet_size: usize = match get_sdp_attribute(&sdp_session, "x-nv-video[0].packetSize") {
 			Ok(packet_size) => packet_size,
 			Err(()) => {
@@ -313,17 +349,24 @@ impl RtspServer {
 			},
 		};
 		let packet_size = self.video_config.clamp_packet_size(requested_packet_size);
+		if !VideoStreamConfig::valid_packet_size(packet_size) {
+			tracing::warn!("Rejected invalid client video packet size: {packet_size}");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		}
 		if packet_size != requested_packet_size {
 			tracing::info!("Clamping client video packet size from {requested_packet_size} to {packet_size} bytes.");
 		}
-		let mut bitrate = match get_sdp_attribute(&sdp_session, "x-ml-video.configuredBitrateKbps") {
+		let bitrate_kbps: usize = match get_sdp_attribute(&sdp_session, "x-ml-video.configuredBitrateKbps") {
 			Ok(bitrate) => bitrate,
 			Err(()) => {
 				tracing::warn!("Failed to parse x-ml-video.configuredBitrateKbps in SDP session.");
 				return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
 			},
 		};
-		bitrate *= 1000; // Convert from kbps to bps.
+		let Some(bitrate) = video_bitrate_bps(bitrate_kbps) else {
+			tracing::warn!("Client video bitrate {bitrate_kbps} kbps overflows bits per second");
+			return rtsp_response(cseq, request.version(), rtsp_types::StatusCode::BadRequest);
+		};
 		let minimum_fec_packets = match get_sdp_attribute(&sdp_session, "x-nv-vqos[0].fec.minRequiredFecPackets") {
 			Ok(minimum_fec_packets) => minimum_fec_packets,
 			Err(()) => {
@@ -503,28 +546,29 @@ impl RtspServer {
 			},
 		}
 
-		let mut message_buffer = String::new();
+		let mut message_buffer = Vec::new();
+		let deadline = tokio::time::Instant::now() + RTSP_REQUEST_TIMEOUT;
 
 		let message = loop {
 			let mut buffer = [0u8; 2048];
-			let bytes_read = connection
-				.read(&mut buffer)
+			let bytes_read = read_rtsp_chunk(&mut connection, &mut buffer, deadline)
 				.await
 				.map_err(|e| tracing::warn!("Failed to read from connection '{}': {}", address, e))?;
 			if bytes_read == 0 {
 				tracing::warn!("Received empty RTSP request.");
 				return Ok(());
 			}
-			message_buffer.push_str(
-				std::str::from_utf8(&buffer[..bytes_read])
-					.map_err(|e| tracing::warn!("Failed to convert message to string: {e}"))?,
-			);
+			if message_buffer.len() + bytes_read > MAX_RTSP_REQUEST_BYTES {
+				tracing::warn!("Rejected RTSP request exceeding {MAX_RTSP_REQUEST_BYTES} bytes from {address}");
+				return Err(());
+			}
+			message_buffer.extend_from_slice(&buffer[..bytes_read]);
 
 			// Hacky workaround to fix rtsp_types parsing SETUP/PLAY requests from Moonlight.
-			let message_buffer = message_buffer.replace("streamid", "rtsp://localhost?streamid");
-			let message_buffer = message_buffer.replace("PLAY /", "PLAY rtsp://localhost/");
+			let message_buffer = replace_bytes(&message_buffer, b"streamid", b"rtsp://localhost?streamid");
+			let message_buffer = replace_bytes(&message_buffer, b"PLAY /", b"PLAY rtsp://localhost/");
 
-			tracing::trace!("Request: {}", message_buffer);
+			tracing::trace!("Request: {}", String::from_utf8_lossy(&message_buffer));
 			let result = rtsp_types::Message::parse(&message_buffer);
 
 			break match result {
@@ -621,4 +665,46 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 		.trim()
 		.parse()
 		.map_err(|_| tracing::warn!("Attribute {attribute} can't be parsed."))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn replace_bytes_matches_str_replace() {
+		let text = "PLAY / RTSP/1.0\r\nstreamid=0 streamid=1\r\n";
+		let replaced = replace_bytes(text.as_bytes(), b"streamid", b"rtsp://localhost?streamid");
+		assert_eq!(
+			replaced,
+			text.replace("streamid", "rtsp://localhost?streamid").as_bytes()
+		);
+		assert_eq!(replace_bytes(b"no match", b"PLAY /", b"x"), b"no match");
+		assert_eq!(
+			replace_bytes(&[0xff, b'P', b'L', b'A', b'Y', b' ', b'/'], b"PLAY /", b"Y"),
+			[0xff, b'Y']
+		);
+	}
+
+	#[tokio::test]
+	async fn partial_reads_do_not_reset_request_deadline() {
+		let (mut reader, mut writer) = tokio::io::duplex(16);
+		writer.write_all(b"RT").await.unwrap();
+		let mut buffer = [0u8; 16];
+		let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(100);
+
+		assert_eq!(read_rtsp_chunk(&mut reader, &mut buffer, deadline).await.unwrap(), 2);
+		let error = read_rtsp_chunk(&mut reader, &mut buffer, deadline).await.unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+	}
+
+	#[test]
+	fn client_bitrate_conversion_rejects_overflow() {
+		assert_eq!(video_bitrate_bps(150_000), Some(150_000_000));
+		// The encoder accepts u32 bits/sec, so the RTSP value must fit this too.
+		let largest_kbps = (u32::MAX as usize) / 1_000;
+		assert_eq!(video_bitrate_bps(largest_kbps), Some(largest_kbps * 1_000));
+		assert_eq!(video_bitrate_bps(largest_kbps + 1), None);
+		assert_eq!(video_bitrate_bps(usize::MAX), None);
+	}
 }

@@ -53,12 +53,15 @@ Then import the module and enable the service in your configuration:
             "/run/current-system/sw/bin/steam"
             "steam://open/bigpicture"
           ];
+          steam_integration = true;
         }
       ];
     };
   };
 }
 ```
+
+This module replaces the `services.moonshine` module from nixpkgs (through `disabledModules`), so use the options shown here rather than the ones on search.nixos.org.
 
 After `nixos-rebuild switch` the service is running. There is no `systemctl enable` step, and user lingering is enabled automatically. Pair with a Moonlight client as usual via http://localhost:47989/pin .
 

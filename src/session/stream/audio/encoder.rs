@@ -9,12 +9,42 @@ use crate::session::stream::RtpHeader;
 use crate::session::stream::StartWaiter;
 
 use crate::session::stream::audio::OpusStreamConfig;
-use crate::session::stream::audio::pulse_server::AudioFrame;
+use crate::session::stream::audio::pulse_server::{AudioFrame, DEFAULT_CLOCK_RATE_HZ};
 
 const NR_DATA_SHARDS: usize = 4;
 const NR_PARITY_SHARDS: usize = 2;
 const NR_TOTAL_SHARDS: usize = NR_DATA_SHARDS + NR_PARITY_SHARDS;
 const MAX_SHARD_SIZE: usize = 2048_usize.div_ceil(16) * 16;
+
+/// Moonlight's audio FEC reconstructs timestamps by adding the negotiated
+/// packet duration (in milliseconds) for each successive RTP sequence number.
+/// Using a 90 kHz clock here makes packets in the same FEC block disagree on
+/// their base timestamp, preventing reliable recovery.
+#[derive(Debug)]
+struct AudioRtpClock {
+	next_timestamp_ms: u32,
+	packet_duration_ms: u32,
+}
+
+impl AudioRtpClock {
+	fn new(packet_duration_ms: u32) -> Self {
+		// Match PulseServer's fallback when an unsupported duration is received.
+		let packet_duration_ms = match packet_duration_ms {
+			5 | 10 => packet_duration_ms,
+			_ => 1000 / DEFAULT_CLOCK_RATE_HZ,
+		};
+		Self {
+			next_timestamp_ms: 0,
+			packet_duration_ms,
+		}
+	}
+
+	fn next_timestamp(&mut self) -> u32 {
+		let timestamp = self.next_timestamp_ms;
+		self.next_timestamp_ms = timestamp.wrapping_add(self.packet_duration_ms);
+		timestamp
+	}
+}
 
 #[derive(Debug)]
 #[repr(C)]
@@ -32,6 +62,7 @@ impl AudioEncoder {
 	#[allow(clippy::too_many_arguments)]
 	pub fn spawn(
 		sample_rate: u32,
+		packet_duration_ms: u32,
 		stream_config: &OpusStreamConfig,
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
@@ -77,6 +108,7 @@ impl AudioEncoder {
 				inner.run(
 					frame_rx,
 					frame_recycle_tx,
+					packet_duration_ms,
 					fec_encoder,
 					encoder,
 					keys_rx,
@@ -100,6 +132,7 @@ impl AudioEncoderInner {
 		self,
 		frame_rx: crossbeam_channel::Receiver<AudioFrame>,
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
+		packet_duration_ms: u32,
 		mut fec_encoder: ReedSolomon,
 		mut encoder: opus::MSEncoder,
 		keys_rx: SessionKeysReceiver,
@@ -123,7 +156,7 @@ impl AudioEncoderInner {
 		}
 
 		let mut sequence_number = 0u16;
-		let stream_start_time = std::time::Instant::now();
+		let mut rtp_clock = AudioRtpClock::new(packet_duration_ms);
 
 		// For unknown reasons, the RS parity matrix computed by our RS implementation.
 		// doesn't match the one Nvidia uses for audio data. I'm not exactly sure why,
@@ -164,8 +197,7 @@ impl AudioEncoderInner {
 				},
 			};
 
-			// TODO: Figure out the 1000 / 90 value.
-			let timestamp = ((std::time::Instant::now() - stream_start_time).as_micros() / (1000 / 90)) as u32;
+			// Timestamp advances only after a packet has been successfully encoded.
 			let encoded_size = match encoder.encode_float(&frame.buf, &mut encoded_audio) {
 				Ok(encoded_size) => encoded_size,
 				Err(e) => {
@@ -205,6 +237,10 @@ impl AudioEncoderInner {
 				},
 				false => encoded_audio[..encoded_size].to_vec(),
 			};
+
+			// Advance only when an audio packet is ready to transmit; errors must
+			// not create a gap in the FEC block's inferred base timestamp.
+			let timestamp = rtp_clock.next_timestamp();
 
 			let shard = &mut shards[sequence_number as usize % NR_DATA_SHARDS];
 
@@ -315,5 +351,50 @@ impl AudioEncoderInner {
 		}
 
 		tracing::debug!("Audio encoder stopped.");
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::AudioRtpClock;
+
+	#[test]
+	fn timestamps_match_moonlight_audio_fec_block_layout() {
+		for duration_ms in [5, 10] {
+			let mut clock = AudioRtpClock::new(duration_ms);
+			for block in 0..3u32 {
+				let timestamps = [
+					clock.next_timestamp(),
+					clock.next_timestamp(),
+					clock.next_timestamp(),
+					clock.next_timestamp(),
+				];
+				let base = block * 4 * duration_ms;
+				for (index, timestamp) in timestamps.into_iter().enumerate() {
+					assert_eq!(timestamp, base + index as u32 * duration_ms);
+					// The receiver infers a common FEC base timestamp from any
+					// packet's timestamp and its index inside the four-shard block.
+					assert_eq!(timestamp - index as u32 * duration_ms, base);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn timestamps_wrap_without_overflow() {
+		let mut clock = AudioRtpClock {
+			next_timestamp_ms: u32::MAX - 4,
+			packet_duration_ms: 5,
+		};
+		assert_eq!(clock.next_timestamp(), u32::MAX - 4);
+		assert_eq!(clock.next_timestamp(), 0);
+		assert_eq!(clock.next_timestamp(), 5);
+	}
+
+	#[test]
+	fn unsupported_packet_duration_matches_pulse_server_fallback() {
+		let mut clock = AudioRtpClock::new(0);
+		assert_eq!(clock.next_timestamp(), 0);
+		assert_eq!(clock.next_timestamp(), 5);
 	}
 }
