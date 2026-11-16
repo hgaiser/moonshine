@@ -171,6 +171,7 @@ fn parse_desktop_application(
 		launch_timeout_secs: config.launch_timeout_secs,
 		env: config.env.clone(),
 		steam_integration: false,
+		working_directory: None,
 	}))
 }
 

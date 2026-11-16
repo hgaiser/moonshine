@@ -9,12 +9,14 @@ use walkdir::WalkDir;
 
 use bottles::BottlesApplicationScannerConfig;
 use desktop::DesktopApplicationScannerConfig;
+use faugus::FaugusApplicationScannerConfig;
 use heroic::HeroicApplicationScannerConfig;
 use lutris::LutrisApplicationScannerConfig;
 use steam::SteamApplicationScannerConfig;
 
 pub mod bottles;
 pub mod desktop;
+pub mod faugus;
 pub mod heroic;
 pub mod lutris;
 pub mod manager;
@@ -42,6 +44,9 @@ pub enum ApplicationScannerConfig {
 
 	/// Scans the Bottles library.
 	Bottles(BottlesApplicationScannerConfig),
+
+	/// Scans the Faugus Launcher library.
+	Faugus(FaugusApplicationScannerConfig),
 }
 
 /// Fingerprint of the files a scanner reads: their paths and modified timestamps.
@@ -85,6 +90,7 @@ impl ApplicationScanner {
 			ApplicationScannerConfig::Lutris(config) => lutris::source_fingerprint(config),
 			ApplicationScannerConfig::Heroic(config) => heroic::source_fingerprint(config),
 			ApplicationScannerConfig::Bottles(config) => bottles::source_fingerprint(config),
+			ApplicationScannerConfig::Faugus(config) => faugus::source_fingerprint(config),
 		}
 	}
 }
@@ -167,6 +173,10 @@ pub fn scan_applications(
 			},
 			ApplicationScannerConfig::Bottles(config) => match bottles::scan_bottles_applications(config) {
 				Ok(bottles_applications) => bottles_applications,
+				Err(()) => continue,
+			},
+			ApplicationScannerConfig::Faugus(config) => match faugus::scan_faugus_applications(config) {
+				Ok(faugus_applications) => faugus_applications,
 				Err(()) => continue,
 			},
 		};

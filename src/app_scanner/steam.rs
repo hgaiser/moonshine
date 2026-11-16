@@ -111,6 +111,7 @@ pub(crate) fn scan_steam_applications(config: &SteamApplicationScannerConfig) ->
 				env: config.env.clone(),
 				// Steam launches these, so Steam's focus contract applies.
 				steam_integration: true,
+				working_directory: None,
 			};
 
 			// Search for boxart.
