@@ -75,7 +75,7 @@ shellexpand = "3.1.2"
 shlex = "2.0.1"
 # The smithay fork with the Vulkan renderer (`ferriscope-smithay`). Moonshine exchanges
 # smithay types (`Dmabuf`) with ferriscope, so both must use the same crate.
-smithay = { package = "ferriscope-smithay", version = "0.7.1", default-features = false, features = [
+smithay = { package = "ferriscope-smithay", version = "0.7.2", default-features = false, features = [
     "backend_drm",
     "backend_gbm",
     "backend_vulkan",

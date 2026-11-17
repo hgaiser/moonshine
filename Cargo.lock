@@ -1301,9 +1301,9 @@ dependencies = [
 
 [[package]]
 name = "ferriscope-smithay"
-version = "0.7.1+a9822e8"
+version = "0.7.2+a9822e8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "33aa07718272753efd2f6b613f75f6d23185118599f3e8b082d13453bc00de2d"
+checksum = "cb2bcfd2024ec2ed1ce4d7fc612e2a96e19b22a0c2742b2dceb3559acc89bfe7"
 dependencies = [
  "appendlist",
  "ash",
@@ -3901,7 +3901,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix 1.1.4",
  "windows-sys 0.61.2",
