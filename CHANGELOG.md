@@ -7,12 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.18.0] - 17-11-2026
+
 ### Added
 
 - Add a web control panel at http://localhost:47990, in the new `moonshine-ui` crate. It shows the stream with live graphs, the health checks and the logs, pairs and manages devices, edits applications, scanners and settings in `config.toml`, and restarts Moonshine. Configure it in the new `[ui]` table; by default only this computer can open it. To open it through a reverse proxy, list its name in `allowed_hosts`.
 - Add `hidden_applications` to hide scanned applications from clients.
 - Add a `working_directory` option to applications, the directory the application starts in. (#264)
 - Add a Faugus Launcher application scanner. Games start in the folder holding their executable, as they do from Faugus' own window. (#264, @istvnurbn)
+- Add `--output json` to `moonshine-bench`: one machine-readable result on stdout, with a format `version`, for single runs and the matrix, also for runs that fail. (#260, @repparw)
+
+### Changed
+
+- Log `moonshine-bench` to stderr, so stdout holds only the result. (#260)
+
+### Fixed
+
+- Give the default Steam application Steam integration, so its overlay and focus work.
+- Hide the gamescope session from Steam when Steam integration is off, so Steam acts as on a desktop: its power menu has "Exit Big Picture Mode", not "Switch to Desktop".
+- Fix the stream freezing at the first pen or stylus contact from a client, by updating ferriscope-smithay to v0.7.3.
+- Fix cursors of Wayland applications, such as a nested COSMIC, being drawn in pieces, by updating ferriscope-smithay to v0.7.3.
 
 ## [v0.17.2] - 15-11-2026
 

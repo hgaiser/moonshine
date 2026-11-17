@@ -3,7 +3,7 @@ members = [".", "tools", "ui"]
 resolver = "2"
 
 [workspace.package]
-version = "0.17.2"
+version = "0.18.0"
 
 [package]
 name = "moonshine"
