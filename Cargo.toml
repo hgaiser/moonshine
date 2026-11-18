@@ -57,7 +57,7 @@ network-interface = "2.0.5"
 notify-rust = "4.17.0"
 open = "5.3.5"
 opus = "0.3.1"
-pixelforge = { version = "0.12.1", features = ["dmabuf"] }
+pixelforge = { version = "0.13.0", features = ["dmabuf"] }
 pulseaudio = "0.3.1"
 rcgen = "0.14.8"
 rsa = "0.9.10"
