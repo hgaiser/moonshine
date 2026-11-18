@@ -23,7 +23,7 @@ use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeSta
 use crate::session::manager::SessionShutdownReason;
 use crate::session::stream::StartWaiter;
 
-use crate::session::stream::video::packetizer::Packetizer;
+use crate::session::stream::video::packetizer::{FrameType, Packetizer};
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
 	FrameStats, RateControlMode, StatsSender, StreamInfo, VideoChromaSampling, VideoDynamicRange, VideoFormat,
@@ -115,6 +115,15 @@ fn frame_colors(frame: FrameColorSpace, full_range: bool) -> (ColorSpec, StreamC
 /// Whether the encoder currently writes an HDR10 stream.
 fn is_hdr(encoder: &Encoder) -> bool {
 	matches!(encoder.config().color, StreamColor::Hdr10 { .. })
+}
+
+/// Whether an invalidation request for the lost display orders `first..=last`
+/// repeats the last one answered, `answered = (its first lost display order,
+/// the display order of the frame answering it)`. The client reports every frame
+/// it drops until that answer reaches it; a request that reaches the answering
+/// frame means the answer was lost too.
+fn covered_by(answered: Option<(u64, u64)>, first: u64, last: u64) -> bool {
+	answered.is_some_and(|(answered_first, answer)| first >= answered_first && last < answer)
 }
 
 pub(crate) struct VideoPipeline {}
@@ -438,9 +447,16 @@ async fn run_packet_consumer(
 		let processing_latency = t_start.duration_since(frame_context.created_at);
 		let latency_100us = (processing_latency.as_micros() / 100).min(u16::MAX as u128) as u16;
 
+		let frame_type = if is_key_frame {
+			FrameType::Key
+		} else if packet.is_recovery_frame {
+			FrameType::Recovery
+		} else {
+			FrameType::Predicted
+		};
 		let shards = match packetizer.packetize(
 			&packet.data,
-			is_key_frame,
+			frame_type,
 			ctx.packet_size,
 			ctx.minimum_fec_packets,
 			config.fec_percentage,
@@ -738,6 +754,10 @@ impl VideoPipelineInner {
 		.with_frame_rate(ctx.fps, 1)
 		.with_gop_size(0) // Infinite GOP, we'll request IDR frames manually
 		.with_max_reference_frames(ctx.max_reference_frames)
+		// Each reference predicted from costs encode time (RADV H.264 takes ~75%
+		// longer with two than with one); invalidation recovers from the whole
+		// window either way.
+		.with_active_reference_frames(1)
 		.with_virtual_buffer_size_ms(1000 / ctx.fps)
 		.with_initial_virtual_buffer_size_ms(0);
 
@@ -847,9 +867,15 @@ impl VideoPipelineInner {
 		// carry; `frame_number_base` is the display order of the first frame of
 		// the current epoch and advances on reset (which restarts the consumer's
 		// numbering). A rare readback drop can skew this by a frame, which at
-		// worst over-invalidates into a (safe) IDR.
+		// worst over-invalidates into a (safe) IDR, or makes `covered_by` skip a new
+		// loss until the client's reports pass the last answer (a short delay).
 		let mut submitted_count: u64 = 0;
 		let mut frame_number_base: u64 = 0;
+		// The last invalidation answered, for `covered_by`.
+		let mut last_invalidation: Option<(u64, u64)> = None;
+		// An invalidation recovered and its recovery frame isn't submitted yet: the client
+		// drops every frame until it arrives, so a static screen re-encodes the last frame.
+		let mut pending_recovery = false;
 
 		// Track the last HDR mode state sent to the control stream.
 		let mut last_hdr_state = HdrModeState {
@@ -886,6 +912,8 @@ impl VideoPipelineInner {
 				// The next submitted frame becomes the consumer's frame 1 of the
 				// new epoch; anchor the invalidation index mapping to it.
 				frame_number_base = submitted_count;
+				last_invalidation = None;
+				pending_recovery = false;
 				encoder.request_idr();
 				pending_idr = true;
 			}
@@ -913,12 +941,25 @@ impl VideoPipelineInner {
 			// falls back to an IDR when no reference survives).
 			loop {
 				match invalidate_request_rx.try_recv() {
-					Ok((first, _last)) => {
+					Ok((first, last)) => {
 						let first_display_order = frame_number_base + (first.max(1) as u64 - 1);
+						let last_display_order = frame_number_base + (last.max(1) as u64 - 1);
+						if covered_by(last_invalidation, first_display_order, last_display_order) {
+							tracing::trace!(
+								"Skipping reference frame invalidation from client frame {first}, already answered"
+							);
+							continue;
+						}
 						tracing::debug!(
 							"Reference frame invalidation requested from client frame {first} (display order {first_display_order})"
 						);
-						encoder.invalidate_reference_frames(first_display_order);
+						// The encoder falls back to an IDR when no reference from before the loss is left.
+						if encoder.invalidate_reference_frames(first_display_order) {
+							pending_recovery = true;
+						} else {
+							pending_idr = true;
+						}
+						last_invalidation = Some((first_display_order, submitted_count));
 					},
 					Err(broadcast::error::TryRecvError::Lagged(n)) => {
 						// Missed some loss reports; force an IDR to be safe.
@@ -935,10 +976,10 @@ impl VideoPipelineInner {
 				Ok(frame) => Some(frame),
 				Err(ferriscope::RecvTimeoutError::Timeout) => {
 					// No frame received within timeout.
-					// If we have a pending IDR request, re-encode the last frame,
-					// which the encoder still holds in its input image.
-					if pending_idr && has_encoded {
-						tracing::debug!("Re-encoding last frame for IDR request (no re-import)");
+					// If the client waits for an IDR or a recovery frame, re-encode the
+					// last frame, which the encoder still holds in its input image.
+					if (pending_idr || pending_recovery) && has_encoded {
+						tracing::debug!("Re-encoding last frame for IDR or recovery (no re-import)");
 						// Use current time as created_at for the re-encoded IDR (no actual frame).
 						let now = std::time::Instant::now();
 						match encoder.repeat() {
@@ -961,12 +1002,20 @@ impl VideoPipelineInner {
 								// it or the consumer drops it.
 								in_flight.fetch_add(1, Ordering::Relaxed);
 								submitted_count += 1;
+								pending_recovery = false;
 								let _ = frame_ctx_tx.blocking_send(ConsumerMessage::Frame(frame_context, future));
 							},
 							Err(PixelForgeError::DeviceLost) => {
 								return Err("Failed to re-encode frame for IDR request: the GPU was lost".to_string());
 							},
-							Err(e) => tracing::warn!("Failed to re-encode frame for IDR request: {e}"),
+							Err(e) => {
+								tracing::warn!("Failed to re-encode frame for IDR or recovery: {e}");
+								// Don't retry every interval: make the next captured frame an IDR.
+								if pending_recovery {
+									pending_recovery = false;
+									encoder.request_idr();
+								}
+							},
 						}
 					}
 					if !pending_idr && last_frame_time.elapsed() > std::time::Duration::from_secs(5) {
@@ -1174,6 +1223,7 @@ impl VideoPipelineInner {
 						// it or the consumer drops it.
 						in_flight.fetch_add(1, Ordering::Relaxed);
 						submitted_count += 1;
+						pending_recovery = false;
 						let consumer_gone = frame_ctx_tx
 							.blocking_send(ConsumerMessage::Frame(frame_context, future))
 							.is_err();
@@ -1225,6 +1275,7 @@ impl VideoPipelineInner {
 
 #[cfg(test)]
 mod tests {
+	use super::covered_by;
 	use super::drm_fourcc_to_input;
 	use ash::vk;
 	use pixelforge::RgbFormat;
@@ -1238,6 +1289,19 @@ mod tests {
 	const XBGR2101010: u32 = 0x30334258; // "XB30"
 	const ABGR16161616F: u32 = 0x48344241; // "AB4H"
 	const XBGR16161616F: u32 = 0x48344258; // "XB4H"
+
+	#[test]
+	fn covered_by_skips_only_repeats_of_the_answered_loss() {
+		// The loss from display order 10 was answered by the frame at 20.
+		let answered = Some((10, 20));
+		assert!(covered_by(answered, 10, 10));
+		assert!(covered_by(answered, 12, 19));
+		// The answer itself was lost.
+		assert!(!covered_by(answered, 12, 20));
+		// Loss from before the answered one.
+		assert!(!covered_by(answered, 8, 9));
+		assert!(!covered_by(None, 1, 2));
+	}
 
 	#[test]
 	fn drm_fourcc_abgr_xbgr_8bit_maps_to_rgba() {
