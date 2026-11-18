@@ -404,8 +404,11 @@ impl RtspServer {
 			get_optional_sdp_attribute(&sdp_session, "x-ss-video[0].chromaSamplingType").unwrap_or_default();
 		let chroma_sampling_type = VideoChromaSampling::try_from(chroma_sampling_type).unwrap_or_default();
 
-		let max_reference_frames: u32 =
-			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1);
+		let max_reference_frames = reference_frames(
+			get_optional_sdp_attribute(&sdp_session, "x-nv-video[0].maxNumReferenceFrames").unwrap_or(1),
+			fps,
+		);
+		tracing::info!("Requesting {max_reference_frames} reference frames (the encoder may hold fewer).");
 
 		// Bit 0 selects full-range luma, the remaining bits an SDR colorspace.
 		// Sunshine: `colorspace_from_client_config()`
@@ -667,6 +670,29 @@ fn get_sdp_attribute<F: FromStr>(sdp_session: &sdp_types::Session, attribute: &s
 		.map_err(|_| tracing::warn!("Attribute {attribute} can't be parsed."))
 }
 
+/// How long ago a lost frame can be and still be recovered by invalidation when the host
+/// chooses the count. It has to cover the round trip, the client's loss detection and the
+/// frames already in flight.
+const INVALIDATION_WINDOW_MS: u32 = 150;
+/// Fewest references held for invalidation, for low frame rates.
+const MIN_INVALIDATION_REFERENCES: u32 = 4;
+/// Most references the codecs can hold (H.264 `max_num_ref_frames`).
+const MAX_REFERENCES: u32 = 16;
+
+/// The reference frames to hold for a client's `maxNumReferenceFrames`.
+///
+/// moonlight-common-c sends 0, "host's choice", when its decoder supports reference frame
+/// invalidation, and 1 otherwise. The encoder predicts from one; the rest let invalidation
+/// reach back to a frame before the loss.
+fn reference_frames(requested: u32, fps: u32) -> u32 {
+	match requested {
+		0 => (fps * INVALIDATION_WINDOW_MS)
+			.div_ceil(1000)
+			.clamp(MIN_INVALIDATION_REFERENCES, MAX_REFERENCES),
+		n => n,
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -706,5 +732,13 @@ mod tests {
 		assert_eq!(video_bitrate_bps(largest_kbps), Some(largest_kbps * 1_000));
 		assert_eq!(video_bitrate_bps(largest_kbps + 1), None);
 		assert_eq!(video_bitrate_bps(usize::MAX), None);
+	}
+
+	#[test]
+	fn host_choice_holds_the_invalidation_window() {
+		assert_eq!(reference_frames(0, 60), 9);
+		assert_eq!(reference_frames(0, 120), 16);
+		assert_eq!(reference_frames(0, 10), 4);
+		assert_eq!(reference_frames(3, 60), 3);
 	}
 }

@@ -52,6 +52,17 @@ enum RtpFlag {
 	StartOfFrame = 0x4,
 }
 
+/// The frame types of the video frame header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum FrameType {
+	Predicted = 1,
+	Key = 2,
+	/// The first frame after a reference frame invalidation: the client drops frames
+	/// until it receives one.
+	Recovery = 5,
+}
+
 #[derive(Debug)]
 #[repr(C)]
 struct VideoFrameHeader {
@@ -203,7 +214,7 @@ impl Packetizer {
 	pub fn packetize(
 		&mut self,
 		encoded_data: &[u8],
-		is_key_frame: bool,
+		frame_type: FrameType,
 		requested_packet_size: usize,
 		minimum_fec_packets: u32,
 		fec_percentage: u8,
@@ -216,10 +227,10 @@ impl Packetizer {
 		self.maybe_update_cipher();
 
 		tracing::trace!(
-			"Packetizing frame {}, size={}, keyframe={}",
+			"Packetizing frame {}, size={}, type={:?}",
 			frame_number,
 			encoded_data.len(),
-			is_key_frame
+			frame_type
 		);
 
 		let requested_shard_payload_size = requested_packet_size - NV_VIDEO_PACKET_SIZE;
@@ -234,7 +245,7 @@ impl Packetizer {
 		let video_frame_header = VideoFrameHeader {
 			header_type: 0x01,
 			frame_processing_latency,
-			frame_type: if is_key_frame { 2 } else { 1 },
+			frame_type: frame_type as u8,
 			last_payload_len: last_shard_size as u32,
 		};
 
@@ -496,7 +507,9 @@ mod tests {
 			(4092, vec![(1023, 0); 4]),
 		] {
 			let data = frame(shards);
-			let batch = packetizer().packetize(&data, true, 80, 2, 20, 1, &mut 0, 0, 0).unwrap();
+			let batch = packetizer()
+				.packetize(&data, FrameType::Key, 80, 2, 20, 1, &mut 0, 0, 0)
+				.unwrap();
 			let blocks = blocks(&batch);
 			let wire: Vec<_> = blocks.iter().map(|block| counts(block[0])).collect();
 			assert_eq!(wire, layout, "{shards} data packets");
@@ -513,7 +526,7 @@ mod tests {
 	#[test]
 	fn oversized_frame_does_not_consume_sequence_numbers() {
 		let mut sequence = 77;
-		let result = packetizer().packetize(&frame(4093), true, 80, 2, 20, 1, &mut sequence, 0, 0);
+		let result = packetizer().packetize(&frame(4093), FrameType::Key, 80, 2, 20, 1, &mut sequence, 0, 0);
 		assert!(result.is_err());
 		assert_eq!(sequence, 77);
 	}
@@ -524,7 +537,17 @@ mod tests {
 			[(213, 20, 0), (1, 20, 2), (40, 0, 2), (40, 20, u32::MAX), (600, 100, 2)]
 		{
 			let batch = packetizer()
-				.packetize(&frame(data_shards), true, 80, minimum, percentage, 1, &mut 0, 0, 0)
+				.packetize(
+					&frame(data_shards),
+					FrameType::Key,
+					80,
+					minimum,
+					percentage,
+					1,
+					&mut 0,
+					0,
+					0,
+				)
 				.unwrap();
 			for block in blocks(&batch) {
 				let (data, parity) = counts(block[0]);
