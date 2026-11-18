@@ -182,6 +182,15 @@ const SETTINGS: &[SettingSpec] = &[
 		Some("%"),
 	),
 	setting(
+		"bitrate_includes_overhead",
+		&["stream", "video", "bitrate_includes_overhead"],
+		VIDEO,
+		"Fit the stream in the client's bitrate",
+		"Encode video below the bitrate Moonlight asks for, so error correction, audio and packet overhead fit inside it, as Sunshine does. Off, they are sent on top of it.",
+		Kind::Bool,
+		Effect::NextStream,
+	),
+	setting(
 		"rate_control",
 		&["stream", "video", "rate_control"],
 		VIDEO,
