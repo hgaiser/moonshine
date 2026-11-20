@@ -27,28 +27,117 @@ use self::input::CompositorInput;
 /// How long [`Compositor::launch`] waits for ferriscope's readiness handshake.
 const READY_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long [`KeyboardConfig::resolve`] waits for systemd-localed.
+const LOCALED_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The layout when none is configured and the host's cannot be read.
+const FALLBACK_LAYOUT: &str = "us";
+
 /// Keyboard configuration for the compositor's XKB state.
 ///
 /// Passed to ferriscope as the seat keymap; Steam's `GAMESCOPE_KEYBOARD_LAYOUT`
 /// overrides the layout and variant at runtime, as in gamescope.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+///
+/// An empty `layout` (the default) uses the host's X11 keymap, as `localectl`
+/// shows it, for each stream (see [`Self::resolve`]).
+#[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct KeyboardConfig {
+	/// XKB layout, for example `us` or `de`; empty for the host's.
 	pub layout: String,
+	/// XKB variant; empty for the host's when `layout` is empty.
 	pub variant: String,
+	/// XKB model; empty for the host's when `layout` is empty.
 	pub model: String,
+	/// XKB options; unset for the host's when `layout` is empty.
 	pub options: Option<String>,
 }
 
-impl Default for KeyboardConfig {
-	fn default() -> Self {
+/// The host's X11 keymap, from `org.freedesktop.locale1`.
+#[derive(Debug, Default, Clone, PartialEq)]
+struct HostKeymap {
+	layout: String,
+	variant: String,
+	model: String,
+	options: String,
+}
+
+impl KeyboardConfig {
+	/// The keymap for a stream.
+	///
+	/// A configured `layout` is used as it is. Without one, the host's X11
+	/// keymap is read from systemd-localed (the service behind `localectl`),
+	/// because a systemd service has no desktop environment to ask. Its
+	/// variant, model and options fill in the fields the configuration leaves
+	/// empty. When it cannot be read, or has no layout, the layout is `us`.
+	pub(crate) async fn resolve(&self) -> Self {
+		if !self.layout.is_empty() {
+			return self.clone();
+		}
+		let host = match tokio::time::timeout(LOCALED_TIMEOUT, host_keymap()).await {
+			Ok(Ok(host)) => Some(host),
+			Ok(Err(e)) => {
+				tracing::warn!("Failed to read the host's keyboard layout from systemd-localed: {e}");
+				None
+			},
+			Err(_) => {
+				tracing::warn!("Timed out reading the host's keyboard layout from systemd-localed.");
+				None
+			},
+		};
+		let resolved = self.with_host_keymap(host.as_ref());
+		tracing::info!(
+			layout = resolved.layout,
+			variant = resolved.variant,
+			model = resolved.model,
+			options = resolved.options.as_deref().unwrap_or_default(),
+			"Using the host's keyboard layout (no layout configured)."
+		);
+		resolved
+	}
+
+	/// This configuration with its empty fields filled in from `host`, or as
+	/// it is when it configures a layout.
+	fn with_host_keymap(&self, host: Option<&HostKeymap>) -> Self {
+		if !self.layout.is_empty() {
+			return self.clone();
+		}
+		let host = host.filter(|host| !host.layout.is_empty());
+		let Some(host) = host else {
+			return Self {
+				layout: FALLBACK_LAYOUT.to_string(),
+				..self.clone()
+			};
+		};
+		let or_host = |configured: &str, host: &str| if configured.is_empty() { host } else { configured }.to_string();
 		Self {
-			layout: "us".to_string(),
-			variant: String::new(),
-			model: String::new(),
-			options: None,
+			layout: host.layout.clone(),
+			variant: or_host(&self.variant, &host.variant),
+			model: or_host(&self.model, &host.model),
+			options: self
+				.options
+				.clone()
+				.or_else(|| (!host.options.is_empty()).then(|| host.options.clone())),
 		}
 	}
+}
+
+/// Read the host's X11 keymap from systemd-localed.
+async fn host_keymap() -> zbus::Result<HostKeymap> {
+	let connection = zbus::Connection::system().await?;
+	let proxy = zbus::Proxy::new(
+		&connection,
+		"org.freedesktop.locale1",
+		"/org/freedesktop/locale1",
+		"org.freedesktop.locale1",
+	)
+	.await?;
+	Ok(HostKeymap {
+		layout: proxy.get_property("X11Layout").await?,
+		variant: proxy.get_property("X11Variant").await?,
+		model: proxy.get_property("X11Model").await?,
+		options: proxy.get_property("X11Options").await?,
+	})
 }
 
 impl From<&KeyboardConfig> for ferriscope::KeyboardConfig {
@@ -351,6 +440,63 @@ mod tests {
 			hdr: false,
 			steam_integration: false,
 		}
+	}
+
+	fn host() -> HostKeymap {
+		HostKeymap {
+			layout: "de".to_string(),
+			variant: "nodeadkeys".to_string(),
+			model: "pc105".to_string(),
+			options: "caps:escape".to_string(),
+		}
+	}
+
+	#[test]
+	fn a_configured_layout_ignores_the_host() {
+		let config = KeyboardConfig {
+			layout: "fr".to_string(),
+			..KeyboardConfig::default()
+		};
+		assert_eq!(config.with_host_keymap(Some(&host())), config);
+	}
+
+	#[test]
+	fn an_empty_layout_takes_the_host_keymap() {
+		let resolved = KeyboardConfig::default().with_host_keymap(Some(&host()));
+		assert_eq!(
+			resolved,
+			KeyboardConfig {
+				layout: "de".to_string(),
+				variant: "nodeadkeys".to_string(),
+				model: "pc105".to_string(),
+				options: Some("caps:escape".to_string()),
+			}
+		);
+	}
+
+	#[test]
+	fn configured_fields_win_over_the_host() {
+		let config = KeyboardConfig {
+			variant: "neo".to_string(),
+			options: Some(String::new()),
+			..KeyboardConfig::default()
+		};
+		let resolved = config.with_host_keymap(Some(&host()));
+		assert_eq!(resolved.layout, "de");
+		assert_eq!(resolved.variant, "neo");
+		assert_eq!(resolved.model, "pc105");
+		assert_eq!(
+			resolved.options.as_deref(),
+			Some(""),
+			"set options are kept, also empty ones"
+		);
+	}
+
+	#[test]
+	fn without_a_host_layout_it_falls_back_to_us() {
+		assert_eq!(KeyboardConfig::default().with_host_keymap(None).layout, "us");
+		let empty = HostKeymap::default();
+		assert_eq!(KeyboardConfig::default().with_host_keymap(Some(&empty)).layout, "us");
 	}
 
 	/// Regression: the Steam overlay rendered in the left letterbox under

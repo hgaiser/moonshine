@@ -204,7 +204,7 @@ const SETTINGS: &[SettingSpec] = &[
 		&["compositor", "keyboard", "layout"],
 		INPUT,
 		"Keyboard layout",
-		"XKB layout for the stream, for example us or de.",
+		"XKB layout for the stream, for example us or de. Empty uses the host's layout.",
 		Kind::Text,
 		Effect::NextStream,
 	),
