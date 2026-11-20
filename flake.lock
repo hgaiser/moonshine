@@ -3,16 +3,16 @@
     "ferriscope": {
       "flake": false,
       "locked": {
-        "lastModified": 1794615961,
-        "narHash": "sha256-JvJgK9Gh9Poq201M5cGST+W8CNuWayynBBtd6b31TXE=",
+        "lastModified": 1795156116,
+        "narHash": "sha256-PdZlj/xwJSgX4Pd/hg+7EFcfEMqPJRPtkYeYGXa2A3U=",
         "owner": "hgaiser",
         "repo": "ferriscope",
-        "rev": "8638d7c425efb42443d0c1d3c20f98f4ad8ad12f",
+        "rev": "ede3767dc477046c496985ca4fff6f888c2a0664",
         "type": "github"
       },
       "original": {
         "owner": "hgaiser",
-        "ref": "v0.1.0",
+        "ref": "v0.2.0",
         "repo": "ferriscope",
         "type": "github"
       }
