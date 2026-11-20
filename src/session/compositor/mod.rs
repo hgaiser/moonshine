@@ -39,7 +39,7 @@ const FALLBACK_LAYOUT: &str = "us";
 /// overrides the layout and variant at runtime, as in gamescope.
 ///
 /// An empty `layout` (the default) uses the host's X11 keymap, as `localectl`
-/// shows it, for each stream (see [`Self::resolve`]).
+/// shows it, read again for each stream.
 #[derive(Debug, Default, Serialize, Deserialize, Clone, PartialEq)]
 #[serde(default)]
 pub struct KeyboardConfig {
