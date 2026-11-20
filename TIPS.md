@@ -41,6 +41,24 @@ Steam is single-instance per user, so when Moonshine launches Steam inside its o
 The result is that Big Picture opens on the host's physical desktop and the streaming session fails (Moonlight sees a 503 error).
 Note that this closes your desktop Steam session when a stream starts.
 
+### Lutris
+
+Lutris is single-instance too ([#233](https://github.com/hgaiser/moonshine/issues/233)): while Lutris is open on the desktop, a `lutris:rungame/...` launch from Moonshine goes to the desktop instance, and the game starts on the host's desktop, outside the stream.
+Lutris has no command to quit, so stop its process before the stream starts:
+
+```toml
+[[application_scanner]]
+type = "lutris"
+command = ["/usr/bin/lutris", "lutris:rungame/{slug}"]
+pre_command = [
+    ["/usr/bin/bash", "-c", "pkill -f 'python[^ ]* [^ ]*bin/[l]utris'; for i in $(seq 1 30); do ! pgrep -f 'python[^ ]* [^ ]*bin/[l]utris' >/dev/null && break; sleep 1; done"],
+]
+```
+
+The same `pre_command` works on a single `[[application]]` that runs a Lutris game.
+Lutris runs as `python3 /usr/bin/lutris` (or `/app/bin/lutris` in the Flatpak), so its process is named `python3`, and `pgrep -x lutris` does not find it.
+The pattern matches the Python interpreter followed by the Lutris script; the `[l]` keeps it from matching the `bash -c` command that contains it.
+
 ## Prevent the host from suspending while streaming
 
 ### How to
