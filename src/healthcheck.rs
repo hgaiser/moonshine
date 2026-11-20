@@ -6,7 +6,9 @@ use std::os::unix::io::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use pixelforge::{BitDepth, ChromaFormat, Codec, VideoContext, VideoContextBuilder};
+use pixelforge::{BitDepth, ChromaFormat, Codec, VideoContext};
+
+use crate::gpu::GpuContext;
 
 use crate::config::Config;
 use crate::session::stream::video::KcmpProbe;
@@ -203,7 +205,9 @@ pub fn print_health_report(report: &HealthReport) {
 /// Runs the render-node, renderer, Vulkan, codec and DMA-BUF probes and records
 /// their results. This is the value-producing part of [`run_healthcheck`] and
 /// is invoked unconditionally so the server always advertises real capabilities.
-pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
+///
+/// The probes use `gpu`'s Vulkan objects, the ones the sessions use.
+pub fn probe_capabilities(config: Option<&Config>, gpu: &GpuContext) -> Capabilities {
 	let gpu_config = config.map(|c| c.compositor.gpu.clone()).unwrap_or(None);
 
 	let mut report = HealthReport {
@@ -216,7 +220,7 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 		duration: Duration::ZERO,
 	};
 
-	run_gpu_checks(&mut report, &gpu_config);
+	run_gpu_checks(&mut report, &gpu_config, gpu);
 
 	Capabilities {
 		supported_codecs: report.supported_codecs,
@@ -227,13 +231,13 @@ pub fn probe_capabilities(config: Option<&Config>) -> Capabilities {
 }
 
 /// Run the GPU/codec/HDR probes and record their results into `report`.
-fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
+fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>, gpu: &GpuContext) {
 	let render_node = check_render_nodes(report, gpu_config);
 	let render_node_open = check_render_node_open(report, gpu_config, render_node.as_ref());
 	// Prefer the configured/accessible node over the first discovered one, so
 	// the renderer probe (HDR detection) runs on the GPU the compositor will use.
-	let renderer_result = check_renderer(report, render_node_open.as_ref().or(render_node.as_ref()));
-	let vk_context = check_vulkan(report);
+	let renderer_result = check_renderer(report, render_node_open.as_ref().or(render_node.as_ref()), gpu);
+	let vk_context = check_vulkan(report, gpu);
 	check_codecs(report, vk_context.as_ref());
 	report.dma_buf_supported = check_dmabuf(report, vk_context.as_ref());
 	check_wsi_layer(report);
@@ -253,7 +257,9 @@ fn run_gpu_checks(report: &mut HealthReport, gpu_config: &Option<String>) {
 	}
 }
 
-pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
+/// Run all checks. The GPU probes use `gpu`'s Vulkan objects, the ones the
+/// sessions use.
+pub fn run_healthcheck(config: Option<&Config>, gpu: &GpuContext) -> HealthReport {
 	let started = Instant::now();
 
 	let gpu_config = config.map(|c| c.compositor.gpu.clone()).unwrap_or(None);
@@ -270,7 +276,7 @@ pub fn run_healthcheck(config: Option<&Config>) -> HealthReport {
 
 	// --- GPU checks ---
 
-	run_gpu_checks(&mut report, &gpu_config);
+	run_gpu_checks(&mut report, &gpu_config, gpu);
 
 	// --- External dependencies ---
 
@@ -465,12 +471,16 @@ fn check_render_node_open(
 ///
 /// Returns the GPU name, whether the renderer can draw into an HDR format, and
 /// the renderable format names.
-fn check_renderer(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(String, bool, Vec<String>)> {
+fn check_renderer(
+	report: &mut HealthReport,
+	node: Option<&PathBuf>,
+	gpu: &GpuContext,
+) -> Option<(String, bool, Vec<String>)> {
 	use smithay::backend::{
 		allocator::{Fourcc, dmabuf::Dmabuf},
 		drm::{DrmDeviceFd, DrmNode},
 		renderer::{Bind, vulkan::VulkanRenderer},
-		vulkan::{Instance, PhysicalDevice, version::Version},
+		vulkan::PhysicalDevice,
 	};
 
 	const NAME: &str = "Renderer";
@@ -493,11 +503,11 @@ fn check_renderer(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(
 		Ok(drm_node) => drm_node,
 		Err(e) => return fail(report, format!("  {} is not a DRM node: {e}", node.display())),
 	};
-	let instance = match Instance::new(Version::VERSION_1_3, None) {
+	let instance = match gpu.compositor_instance() {
 		Ok(instance) => instance,
-		Err(e) => return fail(report, format!("  Failed to create a Vulkan instance: {e:?}")),
+		Err(e) => return fail(report, format!("  Failed to create a Vulkan instance: {e}")),
 	};
-	let phd = match PhysicalDevice::enumerate(&instance) {
+	let phd = match PhysicalDevice::enumerate(instance.smithay()) {
 		Ok(mut devices) => devices.find(|phd| {
 			phd.render_node().ok().flatten() == Some(drm_node) || phd.primary_node().ok().flatten() == Some(drm_node)
 		}),
@@ -550,9 +560,9 @@ fn check_renderer(report: &mut HealthReport, node: Option<&PathBuf>) -> Option<(
 	Some((gpu_name, hdr_supported, format_names))
 }
 
-fn check_vulkan(report: &mut HealthReport) -> Option<VideoContext> {
+fn check_vulkan(report: &mut HealthReport, gpu: &GpuContext) -> Option<VideoContext> {
 	let start = Instant::now();
-	match VideoContextBuilder::new().app_name("Moonshine Health Check").build() {
+	match gpu.video_context() {
 		Ok(ctx) => {
 			let props = ctx.device_properties();
 			let device_name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }

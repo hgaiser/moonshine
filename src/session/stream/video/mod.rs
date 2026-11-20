@@ -5,6 +5,7 @@ use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::gpu::GpuContext;
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::CompositorFrames;
 use crate::session::compositor::frame::HdrModeState;
@@ -502,6 +503,7 @@ impl VideoStreamHandle {
 pub(crate) struct VideoStream {
 	socket: UdpGsoSocket,
 	frames: CompositorFrames,
+	gpu: GpuContext,
 	hdr_metadata_tx: watch::Sender<HdrModeState>,
 	stats_tx: StatsSender,
 }
@@ -511,6 +513,7 @@ impl VideoStream {
 		config: VideoStreamConfig,
 		address: String,
 		frames: CompositorFrames,
+		gpu: GpuContext,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		_stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: StatsSender,
@@ -529,6 +532,7 @@ impl VideoStream {
 		Ok(Self {
 			socket,
 			frames,
+			gpu,
 			hdr_metadata_tx,
 			stats_tx,
 		})
@@ -545,6 +549,7 @@ impl VideoStream {
 		let Self {
 			socket,
 			frames,
+			gpu,
 			hdr_metadata_tx,
 			stats_tx,
 		} = self;
@@ -593,6 +598,7 @@ impl VideoStream {
 		// Spawn pipeline thread — gated behind start.
 		VideoPipeline::new(
 			frames,
+			gpu,
 			config,
 			context,
 			keys_rx,

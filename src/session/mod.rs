@@ -4,6 +4,7 @@ use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
 use tokio::sync::watch;
 
+use crate::gpu::GpuContext;
 use crate::session::compositor::CompositorConfig;
 use crate::session::stream::StartSignal;
 use crate::session::stream::audio::AudioChannels;
@@ -148,6 +149,7 @@ impl InitializedSession {
 		control_config: ControlStreamConfig,
 		address: String,
 		context: SessionContext,
+		gpu: GpuContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: StatsSender,
 	) -> Result<Self, ()> {
@@ -155,12 +157,13 @@ impl InitializedSession {
 		let (hdr_metadata_tx, hdr_metadata_rx) = watch::channel(HdrModeState::new(context.hdr));
 
 		// Create compositor, audio stream, video stream, and control stream.
-		let (compositor, handles) = Compositor::new(compositor_config, (&context).into(), stop.clone());
+		let (compositor, handles) = Compositor::new(compositor_config, (&context).into(), gpu.clone(), stop.clone());
 		let audio = AudioStream::new(audio_config, address.clone(), stop.clone()).await?;
 		let video_stream = VideoStream::new(
 			video_config.clone(),
 			address.clone(),
 			handles.frames,
+			gpu,
 			hdr_metadata_tx,
 			stop.clone(),
 			stats_tx,

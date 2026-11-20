@@ -5,6 +5,7 @@ use async_shutdown::ShutdownManager;
 use tokio::sync::{Mutex, broadcast, watch};
 
 use crate::ShutdownReason;
+use crate::gpu::GpuContext;
 use crate::session::InitializedSession;
 use crate::session::SessionContext;
 use crate::session::SessionKeyData;
@@ -93,6 +94,9 @@ pub enum SessionShutdownReason {
 struct SessionManagerInner {
 	/// Configuration for the compositor.
 	compositor_config: CompositorConfig,
+
+	/// The Vulkan objects every session shares (see `crate::gpu`).
+	gpu: GpuContext,
 
 	/// Configuration for the video stream.
 	video_config: VideoStreamConfig,
@@ -208,6 +212,7 @@ impl SessionManager {
 		address: String,
 		stream_timeout: u64,
 		inhibit_sleep: bool,
+		gpu: GpuContext,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		let trigger_token = shutdown.trigger_shutdown_token(ShutdownReason::SessionManagerShutdown);
@@ -217,6 +222,7 @@ impl SessionManager {
 
 		let inner = SessionManagerInner {
 			compositor_config,
+			gpu,
 			video_config,
 			audio_config,
 			control_config,
@@ -373,6 +379,7 @@ impl SessionManager {
 		context.keys = SessionKeys::Rx(rx);
 
 		let compositor_config = guard.compositor_config.clone();
+		let gpu = guard.gpu.clone();
 		let video_config = guard.video_config.clone();
 		let audio_config = guard.audio_config.clone();
 		let control_config = guard.control_config.clone();
@@ -386,6 +393,7 @@ impl SessionManager {
 			control_config,
 			address,
 			context,
+			gpu,
 			stop,
 			stats_tx,
 		)

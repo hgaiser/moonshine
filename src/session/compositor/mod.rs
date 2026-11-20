@@ -18,6 +18,7 @@ use async_shutdown::ShutdownManager;
 use ferriscope::{Compositor as FerriscopeCompositor, FrameReceiver};
 use serde::{Deserialize, Serialize};
 
+use crate::gpu::GpuContext;
 use crate::session::SessionContext;
 use crate::session::manager::SessionShutdownReason;
 
@@ -138,6 +139,7 @@ pub(crate) struct CompositorHandles {
 pub(crate) struct Compositor {
 	config: CompositorConfig,
 	context: CompositorContext,
+	gpu: GpuContext,
 	stop: ShutdownManager<SessionShutdownReason>,
 	handles: CompositorHandles,
 }
@@ -176,6 +178,7 @@ fn build_ferriscope_config(
 	config: &CompositorConfig,
 	context: &CompositorContext,
 	render_node: std::path::PathBuf,
+	vulkan_instance: Option<ferriscope::VulkanInstance>,
 ) -> ferriscope::CompositorConfig {
 	let steam = context.steam_integration;
 	ferriscope::CompositorConfig {
@@ -183,6 +186,9 @@ fn build_ferriscope_config(
 		height: context.height,
 		rate: context.refresh_rate as f64,
 		render_node,
+		// The process-wide instance, so the Vulkan driver stays loaded between
+		// sessions (see `crate::gpu`).
+		vulkan_instance,
 		xwayland: true,
 		command: None,
 		steam,
@@ -204,6 +210,7 @@ impl Compositor {
 	pub fn new(
 		config: CompositorConfig,
 		context: CompositorContext,
+		gpu: GpuContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> (Self, CompositorHandles) {
 		let handles = CompositorHandles {
@@ -218,6 +225,7 @@ impl Compositor {
 			Self {
 				config,
 				context,
+				gpu,
 				stop,
 				handles: ours,
 			},
@@ -229,6 +237,7 @@ impl Compositor {
 		let Self {
 			config,
 			context,
+			gpu,
 			stop,
 			handles,
 		} = self;
@@ -239,7 +248,10 @@ impl Compositor {
 			tracing::error!("Failed to find render node: {e}");
 		})?;
 
-		let ferriscope_config = build_ferriscope_config(&config, &context, render_node);
+		let vulkan_instance = gpu.compositor_instance().map_err(|e| {
+			tracing::error!("Failed to create the compositor's Vulkan instance: {e}");
+		})?;
+		let ferriscope_config = build_ferriscope_config(&config, &context, render_node, Some(vulkan_instance));
 		tracing::info!(
 			steam = ferriscope_config.steam,
 			width = ferriscope_config.width,
@@ -355,21 +367,26 @@ mod tests {
 		let config = CompositorConfig::default();
 		let render_node = std::path::PathBuf::from("/dev/dri/renderD128");
 
-		let forwarded = build_ferriscope_config(&config, &context(), render_node.clone());
+		let forwarded = build_ferriscope_config(&config, &context(), render_node.clone(), None);
 		assert!(!forwarded.steam, "Steam integration is off by default");
 
 		let on = CompositorContext {
 			steam_integration: true,
 			..context()
 		};
-		let forwarded = build_ferriscope_config(&config, &on, render_node);
+		let forwarded = build_ferriscope_config(&config, &on, render_node, None);
 		assert!(forwarded.steam);
 	}
 
 	#[test]
 	fn the_ferriscope_config_matches_the_session() {
 		let config = CompositorConfig::default();
-		let forwarded = build_ferriscope_config(&config, &context(), std::path::PathBuf::from("/dev/dri/renderD128"));
+		let forwarded = build_ferriscope_config(
+			&config,
+			&context(),
+			std::path::PathBuf::from("/dev/dri/renderD128"),
+			None,
+		);
 		assert_eq!(forwarded.width, 2424);
 		assert_eq!(forwarded.height, 1080);
 		assert_eq!(forwarded.rate, 60.0);
@@ -386,13 +403,17 @@ mod tests {
 	/// legacy compositor's three-buffer decoupling.
 	#[test]
 	fn the_pool_defaults_to_three_frames_and_holds_at_least_one() {
-		let pool =
-			|config: &CompositorConfig| match build_ferriscope_config(config, &context(), "/dev/dri/renderD128".into())
-				.output
-			{
-				ferriscope::FrameOutput::Channel(channel) => channel.pool_size,
-				output => panic!("unexpected output {output:?}"),
-			};
+		let pool = |config: &CompositorConfig| match build_ferriscope_config(
+			config,
+			&context(),
+			"/dev/dri/renderD128".into(),
+			None,
+		)
+		.output
+		{
+			ferriscope::FrameOutput::Channel(channel) => channel.pool_size,
+			output => panic!("unexpected output {output:?}"),
+		};
 		assert_eq!(pool(&CompositorConfig::default()), 3);
 		let empty = CompositorConfig {
 			pool_size: 0,

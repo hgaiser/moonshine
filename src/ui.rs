@@ -26,6 +26,7 @@ use crate::ShutdownReason;
 use crate::app_scanner::{ApplicationManager, ApplicationScannerConfig};
 use crate::clients::ClientManager;
 use crate::config::Config;
+use crate::gpu::GpuContext;
 use crate::healthcheck::{self, CheckOutcome, HealthReport};
 use crate::session::application::ApplicationConfig;
 use crate::session::manager::{SessionManager, SessionPhase, SessionSettings};
@@ -349,6 +350,8 @@ pub struct UiContext {
 	pub client_manager: ClientManager,
 	pub application_manager: ApplicationManager,
 	pub webserver: Webserver,
+	/// The Vulkan objects the sessions use; the health checks probe them.
+	pub gpu: GpuContext,
 	pub health: Option<HealthReport>,
 	pub supported_codecs: u32,
 	pub hdr_supported: bool,
@@ -423,6 +426,7 @@ pub struct UiBackend {
 	client_manager: ClientManager,
 	application_manager: ApplicationManager,
 	webserver: Webserver,
+	gpu: GpuContext,
 	health: Arc<Mutex<HealthInfo>>,
 	gpu_name: String,
 	supported_codecs: u32,
@@ -555,6 +559,7 @@ impl UiBackend {
 			client_manager: context.client_manager,
 			application_manager: context.application_manager,
 			webserver: context.webserver,
+			gpu: context.gpu,
 			health: Arc::new(Mutex::new(health)),
 			gpu_name,
 			supported_codecs: context.supported_codecs,
@@ -1471,8 +1476,10 @@ impl Backend for UiBackend {
 				}
 				let health = self.health.clone();
 				let config = self.current();
+				let gpu = self.gpu.clone();
 				tokio::spawn(async move {
-					let report = tokio::task::spawn_blocking(move || healthcheck::run_healthcheck(Some(&config))).await;
+					let report =
+						tokio::task::spawn_blocking(move || healthcheck::run_healthcheck(Some(&config), &gpu)).await;
 					let mut health = health.lock().unwrap_or_else(PoisonError::into_inner);
 					match report {
 						Ok(report) => *health = health_info(&report),

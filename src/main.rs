@@ -14,6 +14,7 @@ use moonshine::app_scanner::ApplicationManager;
 use moonshine::clients::ClientManager;
 use moonshine::config::Config;
 use moonshine::discovery::MdnsDiscovery;
+use moonshine::gpu::GpuContext;
 use moonshine::rtsp::RtspServer;
 use moonshine::session::manager::SessionManager;
 use moonshine::webserver::Webserver;
@@ -62,9 +63,13 @@ async fn main() -> Result<(), ()> {
 	let config_path = args.config.unwrap_or_else(default_config_path);
 	let config = Config::load_or_create(&config_path)?;
 
+	// The Vulkan objects every session and health check shares, so the Vulkan
+	// driver stays loaded for the whole process (see `moonshine::gpu`).
+	let gpu = GpuContext::new();
+
 	// Standalone healthcheck subcommand — run checks and exit.
 	if let Some(Command::Healthcheck) = args.command {
-		let report = tokio::task::spawn_blocking(move || healthcheck::run_healthcheck(Some(&config)))
+		let report = tokio::task::spawn_blocking(move || healthcheck::run_healthcheck(Some(&config), &gpu))
 			.await
 			.map_err(|e| tracing::error!("Failed to run health check task: {e}"))?;
 		healthcheck::print_health_report(&report);
@@ -84,7 +89,8 @@ async fn main() -> Result<(), ()> {
 		tracing::info!("Health checks disabled (--no-health-check); probing GPU capabilities only.");
 		let capabilities = tokio::task::spawn_blocking({
 			let cfg = config.clone();
-			move || healthcheck::probe_capabilities(Some(&cfg))
+			let gpu = gpu.clone();
+			move || healthcheck::probe_capabilities(Some(&cfg), &gpu)
 		})
 		.await
 		.map_err(|e| tracing::error!("Failed to run health check task: {e}"))?;
@@ -98,7 +104,8 @@ async fn main() -> Result<(), ()> {
 		tracing::debug!("Running health checks...");
 		let report = tokio::task::spawn_blocking({
 			let cfg = config.clone();
-			move || healthcheck::run_healthcheck(Some(&cfg))
+			let gpu = gpu.clone();
+			move || healthcheck::run_healthcheck(Some(&cfg), &gpu)
 		})
 		.await
 		.map_err(|e| tracing::error!("Failed to run health check task: {e}"))?;
@@ -143,7 +150,13 @@ async fn main() -> Result<(), ()> {
 	});
 
 	#[cfg_attr(not(feature = "ui"), allow(unused_mut))]
-	let mut moonshine = Moonshine::new(config.clone(), supported_codecs, hdr_supported, shutdown.clone())?;
+	let mut moonshine = Moonshine::new(
+		config.clone(),
+		supported_codecs,
+		hdr_supported,
+		gpu.clone(),
+		shutdown.clone(),
+	)?;
 
 	#[cfg(feature = "ui")]
 	let restart_requested = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -156,6 +169,7 @@ async fn main() -> Result<(), ()> {
 			client_manager: moonshine._client_manager.clone(),
 			application_manager: moonshine._application_manager.clone(),
 			webserver: moonshine._webserver.clone(),
+			gpu: gpu.clone(),
 			health: health_report,
 			supported_codecs,
 			hdr_supported,
@@ -179,6 +193,11 @@ async fn main() -> Result<(), ()> {
 
 	let exit_code = shutdown.wait_shutdown_complete().await;
 	tracing::debug!("Successfully waited for shutdown to complete.");
+
+	// The sessions have stopped. Release the Vulkan objects here, before `exit`
+	// (which runs no destructors), so they are destroyed while no session thread
+	// uses them; this is normally the last reference.
+	drop(gpu);
 
 	#[cfg(feature = "ui")]
 	if restart_requested.load(std::sync::atomic::Ordering::SeqCst) {
@@ -264,6 +283,7 @@ impl Moonshine {
 		config: Config,
 		supported_codecs: u32,
 		hdr_supported: bool,
+		gpu: GpuContext,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
 		let (cert, pkey) = moonshine::tls::load_or_create_certificate(&config)?;
@@ -276,6 +296,7 @@ impl Moonshine {
 			config.address.clone(),
 			config.stream.timeout,
 			config.inhibit_sleep,
+			gpu,
 			shutdown.clone(),
 		)?;
 		let client_manager = ClientManager::new(cert.clone(), pkey.clone())?;

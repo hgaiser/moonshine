@@ -17,6 +17,7 @@ use async_shutdown::ShutdownManager;
 use smithay::backend::allocator::Buffer;
 use tokio::sync::{broadcast, mpsc, watch};
 
+use crate::gpu::GpuContext;
 use crate::session::SessionKeysReceiver;
 use crate::session::compositor::CompositorFrames;
 use crate::session::compositor::frame::{FrameColorSpace, HdrMetadata, HdrModeState, color_space, hdr_metadata};
@@ -35,7 +36,7 @@ use dmabuf::{DmaBufImporter, DmaBufPlane};
 
 use pixelforge::{
 	ChromaFormat, Codec, ColorRange, ColorSpec, EncodeConfig, EncodeFuture, Encoder, EncoderTuningMode, Frame,
-	PixelForgeError, RateControl, RgbFormat, RgbSource, Source, StreamColor, VideoContext, VideoContextBuilder,
+	PixelForgeError, RateControl, RgbFormat, RgbSource, Source, StreamColor, VideoContext,
 };
 
 /// Maximum number of frames in flight (submitted to the encoder but not yet
@@ -565,6 +566,7 @@ impl VideoPipeline {
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		frames: CompositorFrames,
+		gpu: GpuContext,
 		config: VideoStreamConfig,
 		context: VideoStreamContext,
 		keys_rx: SessionKeysReceiver,
@@ -581,6 +583,7 @@ impl VideoPipeline {
 		tracing::debug!("Initializing video pipeline.");
 
 		let inner = VideoPipelineInner {
+			gpu,
 			config,
 			context,
 			keys_rx,
@@ -624,6 +627,7 @@ impl Drop for StreamStoppedOnDrop {
 }
 
 struct VideoPipelineInner {
+	gpu: GpuContext,
 	config: VideoStreamConfig,
 	context: VideoStreamContext,
 	keys_rx: SessionKeysReceiver,
@@ -701,9 +705,11 @@ impl VideoPipelineInner {
 	fn create_encoder(&self) -> Result<(VideoContext, Encoder), String> {
 		let ctx = &self.context;
 
-		// Create Vulkan video context.
-		let context = VideoContextBuilder::new()
-			.build()
+		// A new video context (its own device) on the process-wide instance (see
+		// `crate::gpu`).
+		let context = self
+			.gpu
+			.video_context()
 			.map_err(|e| format!("Failed to create video context: {e}"))?;
 
 		// Convert our video format to pixelforge's codec.

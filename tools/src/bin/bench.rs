@@ -6,6 +6,7 @@ use async_shutdown::ShutdownManager;
 use clap::Parser;
 use moonshine::ShutdownReason;
 use moonshine::config::ApplicationConfig;
+use moonshine::gpu::GpuContext;
 use moonshine::session::SessionContext;
 use moonshine::session::SessionKeyData;
 use moonshine::session::SessionKeys;
@@ -541,15 +542,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 		std::process::exit(1);
 	}
 
+	// One set of Vulkan objects for every run, as in the server: matrix runs
+	// would otherwise reload the Vulkan driver for each run.
+	let gpu = GpuContext::new();
 	if args.matrix {
-		run_matrix(&args).await
+		run_matrix(&args, &gpu).await
 	} else {
-		run_single(&args).await
+		run_single(&args, &gpu).await
 	}
 }
 
-async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
-	let result = run_benchmark(args, "", &args.resolution, args.fps, &args.codec, args.duration).await;
+async fn run_single(args: &Args, gpu: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
+	let result = run_benchmark(args, gpu, "", &args.resolution, args.fps, &args.codec, args.duration).await;
 	let report = RunReport::new(result, "", &args.resolution, args.fps, &args.codec);
 	// Also for a run that failed, so a consumer always gets a result.
 	if args.output == OutputFormat::Json {
@@ -562,7 +566,7 @@ async fn run_single(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 	}
 }
 
-async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_matrix(args: &Args, gpu: &GpuContext) -> Result<(), Box<dyn std::error::Error>> {
 	const RESOLUTIONS: [(&str, &str); 3] = [("4k", "3840x2160"), ("1440p", "2560x1440"), ("1080p", "1920x1080")];
 	const FPS_VALUES: [u32; 3] = [60, 120, 360];
 	const CODECS: [&str; 3] = ["hevc", "h264", "av1"];
@@ -596,7 +600,7 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 					codec
 				);
 
-				let result = run_benchmark(args, resolution_label, resolution, fps, codec, duration).await;
+				let result = run_benchmark(args, gpu, resolution_label, resolution, fps, codec, duration).await;
 				let report = RunReport::new(result, resolution_label, resolution, fps, codec);
 				if let RunStatus::Failed(err) = &report.status {
 					tracing::error!(
@@ -637,6 +641,7 @@ async fn run_matrix(args: &Args) -> Result<(), Box<dyn std::error::Error>> {
 
 async fn run_benchmark(
 	args: &Args,
+	gpu: &GpuContext,
 	resolution_label: &'static str,
 	resolution: &str,
 	target_fps: u32,
@@ -675,6 +680,7 @@ async fn run_benchmark(
 		"127.0.0.1".to_string(),
 		STREAM_TIMEOUT_SECS,
 		false,
+		gpu.clone(),
 		shutdown.clone(),
 	)
 	.map_err(|_| boxed_error("Failed to create session manager"))?;

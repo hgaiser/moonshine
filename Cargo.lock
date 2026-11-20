@@ -1285,9 +1285,9 @@ dependencies = [
 
 [[package]]
 name = "ferriscope"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2a1024687c401c539547955d733214bfaf6dc24d51ab4f9883bafcedc2b39d9b"
+checksum = "6b410cccec8d85df78e3e51458a8ecaafb335d2bbd05e0ddadf8508cfd03cc96"
 dependencies = [
  "bitflags",
  "ferriscope-smithay",
@@ -2811,9 +2811,9 @@ dependencies = [
 
 [[package]]
 name = "pixelforge"
-version = "0.13.0"
+version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3541a76ecebe4ce1ac93f1dfec002c91898dc71609c1563b3c5893edd846223"
+checksum = "e6d9f4dbfea257d1c829a3e1bf20437d249c2dceaa87e0a4610942226aa90277"
 dependencies = [
  "futures-channel",
  "futures-core",
