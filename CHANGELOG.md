@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep the stream within the bitrate the client asks for: video is encoded below it, so FEC, audio and packet overhead fit inside it, as Sunshine does. `stream.video.bitrate_includes_overhead = false` restores the old behavior.
+
 - Answer each frame loss once, not again each time the client reports it before the answer reaches it.
 - Send the frame that recovers from a reference frame invalidation as frame type 5. The client drops every frame until it gets one, so each invalidation ended in an IDR.
 - Re-send the last frame when the screen doesn't change and the client waits for a recovery frame, as for an IDR, or for the IDR sent when the encoder can't recover from an invalidation.
