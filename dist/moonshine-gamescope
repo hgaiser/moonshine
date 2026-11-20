@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Run a command in gamescope at the Moonlight client's resolution and frame rate.
+#
+# Usage: moonshine-gamescope [GAMESCOPE_ARGS... --] COMMAND [ARGS...]
+#
+# Moonshine sets MOONSHINE_CLIENT_WIDTH, MOONSHINE_CLIENT_HEIGHT and
+# MOONSHINE_CLIENT_FRAMERATE for the applications it launches. With all three
+# set, COMMAND runs in fullscreen gamescope at that resolution and frame rate.
+# With none set (outside a Moonshine session), COMMAND runs as it is.
+#
+# Extra gamescope arguments go before a `--`; without them, the `--` is
+# optional. As a Steam launch option:
+#
+#   moonshine-gamescope -- %command%
+#   moonshine-gamescope --hdr-enabled -- %command%
+
+set -euo pipefail
+
+usage() {
+	echo "Usage: moonshine-gamescope [GAMESCOPE_ARGS... --] COMMAND [ARGS...]" >&2
+	exit 2
+}
+
+gamescope_args=()
+if [[ $# -gt 0 && $1 == -* && $1 != "--" ]]; then
+	# Gamescope arguments, up to the first `--`. Steam's %command% contains
+	# `--` itself, so the first one is ours.
+	while [[ $# -gt 0 && $1 != "--" ]]; do
+		gamescope_args+=("$1")
+		shift
+	done
+	[[ $# -gt 0 ]] || usage
+fi
+[[ $# -gt 0 && $1 == "--" ]] && shift
+[[ $# -gt 0 ]] || usage
+
+set_count=0
+for name in MOONSHINE_CLIENT_WIDTH MOONSHINE_CLIENT_HEIGHT MOONSHINE_CLIENT_FRAMERATE; do
+	[[ -n ${!name:-} ]] && set_count=$((set_count + 1))
+done
+
+case $set_count in
+	0)
+		exec "$@"
+		;;
+	3)
+		exec gamescope -f \
+			-W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" \
+			-w "$MOONSHINE_CLIENT_WIDTH" -h "$MOONSHINE_CLIENT_HEIGHT" \
+			-r "$MOONSHINE_CLIENT_FRAMERATE" \
+			"${gamescope_args[@]}" -- "$@"
+		;;
+	*)
+		echo "moonshine-gamescope: MOONSHINE_CLIENT_WIDTH, MOONSHINE_CLIENT_HEIGHT and MOONSHINE_CLIENT_FRAMERATE must be set all or none ($set_count of 3 set)" >&2
+		exit 1
+		;;
+esac

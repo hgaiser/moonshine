@@ -258,6 +258,9 @@ CMDS=(
   "install -Dm755 '${S}/lib/ferriscope/libferriscope_wsi.so' '${MOONSHINE_HOME}/lib/ferriscope/libferriscope_wsi.so'"
   "sed 's|/usr/lib/ferriscope/|${MOONSHINE_HOME}/lib/ferriscope/|' '${S}/share/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json' > /etc/vulkan/implicit_layer.d/VkLayer_FERRISCOPE_wsi.x86_64.json"
 
+  # Deploy the gamescope wrapper (see TIPS.md)
+  "install -Dm755 '${S}/bin/moonshine-gamescope' '${MOONSHINE_HOME}/bin/moonshine-gamescope'"
+
   # Deploy the install script itself for future upgrades/uninstall
   "cp '${S}/bin/moonshine-install.sh' '${MOONSHINE_HOME}/bin/moonshine-install.sh'"
   "chmod 755 '${MOONSHINE_HOME}/bin/moonshine-install.sh'"

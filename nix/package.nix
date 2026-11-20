@@ -201,6 +201,10 @@ rustPlatform.buildRustPackage {
     # picked up by services.udev.packages.
     install -Dm644 dist/60-moonshine.rules $out/lib/udev/rules.d/60-moonshine.rules
 
+    # Runs a game in gamescope at the client's resolution (see TIPS.md).
+    # gamescope itself comes from the user's PATH.
+    install -Dm755 dist/moonshine-gamescope $out/bin/moonshine-gamescope
+
     # Polkit rule that lets the 'moonshine' group hold a block-type sleep
     # inhibitor (used by the suspend-inhibit tip in TIPS.md). The group itself
     # is declared in the NixOS module; the rule is referenced from there.

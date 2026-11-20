@@ -70,7 +70,7 @@ jobs:
            ./dist/moonshine-modules.conf ./dist/moonshine-sysusers.conf \
            ./dist/moonshine@.service \
            ./dist/moonshine-atomic-update.conf "$STAGE/share/moonshine/"
-        cp ./dist/moonshine-install.sh "$STAGE/bin/"
+        cp ./dist/moonshine-install.sh ./dist/moonshine-gamescope "$STAGE/bin/"
         cp README.md LICENSE "$STAGE/"
         tar --zstd -cf "./moonshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst" \
           -C "$RUNNER_TEMP" moonshine

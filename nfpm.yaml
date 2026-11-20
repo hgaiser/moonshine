@@ -20,6 +20,8 @@ contents:
     dst: /usr/bin/moonshine
   - src: ./dist/start-moonshine.sh
     dst: /usr/bin/start-moonshine.sh
+  - src: ./dist/moonshine-gamescope
+    dst: /usr/bin/moonshine-gamescope
   - src: ./dist/60-moonshine.rules
     dst: /usr/lib/udev/rules.d/60-moonshine.rules
   - src: ./dist/moonshine-modules.conf

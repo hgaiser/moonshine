@@ -110,7 +110,17 @@ If the daemon is not installed or not running, `gamemoderun` simply launches the
 
 ### How to
 
-Set the game's Steam launch option (or the app's `command`) to wrap the game in Gamescope, using the client's resolution from the environment:
+Set the game's Steam launch option to:
+
+```
+moonshine-gamescope -- %command%
+```
+
+`moonshine-gamescope` ships with Moonshine. In a stream, it runs the game in fullscreen Gamescope at the client's resolution and frame rate. Outside a stream, it runs the game as it is, so the same launch option also works on the desktop. Extra Gamescope arguments go before the `--`, for example `moonshine-gamescope --hdr-enabled -- %command%`. For an app's `command`, use `["moonshine-gamescope", "--", "/path/to/game"]`.
+
+If the command is not found, use its full path: `/usr/bin/moonshine-gamescope` for the packages, or `/opt/moonshine/bin/moonshine-gamescope` for the tarball install.
+
+The wrapper runs this command, which you can also write out yourself to change it:
 
 ```
 /usr/bin/gamescope -f -W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w "$MOONSHINE_CLIENT_WIDTH" -h "$MOONSHINE_CLIENT_HEIGHT" -r "$MOONSHINE_CLIENT_FRAMERATE" -- %command%
@@ -132,7 +142,9 @@ Moonshine sets `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and `MOONSHIN
 
 Wrapping the game in Gamescope can also work around focus or rendering issues: Gamescope provides its own Wayland/X11 surfaces and input handling, so games that misbehave under Moonshine's compositor directly (unfocused windows, scaling artifacts, etc.) often behave correctly when run inside it.
 
-Note that these environment variables are only set when the app is launched by Moonshine, so fall back to defaults (e.g. `${MOONSHINE_CLIENT_WIDTH:-2560}`) if you also run the same command outside a stream.
+Note that these environment variables are only set when the app is launched by Moonshine, so fall back to defaults (e.g. `${MOONSHINE_CLIENT_WIDTH:-2560}`) if you also run a written-out command outside a stream.
+
+In our tests on NVIDIA, X11 games (which includes Proton games) show inside Gamescope, but a native Wayland Vulkan client (`vkcube --wsi wayland`) did not.
 
 ## Run Flatpak Steam inside Moonshine's compositor
 
