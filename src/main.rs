@@ -296,6 +296,7 @@ impl Moonshine {
 			config.address.clone(),
 			config.stream.timeout,
 			config.inhibit_sleep,
+			"moonshine",
 			gpu,
 			shutdown.clone(),
 		)?;

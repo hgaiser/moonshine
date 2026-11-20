@@ -98,6 +98,9 @@ struct SessionManagerInner {
 	/// The Vulkan objects every session shares (see `crate::gpu`).
 	gpu: GpuContext,
 
+	/// Names the sessions' systemd unit and PulseAudio socket directory.
+	session_name: String,
+
 	/// Configuration for the video stream.
 	video_config: VideoStreamConfig,
 
@@ -203,6 +206,13 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+	/// `session_name` names the application's transient systemd unit
+	/// (`<session_name>-session.service`) and the PulseAudio socket directory
+	/// (`$XDG_RUNTIME_DIR/<session_name>/pulse`). The server uses `"moonshine"`.
+	/// Another session manager in the same user session, such as
+	/// `moonshine-bench`, needs a name of its own: starting a session stops a
+	/// leftover unit of the same name and replaces the socket, which would end
+	/// the server's session.
 	#[allow(clippy::too_many_arguments)]
 	pub fn new(
 		compositor_config: CompositorConfig,
@@ -212,6 +222,7 @@ impl SessionManager {
 		address: String,
 		stream_timeout: u64,
 		inhibit_sleep: bool,
+		session_name: &str,
 		gpu: GpuContext,
 		shutdown: ShutdownManager<ShutdownReason>,
 	) -> Result<Self, ()> {
@@ -223,6 +234,7 @@ impl SessionManager {
 		let inner = SessionManagerInner {
 			compositor_config,
 			gpu,
+			session_name: session_name.to_string(),
 			video_config,
 			audio_config,
 			control_config,
@@ -380,6 +392,7 @@ impl SessionManager {
 
 		let compositor_config = guard.compositor_config.clone();
 		let gpu = guard.gpu.clone();
+		let session_name = guard.session_name.clone();
 		let video_config = guard.video_config.clone();
 		let audio_config = guard.audio_config.clone();
 		let control_config = guard.control_config.clone();
@@ -393,6 +406,7 @@ impl SessionManager {
 			control_config,
 			address,
 			context,
+			session_name,
 			gpu,
 			stop,
 			stats_tx,

@@ -132,6 +132,9 @@ impl SessionState {
 /// Initialized session state — components created, compositor and app not yet started.
 pub(crate) struct InitializedSession {
 	context: SessionContext,
+	/// Names the application's systemd unit and the PulseAudio socket directory
+	/// (see `SessionManager::new`).
+	session_name: String,
 	compositor: Compositor,
 	audio_stream: AudioStream,
 	video_stream: VideoStream,
@@ -149,6 +152,7 @@ impl InitializedSession {
 		control_config: ControlStreamConfig,
 		address: String,
 		context: SessionContext,
+		session_name: String,
 		gpu: GpuContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 		stats_tx: StatsSender,
@@ -158,7 +162,7 @@ impl InitializedSession {
 
 		// Create compositor, audio stream, video stream, and control stream.
 		let (compositor, handles) = Compositor::new(compositor_config, (&context).into(), gpu.clone(), stop.clone());
-		let audio = AudioStream::new(audio_config, address.clone(), stop.clone()).await?;
+		let audio = AudioStream::new(audio_config, address.clone(), &session_name, stop.clone()).await?;
 		let video_stream = VideoStream::new(
 			video_config.clone(),
 			address.clone(),
@@ -173,6 +177,7 @@ impl InitializedSession {
 
 		Ok(Self {
 			context,
+			session_name,
 			compositor,
 			audio_stream: audio,
 			video_stream,
@@ -190,6 +195,7 @@ impl InitializedSession {
 	pub(crate) async fn launch(self) -> Result<LaunchedSession, ()> {
 		let Self {
 			context,
+			session_name,
 			compositor,
 			audio_stream: audio,
 			video_stream,
@@ -205,7 +211,7 @@ impl InitializedSession {
 		let application = Application::spawn(
 			context.application.clone(),
 			ApplicationContext {
-				unit_name: "moonshine-session.service".to_string(),
+				unit_name: format!("{session_name}-session.service"),
 				pulse_socket_path,
 				xdisplay: ready.xdisplay,
 				wayland_display: ready.wayland_display.clone(),

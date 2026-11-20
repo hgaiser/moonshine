@@ -671,7 +671,12 @@ async fn run_benchmark(
 	let shutdown = ShutdownManager::<ShutdownReason>::new();
 	let session_manager = SessionManager::new(
 		CompositorConfig::default(),
-		VideoStreamConfig::default(),
+		// Ports, unit name and PulseAudio socket of its own, so a benchmark does
+		// not disturb a Moonshine server (and its session) of the same user.
+		VideoStreamConfig {
+			port: 0,
+			..Default::default()
+		},
 		AudioStreamConfig { port: 0 },
 		ControlStreamConfig {
 			port: 0,
@@ -680,6 +685,7 @@ async fn run_benchmark(
 		"127.0.0.1".to_string(),
 		STREAM_TIMEOUT_SECS,
 		false,
+		"moonshine-bench",
 		gpu.clone(),
 		shutdown.clone(),
 	)

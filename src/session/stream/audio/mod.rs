@@ -292,9 +292,13 @@ pub(crate) struct AudioStream {
 }
 
 impl AudioStream {
+	/// `session_name` names the PulseAudio socket directory
+	/// (`$XDG_RUNTIME_DIR/<session_name>/pulse`), so two session managers in
+	/// one user session (Moonshine and `moonshine-bench`) do not share it.
 	pub async fn new(
 		config: AudioStreamConfig,
 		address: String,
+		session_name: &str,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing audio stream.");
@@ -306,7 +310,8 @@ impl AudioStream {
 		// Create the socket directory for the PulseAudio server.
 		let pulse_socket_dir = dirs::runtime_dir()
 			.ok_or_else(|| tracing::error!("Failed to get runtime directory for PulseAudio socket"))?
-			.join("moonshine/pulse");
+			.join(session_name)
+			.join("pulse");
 		std::fs::create_dir_all(&pulse_socket_dir)
 			.map_err(|e| tracing::error!("Failed to create pulse socket directory: {e}"))?;
 		let pulse_socket_path = pulse_socket_dir.join("native");
