@@ -356,7 +356,10 @@ impl Webserver {
 
 		let response = if https {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => {
+					self.server_info(local_address, mac_address, https, &peer_cert_fingerprint)
+						.await
+				},
 				(&Method::GET, "/applist") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
@@ -411,7 +414,10 @@ impl Webserver {
 			}
 		} else {
 			match (request.method(), request.uri().path()) {
-				(&Method::GET, "/serverinfo") => self.server_info(params, local_address, mac_address, https).await,
+				(&Method::GET, "/serverinfo") => {
+					self.server_info(local_address, mac_address, https, &peer_cert_fingerprint)
+						.await
+				},
 				(&Method::GET, "/pair") => {
 					if !self.pairing_enabled() {
 						tracing::warn!("Pairing is disabled in configuration.");
@@ -568,10 +574,10 @@ impl Webserver {
 
 	async fn server_info(
 		&self,
-		params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
 		mac_address: Option<String>,
 		https: bool,
+		peer_cert_fingerprint: &Option<String>,
 	) -> Response<Full<Bytes>> {
 		let session_context = match self.session_manager.get_session_context().await {
 			Ok(session_context) => session_context,
@@ -582,14 +588,12 @@ impl Webserver {
 			},
 		};
 
-		// Seems we should only say we paired when using HTTPS.
-		let paired = if https {
-			match params.get("uniqueid") {
-				Some(unique_id) if self.client_manager.is_paired(unique_id.clone()).unwrap_or(false) => "1",
-				Some(_) | None => "0",
-			}
-		} else {
-			"0"
+		// Only HTTPS carries the client certificate, which is what pairing
+		// registers. The `uniqueid` parameter is not unique: Moonlight clients
+		// share a default one, so keying on it reports a new device as paired.
+		let paired = match peer_cert_fingerprint {
+			Some(fingerprint) if https && self.client_manager.is_cert_paired(fingerprint).unwrap_or(false) => "1",
+			_ => "0",
 		};
 
 		let local_ip = local_address.map(|addr| addr.ip().to_string()).unwrap_or_default();

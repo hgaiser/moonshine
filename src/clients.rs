@@ -118,10 +118,6 @@ impl ClientManager {
 		&self.state
 	}
 
-	pub(crate) fn is_paired(&self, id: String) -> Result<bool, ()> {
-		self.state.has_client(id)
-	}
-
 	pub(crate) fn is_cert_paired(&self, fingerprint: &str) -> Result<bool, ()> {
 		self.state.has_paired_cert(fingerprint.to_string())
 	}
