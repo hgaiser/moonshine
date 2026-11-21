@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.19.0] - 21-11-2026
+
+### Added
+
+- Add `moonshine-gamescope`, to run a game in gamescope at the client's resolution. (@BigDiaB)
+- Use the host's keyboard layout when none is configured.
+
+### Changed
+
+- Update pixelforge to 0.13.0. (#276, @porkloin)
+
 ### Fixed
 
 - Answer each frame loss once, not again each time the client reports it before the answer reaches it.
@@ -15,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Hold 150 ms of reference frames (4 to 16) when the client leaves the count to the host, as Moonlight does when its decoder can recover from an invalidation, and predict from one of them. With the single reference held before, every invalidation fell back to an IDR.
 - Hide the small tray window that Wine shows at the top-left in some games, such as Ubisoft games, which could also take the mouse focus from the game, by updating ferriscope to v0.2.1. (#277)
 - Show a game that a Steam launch option wraps, such as `moonshine-gamescope %command%`, instead of Steam's loading screen, by updating ferriscope to v0.2.2.
+- Report the pair status from the client certificate.
+- Keep one Vulkan instance per process for all sessions.
+- Give `moonshine-bench` its own unit, PulseAudio socket and video port.
 
 ## [v0.18.0] - 17-11-2026
 
