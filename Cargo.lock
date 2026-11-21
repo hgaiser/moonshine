@@ -1285,9 +1285,9 @@ dependencies = [
 
 [[package]]
 name = "ferriscope"
-version = "0.2.0"
+version = "0.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b410cccec8d85df78e3e51458a8ecaafb335d2bbd05e0ddadf8508cfd03cc96"
+checksum = "9fdf0d49eafb0301a363955d4a54cb86d4afa68d323282cee00ed4fd3ee62651"
 dependencies = [
  "bitflags",
  "ferriscope-smithay",
