@@ -44,7 +44,11 @@ case $set_count in
 		exec "$@"
 		;;
 	3)
-		exec gamescope -f \
+		# ferriscope turns off gamescope's WSI layer for its applications and
+		# turns on its own. Inside gamescope the game needs gamescope's layer:
+		# without it, NVIDIA's X11 presentation leaks a buffer per frame in
+		# gamescope's Xwayland until the session runs out of memory.
+		exec env -u DISABLE_GAMESCOPE_WSI -u ENABLE_FERRISCOPE_WSI gamescope -f \
 			-W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" \
 			-w "$MOONSHINE_CLIENT_WIDTH" -h "$MOONSHINE_CLIENT_HEIGHT" \
 			-r "$MOONSHINE_CLIENT_FRAMERATE" \
