@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Re-send the last frame when the screen doesn't change and the client waits for a recovery frame, as for an IDR, or for the IDR sent when the encoder can't recover from an invalidation.
 - Hold 150 ms of reference frames (4 to 16) when the client leaves the count to the host, as Moonlight does when its decoder can recover from an invalidation, and predict from one of them. With the single reference held before, every invalidation fell back to an IDR.
 - Hide the small tray window that Wine shows at the top-left in some games, such as Ubisoft games, which could also take the mouse focus from the game, by updating ferriscope to v0.2.1. (#277)
+- Show a game that a Steam launch option wraps, such as `moonshine-gamescope %command%`, instead of Steam's loading screen, by updating ferriscope to v0.2.2.
 
 ## [v0.18.0] - 17-11-2026
 

@@ -7,7 +7,7 @@
     # The source of ferriscope's Vulkan WSI layer (see nix/package.nix). Keep
     # the tag at the ferriscope version in Cargo.lock.
     ferriscope = {
-      url = "github:hgaiser/ferriscope/v0.2.1";
+      url = "github:hgaiser/ferriscope/v0.2.2";
       flake = false;
     };
   };
