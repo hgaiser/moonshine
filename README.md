@@ -259,8 +259,10 @@ A notification will also appear on the host that you can click to open the pairi
 You can also pair from the command line:
 
 ```sh
-curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
+curl -X POST "http://localhost:47989/submit-pin" -d "pin=<PIN>"
 ```
+
+The PIN goes to the pairing request that waits for one. If none waits, Moonshine answers 404; if several do, it answers 409, and you pick one by adding its `uniqueid=<id>` (the pairing page and the log show it).
 
 ### Adding applications
 

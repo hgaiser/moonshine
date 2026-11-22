@@ -51,6 +51,14 @@ pub(crate) struct PendingClient {
 	pub(crate) since: SystemTime,
 }
 
+impl PendingClient {
+	/// Whether the client still waits for its PIN: it has none yet, and asked recently enough
+	/// that it hasn't given up.
+	fn waits_for_pin(&self) -> bool {
+		self.key.is_none() && self.since.elapsed().is_ok_and(|age| age < PAIRING_REQUEST_TIMEOUT)
+	}
+}
+
 /// A device that asks to pair and waits for its PIN.
 #[derive(Clone, Debug)]
 pub struct PairingRequest {
@@ -137,8 +145,7 @@ impl ClientManager {
 		};
 		let mut requests: Vec<PairingRequest> = inner
 			.values()
-			.filter(|client| client.key.is_none())
-			.filter(|client| client.since.elapsed().is_ok_and(|age| age < PAIRING_REQUEST_TIMEOUT))
+			.filter(|client| client.waits_for_pin())
 			.map(|client| PairingRequest {
 				id: client.id.clone(),
 				since: client.since,
@@ -197,6 +204,12 @@ impl ClientManager {
 		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
+		// A request stays known after it gets its PIN or its client gives up. A PIN for it would
+		// reach no one, so refuse it rather than report success.
+		if !client.waits_for_pin() {
+			tracing::warn!("The pairing request from {id} no longer waits for a PIN.");
+			return Err(());
+		}
 		let key = create_key(&client.salt, pin).map_err(|e| tracing::warn!("Failed to create client key: {e}"))?;
 		client.key = Some(key);
 		client.pin_notify.notify_waiters();
@@ -454,4 +467,41 @@ fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 fn cert_pem_fingerprint(pem: &str) -> Option<String> {
 	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).ok()?;
 	Some(hex::encode(Sha256::digest(&pem_obj.contents)))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn pending(since: SystemTime) -> PendingClient {
+		PendingClient {
+			id: "0123456789ABCDEF".to_string(),
+			pem: String::new(),
+			salt: [0; 16],
+			pin_notify: Arc::new(Notify::new()),
+			key: None,
+			server_secret: None,
+			server_challenge: None,
+			client_hash: None,
+			since,
+		}
+	}
+
+	#[test]
+	fn a_new_request_waits_for_its_pin() {
+		assert!(pending(SystemTime::now()).waits_for_pin());
+	}
+
+	#[test]
+	fn a_request_with_a_pin_no_longer_waits() {
+		let mut client = pending(SystemTime::now());
+		client.key = Some([0; 16]);
+		assert!(!client.waits_for_pin());
+	}
+
+	#[test]
+	fn an_abandoned_request_no_longer_waits() {
+		let client = pending(SystemTime::now() - PAIRING_REQUEST_TIMEOUT - Duration::from_secs(1));
+		assert!(!client.waits_for_pin());
+	}
 }

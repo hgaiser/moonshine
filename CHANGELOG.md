@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `/submit-pin` no longer needs a `uniqueid`: without one, the PIN goes to the pairing request that waits for it, so pairing from the command line is `curl -X POST http://localhost:47989/submit-pin -d pin=<PIN>`. It answers 404 if no request waits and 409 if several do.
+
+### Fixed
+
+- Refuse a PIN for a pairing request that already has one, or that asked more than 5 minutes ago, instead of answering that it was accepted while nothing paired.
+
 ## [v0.19.1] - 23-11-2026
 
 ### Added
