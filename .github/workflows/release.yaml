@@ -89,6 +89,13 @@ jobs:
           nfpm package --config nfpm.yaml --packager "$fmt" --target .
         done
 
+    # The install script checks each download against this file.
+    - name: Compute checksums
+      run: |
+        cp ./dist/moonshine-install.sh .
+        sha256sum moonshine-*.tar.zst moonshine_*.deb moonshine-*.rpm moonshine-install.sh > SHA256SUMS
+        cat SHA256SUMS
+
     - name: Release
       uses: softprops/action-gh-release@v2
       if: steps.tag.outputs.tag != ''
@@ -98,4 +105,5 @@ jobs:
           ./moonshine-${{ steps.tag.outputs.tag }}-linux-amd64.tar.zst
           ./moonshine_*.deb
           ./moonshine-*.rpm
-          ./dist/moonshine-install.sh
+          ./moonshine-install.sh
+          ./SHA256SUMS

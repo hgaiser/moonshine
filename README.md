@@ -18,12 +18,41 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 ## Requirements
 
-1. **Linux only**. Available as `.deb`, `.rpm`, Nix, AUR, and an install script for SteamOS. Tested on Arch Linux, but reported to work on other distributions too.
+1. **Linux only**, x86_64, with glibc 2.39 or newer (for example Ubuntu 24.04+, Debian 13+, Fedora 40+). Available as an install script, `.deb`, `.rpm`, Nix and AUR. Tested on Arch Linux, but reported to work on other distributions too.
 1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
 1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
 1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
 
 ## Installation
+
+Run the install script as your normal user (not with `sudo`). It asks for `sudo` when it needs it:
+
+```sh
+curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash
+```
+
+The script picks the installation method for your system:
+
+| System | Method |
+|---|---|
+| Arch, CachyOS, EndeavourOS, Manjaro, ... | The `moonshine-bin` AUR package, with `paru`, `yay` or `makepkg` |
+| Debian, Ubuntu, Linux Mint, Pop!_OS, ... | The release `.deb`, with `apt` |
+| Fedora, Nobara, ... | The release `.rpm`, with `dnf` |
+| Bazzite, Silverblue, Kinoite and other Fedora Atomic distros | The release `.rpm`, layered with `rpm-ostree` (reboot after install) |
+| SteamOS, and every other distro | The release tarball, unpacked into `/opt/moonshine` |
+| NixOS | Nothing: use the NixOS module (see [Nix](#nix) under Manual installation) |
+
+It checks each download against the release's `SHA256SUMS`. It then asks whether to start the service, enable it on boot, run it while you are logged out, add you to the `input` group for gamepads, and run a health check. These are the steps in [Enable the service](#enable-the-service).
+
+- **Upgrade**: run the script again. It keeps the method of the current installation.
+- **Uninstall**: `curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash -s -- --uninstall`
+- **Preview**: add `--dry-run` to see the method and the commands, without changes.
+- **Choose the method**: add `--method aur|deb|rpm|ostree|opt`.
+
+Run the script with `--help` for all options.
+
+<details>
+<summary><b>Manual installation</b></summary>
 
 ### Arch
 
@@ -102,13 +131,7 @@ After reboot, follow the [Enable the service](#enable-the-service) steps below.
 
 ### SteamOS
 
-Use the installer script:
-
-```sh
-curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash
-```
-
-This deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`. The installer registers these files with SteamOS so they persist across atomic updates.
+Use the [install script](#installation). On SteamOS, it deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`. The installer registers these files with SteamOS so they persist across atomic updates.
 
 ### Enable the service
 
@@ -184,6 +207,8 @@ Then run:
 ```sh
 cargo run --release -- /path/to/config.toml
 ```
+
+</details>
 
 ## Configuration
 
