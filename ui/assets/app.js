@@ -88,6 +88,7 @@ function onSnapshot(s) {
   $("#host-name").textContent = s.server.name;
   $("#rail-foot").innerHTML = `<span>Moonshine ${esc(s.server.version)}</span><span>Up ${uptime(s.server.started)}</span>`;
   if (changedPart("session", s.session)) renderSession();
+  bannerFx(!!s.session && s.session.phase === "streaming");
   if (changedPart("health", s.health)) renderHealth();
   if (changedPart("server", s.server)) renderServer();
   if (changedPart("pairing", s.pairing)) renderPair();
@@ -702,6 +703,121 @@ function setNavCounts() {
   const u = changed().length, nu = $("#nav-unsaved"); nu.textContent = u; nu.hidden = !u;
   renderBell();
 }
+
+/* ---------- Banner ---------- */
+// While a client streams, moonlight flows down the beam into the staff's crystal and the crystal pulses.
+// One canvas pixel is one banner pixel. The geometry mirrors assets/banner-src/banner.py: the UI banner is
+// render(1280, 120, 250) with the top 8 rows cut off, shown at 2x.
+const bannerFx = (() => {
+  const cv = $("#mast-fx"), img = $(".mast img"), g = cv.getContext("2d");
+  const X0 = 240, Y0 = 8, W = cv.width, H = cv.height;        // canvas origin in render() pixels
+  const MX = 370 - X0, MY = 40 - Y0, MR = 25;                  // moon
+  const CX = 263 - X0, CY = 15 - Y0;                           // crystal on the staff
+  const BL = Math.hypot(CX - MX, CY - MY), UX = (CX - MX) / BL, UY = (CY - MY) / BL;
+  const bw = t => MR * .9 * Math.max(0, 1 - t) ** .75 + 2.5;  // beam half-width, as in banner.py
+  const B4 = [0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5];
+  const bayer = (x, y) => (B4[((y + Y0) & 3) * 4 + ((x + X0) & 3)] + .5) / 16;
+  const LIGHT = [236, 240, 255], MID = [170, 180, 245];
+  const rgb = c => `rgb(${c})`;
+  const T0 = (MR + 1) / BL;                                    // the beam leaves the moon here
+
+  // Beam pixels: position along the beam (0 = moon, 1 = crystal) and closeness to the beam's center line.
+  const beam = [], halo = [];
+  for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+    const t = ((x - MX) * UX + (y - MY) * UY) / BL, sd = (x - MX) * -UY + (y - MY) * UX, w = bw(t);
+    if (t >= 0 && t <= 1.02 && Math.abs(sd) < w && Math.hypot(x + .5 - MX, y + .5 - MY) > MR + .5)
+      beam.push({ i: (y * W + x) * 4, t, e: 1 - Math.abs(sd) / w, b: bayer(x, y) });
+    const d = Math.hypot(x - CX, y - CY);
+    if (d > 6.5 && d < 13) halo.push({ x, y, f: 1 - (d - 6.5) / 6.5, b: bayer(x, y) });
+  }
+  const data = g.createImageData(W, H);
+
+  // Motes of light that drift down the beam and funnel into the crystal.
+  const gauss = () => (Math.random() + Math.random() + Math.random() - 1.5) / 1.5;
+  const mote = t => ({ t, s: gauss() * .8, v: .05 + Math.random() * .04, ph: Math.random() * 6.3, kind: Math.random() });
+  const motes = Array.from({ length: 36 }, () => mote(T0 + Math.random() * (1 - T0)));
+
+  let on = false, raf = 0, last = 0, time = 0, offAt = 0, energy = 0;
+  const still = matchMedia("(prefers-reduced-motion: reduce)");
+
+  function step(dt) {
+    energy *= Math.exp(-dt * 1.5);
+    for (const m of motes) {
+      m.t += m.v * (.6 + .8 * m.t) * dt;
+      if (m.t >= .97) { energy = Math.min(.4, energy + .08); Object.assign(m, mote(T0 + Math.random() * .05)); }
+    }
+  }
+
+  function draw() {
+    // Bands of brighter light that travel along the beam, dithered like the banner.
+    const d = data.data; d.fill(0);
+    for (const p of beam) {
+      const k = (.5 + .5 * Math.cos(2 * Math.PI * (p.t - time * .05) * 3)) ** 2.5 * p.e ** .7 * (.5 + .5 * p.t);
+      if (k * .9 <= p.b) continue;
+      const c = k > .45 ? LIGHT : MID;
+      d[p.i] = c[0]; d[p.i + 1] = c[1]; d[p.i + 2] = c[2]; d[p.i + 3] = c === LIGHT ? 176 : 136;
+    }
+    g.putImageData(data, 0, 0);
+
+    // The crystal: a slow pulse, lifted by each mote that arrives.
+    const pulse = Math.min(1, .25 + .5 * (.5 - .5 * Math.cos(2 * Math.PI * time / 4.5)) + energy);
+    g.fillStyle = rgb(MID); g.globalAlpha = .6;
+    for (const h of halo) if (pulse * h.f * .6 > h.b) g.fillRect(h.x, h.y, 1, 1);
+    g.fillStyle = rgb(LIGHT);
+    const ext = Math.round(pulse * 3);
+    for (let a = 0; a < 8; a++) {
+      const L = a % 2 ? 8 : 15, ca = Math.cos(a * Math.PI / 4), sa = Math.sin(a * Math.PI / 4);
+      for (let r = L; r < L + ext; r++) {
+        g.globalAlpha = .75 * (1 - (r - L) / 4);
+        g.fillRect(CX + Math.round(ca * r), CY + Math.round(sa * r), 1, 1);
+      }
+    }
+    g.globalAlpha = Math.max(0, pulse - .5);                   // the cyan half of the crystal charges to white
+    for (let dy = -6; dy <= 6; dy++) g.fillRect(CX + 1, CY + dy, 3 - (Math.abs(dy) >> 1), 1);
+
+    for (const m of motes) {
+      const lat = m.s * bw(m.t) + Math.sin(time * 1.3 + m.ph) * .6;
+      const x = Math.round(MX + UX * BL * m.t - UY * lat), y = Math.round(MY + UY * BL * m.t + UX * lat);
+      const a = Math.ceil(Math.min(1, (m.t - T0) / .08) * (.55 + .45 * m.t) * 3) / 3;
+      if (a <= 0) continue;
+      g.fillStyle = rgb(MID);
+      if (m.kind < .4) {                                       // a streak with a fading tail
+        for (let k = 1; k <= 3; k++) { g.globalAlpha = a * (1 - k / 4); g.fillRect(Math.round(x - UX * k), Math.round(y - UY * k), 1, 1); }
+      } else if (m.kind < .65 && Math.sin(time * 4 + m.ph) > 0) { // a twinkling four-point star
+        g.globalAlpha = a; g.fillRect(x - 1, y, 3, 1); g.fillRect(x, y - 1, 1, 3);
+      }
+      g.fillStyle = rgb(LIGHT); g.globalAlpha = a;
+      g.fillRect(x, y, 1, 1);
+    }
+    g.globalAlpha = 1;
+  }
+
+  function frame(ts) {
+    raf = 0;
+    if (still.matches || (!on && ts - offAt > 1600)) { g.clearRect(0, 0, W, H); return; }
+    raf = requestAnimationFrame(frame);
+    if (ts - last < 1000 / 30 - 2) return;                     // 30 fps is enough for slow light
+    const dt = Math.min(.1, (ts - last) / 1000); last = ts;
+    time += dt; step(dt); draw();
+  }
+
+  // The image is object-fit: cover, anchored left; follow its scale so the canvas stays on the beam.
+  function place() {
+    const s = Math.max(img.clientWidth / 2560, img.clientHeight / 214), px = 2 * s;
+    cv.style.left = X0 * px + "px";
+    cv.style.top = (img.clientHeight - 214 * s) / 2 + "px";
+    cv.style.width = W * px + "px"; cv.style.height = H * px + "px";
+  }
+  new ResizeObserver(place).observe(img);
+
+  return function set(v) {
+    if (v === on) return;
+    on = v;
+    cv.classList.toggle("on", on);
+    if (!on) offAt = performance.now();
+    else if (!raf && !still.matches) { last = performance.now(); raf = requestAnimationFrame(frame); }
+  };
+})();
 
 /* ---------- Theme ---------- */
 const THEMES = ["auto", "light", "dark"];

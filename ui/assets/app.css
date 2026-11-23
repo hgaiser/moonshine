@@ -71,6 +71,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .mast { position: relative; overflow: hidden; background: #0d0a22; }
 /* The banner is a wide strip at its own 2x pixel scale: wide screens show more sky to the right, narrow screens cut at the right. */
 .mast img { display: block; width: 100%; height: 214px; object-fit: cover; object-position: left center; image-rendering: pixelated; max-width: 100%; }
+/* Moonlight that flows into the staff while a client streams; app.js places it over the beam. */
+.mast-fx { position: absolute; left: 0; top: 0; image-rendering: pixelated; pointer-events: none; opacity: 0; transition: opacity 1.5s ease; }
+.mast-fx.on { opacity: 1; }
 .mast::after { content: ""; position: absolute; inset: 0; background: linear-gradient(90deg, rgba(8,6,24,.85) 0, rgba(8,6,24,.35) 200px, rgba(8,6,24,0) 280px); pointer-events: none; }
 .mast-inner { position: absolute; inset: 0; z-index: 1; display: flex; flex-direction: column; justify-content: center; gap: 6px;
   padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); color: #ecebff; }
