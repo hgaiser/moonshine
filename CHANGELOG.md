@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.19.1] - 23-11-2026
+
+### Added
+
+- Pick the installation method in `moonshine-install.sh`: the AUR on Arch, the `.deb` on Debian and Ubuntu, the `.rpm` on Fedora, a layered `.rpm` on Fedora Atomic (Bazzite, Silverblue), and `/opt` on SteamOS and other distros. Run it again to upgrade, or with `--uninstall` to remove moonshine.
+- Publish `SHA256SUMS` with each release. The install script checks each download against it.
+- Animate the moonbeam in the control panel's banner while a client streams.
+
 ## [v0.19.0] - 21-11-2026
 
 ### Added
