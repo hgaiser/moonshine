@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
-- Keep the stream within the bitrate the client asks for: video is encoded below it, so FEC, audio and packet overhead fit inside it, as Sunshine does. `stream.video.bitrate_includes_overhead = false` restores the old behavior.
+- Keep the stream within the bitrate the client asks for: video is encoded below it, so FEC, audio and packet overhead fit inside it, as Sunshine does.
 
 ## [v0.19.1] - 23-11-2026
 

@@ -506,18 +506,16 @@ impl RtspServer {
 
 		// Moonlight sends the bitrate the user picked so the host can fit the
 		// stream's FEC and other traffic inside it.
-		if self.video_config.bitrate_includes_overhead {
-			let video_bitrate = video_bitrate_within(
-				bitrate,
-				self.video_config.fec_percentage,
-				audio_config.stream_config.bitrate as usize,
-			);
-			tracing::info!(
-				"Encoding video at {} kb/s to keep the stream, with FEC, audio and packet overhead, within the client's {bitrate_kbps} kb/s.",
-				video_bitrate / 1_000
-			);
-			video_stream_context.bitrate = video_bitrate;
-		}
+		let video_bitrate = video_bitrate_within(
+			bitrate,
+			self.video_config.fec_percentage,
+			audio_config.stream_config.bitrate as usize,
+		);
+		tracing::info!(
+			"Encoding video at {} kb/s to keep the stream, with FEC, audio and packet overhead, within the client's {bitrate_kbps} kb/s.",
+			video_bitrate / 1_000
+		);
+		video_stream_context.bitrate = video_bitrate;
 
 		let audio_stream_context = AudioStreamContext {
 			packet_duration_ms: packet_duration,

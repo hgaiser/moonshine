@@ -32,12 +32,6 @@ pub struct VideoStreamConfig {
 	/// What percentage of data packets should be parity packets.
 	pub fec_percentage: u8,
 
-	/// Keep the whole stream (video, its FEC, audio and packet overhead) within
-	/// the bitrate the client asks for, by encoding video at less than it, as
-	/// Sunshine does. Off, video is encoded at the client's bitrate and the
-	/// rest is sent on top of it.
-	pub bitrate_includes_overhead: bool,
-
 	/// Whether to enable video stream encryption (AES-128-GCM).
 	#[serde(default)]
 	pub encrypt: bool,
@@ -137,7 +131,6 @@ impl Default for VideoStreamConfig {
 		Self {
 			port: 47998,
 			fec_percentage: 20,
-			bitrate_includes_overhead: true,
 			encrypt: false,
 			log_frame_spikes: false,
 			max_packet_size: 0,
