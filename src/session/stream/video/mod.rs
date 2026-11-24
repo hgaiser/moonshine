@@ -140,6 +140,22 @@ impl Default for VideoStreamConfig {
 	}
 }
 
+/// The video bitrate that keeps a stream within `configured` bits per second,
+/// as Sunshine computes it from `x-ml-video.configuredBitrateKbps` in
+/// `cmd_announce()` (src/rtsp.cpp): take off the FEC parity (unless over 80%),
+/// then the audio bitrate (at most a fifth of what's left), then 500 kb/s for
+/// packet headers and control traffic (at most a tenth). The caps stop a low
+/// bitrate from leaving almost nothing for video.
+pub fn video_bitrate_within(configured: usize, fec_percentage: u8, audio_bitrate: usize) -> usize {
+	let mut bitrate = configured as u64;
+	if fec_percentage <= 80 {
+		bitrate = bitrate * (100 - u64::from(fec_percentage)) / 100;
+	}
+	bitrate -= (audio_bitrate as u64).min(bitrate / 5);
+	bitrate -= 500_000.min(bitrate / 10);
+	bitrate as usize
+}
+
 /// Average frames a keyframe burst spans, FEC included, for sizing the
 /// socket's send buffer when `send_buffer_size` is automatic.
 const KEYFRAME_BURST_FRAMES: usize = 8;
@@ -796,6 +812,19 @@ mod tests {
 		assert_eq!(keyframe_burst_bytes(80_000_000, 120), 83_333 * KEYFRAME_BURST_FRAMES);
 		// A zero frame rate doesn't divide by zero.
 		assert_eq!(keyframe_burst_bytes(8_000, 0), 1_000 * KEYFRAME_BURST_FRAMES);
+	}
+
+	#[test]
+	fn video_bitrate_leaves_room_for_fec_audio_and_overhead() {
+		// Sunshine's numbers for 20 Mb/s, 20% FEC and high-quality stereo.
+		assert_eq!(video_bitrate_within(20_000_000, 20, 512_000), 14_988_000);
+		// At a low bitrate the caps keep most of it for video.
+		assert_eq!(video_bitrate_within(1_000_000, 20, 512_000), 576_000);
+		// FEC over 80% isn't taken off.
+		assert_eq!(video_bitrate_within(20_000_000, 90, 512_000), 18_988_000);
+		// The largest bitrate a client can ask for doesn't overflow.
+		let largest = u32::MAX as usize;
+		assert!(video_bitrate_within(largest, 0, 0) < largest);
 	}
 
 	fn config(max_packet_size: usize) -> VideoStreamConfig {

@@ -23,6 +23,7 @@ use crate::session::stream::video::VideoDynamicRange;
 use crate::session::stream::video::VideoFormat;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
+use crate::session::stream::video::video_bitrate_within;
 
 /// Upper bound for one RTSP request (headers and SDP payload), including partial reads.
 const MAX_RTSP_REQUEST_BYTES: usize = 64 * 1024;
@@ -440,7 +441,7 @@ impl RtspServer {
 		let client_encryption_flags: u8 =
 			get_optional_sdp_attribute(&sdp_session, "x-ss-general.encryptionEnabled").unwrap_or(0);
 
-		let video_stream_context = VideoStreamContext {
+		let mut video_stream_context = VideoStreamContext {
 			width,
 			height,
 			fps,
@@ -502,6 +503,19 @@ impl RtspServer {
 			audio_config.high_quality,
 			audio_config.stream_config
 		);
+
+		// Moonlight sends the bitrate the user picked so the host can fit the
+		// stream's FEC and other traffic inside it.
+		let video_bitrate = video_bitrate_within(
+			bitrate,
+			self.video_config.fec_percentage,
+			audio_config.stream_config.bitrate as usize,
+		);
+		tracing::info!(
+			"Encoding video at {} kb/s to keep the stream, with FEC, audio and packet overhead, within the client's {bitrate_kbps} kb/s.",
+			video_bitrate / 1_000
+		);
+		video_stream_context.bitrate = video_bitrate;
 
 		let audio_stream_context = AudioStreamContext {
 			packet_duration_ms: packet_duration,
