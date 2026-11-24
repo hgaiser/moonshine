@@ -1,26 +1,34 @@
 # Tips & Tricks
 
-Practical recipes for getting the most out of Moonshine.
-Each tip shows a real-world use of `pre_command` / `post_command` (or other configuration) to solve a common problem.
-See the [Configuration](../README.md#configuration) section of the README for the full schema of these fields.
+Recipes for common problems, one for each section.
+See the [Configuration](README.md#configuration) section of the README for the configuration fields.
 
 ## Table of Contents
 
-- [Close a desktop Steam before streaming Steam](#close-a-desktop-steam-before-streaming-steam)
-- [Prevent the host from suspending while streaming](#prevent-the-host-from-suspending-while-streaming)
-- [Run games in high-performance mode](#run-games-in-high-performance-mode)
-- [Use Gamescope with the client's resolution](#use-gamescope-with-the-clients-resolution)
-- [Run Flatpak Steam inside Moonshine's compositor](#run-flatpak-steam-inside-moonshines-compositor)
-- [Run Flatpak Bottles inside Moonshine's compositor](#run-flatpak-bottles-inside-moonshines-compositor)
-- [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
-- [Debug a failing application](#debug-a-failing-application)
-- [Watch per-frame timings from another program](#watch-per-frame-timings-from-another-program)
+- **Steam and launchers**
+  - [Close a desktop Steam before streaming Steam](#close-a-desktop-steam-before-streaming-steam)
+  - [Close a desktop Lutris before streaming a Lutris game](#close-a-desktop-lutris-before-streaming-a-lutris-game)
+  - [Run Flatpak Steam inside Moonshine's compositor](#run-flatpak-steam-inside-moonshines-compositor)
+  - [Run Flatpak Bottles inside Moonshine's compositor](#run-flatpak-bottles-inside-moonshines-compositor)
+- **Games**
+  - [Run games in high-performance mode](#run-games-in-high-performance-mode)
+  - [Use Gamescope with the client's resolution](#use-gamescope-with-the-clients-resolution)
+- **Host**
+  - [Prevent the host from suspending while streaming](#prevent-the-host-from-suspending-while-streaming)
+  - [Run a desktop environment for a full remote desktop](#run-a-desktop-environment-for-a-full-remote-desktop)
+- **Troubleshooting and tools**
+  - [Debug a failing application](#debug-a-failing-application)
+  - [Watch per-frame timings from another program](#watch-per-frame-timings-from-another-program)
+  - [Open the control panel through a reverse proxy](#open-the-control-panel-through-a-reverse-proxy)
+  - [Pair a client from the command line](#pair-a-client-from-the-command-line)
 
-## Close a desktop Steam before streaming Steam
+## Steam and launchers
 
-### How to
+### Close a desktop Steam before streaming Steam
 
-Add a `pre_command` that shuts down any running desktop Steam before the stream starts, so Moonshine's instance becomes the primary one:
+#### How to
+
+Add a `pre_command` that shuts down a desktop Steam and waits (up to 30 seconds) until it exits:
 
 ```toml
 [[application]]
@@ -32,18 +40,15 @@ pre_command = [
 ]
 ```
 
-This asks any running Steam to shut down and waits (up to ~30s) for it to exit before the streaming instance launches.
+#### Details
 
-### Details
+Steam allows only one instance for each user. If Steam runs on your desktop, Moonshine's launch goes to that instance, and Big Picture opens on the desktop instead of in the stream ([#134](https://github.com/hgaiser/moonshine/issues/134)).
+This closes your desktop Steam when a stream starts.
 
-This is the recommended workaround from issue [#134](https://github.com/hgaiser/moonshine/issues/134).
-Steam is single-instance per user, so when Moonshine launches Steam inside its own compositor while a desktop Steam is already running on the host, the `steam://` URL (for example "open big picture") is forwarded to the existing desktop instance instead of running inside Moonshine's compositor.
-The result is that Big Picture opens on the host's physical desktop and the streaming session fails (Moonlight sees a 503 error).
-Note that this closes your desktop Steam session when a stream starts.
+### Close a desktop Lutris before streaming a Lutris game
 
-### Lutris
+#### How to
 
-Lutris is single-instance too ([#233](https://github.com/hgaiser/moonshine/issues/233)): while Lutris is open on the desktop, a `lutris:rungame/...` launch from Moonshine goes to the desktop instance, and the game starts on the host's desktop, outside the stream.
 Lutris has no command to quit, so stop its process before the stream starts:
 
 ```toml
@@ -55,100 +60,17 @@ pre_command = [
 ]
 ```
 
-The same `pre_command` works on a single `[[application]]` that runs a Lutris game.
-Lutris runs as `python3 /usr/bin/lutris` (or `/app/bin/lutris` in the Flatpak), so its process is named `python3`, and `pgrep -x lutris` does not find it.
-The pattern matches the Python interpreter followed by the Lutris script; the `[l]` keeps it from matching the `bash -c` command that contains it.
+The same `pre_command` works on an `[[application]]` that runs a Lutris game.
 
-## Prevent the host from suspending while streaming
+#### Details
 
-### How to
+Lutris allows only one instance too ([#233](https://github.com/hgaiser/moonshine/issues/233)). If Lutris is open on your desktop, the game starts on the desktop, outside the stream.
+Lutris runs as `python3 /usr/bin/lutris` (or `/app/bin/lutris` in the Flatpak), so `pgrep -x lutris` does not find it.
+The pattern matches the Python interpreter followed by the Lutris script. The `[l]` keeps it from matching the `bash -c` command that contains it.
 
-Make sure your user is in the `moonshine` group: `sudo usermod -aG moonshine $USER`.
-Moonshine then blocks sleep automatically for the duration of every stream — nothing else is required.
-If you want to disable this, set `inhibit_sleep = false` at the top of your configuration:
+### Run Flatpak Steam inside Moonshine's compositor
 
-```toml
-name = "Moonshine"
-inhibit_sleep = false
-```
-
-### Details
-
-Moonshine asks logind (over D-Bus) to inhibit sleep when a session starts and releases it when the session ends.
-This is the same thing `systemd-inhibit` does, but handled by Moonshine itself, so you do not have to wrap each application's `command` with it.
-It requires the polkit rule shipped with Moonshine (`/usr/share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules`) and membership in the `moonshine` group it is scoped to.
-When installed from a package, both are set up for you (via the sysusers.d drop-in and the package's post-install step); if you installed Moonshine manually, create the group with `sudo groupadd --system moonshine` and copy that polkit rule file into place yourself.
-If the user is not in the `moonshine` group (and has no active session), Moonshine logs a warning and streaming still works, but the host may suspend mid-stream.
-
-## Run games in high-performance mode
-
-### How to
-
-Install the `gamemode` package for your distribution.
-Then for each Steam game you want to optimize (or globally in Steam's launch options), set the game's launch option to:
-
-```
-gamemoderun %command%
-```
-
-Do **not** use `gamemoderun` with Steam anywhere in Moonshine's configuration, since that launches Steam itself under `LD_PRELOAD`, which leaks into Steam's child processes and can prevent the session from launching.
-
-### Details
-
-[GameMode](https://github.com/FeralInteractive/gamemode) applies a set of temporary system optimizations (CPU governor, I/O priority, scheduler tweaks, etc.) while a game is running, then reverts them when it exits.
-GameMode consists of a daemon (`gamemoded`) and a client library; `gamemoderun` asks the daemon to enable optimizations for the process it launches.
-The daemon is normally started automatically via D-Bus the first time a game requests it, so no manual step is needed beyond installing the package — you can verify it with `gamemoded -t`.
-
-### Requirements
-
-Make sure your user is in the `gamemode` group: `sudo usermod -aG gamemode $USER`.
-Without it, `gamemoderun` will not be able to communicate with the daemon and will silently skip applying optimizations.
-
-If the daemon is not installed or not running, `gamemoderun` simply launches the game without applying any optimizations.
-
-## Use Gamescope with the client's resolution
-
-### How to
-
-Set the game's Steam launch option to:
-
-```
-moonshine-gamescope -- %command%
-```
-
-`moonshine-gamescope` ships with Moonshine. In a stream, it runs the game in fullscreen Gamescope at the client's resolution and frame rate. Outside a stream, it runs the game as it is, so the same launch option also works on the desktop. Extra Gamescope arguments go before the `--`, for example `moonshine-gamescope --hdr-enabled -- %command%`. For an app's `command`, use `["moonshine-gamescope", "--", "/path/to/game"]`.
-
-If the command is not found, use its full path: `/usr/bin/moonshine-gamescope` for the packages, or `/opt/moonshine/bin/moonshine-gamescope` for the tarball install.
-
-The wrapper runs this command, which you can also write out yourself to change it:
-
-```
-/usr/bin/gamescope -f -W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w "$MOONSHINE_CLIENT_WIDTH" -h "$MOONSHINE_CLIENT_HEIGHT" -r "$MOONSHINE_CLIENT_FRAMERATE" -- %command%
-```
-
-For supersampling, render above the output resolution — here 1.5x the client resolution:
-
-```
-/usr/bin/gamescope -f -W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w $((MOONSHINE_CLIENT_WIDTH * 3 / 2)) -h $((MOONSHINE_CLIENT_HEIGHT * 3 / 2)) -r "$MOONSHINE_CLIENT_FRAMERATE" -- %command%
-```
-
-Moonshine sets `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and `MOONSHINE_CLIENT_FRAMERATE` on the environment of the launched application, so they are inherited by Gamescope, Steam and `%command%`.
-
-### Details
-
-- `-W`/`-H` set the output resolution; set them to the client's resolution so the stream is filled.
-- `-w`/`-h` set the resolution the game actually renders at. Rendering below the output resolution upscales (bilinear or FSR); rendering above it downsamples for supersampling. You can play with the values to trade quality against performance — when they match the client resolution you get a 1:1 image.
-- `-r` sets the refresh rate, e.g. from `MOONSHINE_CLIENT_FRAMERATE`.
-
-Wrapping the game in Gamescope can also work around focus or rendering issues: Gamescope provides its own Wayland/X11 surfaces and input handling, so games that misbehave under Moonshine's compositor directly (unfocused windows, scaling artifacts, etc.) often behave correctly when run inside it.
-
-Note that these environment variables are only set when the app is launched by Moonshine, so fall back to defaults (e.g. `${MOONSHINE_CLIENT_WIDTH:-2560}`) if you also run a written-out command outside a stream.
-
-In our tests on NVIDIA, X11 games (which includes Proton games) show inside Gamescope, but a native Wayland Vulkan client (`vkcube --wsi wayland`) did not.
-
-## Run Flatpak Steam inside Moonshine's compositor
-
-### How to
+#### How to
 
 Wrap the `command` with `dbus-run-session`:
 
@@ -156,65 +78,131 @@ Wrap the `command` with `dbus-run-session`:
 [[application]]
 title = "Steam Flatpak"
 command = [
-	"dbus-run-session", "--",
-	"flatpak", "run",
-	"com.valvesoftware.Steam",
-	"steam://open/bigpicture",
+    "dbus-run-session", "--",
+    "flatpak", "run", "com.valvesoftware.Steam",
+    "steam://open/bigpicture",
 ]
 steam_integration = true
 ```
 
-For games launched through Steam's application scanner:
+For the Steam application scanner:
 
 ```toml
 [[application_scanner]]
 type = "steam"
 library = "$HOME/.var/app/com.valvesoftware.Steam/.local/share/Steam"
 command = [
-	"dbus-run-session", "--",
-	"flatpak", "run",
-	"com.valvesoftware.Steam",
-	"steam://rungameid/{game_id}",
+    "dbus-run-session", "--",
+    "flatpak", "run", "com.valvesoftware.Steam",
+    "steam://rungameid/{game_id}",
 ]
 ```
 
-### Details
+#### Details
 
-The root cause is in how Flatpak's portal infrastructure interacts with the desktop environment.
-Flatpak uses the host's D-Bus session bus to communicate with portal backends. When setting up the sandbox, the portal backend tells Flatpak to expose the **host's** Wayland and display sockets, overriding the `WAYLAND_DISPLAY` and `DISPLAY` environment variables that Moonshine sets. This causes Steam to render on the host's physical desktop instead of inside Moonshine's headless compositor.
+Flatpak asks the desktop portal on your D-Bus session bus how to set up the sandbox. The portal gives it the Wayland and X11 sockets of your desktop, not the `WAYLAND_DISPLAY` and `DISPLAY` that Moonshine sets, so Steam opens on your desktop.
+`dbus-run-session` starts a new session bus without the portal, so Flatpak uses Moonshine's environment.
 
-`dbus-run-session` spawns a fresh D-Bus daemon without the host's portal backend registered, so Flatpak cannot discover the host compositor through the portal and falls back to the environment variables inherited from Moonshine's systemd unit. Because the portal backend is responsible for both Wayland and audio setup, the `PULSE_SERVER` env var is also honored correctly without needing `--env=` overrides.
+### Run Flatpak Bottles inside Moonshine's compositor
 
-## Run Flatpak Bottles inside Moonshine's compositor
+#### How to
 
-### How to
-
-Wrap the `command` with `dbus-run-session`, as for Flatpak Steam above:
+Wrap the commands with `dbus-run-session`, as for [Flatpak Steam](#run-flatpak-steam-inside-moonshines-compositor):
 
 ```toml
 [[application_scanner]]
 type = "bottles"
 command = [
-	"dbus-run-session", "--",
-	"flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
-	"run", "-b", "{bottle}", "--program-id", "{program_id}",
+    "dbus-run-session", "--",
+    "flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+    "run", "-b", "{bottle}", "--program-id", "{program_id}",
 ]
 umu_command = [
-	"dbus-run-session", "--",
-	"flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
-	"umu", "run", "--game", "{umu_game}",
+    "dbus-run-session", "--",
+    "flatpak", "run", "--command=bottles-cli", "com.usebottles.bottles",
+    "umu", "run", "--game", "{umu_game}",
 ]
 ```
 
-### Details
+#### Details
 
-The root cause is the same as for Flatpak Steam: the portal backend overrides the `WAYLAND_DISPLAY`/`DISPLAY` variables Moonshine sets, so the game renders on the host's desktop. `dbus-run-session` hides the portal, and Flatpak falls back to Moonshine's environment.
+The cause is the same as for Flatpak Steam: without `dbus-run-session`, the game opens on your desktop.
 
-## Run a desktop environment for a full remote desktop
+## Games
 
-### How to
+### Run games in high-performance mode
 
-Add the desktop environment as a regular application. For example, to stream a full COSMIC desktop instead of a single game:
+#### How to
+
+Install the `gamemode` package and add your user to the `gamemode` group: `sudo usermod -aG gamemode $USER`.
+Then set the Steam launch option of a game (or the global launch option) to:
+
+```
+gamemoderun %command%
+```
+
+Do **not** use `gamemoderun` on Steam itself in Moonshine's configuration. It preloads a library into Steam and all its child processes, which can stop the session from launching.
+
+#### Details
+
+[GameMode](https://github.com/FeralInteractive/gamemode) applies temporary system optimizations (CPU governor, I/O priority, scheduler) while a game runs.
+Without the `gamemoded` daemon or the `gamemode` group, `gamemoderun` starts the game without optimizations and shows no error. Check the daemon with `gamemoded -t`.
+
+### Use Gamescope with the client's resolution
+
+#### How to
+
+Set the Steam launch option of the game to:
+
+```
+moonshine-gamescope -- %command%
+```
+
+`moonshine-gamescope` ships with Moonshine. In a stream, it runs the game in fullscreen Gamescope at the resolution and frame rate of the client. Outside a stream, it runs the game as it is, so the same launch option also works on the desktop.
+
+- Extra Gamescope arguments go before the `--`, for example `moonshine-gamescope --hdr-enabled -- %command%`.
+- For an application's `command`, use `["moonshine-gamescope", "--", "/path/to/game"]`.
+- If the command is not found, use its full path: `/usr/bin/moonshine-gamescope` for the packages, or `/opt/moonshine/bin/moonshine-gamescope` for the tarball.
+
+To change the Gamescope command, write it out yourself. Moonshine sets `MOONSHINE_CLIENT_WIDTH`, `MOONSHINE_CLIENT_HEIGHT` and `MOONSHINE_CLIENT_FRAMERATE` for the applications it launches. For example, this renders at 1.5 times the client resolution (supersampling):
+
+```
+/usr/bin/gamescope -f -W "$MOONSHINE_CLIENT_WIDTH" -H "$MOONSHINE_CLIENT_HEIGHT" -w $((MOONSHINE_CLIENT_WIDTH * 3 / 2)) -h $((MOONSHINE_CLIENT_HEIGHT * 3 / 2)) -r "$MOONSHINE_CLIENT_FRAMERATE" -- %command%
+```
+
+#### Details
+
+Gamescope can also fix games that have focus or scaling problems directly in Moonshine's compositor, because it gives them its own window and input handling.
+X11 games (including Proton games) show inside Gamescope. Native Wayland games may not.
+
+## Host
+
+### Prevent the host from suspending while streaming
+
+#### How to
+
+The packaged service does this for you: Moonshine keeps the computer awake during each stream.
+To turn this off, turn off "Keep the computer awake while streaming" in the control panel, or set `inhibit_sleep = false` at the top of `config.toml`.
+
+If you run Moonshine outside the service (for example with `cargo run`), add your user to the `moonshine` group:
+
+```sh
+sudo usermod -aG moonshine $USER
+```
+
+#### Details
+
+Moonshine asks logind for a sleep inhibitor when a stream starts, and releases it when the stream ends. This is what `systemd-inhibit` does.
+Moonshine runs without a login session, so logind refuses unless polkit allows it. The polkit rule that comes with Moonshine (`50-moonshine-inhibit-sleep.rules`) allows it for processes in the `moonshine` group.
+The service unit runs Moonshine with this group (`SupplementaryGroups=moonshine`), so your user does not have to be a member. Polkit gets the groups of the process from the D-Bus daemon (dbus-daemon 1.14 or later, or dbus-broker 23 or later).
+The packages create the group and install the rule. For a build from source, see [Building from source](README.md#building-from-source).
+If Moonshine cannot get the inhibitor, it logs a warning, and streaming still works. `moonshine healthcheck` shows the result in its "Sleep inhibit" check. Run from a terminal, this check fails if your user is not in the group, even when the service works.
+
+### Run a desktop environment for a full remote desktop
+
+#### How to
+
+Add the desktop environment as an application. For example, for COSMIC:
 
 ```toml
 [[application]]
@@ -223,19 +211,20 @@ command = ["/usr/bin/start-cosmic"]
 env = { COSMIC_BACKEND = "winit" }
 ```
 
-### Details
+Other compositors work the same way, for example `["/usr/bin/sway"]`.
 
-Launching a desktop environment as an application turns the stream into a full remote desktop: the compositor boots inside Moonshine's headless compositor, and you use the desktop's own keybindings to launch programs. Other compositors work the same way, e.g. `["/usr/bin/sway"]`.
+#### Details
 
-Leave Steam integration off (the default) for a desktop: with `steam_integration = true`, only Steam and Steam game windows get focus and keyboard input.
+- Leave `steam_integration` off. With it on, only Steam windows get focus and keyboard input.
+- Run the nested compositor as a Wayland client, not as an X11 client. Moonshine gives a Wayland window the resolution of the stream, but it keeps an X11 window at the size the window asks for. The X11 backend of COSMIC asks for 1280x800, so the desktop stays at that size. `COSMIC_BACKEND = "winit"` makes COSMIC use its Wayland backend.
 
-Run a nested compositor as a Wayland client, not as an X11 client. Moonshine's compositor gives a Wayland window the stream's resolution, but it keeps an X11 window at the size the window asks for and scales it to the stream, as it does for games. COSMIC's compositor uses its X11 backend when `DISPLAY` is set, and its X11 window asks for 1280x800, so the desktop stays at 1280x800 whatever the stream's resolution. `COSMIC_BACKEND = "winit"` makes it use its Wayland backend instead.
+## Troubleshooting and tools
 
-## Debug a failing application
+### Debug a failing application
 
-### How to
+#### How to
 
-Set the application's `stdout` and `stderr` to `"journal"` so its output is captured by systemd's journal instead of being discarded (the default is `null`):
+Send the output of the application to the systemd journal. By default, Moonshine discards it:
 
 ```toml
 [[application]]
@@ -246,23 +235,20 @@ stdout = "journal"
 stderr = "journal"
 ```
 
-After a failed run, inspect the logs for the session's unit:
+Then read the log of the session unit. Add `-f` to follow it while you launch again:
 
+```sh
+journalctl --user -u moonshine-session.service -e
 ```
-journalctl --user -u moonshine-session.service
-```
 
-You can also add `-e` to jump to the end of the log and `-f` to follow it live while retrying the launch.
+#### Details
 
-### Details
+`stdout` and `stderr` are also available on `[[application_scanner]]` tables.
+They accept every systemd `StandardOutput`/`StandardError` value, for example `file:/path/to/log.txt` or `append:/path/to/log.txt`.
 
-By default Moonshine launches applications with `StandardOutput=null` and `StandardError=null`, so an application that fails to start produces no diagnostic output at all. Redirecting to the journal makes its stderr (where most crash output and backtraces land) visible, which is usually the fastest way to find out why the session failed to launch.
+### Watch per-frame timings from another program
 
-These fields are also available on `[[application_scanner]]` configs for games launched through Steam/Lutris/Heroic. Instead of the journal you can also redirect to a file, e.g. `stdout = "file:/path/to/log.txt"`; any systemd `StandardOutput`/`StandardError` value (`journal`, `file:/path`, `append:/path`, `inherit`, ...) is accepted.
-
-## Watch per-frame timings from another program
-
-### How to
+#### How to
 
 Turn on the statistics socket in your configuration and restart Moonshine:
 
@@ -273,6 +259,39 @@ socket = "$XDG_RUNTIME_DIR/moonshine/stats.sock"
 
 Then read it, for example with `socat - UNIX-CONNECT:$XDG_RUNTIME_DIR/moonshine/stats.sock`.
 
-### Details
+#### Details
 
-Every connection gets one JSON object per line: `stream_started` with the statistics format version and the stream's resolution, frame rate, bitrate, codec, dynamic range and chroma, then a `frame` per encoded frame with its number (the frame index the client receives), when it was captured, the captured content's color space and the time it spent in each pipeline stage, then `stream_stopped`. A `frame` line is Moonshine's own per-frame statistics record, field names and all, with every duration in whole microseconds. `gpu_encode` and `bitstream_ready` appear only when the video queue reports timestamps, and are parts of `encode_wait` rather than extra stages. A connection made during a stream starts with that stream's `stream_started`. A reader that falls behind gets a `lagged` line saying how many messages it missed. The socket is only accessible to the user Moonshine runs as, and the format is described in `src/stats_socket.rs`.
+The socket sends one JSON object per line: `stream_started`, then one `frame` for each encoded frame with the time of each pipeline stage in microseconds, then `stream_stopped`.
+Only the user that runs Moonshine can open the socket. [`src/stats_socket.rs`](src/stats_socket.rs) describes the format.
+
+### Open the control panel through a reverse proxy
+
+#### How to
+
+Add the name of the proxy to `allowed_hosts`, and add the address of the proxy to `allowed_networks`:
+
+```toml
+[ui]
+allowed_networks = ["127.0.0.1/32", "::1/128", "192.168.1.10/32"]
+allowed_hosts = ["moonshine.example.com"]
+```
+
+#### Details
+
+The control panel only answers to an IP address, `localhost` or the name of this computer. `allowed_hosts` adds more names.
+
+The control panel then sees the address of the proxy, not the address of the browser. So anyone who can reach the proxy can open the control panel. Put authentication on the proxy, or only make it reachable from networks you trust.
+
+### Pair a client from the command line
+
+#### How to
+
+When Moonlight shows a PIN, send it to Moonshine:
+
+```sh
+curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
+```
+
+#### Details
+
+This does the same as the Clients page of the control panel or the page at http://localhost:47989/pin . It is useful on a host without a browser, for example over SSH.

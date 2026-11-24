@@ -5,7 +5,7 @@ This directory contains a [nix flake](https://wiki.nixos.org/wiki/Flakes) that b
 ## What you get
 
 - **A package**: the `moonshine` binary and the udev rules, built from this repository, and the ferriscope-wsi Vulkan layer, built from the ferriscope revision `Cargo.lock` pins (`moonshine.ferriscope-wsi`).
-- **A NixOS module**: a `services.moonshine` service that takes care of everything from the [installation steps](../README.md#installation): lingering, kernel modules, device permissions, and the systemd service.
+- **A NixOS module**: a `services.moonshine` service that takes care of everything from the [installation steps](../README.md#enable-the-service): lingering, kernel modules, device permissions, and the systemd service.
 - **A dev shell**: the full build environment for working on Moonshine.
 
 ## Building
@@ -14,6 +14,8 @@ This directory contains a [nix flake](https://wiki.nixos.org/wiki/Flakes) that b
 nix build github:hgaiser/moonshine
 ./result/bin/moonshine --help
 ```
+
+The package (also with `nix profile install github:hgaiser/moonshine`) has only the binary, the udev rules and the Vulkan layer. It does not include the systemd unit. On other distributions, use one of the native packages from the main README.
 
 ## Running as a service
 
@@ -61,7 +63,7 @@ Then import the module and enable the service in your configuration:
 }
 ```
 
-This module replaces the `services.moonshine` module from nixpkgs (through `disabledModules`), so use the options shown here rather than the ones on search.nixos.org.
+This module replaces the `services.moonshine` module from nixpkgs (through `disabledModules`), so use the options shown here rather than the ones on search.nixos.org. The differences: `openFirewall` instead of `firewallInterfaces`, a `uid` option, and the user is not added to the `input` group for you.
 
 After `nixos-rebuild switch` the service is running. There is no `systemctl enable` step, and user lingering is enabled automatically. Pair with a Moonlight client as usual via http://localhost:47989/pin .
 

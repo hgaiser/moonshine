@@ -15,10 +15,29 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 - **HDR support**: True 10-bit HDR streaming for supported games.
 - **Full input support**: Mouse, keyboard, touchscreen, pen/stylus, and gamepad (including motion, touchpad, and haptics).
 - **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
+- **Web control panel**: Pair devices, manage applications, change settings and watch live stream statistics.
+
+![The Moonshine control panel during a stream](assets/control-panel.png)
+
+<details>
+<summary><b>More screenshots</b></summary>
+
+![The Applications page of the control panel](assets/control-panel-applications.png)
+![The Clients page of the control panel](assets/control-panel-clients.png)
+
+</details>
+
+## Quick start
+
+1. Install Moonshine with the [install script](#installation).
+2. Open the control panel at http://localhost:47990 .
+3. In Moonlight, select the host (or add it by its IP address). Moonlight shows a PIN.
+4. Type the PIN on the Clients page of the control panel.
+5. Select Steam (or a game) in Moonlight to start streaming.
 
 ## Requirements
 
-1. **Linux only**, x86_64, with glibc 2.39 or newer (for example Ubuntu 24.04+, Debian 13+, Fedora 40+). Available as an install script, `.deb`, `.rpm`, Nix and AUR. Tested on Arch Linux, but reported to work on other distributions too.
+1. **Linux only**, x86_64, with glibc 2.39 or newer (for example Ubuntu 24.04+, Debian 13+, Fedora 40+).
 1. **systemd**. Required for launching and managing application processes. Almost all modern Linux distributions include it by default.
 1. **A GPU with Vulkan video encoding**. NVIDIA RTX, AMD RDNA2+, or Intel Arc.
 1. **Moonlight v6.0.0 or higher**. Compatibility with older versions or unofficial ports is not guaranteed.
@@ -40,9 +59,9 @@ The script picks the installation method for your system:
 | Fedora, Nobara, ... | The release `.rpm`, with `dnf` |
 | Bazzite, Silverblue, Kinoite and other Fedora Atomic distros | The release `.rpm`, layered with `rpm-ostree` (reboot after install) |
 | SteamOS, and every other distro | The release tarball, unpacked into `/opt/moonshine` |
-| NixOS | Nothing: use the NixOS module (see [Nix](#nix) under Manual installation) |
+| NixOS | Nothing: use the [NixOS module](#nixos) |
 
-It checks each download against the release's `SHA256SUMS`. It then asks whether to start the service, enable it on boot, run it while you are logged out, add you to the `input` group for gamepads, and run a health check. These are the steps in [Enable the service](#enable-the-service).
+It checks each download against the release's `SHA256SUMS`. It then offers to do the steps in [Enable the service](#enable-the-service) for you.
 
 - **Upgrade**: run the script again. It keeps the method of the current installation.
 - **Uninstall**: `curl -fsSL https://github.com/hgaiser/moonshine/releases/latest/download/moonshine-install.sh | bash -s -- --uninstall`
@@ -51,45 +70,22 @@ It checks each download against the release's `SHA256SUMS`. It then asks whether
 
 Run the script with `--help` for all options.
 
-<details>
-<summary><b>Manual installation</b></summary>
+### Manual installation
 
-### Arch
+Download the package from the [releases page](https://github.com/hgaiser/moonshine/releases), install it, then do the steps in [Enable the service](#enable-the-service).
 
-The recommended method is to install through the AUR using:
+| System | Command |
+|---|---|
+| Arch | `yay -S moonshine-bin` |
+| Debian / Ubuntu | `sudo apt install ./moonshine_*.deb` |
+| Fedora / RHEL | `sudo dnf install ./moonshine-*.rpm` |
+| Fedora Atomic (Bazzite, Silverblue, ...) | `sudo rpm-ostree install ./moonshine-*.rpm`, then reboot |
 
-```
-yay -S moonshine-bin
-```
+To build from source, see [Building from source](#building-from-source).
 
-After installing, follow the distro-agnostic [Enable the service](#enable-the-service) steps below.
+### NixOS
 
-### Debian / Ubuntu (.deb)
-
-Download the latest `.deb` from the [releases page](https://github.com/hgaiser/moonshine/releases) and install it:
-
-```sh
-sudo apt install ./moonshine_*.deb
-```
-
-After installing, follow the [Enable the service](#enable-the-service) steps below.
-
-### Fedora / RHEL (.rpm)
-
-Download the latest `.rpm` from the [releases page](https://github.com/hgaiser/moonshine/releases) and install it:
-
-```sh
-sudo dnf install ./moonshine-*.rpm
-```
-
-The package's post-install scripts set up udev rules, kernel modules, and the `moonshine` group automatically.
-After installing, follow the [Enable the service](#enable-the-service) steps below.
-
-### Nix
-
-On NixOS, use the `services.moonshine` module. It installs the package and handles everything in [Enable the service](#enable-the-service), so skip those steps.
-
-Moonshine and its module are in nixpkgs:
+Moonshine and its `services.moonshine` module are in nixpkgs. The module does all the steps in [Enable the service](#enable-the-service), so skip them.
 
 ```nix
 services.moonshine = {
@@ -109,111 +105,33 @@ services.moonshine = {
 ```
 
 See all options at [search.nixos.org](https://search.nixos.org/options?channel=unstable&query=services.moonshine).
-
-#### Alternative: compiling latest commit on NixOS
-
-This repository is also a flake that builds from the latest commit. Add it to your system flake's inputs and import its module. See [nix/README.md](nix/README.md) for details.
-
-The flake module replaces the nixpkgs one, and its options are slightly different: `openFirewall` instead of `firewallInterfaces`, a `uid` option you may need to set if the user's uid isn't declared in your config, and the user isn't added to `input` for you.
-
-The flake package (`nix profile install github:hgaiser/moonshine`) has only the binary, udev rules and Vulkan layer. It doesn't include the systemd unit, so on other distros use one of the native packages above.
-
-### Bazzite / Silverblue / Atomic distros
-
-On Fedora Atomic distros, download the `.rpm` from the [releases page](https://github.com/hgaiser/moonshine/releases) and layer it:
-
-```sh
-sudo rpm-ostree install ./moonshine-*.rpm
-sudo systemctl reboot
-```
-
-After reboot, follow the [Enable the service](#enable-the-service) steps below.
-
-### SteamOS
-
-Use the [install script](#installation). On SteamOS, it deploys moonshine to `/opt/moonshine/` and configuration drop-ins to `/etc/`. The installer registers these files with SteamOS so they persist across atomic updates.
+This repository is also a flake that builds the latest commit. See [nix/README.md](nix/README.md).
 
 ### Enable the service
 
-These steps apply to every installation method above (the service is a systemd unit).
+The install script and the NixOS module do these steps for you. Do them yourself after a manual installation.
 
-1. **Enable user lingering**:
+1. **Enable user lingering**, so Moonshine can run applications when you are not logged in:
    ```sh
    sudo loginctl enable-linger $USER
    ```
-   This allows Moonshine to run applications in the user's session even when the user is not logged in (when running headless).
+   If you are always logged in when you stream, you can skip this step.
 
-   If your user is always logged in when you want to stream, you can skip this step.
-
-2. **Enable the service to start on boot and run immediately**:
+2. **Start the service now and on boot**:
    ```sh
    sudo systemctl enable --now moonshine@$USER
    ```
 
-3. **Gamepad support when streaming headless** (no active desktop session): add your user to the `input` group, then log out and back in (or reboot) for it to take effect:
+3. **Gamepad support when streaming headless** (no active desktop session): add your user to the `input` group, then log out and back in:
    ```sh
    sudo usermod -aG input $USER
    ```
-   Moonshine creates a virtual gamepad per streamed controller, and the streamed game must be able to read it. When streaming while a desktop session is active, your user is already granted access to input devices as the active seat, so this step is not needed there. Run `moonshine healthcheck` to verify — it reports an `input group` warning if the group is missing.
-
-### Source
-
-The following dependencies are required to build and run:
-
-```sh
-# Build dependencies
-sudo pacman -S --asdeps \
-   clang \
-   cmake \
-   jq \
-   libc++ \
-   rust
-
-# Runtime dependencies
-sudo pacman -S \
-   gcc-libs \
-   glibc \
-   libevdev \
-   libxkbcommon \
-   mesa \
-   opus \
-   wayland \
-   xorg-xwayland
-```
-
-Then build:
-
-```sh
-cargo build --release --workspace
-```
-
-Set up the environment:
-
-```sh
-# Install uinput/uhid kernel modules
-sudo install -Dm644 dist/moonshine-modules.conf /usr/lib/modules-load.d/moonshine.conf
-sudo modprobe uinput uhid
-
-# Install udev rules for input device access
-sudo install -Dm644 dist/60-moonshine.rules /usr/lib/udev/rules.d/60-moonshine.rules
-sudo udevadm control --reload-rules
-
-# Install ferriscope's Vulkan WSI layer for game rendering
-dist/install-wsi.sh   # builds as you, asks for sudo only to install
-```
-
-Then run:
-
-```sh
-cargo run --release -- /path/to/config.toml
-```
-
-</details>
+   The streamed game must be able to read the virtual gamepads that Moonshine creates. With an active desktop session, your user already has this access, so you can skip this step.
 
 ## Configuration
 
-A configuration file is created automatically if the path you provide doesn't exist.
-When using the AUR package, it defaults to `$XDG_CONFIG_HOME/moonshine/config.toml`.
+The service reads `~/.config/moonshine/config.toml`. Moonshine creates this file on the first start.
+The default configuration streams Steam Big Picture and finds your installed Steam games, so most users do not have to change anything.
 
 ### Control panel
 
@@ -231,63 +149,31 @@ By default, only this computer can open it. To open it from other devices, add t
 
 ```toml
 [ui]
-port = 47990
 allowed_networks = ["127.0.0.1/32", "::1/128", "192.168.1.0/24"]
 ```
-
-The control panel only answers to an IP address, `localhost` or this computer's name. To open it through a reverse proxy at another name, add that name to `allowed_hosts`, and add the address of the proxy to `allowed_networks`:
-
-```toml
-[ui]
-allowed_networks = ["127.0.0.1/32", "::1/128", "100.64.0.0/10"]
-allowed_hosts = ["moonshine.example.com"]
-```
-
-The control panel then sees the address of the proxy, not the address of the browser. So anyone who can reach the proxy can open the control panel. Put authentication on the proxy, or only make it reachable from networks you trust.
 
 > [!WARNING]
 > Anyone who can open the control panel can add applications, which run commands as your user. Only add address ranges that you trust. The control panel has no password.
 
 Set `enabled = false` in the `[ui]` table to turn the control panel off.
+To open it through a reverse proxy, see [TIPS.md](TIPS.md#open-the-control-panel-through-a-reverse-proxy).
 
 ### Pairing with a client
 
-When you connect with Moonlight for the first time, it will show a PIN.
+When you connect with Moonlight for the first time, it shows a PIN.
 Type it on the Clients page of the [control panel](#control-panel).
-A notification will also appear on the host that you can click to open the pairing page, or you can visit it manually at http://localhost:47989/pin .
-
-You can also pair from the command line:
-
-```sh
-curl -X POST "http://localhost:47989/submit-pin" -d "uniqueid=0123456789ABCDEF&pin=<PIN>"
-```
+You can also click the notification on the host, or open http://localhost:47989/pin .
+To pair without a browser, see [TIPS.md](TIPS.md#pair-a-client-from-the-command-line).
 
 ### Adding applications
 
-Each application runs in its own isolated streaming session. Add them to `config.toml` like this:
-
-```toml
-[[application]]
-title = "Steam"
-boxart = "/path/to/steam.png"  # optional
-command = ["/usr/bin/steam", "steam://open/bigpicture"]
-steam_integration = true
-```
-
-- `title`: The name shown in Moonlight.
-- `boxart` (optional): Path to a cover image.
-- `command`: The command to run. First entry is the executable, the rest are arguments.
-- `working_directory` (optional): The directory to start the application in, for example a game that loads its data from the directory it runs in. `~` and environment variables are expanded, and the directory has to exist. The `pre_command` and `post_command` commands run there too. Defaults to your home directory.
-- `pre_command` (optional): Commands to run before launching the application. Each entry is a separate command, executed in order. Runs synchronously — the session waits for all to finish.
-- `steam_integration` (optional): Steam integration, as gamescope's `-e`; off by default. Turn it on for Steam (Big Picture), so its overlay and focus work. With it on, only Steam and Steam game windows can take focus, so leave it off for anything launched directly. With it off, Steam acts as on a desktop: its power menu has "Exit Big Picture Mode", not "Switch to Desktop". Games from the Steam application scanner have it on.
-- `post_command` (optional): Commands to run after the streaming session ends. Each entry is a separate command, executed in order. Runs synchronously — the server waits for all to finish.
-
-Example:
+Each application runs in its own isolated streaming session. Add them in the control panel, or in `config.toml`:
 
 ```toml
 [[application]]
 title = "Steam"
 command = ["/usr/bin/steam", "steam://open/bigpicture"]
+boxart = "/path/to/steam.png"
 steam_integration = true
 pre_command = [
     ["/usr/bin/systemctl", "stop", "conflicting.service"],
@@ -297,11 +183,23 @@ post_command = [
 ]
 ```
 
+- `title`: The name shown in Moonlight.
+- `command`: The command to run. The first entry is the executable, the rest are arguments.
+- `boxart` (optional): Path to a cover image.
+- `working_directory` (optional): The directory to start the application (and its `pre_command` and `post_command`) in. `~` and environment variables are expanded. The directory must exist. Defaults to your home directory.
+- `steam_integration` (optional): Turn it on for Steam Big Picture, so its overlay and focus work. Leave it off for everything else. Off by default.
+- `pre_command` (optional): Commands to run before the application starts. They run in order, and the session waits until they finish.
+- `post_command` (optional): Commands to run after the session ends. They run in order, and the session waits until they finish.
+
+See [TIPS.md](TIPS.md) for practical recipes with these fields.
+
 ### Application scanners
 
-Scanners automatically detect installed applications so you don't have to add them manually.
+Scanners find installed applications, so you don't have to add them one by one:
 
-**Steam scanner** — finds all installed Steam games:
+- **Steam**: installed Steam games (on by default).
+- **Desktop**: applications from `.desktop` files.
+- **Lutris**, **Heroic**, **Bottles** and **Faugus**: games from these launchers.
 
 ```toml
 [[application_scanner]]
@@ -310,137 +208,80 @@ library = "$HOME/.local/share/Steam"
 command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
 ```
 
-**Desktop scanner** — finds applications from `.desktop` files:
+See [SCANNERS.md](SCANNERS.md) for the options of each scanner.
 
-```toml
-[[application_scanner]]
-type = "desktop"
-directories = [
-  "$HOME/.local/share/applications",
-  "/usr/share/applications",
-]
-include_terminal = false
-resolve_icons = true
-```
+## Troubleshooting
 
-**Lutris scanner** — finds all installed Lutris games:
-
-```toml
-[[application_scanner]]
-type = "lutris"
-command = ["/usr/bin/lutris", "lutris:rungame/{slug}"]
-```
-
-Games are matched by their Lutris slug.
-Box art is automatically loaded from Lutris's `coverart/` directory when available.
-The default database path is `~/.local/share/lutris/pga.db`.
-You can override it with the `pga_db` option to point at a custom database location.
-
-**Heroic scanner** — finds all installed [Heroic Games Launcher](https://github.com/Heroic-Games-Launcher/HeroicGamesLauncher) games (Epic, GOG, Amazon and manually added games):
-
-```toml
-[[application_scanner]]
-type = "heroic"
-command = ["heroic", "--no-gui", "heroic://launch?appName={app_name}&runner={runner}"]
-```
-
-If you installed Heroic from Flathub, launch it through Flatpak instead:
-
-```toml
-[[application_scanner]]
-type = "heroic"
-command = [
-  "dbus-run-session", "--",
-  "flatpak", "run", "com.heroicgameslauncher.hgl",
-  "--no-gui", "heroic://launch?appName={app_name}&runner={runner}",
-]
-```
-
-The `dbus-run-session` prefix keeps the game inside Moonshine's compositor instead of on your desktop.
-See [TIPS.md](TIPS.md) for why Flatpak needs it.
-
-`{app_name}` is Heroic's internal game id and `{runner}` is the store it came from (`legendary` for Epic, `gog` for GOG, `nile` for Amazon, `sideload` for manually added games).
-Commands are resolved against Moonshine's own `PATH`, which under the packaged systemd service is systemd's default rather than your login shell's.
-A bare `heroic` therefore works for packages that install into `/usr/bin`, but not for an AppImage or anything under `~/.local/bin`; use an absolute path in those cases.
-Box art is automatically loaded from Heroic's `images-cache/` directory for any art Heroic has already downloaded.
-
-The default configuration directory is `~/.config/heroic`, falling back to `~/.var/app/com.heroicgameslauncher.hgl/config/heroic` when only the Flatpak is installed.
-You can override it with the `config_dir` option.
-
-**Bottles scanner** — finds games and applications in the [Bottles](https://github.com/bottlesdevs/Bottles) Library tab:
-
-```toml
-[[application_scanner]]
-type = "bottles"
-command = ["bottles-cli", "run", "-b", "{bottle}", "--program-id", "{program_id}"]
-umu_command = ["bottles-cli", "umu", "run", "--game", "{umu_game}"]
-```
-
-Only entries you added to Bottles' Library ("Add to Library" on a program) are exposed — not every program Bottles discovers. UMU entries appear once Bottles reports them as ready, and Steam shortcuts in the Library are skipped. `umu_command` is optional: without it, UMU entries are skipped.
-
-> **Limitation:** Bottles launches executables that live outside the bottle (e.g. on a separate game drive) through `wine start`, which exits immediately, so Moonshine ends the session shortly after launch. Games installed inside the bottle prefix are unaffected.
-
-`{bottle}` is the bottle's name, `{program_id}` the program's internal id, `{name}` the entry's display name, and `{umu_game}` the id of a game managed through Bottles' UMU integration.
-Commands are resolved against Moonshine's own `PATH`, so a bare `bottles-cli` only works for a natively installed Bottles. For Flatpak Bottles, see [TIPS.md](TIPS.md#run-flatpak-bottles-inside-moonshines-compositor).
-
-The default data directory is the first of `~/.local/share/bottles` and `~/.var/app/com.usebottles.bottles/data/bottles` that contains a `library.yml` — leftover data from an uninstalled native Bottles does not shadow the Flatpak install.
-You can override it with the `data_dir` option.
-
-Box art is automatically loaded from Bottles' grid images when available, falling back to the program's icon.
-
-**Faugus scanner** — finds the games in your [Faugus Launcher](https://github.com/Faugus/faugus-launcher) library:
-
-```toml
-[[application_scanner]]
-type = "faugus"
-command = ["faugus-launcher", "--game", "{game_id}"]
-```
-
-`{game_id}` is the game's Faugus id.
-Each game starts in the folder holding its executable (its `working_directory`), as it does when launched from Faugus' window: `faugus-launcher --game` on its own keeps the caller's directory, and some games quit right away when started anywhere else.
-Hidden games are skipped unless you set `include_hidden = true`, and so are games using Faugus' Steam runner, which hands the game to Steam and exits shortly after; the Steam scanner launches those.
-Box art is automatically loaded from the game's cover in Faugus when available, falling back to its banner and then its icon.
-
-If you installed Faugus from Flathub, launch it through Flatpak, with the same `dbus-run-session` prefix as for Heroic:
-
-```toml
-[[application_scanner]]
-type = "faugus"
-command = [
-  "dbus-run-session", "--",
-  "flatpak", "run", "--command=/app/bin/faugus-launcher", "io.github.Faugus.faugus-launcher",
-  "--game", "{game_id}",
-]
-```
-
-The default data directory is the first of `~/.local/share/faugus-launcher` and `~/.var/app/io.github.Faugus.faugus-launcher/data/faugus-launcher` that contains a `games.json`, followed by the same under `~/.config` and `~/.var/app/io.github.Faugus.faugus-launcher/config`, where older Faugus releases kept their library.
-You can override it with the `data_dir` option.
-
-## Tips & Tricks
-
-See [TIPS.md](TIPS.md) for practical recipes and workarounds.
+- Run `moonshine healthcheck` to check the GPU, codec support and ports. Add `--config ~/.config/moonshine/config.toml` to also check your configured ports and GPU.
+- Read the logs with `journalctl -u moonshine@$USER`, or on the Logs page of the control panel.
+- If an application does not start, see [Debug a failing application](TIPS.md#debug-a-failing-application).
+- When you report a bug, attach the report from the Logs page of the control panel.
 
 ## FAQ
 
 1. **How does this compare to [Sunshine](https://github.com/LizardByte/Sunshine)?**
-   - Sunshine supports more platforms and has more features overall. Moonshine is Linux-only.
-   - Moonshine runs each streaming session in its own isolated environment, separate from your desktop. This means your host PC stays usable while you stream, and it works without an active desktop session.
+
+   Sunshine supports more platforms and has more features. Moonshine is Linux-only, and runs each stream in its own compositor instead of capturing your desktop.
+
 2. **Can I use Moonshine to stream to two clients simultaneously?**
 
    This is currently not a supported feature and not a focus of Moonshine. If you are interested in adding support for this, feel free to open an issue or discuss on [Discord](https://discord.com/invite/moonlight-stream-352065098472488960).
 
-3. **How do I run the healthcheck?**
-
-   Run `moonshine healthcheck` to check GPU capabilities, codec support, and port availability. Pass `--config <path>` to also check configured ports and GPU preferences.
-
 ## Security
 
-Moonshine is **not designed for use on public networks**.
+Moonshine is **not designed for use on public networks**. **Do not expose Moonshine ports directly to the internet.**
 The underlying GameStream protocol has limitations that mean traffic is not fully encrypted at the application level.
 
 If you need to stream over the internet, use a VPN such as [Tailscale](https://tailscale.com/), [WireGuard](https://www.wireguard.com/), or [ZeroTier](https://www.zerotier.com/).
 
-**Do not expose Moonshine ports directly to the internet.**
+## Building from source
+
+These commands are for Arch Linux. Other distributions have the same packages under similar names.
+
+```sh
+# Build dependencies
+sudo pacman -S clang cmake jq libc++ rust
+
+# Runtime dependencies
+sudo pacman -S gcc-libs glibc libevdev libxkbcommon mesa opus wayland xorg-xwayland
+```
+
+Build:
+
+```sh
+cargo build --release --workspace
+```
+
+Set up the environment:
+
+```sh
+# Install uinput/uhid kernel modules
+sudo install -Dm644 dist/moonshine-modules.conf /usr/lib/modules-load.d/moonshine.conf
+sudo modprobe uinput uhid
+
+# Install udev rules for input device access
+sudo install -Dm644 dist/60-moonshine.rules /usr/lib/udev/rules.d/60-moonshine.rules
+sudo udevadm control --reload-rules
+
+# Allow the moonshine group to keep the computer awake while streaming
+# (run Moonshine with this group, or add your user to it)
+sudo groupadd --system moonshine
+sudo install -Dm644 dist/50-moonshine-inhibit-sleep.rules /etc/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules
+
+# Install ferriscope's Vulkan WSI layer for game rendering
+dist/install-wsi.sh   # builds as you, asks for sudo only to install
+```
+
+Run:
+
+```sh
+cargo run --release -- /path/to/config.toml
+```
+
+## Contributing
+
+Bug reports and pull requests are welcome on [GitHub](https://github.com/hgaiser/moonshine/issues).
+See [CHANGELOG.md](CHANGELOG.md) for the changes in each release.
 
 ## Acknowledgement
 
@@ -450,3 +291,7 @@ This wouldn't have been possible without the incredible work by the people behin
 2. [Sunshine](https://github.com/LizardByte/Sunshine), which laid a lot of the groundwork for the host part of the API.
 3. [Inputtino](https://github.com/games-on-whales/inputtino), for a thorough implementation of input devices.
 4. [magic-mirror](https://github.com/colinmarc/magic-mirror), for inspiration of using Vulkan and a Wayland compositor for headless streaming.
+
+## License
+
+Moonshine is licensed under the [BSD 2-Clause License](LICENSE).
