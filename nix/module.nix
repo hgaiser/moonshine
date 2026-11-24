@@ -165,13 +165,17 @@ in
     # gamepad/keyboard/mouse.
     services.udev.packages = [ cfg.package ];
 
-    # Group that opt-in users join so the suspend-inhibit polkit rule
-    # (shipped in the package) lets Moonshine hold a block-type sleep
-    # inhibitor. See TIPS.md. The rule itself needs no wiring here: nixpkgs
-    # builds polkit with --datadir=/run/current-system/sw/share and its module
-    # links /share/polkit-1 into the system path, so
+    # Group that the suspend-inhibit polkit rule (shipped in the package)
+    # allows to hold a block-type sleep inhibitor. The service runs with it
+    # (SupplementaryGroups below), so the user does not have to join it:
+    # polkit gets the groups of the process from the D-Bus daemon. See TIPS.md.
+    # The rule itself needs no wiring here: nixpkgs builds polkit with
+    # --datadir=/run/current-system/sw/share and its module links
+    # /share/polkit-1 into the system path, so
     # share/polkit-1/rules.d/50-moonshine-inhibit-sleep.rules is picked up
-    # from environment.systemPackages above.
+    # from environment.systemPackages above. Without polkitd, logind refuses the
+    # inhibitor to every process that does not run as root.
+    security.polkit.enable = true;
     users.groups.moonshine = { };
 
     # Virtual input backends used by inputtino (upstream ships this as a
@@ -211,8 +215,10 @@ in
         # to /dev/uinput, not the streamed games, which moonshine launches via
         # the user's systemd manager and which get only the user's real groups.
         # Headless users who want gamepads must add the user to `input`.
+        # `moonshine` lets the service keep the computer awake while streaming.
         SupplementaryGroups = [
           "video"
+          "moonshine"
         ];
         ExecStart = "${lib.getExe cfg.package} ${configFile}";
         Restart = "on-failure";
