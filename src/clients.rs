@@ -57,6 +57,19 @@ impl PendingClient {
 	fn waits_for_pin(&self) -> bool {
 		self.key.is_none() && self.since.elapsed().is_ok_and(|age| age < PAIRING_REQUEST_TIMEOUT)
 	}
+
+	/// Store the key made from the PIN, and wake the pairing request that waits for it.
+	fn accept_key(&mut self, key: [u8; 16]) {
+		self.key = Some(key);
+		// `notify_one` keeps a permit when the request does not wait yet: it starts waiting only
+		// after it is stored, so a PIN that arrives in between would otherwise be lost.
+		self.pin_notify.notify_one();
+	}
+}
+
+/// Whether `pin` has the form of a Moonlight PIN: 4 digits.
+pub fn is_valid_pin(pin: &str) -> bool {
+	pin.len() == 4 && pin.chars().all(|c| c.is_ascii_digit())
 }
 
 /// A device that asks to pair and waits for its PIN.
@@ -211,8 +224,7 @@ impl ClientManager {
 			return Err(());
 		}
 		let key = create_key(&client.salt, pin).map_err(|e| tracing::warn!("Failed to create client key: {e}"))?;
-		client.key = Some(key);
-		client.pin_notify.notify_waiters();
+		client.accept_key(key);
 		Ok(())
 	}
 
@@ -497,6 +509,25 @@ mod tests {
 		let mut client = pending(SystemTime::now());
 		client.key = Some([0; 16]);
 		assert!(!client.waits_for_pin());
+	}
+
+	#[tokio::test]
+	async fn a_pin_before_the_request_waits_is_not_lost() {
+		let mut client = pending(SystemTime::now());
+		let notify = client.pin_notify.clone();
+		client.accept_key([0; 16]);
+		tokio::time::timeout(Duration::from_secs(1), notify.notified())
+			.await
+			.expect("the PIN notification was lost");
+	}
+
+	#[test]
+	fn only_four_digits_are_a_pin() {
+		assert!(is_valid_pin("0123"));
+		assert!(!is_valid_pin("123"));
+		assert!(!is_valid_pin("12345"));
+		assert!(!is_valid_pin("12a4"));
+		assert!(!is_valid_pin("١٢٣٤"));
 	}
 
 	#[test]

@@ -678,6 +678,10 @@ impl Webserver {
 				return bad_request("Bad request.".to_string());
 			},
 		};
+		if !crate::clients::is_valid_pin(pin) {
+			tracing::warn!("Received a PIN that is not 4 digits.");
+			return bad_request("The PIN must be the 4 digits that Moonlight shows.".to_string());
+		}
 
 		// Without a unique id, the PIN goes to the one request that waits for it. Moonlight clients
 		// all send the same unique id, so it rarely says which request a PIN is for.
