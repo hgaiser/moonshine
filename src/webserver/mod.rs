@@ -671,14 +671,6 @@ impl Webserver {
 
 		let params: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
 
-		let unique_id = match params.get("uniqueid") {
-			Some(unique_id) => unique_id,
-			None => {
-				tracing::warn!("Missing 'uniqueid' in PIN submission.");
-				return bad_request("Bad request.".to_string());
-			},
-		};
-
 		let pin = match params.get("pin") {
 			Some(pin) => pin,
 			None => {
@@ -686,8 +678,32 @@ impl Webserver {
 				return bad_request("Bad request.".to_string());
 			},
 		};
+		if !crate::clients::is_valid_pin(pin) {
+			tracing::warn!("Received a PIN that is not 4 digits.");
+			return bad_request("The PIN must be the 4 digits that Moonlight shows.".to_string());
+		}
 
-		let response = self.client_manager.register_pin(unique_id, pin);
+		// Without a unique id, the PIN goes to the one request that waits for it. Moonlight clients
+		// all send the same unique id, so it rarely says which request a PIN is for.
+		let unique_id = match params.get("uniqueid") {
+			Some(unique_id) => unique_id.clone(),
+			None => match self.client_manager.pairing_requests().as_slice() {
+				[request] => request.id.clone(),
+				[] => {
+					tracing::warn!("Received a PIN, but no pairing request waits for one.");
+					return text_response(StatusCode::NOT_FOUND, "No pairing request waits for a PIN.");
+				},
+				_ => {
+					tracing::warn!("Received a PIN without a unique id, but several pairing requests wait for one.");
+					return text_response(
+						StatusCode::CONFLICT,
+						"Several pairing requests wait for a PIN; pass the uniqueid of one.",
+					);
+				},
+			},
+		};
+
+		let response = self.client_manager.register_pin(&unique_id, pin);
 		match response {
 			Ok(()) => {
 				tracing::info!("PIN registered successfully.");
@@ -1056,6 +1072,13 @@ fn rtsp_host(ip: IpAddr) -> String {
 fn bad_request(message: String) -> Response<Full<Bytes>> {
 	Response::builder()
 		.status(StatusCode::BAD_REQUEST)
+		.body(Full::new(Bytes::from(message)))
+		.unwrap()
+}
+
+fn text_response(status: StatusCode, message: &'static str) -> Response<Full<Bytes>> {
+	Response::builder()
+		.status(status)
 		.body(Full::new(Bytes::from(message)))
 		.unwrap()
 }

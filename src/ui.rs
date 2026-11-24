@@ -1304,7 +1304,7 @@ impl Backend for UiBackend {
 				Ok("Stream stopped.".to_string())
 			},
 			Action::SubmitPin { id, pin } => {
-				if pin.len() != 4 || !pin.chars().all(|c| c.is_ascii_digit()) {
+				if !crate::clients::is_valid_pin(&pin) {
 					return Err("Type the 4 digits that Moonlight shows.".to_string());
 				}
 				self.client_manager.submit_pin(&id, &pin).map_err(|()| {

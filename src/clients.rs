@@ -51,6 +51,27 @@ pub(crate) struct PendingClient {
 	pub(crate) since: SystemTime,
 }
 
+impl PendingClient {
+	/// Whether the client still waits for its PIN: it has none yet, and asked recently enough
+	/// that it hasn't given up.
+	fn waits_for_pin(&self) -> bool {
+		self.key.is_none() && self.since.elapsed().is_ok_and(|age| age < PAIRING_REQUEST_TIMEOUT)
+	}
+
+	/// Store the key made from the PIN, and wake the pairing request that waits for it.
+	fn accept_key(&mut self, key: [u8; 16]) {
+		self.key = Some(key);
+		// `notify_one` keeps a permit when the request does not wait yet: it starts waiting only
+		// after it is stored, so a PIN that arrives in between would otherwise be lost.
+		self.pin_notify.notify_one();
+	}
+}
+
+/// Whether `pin` has the form of a Moonlight PIN: 4 digits.
+pub fn is_valid_pin(pin: &str) -> bool {
+	pin.len() == 4 && pin.chars().all(|c| c.is_ascii_digit())
+}
+
 /// A device that asks to pair and waits for its PIN.
 #[derive(Clone, Debug)]
 pub struct PairingRequest {
@@ -137,8 +158,7 @@ impl ClientManager {
 		};
 		let mut requests: Vec<PairingRequest> = inner
 			.values()
-			.filter(|client| client.key.is_none())
-			.filter(|client| client.since.elapsed().is_ok_and(|age| age < PAIRING_REQUEST_TIMEOUT))
+			.filter(|client| client.waits_for_pin())
 			.map(|client| PairingRequest {
 				id: client.id.clone(),
 				since: client.since,
@@ -197,9 +217,14 @@ impl ClientManager {
 		let client = inner.get_mut(id).ok_or_else(|| {
 			tracing::warn!("No known client with id {id}");
 		})?;
+		// A request stays known after it gets its PIN or its client gives up. A PIN for it would
+		// reach no one, so refuse it rather than report success.
+		if !client.waits_for_pin() {
+			tracing::warn!("The pairing request from {id} no longer waits for a PIN.");
+			return Err(());
+		}
 		let key = create_key(&client.salt, pin).map_err(|e| tracing::warn!("Failed to create client key: {e}"))?;
-		client.key = Some(key);
-		client.pin_notify.notify_waiters();
+		client.accept_key(key);
 		Ok(())
 	}
 
@@ -454,4 +479,60 @@ fn aes_decrypt_ecb(data: &[u8], key: &[u8; 16]) -> Result<Vec<u8>, String> {
 fn cert_pem_fingerprint(pem: &str) -> Option<String> {
 	let (_, pem_obj) = parse_x509_pem(pem.as_bytes()).ok()?;
 	Some(hex::encode(Sha256::digest(&pem_obj.contents)))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn pending(since: SystemTime) -> PendingClient {
+		PendingClient {
+			id: "0123456789ABCDEF".to_string(),
+			pem: String::new(),
+			salt: [0; 16],
+			pin_notify: Arc::new(Notify::new()),
+			key: None,
+			server_secret: None,
+			server_challenge: None,
+			client_hash: None,
+			since,
+		}
+	}
+
+	#[test]
+	fn a_new_request_waits_for_its_pin() {
+		assert!(pending(SystemTime::now()).waits_for_pin());
+	}
+
+	#[test]
+	fn a_request_with_a_pin_no_longer_waits() {
+		let mut client = pending(SystemTime::now());
+		client.key = Some([0; 16]);
+		assert!(!client.waits_for_pin());
+	}
+
+	#[tokio::test]
+	async fn a_pin_before_the_request_waits_is_not_lost() {
+		let mut client = pending(SystemTime::now());
+		let notify = client.pin_notify.clone();
+		client.accept_key([0; 16]);
+		tokio::time::timeout(Duration::from_secs(1), notify.notified())
+			.await
+			.expect("the PIN notification was lost");
+	}
+
+	#[test]
+	fn only_four_digits_are_a_pin() {
+		assert!(is_valid_pin("0123"));
+		assert!(!is_valid_pin("123"));
+		assert!(!is_valid_pin("12345"));
+		assert!(!is_valid_pin("12a4"));
+		assert!(!is_valid_pin("١٢٣٤"));
+	}
+
+	#[test]
+	fn an_abandoned_request_no_longer_waits() {
+		let client = pending(SystemTime::now() - PAIRING_REQUEST_TIMEOUT - Duration::from_secs(1));
+		assert!(!client.waits_for_pin());
+	}
 }
