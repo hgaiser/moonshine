@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Keep the stream within the bitrate the client asks for: video is encoded below it, so FEC, audio and packet overhead fit inside it, as Sunshine does.
 - Refuse a PIN for a pairing request that already has one, or that asked more than 5 minutes ago, instead of answering that it was accepted while nothing paired.
 
 ## [v0.19.1] - 23-11-2026
