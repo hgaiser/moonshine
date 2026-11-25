@@ -648,3 +648,18 @@ async fn run_control_loop(
 	// fail to bind to the same port.
 	drop(host);
 }
+
+#[cfg(test)]
+mod tests {
+	use super::{ControlMessage, ControlMessageType};
+
+	#[test]
+	fn input_data_rejects_a_truncated_event_length() {
+		let mut message = [0; 7];
+		message[..2].copy_from_slice(&(ControlMessageType::InputData as u16).to_le_bytes());
+		for body_len in 0u16..4 {
+			message[2..4].copy_from_slice(&body_len.to_le_bytes());
+			assert!(ControlMessage::from_bytes(&message[..4 + usize::from(body_len)]).is_err());
+		}
+	}
+}

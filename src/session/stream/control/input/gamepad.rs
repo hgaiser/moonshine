@@ -348,8 +348,8 @@ pub(crate) struct Gamepad {
 	/// positions, triggers, touchpad events, and motion data.
 	gamepad: inputtino::Joypad,
 
-	/// Fingers currently on the touchpad, so CancelAll can lift them.
-	touch_points: Vec<u32>,
+	/// Client pointer IDs occupying the two DualSense finger slots.
+	touch_slots: [Option<u32>; 2],
 }
 
 impl Gamepad {
@@ -391,8 +391,7 @@ impl Gamepad {
 				let mut gamepad =
 					PS5Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
 
-				// These callbacks run on inputtino's uhid thread, which also answers the kernel's
-				// report requests: never block it, and skip values the client already has.
+				// Don't block inputtino's UHID thread: it also answers the kernel's report requests.
 				gamepad.set_on_led({
 					let feedback_tx = feedback_tx.clone();
 					let index = info.index;
@@ -463,29 +462,21 @@ impl Gamepad {
 			),
 		};
 
-		let feedback_tx_for_rumble = feedback_tx.clone();
 		gamepad.set_on_rumble({
 			let index = info.index;
-			let mut last_rumble = None;
 			move |low_frequency, high_frequency| {
-				let rumble = (low_frequency as u16, high_frequency as u16);
-				if last_rumble != Some(rumble)
-					&& feedback_tx_for_rumble
-						.try_send(FeedbackCommand::Rumble(RumbleCommand {
-							id: index as u16,
-							low_frequency: rumble.0,
-							high_frequency: rumble.1,
-						}))
-						.is_ok()
-				{
-					last_rumble = Some(rumble);
-				}
+				// Hold-to-Home also sends rumble, so the last game report may not match the client.
+				let _ = feedback_tx.try_send(FeedbackCommand::Rumble(RumbleCommand {
+					id: index as u16,
+					low_frequency: low_frequency as u16,
+					high_frequency: high_frequency as u16,
+				}));
 			}
 		});
 
 		Ok(Self {
 			gamepad,
-			touch_points: Vec::new(),
+			touch_slots: [None; 2],
 		})
 	}
 
@@ -510,27 +501,39 @@ impl Gamepad {
 			// Follow the touch lifecycle rather than pressure, which clients don't reliably fill in.
 			match touch.event_kind {
 				PointerEventKind::Down | PointerEventKind::Move => {
+					let slot = self
+						.touch_slot(touch.pointer_id)
+						.or_else(|| self.touch_slots.iter().position(Option::is_none));
+					let Some(slot) = slot else {
+						return;
+					};
+					self.touch_slots[slot] = Some(touch.pointer_id);
 					gamepad.place_finger(
-						touch.pointer_id,
-						(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
-						(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
+						slot as u32,
+						(touch.x * (PS5Joypad::TOUCHPAD_WIDTH - 1) as f32).round() as u16,
+						(touch.y * (PS5Joypad::TOUCHPAD_HEIGHT - 1) as f32).round() as u16,
 					);
-					if !self.touch_points.contains(&touch.pointer_id) {
-						self.touch_points.push(touch.pointer_id);
-					}
 				},
 				PointerEventKind::Up | PointerEventKind::Cancel => {
-					gamepad.release_finger(touch.pointer_id);
-					self.touch_points.retain(|id| *id != touch.pointer_id);
+					if let Some(slot) = self.touch_slot(touch.pointer_id) {
+						self.touch_slots[slot] = None;
+						gamepad.release_finger(slot as u32);
+					}
 				},
 				PointerEventKind::CancelAll => {
-					for pointer_id in self.touch_points.drain(..) {
-						gamepad.release_finger(pointer_id);
+					for (slot, pointer_id) in self.touch_slots.iter_mut().enumerate() {
+						if pointer_id.take().is_some() {
+							gamepad.release_finger(slot as u32);
+						}
 					}
 				},
 				PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => {},
 			}
 		}
+	}
+
+	fn touch_slot(&self, pointer_id: u32) -> Option<usize> {
+		self.touch_slots.iter().position(|id| *id == Some(pointer_id))
 	}
 
 	pub fn set_motion(&self, motion: &GamepadMotion) {
