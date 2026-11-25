@@ -6,14 +6,19 @@ use inputtino::JoypadMotionType;
 use super::MAX_GAMEPADS;
 use crate::session::stream::control::ControlMessageType;
 
-/// Latest unsent feedback for each controller. Producers never wait for the
-/// control loop to make room, and no network work is done while holding the lock.
+/// Unsent feedback per controller. Rumble preserves transitions in a short FIFO;
+/// other feedback keeps the latest state. Network work happens outside the lock.
 #[derive(Default)]
 pub(super) struct Feedback(Mutex<[Option<PendingFeedback>; MAX_GAMEPADS]>);
 
 impl Feedback {
 	pub(super) fn rumble(&self, command: RumbleCommand) {
-		self.update(command.id, |pending| pending.rumble = Some(command));
+		self.update(command.id, |pending| {
+			if pending.rumble.is_full() {
+				pending.rumble.remove(0);
+			}
+			pending.rumble.push(command);
+		});
 	}
 
 	pub(super) fn led(&self, command: SetLedCommand) {
@@ -48,7 +53,7 @@ impl Feedback {
 
 #[derive(Debug, Default)]
 pub(super) struct PendingFeedback {
-	rumble: Option<RumbleCommand>,
+	rumble: ArrayVec<RumbleCommand, 4>,
 	led: Option<SetLedCommand>,
 	accel: Option<EnableMotionEventCommand>,
 	gyro: Option<EnableMotionEventCommand>,
@@ -57,7 +62,7 @@ pub(super) struct PendingFeedback {
 
 impl PendingFeedback {
 	pub(super) fn send(self, mut send: impl FnMut(&[u8])) {
-		if let Some(command) = self.rumble {
+		for command in self.rumble {
 			send(&command.as_packet());
 		}
 		if let Some(command) = self.led {
@@ -235,7 +240,7 @@ mod tests {
 	}
 
 	#[test]
-	fn latest_rumble_state_survives_bursts_without_replaying_old_effects() {
+	fn rumble_overflow_keeps_the_latest_updates_per_controller() {
 		let feedback = Feedback::default();
 		for value in 1..=500 {
 			feedback.rumble(RumbleCommand {
@@ -256,13 +261,44 @@ mod tests {
 		};
 		feedback.rumble(stop);
 
-		let other_pad = RumbleCommand {
-			id: 1,
-			low_frequency: 0,
+		let expected = [
+			(0, 498),
+			(0, 499),
+			(0, 500),
+			(0, 0),
+			(1, 497),
+			(1, 498),
+			(1, 499),
+			(1, 500),
+		]
+		.map(|(id, value)| {
+			RumbleCommand {
+				id,
+				low_frequency: if id == 0 { value } else { 0 },
+				high_frequency: value,
+			}
+			.as_packet()
+		});
+		assert_eq!(drain_packets(&feedback), expected);
+		assert!(drain_packets(&feedback).is_empty());
+	}
+
+	#[test]
+	fn rumble_preserves_a_short_pulse_between_drains() {
+		let feedback = Feedback::default();
+		let start = RumbleCommand {
+			id: 0,
+			low_frequency: 500,
 			high_frequency: 500,
 		};
-		assert_eq!(drain_packets(&feedback), [stop.as_packet(), other_pad.as_packet()]);
-		assert!(drain_packets(&feedback).is_empty());
+		let stop = RumbleCommand {
+			low_frequency: 0,
+			high_frequency: 0,
+			..start
+		};
+		feedback.rumble(start);
+		feedback.rumble(stop);
+		assert_eq!(drain_packets(&feedback), [start.as_packet(), stop.as_packet()]);
 	}
 
 	#[test]
