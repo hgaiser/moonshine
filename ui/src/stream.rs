@@ -3,7 +3,7 @@
 //! The page asks for a token (`POST /api/stream/token`), opens a WebTransport session at
 //! `https://<host>:<port>/stream?token=<token>` on the control panel's port (UDP) and opens one
 //! bidirectional stream for control messages. Its first message is `start`, with what it wants to
-//! stream; only then does the [`Backend`](crate::Backend) start or join a session.
+//! stream; only then does the [`Backend`] start or join a session.
 //!
 //! # Wire protocol
 //!

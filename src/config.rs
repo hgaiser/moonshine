@@ -85,7 +85,7 @@ pub struct UiConfig {
 	pub allowed_hosts: Vec<String>,
 
 	/// The certificate (PEM) for HTTPS. Without it, the control panel makes a self-signed
-	/// certificate (`ui-cert.pem`, next to the certificate in the [webserver] table), so the
+	/// certificate (`ui-cert.pem`, next to the certificate in the `[webserver]` table), so the
 	/// browser shows a warning one time. Streaming in the browser needs HTTPS when the control
 	/// panel is opened from another computer.
 	pub certificate: Option<PathBuf>,
