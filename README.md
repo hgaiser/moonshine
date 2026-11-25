@@ -14,6 +14,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 - **Full input support**: Mouse, keyboard, touchscreen, pen/stylus, and gamepad (including motion, touchpad, and haptics).
 - **Audio streaming**: Stereo and surround sound (5.1/7.1) with low-latency Opus encoding.
 - **Web control panel**: Pair devices, manage applications, change settings and watch live stream statistics.
+- **Stream in the browser**: Play from the control panel in Chrome, Edge or Firefox, with nothing to install.
 
 ![The Moonshine control panel during a stream](assets/control-panel.png)
 
@@ -22,6 +23,7 @@ Your keyboard, mouse, and controller inputs are sent back to the host so you can
 
 ![The Applications page of the control panel](assets/control-panel-applications.png)
 ![The Clients page of the control panel](assets/control-panel-clients.png)
+![The stream page of the control panel](assets/control-panel-play.png)
 
 </details>
 
@@ -141,6 +143,7 @@ Moonshine has a web control panel at http://localhost:47990 . With it you can:
 - Add and edit applications and scanners, and hide scanned applications from clients.
 - Change settings. Each setting shows if it applies now, at the next stream, or after a restart.
 - Read the logs, and download a report for bug reports.
+- Stream an application in this browser (see [Streaming in the browser](#streaming-in-the-browser)).
 
 The control panel writes its changes to `config.toml` and keeps your comments in place.
 By default, only this computer can open it. To open it from other devices, add their address range:
@@ -155,6 +158,15 @@ allowed_networks = ["127.0.0.1/32", "::1/128", "192.168.1.0/24"]
 
 Set `enabled = false` in the `[ui]` table to turn the control panel off.
 To open it through a reverse proxy, see [TIPS.md](TIPS.md#open-the-control-panel-through-a-reverse-proxy).
+
+### Streaming in the browser
+
+Select **Stream in browser** in the control panel, or open http://localhost:47990/play .
+It works in Chrome, Edge and Firefox.
+
+- The stream uses UDP port 47990: open it in the firewall.
+- From other devices, the page uses HTTPS with a self-signed certificate, so the browser warns the first time. To use your own, set `certificate` and `private_key` in `[ui]`.
+- To turn it off, set `streaming = false` in `[ui]`.
 
 ### Pairing with a client
 

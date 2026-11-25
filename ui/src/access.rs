@@ -67,7 +67,7 @@ impl Network {
 }
 
 /// Strip the port from a `Host` header value.
-fn host_without_port(host: &str) -> &str {
+pub(crate) fn host_without_port(host: &str) -> &str {
 	if let Some(rest) = host.strip_prefix('[') {
 		return rest.split(']').next().unwrap_or(rest);
 	}

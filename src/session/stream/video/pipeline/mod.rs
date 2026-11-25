@@ -27,8 +27,8 @@ use crate::session::stream::StartWaiter;
 use crate::session::stream::video::packetizer::{FrameType, Packetizer};
 use crate::session::stream::video::shard_batch::ShardBatch;
 use crate::session::stream::video::{
-	FrameStats, RateControlMode, StatsSender, StreamInfo, VideoChromaSampling, VideoDynamicRange, VideoFormat,
-	VideoStreamConfig, VideoStreamContext,
+	EncodedFrame, FrameStats, RateControlMode, StatsSender, StreamInfo, VideoChromaSampling, VideoDynamicRange,
+	VideoFormat, VideoSink, VideoStreamConfig, VideoStreamContext,
 };
 
 pub(crate) use dmabuf::KcmpProbe;
@@ -304,19 +304,27 @@ struct InFlightGuard(Arc<AtomicUsize>);
 /// limit.
 pub(super) struct PacketBatch {
 	epoch: u32,
-	shards: ShardBatch,
+	payload: BatchPayload,
 	in_flight: InFlightGuard,
+}
+
+/// What a [`PacketBatch`] carries, for the sink that was current when the frame was encoded.
+pub(super) enum BatchPayload {
+	/// GameStream packets: FEC shards, encrypted when the client asked for it.
+	Shards(ShardBatch),
+	/// The encoded frame itself, for a sink that does its own framing (the browser).
+	Encoded(EncodedFrame),
 }
 
 impl PacketBatch {
 	/// Release the frame's in-flight slot and return the reset epoch the frame
-	/// was packetized in (see [`ConsumerMessage::ResetCounters`]) and its shards.
+	/// was packetized in (see [`ConsumerMessage::ResetCounters`]) and its payload.
 	///
 	/// The slot is released here, when the sender dequeues the batch, not when
 	/// its shards are sent or leave the host.
-	pub(super) fn into_parts(self) -> (u32, ShardBatch) {
+	pub(super) fn into_parts(self) -> (u32, BatchPayload) {
 		drop(self.in_flight);
-		(self.epoch, self.shards)
+		(self.epoch, self.payload)
 	}
 
 	/// An empty batch holding a new in-flight slot, as the encoding thread and
@@ -326,7 +334,7 @@ impl PacketBatch {
 		in_flight.fetch_add(1, Ordering::Relaxed);
 		Self {
 			epoch: 0,
-			shards: ShardBatch::empty(),
+			payload: BatchPayload::Shards(ShardBatch::empty()),
 			in_flight: InFlightGuard(in_flight.clone()),
 		}
 	}
@@ -362,6 +370,7 @@ async fn run_packet_consumer(
 	mut packetizer: Packetizer,
 	ctx: VideoStreamContext,
 	config: VideoStreamConfig,
+	sink: watch::Receiver<VideoSink>,
 ) {
 	let mut frame_number = 0u32;
 	let mut sequence_number = 0u32;
@@ -455,25 +464,37 @@ async fn run_packet_consumer(
 		} else {
 			FrameType::Predicted
 		};
-		let shards = match packetizer.packetize(
-			&packet.data,
-			frame_type,
-			ctx.packet_size,
-			ctx.minimum_fec_packets,
-			config.fec_percentage,
-			frame_number,
-			&mut sequence_number,
-			rtp_timestamp,
-			latency_100us,
-		) {
-			Ok(shards) => shards,
-			// Drop just this frame rather than tearing down the session: the
-			// client sees a gap (the frame number was already consumed) and
-			// requests an IDR, which recovers the stream.
-			Err(()) => {
-				tracing::warn!("Failed to packetize encoded frame");
-				continue;
-			},
+		// A browser frames the stream itself, so it gets the encoded frame as it is.
+		let to_browser = matches!(*sink.borrow(), VideoSink::Browser(_));
+		let payload = if to_browser {
+			BatchPayload::Encoded(EncodedFrame {
+				data: std::mem::take(&mut packet.data),
+				key_frame: is_key_frame,
+				recovery: packet.is_recovery_frame,
+				frame_number,
+				captured_at: frame_context.created_at,
+			})
+		} else {
+			match packetizer.packetize(
+				&packet.data,
+				frame_type,
+				ctx.packet_size,
+				ctx.minimum_fec_packets,
+				config.fec_percentage,
+				frame_number,
+				&mut sequence_number,
+				rtp_timestamp,
+				latency_100us,
+			) {
+				Ok(shards) => BatchPayload::Shards(shards),
+				// Drop just this frame rather than tearing down the session: the
+				// client sees a gap (the frame number was already consumed) and
+				// requests an IDR, which recovers the stream.
+				Err(()) => {
+					tracing::warn!("Failed to packetize encoded frame");
+					continue;
+				},
+			}
 		};
 
 		let t_packetized = std::time::Instant::now();
@@ -484,7 +505,7 @@ async fn run_packet_consumer(
 		// video-pipeline shutdown token and tears the session down.
 		let batch = PacketBatch {
 			epoch: reset_epoch,
-			shards,
+			payload,
 			in_flight: in_flight_slot,
 		};
 		if packet_tx.send(batch).await.is_err() {
@@ -579,6 +600,7 @@ impl VideoPipeline {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		start: StartWaiter,
 		stats_tx: StatsSender,
+		sink: watch::Receiver<VideoSink>,
 	) -> Result<Self, ()> {
 		tracing::debug!("Initializing video pipeline.");
 
@@ -609,6 +631,7 @@ impl VideoPipeline {
 					hdr_metadata_tx,
 					start,
 					stats_tx,
+					sink,
 				);
 			})
 			.map_err(|e| tracing::error!("Failed to start video pipeline thread: {e}"))?;
@@ -648,6 +671,7 @@ impl VideoPipelineInner {
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		mut start: StartWaiter,
 		stats_tx: StatsSender,
+		sink: watch::Receiver<VideoSink>,
 	) {
 		tracing::debug!("Starting video pipeline.");
 
@@ -695,6 +719,7 @@ impl VideoPipelineInner {
 			stop_session_manager,
 			hdr_metadata_tx,
 			stats_tx,
+			sink,
 		) {
 			tracing::error!("Video encoding loop failed: {e}");
 		}
@@ -799,6 +824,7 @@ impl VideoPipelineInner {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		hdr_metadata_tx: watch::Sender<HdrModeState>,
 		stats_tx: StatsSender,
+		sink: watch::Receiver<VideoSink>,
 	) -> Result<(), String> {
 		let ctx = &self.context;
 
@@ -847,6 +873,7 @@ impl VideoPipelineInner {
 				packetizer,
 				ctx,
 				config,
+				sink,
 			))
 		};
 

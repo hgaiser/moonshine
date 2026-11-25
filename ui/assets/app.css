@@ -238,6 +238,7 @@ details.scanner[open] > summary { margin-bottom: 8px; }
 .switch input::after { content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px; border-radius: 50%; background: var(--surface); transition: transform .15s; box-shadow: 0 1px 2px rgba(0,0,0,.3); }
 .switch input:checked { background: var(--accent); }
 .switch input:checked::after { transform: translateX(16px); }
+.switch input:disabled { opacity: .5; cursor: not-allowed; }
 .list { display: grid; }
 .row { display: grid; grid-template-columns: 44px minmax(0, 1fr) auto; gap: 12px; align-items: center; padding: 12px 0; border-top: 1px solid var(--line); }
 .row:first-child { border-top: 0; }
@@ -371,3 +372,27 @@ a { color: var(--accent); }
 .btn.link { text-decoration: none; color: inherit; }
 .req + .req { border-top: 1px solid var(--line); padding-top: 16px; }
 .req { display: grid; gap: 12px; }
+
+/* ---------- Browser stream ---------- */
+/* The stream page (/play). */
+.play-page { min-height: 100vh; display: grid; grid-template-rows: auto 1fr; }
+.play-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 12px max(16px, env(safe-area-inset-right, 0px)) 12px max(16px, env(safe-area-inset-left, 0px)); background: #0d0a22; }
+.play-head .wordmark { font-size: 28px; }
+.play-main { display: grid; place-items: start center; padding: 24px 16px calc(24px + env(safe-area-inset-bottom, 0px)); }
+.play-main .note { margin: 0; }
+.play-main .sheet { max-height: none; overflow: visible; }
+html.streaming, html.streaming body { overflow: hidden; }
+/* No space kept for a scroll bar: the stream covers the whole window. */
+html.streaming { scrollbar-gutter: auto; }
+.stream-root { position: fixed; inset: 0; z-index: 100; background: #000; display: grid; place-items: center; }
+.stream-video { width: 100%; height: 100%; object-fit: contain; outline: none; touch-action: none; cursor: none; }
+.stream-bar { position: absolute; top: 0; left: 50%; transform: translate(-50%, calc(-100% - 2px)); display: flex; gap: 8px; align-items: center;
+  padding: 8px 12px; background: color-mix(in srgb, var(--surface) 92%, transparent); color: var(--fg); transition: transform .15s; }
+/* An invisible strip at the top edge: point at it (or tap it) to show the bar. */
+.stream-edge { position: absolute; top: 0; left: 0; right: 0; height: 8px; }
+.stream-edge:hover + .stream-bar, .stream-bar:hover, .stream-bar:focus-within, .stream-root.bar-open .stream-bar { transform: translate(-50%, 0); }
+.stream-title { font-size: 13px; color: var(--muted); margin-right: 8px; white-space: nowrap; }
+.stream-status { position: absolute; color: #fff; font-size: 16px; text-align: center; max-width: 60ch; pointer-events: none; }
+.stream-status[hidden] { display: none; }
+.stream-stats { position: absolute; top: 12px; left: 12px; margin: 0; padding: 8px 10px; background: rgba(0, 0, 0, .7); color: #fff; font: 12px/1.5 var(--font-mono); pointer-events: none; }
+.stream-hint { position: absolute; bottom: 12px; left: 50%; transform: translateX(-50%); margin: 0; padding: 8px 12px; background: rgba(0, 0, 0, .75); color: #fff; font-size: 13px; }

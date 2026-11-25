@@ -13,9 +13,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use async_shutdown::ShutdownManager;
 use moonshine_ui::protocol::{
-	Action, ApplicationForm, ApplicationInfo, DeviceInfo, FrameSample, HealthCheck, HealthInfo, PairingInfo,
-	PairingRequestInfo, ScannedApplication, ScannerForm, ScannerInfo, ScannerKind, ServerInfo, SessionInfo, Setting,
-	SettingOption, Snapshot, StatsEvent, StreamStart,
+	Action, ApplicationForm, ApplicationInfo, DeviceInfo, FrameSample, HealthCheck, HealthInfo, LibraryApplication,
+	PairingInfo, PairingRequestInfo, ScannedApplication, ScannerForm, ScannerInfo, ScannerKind, ServerInfo,
+	SessionInfo, Setting, SettingOption, Snapshot, StatsEvent, StreamStart,
+};
+use moonshine_ui::stream::{
+	ClientEvent, ServerEvent, StreamLink, StreamParams, StreamRequest, VideoCodec, VideoFrame, WebTransportCertificate,
 };
 use moonshine_ui::{Backend, LogBuffer, Network, Options, UiServer};
 use serde_json::Value;
@@ -29,7 +32,9 @@ use crate::config::Config;
 use crate::gpu::GpuContext;
 use crate::healthcheck::{self, CheckOutcome, HealthReport};
 use crate::session::application::ApplicationConfig;
-use crate::session::manager::{SessionManager, SessionPhase, SessionSettings};
+use crate::session::browser::{BrowserCommand, BrowserEvent, BrowserStream};
+use crate::session::manager::{BrowserStreamRequest, SessionManager, SessionPhase, SessionSettings};
+use crate::session::stream::audio::{AudioChannels, AudioConfig};
 use crate::session::stream::video::{FrameStats, StreamEvent, StreamInfo, VideoDynamicRange, VideoFormat};
 use crate::webserver::Webserver;
 
@@ -68,6 +73,8 @@ struct SettingSpec {
 	max: i64,
 	placeholder: Option<&'static str>,
 	advanced: bool,
+	/// Shown, but only config.toml can change it.
+	read_only: bool,
 }
 
 const fn setting(
@@ -92,6 +99,7 @@ const fn setting(
 		max: i64::MAX,
 		placeholder: None,
 		advanced: false,
+		read_only: false,
 	}
 }
 
@@ -104,6 +112,11 @@ const fn bounded(mut spec: SettingSpec, min: i64, max: i64, unit: Option<&'stati
 
 const fn advanced(mut spec: SettingSpec) -> SettingSpec {
 	spec.advanced = true;
+	spec
+}
+
+const fn read_only(mut spec: SettingSpec) -> SettingSpec {
+	spec.read_only = true;
 	spec
 }
 
@@ -231,6 +244,17 @@ const SETTINGS: &[SettingSpec] = &[
 		Kind::Bool,
 		Effect::NextStream,
 	),
+	// Deliberately read-only: whoever can open this page could otherwise turn browser streaming
+	// on themselves. Only an edit of config.toml can turn it on or off.
+	read_only(setting(
+		"ui_streaming",
+		&["ui", "streaming"],
+		NETWORK,
+		"Stream in the browser",
+		"Play sessions in this page. Change it in config.toml ([ui] streaming); this page cannot change it, on purpose.",
+		Kind::Bool,
+		Effect::Restart,
+	)),
 	advanced(setting(
 		"ui_allowed_networks",
 		&["ui", "allowed_networks"],
@@ -396,8 +420,50 @@ pub async fn spawn(context: UiContext) -> Result<Option<UiServer>, ()> {
 			.iter()
 			.map(|name| name.trim().to_string()),
 	);
+	let stream_host = context
+		.config
+		.ui
+		.stream_host
+		.as_deref()
+		.map(str::trim)
+		.filter(|host| !host.is_empty())
+		.map(|host| host.trim_start_matches('[').trim_end_matches(']').to_string());
+	// The stream checks its own `Host` like the page does, so a configured name must be allowed.
+	if let Some(name) = stream_host
+		.as_ref()
+		.filter(|host| host.parse::<std::net::IpAddr>().is_err())
+		&& !host_names.iter().any(|known| known.eq_ignore_ascii_case(name))
+	{
+		host_names.push(name.clone());
+	}
+
+	// Streaming in the browser needs a secure page, so serve HTTPS when the certificate loads.
+	let tls = match crate::tls::control_panel_tls_config(&context.config, &host_names) {
+		Ok(tls) => Some(Arc::new(tls)),
+		Err(()) => {
+			tracing::warn!(
+				"The control panel serves plain HTTP only, so it cannot stream to a browser on another computer."
+			);
+			None
+		},
+	};
+
+	// WebTransport needs a certificate that the browser trusts, or a short-lived one that the page
+	// pins by its hash.
+	let stream_certificate = match (&context.config.ui.certificate, &context.config.ui.private_key) {
+		(Some(certificate), Some(private_key)) => WebTransportCertificate::Files {
+			certificate: certificate.clone(),
+			private_key: private_key.clone(),
+		},
+		_ => WebTransportCertificate::SelfSigned {
+			names: std::iter::once("localhost".to_string())
+				.chain(host_names.iter().cloned())
+				.collect(),
+		},
+	};
 
 	let logs = context.logs.clone();
+	let streaming = context.config.ui.streaming;
 	let backend = Arc::new(UiBackend::new(context));
 	let server = moonshine_ui::serve(
 		backend,
@@ -405,6 +471,10 @@ pub async fn spawn(context: UiContext) -> Result<Option<UiServer>, ()> {
 			listen,
 			allowed_networks: allowed,
 			host_names,
+			tls,
+			stream_certificate,
+			stream_host,
+			streaming,
 		},
 		logs,
 	)
@@ -660,6 +730,7 @@ impl UiBackend {
 					max: (matches!(spec.kind, Kind::Number | Kind::Range) && spec.max != i64::MAX).then_some(spec.max),
 					placeholder: spec.placeholder.map(str::to_string),
 					advanced: spec.advanced,
+					read_only: spec.read_only,
 				}
 			})
 			.collect()
@@ -733,6 +804,9 @@ impl UiBackend {
 				.iter()
 				.find(|spec| spec.key == key)
 				.ok_or_else(|| format!("Unknown setting '{key}'."))?;
+			if spec.read_only {
+				return Err(format!("'{}' can only be changed in config.toml.", spec.label));
+			}
 			edits.push((spec, validate_setting(spec, value)?));
 		}
 
@@ -1258,6 +1332,7 @@ impl Backend for UiBackend {
 				gpu: self.gpu_name.clone(),
 				codecs: codec_names(self.supported_codecs),
 				hdr: self.hdr_supported,
+				browser_streaming: self.startup.ui.streaming,
 				address: self.startup.address.clone(),
 				config_path: self.config_path.display().to_string(),
 				started: self.started,
@@ -1284,6 +1359,15 @@ impl Backend for UiBackend {
 				.map(|(index, application)| ApplicationInfo {
 					index,
 					form: application_form(application),
+				})
+				.collect(),
+			library: self
+				.application_manager
+				.applications()
+				.iter()
+				.map(|application| LibraryApplication {
+					id: application.id(),
+					title: application.title.clone(),
 				})
 				.collect(),
 			scanners,
@@ -1568,6 +1652,197 @@ impl Backend for UiBackend {
 
 	async fn refresh(&self) {
 		self.application_manager.refresh().await;
+	}
+
+	async fn start_stream(&self, request: StreamRequest) -> Result<StreamLink, String> {
+		if request.width < 320 || request.height < 200 || request.width > 7680 || request.height > 4320 {
+			return Err(format!(
+				"A resolution of {}x{} is not supported.",
+				request.width, request.height
+			));
+		}
+		if !(10..=240).contains(&request.fps) {
+			return Err(format!("A frame rate of {} is not supported.", request.fps));
+		}
+		let bitrate_kbps = request.bitrate_kbps.clamp(500, 500_000);
+		let audio_channels = match request.audio_channels {
+			2 => AudioChannels::Stereo,
+			6 => AudioChannels::Surround51,
+			8 => AudioChannels::Surround71,
+			n => return Err(format!("{n} audio channels are not supported (only 2, 6 and 8).")),
+		};
+
+		// The codecs that both the browser and the GPU support in 10 bits, best first. H.264 has no
+		// HDR here.
+		let codecs_10bit: Vec<VideoFormat> = [VideoCodec::Hevc, VideoCodec::Av1]
+			.into_iter()
+			.filter(|codec| request.codecs_10bit.contains(codec))
+			.filter(|codec| {
+				let flag = match codec {
+					VideoCodec::Hevc => healthcheck::CODEC_HEVC_MAIN10,
+					_ => healthcheck::CODEC_AV1_MAIN10,
+				};
+				self.supported_codecs & flag != 0
+			})
+			.map(video_format)
+			.collect();
+		if request.hdr && !self.hdr_supported {
+			return Err("HDR is off on this computer (see [compositor] hdr and the health check).".to_string());
+		}
+		if request.hdr && codecs_10bit.is_empty() {
+			return Err(
+				"This browser and this computer have no 10-bit codec in common, so HDR is not possible.".to_string(),
+			);
+		}
+
+		// The codecs that both the browser and the GPU support, best first.
+		let codecs: Vec<VideoFormat> = [VideoCodec::Hevc, VideoCodec::H264, VideoCodec::Av1]
+			.into_iter()
+			.filter(|codec| request.codecs.contains(codec))
+			.filter(|codec| {
+				let flags = match codec {
+					VideoCodec::H264 => healthcheck::CODEC_H264,
+					VideoCodec::Hevc => healthcheck::CODEC_HEVC,
+					VideoCodec::Av1 => healthcheck::CODEC_AV1_MAIN8,
+				};
+				self.supported_codecs & flags != 0
+			})
+			.map(video_format)
+			.collect();
+		if codecs.is_empty() {
+			return Err(format!(
+				"This browser can decode none of the codecs this computer encodes ({}).",
+				codec_names(self.supported_codecs).join(", ")
+			));
+		}
+
+		// A running session has its application; a new one needs a known application.
+		let application = match self.application_manager.find(request.application_id) {
+			Some(application) => application,
+			None => match self.session_manager.status().await {
+				Some(status) => status.context.application,
+				None => return Err("The application does not exist (anymore).".to_string()),
+			},
+		};
+
+		// Even sizes: the encoder works on 2x2 chroma blocks.
+		let stream = self
+			.session_manager
+			.stream_to_browser(BrowserStreamRequest {
+				application,
+				application_id: request.application_id,
+				width: request.width & !1,
+				height: request.height & !1,
+				fps: request.fps,
+				// The bitrate is the whole stream's, like Moonlight's: FEC and audio fit within it.
+				bitrate: crate::session::stream::video::video_bitrate_within(
+					bitrate_kbps as usize * 1000,
+					self.startup.stream.video.fec_percentage,
+					AudioConfig::from_channels(audio_channels, 0, audio_channels == AudioChannels::Stereo)
+						.stream_config
+						.bitrate as usize,
+				),
+				codecs,
+				codecs_10bit,
+				hdr: request.hdr,
+				audio_channels,
+			})
+			.await?;
+
+		Ok(stream_link(stream, self.startup.stream.video.fec_percentage))
+	}
+}
+
+fn video_format(codec: VideoCodec) -> VideoFormat {
+	match codec {
+		VideoCodec::H264 => VideoFormat::H264,
+		VideoCodec::Hevc => VideoFormat::Hevc,
+		VideoCodec::Av1 => VideoFormat::Av1,
+	}
+}
+
+/// Hand a session's browser stream to the control panel, in its terms.
+fn stream_link(stream: BrowserStream, fec_percent: u8) -> StreamLink {
+	let BrowserStream {
+		video_format,
+		hdr,
+		width,
+		height,
+		fps,
+		bitrate,
+		audio_layout,
+		audio_sample_rate,
+		video,
+		audio,
+		events,
+		commands,
+	} = stream;
+
+	let video = futures_util::stream::unfold(video, |mut video| async move {
+		let frame = video.recv().await?;
+		Some((
+			VideoFrame {
+				data: frame.data,
+				key_frame: frame.key_frame,
+				recovery: frame.recovery,
+				number: frame.frame_number,
+				captured_at: frame.captured_at,
+			},
+			video,
+		))
+	});
+	let audio = futures_util::stream::unfold(audio, |mut audio| async move {
+		let packet = audio.recv().await?;
+		Some((packet, audio))
+	});
+	let events = futures_util::stream::unfold(events, |mut events| async move {
+		let event = match events.recv().await? {
+			BrowserEvent::Feedback(packet) => ServerEvent::Feedback(packet),
+			BrowserEvent::Ended(reason) => ServerEvent::Ended(reason),
+		};
+		Some((event, events))
+	});
+
+	// The control panel's commands, in the session's terms. When the control panel drops its
+	// sender, this task ends and drops the session's, which detaches the browser.
+	let (commands_tx, mut commands_rx) = tokio::sync::mpsc::channel(256);
+	tokio::spawn(async move {
+		while let Some(event) = commands_rx.recv().await {
+			let command = match event {
+				ClientEvent::Start => BrowserCommand::Start,
+				ClientEvent::Input(packet) => BrowserCommand::Input(packet),
+				ClientEvent::RequestKeyFrame => BrowserCommand::RequestKeyFrame,
+				ClientEvent::Stop => BrowserCommand::Stop,
+			};
+			if commands.send(command).await.is_err() {
+				break;
+			}
+		}
+	});
+
+	StreamLink {
+		params: StreamParams {
+			codec: match video_format {
+				VideoFormat::H264 => VideoCodec::H264,
+				VideoFormat::Hevc => VideoCodec::Hevc,
+				VideoFormat::Av1 => VideoCodec::Av1,
+			},
+			hdr,
+			width,
+			height,
+			fps,
+			bitrate_kbps: (bitrate / 1000) as u32,
+			fec_percent,
+			audio_channels: audio_layout.channels as u8,
+			audio_streams: audio_layout.streams,
+			audio_coupled_streams: audio_layout.coupled_streams,
+			audio_mapping: audio_layout.mapping[..audio_layout.channels as usize].to_vec(),
+			audio_sample_rate,
+		},
+		video: Box::pin(video),
+		audio: Box::pin(audio),
+		events: Box::pin(events),
+		commands: commands_tx,
 	}
 }
 

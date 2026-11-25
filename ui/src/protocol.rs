@@ -15,6 +15,8 @@ pub struct Snapshot {
 	pub pairing: PairingInfo,
 	pub devices: Vec<DeviceInfo>,
 	pub applications: Vec<ApplicationInfo>,
+	/// What a client can stream: the configured and the scanned applications, as Moonlight sees them.
+	pub library: Vec<LibraryApplication>,
 	pub scanners: Vec<ScannerInfo>,
 	/// The kinds of scanner that can be added.
 	pub scanner_kinds: Vec<ScannerKind>,
@@ -32,6 +34,8 @@ pub struct ServerInfo {
 	pub gpu: String,
 	pub codecs: Vec<String>,
 	pub hdr: bool,
+	/// Whether the control panel can stream to the browser (`[ui] streaming`).
+	pub browser_streaming: bool,
 	pub address: String,
 	pub config_path: String,
 	/// When Moonshine started.
@@ -92,6 +96,14 @@ pub struct DeviceInfo {
 	pub paired_at: Option<u64>,
 	pub last_seen: Option<u64>,
 	pub streaming: bool,
+}
+
+/// An application that a client can stream.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct LibraryApplication {
+	/// The ID that Moonlight uses.
+	pub id: i32,
+	pub title: String,
 }
 
 /// An application from the configuration file.
@@ -196,6 +208,9 @@ pub struct Setting {
 	pub placeholder: Option<String>,
 	/// Whether the setting is in a collapsed group.
 	pub advanced: bool,
+	/// Shown, but only config.toml can change it.
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub read_only: bool,
 }
 
 /// One value of a `choice` setting.

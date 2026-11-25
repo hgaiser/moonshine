@@ -83,6 +83,30 @@ pub struct UiConfig {
 	/// The IP addresses, `localhost` and this computer's own name always work. Other names are
 	/// refused, so that a website cannot reach the control panel by DNS rebinding.
 	pub allowed_hosts: Vec<String>,
+
+	/// The certificate (PEM) for HTTPS. Without it, the control panel makes a self-signed
+	/// certificate (`ui-cert.pem`, next to the certificate in the [webserver] table), so the
+	/// browser shows a warning one time. Streaming in the browser needs HTTPS when the control
+	/// panel is opened from another computer.
+	pub certificate: Option<PathBuf>,
+
+	/// The private key (PEM) for `certificate`.
+	pub private_key: Option<PathBuf>,
+
+	/// Whether the control panel can stream sessions to the browser (WebTransport, UDP on `port`).
+	/// Off: no "Stream in browser" buttons, and nothing listens on the UDP port.
+	///
+	/// Deliberately read-only on the control panel's Settings page: whoever can open the page
+	/// could otherwise turn it on. Only an edit of config.toml changes it.
+	pub streaming: bool,
+
+	/// The address or name that browsers connect to for the stream (UDP, on `port`).
+	///
+	/// A reverse proxy forwards only the page, not the stream, so the browser must reach this
+	/// computer directly. Without this setting, a page that comes through a reverse proxy streams
+	/// from the address that the proxy connected to, and any other page streams from the address
+	/// in its own URL.
+	pub stream_host: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -92,6 +116,10 @@ impl Default for UiConfig {
 			port: 47990,
 			allowed_networks: vec!["127.0.0.1/32".to_string(), "::1/128".to_string()],
 			allowed_hosts: Vec::new(),
+			certificate: None,
+			private_key: None,
+			streaming: true,
+			stream_host: None,
 		}
 	}
 }
@@ -147,6 +175,16 @@ impl Config {
 		let private_key_path = shellexpand::full(&private_key_path)
 			.map_err(|e| tracing::warn!("Failed to expand private key path: {e}"))?;
 		self.webserver.private_key = private_key_path.to_string().into();
+
+		for path in [&mut self.ui.certificate, &mut self.ui.private_key]
+			.into_iter()
+			.flatten()
+		{
+			let expanded = shellexpand::full(&path.to_string_lossy())
+				.map_err(|e| tracing::warn!("Failed to expand control panel certificate path: {e}"))?
+				.to_string();
+			*path = expanded.into();
+		}
 
 		if let Some(socket) = &self.stats.socket {
 			let path = shellexpand::full(&socket.to_string_lossy())

@@ -114,7 +114,7 @@ function renderSession() {
   const s = snap.session;
   if (!s) {
     el.innerHTML = `
-      <div class="panel-head"><h2>Stream</h2><span class="pill plain">Idle</span></div>
+      <div class="panel-head"><h2>Stream</h2><span class="pill plain">Idle</span><button class="btn primary sm" id="stream-browser" style="margin-left:auto">Stream in browser</button></div>
       <div class="empty">
         <h3 style="font-size:18px;font-weight:600;margin:0">No one is streaming</h3>
         <p class="muted" style="margin:0;max-width:56ch">Open Moonlight on a paired device and select an application. The live graphs for the stream show here.</p>
@@ -128,7 +128,7 @@ function renderSession() {
     el.innerHTML = `
       <div class="session-top">
         <div class="session-title"><h3>${title}</h3>${pill}</div>
-        <button class="btn sm danger" id="stop">Stop stream</button>
+        <span style="display:flex;gap:8px"><button class="btn sm" id="join-browser">Stream in browser</button><button class="btn sm danger" id="stop">Stop stream</button></span>
       </div>
       <div id="stop-confirm"></div>
       <dl class="facts">
@@ -146,10 +146,14 @@ function renderSession() {
       $("#stop-yes").onclick = async () => { $("#stop-yes").disabled = true; await act("stop_session"); };
     };
   }
+  const streamButton = $("#stream-browser") || $("#join-browser");
+  if (streamButton && snap.server?.browser_streaming === false) streamButton.remove();
+  else if (streamButton) streamButton.onclick = () => { location.href = "/play"; };
   bindCharts();
   drawAll();
 }
 
+/* ---------- Stream in the browser ---------- */
 function chartsHTML(idle) {
   const leg = STAGES.map(([k, l]) => `<span><i style="background:var(--s-${k})"></i>${l}</span>`).join("") + `<span><i style="background:var(--fg);height:2px"></i>Slowest frame</span>`;
   return `<div class="charts-head">
@@ -428,7 +432,7 @@ function renderApps() {
   $("#show-hidden-lbl").textContent = `Show hidden (${hiddenN})`;
   const match = t => !q || t.toLowerCase().includes(q);
   const kinds = Object.fromEntries(snap.scanner_kinds.map(k => [k.kind, k]));
-  const own = snap.applications.filter(a => match(a.form.title));
+  const own = snap.applications.filter(a => match(a.form.title)).sort((a, b) => a.form.title.localeCompare(b.form.title, undefined, { sensitivity: "base" }));
   let html = `<div class="panel">
       <div class="panel-head"><div><h2>Your applications</h2><p class="muted" style="margin:2px 0 0;font-size:13px">Saved in config.toml.</p></div><button class="btn primary sm" id="add-app">Add application</button></div>
       <div class="list">${own.length ? own.map(a => appRow(a.form.title, a.form.command, false, `<button class="btn sm" data-editapp="${a.index}">Edit</button>`)).join("") : `<p class="empty-note">${q ? "No applications match the search." : "No applications yet."}</p>`}</div>
@@ -571,7 +575,7 @@ function syncSettings() {
 
 function control(s) {
   const v = draft[s.key], id = "s-" + s.key;
-  if (s.kind === "bool") return `<label class="switch"><input type="checkbox" id="${id}" ${v ? "checked" : ""} aria-label="${esc(s.label)}"><span>${v ? "On" : "Off"}</span></label>`;
+  if (s.kind === "bool") return `<label class="switch"><input type="checkbox" id="${id}" ${v ? "checked" : ""} ${s.read_only ? "disabled" : ""} aria-label="${esc(s.label)}"><span>${v ? "On" : "Off"}</span></label>`;
   if (s.kind === "range") return `<div style="display:grid;gap:2px;width:100%"><div class="range"><input type="range" id="${id}" min="${s.min ?? 0}" max="${s.max ?? 100}" step="5" value="${v}" aria-label="${esc(s.label)}" aria-valuetext="${v} percent"><output for="${id}" id="o-${s.key}">${v}${esc(s.unit || "")}</output></div>
     <div class="range-scale" aria-hidden="true"><span>${s.min ?? 0}${esc(s.unit || "")}</span><span>${Math.round(((s.min ?? 0) + (s.max ?? 100)) / 2)}${esc(s.unit || "")}</span><span>${s.max ?? 100}${esc(s.unit || "")}</span></div></div>`;
   if (s.kind === "choice") return `<select id="${id}" aria-label="${esc(s.label)}">${(s.options || []).map(o => `<option value="${esc(o.value)}" ${o.value === v ? "selected" : ""}>${esc(o.label)}</option>`).join("")}</select>`;

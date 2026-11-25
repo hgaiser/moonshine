@@ -282,6 +282,15 @@ The control panel only answers to an IP address, `localhost` or the name of this
 
 The control panel then sees the address of the proxy, not the address of the browser. So anyone who can reach the proxy can open the control panel. Put authentication on the proxy, or only make it reachable from networks you trust.
 
+A reverse proxy forwards the page, but not the browser stream (UDP). The browser connects to this computer directly for the stream, at the address that the proxy connected to. If the browser must use another address or name, set it in `stream_host`:
+
+```toml
+[ui]
+stream_host = "gaming-pc.example.com"
+```
+
+The browser must reach UDP port 47990 at that address.
+
 ### Pair a client from the command line
 
 #### How to
