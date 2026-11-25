@@ -68,8 +68,33 @@ pub(crate) enum GamepadKind {
 	Nintendo = 0x03,
 }
 
-const CAP_ACCELEROMETER: u16 = 0x10;
-const CAP_GYROSCOPE: u16 = 0x20;
+#[derive(Copy, Clone, Debug)]
+#[repr(u16)]
+enum GamepadCapability {
+	/// Reports values between 0x00 and 0xFF for trigger axes.
+	_AnalogTriggers = 0x01,
+
+	/// Can rumble.
+	_Rumble = 0x02,
+
+	/// Can rumble triggers.
+	_TriggerRumble = 0x04,
+
+	/// Reports touchpad events.
+	_Touchpad = 0x08,
+
+	/// Can report accelerometer events.
+	Acceleration = 0x10,
+
+	/// Can report gyroscope events.
+	Gyro = 0x20,
+
+	/// Reports battery state.
+	_BatteryState = 0x40,
+
+	// Can set RGB LED state.
+	_RgbLed = 0x80,
+}
 
 #[derive(Debug)]
 pub(crate) struct GamepadInfo {
@@ -116,11 +141,11 @@ impl GamepadInfo {
 
 	fn motion_sensors(&self) -> impl Iterator<Item = JoypadMotionType> {
 		[
-			(CAP_ACCELEROMETER, JoypadMotionType::ACCELERATION),
-			(CAP_GYROSCOPE, JoypadMotionType::GYROSCOPE),
+			(GamepadCapability::Acceleration, JoypadMotionType::ACCELERATION),
+			(GamepadCapability::Gyro, JoypadMotionType::GYROSCOPE),
 		]
 		.into_iter()
-		.filter_map(move |(capability, sensor)| (self.capabilities & capability != 0).then_some(sensor))
+		.filter_map(move |(capability, sensor)| (self.capabilities & capability as u16 != 0).then_some(sensor))
 	}
 }
 
@@ -132,7 +157,6 @@ pub(crate) struct GamepadTouch {
 	pointer_id: u32,
 	pub x: f32,
 	pub y: f32,
-	// pressure: f32, // Unused, the DualSense touchpad has no pressure sensor.
 }
 
 impl GamepadTouch {
@@ -144,7 +168,7 @@ impl GamepadTouch {
 			+ std::mem::size_of::<u32>() // pointer_id
 			+ std::mem::size_of::<f32>() // x
 			+ std::mem::size_of::<f32>() // y
-			+ std::mem::size_of::<f32>() // pressure
+			+ std::mem::size_of::<f32>() // pressure (on the wire; unused by DualSense)
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
@@ -389,6 +413,7 @@ impl Gamepad {
 				gamepad.set_on_led({
 					let feedback = feedback.clone();
 					let index = info.index;
+					// Skip identical color reports even after the pending slot has been drained.
 					let mut last_rgb = None;
 					move |r, g, b| {
 						let rgb = (r as u8, g as u8, b as u8);
