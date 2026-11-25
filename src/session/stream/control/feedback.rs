@@ -41,14 +41,13 @@ impl Feedback {
 		update(pending[usize::from(id)].get_or_insert_with(PendingFeedback::default));
 	}
 
-	pub(super) fn take(&self) -> impl Iterator<Item = FeedbackCommand> {
-		let pending: ArrayVec<_, MAX_GAMEPADS> = self.0.lock().unwrap().iter_mut().filter_map(Option::take).collect();
-		pending.into_iter().flat_map(PendingFeedback::into_commands)
+	pub(super) fn take(&self) -> ArrayVec<PendingFeedback, MAX_GAMEPADS> {
+		self.0.lock().unwrap().iter_mut().filter_map(Option::take).collect()
 	}
 }
 
-#[derive(Default)]
-struct PendingFeedback {
+#[derive(Debug, Default)]
+pub(super) struct PendingFeedback {
 	rumble: Option<RumbleCommand>,
 	led: Option<SetLedCommand>,
 	accel: Option<EnableMotionEventCommand>,
@@ -57,39 +56,23 @@ struct PendingFeedback {
 }
 
 impl PendingFeedback {
-	fn into_commands(self) -> impl Iterator<Item = FeedbackCommand> {
-		[
-			self.rumble.map(FeedbackCommand::Rumble),
-			self.led.map(FeedbackCommand::SetLed),
-			self.accel.map(FeedbackCommand::EnableMotionEvent),
-			self.gyro.map(FeedbackCommand::EnableMotionEvent),
-			self.trigger.map(FeedbackCommand::TriggerEffect),
-		]
-		.into_iter()
-		.flatten()
-	}
-}
-
-#[derive(Debug)]
-pub(crate) enum FeedbackCommand {
-	Rumble(RumbleCommand),
-	SetLed(SetLedCommand),
-	EnableMotionEvent(EnableMotionEventCommand),
-	TriggerEffect(TriggerEffectCommand),
-}
-
-impl FeedbackCommand {
-	pub(super) fn with_packet(&self, send: impl FnOnce(&[u8])) {
-		match self {
-			Self::Rumble(command) => send(&command.as_packet()),
-			Self::SetLed(command) => send(&command.as_packet()),
-			Self::EnableMotionEvent(command) => send(&command.as_packet()),
-			Self::TriggerEffect(command) => send(&command.as_packet()),
+	pub(super) fn send(self, mut send: impl FnMut(&[u8])) {
+		if let Some(command) = self.rumble {
+			send(&command.as_packet());
+		}
+		if let Some(command) = self.led {
+			send(&command.as_packet());
+		}
+		for command in [self.accel, self.gyro].into_iter().flatten() {
+			send(&command.as_packet());
+		}
+		if let Some(command) = self.trigger {
+			send(&command.as_packet());
 		}
 	}
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct RumbleCommand {
 	pub id: u16,
 	pub low_frequency: u16,
@@ -243,6 +226,14 @@ impl TriggerEffectCommand {
 mod tests {
 	use super::*;
 
+	fn drain_packets(feedback: &Feedback) -> Vec<Vec<u8>> {
+		let mut packets = Vec::new();
+		for pending in feedback.take() {
+			pending.send(|packet| packets.push(packet.to_vec()));
+		}
+		packets
+	}
+
 	#[test]
 	fn latest_rumble_state_survives_bursts_without_replaying_old_effects() {
 		let feedback = Feedback::default();
@@ -258,21 +249,20 @@ mod tests {
 				high_frequency: value,
 			});
 		}
-		feedback.rumble(RumbleCommand {
+		let stop = RumbleCommand {
 			id: 0,
 			low_frequency: 0,
 			high_frequency: 0,
-		});
+		};
+		feedback.rumble(stop);
 
-		let rumble: Vec<_> = feedback
-			.take()
-			.map(|command| match command {
-				FeedbackCommand::Rumble(rumble) => (rumble.id, rumble.low_frequency, rumble.high_frequency),
-				_ => panic!("expected a rumble command"),
-			})
-			.collect();
-		assert_eq!(rumble, [(0, 0, 0), (1, 0, 500)]);
-		assert!(feedback.take().next().is_none());
+		let other_pad = RumbleCommand {
+			id: 1,
+			low_frequency: 0,
+			high_frequency: 500,
+		};
+		assert_eq!(drain_packets(&feedback), [stop.as_packet(), other_pad.as_packet()]);
+		assert!(drain_packets(&feedback).is_empty());
 	}
 
 	#[test]
@@ -289,14 +279,15 @@ mod tests {
 			});
 		}
 
-		let mut pending = feedback.take();
-		let Some(FeedbackCommand::TriggerEffect(effect)) = pending.next() else {
-			panic!("expected a trigger effect command");
+		let expected = TriggerEffectCommand {
+			id: 0,
+			trigger_event_flags: 0x0c,
+			type_left: 3,
+			type_right: 4,
+			left: [3; 10],
+			right: [4; 10],
 		};
-		assert_eq!(effect.trigger_event_flags, 0x0c);
-		assert_eq!((effect.type_left, effect.left), (3, [3; 10]));
-		assert_eq!((effect.type_right, effect.right), (4, [4; 10]));
-		assert!(pending.next().is_none());
+		assert_eq!(drain_packets(&feedback), [expected.as_packet()]);
 	}
 
 	#[test]
@@ -309,14 +300,7 @@ mod tests {
 				motion_type,
 			});
 		}
-		let mut sensors: Vec<_> = feedback
-			.take()
-			.map(|command| match command {
-				FeedbackCommand::EnableMotionEvent(motion) => motion.motion_type as u8,
-				_ => panic!("expected a motion command"),
-			})
-			.collect();
-		sensors.sort_unstable();
-		assert_eq!(sensors, [1, 2]);
+		let packets = drain_packets(&feedback);
+		assert_eq!(packets.iter().map(|packet| packet[8]).collect::<Vec<_>>(), [1, 2]);
 	}
 }

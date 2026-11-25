@@ -489,17 +489,18 @@ async fn run_control_loop(
 			break;
 		}
 
-		// Publish at most one pending state of each kind per gamepad.
-		for command in input_handler.feedback.take() {
-			let Some(peer_id) = connected_peer else {
-				continue;
-			};
-			tracing::debug!("Sending control feedback command: {command:?}");
+		let feedback = input_handler.feedback.take();
+		if let Some(peer_id) = connected_peer
+			&& !feedback.is_empty()
+		{
 			let key = &context.keys_rx.borrow().remote_input_key;
-			command.with_packet(|payload| {
-				send_to_peer(&mut host, peer_id, key, sequence_number, payload, "feedback");
-			});
-			sequence_number += 1;
+			for pending in feedback {
+				tracing::debug!("Sending gamepad feedback: {pending:?}");
+				pending.send(|payload| {
+					send_to_peer(&mut host, peer_id, key, sequence_number, payload, "feedback");
+					sequence_number += 1;
+				});
+			}
 		}
 
 		match host

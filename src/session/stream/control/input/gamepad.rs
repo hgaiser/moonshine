@@ -68,33 +68,8 @@ pub(crate) enum GamepadKind {
 	Nintendo = 0x03,
 }
 
-#[derive(Copy, Clone, Debug)]
-#[repr(u16)]
-enum GamepadCapability {
-	/// Reports values between 0x00 and 0xFF for trigger axes.
-	_AnalogTriggers = 0x01,
-
-	/// Can rumble.
-	_Rumble = 0x02,
-
-	/// Can rumble triggers.
-	_TriggerRumble = 0x04,
-
-	/// Reports touchpad events.
-	_Touchpad = 0x08,
-
-	/// Can report accelerometer events.
-	Acceleration = 0x10,
-
-	/// Can report gyroscope events.
-	Gyro = 0x20,
-
-	/// Reports battery state.
-	_BatteryState = 0x40,
-
-	// Can set RGB LED state.
-	_RgbLed = 0x80,
-}
+const CAP_ACCELEROMETER: u16 = 0x10;
+const CAP_GYROSCOPE: u16 = 0x20;
 
 #[derive(Debug)]
 pub(crate) struct GamepadInfo {
@@ -141,11 +116,11 @@ impl GamepadInfo {
 
 	fn motion_sensors(&self) -> impl Iterator<Item = JoypadMotionType> {
 		[
-			(GamepadCapability::Acceleration, JoypadMotionType::ACCELERATION),
-			(GamepadCapability::Gyro, JoypadMotionType::GYROSCOPE),
+			(CAP_ACCELEROMETER, JoypadMotionType::ACCELERATION),
+			(CAP_GYROSCOPE, JoypadMotionType::GYROSCOPE),
 		]
 		.into_iter()
-		.filter_map(move |(capability, sensor)| (self.capabilities & capability as u16 != 0).then_some(sensor))
+		.filter_map(move |(capability, sensor)| (self.capabilities & capability != 0).then_some(sensor))
 	}
 }
 
@@ -428,17 +403,8 @@ impl Gamepad {
 					let feedback = feedback.clone();
 					let index = info.index;
 					move |trigger_event_flags, type_left, type_right, left, right| {
-						let left: &[u8; 10] = if let Ok(left) = left.try_into() {
-							left
-						} else {
-							tracing::warn!("Couldn't convert left trigger effect.");
-							return;
-						};
-
-						let right: &[u8; 10] = if let Ok(right) = right.try_into() {
-							right
-						} else {
-							tracing::warn!("Couldn't convert right trigger effect.");
+						let (Ok(left), Ok(right)) = (<[u8; 10]>::try_from(left), <[u8; 10]>::try_from(right)) else {
+							tracing::warn!("Expected ten bytes for each adaptive trigger effect.");
 							return;
 						};
 
@@ -447,8 +413,8 @@ impl Gamepad {
 							trigger_event_flags,
 							type_left,
 							type_right,
-							left: *left,
-							right: *right,
+							left,
+							right,
 						});
 					}
 				});
