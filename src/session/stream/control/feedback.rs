@@ -1,4 +1,74 @@
+use std::sync::Mutex;
+
+use arrayvec::ArrayVec;
+use inputtino::JoypadMotionType;
+
+use super::MAX_GAMEPADS;
 use crate::session::stream::control::ControlMessageType;
+
+/// Latest unsent feedback for each controller. Producers never wait for the
+/// control loop to make room, and no network work is done while holding the lock.
+#[derive(Default)]
+pub(super) struct Feedback(Mutex<[Option<PendingFeedback>; MAX_GAMEPADS]>);
+
+impl Feedback {
+	pub(super) fn rumble(&self, command: RumbleCommand) {
+		self.update(command.id, |pending| pending.rumble = Some(command));
+	}
+
+	pub(super) fn led(&self, command: SetLedCommand) {
+		self.update(command.id, |pending| pending.led = Some(command));
+	}
+
+	pub(super) fn motion(&self, command: EnableMotionEventCommand) {
+		self.update(command.id, |pending| match command.motion_type {
+			JoypadMotionType::ACCELERATION => pending.accel = Some(command),
+			JoypadMotionType::GYROSCOPE => pending.gyro = Some(command),
+		});
+	}
+
+	pub(super) fn trigger_effect(&self, mut command: TriggerEffectCommand) {
+		self.update(command.id, |pending| {
+			if let Some(old) = pending.trigger.take() {
+				command.keep_unchanged_triggers(old);
+			}
+			pending.trigger = Some(command);
+		});
+	}
+
+	fn update(&self, id: u16, update: impl FnOnce(&mut PendingFeedback)) {
+		let mut pending = self.0.lock().unwrap();
+		update(pending[usize::from(id)].get_or_insert_with(PendingFeedback::default));
+	}
+
+	pub(super) fn take(&self) -> impl Iterator<Item = FeedbackCommand> {
+		let pending: ArrayVec<_, MAX_GAMEPADS> = self.0.lock().unwrap().iter_mut().filter_map(Option::take).collect();
+		pending.into_iter().flat_map(PendingFeedback::into_commands)
+	}
+}
+
+#[derive(Default)]
+struct PendingFeedback {
+	rumble: Option<RumbleCommand>,
+	led: Option<SetLedCommand>,
+	accel: Option<EnableMotionEventCommand>,
+	gyro: Option<EnableMotionEventCommand>,
+	trigger: Option<TriggerEffectCommand>,
+}
+
+impl PendingFeedback {
+	fn into_commands(self) -> impl Iterator<Item = FeedbackCommand> {
+		[
+			self.rumble.map(FeedbackCommand::Rumble),
+			self.led.map(FeedbackCommand::SetLed),
+			self.accel.map(FeedbackCommand::EnableMotionEvent),
+			self.gyro.map(FeedbackCommand::EnableMotionEvent),
+			self.trigger.map(FeedbackCommand::TriggerEffect),
+		]
+		.into_iter()
+		.flatten()
+	}
+}
 
 #[derive(Debug)]
 pub(crate) enum FeedbackCommand {
@@ -9,12 +79,12 @@ pub(crate) enum FeedbackCommand {
 }
 
 impl FeedbackCommand {
-	pub fn as_packet(&self) -> Vec<u8> {
+	pub(super) fn with_packet(&self, send: impl FnOnce(&[u8])) {
 		match self {
-			FeedbackCommand::Rumble(command) => command.as_packet().to_vec(),
-			FeedbackCommand::SetLed(command) => command.as_packet().to_vec(),
-			FeedbackCommand::EnableMotionEvent(command) => command.as_packet().to_vec(),
-			FeedbackCommand::TriggerEffect(command) => command.as_packet().to_vec(),
+			Self::Rumble(command) => send(&command.as_packet()),
+			Self::SetLed(command) => send(&command.as_packet()),
+			Self::EnableMotionEvent(command) => send(&command.as_packet()),
+			Self::TriggerEffect(command) => send(&command.as_packet()),
 		}
 	}
 }
@@ -86,7 +156,7 @@ impl SetLedCommand {
 pub(crate) struct EnableMotionEventCommand {
 	pub id: u16,
 	pub report_rate: u16,
-	pub motion_type: u8,
+	pub motion_type: JoypadMotionType,
 }
 
 impl EnableMotionEventCommand {
@@ -107,7 +177,7 @@ impl EnableMotionEventCommand {
 		buffer[2..4].copy_from_slice(&(Self::PAYLOAD_LENGTH as u16).to_le_bytes());
 		buffer[4..6].copy_from_slice(&self.id.to_le_bytes());
 		buffer[6..8].copy_from_slice(&self.report_rate.to_le_bytes());
-		buffer[8] = self.motion_type;
+		buffer[8] = self.motion_type as u8;
 
 		buffer
 	}
@@ -134,6 +204,22 @@ impl TriggerEffectCommand {
 		+ 10 * std::mem::size_of::<u8>() // Left trigger effect (10 bytes).
 		+ 10 * std::mem::size_of::<u8>(); // Right trigger effect (10 bytes).
 
+	fn keep_unchanged_triggers(&mut self, old: Self) {
+		// DualSense valid_flag0 bits, as forwarded by inputtino.
+		const RIGHT: u8 = 0x04;
+		const LEFT: u8 = 0x08;
+		let unchanged = old.trigger_event_flags & !self.trigger_event_flags;
+		if unchanged & LEFT != 0 {
+			self.type_left = old.type_left;
+			self.left = old.left;
+		}
+		if unchanged & RIGHT != 0 {
+			self.type_right = old.type_right;
+			self.right = old.right;
+		}
+		self.trigger_event_flags |= unchanged;
+	}
+
 	pub fn as_packet(&self) -> [u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH] {
 		let mut buffer = [0u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH];
 
@@ -150,5 +236,87 @@ impl TriggerEffectCommand {
 		buffer[19..29].copy_from_slice(&self.right);
 
 		buffer
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn latest_rumble_state_survives_bursts_without_replaying_old_effects() {
+		let feedback = Feedback::default();
+		for value in 1..=500 {
+			feedback.rumble(RumbleCommand {
+				id: 0,
+				low_frequency: value,
+				high_frequency: value,
+			});
+			feedback.rumble(RumbleCommand {
+				id: 1,
+				low_frequency: 0,
+				high_frequency: value,
+			});
+		}
+		feedback.rumble(RumbleCommand {
+			id: 0,
+			low_frequency: 0,
+			high_frequency: 0,
+		});
+
+		let rumble: Vec<_> = feedback
+			.take()
+			.map(|command| match command {
+				FeedbackCommand::Rumble(rumble) => (rumble.id, rumble.low_frequency, rumble.high_frequency),
+				_ => panic!("expected a rumble command"),
+			})
+			.collect();
+		assert_eq!(rumble, [(0, 0, 0), (1, 0, 500)]);
+		assert!(feedback.take().next().is_none());
+	}
+
+	#[test]
+	fn partial_trigger_updates_keep_both_latest_effects() {
+		let feedback = Feedback::default();
+		for (flags, left, right) in [(0x0c, 1, 2), (0x08, 3, 0), (0x04, 0, 4)] {
+			feedback.trigger_effect(TriggerEffectCommand {
+				id: 0,
+				trigger_event_flags: flags,
+				type_left: left,
+				type_right: right,
+				left: [left; 10],
+				right: [right; 10],
+			});
+		}
+
+		let mut pending = feedback.take();
+		let Some(FeedbackCommand::TriggerEffect(effect)) = pending.next() else {
+			panic!("expected a trigger effect command");
+		};
+		assert_eq!(effect.trigger_event_flags, 0x0c);
+		assert_eq!((effect.type_left, effect.left), (3, [3; 10]));
+		assert_eq!((effect.type_right, effect.right), (4, [4; 10]));
+		assert!(pending.next().is_none());
+	}
+
+	#[test]
+	fn enabling_one_sensor_does_not_replace_the_other() {
+		let feedback = Feedback::default();
+		for motion_type in [JoypadMotionType::ACCELERATION, JoypadMotionType::GYROSCOPE] {
+			feedback.motion(EnableMotionEventCommand {
+				id: 0,
+				report_rate: 100,
+				motion_type,
+			});
+		}
+		let mut sensors: Vec<_> = feedback
+			.take()
+			.map(|command| match command {
+				FeedbackCommand::EnableMotionEvent(motion) => motion.motion_type as u8,
+				_ => panic!("expected a motion command"),
+			})
+			.collect();
+		sensors.sort_unstable();
+		assert_eq!(sensors, [1, 2]);
 	}
 }

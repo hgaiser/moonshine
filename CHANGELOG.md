@@ -18,9 +18,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Finish pairing when the PIN arrives right after the pairing request, instead of waiting forever.
 - Refuse a PIN on `/submit-pin` that is not 4 digits, as the control panel does.
 - Keep streaming when a control message cannot be parsed.
-- Keep gamepad feedback from blocking virtual controllers, and handle larger bursts of gamepad input and feedback.
+- Send only the latest pending gamepad feedback instead of replaying a backlog or dropping the final rumble stop when the queue fills.
 - Give virtual gamepads a full six-byte device address and keep Moonshine's virtual input devices out of the host desktop's libinput devices.
 - Track both DualSense touchpad contacts from touch events instead of pressure.
+- Request only the motion sensors a controller advertises, and keep its last known battery level when the client reports an unknown percentage.
 
 ## [v0.19.1] - 23-11-2026
 

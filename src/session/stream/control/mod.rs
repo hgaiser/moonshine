@@ -3,12 +3,11 @@ use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
+use self::input::InputHandler;
 use self::input::gamepad::GamepadConfig;
-use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
 use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
@@ -22,6 +21,8 @@ use crate::session::stream::video::VideoStreamHandle;
 
 mod feedback;
 pub(crate) mod input;
+
+const MAX_GAMEPADS: usize = 16;
 
 /// Configuration for the control stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -471,10 +472,6 @@ async fn run_control_loop(
 
 	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 
-	// Create a channel over which we can receive feedback messages to send to the connected client.
-	// Gamepad callbacks drop commands when this is full, so leave room for bursts.
-	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(64);
-
 	// Sequence number of feedback messages.
 	let mut sequence_number = 0u32;
 	let mut send_hdr_mode = false;
@@ -492,16 +489,16 @@ async fn run_control_loop(
 			break;
 		}
 
-		// Send queued feedback messages; games can queue several per loop iteration.
-		// Bounded so a steady stream of feedback can't starve ENet servicing.
-		for command in std::iter::from_fn(|| feedback_rx.try_recv().ok()).take(64) {
+		// Publish at most one pending state of each kind per gamepad.
+		for command in input_handler.feedback.take() {
 			let Some(peer_id) = connected_peer else {
 				continue;
 			};
 			tracing::debug!("Sending control feedback command: {command:?}");
-			let payload = command.as_packet();
-			let key = context.keys_rx.borrow().remote_input_key.clone();
-			send_to_peer(&mut host, peer_id, &key, sequence_number, &payload, "feedback");
+			let key = &context.keys_rx.borrow().remote_input_key;
+			command.with_packet(|payload| {
+				send_to_peer(&mut host, peer_id, key, sequence_number, payload, "feedback");
+			});
 			sequence_number += 1;
 		}
 
@@ -580,7 +577,7 @@ async fn run_control_loop(
 						stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 					},
 					ControlMessage::InputData(event) => {
-						let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;
+						let _ = input_handler.handle_raw_input(event).await;
 					},
 					ControlMessage::HdrMode => {
 						tracing::info!("Received HdrMode toggle from client");
