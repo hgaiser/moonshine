@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- A guide in the control panel for new users. It darkens the page except one part and tells what that part does. It opens by itself at start until you turn it off, and the guide button in the masthead opens it again.
+
 ## [v0.19.2] - 26-11-2026
 
 ### Changed

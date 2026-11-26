@@ -325,6 +325,23 @@ details.adv[open] > summary { margin-bottom: 8px; }
 .toasts { position: fixed; z-index: 30; right: max(16px, env(safe-area-inset-right, 0px)); bottom: calc(env(safe-area-inset-bottom, 0px) + 16px); display: grid; gap: 8px; max-width: min(380px, calc(100% - 32px)); }
 .toast { background: var(--fg); color: var(--bg); padding: 10px 14px; border-radius: var(--r); box-shadow: 0 8px 24px rgba(0,0,0,.25); font-size: 13px; }
 
+/* Guide: a dark layer with a hole over one part of the page, and a card that tells what the part does. */
+.guide-block { position: fixed; inset: 0; z-index: 40; }
+/* The hole's border glows in moon gold and pulses slowly. The last shadow is the dark layer. The dark layer
+   looks the same in both themes, so the glow uses the bright moon gold of the banner in both. */
+@property --glow { syntax: "<color>"; inherits: false; initial-value: transparent; }
+.guide-hole { --glow: rgba(255,214,110,.85); position: fixed; z-index: 41; pointer-events: none; border-radius: var(--r);
+  box-shadow: 0 0 0 2px #ffe18c, 0 0 22px 6px var(--glow), inset 0 0 14px var(--glow), 0 0 0 200vmax rgba(8,6,24,.68);
+  transition: top .2s ease, left .2s ease, width .2s ease, height .2s ease; animation: guide-glow 2.4s ease-in-out infinite; }
+@keyframes guide-glow { 50% { --glow: rgba(255,214,110,.4); } }
+.guide-card { position: fixed; z-index: 42; width: min(340px, calc(100vw - 24px)); display: grid; gap: 10px; padding: 16px; background: var(--surface); color: var(--fg); clip-path: var(--px4); }
+.guide-card h2 { font-family: var(--font-display); font-weight: 600; font-size: 20px; text-transform: lowercase; }
+.guide-card p { margin: 0; color: var(--muted); }
+.guide-step { font-family: var(--font-mono); font-size: 11.5px; color: var(--accent); }
+.guide-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.guide-actions .grow { flex: 1; }
+.guide-off { font-size: 12.5px; color: var(--muted); }
+
 @media (max-width: 760px) {
   .shell { grid-template-columns: minmax(0, 1fr); gap: 16px; padding-block: 0 64px; }
   nav.rail { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 8; flex-direction: row; overflow-x: auto; background: var(--bg); margin: 0 -16px; padding: 8px 16px; border-bottom: 1px solid var(--line); }
