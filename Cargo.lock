@@ -2811,9 +2811,9 @@ dependencies = [
 
 [[package]]
 name = "pixelforge"
-version = "0.14.0"
+version = "0.14.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6d9f4dbfea257d1c829a3e1bf20437d249c2dceaa87e0a4610942226aa90277"
+checksum = "3c43230306c3ad3adfd3196437944b76025dcb078cc4e1053a8015052c01fba5"
 dependencies = [
  "futures-channel",
  "futures-core",
