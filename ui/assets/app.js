@@ -393,11 +393,12 @@ function renderClients() {
           : `<div class="row-title">${esc(c.name)}${c.streaming ? '<span class="pill ok">Streaming</span>' : ""}</div>`}
         <div class="row-sub">Paired ${rel(c.paired_at)} · Last seen ${rel(c.last_seen)} · <span class="mono">${esc(c.fingerprint.slice(0, 8))}</span></div>
       </div>
-      <div class="row-actions">${editing.has(c.fingerprint) ? "" : `<button class="btn sm" data-edit>Rename</button><button class="btn sm danger" data-unpair>Unpair</button>`}</div>
+      <div class="row-actions">${editing.has(c.fingerprint) ? "" : `<label class="switch" title="Smooth video packet bursts for links with small buffers (such as USB Ethernet adapters or 100 Mb/s ports)."><input type="checkbox" data-pacing ${c.packet_pacing ? "checked" : ""} aria-label="Packet pacing for ${esc(c.name)}"><span>Packet pacing</span></label><button class="btn sm" data-edit>Rename</button><button class="btn sm danger" data-unpair>Unpair</button>`}</div>
       ${confirming.has(c.fingerprint) ? `<div class="confirm"><span>Unpair ${esc(c.name)}? It must pair again with a new PIN to stream.${c.streaming ? " Its stream stops." : ""}</span><button class="btn sm" data-keep>Keep</button><button class="btn sm danger solid" data-yes>Unpair</button></div>` : ""}
     </div>`).join("") : `<p class="empty-note">No devices are paired yet.</p>`;
   $$("#client-list .row").forEach(row => {
     const fp = row.dataset.fp, b = s => $(s, row);
+    if (b("[data-pacing]")) b("[data-pacing]").onchange = async e => { const inp = e.target; inp.disabled = true; const r = await act("set_device_packet_pacing", { fingerprint: fp, enabled: inp.checked }); inp.disabled = false; if (!r.ok) inp.checked = !inp.checked; };
     if (b("[data-edit]")) b("[data-edit]").onclick = () => { editing.add(fp); renderClients(); const i = $(`[data-fp="${fp}"] input`); i.focus(); i.select(); };
     if (b("[data-cancel]")) b("[data-cancel]").onclick = () => { editing.delete(fp); renderClients(); };
     if (b("[data-rename]")) b("[data-rename]").onsubmit = async e => { e.preventDefault(); const r = await act("rename_device", { fingerprint: fp, name: b("input").value }); if (r.ok) { editing.delete(fp); prev.devices = null; } };

@@ -447,6 +447,7 @@ impl RtspServer {
 			fps,
 			packet_size,
 			bitrate,
+			configured_bitrate: bitrate,
 			minimum_fec_packets,
 			qos: video_qos_type != "0",
 			video_format,

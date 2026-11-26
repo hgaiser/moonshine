@@ -97,6 +97,9 @@ pub struct PairedDevice {
 
 	/// When the device last made a request, if known.
 	pub last_seen: Option<SystemTime>,
+
+	/// Whether outgoing video packets are paced for this device.
+	pub packet_pacing: bool,
 }
 
 /// How long a pairing request waits for its PIN before it is no longer listed.
@@ -179,6 +182,7 @@ impl ClientManager {
 				name: record.name,
 				paired_at: from_unix_secs(record.paired_at),
 				last_seen: from_unix_secs(record.last_seen),
+				packet_pacing: record.packet_pacing,
 			})
 			.collect())
 	}
@@ -188,6 +192,22 @@ impl ClientManager {
 		let name = name.trim().to_string();
 		self.state
 			.update_device(fingerprint, |record| record.name = name, |_, _| true)
+	}
+
+	/// Whether outgoing video packets should be paced for a paired device.
+	pub fn device_packet_pacing(&self, fingerprint: &str) -> bool {
+		self.state
+			.device(fingerprint)
+			.ok()
+			.flatten()
+			.is_some_and(|record| record.packet_pacing)
+	}
+
+	/// Enable or disable outgoing video packet pacing for a paired device.
+	/// Returns whether the device is paired.
+	pub fn set_device_packet_pacing(&self, fingerprint: &str, enabled: bool) -> Result<bool, ()> {
+		self.state
+			.update_device(fingerprint, |record| record.packet_pacing = enabled, |_, _| true)
 	}
 
 	/// Unpair a device: it must pair again to stream. Returns whether the device was paired.

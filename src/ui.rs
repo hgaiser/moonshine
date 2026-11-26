@@ -1228,6 +1228,7 @@ impl Backend for UiBackend {
 				},
 				paired_at: device.paired_at.map(unix),
 				last_seen: device.last_seen.map(unix),
+				packet_pacing: device.packet_pacing,
 				fingerprint: device.fingerprint,
 			})
 			.collect();
@@ -1329,6 +1330,22 @@ impl Backend for UiBackend {
 					Ok(true) => Ok("Saved.".to_string()),
 					Ok(false) => Err("This device is no longer paired.".to_string()),
 					Err(()) => Err("Failed to save the name. Check the logs.".to_string()),
+				}
+			},
+			Action::SetDevicePacketPacing { fingerprint, enabled } => {
+				match self.client_manager.set_device_packet_pacing(&fingerprint, enabled) {
+					Ok(true) => {
+						self.session_manager
+							.set_client_packet_pacing(&fingerprint, enabled)
+							.await;
+						Ok(if enabled {
+							"Packet pacing is on.".to_string()
+						} else {
+							"Packet pacing is off.".to_string()
+						})
+					},
+					Ok(false) => Err("This device is no longer paired.".to_string()),
+					Err(()) => Err("Failed to save packet pacing. Check the logs.".to_string()),
 				}
 			},
 			Action::UnpairDevice { fingerprint } => {

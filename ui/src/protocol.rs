@@ -92,6 +92,7 @@ pub struct DeviceInfo {
 	pub paired_at: Option<u64>,
 	pub last_seen: Option<u64>,
 	pub streaming: bool,
+	pub packet_pacing: bool,
 }
 
 /// An application from the configuration file.
@@ -222,6 +223,10 @@ pub enum Action {
 	RenameDevice {
 		fingerprint: String,
 		name: String,
+	},
+	SetDevicePacketPacing {
+		fingerprint: String,
+		enabled: bool,
 	},
 	UnpairDevice {
 		fingerprint: String,

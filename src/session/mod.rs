@@ -264,12 +264,14 @@ impl LaunchedSession {
 		&self.context
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	pub(crate) async fn start(
 		self,
 		video_config: VideoStreamConfig,
 		stream_timeout: u64,
 		video_ctx: VideoStreamContext,
 		audio_ctx: AudioStreamContext,
+		packet_pacing: bool,
 		stop: ShutdownManager<SessionShutdownReason>,
 		inhibit_sleep: bool,
 	) -> Result<(ActiveSession, StartSignal, StartSignal), ()> {
@@ -294,7 +296,7 @@ impl LaunchedSession {
 
 		// Start video stream — gated, returns VideoStreamHandle.
 		let video_handle = video_stream
-			.start(video_config, video_ctx, keys_rx.clone(), stop.clone())
+			.start(video_config, video_ctx, keys_rx.clone(), packet_pacing, stop.clone())
 			.map_err(|()| tracing::error!("Failed to start video stream"))?;
 
 		// Start audio stream — gated, returns its StartSignal.
@@ -358,5 +360,10 @@ impl ActiveSession {
 	/// It fires once the client's first video PING arrives.
 	pub(crate) fn reset_video_stream(&self) {
 		self.video_handle.request_reset();
+	}
+
+	/// Enable or disable video packet pacing on the active video stream.
+	pub(crate) fn set_video_packet_pacing(&self, enabled: bool) {
+		self.video_handle.set_packet_pacing(enabled);
 	}
 }
