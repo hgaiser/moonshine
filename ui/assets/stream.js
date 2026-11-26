@@ -424,6 +424,7 @@ class Player {
       `${this.options.title || "Stream"} · ${params.width}×${params.height} @ ${params.fps} · ${params.codec.toUpperCase()}`;
     await this.setupAudio(params).catch(e => this.hint(`No audio: ${e.message}`));
     this.bindInput();
+    this.keepAwake();
     this.timers = [
       setInterval(() => this.ping(), 1000),
       setInterval(() => this.checkLoss(), 20),
@@ -744,12 +745,25 @@ class Player {
     this.listeners.push([target, type, handler, options]);
   }
 
+  /// Keep the screen on: gamepad input does not count as activity, so a phone or tablet would turn
+  /// it off. The browser releases the lock when the page is hidden; visibilitychange asks again.
+  async keepAwake() {
+    if (this.closed || document.hidden || !navigator.wakeLock || (this.wakeLock && !this.wakeLock.released)) return;
+    try {
+      this.wakeLock = await navigator.wakeLock.request("screen");
+      if (this.closed) this.wakeLock.release().catch(() => {});
+    } catch { /* Not allowed here (battery saver, a policy): the screen can turn off. */ }
+  }
+
   bindInput() {
     const canvas = this.canvas;
     this.on(document, "keydown", e => this.onKey(e, true), true);
     this.on(document, "keyup", e => this.onKey(e, false), true);
     this.on(window, "blur", () => this.releaseAll());
-    this.on(document, "visibilitychange", () => { if (document.hidden) this.releaseAll(); });
+    this.on(document, "visibilitychange", () => {
+      if (document.hidden) this.releaseAll();
+      else this.keepAwake();
+    });
 
     this.on(canvas, "pointerdown", e => this.onPointer(e, "down"));
     this.on(canvas, "pointerup", e => this.onPointer(e, "up"));
@@ -1104,6 +1118,7 @@ class Player {
     this.audioContext?.close().catch(() => {});
     if (document.pointerLockElement) document.exitPointerLock();
     navigator.keyboard?.unlock?.();
+    this.wakeLock?.release().catch(() => {});
     if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
     try { screen.orientation?.unlock?.(); } catch { /* Not locked. */ }
     this.root?.remove();
