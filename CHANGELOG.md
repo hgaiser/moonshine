@@ -7,16 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [v0.19.2] - 26-11-2026
+
 ### Changed
 
-- `/submit-pin` no longer needs a `uniqueid`: without one, the PIN goes to the pairing request that waits for it, so pairing from the command line is `curl -X POST http://localhost:47989/submit-pin -d pin=<PIN>`. It answers 404 if no request waits and 409 if several do.
+- `/submit-pin` no longer needs a `uniqueid`: without one, the PIN goes to the pairing request that waits for it, so pairing from the command line is `curl -X POST http://localhost:47989/submit-pin -d pin=<PIN>`. It answers 404 if no request waits and 409 if several do, @porkloin (#280)
 
 ### Fixed
 
-- Keep the stream within the bitrate the client asks for: video is encoded below it, so FEC, audio and packet overhead fit inside it, as Sunshine does.
-- Refuse a PIN for a pairing request that already has one, or that asked more than 5 minutes ago, instead of answering that it was accepted while nothing paired.
-- Finish pairing when the PIN arrives right after the pairing request, instead of waiting forever.
-- Refuse a PIN on `/submit-pin` that is not 4 digits, as the control panel does.
+- Fix HEVC streams that freeze on the first frames on iOS (Moonlight and VoidLink) when the client lets the host choose the reference frames. The encoder now holds only the references that the stream's level allows (5 at 4K), and 4K at 120 fps gets level 5.2 instead of 5.1. H.264 keeps its DPB within its level too.
+- Keep the stream within the bitrate the client asks for: video is encoded below it, so FEC, audio and packet overhead fit inside it, as Sunshine does, @porkloin (#278)
+- Refuse a PIN for a pairing request that already has one, or that asked more than 5 minutes ago, instead of answering that it was accepted while nothing paired, @porkloin (#280)
+- Finish pairing when the PIN arrives right after the pairing request, instead of waiting forever (#280)
+- Refuse a PIN on `/submit-pin` that is not 4 digits, as the control panel does (#280)
+- Run the Nix service in the `moonshine` group and enable polkit, so it can keep the computer awake.
 
 ## [v0.19.1] - 23-11-2026
 
