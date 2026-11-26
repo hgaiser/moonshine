@@ -1,14 +1,15 @@
+use std::sync::Arc;
+
 use inputtino::{
-	BatteryState as InputtinoBatterState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
+	BatteryState as InputtinoBatteryState, DeviceDefinition, Joypad, JoypadMotionType, JoypadStickPosition, PS5Joypad,
 	SwitchJoypad, XboxOneJoypad,
 };
 use serde::{Deserialize, Serialize};
 use strum_macros::FromRepr;
-use tokio::sync::mpsc;
 
-use crate::session::stream::control::{
-	FeedbackCommand,
-	feedback::{EnableMotionEventCommand, RumbleCommand, SetLedCommand, TriggerEffectCommand},
+use super::touch::PointerEventKind;
+use crate::session::stream::control::feedback::{
+	EnableMotionEventCommand, Feedback, RumbleCommand, SetLedCommand, TriggerEffectCommand,
 };
 
 /// Configuration for the hold-to-Home gamepad button remap.
@@ -83,10 +84,10 @@ enum GamepadCapability {
 	_Touchpad = 0x08,
 
 	/// Can report accelerometer events.
-	_Acceleration = 0x10,
+	Acceleration = 0x10,
 
 	/// Can report gyroscope events.
-	_Gyro = 0x20,
+	Gyro = 0x20,
 
 	/// Reports battery state.
 	_BatteryState = 0x40,
@@ -138,21 +139,24 @@ impl GamepadInfo {
 		}
 	}
 
-	#[allow(dead_code)]
-	fn has_capability(&self, capability: &GamepadCapability) -> bool {
-		(self.capabilities & *capability as u16) != 0
+	fn motion_sensors(&self) -> impl Iterator<Item = JoypadMotionType> {
+		[
+			(GamepadCapability::Acceleration, JoypadMotionType::ACCELERATION),
+			(GamepadCapability::Gyro, JoypadMotionType::GYROSCOPE),
+		]
+		.into_iter()
+		.filter_map(move |(capability, sensor)| (self.capabilities & capability as u16 != 0).then_some(sensor))
 	}
 }
 
 #[derive(Debug)]
 pub(crate) struct GamepadTouch {
 	pub index: u8,
-	_event_type: u8,
+	event_kind: PointerEventKind,
 	// zero: [u8; 2], // Alignment/reserved
 	pointer_id: u32,
 	pub x: f32,
 	pub y: f32,
-	pub pressure: f32,
 }
 
 impl GamepadTouch {
@@ -164,7 +168,7 @@ impl GamepadTouch {
 			+ std::mem::size_of::<u32>() // pointer_id
 			+ std::mem::size_of::<f32>() // x
 			+ std::mem::size_of::<f32>() // y
-			+ std::mem::size_of::<f32>() // pressure
+			+ std::mem::size_of::<f32>() // pressure (on the wire; unused by DualSense)
 		;
 
 		if buffer.len() < EXPECTED_SIZE {
@@ -175,14 +179,16 @@ impl GamepadTouch {
 			return Err(());
 		}
 
+		let event_kind = PointerEventKind::from_repr(buffer[1])
+			.ok_or_else(|| tracing::warn!(event_type = buffer[1], "Unknown gamepad touch event type"))?;
+
 		Ok(Self {
 			index: buffer[0],
-			_event_type: buffer[1],
+			event_kind,
 			// zero: u16::from_le_bytes(buffer[2..4].try_into().unwrap()),
 			pointer_id: u32::from_le_bytes(buffer[4..8].try_into().unwrap()),
 			x: f32::from_le_bytes(buffer[8..12].try_into().unwrap()).clamp(0.0, 1.0),
 			y: f32::from_le_bytes(buffer[12..16].try_into().unwrap()).clamp(0.0, 1.0),
-			pressure: f32::from_le_bytes(buffer[16..20].try_into().unwrap()).clamp(0.0, 1.0),
 		})
 	}
 }
@@ -304,14 +310,13 @@ enum BatteryState {
 	Charging = 0x03,
 	NotCharging = 0x04,
 	Full = 0x05,
-	PercentageUnknown = 0xFF,
 }
 
 #[derive(Debug)]
 pub(crate) struct GamepadBattery {
 	pub index: u8,
 	battery_state: BatteryState,
-	battery_percentage: u8,
+	battery_percentage: Option<u8>,
 }
 
 impl GamepadBattery {
@@ -335,8 +340,22 @@ impl GamepadBattery {
 			index: buffer[0],
 			battery_state: BatteryState::from_repr(buffer[1])
 				.ok_or_else(|| tracing::warn!("Unknown battery state: {}", buffer[1]))?,
-			battery_percentage: buffer[2],
+			// Moonlight uses 0xff for an unknown percentage.
+			battery_percentage: (buffer[2] <= 100).then_some(buffer[2]),
 		})
+	}
+
+	fn update(&self, last_percentage: &mut u8) -> Option<(InputtinoBatteryState, u8)> {
+		let state = match self.battery_state {
+			BatteryState::Discharging => InputtinoBatteryState::BATTERY_DISCHARGING,
+			BatteryState::Charging => InputtinoBatteryState::BATTERY_CHARGHING,
+			BatteryState::Full => InputtinoBatteryState::BATTERY_FULL,
+			BatteryState::NotPresent | BatteryState::NotCharging | BatteryState::Unknown => return None,
+		};
+		if let Some(percentage) = self.battery_percentage {
+			*last_percentage = percentage;
+		}
+		Some((state, *last_percentage))
 	}
 }
 
@@ -344,11 +363,17 @@ pub(crate) struct Gamepad {
 	/// The underlying inputtino joypad, used to inject button presses, stick
 	/// positions, triggers, touchpad events, and motion data.
 	gamepad: inputtino::Joypad,
+
+	/// Client pointer IDs occupying the two DualSense finger slots.
+	touch_slots: [Option<u32>; 2],
+
+	last_battery_percentage: u8,
 }
 
 impl Gamepad {
-	pub async fn new(info: &GamepadInfo, feedback_tx: mpsc::Sender<FeedbackCommand>) -> Result<Self, ()> {
-		let id = format!("00:11:22:33:{:02x}", info.index);
+	pub(super) fn new(info: &GamepadInfo, feedback: Arc<Feedback>) -> Result<Self, ()> {
+		// inputtino parses this as a 6-octet MAC address (PS5 pairing info, SDL device linking).
+		let id = format!("00:11:22:33:00:{:02x}", info.index);
 		let definition = match info.kind {
 			GamepadKind::Unknown | GamepadKind::Xbox => DeviceDefinition::new(
 				"Moonshine XOne controller",
@@ -384,63 +409,48 @@ impl Gamepad {
 				let mut gamepad =
 					PS5Joypad::new(&definition).map_err(|e| tracing::warn!("Failed to create gamepad: {e}"))?;
 
+				// Feedback writes never wait for the control loop to drain pending reports.
 				gamepad.set_on_led({
-					let feedback_tx = feedback_tx.clone();
+					let feedback = feedback.clone();
 					let index = info.index;
+					// Skip identical color reports even after the pending slot has been drained.
+					let mut last_rgb = None;
 					move |r, g, b| {
-						let _ = feedback_tx.blocking_send(FeedbackCommand::SetLed(SetLedCommand {
-							id: index as u16,
-							rgb: (r as u8, g as u8, b as u8),
-						}));
+						let rgb = (r as u8, g as u8, b as u8);
+						if last_rgb != Some(rgb) {
+							feedback.led(SetLedCommand { id: index as u16, rgb });
+							last_rgb = Some(rgb);
+						}
 					}
 				});
 
 				gamepad.set_on_trigger_effect({
-					let feedback_tx = feedback_tx.clone();
+					let feedback = feedback.clone();
 					let index = info.index;
 					move |trigger_event_flags, type_left, type_right, left, right| {
-						let left: &[u8; 10] = if let Ok(left) = left.try_into() {
-							left
-						} else {
-							tracing::warn!("Couldn't convert left trigger effect.");
+						let (Ok(left), Ok(right)) = (<[u8; 10]>::try_from(left), <[u8; 10]>::try_from(right)) else {
+							tracing::warn!("Expected ten bytes for each adaptive trigger effect.");
 							return;
 						};
 
-						let right: &[u8; 10] = if let Ok(right) = right.try_into() {
-							right
-						} else {
-							tracing::warn!("Couldn't convert right trigger effect.");
-							return;
-						};
-
-						// tracing::info!("Trigger effect: {:?} {:?} {:?} {:?}", type_left, type_right, left, right);
-
-						let _ = feedback_tx.blocking_send(FeedbackCommand::TriggerEffect(TriggerEffectCommand {
+						feedback.trigger_effect(TriggerEffectCommand {
 							id: index as u16,
 							trigger_event_flags,
 							type_left,
 							type_right,
-							left: left.to_owned(),
-							right: right.to_owned(),
-						}));
+							left,
+							right,
+						});
 					}
 				});
 
-				// Enable gyro and accelerometer events.
-				let _ = feedback_tx
-					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
+				for motion_type in info.motion_sensors() {
+					feedback.motion(EnableMotionEventCommand {
 						id: info.index as u16,
 						report_rate: 100,
-						motion_type: JoypadMotionType::ACCELERATION as u8,
-					}))
-					.await;
-				let _ = feedback_tx
-					.send(FeedbackCommand::EnableMotionEvent(EnableMotionEventCommand {
-						id: info.index as u16,
-						report_rate: 100,
-						motion_type: JoypadMotionType::GYROSCOPE as u8,
-					}))
-					.await;
+						motion_type,
+					});
+				}
 
 				Joypad::PS5(gamepad)
 			},
@@ -449,19 +459,24 @@ impl Gamepad {
 			),
 		};
 
-		let feedback_tx_for_rumble = feedback_tx.clone();
 		gamepad.set_on_rumble({
 			let index = info.index;
 			move |low_frequency, high_frequency| {
-				let _ = feedback_tx_for_rumble.blocking_send(FeedbackCommand::Rumble(RumbleCommand {
+				// Hold-to-Home also sends rumble, so the last game report may not match the client.
+				feedback.rumble(RumbleCommand {
 					id: index as u16,
 					low_frequency: low_frequency as u16,
 					high_frequency: high_frequency as u16,
-				}));
+				});
 			}
 		});
 
-		Ok(Self { gamepad })
+		Ok(Self {
+			gamepad,
+			touch_slots: [None; 2],
+			// Match the initial DualSense level in inputtino.
+			last_battery_percentage: 100,
+		})
 	}
 
 	/// Apply button flags to the gamepad.
@@ -482,16 +497,42 @@ impl Gamepad {
 
 	pub fn touch(&mut self, touch: &GamepadTouch) {
 		if let Joypad::PS5(gamepad) = &self.gamepad {
-			if touch.pressure > 0.5 {
-				gamepad.place_finger(
-					touch.pointer_id,
-					(touch.x * PS5Joypad::TOUCHPAD_WIDTH as f32) as u16,
-					(touch.y * PS5Joypad::TOUCHPAD_HEIGHT as f32) as u16,
-				);
-			} else {
-				gamepad.release_finger(touch.pointer_id);
+			// Follow the touch lifecycle rather than pressure, which clients don't reliably fill in.
+			match touch.event_kind {
+				PointerEventKind::Down | PointerEventKind::Move => {
+					let slot = self
+						.touch_slot(touch.pointer_id)
+						.or_else(|| self.touch_slots.iter().position(Option::is_none));
+					let Some(slot) = slot else {
+						return;
+					};
+					self.touch_slots[slot] = Some(touch.pointer_id);
+					gamepad.place_finger(
+						slot as u32,
+						(touch.x * (PS5Joypad::TOUCHPAD_WIDTH - 1) as f32).round() as u16,
+						(touch.y * (PS5Joypad::TOUCHPAD_HEIGHT - 1) as f32).round() as u16,
+					);
+				},
+				PointerEventKind::Up | PointerEventKind::Cancel => {
+					if let Some(slot) = self.touch_slot(touch.pointer_id) {
+						self.touch_slots[slot] = None;
+						gamepad.release_finger(slot as u32);
+					}
+				},
+				PointerEventKind::CancelAll => {
+					for (slot, pointer_id) in self.touch_slots.iter_mut().enumerate() {
+						if pointer_id.take().is_some() {
+							gamepad.release_finger(slot as u32);
+						}
+					}
+				},
+				PointerEventKind::Hover | PointerEventKind::ButtonOnly | PointerEventKind::HoverLeave => {},
 			}
 		}
+	}
+
+	fn touch_slot(&self, pointer_id: u32) -> Option<usize> {
+		self.touch_slots.iter().position(|id| *id == Some(pointer_id))
 	}
 
 	pub fn set_motion(&self, motion: &GamepadMotion) {
@@ -505,22 +546,41 @@ impl Gamepad {
 		}
 	}
 
-	pub fn set_battery(&self, gamepad_battery: &GamepadBattery) {
-		if let Joypad::PS5(gamepad) = &self.gamepad {
-			let state = match gamepad_battery.battery_state {
-				BatteryState::Discharging => InputtinoBatterState::BATTERY_DISCHARGING,
-				BatteryState::Charging => InputtinoBatterState::BATTERY_CHARGHING,
-				BatteryState::Full => InputtinoBatterState::BATTERY_FULL,
-				BatteryState::NotPresent => return,
-				BatteryState::NotCharging => return,
-				BatteryState::Unknown => return,
-				_ => {
-					tracing::warn!("Unknown battery state: {:?}", gamepad_battery.battery_state);
-					return;
-				},
-			};
-
-			gamepad.set_battery(state, gamepad_battery.battery_percentage);
+	pub(super) fn set_battery(&mut self, battery: &GamepadBattery) {
+		if let Joypad::PS5(gamepad) = &self.gamepad
+			&& let Some((state, percentage)) = battery.update(&mut self.last_battery_percentage)
+		{
+			gamepad.set_battery(state, percentage);
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn only_advertised_sensors_are_requested() {
+		for (capabilities, expected) in [(0x02, &[][..]), (0x10, &[1][..]), (0x20, &[2][..]), (0x30, &[1, 2][..])] {
+			let arrival = [0, 0x02, capabilities, 0, 0, 0, 0, 0];
+			let info = GamepadInfo::from_bytes(&arrival).unwrap();
+			let sensors: Vec<_> = info.motion_sensors().map(|sensor| sensor as u8).collect();
+			assert_eq!(sensors, expected);
+		}
+	}
+
+	#[test]
+	fn unknown_battery_percentage_preserves_the_level_but_updates_charging() {
+		let mut percentage = 100;
+		let draining = GamepadBattery::from_bytes(&[0, 0x02, 65, 0]).unwrap();
+		assert_eq!(
+			draining.update(&mut percentage),
+			Some((InputtinoBatteryState::BATTERY_DISCHARGING, 65))
+		);
+		let charging = GamepadBattery::from_bytes(&[0, 0x03, 0xff, 0]).unwrap();
+		assert_eq!(
+			charging.update(&mut percentage),
+			Some((InputtinoBatteryState::BATTERY_CHARGHING, 65))
+		);
 	}
 }

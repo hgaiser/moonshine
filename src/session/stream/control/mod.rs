@@ -3,12 +3,11 @@ use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 use tokio::sync::watch;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
+use self::input::InputHandler;
 use self::input::gamepad::GamepadConfig;
-use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
 use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
@@ -22,6 +21,8 @@ use crate::session::stream::video::VideoStreamHandle;
 
 mod feedback;
 pub(crate) mod input;
+
+const MAX_GAMEPADS: usize = 16;
 
 /// Configuration for the control stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -163,6 +164,14 @@ impl<'a> ControlMessage<'a> {
 			ControlMessageType::LossStats => Ok(Self::LossStats),
 			ControlMessageType::FrameStats => Ok(Self::FrameStats),
 			ControlMessageType::InputData => {
+				if buffer.len() < 8 {
+					tracing::warn!(
+						"Expected input data message of at least 8 bytes, got {} bytes.",
+						buffer.len()
+					);
+					return Err(());
+				}
+
 				// Length of the input event, excluding the length itself.
 				let length = u32::from_be_bytes(buffer[4..8].try_into().unwrap());
 				if length as usize != buffer.len() - 8 {
@@ -463,9 +472,6 @@ async fn run_control_loop(
 
 	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 
-	// Create a channel over which we can receive feedback messages to send to the connected client.
-	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
-
 	// Sequence number of feedback messages.
 	let mut sequence_number = 0u32;
 	let mut send_hdr_mode = false;
@@ -483,15 +489,18 @@ async fn run_control_loop(
 			break;
 		}
 
-		// Check for feedback messages.
-		if let Ok(command) = feedback_rx.try_recv()
-			&& let Some(peer_id) = connected_peer
+		let feedback = input_handler.feedback.take();
+		if let Some(peer_id) = connected_peer
+			&& !feedback.is_empty()
 		{
-			tracing::debug!("Sending control feedback command: {command:?}");
-			let payload = command.as_packet();
-			let key = context.keys_rx.borrow().remote_input_key.clone();
-			send_to_peer(&mut host, peer_id, &key, sequence_number, &payload, "feedback");
-			sequence_number += 1;
+			let key = &context.keys_rx.borrow().remote_input_key;
+			for pending in feedback {
+				tracing::debug!("Sending gamepad feedback: {pending:?}");
+				pending.send(|payload| {
+					send_to_peer(&mut host, peer_id, key, sequence_number, payload, "feedback");
+					sequence_number += 1;
+				});
+			}
 		}
 
 		match host
@@ -510,7 +519,8 @@ async fn run_control_loop(
 			Ok(Some(Event::Receive { ref packet, .. })) => {
 				let mut control_message = match ControlMessage::from_bytes(packet.data()) {
 					Ok(control_message) => control_message,
-					Err(()) => break,
+					// Skip messages we can't parse (e.g. types from newer clients) instead of ending the session.
+					Err(()) => continue,
 				};
 				tracing::trace!("Received control message: {control_message:?}");
 
@@ -568,7 +578,7 @@ async fn run_control_loop(
 						stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
 					},
 					ControlMessage::InputData(event) => {
-						let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;
+						let _ = input_handler.handle_raw_input(event).await;
 					},
 					ControlMessage::HdrMode => {
 						tracing::info!("Received HdrMode toggle from client");
@@ -635,4 +645,19 @@ async fn run_control_loop(
 	// returns. Without this, the next session's control stream may
 	// fail to bind to the same port.
 	drop(host);
+}
+
+#[cfg(test)]
+mod tests {
+	use super::{ControlMessage, ControlMessageType};
+
+	#[test]
+	fn input_data_rejects_a_truncated_event_length() {
+		let mut message = [0; 7];
+		message[..2].copy_from_slice(&(ControlMessageType::InputData as u16).to_le_bytes());
+		for body_len in 0u16..4 {
+			message[2..4].copy_from_slice(&body_len.to_le_bytes());
+			assert!(ControlMessage::from_bytes(&message[..4 + usize::from(body_len)]).is_err());
+		}
+	}
 }

@@ -21,7 +21,10 @@ use self::{
 	mouse::{MouseButton, MouseMoveAbsolute, MouseMoveRelative, MouseScrollHorizontal, MouseScrollVertical},
 };
 
-use crate::session::stream::control::FeedbackCommand;
+use super::{
+	MAX_GAMEPADS,
+	feedback::{Feedback, RumbleCommand},
+};
 
 pub(crate) mod gamepad;
 mod keyboard;
@@ -138,7 +141,8 @@ impl InputEvent {
 
 pub(crate) struct InputHandler {
 	compositor: CompositorInput,
-	gamepad_tx: mpsc::Sender<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
+	gamepad_tx: mpsc::Sender<InputEvent>,
+	pub(super) feedback: Arc<Feedback>,
 }
 
 impl InputHandler {
@@ -147,7 +151,10 @@ impl InputHandler {
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 		gamepad_config: GamepadConfig,
 	) -> Result<Self, ()> {
-		let (gamepad_tx, gamepad_rx) = mpsc::channel(10);
+		// The control loop awaits sends into this channel, so a full channel stalls all input and ENet servicing.
+		let (gamepad_tx, gamepad_rx) = mpsc::channel(64);
+		let feedback = Arc::new(Feedback::default());
+		let gamepad_feedback = feedback.clone();
 
 		std::thread::spawn(move || {
 			let rt = tokio::runtime::Builder::new_current_thread()
@@ -159,16 +166,20 @@ impl InputHandler {
 				let local = tokio::task::LocalSet::new();
 				local
 					.run_until(async move {
-						run_gamepad_handler(gamepad_rx, stop_session_manager, gamepad_config).await;
+						run_gamepad_handler(gamepad_rx, gamepad_feedback, stop_session_manager, gamepad_config).await;
 					})
 					.await;
 			});
 		});
 
-		Ok(Self { compositor, gamepad_tx })
+		Ok(Self {
+			compositor,
+			gamepad_tx,
+			feedback,
+		})
 	}
 
-	async fn handle_input(&self, event: InputEvent, feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
+	async fn handle_input(&self, event: InputEvent) -> Result<(), ()> {
 		match event {
 			InputEvent::KeyDown(key) => {
 				if let Some(code) = key.to_linux_keycode() {
@@ -242,7 +253,7 @@ impl InputHandler {
 			// Gamepad events: forward to gamepad handler thread.
 			gamepad_event => {
 				self.gamepad_tx
-					.send((gamepad_event, feedback))
+					.send(gamepad_event)
 					.await
 					.map_err(|e| tracing::warn!("Failed to send gamepad event: {e}"))?;
 			},
@@ -250,9 +261,9 @@ impl InputHandler {
 		Ok(())
 	}
 
-	pub async fn handle_raw_input(&self, event: &[u8], feedback: mpsc::Sender<FeedbackCommand>) -> Result<(), ()> {
+	pub(super) async fn handle_raw_input(&self, event: &[u8]) -> Result<(), ()> {
 		let event = InputEvent::from_bytes(event)?;
-		self.handle_input(event, feedback).await
+		self.handle_input(event).await
 	}
 }
 
@@ -264,9 +275,8 @@ struct GamepadSlot {
 	/// Hold-to-Home button remap state machine.
 	remap: HoldToHome,
 
-	/// Channel to send feedback commands (rumble, LED, trigger effects, motion)
-	/// back to the client.
-	feedback_tx: mpsc::Sender<FeedbackCommand>,
+	/// Latest feedback to send back to the client.
+	feedback: Arc<Feedback>,
 
 	/// Gamepad index assigned by the client (0-15).
 	index: u8,
@@ -286,17 +296,17 @@ struct GamepadSlot {
 }
 
 impl GamepadSlot {
-	async fn new(
+	fn new(
 		info: &GamepadInfo,
-		feedback_tx: mpsc::Sender<FeedbackCommand>,
+		feedback: Arc<Feedback>,
 		config: &GamepadConfig,
 		timer_wake: Arc<Notify>,
 	) -> Result<Self, ()> {
-		let gamepad = Gamepad::new(info, feedback_tx.clone()).await?;
+		let gamepad = Gamepad::new(info, feedback.clone())?;
 		Ok(Self {
 			gamepad,
 			remap: HoldToHome::new(config),
-			feedback_tx,
+			feedback,
 			index: info.index,
 			timer_wake,
 			home_rumble_intensity: config.home_button.rumble_intensity,
@@ -359,25 +369,24 @@ impl GamepadSlot {
 	}
 
 	fn send_rumble(&self, low_frequency: u16, high_frequency: u16) {
-		let _ = self.feedback_tx.try_send(FeedbackCommand::Rumble(
-			crate::session::stream::control::feedback::RumbleCommand {
-				id: self.index as u16,
-				low_frequency,
-				high_frequency,
-			},
-		));
+		self.feedback.rumble(RumbleCommand {
+			id: self.index as u16,
+			low_frequency,
+			high_frequency,
+		});
 	}
 }
 
 async fn run_gamepad_handler(
-	mut command_rx: mpsc::Receiver<(InputEvent, mpsc::Sender<FeedbackCommand>)>,
+	mut command_rx: mpsc::Receiver<InputEvent>,
+	feedback: Arc<Feedback>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	gamepad_config: GamepadConfig,
 ) {
 	let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::InputHandlerStopped);
 	let _delay_stop = stop_session_manager.delay_shutdown_token();
 
-	let gamepads = Arc::new(Mutex::new([const { None }; 16]));
+	let gamepads = Arc::new(Mutex::new([const { None }; MAX_GAMEPADS]));
 	let timer_wake = Arc::new(Notify::new());
 
 	// Spawn a timer task that advances gamepads with pending deadlines.
@@ -385,12 +394,12 @@ async fn run_gamepad_handler(
 	let timer_wake_for_timer = timer_wake.clone();
 	tokio::task::spawn_local(run_timer_task(gamepads_timer, timer_wake_for_timer));
 
-	while let Ok(Some((command, feedback_tx))) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
+	while let Ok(Some(command)) = stop_session_manager.wrap_cancel(command_rx.recv()).await {
 		match command {
 			InputEvent::GamepadInfo(gamepad) => {
 				tracing::debug!("Gamepad info: {gamepad:?}");
 				let idx = gamepad.index as usize;
-				if idx >= 16 {
+				if idx >= MAX_GAMEPADS {
 					tracing::warn!(
 						"Received info for gamepad {}, but we only have 16 slots.",
 						gamepad.index
@@ -405,7 +414,7 @@ async fn run_gamepad_handler(
 
 				if needs_create
 					&& let Ok(new_slot) =
-						GamepadSlot::new(&gamepad, feedback_tx, &gamepad_config, timer_wake.clone()).await
+						GamepadSlot::new(&gamepad, feedback.clone(), &gamepad_config, timer_wake.clone())
 				{
 					let mut gamepads = gamepads.lock().await;
 					gamepads[idx] = Some(new_slot);
@@ -475,7 +484,7 @@ async fn run_gamepad_handler(
 			InputEvent::GamepadUpdate(gamepad_update) => {
 				tracing::trace!("Gamepad update: {gamepad_update:?}");
 				let idx = gamepad_update.index as usize;
-				if idx >= 16 {
+				if idx >= MAX_GAMEPADS {
 					tracing::warn!(
 						"Received update for gamepad {}, but we only have 16 gamepads.",
 						gamepad_update.index
@@ -496,13 +505,8 @@ async fn run_gamepad_handler(
 						gamepad_update.index
 					);
 					let synthetic_info = GamepadInfo::default_for_index(gamepad_update.index as u8);
-					if let Ok(new_slot) = GamepadSlot::new(
-						&synthetic_info,
-						feedback_tx.clone(),
-						&gamepad_config,
-						timer_wake.clone(),
-					)
-					.await
+					if let Ok(new_slot) =
+						GamepadSlot::new(&synthetic_info, feedback.clone(), &gamepad_config, timer_wake.clone())
 					{
 						let mut gamepads = gamepads.lock().await;
 						gamepads[idx] = Some(new_slot);
@@ -544,7 +548,7 @@ async fn run_gamepad_handler(
 	tracing::debug!("Input handler stopped.");
 }
 
-async fn run_timer_task(gamepads: Arc<Mutex<[Option<GamepadSlot>; 16]>>, wake: Arc<Notify>) {
+async fn run_timer_task(gamepads: Arc<Mutex<[Option<GamepadSlot>; MAX_GAMEPADS]>>, wake: Arc<Notify>) {
 	loop {
 		// Find the soonest deadline across all gamepads.
 		let next_deadline = {

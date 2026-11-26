@@ -1,25 +1,83 @@
+use std::sync::Mutex;
+
+use arrayvec::ArrayVec;
+use inputtino::JoypadMotionType;
+
+use super::MAX_GAMEPADS;
 use crate::session::stream::control::ControlMessageType;
 
-#[derive(Debug)]
-pub(crate) enum FeedbackCommand {
-	Rumble(RumbleCommand),
-	SetLed(SetLedCommand),
-	EnableMotionEvent(EnableMotionEventCommand),
-	TriggerEffect(TriggerEffectCommand),
+/// Unsent feedback per controller. Rumble preserves transitions in a short FIFO;
+/// other feedback keeps the latest state. Network work happens outside the lock.
+#[derive(Default)]
+pub(super) struct Feedback(Mutex<[Option<PendingFeedback>; MAX_GAMEPADS]>);
+
+impl Feedback {
+	pub(super) fn rumble(&self, command: RumbleCommand) {
+		self.update(command.id, |pending| {
+			if pending.rumble.is_full() {
+				pending.rumble.remove(0);
+			}
+			pending.rumble.push(command);
+		});
+	}
+
+	pub(super) fn led(&self, command: SetLedCommand) {
+		self.update(command.id, |pending| pending.led = Some(command));
+	}
+
+	pub(super) fn motion(&self, command: EnableMotionEventCommand) {
+		self.update(command.id, |pending| match command.motion_type {
+			JoypadMotionType::ACCELERATION => pending.accel = Some(command),
+			JoypadMotionType::GYROSCOPE => pending.gyro = Some(command),
+		});
+	}
+
+	pub(super) fn trigger_effect(&self, mut command: TriggerEffectCommand) {
+		self.update(command.id, |pending| {
+			if let Some(old) = pending.trigger.take() {
+				command.keep_unchanged_triggers(old);
+			}
+			pending.trigger = Some(command);
+		});
+	}
+
+	fn update(&self, id: u16, update: impl FnOnce(&mut PendingFeedback)) {
+		let mut pending = self.0.lock().unwrap();
+		update(pending[usize::from(id)].get_or_insert_with(PendingFeedback::default));
+	}
+
+	pub(super) fn take(&self) -> ArrayVec<PendingFeedback, MAX_GAMEPADS> {
+		self.0.lock().unwrap().iter_mut().filter_map(Option::take).collect()
+	}
 }
 
-impl FeedbackCommand {
-	pub fn as_packet(&self) -> Vec<u8> {
-		match self {
-			FeedbackCommand::Rumble(command) => command.as_packet().to_vec(),
-			FeedbackCommand::SetLed(command) => command.as_packet().to_vec(),
-			FeedbackCommand::EnableMotionEvent(command) => command.as_packet().to_vec(),
-			FeedbackCommand::TriggerEffect(command) => command.as_packet().to_vec(),
+#[derive(Debug, Default)]
+pub(super) struct PendingFeedback {
+	rumble: ArrayVec<RumbleCommand, 4>,
+	led: Option<SetLedCommand>,
+	accel: Option<EnableMotionEventCommand>,
+	gyro: Option<EnableMotionEventCommand>,
+	trigger: Option<TriggerEffectCommand>,
+}
+
+impl PendingFeedback {
+	pub(super) fn send(self, mut send: impl FnMut(&[u8])) {
+		for command in self.rumble {
+			send(&command.as_packet());
+		}
+		if let Some(command) = self.led {
+			send(&command.as_packet());
+		}
+		for command in [self.accel, self.gyro].into_iter().flatten() {
+			send(&command.as_packet());
+		}
+		if let Some(command) = self.trigger {
+			send(&command.as_packet());
 		}
 	}
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) struct RumbleCommand {
 	pub id: u16,
 	pub low_frequency: u16,
@@ -86,7 +144,7 @@ impl SetLedCommand {
 pub(crate) struct EnableMotionEventCommand {
 	pub id: u16,
 	pub report_rate: u16,
-	pub motion_type: u8,
+	pub motion_type: JoypadMotionType,
 }
 
 impl EnableMotionEventCommand {
@@ -107,7 +165,7 @@ impl EnableMotionEventCommand {
 		buffer[2..4].copy_from_slice(&(Self::PAYLOAD_LENGTH as u16).to_le_bytes());
 		buffer[4..6].copy_from_slice(&self.id.to_le_bytes());
 		buffer[6..8].copy_from_slice(&self.report_rate.to_le_bytes());
-		buffer[8] = self.motion_type;
+		buffer[8] = self.motion_type as u8;
 
 		buffer
 	}
@@ -134,6 +192,22 @@ impl TriggerEffectCommand {
 		+ 10 * std::mem::size_of::<u8>() // Left trigger effect (10 bytes).
 		+ 10 * std::mem::size_of::<u8>(); // Right trigger effect (10 bytes).
 
+	fn keep_unchanged_triggers(&mut self, old: Self) {
+		// DualSense valid_flag0 bits, as forwarded by inputtino.
+		const RIGHT: u8 = 0x04;
+		const LEFT: u8 = 0x08;
+		let unchanged = old.trigger_event_flags & !self.trigger_event_flags;
+		if unchanged & LEFT != 0 {
+			self.type_left = old.type_left;
+			self.left = old.left;
+		}
+		if unchanged & RIGHT != 0 {
+			self.type_right = old.type_right;
+			self.right = old.right;
+		}
+		self.trigger_event_flags |= unchanged;
+	}
+
 	pub fn as_packet(&self) -> [u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH] {
 		let mut buffer = [0u8; Self::HEADER_LENGTH + Self::PAYLOAD_LENGTH];
 
@@ -150,5 +224,119 @@ impl TriggerEffectCommand {
 		buffer[19..29].copy_from_slice(&self.right);
 
 		buffer
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn drain_packets(feedback: &Feedback) -> Vec<Vec<u8>> {
+		let mut packets = Vec::new();
+		for pending in feedback.take() {
+			pending.send(|packet| packets.push(packet.to_vec()));
+		}
+		packets
+	}
+
+	#[test]
+	fn rumble_overflow_keeps_the_latest_updates_per_controller() {
+		let feedback = Feedback::default();
+		for value in 1..=500 {
+			feedback.rumble(RumbleCommand {
+				id: 0,
+				low_frequency: value,
+				high_frequency: value,
+			});
+			feedback.rumble(RumbleCommand {
+				id: 1,
+				low_frequency: 0,
+				high_frequency: value,
+			});
+		}
+		let stop = RumbleCommand {
+			id: 0,
+			low_frequency: 0,
+			high_frequency: 0,
+		};
+		feedback.rumble(stop);
+
+		let expected = [
+			(0, 498),
+			(0, 499),
+			(0, 500),
+			(0, 0),
+			(1, 497),
+			(1, 498),
+			(1, 499),
+			(1, 500),
+		]
+		.map(|(id, value)| {
+			RumbleCommand {
+				id,
+				low_frequency: if id == 0 { value } else { 0 },
+				high_frequency: value,
+			}
+			.as_packet()
+		});
+		assert_eq!(drain_packets(&feedback), expected);
+		assert!(drain_packets(&feedback).is_empty());
+	}
+
+	#[test]
+	fn rumble_preserves_a_short_pulse_between_drains() {
+		let feedback = Feedback::default();
+		let start = RumbleCommand {
+			id: 0,
+			low_frequency: 500,
+			high_frequency: 500,
+		};
+		let stop = RumbleCommand {
+			low_frequency: 0,
+			high_frequency: 0,
+			..start
+		};
+		feedback.rumble(start);
+		feedback.rumble(stop);
+		assert_eq!(drain_packets(&feedback), [start.as_packet(), stop.as_packet()]);
+	}
+
+	#[test]
+	fn partial_trigger_updates_keep_both_latest_effects() {
+		let feedback = Feedback::default();
+		for (flags, left, right) in [(0x0c, 1, 2), (0x08, 3, 0), (0x04, 0, 4)] {
+			feedback.trigger_effect(TriggerEffectCommand {
+				id: 0,
+				trigger_event_flags: flags,
+				type_left: left,
+				type_right: right,
+				left: [left; 10],
+				right: [right; 10],
+			});
+		}
+
+		let expected = TriggerEffectCommand {
+			id: 0,
+			trigger_event_flags: 0x0c,
+			type_left: 3,
+			type_right: 4,
+			left: [3; 10],
+			right: [4; 10],
+		};
+		assert_eq!(drain_packets(&feedback), [expected.as_packet()]);
+	}
+
+	#[test]
+	fn enabling_one_sensor_does_not_replace_the_other() {
+		let feedback = Feedback::default();
+		for motion_type in [JoypadMotionType::ACCELERATION, JoypadMotionType::GYROSCOPE] {
+			feedback.motion(EnableMotionEventCommand {
+				id: 0,
+				report_rate: 100,
+				motion_type,
+			});
+		}
+		let packets = drain_packets(&feedback);
+		assert_eq!(packets.iter().map(|packet| packet[8]).collect::<Vec<_>>(), [1, 2]);
 	}
 }
