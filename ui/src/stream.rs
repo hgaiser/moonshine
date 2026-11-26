@@ -31,6 +31,7 @@
 //! | browser | 3 key frame | none: a frame was lost |
 //! | browser | 4 stop | none: stop the session |
 //! | browser | 5 ping | browser time f64 (ms) |
+//! | browser | 6 invalidate | first frame u32, last frame u32: frames from `first` were lost, and `last` is the newest frame seen; the server sends a recovery frame that does not refer to them, or a key frame |
 //! | server | 1 ready | JSON [`StreamParams`] |
 //! | server | 2 feedback | a Moonlight feedback packet (rumble and so on) |
 //! | server | 3 ended | the reason, UTF-8 |
@@ -133,6 +134,8 @@ pub enum ClientEvent {
 	Input(Vec<u8>),
 	/// A frame was lost.
 	RequestKeyFrame,
+	/// The frames from `first` were lost; `last` is the newest frame the browser saw.
+	InvalidateReferenceFrames { first: u32, last: u32 },
 	/// Stop the session.
 	Stop,
 }
@@ -198,6 +201,7 @@ const CLIENT_INPUT: u8 = 2;
 const CLIENT_KEY_FRAME: u8 = 3;
 const CLIENT_STOP: u8 = 4;
 const CLIENT_PING: u8 = 5;
+const CLIENT_INVALIDATE: u8 = 6;
 
 const SERVER_READY: u8 = 1;
 const SERVER_FEEDBACK: u8 = 2;
@@ -792,6 +796,15 @@ async fn read_commands(mut recv: RecvStream, commands: mpsc::Sender<ClientEvent>
 			CLIENT_START => ClientEvent::Start,
 			CLIENT_INPUT => ClientEvent::Input(payload),
 			CLIENT_KEY_FRAME => ClientEvent::RequestKeyFrame,
+			CLIENT_INVALIDATE => {
+				let Some((first, last)) = payload.split_first_chunk::<4>().and_then(|(first, rest)| {
+					let last = <[u8; 4]>::try_from(rest).ok()?;
+					Some((u32::from_le_bytes(*first), u32::from_le_bytes(last)))
+				}) else {
+					continue;
+				};
+				ClientEvent::InvalidateReferenceFrames { first, last }
+			},
 			CLIENT_STOP => ClientEvent::Stop,
 			CLIENT_PING => {
 				if let Ok(bytes) = <[u8; 8]>::try_from(payload.as_slice()) {

@@ -658,7 +658,9 @@ impl SessionManager {
 				VideoDynamicRange::Sdr
 			},
 			chroma_sampling_type: VideoChromaSampling::Yuv420,
-			max_reference_frames: 1,
+			// The browser recovers from a lost frame with reference frame invalidation. It sees a
+			// loss later than Moonlight does (it waits for late datagrams), so it gets the most.
+			max_reference_frames: crate::rtsp::MAX_REFERENCES,
 			full_range: false,
 			encrypt_video: false,
 		};

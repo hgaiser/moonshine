@@ -27,6 +27,9 @@ pub enum BrowserCommand {
 	Input(Vec<u8>),
 	/// The browser lost a frame and needs a key frame.
 	RequestKeyFrame,
+	/// The browser lost the frames from `first` (it saw frames up to `last`) and needs a
+	/// frame that does not refer to them.
+	InvalidateReferenceFrames { first: u32, last: u32 },
 	/// The user stopped the session.
 	Stop,
 }
@@ -186,6 +189,9 @@ async fn run_browser_client(
 					let _ = controls.input.handle_raw_input(&event, feedback_tx.clone()).await;
 				},
 				Some(BrowserCommand::RequestKeyFrame) => controls.video.request_idr_frame(),
+				Some(BrowserCommand::InvalidateReferenceFrames { first, last }) => {
+					controls.video.invalidate_reference_frames(first, last)
+				},
 				Some(BrowserCommand::Stop) => {
 					tracing::info!("The browser stopped the session.");
 					let _ = stop.trigger_shutdown(SessionShutdownReason::UserStopped);

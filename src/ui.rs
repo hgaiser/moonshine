@@ -1812,6 +1812,9 @@ fn stream_link(stream: BrowserStream, fec_percent: u8) -> StreamLink {
 				ClientEvent::Start => BrowserCommand::Start,
 				ClientEvent::Input(packet) => BrowserCommand::Input(packet),
 				ClientEvent::RequestKeyFrame => BrowserCommand::RequestKeyFrame,
+				ClientEvent::InvalidateReferenceFrames { first, last } => {
+					BrowserCommand::InvalidateReferenceFrames { first, last }
+				},
 				ClientEvent::Stop => BrowserCommand::Stop,
 			};
 			if commands.send(command).await.is_err() {

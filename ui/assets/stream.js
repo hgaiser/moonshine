@@ -9,14 +9,20 @@
 
 import { FrameShards, parseVideoDatagram } from "/fec.js";
 
-const CLIENT = { start: 1, input: 2, keyFrame: 3, stop: 4, ping: 5 };
+const CLIENT = { start: 1, input: 2, keyFrame: 3, stop: 4, ping: 5, invalidate: 6 };
 const SERVER = { ready: 1, feedback: 2, ended: 3, pong: 4, error: 5 };
 const DATAGRAM = { video: 1, audio: 2 };
 
-// A frame that is still incomplete this long after a newer frame arrived is lost.
-const LOSS_TIMEOUT_MS = 100;
+// A frame that is still incomplete this long after a newer frame arrived is lost. The server sends
+// a frame's datagrams before the next frame's, so only reordering on the way delays them. Short,
+// because the encoder must still hold a reference from before the loss.
+const LOSS_TIMEOUT_MS = 40;
 // How often to ask again for a key frame while the stream waits for one.
 const KEY_FRAME_RETRY_MS = 250;
+// How long to wait for the recovery frame after a loss (plus the round trip), before a key frame.
+const RECOVERY_TIMEOUT_MS = 250;
+// A decoder error this soon after a recovery frame means that the decoder cannot use them.
+const RECOVERY_ERROR_MS = 1000;
 // The audio buffer target.
 const AUDIO_TARGET_S = 0.03;
 
@@ -217,12 +223,17 @@ class Player {
     this.held = new Set();
     this.buttons = new Set();
     this.pads = new Map(); // gamepad.index -> { slot, state }
-    this.stats = { frames: 0, lost: 0, recovered: 0, bytes: 0, decodeMs: [], rtt: null, since: performance.now(), keyRequests: 0 };
+    this.stats = { frames: 0, lost: 0, recovered: 0, bytes: 0, decodeMs: [], rtt: null, since: performance.now(), keyRequests: 0, recoveries: 0 };
     this.totals = { frames: 0, audioPackets: 0 };
     this.frames = new Map();
     this.next = null;
     this.waitingKey = true;
     this.lastKeyRequest = 0;
+    // After a loss: { lost (the first lost frame), since }, until a recovery frame or key frame.
+    this.recovering = null;
+    // Reference frame invalidation; off when the decoder fails on a recovery frame.
+    this.invalidation = true;
+    this.lastRecovery = -Infinity;
     this.decodeStart = new Map();
     this.audioSequence = null;
     this.listeners = [];
@@ -497,12 +508,13 @@ class Player {
     if (this.next !== null && number + 64 < this.next && (h.flags & 1)) {
       this.frames.clear();
       this.next = null;
+      this.recovering = null;
     }
     if (this.next !== null && number < this.next) return;
 
     let frame = this.frames.get(number);
     if (!frame) {
-      frame = { number, shards: new FrameShards(h), key: (h.flags & 1) !== 0, timestamp: h.timestamp, first: performance.now() };
+      frame = { number, shards: new FrameShards(h), key: (h.flags & 1) !== 0, recovery: (h.flags & 2) !== 0, timestamp: h.timestamp, first: performance.now() };
       this.frames.set(number, frame);
     }
     if (frame.complete) return;
@@ -524,6 +536,23 @@ class Player {
         for (const n of [...this.frames.keys()]) if (n < key.number) this.frames.delete(n);
         this.next = key.number;
         this.waitingKey = false;
+        this.recovering = null;
+      }
+      if (this.recovering) {
+        // The frames after the lost one refer to it: go on at the first recovery or key frame.
+        // A recovery frame refers only to frames before the loss, which were decoded.
+        let start = null;
+        for (const f of this.frames.values()) {
+          if (f.complete && f.number > this.recovering.lost && (f.key || f.recovery) && (!start || f.number < start.number)) start = f;
+        }
+        if (!start) return;
+        for (const n of [...this.frames.keys()]) if (n < start.number) this.frames.delete(n);
+        this.next = start.number;
+        this.recovering = null;
+        if (start.recovery && !start.key) {
+          this.stats.recoveries++;
+          this.lastRecovery = performance.now();
+        }
       }
       const frame = this.frames.get(this.next);
       if (!frame || !frame.complete) return;
@@ -539,6 +568,15 @@ class Player {
       if (performance.now() - this.lastKeyRequest > KEY_FRAME_RETRY_MS) this.requestKeyFrame();
       return;
     }
+    if (this.recovering) {
+      // The recovery frame did not come (or was lost too): ask for a key frame.
+      if (performance.now() - this.recovering.since > RECOVERY_TIMEOUT_MS + (this.stats.rtt ?? 0)) {
+        this.recovering = null;
+        this.waitingKey = true;
+        this.requestKeyFrame();
+      }
+      return;
+    }
     if (this.next === null) return;
     const blocking = this.frames.get(this.next);
     let newer = null;
@@ -547,8 +585,18 @@ class Player {
     // A newer frame arrived, and the next one is still not complete.
     if (performance.now() - newer.first > LOSS_TIMEOUT_MS && !(blocking && blocking.complete)) {
       this.stats.lost++;
-      this.waitingKey = true;
-      this.requestKeyFrame();
+      if (this.invalidation && this.decoder && this.decoder.state === "configured") {
+        let last = this.next;
+        for (const n of this.frames.keys()) last = Math.max(last, n);
+        this.recovering = { lost: this.next, since: performance.now() };
+        const payload = new DataView(new ArrayBuffer(8));
+        payload.setUint32(0, this.next, true);
+        payload.setUint32(4, last, true);
+        this.send(CLIENT.invalidate, payload.buffer);
+      } else {
+        this.waitingKey = true;
+        this.requestKeyFrame();
+      }
       this.pump();
     }
   }
@@ -587,7 +635,14 @@ class Player {
   createDecoder(codec) {
     this.decoder = new VideoDecoder({
       output: videoFrame => this.render(videoFrame),
-      error: e => { console.warn("The video decoder failed:", e); this.resetDecoder(); },
+      error: e => {
+        console.warn("The video decoder failed:", e);
+        if (this.invalidation && performance.now() - this.lastRecovery < RECOVERY_ERROR_MS) {
+          console.warn("The decoder cannot use recovery frames: lost frames need a key frame from now on.");
+          this.invalidation = false;
+        }
+        this.resetDecoder();
+      },
     });
     this.decoder.configure({ codec, optimizeForLatency: true, hardwareAcceleration: "no-preference" });
     this.codec = codec;
@@ -596,6 +651,7 @@ class Player {
   resetDecoder() {
     try { this.decoder?.close(); } catch { /* Closed already. */ }
     this.decoder = null;
+    this.recovering = null;
     this.waitingKey = true;
     this.requestKeyFrame();
   }
@@ -1021,7 +1077,7 @@ class Player {
       `Bitrate   ${(this.stats.bytes * 8 / seconds / 1e6).toFixed(1)} Mb/s`,
       `Decode    ${Number.isFinite(decode) ? decode.toFixed(1) + " ms" : "–"}`,
       `Round trip ${this.stats.rtt !== null ? this.stats.rtt.toFixed(1) + " ms" : "–"}`,
-      `Lost      ${this.stats.lost} frames, ${this.stats.keyRequests} key frame requests`,
+      `Lost      ${this.stats.lost} frames, ${this.stats.recoveries} recovered without a key frame, ${this.stats.keyRequests} key frame requests`,
       `FEC       ${this.stats.recovered} lost packets rebuilt`,
     ].join("\n");
     this.resetStats();
