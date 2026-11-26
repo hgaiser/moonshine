@@ -97,6 +97,7 @@ function onSnapshot(s) {
   if (changedPart("settings", s.settings)) syncSettings();
   if (changedPart("restart", s.restart_needed)) renderRestart();
   setNavCounts();
+  if (!old) guide.start();
 }
 
 /* ---------- Session + stats ---------- */
@@ -817,6 +818,119 @@ const bannerFx = (() => {
     if (!on) offAt = performance.now();
     else if (!raf && !still.matches) { last = performance.now(); raf = requestAnimationFrame(frame); }
   };
+})();
+
+/* ---------- Guide ---------- */
+// A tour for new users: the page goes dark except one part, and a card tells what that part does.
+// It opens by itself until the user turns it off. The guide button in the masthead opens it again.
+const guide = (() => {
+  const KEY = "moonshine-guide";
+  const STEPS = [
+    { page: "home", sel: "nav.rail", title: "Pages", text: "The control panel has five pages. Select a page here to open it." },
+    { page: "home", sel: "#session", title: "Stream", text: "This panel shows which device streams which application. While a device streams, live graphs show the latency, bitrate and frame rate. You can also stop the stream here." },
+    { page: "home", sel: "#page-home .panel:has(#health)", title: "Health", text: "When Moonshine starts, it checks the GPU, the encoders and the ports. A warning tells you what to repair. After a repair, select Check again." },
+    { page: "home", sel: "#bell", title: "Notifications", text: "The bell shows pairing requests, health warnings and stream events. The number shows how many you did not read." },
+    { page: "clients", sel: "#pair-panel", title: "Pair a device", text: "To add a device, select this computer in Moonlight. Moonlight shows a PIN. Type that PIN here. Turn off Allow new devices to refuse all new devices." },
+    { page: "clients", sel: "#page-clients .panel:has(#client-list)", title: "Paired devices", text: "These devices can stream from this computer. Rename a device to find it easily. Unpair a device to remove its access." },
+    { page: "apps", sel: "#app-list > .panel:first-child", title: "Your applications", text: "Add an application with a name and a command. Clients show it in their app list." },
+    { page: "apps", sel: "#app-list > .section-head", title: "Scanners", text: "A scanner finds your Steam games or desktop apps. It updates the list when you install or remove something. Hide an app that you do not want to see in Moonlight." },
+    { page: "config", sel: "#settings > :first-child", title: "Settings", text: "Each setting shows when a change takes effect: now, at the next stream, or after a restart. Select Save to write your changes to config.toml." },
+    { page: "logs", sel: "#report", title: "Logs", text: "This page shows the latest messages from Moonshine. If you find a bug, download the report and attach it to the issue." },
+    { page: null, sel: "#guide-btn", title: "Open the guide again", text: "Select guide to see this tour again." }
+  ];
+  const get = () => { try { return localStorage.getItem(KEY); } catch (e) { return null; } };
+  const put = v => { try { localStorage.setItem(KEY, v); } catch (e) { /* storage blocked */ } };
+  let ui = null, i = 0, raf = 0, last = "", from = "", inerted = [], focusBack = null;
+
+  // The part to light up. If it is not on the page (for example, no settings yet), light up the page heading.
+  function target(s) {
+    const t = $(s.sel);
+    if (t && t.getClientRects().length) return t;
+    return s.page ? $(`#page-${s.page} .page-head`) : null;
+  }
+
+  function show(n) {
+    i = n; last = "";
+    const s = STEPS[i];
+    if (s.page && location.hash.slice(1) !== s.page) { location.hash = s.page; route(); }
+    const t = target(s);
+    if (t) t.scrollIntoView({ block: t.offsetHeight < innerHeight * .6 ? "center" : "start" });
+    ui.card.innerHTML = `
+      <div class="guide-step">${i + 1} / ${STEPS.length}</div>
+      <h2 id="guide-title">${esc(s.title)}</h2>
+      <p id="guide-text">${esc(s.text)}</p>
+      <label class="switch guide-off"><input type="checkbox" id="guide-off" ${ui.off ? "checked" : ""}><span>Do not show the guide at start</span></label>
+      <div class="guide-actions">
+        <button class="btn sm ghost" data-g="close">Close</button><span class="grow"></span>
+        ${i ? '<button class="btn sm" data-g="back">Back</button>' : ""}
+        <button class="btn sm primary" data-g="next">${i === STEPS.length - 1 ? "Done" : "Next"}</button>
+      </div>`;
+    $("#guide-off").onchange = e => { ui.off = e.target.checked; };
+    $$("[data-g]", ui.card).forEach(b => b.onclick = () => ({ close, back: () => show(i - 1), next })[b.dataset.g]());
+    $('[data-g="next"]', ui.card).focus();
+  }
+  const next = () => i < STEPS.length - 1 ? show(i + 1) : close();
+
+  // Follow the part every frame: the page renders again when new data arrives, and it can scroll or resize.
+  function track() {
+    raf = requestAnimationFrame(track);
+    const t = target(STEPS[i]); if (!t) return;
+    const r = t.getBoundingClientRect(), vw = document.documentElement.clientWidth, vh = innerHeight, pad = 6, g = 12;
+    const top = Math.max(4, r.top - pad), bot = Math.min(vh - 4, r.bottom + pad), left = Math.max(4, r.left - pad), right = Math.min(vw - 4, r.right + pad);
+    const cw = ui.card.offsetWidth, ch = ui.card.offsetHeight;
+    const key = [top, bot, left, right, vw, vh, cw, ch].join();
+    if (key === last) return; last = key;
+    Object.assign(ui.hole.style, { top: top + "px", left: left + "px", width: Math.max(0, right - left) + "px", height: Math.max(0, bot - top) + "px" });
+    // Below the part, then above, then at its right or left, and else over its bottom.
+    const clampX = x => Math.max(g, Math.min(vw - cw - g, x)), clampY = y => Math.max(g, Math.min(vh - ch - g, y));
+    let x, y;
+    if (bot + g + ch <= vh - g) { x = clampX(left); y = bot + g; }
+    else if (top - g - ch >= g) { x = clampX(left); y = top - g - ch; }
+    else if (right + g + cw <= vw - g) { x = right + g; y = clampY(top); }
+    else if (left - g - cw >= g) { x = left - g - cw; y = clampY(top); }
+    else { x = clampX(left); y = vh - ch - g; }
+    ui.card.style.left = x + "px"; ui.card.style.top = y + "px";
+  }
+
+  function onKey(e) {
+    if (e.key === "Escape") { e.preventDefault(); e.stopPropagation(); close(); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); next(); }
+    else if (e.key === "ArrowLeft" && i) { e.preventDefault(); show(i - 1); }
+  }
+
+  function open() {
+    if (ui) return;
+    toggleBell(false);
+    $("#modal-root").innerHTML = "";
+    from = location.hash || "#home";
+    focusBack = document.activeElement;
+    const root = document.createElement("div");
+    root.innerHTML = `<div class="guide-block"></div><div class="guide-hole"></div>
+      <div class="guide-card" role="dialog" aria-modal="true" aria-labelledby="guide-title" aria-describedby="guide-text"></div>`;
+    // Everything behind the guide is out of reach for the mouse and the keyboard.
+    inerted = [...document.body.children].filter(el => !el.inert);
+    inerted.forEach(el => { el.inert = true; });
+    document.body.appendChild(root);
+    ui = { root, hole: $(".guide-hole", root), card: $(".guide-card", root), off: get() !== "on" };
+    document.addEventListener("keydown", onKey, true);
+    show(0);
+    raf = requestAnimationFrame(track);
+  }
+
+  function close() {
+    if (!ui) return;
+    put(ui.off ? "off" : "on");
+    cancelAnimationFrame(raf);
+    document.removeEventListener("keydown", onKey, true);
+    ui.root.remove(); ui = null;
+    inerted.forEach(el => { el.inert = false; }); inerted = [];
+    if (location.hash !== from) { location.hash = from; route(); }
+    if (focusBack && focusBack.focus) focusBack.focus();
+  }
+
+  $("#guide-btn").onclick = e => { e.stopPropagation(); open(); };
+  // At start, wait for the first data so the panels have their size.
+  return { start() { if (get() !== "off") requestAnimationFrame(open); } };
 })();
 
 /* ---------- Theme ---------- */
