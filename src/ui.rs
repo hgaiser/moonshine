@@ -681,6 +681,7 @@ impl UiBackend {
 			audio_channels: status.context.audio_channels as u32,
 			stream: status.stream.as_ref().map(stream_start),
 			started: unix(status.started),
+			browser_rejoin: status.browser_rejoin,
 		};
 		Some((info, status.client))
 	}

@@ -3,7 +3,7 @@
 //! The page asks for a token (`POST /api/stream/token`), opens a WebTransport session at
 //! `https://<host>:<port>/stream?token=<token>` on the control panel's port (UDP) and opens one
 //! bidirectional stream for control messages. Its first message is `start`, with what it wants to
-//! stream; only then does the [`Backend`] start or join a session.
+//! stream; only then does the [`Backend`] start a session, or attach the browser again to its own.
 //!
 //! # Wire protocol
 //!
@@ -69,7 +69,8 @@ pub enum VideoCodec {
 /// What the browser wants to stream.
 #[derive(Clone, Debug, Deserialize)]
 pub struct StreamRequest {
-	/// The application's ID, as Moonlight knows it. Ignored when the browser joins a running session.
+	/// The application's ID, as Moonlight knows it. Ignored when the browser attaches again to its
+	/// session.
 	pub application_id: i32,
 	pub width: u32,
 	pub height: u32,

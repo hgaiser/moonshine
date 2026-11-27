@@ -53,6 +53,9 @@ pub struct SessionStatus {
 
 	/// The video stream as negotiated with the client, once it runs.
 	pub stream: Option<StreamInfo>,
+
+	/// Whether a browser can attach to the session again: a browser streamed it and went away.
+	pub browser_rejoin: bool,
 }
 
 /// The settings a session is created with. Changes apply to the next session.
@@ -350,6 +353,7 @@ impl SessionManager {
 			client: guard.session_client.clone(),
 			started: guard.session_started.unwrap_or_else(SystemTime::now),
 			stream: self.stats_tx.join().0,
+			browser_rejoin: matches!(session, SessionState::Active(active) if active.browser_can_rejoin()),
 		})
 	}
 
@@ -576,13 +580,17 @@ impl SessionManager {
 		Ok(())
 	}
 
-	/// Stream to a browser: join the active session, or start a new session when there is none.
+	/// Stream to a browser: start a new session, or attach again to the session of a browser that
+	/// went away. Any other session has to stop first.
 	pub async fn stream_to_browser(&self, request: BrowserStreamRequest) -> Result<BrowserStream, String> {
 		let joining = {
 			let guard = self.inner.lock().await;
-			match guard.session {
+			match &guard.session {
 				None => false,
-				Some(SessionState::Active(_)) => true,
+				Some(SessionState::Active(active)) if active.browser_can_rejoin() => true,
+				Some(SessionState::Active(_)) => {
+					return Err("Another device streams now. Stop that stream first.".to_string());
+				},
 				Some(_) => return Err("A client is starting a session. Try again in a moment.".to_string()),
 			}
 		};

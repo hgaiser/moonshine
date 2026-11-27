@@ -3,11 +3,12 @@
 //! A session has one encoder. A browser attaches to the session: the video and audio sinks switch
 //! to the browser's channels, and the browser's input goes to the session's input handler. When the
 //! browser goes away, it detaches, and the session stays until `stream_timeout` passes without a
-//! client, as it does for Moonlight. A Moonlight client that resumes the session takes it over
-//! again, and the other way around.
+//! client, as it does for Moonlight. In that time, a browser can attach again (a reconnect). A
+//! browser cannot take over a session that another client streams, but a Moonlight client that
+//! resumes the session takes it over from the browser.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_shutdown::ShutdownManager;
@@ -69,6 +70,21 @@ pub struct BrowserStream {
 pub(crate) struct Attachment {
 	/// Tells the browser's task that another client took over.
 	detach: Arc<Notify>,
+	/// False once the browser went away.
+	connected: Arc<AtomicBool>,
+}
+
+/// The browser task's side of an [`Attachment`]. Marks the attachment as gone when the task ends,
+/// on every path.
+struct Link {
+	detach: Arc<Notify>,
+	connected: Arc<AtomicBool>,
+}
+
+impl Drop for Link {
+	fn drop(&mut self) {
+		self.connected.store(false, Ordering::Relaxed);
+	}
 }
 
 /// Frames that wait for the browser's sender. Few: the pipeline drops captures instead.
@@ -81,8 +97,9 @@ const AUDIO_QUEUE: usize = 16;
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(1);
 
 impl ActiveSession {
-	/// Attach a browser that can decode `codecs` (and `codecs_10bit` in 10 bits). A browser that
-	/// is attached already, or the Moonlight client, loses the stream.
+	/// Attach a browser that can decode `codecs` (and `codecs_10bit` in 10 bits): to a session
+	/// that it started, or again after the browser went away (see [`Self::browser_can_rejoin`]).
+	/// A Moonlight client that still streams loses the stream.
 	pub(crate) fn attach_browser(
 		&mut self,
 		codecs: &[VideoFormat],
@@ -115,16 +132,20 @@ impl ActiveSession {
 		self.controls.video.set_sink(VideoSink::Browser(video_tx));
 
 		let detach = Arc::new(Notify::new());
+		let connected = Arc::new(AtomicBool::new(true));
 		tokio::spawn(run_browser_client(
 			commands_rx,
 			events_tx,
 			self.controls.clone(),
-			detach.clone(),
+			Link {
+				detach: detach.clone(),
+				connected: connected.clone(),
+			},
 			self.attachment.clone(),
 			generation,
 			stop,
 		));
-		self.browser = Some(Attachment { detach });
+		self.browser = Some(Attachment { detach, connected });
 
 		tracing::info!("A browser attached to the session.");
 		Ok(BrowserStream {
@@ -141,6 +162,15 @@ impl ActiveSession {
 			events,
 			commands,
 		})
+	}
+
+	/// Whether a browser streamed this session last and went away: then a browser can attach
+	/// again. A session that a Moonlight client streams, or that a browser still streams, has to
+	/// stop first.
+	pub(crate) fn browser_can_rejoin(&self) -> bool {
+		self.browser
+			.as_ref()
+			.is_some_and(|browser| !browser.connected.load(Ordering::Relaxed))
 	}
 
 	/// A Moonlight client resumes the session: an attached browser loses the stream.
@@ -161,7 +191,7 @@ async fn run_browser_client(
 	mut commands: mpsc::Receiver<BrowserCommand>,
 	events: mpsc::Sender<BrowserEvent>,
 	controls: SessionControls,
-	detach: Arc<Notify>,
+	link: Link,
 	attachment: Arc<AtomicU64>,
 	generation: u64,
 	stop: ShutdownManager<SessionShutdownReason>,
@@ -175,7 +205,7 @@ async fn run_browser_client(
 				let _ = events.try_send(BrowserEvent::Ended("The session ended.".to_string()));
 				return;
 			},
-			_ = detach.notified() => {
+			_ = link.detach.notified() => {
 				let _ = events.try_send(BrowserEvent::Ended("Another client took over the session.".to_string()));
 				return;
 			},

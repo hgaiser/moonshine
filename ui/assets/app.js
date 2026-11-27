@@ -128,7 +128,7 @@ function renderSession() {
     el.innerHTML = `
       <div class="session-top">
         <div class="session-title"><h3>${title}</h3>${pill}</div>
-        <span style="display:flex;gap:8px"><button class="btn sm" id="join-browser">Play</button><button class="btn sm danger" id="stop">Stop stream</button></span>
+        <span style="display:flex;gap:8px">${s.browser_rejoin ? '<button class="btn sm" id="join-browser">Reconnect</button>' : ""}<button class="btn sm danger" id="stop">Stop stream</button></span>
       </div>
       <div id="stop-confirm"></div>
       <dl class="facts">
@@ -146,7 +146,8 @@ function renderSession() {
       $("#stop-yes").onclick = async () => { $("#stop-yes").disabled = true; await act("stop_session"); };
     };
   }
-  // Play in this browser: from the banner always, and next to Stop stream to take over a session.
+  // Play in this browser: from the banner always, and next to Stop stream to reconnect to the
+  // session of a browser that lost its stream.
   const off = snap.server?.browser_streaming === false;
   $("#play").hidden = off;
   const joinButton = $("#join-browser");
@@ -834,8 +835,8 @@ const guide = (() => {
   const KEY = "moonshine-guide";
   const STEPS = [
     { page: "home", sel: "nav.rail", title: "Pages", text: "The control panel has five pages. Select a page here to open it." },
-    { page: "home", sel: "#session", title: "Stream", text: "This panel shows which device streams which application. While a device streams, live graphs show the latency, bitrate and frame rate. You can also stop the stream here, or select Play to take it over in this browser." },
-    { page: "home", sel: "#play", when: () => snap?.server?.browser_streaming !== false, title: "Play in this browser", text: "Select play to stream an application to this browser. You do not need Moonlight. The advanced options let you select the resolution, frame rate, bitrate, HDR, video codec and audio channels, and show statistics on top of the stream." },
+    { page: "home", sel: "#session", title: "Stream", text: "This panel shows which device streams which application. While a device streams, live graphs show the latency, bitrate and frame rate. You can also stop the stream here." },
+    { page: "home", sel: "#play", when: () => snap?.server?.browser_streaming !== false, title: "Play in this browser", text: "Select play to stream an application to this browser." },
     { page: "home", sel: "#page-home .panel:has(#health)", title: "Health", text: "When Moonshine starts, it checks the GPU, the encoders and the ports. A warning tells you what to repair. After a repair, select Check again." },
     { page: "home", sel: "#bell", title: "Notifications", text: "The bell shows pairing requests, health warnings and stream events. The number shows how many you did not read." },
     { page: "clients", sel: "#pair-panel", title: "Pair a device", text: "To add a device, select this computer in Moonlight. Moonlight shows a PIN. Type that PIN here. Turn off Allow new devices to refuse all new devices." },

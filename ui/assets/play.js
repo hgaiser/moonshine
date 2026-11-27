@@ -52,7 +52,7 @@ async function load() {
     show(`<p class="err">The control panel did not answer (${esc(e.message)}). It tries again.</p>`);
     return;
   }
-  const state = JSON.stringify([snap.server?.browser_streaming, snap.session && [snap.session.application, snap.session.width, snap.session.height, snap.session.fps], (snap.library || []).map(a => a.id), message]);
+  const state = JSON.stringify([snap.server?.browser_streaming, snap.session && [snap.session.application, snap.session.device, snap.session.phase, snap.session.browser_rejoin, snap.session.width, snap.session.height, snap.session.fps], (snap.library || []).map(a => a.id), message]);
   if (state === shown) return;
   shown = state;
   render(snap, picked);
@@ -76,7 +76,40 @@ function render(snap, pick = null, keep = null) {
   }
 
   const missing = player.missingFeatures();
-  const join = Boolean(snap.session);
+  // A browser that lost its stream can attach again to its session. Any other session has to stop
+  // first.
+  const rejoin = Boolean(snap.session?.browser_rejoin);
+  if (snap.session && !rejoin) {
+    const s = snap.session;
+    show(`
+      ${message ? `<p class="note">${esc(message)}</p>` : ""}
+      <p>${esc(s.device || "Another device")} ${s.phase === "streaming" ? "streams" : "starts"} ${esc(s.application || "an application")} now. To start a stream here, stop that stream first. The application closes.</p>
+      <div class="sheet-actions"><button type="button" class="btn danger" id="s-stop">Stop the stream</button></div>`);
+    $("#s-stop").onclick = async () => {
+      const button = $("#s-stop");
+      if (!button.dataset.sure) {
+        button.dataset.sure = "1";
+        button.textContent = "Stop the stream: the application closes";
+        return;
+      }
+      button.disabled = true;
+      try {
+        const res = await fetch("/api/action", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", "X-Moonshine-UI": "1" },
+          body: JSON.stringify({ action: "stop_session" }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || data.error) throw new Error(data.error || `The request failed (${res.status}).`);
+      } catch (e) {
+        toast(e.message, 6000);
+        button.disabled = false;
+      }
+      shown = null;
+      load();
+    };
+    return;
+  }
   const session = snap.session;
   const apps = snap.library || [];
   const saved = loadChoices();
@@ -84,7 +117,7 @@ function render(snap, pick = null, keep = null) {
   let wanted = pick ?? new URLSearchParams(location.search).get("app") ?? (saved.app != null ? String(saved.app) : null);
   if (!apps.some(a => String(a.id) === wanted)) wanted = apps.length ? String(apps[0].id) : null;
   // The options saved for this application, else the options of the last stream.
-  const own = join ? null : saved.apps?.[wanted] ?? null;
+  const own = rejoin ? null : saved.apps?.[wanted] ?? null;
   const last = own ? { ...saved, ...own } : saved;
   const fullscreenOn = keep ? keep.fullscreen : saved.fullscreen !== false;
   const dpr = window.devicePixelRatio || 1;
@@ -107,26 +140,26 @@ function render(snap, pick = null, keep = null) {
   show(`
     ${message ? `<p class="note">${esc(message)}</p>` : ""}
     ${missing ? `<p class="err">${esc(missing)}</p>` : ""}
-    ${join ? `<p class="muted">${esc(session.application || "A session")} runs at ${session.width} × ${session.height} @ ${session.fps}. This browser takes it over; a Moonlight client that streams it now disconnects.</p>` :
+    ${rejoin ? `<p class="muted">${esc(session.application || "A session")} runs at ${session.width} × ${session.height} @ ${session.fps}. A browser streamed it and lost the connection. Reconnect to continue the stream here.</p>` :
       `<div class="field"><label for="s-app">Application</label><select id="s-app">${apps.map(a => `<option value="${a.id}" ${String(a.id) === wanted ? "selected" : ""}>${esc(a.title)}</option>`).join("")}</select></div>
 `}
     <div class="field"><label class="switch"><input type="checkbox" id="s-full" ${fullscreenOn ? "checked" : ""}><span>Start in full screen</span></label><span class="help">On a phone or tablet, also turns the screen to landscape.</span></div>
     <details class="adv" ${keep?.open ? "open" : ""}><summary><strong>Advanced options</strong><span class="adv-sum muted" id="s-adv-sum"></span></summary><div style="display:grid;gap:14px">
-      ${join ? "" : `<div class="field"><label for="s-size">Resolution</label><select id="s-size">${sizes.map((r, i) => `<option value="${i}" ${i === sizeIndex ? "selected" : ""}>${r[0]} × ${r[1]}${i === 0 ? " (this screen)" : ""}</option>`).join("")}</select></div>`}
-      ${join ? "" : `<div class="field"><label for="s-fps">Frame rate</label><select id="s-fps">${[60, 120, 30].map(f => `<option value="${f}" ${f === lastFps ? "selected" : ""}>${f}</option>`).join("")}</select></div>`}
+      ${rejoin ? "" : `<div class="field"><label for="s-size">Resolution</label><select id="s-size">${sizes.map((r, i) => `<option value="${i}" ${i === sizeIndex ? "selected" : ""}>${r[0]} × ${r[1]}${i === 0 ? " (this screen)" : ""}</option>`).join("")}</select></div>`}
+      ${rejoin ? "" : `<div class="field"><label for="s-fps">Frame rate</label><select id="s-fps">${[60, 120, 30].map(f => `<option value="${f}" ${f === lastFps ? "selected" : ""}>${f}</option>`).join("")}</select></div>`}
       <div class="field"><label for="s-rate">Bitrate (Mb/s)</label><input type="number" id="s-rate" min="1" max="500" step="1"><span class="help">The whole stream, with FEC and audio. The default follows Moonlight: 20 Mb/s at 1080p60.</span></div>
-      ${join ? "" : `<div class="field"><label for="s-hdr">HDR</label><select id="s-hdr"><option value="auto" ${hdrMode === "auto" ? "selected" : ""}>Automatic</option><option value="off" ${hdrMode === "off" ? "selected" : ""}>Off</option></select><span class="help" id="s-hdr-help"></span></div>`}
-      ${join ? "" : `<div class="field"><label for="s-codec">Video codec</label><select id="s-codec"><option value="auto">Automatic</option></select><span class="help" id="s-codec-help"></span></div>`}
-      ${join ? "" : `<div class="field"><label for="s-audio">Audio</label><select id="s-audio"><option value="auto">Automatic (${audioName(autoChannels)})</option>${AUDIO.map(([n, l]) => `<option value="${n}" ${n === audioMode ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">This device has ${speakers} audio channel${speakers === 1 ? "" : "s"}. Automatic selects the most channels that it takes. The browser mixes more channels down to fit.</span></div>`}
+      ${rejoin ? "" : `<div class="field"><label for="s-hdr">HDR</label><select id="s-hdr"><option value="auto" ${hdrMode === "auto" ? "selected" : ""}>Automatic</option><option value="off" ${hdrMode === "off" ? "selected" : ""}>Off</option></select><span class="help" id="s-hdr-help"></span></div>`}
+      ${rejoin ? "" : `<div class="field"><label for="s-codec">Video codec</label><select id="s-codec"><option value="auto">Automatic</option></select><span class="help" id="s-codec-help"></span></div>`}
+      ${rejoin ? "" : `<div class="field"><label for="s-audio">Audio</label><select id="s-audio"><option value="auto">Automatic (${audioName(autoChannels)})</option>${AUDIO.map(([n, l]) => `<option value="${n}" ${n === audioMode ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">This device has ${speakers} audio channel${speakers === 1 ? "" : "s"}. Automatic selects the most channels that it takes. The browser mixes more channels down to fit.</span></div>`}
       <div class="field"><label class="switch"><input type="checkbox" id="s-stats" ${last.stats ? "checked" : ""}><span>Show statistics</span></label><span class="help">Statistics on top of the stream: frame rate, bitrate, decode time, round trip and loss. Ctrl+Alt+Shift+S shows or hides them during the stream.</span></div>
-      ${join ? "" : `<div class="field"><label class="switch"><input type="checkbox" id="s-own" ${own ? "checked" : ""}><span>Remember these options for this application</span></label><span class="help">The next stream of this application uses these options again. Without this, it uses the options of the last stream.</span></div>`}
+      ${rejoin ? "" : `<div class="field"><label class="switch"><input type="checkbox" id="s-own" ${own ? "checked" : ""}><span>Remember these options for this application</span></label><span class="help">The next stream of this application uses these options again. Without this, it uses the options of the last stream.</span></div>`}
     </div></details>
     <div class="sheet-actions">
-      <button type="submit" class="btn primary" id="s-go" ${missing || (!join && !apps.length) ? "disabled" : ""}>${join ? "Join the session" : "Start streaming"}</button>
+      <button type="submit" class="btn primary" id="s-go" ${missing || (!rejoin && !apps.length) ? "disabled" : ""}>${rejoin ? "Reconnect" : "Start streaming"}</button>
     </div>`);
 
-  const size = () => join ? [session.width, session.height] : sizes[Number($("#s-size")?.value || 0)];
-  const fps = () => join ? session.fps : Number($("#s-fps")?.value || 60);
+  const size = () => rejoin ? [session.width, session.height] : sizes[Number($("#s-size")?.value || 0)];
+  const fps = () => rejoin ? session.fps : Number($("#s-fps")?.value || 60);
   const channels = () => { const v = $("#s-audio")?.value; return !v || v === "auto" ? autoChannels : Number(v); };
   // The default bitrate follows the size and frame rate. A bitrate that the user typed comes back
   // only with the same size and frame rate.
@@ -210,7 +243,7 @@ function render(snap, pick = null, keep = null) {
     const choices = { ...saved, fullscreen };
     delete choices.hdr; // The old HDR switch.
     delete choices.audio; // The old fixed audio choice.
-    if (join) {
+    if (rejoin) {
       Object.assign(choices, { stats, bitrate });
     } else {
       const index = Number($("#s-size")?.value || 0);
@@ -245,7 +278,7 @@ function render(snap, pick = null, keep = null) {
       bitrateKbps,
       audioChannels: channels(),
       hdr,
-      codec: join ? null : codec(),
+      codec: rejoin ? null : codec(),
       fullscreen,
       stats,
       onClose: (text, failed) => {

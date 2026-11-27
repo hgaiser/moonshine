@@ -57,6 +57,8 @@ pub struct SessionInfo {
 	/// The negotiated video stream, once it runs.
 	pub stream: Option<StreamStart>,
 	pub started: u64,
+	/// Whether a browser can attach to the session again: a browser streamed it and went away.
+	pub browser_rejoin: bool,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
