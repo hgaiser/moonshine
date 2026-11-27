@@ -114,10 +114,10 @@ function renderSession() {
   const s = snap.session;
   if (!s) {
     el.innerHTML = `
-      <div class="panel-head"><h2>Stream</h2><span class="pill plain">Idle</span><button class="btn primary sm" id="stream-browser" style="margin-left:auto">Stream in browser</button></div>
+      <div class="panel-head"><h2>Stream</h2><span class="pill plain">Idle</span></div>
       <div class="empty">
         <h3 style="font-size:18px;font-weight:600;margin:0">No one is streaming</h3>
-        <p class="muted" style="margin:0;max-width:56ch">Open Moonlight on a paired device and select an application. The live graphs for the stream show here.</p>
+        <p class="muted" style="margin:0;max-width:56ch">Open Moonlight on a paired device and select an application${snap.server?.browser_streaming === false ? "" : ", or select Play to stream to this browser"}. The live graphs for the stream show here.</p>
       </div>
       ${stats.buckets.length ? chartsHTML(true) : ""}`;
   } else {
@@ -128,7 +128,7 @@ function renderSession() {
     el.innerHTML = `
       <div class="session-top">
         <div class="session-title"><h3>${title}</h3>${pill}</div>
-        <span style="display:flex;gap:8px"><button class="btn sm" id="join-browser">Stream in browser</button><button class="btn sm danger" id="stop">Stop stream</button></span>
+        <span style="display:flex;gap:8px"><button class="btn sm" id="join-browser">Play</button><button class="btn sm danger" id="stop">Stop stream</button></span>
       </div>
       <div id="stop-confirm"></div>
       <dl class="facts">
@@ -146,9 +146,12 @@ function renderSession() {
       $("#stop-yes").onclick = async () => { $("#stop-yes").disabled = true; await act("stop_session"); };
     };
   }
-  const streamButton = $("#stream-browser") || $("#join-browser");
-  if (streamButton && snap.server?.browser_streaming === false) streamButton.remove();
-  else if (streamButton) streamButton.onclick = () => { location.href = "/play"; };
+  // Play in this browser: from the banner always, and next to Stop stream to take over a session.
+  const off = snap.server?.browser_streaming === false;
+  $("#play").hidden = off;
+  const joinButton = $("#join-browser");
+  if (joinButton && off) joinButton.remove();
+  else if (joinButton) joinButton.onclick = () => { location.href = "/play"; };
   bindCharts();
   drawAll();
 }

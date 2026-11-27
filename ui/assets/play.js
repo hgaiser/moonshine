@@ -25,7 +25,8 @@ try {
   if (theme !== "auto") document.documentElement.setAttribute("data-theme", theme);
 } catch { /* Storage blocked. */ }
 
-// The last choices, in this browser: { app, size ("native" or [w, h]), fps, audio, hdrMode ("auto"
+// The last choices, in this browser: { app, size ("native" or [w, h]), fps, audioMode ("auto", 2, 6
+// or 8; "audio" was the old fixed choice and is ignored), hdrMode ("auto"
 // or "off"), codec ("auto", "hevc", "h264" or "av1"), fullscreen, stats, bitrate ({ kbps, width, height, fps } only when the user changed
 // the default) }.
 const CHOICES = "moonshine-stream-choices";
@@ -84,7 +85,11 @@ function render(snap) {
   const native = [Math.round(long * dpr) & ~1, Math.round(short * dpr) & ~1];
   const sizes = [native, ...RESOLUTIONS.filter(r => r[0] !== native[0] || r[1] !== native[1])];
   const speakers = player.speakerChannels();
-  const defaultChannels = [2, 6, 8].includes(last.audio) ? last.audio : speakers >= 8 ? 8 : speakers >= 6 ? 6 : 2;
+  // Automatic audio: the most channels that this device's speakers take.
+  const autoChannels = speakers >= 8 ? 8 : speakers >= 6 ? 6 : 2;
+  const audioMode = [2, 6, 8].includes(last.audioMode) ? last.audioMode : "auto";
+  const AUDIO = [[2, "Stereo"], [6, "5.1 surround"], [8, "7.1 surround"]];
+  const audioName = n => AUDIO.find(a => a[0] === n)[1];
   // "native" follows this screen; a saved size that is not in the list falls back to it.
   const sizeIndex = Array.isArray(last.size) ? Math.max(0, sizes.findIndex(r => r[0] === last.size[0] && r[1] === last.size[1])) : 0;
   const lastFps = [30, 60, 120].includes(last.fps) ? last.fps : 60;
@@ -98,13 +103,13 @@ function render(snap) {
       `<div class="field"><label for="s-app">Application</label><select id="s-app">${apps.map(a => `<option value="${a.id}" ${String(a.id) === wanted ? "selected" : ""}>${esc(a.title)}</option>`).join("")}</select></div>
     <div class="field"><label for="s-size">Resolution</label><select id="s-size">${sizes.map((r, i) => `<option value="${i}" ${i === sizeIndex ? "selected" : ""}>${r[0]} × ${r[1]}${i === 0 ? " (this screen)" : ""}</option>`).join("")}</select></div>
     <div class="field"><label for="s-fps">Frame rate</label><select id="s-fps">${[60, 120, 30].map(f => `<option value="${f}" ${f === lastFps ? "selected" : ""}>${f}</option>`).join("")}</select></div>
-    <div class="field"><label for="s-audio">Audio</label><select id="s-audio">${[[2, "Stereo"], [6, "5.1 surround"], [8, "7.1 surround"]].map(([n, l]) => `<option value="${n}" ${n === defaultChannels ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">This device has ${speakers} audio channel${speakers === 1 ? "" : "s"}. The browser mixes more channels down to fit.</span></div>
 `}
     <div class="field"><label class="switch"><input type="checkbox" id="s-full" ${last.fullscreen === false ? "" : "checked"}><span>Start in full screen</span></label><span class="help">On a phone or tablet, also turns the screen to landscape.</span></div>
     <div class="field"><label for="s-rate">Bitrate (Mb/s)</label><input type="number" id="s-rate" min="1" max="500" step="1"><span class="help">The whole stream, with FEC and audio. The default follows Moonlight: 20 Mb/s at 1080p60.</span></div>
     <details class="adv"><summary><strong>Advanced options</strong></summary><div style="display:grid;gap:14px">
       ${join ? "" : `<div class="field"><label for="s-hdr">HDR</label><select id="s-hdr"><option value="auto" ${hdrMode === "auto" ? "selected" : ""}>Automatic</option><option value="off" ${hdrMode === "off" ? "selected" : ""}>Off</option></select><span class="help" id="s-hdr-help"></span></div>`}
       ${join ? "" : `<div class="field"><label for="s-codec">Video codec</label><select id="s-codec"><option value="auto">Automatic</option></select><span class="help" id="s-codec-help"></span></div>`}
+      ${join ? "" : `<div class="field"><label for="s-audio">Audio</label><select id="s-audio"><option value="auto">Automatic (${audioName(autoChannels)})</option>${AUDIO.map(([n, l]) => `<option value="${n}" ${n === audioMode ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">This device has ${speakers} audio channel${speakers === 1 ? "" : "s"}. Automatic selects the most channels that it takes. The browser mixes more channels down to fit.</span></div>`}
       <div class="field"><label class="switch"><input type="checkbox" id="s-stats" ${last.stats ? "checked" : ""}><span>Show statistics</span></label><span class="help">Statistics on top of the stream: frame rate, bitrate, decode time, round trip and loss. Ctrl+Alt+Shift+S shows or hides them during the stream.</span></div>
     </div></details>
     <div class="sheet-actions">
@@ -113,6 +118,7 @@ function render(snap) {
 
   const size = () => join ? [session.width, session.height] : sizes[Number($("#s-size")?.value || 0)];
   const fps = () => join ? session.fps : Number($("#s-fps")?.value || 60);
+  const channels = () => { const v = $("#s-audio")?.value; return !v || v === "auto" ? autoChannels : Number(v); };
   // The default bitrate follows the size and frame rate. A bitrate that the user typed comes back
   // only with the same size and frame rate.
   const update = () => {
@@ -186,11 +192,12 @@ function render(snap) {
     delete choices.hdr; // The old HDR switch.
     if (!join) {
       const index = Number($("#s-size")?.value || 0);
+      delete choices.audio; // The old fixed audio choice.
       Object.assign(choices, {
         app: app ? app.id : null,
         size: index === 0 ? "native" : sizes[index],
         fps: fps(),
-        audio: Number($("#s-audio")?.value || 2),
+        audioMode: $("#s-audio")?.value === "auto" ? "auto" : Number($("#s-audio")?.value),
       });
       choices.hdrMode = $("#s-hdr")?.value === "off" ? "off" : "auto";
       choices.codec = codec() || "auto";
@@ -204,7 +211,7 @@ function render(snap) {
       width, height,
       fps: fps(),
       bitrateKbps,
-      audioChannels: Number($("#s-audio")?.value || 2),
+      audioChannels: channels(),
       hdr,
       codec: join ? null : codec(),
       fullscreen,

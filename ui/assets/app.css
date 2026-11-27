@@ -82,6 +82,9 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .mast-tools { position: absolute; z-index: 2; top: 12px; right: max(16px, env(safe-area-inset-right, 0px)); display: flex; gap: 8px; }
 .mtool { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px; border: 0; cursor: pointer; background: rgba(23,18,58,.82); color: #ecebff; clip-path: var(--px4); font-family: var(--font-display); font-size: 14px; text-transform: lowercase; }
 .mtool:hover { background: rgba(48,40,106,.95); }
+.mtool.play { background: #e8c46a; color: #1a1430; text-decoration: none; font-weight: 600; }
+.mtool.play:hover { background: #ffe18c; }
+.mtool[hidden] { display: none; }
 .mtool svg { width: 18px; height: 18px; shape-rendering: crispEdges; }
 .mtool .count { position: static; background: #e8c46a; color: #1a1430; }
 .notif { position: fixed; z-index: 25; top: calc(env(safe-area-inset-top, 0px) + 54px); right: max(16px, env(safe-area-inset-right, 0px)); width: min(380px, calc(100% - 32px)); max-height: min(520px, calc(100% - 80px)); overflow: auto;
