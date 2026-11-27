@@ -340,7 +340,9 @@ details.adv[open] > summary .adv-sum { display: none; }
   box-shadow: 0 0 0 2px #ffe18c, 0 0 22px 6px var(--glow), inset 0 0 14px var(--glow), 0 0 0 200vmax rgba(8,6,24,.68);
   transition: top .2s ease, left .2s ease, width .2s ease, height .2s ease; animation: guide-glow 2.4s ease-in-out infinite; }
 @keyframes guide-glow { 50% { --glow: rgba(255,214,110,.4); } }
-.guide-card { position: fixed; z-index: 42; width: min(340px, calc(100vw - 24px)); display: grid; gap: 10px; padding: 16px; background: var(--surface); color: var(--fg); clip-path: var(--px4); }
+/* The card's stepped border in the highlight's color: the card paints the border, ::before its face. */
+.guide-card { position: fixed; z-index: 42; isolation: isolate; width: min(340px, calc(100vw - 24px)); display: grid; gap: 10px; padding: 16px; background: var(--accent); color: var(--fg); clip-path: var(--px4); box-shadow: 0 12px 32px rgba(0,0,0,.35); }
+.guide-card::before { content: ""; position: absolute; inset: 2px; z-index: -1; background: var(--surface); clip-path: var(--px4); }
 .guide-card h2 { font-family: var(--font-display); font-weight: 600; font-size: 20px; text-transform: lowercase; }
 .guide-card p { margin: 0; color: var(--muted); }
 .guide-step { font-family: var(--font-mono); font-size: 11.5px; color: var(--accent); }
