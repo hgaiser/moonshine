@@ -252,7 +252,7 @@ class CanvasRenderer {
 
   /// Takes the frame and closes it.
   draw(frame) {
-    this.context.drawImage(frame, 0, 0, this.streamWidth, this.streamHeight);
+    this.context.drawImage(frame, 0, 0, this.view.width, this.view.height);
     frame.close();
   }
 
