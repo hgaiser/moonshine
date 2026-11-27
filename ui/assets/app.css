@@ -245,7 +245,8 @@ details.scanner[open] > summary { margin-bottom: 8px; }
 .row-main { min-width: 0; display: grid; gap: 2px; }
 .row-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 500; }
 .row-sub { color: var(--muted); font-size: 12.5px; overflow-wrap: anywhere; }
-.row-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: end; }
+.row-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: end; align-items: center; }
+.row-actions .switch { margin-right: 6px; font-size: 13px; }
 .row .confirm { grid-column: 1 / -1; }
 .row.dim .row-main, .row.dim .avatar { opacity: .5; }
 .inline-edit { display: flex; gap: 6px; flex-wrap: wrap; }

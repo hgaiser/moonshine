@@ -146,8 +146,11 @@ struct SessionManagerInner {
 	/// Starts the audio pipeline (used by bench / external callers).
 	audio_start: Option<StartSignal>,
 
-	/// Certificate fingerprint of the client that launched the current session, if known.
+	/// Certificate fingerprint of the client that launched or resumed the current session, if known.
 	session_client: Option<String>,
+
+	/// Whether outgoing video packets are paced for the current session's client.
+	session_packet_pacing: bool,
 
 	/// When the current session was initialized.
 	session_started: Option<SystemTime>,
@@ -178,6 +181,7 @@ impl SessionManagerInner {
 		self.video_start = None;
 		self.audio_start = None;
 		self.session_client = None;
+		self.session_packet_pacing = false;
 		self.session_started = None;
 		self.stop = ShutdownManager::new();
 	}
@@ -251,6 +255,7 @@ impl SessionManager {
 			video_start: None,
 			audio_start: None,
 			session_client: None,
+			session_packet_pacing: false,
 			session_started: None,
 			shutdown: shutdown.clone(),
 			_trigger_token: trigger_token,
@@ -343,11 +348,26 @@ impl SessionManager {
 		})
 	}
 
-	/// Record which client launched the current session.
-	pub(crate) async fn set_session_client(&self, fingerprint: Option<String>) {
+	/// Record which client launched or resumed the current session and apply its packet pacing setting.
+	pub(crate) async fn set_session_client(&self, fingerprint: Option<String>, packet_pacing: bool) {
 		let mut guard = self.inner.lock().await;
 		if guard.session.is_some() {
 			guard.session_client = fingerprint;
+			guard.session_packet_pacing = packet_pacing;
+			if let Some(SessionState::Active(active)) = &guard.session {
+				active.set_video_packet_pacing(packet_pacing);
+			}
+		}
+	}
+
+	/// Update packet pacing if `fingerprint` is the device currently streaming.
+	pub async fn set_client_packet_pacing(&self, fingerprint: &str, enabled: bool) {
+		let mut guard = self.inner.lock().await;
+		if guard.session_client.as_deref() == Some(fingerprint) {
+			guard.session_packet_pacing = enabled;
+			if let Some(SessionState::Active(active)) = &guard.session {
+				active.set_video_packet_pacing(enabled);
+			}
 		}
 	}
 
@@ -515,12 +535,14 @@ impl SessionManager {
 		let mut guard = self.inner.lock().await;
 		let video_config = guard.video_config.clone();
 		let stream_timeout = guard.stream_timeout;
+		let packet_pacing = guard.session_packet_pacing;
 		match launched
 			.start(
 				video_config,
 				stream_timeout,
 				video_stream_context,
 				audio_stream_context,
+				packet_pacing,
 				stop,
 				guard.inhibit_sleep,
 			)

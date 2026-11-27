@@ -731,6 +731,7 @@ async fn run_benchmark(
 		fps: target_fps,
 		packet_size: 1400,
 		bitrate: args.bitrate,
+		configured_bitrate: args.bitrate,
 		minimum_fec_packets: 2,
 		qos: false,
 		video_format,

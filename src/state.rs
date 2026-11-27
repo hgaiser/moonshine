@@ -16,6 +16,11 @@ pub struct DeviceRecord {
 
 	/// When the device last made a request, in seconds since the Unix epoch. Zero when unknown.
 	pub last_seen: u64,
+
+	/// Pace outgoing video packets for this device to avoid microburst drops on
+	/// shallow-buffered links (such as USB Ethernet adapters or 100 Mb/s ports).
+	#[serde(skip_serializing_if = "std::ops::Not::not")]
+	pub packet_pacing: bool,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -52,7 +57,10 @@ impl PersistentState {
 			.ok_or_else(|| tracing::error!("Failed to get data directory."))?
 			.join("moonshine")
 			.join("state.toml");
+		Self::open(path)
+	}
 
+	fn open(path: PathBuf) -> Result<Self, ()> {
 		let data = if path.exists() {
 			let serialized =
 				std::fs::read_to_string(&path).map_err(|e| tracing::error!("Failed to read state file: {e}"))?;
@@ -154,6 +162,18 @@ impl PersistentState {
 		Ok(inserted)
 	}
 
+	/// What is known about one paired certificate, or `None` when it is not paired.
+	pub(crate) fn device(&self, fingerprint: &str) -> Result<Option<DeviceRecord>, ()> {
+		let data = self
+			.data
+			.read()
+			.map_err(|poison| tracing::error!("RwLock poisoned: {poison}"))?;
+		if !data.paired_certs.contains(fingerprint) {
+			return Ok(None);
+		}
+		Ok(Some(data.devices.get(fingerprint).cloned().unwrap_or_default()))
+	}
+
 	/// The paired certificates and what is known about each of them.
 	pub(crate) fn paired_devices(&self) -> Result<Vec<(String, DeviceRecord)>, ()> {
 		let data = self
@@ -225,4 +245,62 @@ impl PersistentState {
 	// 	self.save()?;
 	// 	Ok(true)
 	// }
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn device_record_packet_pacing_defaults_off_and_omits_when_false() {
+		let legacy: DeviceRecord = toml::from_str(
+			r#"
+			name = "Living room TV"
+			paired_at = 100
+			last_seen = 200
+			"#,
+		)
+		.unwrap();
+		assert!(!legacy.packet_pacing);
+
+		let serialized = toml::to_string(&legacy).unwrap();
+		assert!(!serialized.contains("packet_pacing"), "{serialized}");
+
+		let paced = DeviceRecord {
+			packet_pacing: true,
+			..legacy
+		};
+		let serialized = toml::to_string(&paced).unwrap();
+		assert!(serialized.contains("packet_pacing = true"), "{serialized}");
+		let round_tripped: DeviceRecord = toml::from_str(&serialized).unwrap();
+		assert_eq!(round_tripped, paced);
+	}
+
+	#[test]
+	fn device_packet_pacing_persists_across_reloads() {
+		let dir = tempfile::tempdir().unwrap();
+		let path = dir.path().join("state.toml");
+		let fp = "deadbeef";
+
+		let state = PersistentState::open(path.clone()).unwrap();
+		assert_eq!(state.device(fp).unwrap(), None);
+		assert!(
+			!state
+				.update_device(fp, |r| r.packet_pacing = true, |_, _| true)
+				.unwrap()
+		);
+
+		assert!(state.add_paired_cert(fp.to_string()).unwrap());
+		assert!(!state.device(fp).unwrap().unwrap().packet_pacing);
+
+		assert!(
+			state
+				.update_device(fp, |r| r.packet_pacing = true, |_, _| true)
+				.unwrap()
+		);
+		assert!(state.device(fp).unwrap().unwrap().packet_pacing);
+
+		let reloaded = PersistentState::open(path).unwrap();
+		assert!(reloaded.device(fp).unwrap().unwrap().packet_pacing);
+	}
 }

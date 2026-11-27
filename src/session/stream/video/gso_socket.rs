@@ -1,6 +1,7 @@
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use tokio::net::UdpSocket;
 
+use super::pacing::{PACED_MAX_GSO_SEGMENTS, PacketPacer, chunk_wire_bytes};
 use super::shard_batch::ShardBatch;
 
 /// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
@@ -35,6 +36,7 @@ fn usable_send_buffer(reported: usize) -> usize {
 pub(crate) struct UdpGsoSocket {
 	socket: UdpSocket,
 	udp_state: UdpSocketState,
+	pacer: Option<PacketPacer>,
 }
 
 impl UdpGsoSocket {
@@ -50,7 +52,33 @@ impl UdpGsoSocket {
 		} else {
 			tracing::debug!("GSO not available, using per-shard sends");
 		}
-		Ok(Self { socket, udp_state })
+		Ok(Self {
+			socket,
+			udp_state,
+			pacer: None,
+		})
+	}
+
+	/// Configure or disable packet pacing on this socket.
+	///
+	/// Returns the active wire pacing rate in bytes/sec, or `None` when pacing is off.
+	pub fn set_pacing(&mut self, bytes_per_sec: Option<u64>) -> Option<u64> {
+		if self.pacer.as_ref().map(PacketPacer::bytes_per_sec) == bytes_per_sec {
+			return bytes_per_sec;
+		}
+
+		self.pacer = match bytes_per_sec {
+			Some(rate) => match PacketPacer::new(rate) {
+				Ok(pacer) => Some(pacer),
+				Err(e) => {
+					tracing::warn!("Failed to initialize video packet pacer: {e}");
+					None
+				},
+			},
+			None => None,
+		};
+
+		self.pacer.as_ref().map(PacketPacer::bytes_per_sec)
 	}
 
 	/// Local address the socket is bound to.
@@ -118,33 +146,43 @@ impl UdpGsoSocket {
 	///
 	/// GSO availability is re-checked on every call: quinn-udp disables it at
 	/// runtime if the kernel or NIC rejects a segmented send.
-	pub async fn send_batch(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
+	pub async fn send_batch(&mut self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
 		if self.udp_state.max_gso_segments() > 1 {
 			self.send_batch_gso(batch, addr).await
 		} else {
-			self.send_shards(batch.as_bytes(), batch.shard_size(), addr).await;
+			self.send_shards_paced(batch.as_bytes(), batch.shard_size(), addr).await;
 			0
 		}
 	}
 
 	/// Send a batch as GSO chunks sized to the kernel's segment and datagram
-	/// caps; a frame's batch routinely exceeds both. Uses `try_send` because
-	/// `send` masks every error except `WouldBlock` as success, silently
-	/// discarding the batch.
-	async fn send_batch_gso(&self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
+	/// caps (and the active pacer's segment cap, if any); a frame's batch
+	/// routinely exceeds these caps. Uses `try_send` because `send` masks every
+	/// error except `WouldBlock` as success, silently discarding the batch.
+	async fn send_batch_gso(&mut self, batch: &ShardBatch, addr: std::net::SocketAddr) -> u32 {
 		let shard_size = batch.shard_size();
 		if shard_size == 0 {
 			return 0;
 		}
-		let segments_per_send = gso_segments_per_send(self.udp_state.max_gso_segments(), shard_size);
+		let max_gso = self.udp_state.max_gso_segments();
+		let effective_max_gso = if self.pacer.is_some() {
+			max_gso.min(PACED_MAX_GSO_SEGMENTS)
+		} else {
+			max_gso
+		};
+		let segments_per_send = gso_segments_per_send(effective_max_gso, shard_size);
 
 		let mut failed_chunks = 0u32;
 		for chunk in batch.as_bytes().chunks(segments_per_send * shard_size) {
+			if let Some(pacer) = self.pacer.as_mut() {
+				let wire_bytes = chunk_wire_bytes(chunk.len(), shard_size, addr.is_ipv6());
+				pacer.pace(wire_bytes).await;
+			}
 			let transmit = Transmit {
 				destination: addr,
 				ecn: None,
 				contents: chunk,
-				segment_size: Some(shard_size),
+				segment_size: (chunk.len() > shard_size).then_some(shard_size),
 				src_ip: None,
 			};
 			// Use Tokio's readiness-aware raw-I/O wrapper: a GSO send can
@@ -160,14 +198,34 @@ impl UdpGsoSocket {
 			if let Err(e) = result {
 				failed_chunks += 1;
 				tracing::debug!("GSO send failed ({e}), falling back to per-shard sends for this chunk");
-				self.send_shards(chunk, shard_size, addr).await;
+				// This chunk was already paced above; send its shards directly.
+				self.send_shards_unpaced(chunk, shard_size, addr).await;
 			}
 		}
 		failed_chunks
 	}
 
+	/// Send a contiguous buffer of equal-sized shards as individual UDP packets,
+	/// applying userspace pacing in bounded groups when a pacer is active.
+	async fn send_shards_paced(&mut self, bytes: &[u8], shard_size: usize, addr: std::net::SocketAddr) {
+		if shard_size == 0 {
+			return;
+		}
+		if self.pacer.is_some() {
+			for chunk in bytes.chunks(PACED_MAX_GSO_SEGMENTS * shard_size) {
+				if let Some(pacer) = self.pacer.as_mut() {
+					let wire_bytes = chunk_wire_bytes(chunk.len(), shard_size, addr.is_ipv6());
+					pacer.pace(wire_bytes).await;
+				}
+				self.send_shards_unpaced(chunk, shard_size, addr).await;
+			}
+		} else {
+			self.send_shards_unpaced(bytes, shard_size, addr).await;
+		}
+	}
+
 	/// Send a contiguous buffer of equal-sized shards as individual UDP packets.
-	async fn send_shards(&self, bytes: &[u8], shard_size: usize, addr: std::net::SocketAddr) {
+	async fn send_shards_unpaced(&self, bytes: &[u8], shard_size: usize, addr: std::net::SocketAddr) {
 		if shard_size == 0 {
 			return;
 		}
@@ -181,10 +239,21 @@ impl UdpGsoSocket {
 
 #[cfg(test)]
 mod tests {
+	use std::time::{Duration, Instant};
+
 	use super::*;
 
 	fn usable_send_buffer_size(socket: &UdpGsoSocket) -> usize {
 		usable_send_buffer(socket2::SockRef::from(&socket.socket).send_buffer_size().unwrap())
+	}
+
+	fn synthetic_batch(shard_count: usize, shard_size: usize) -> ShardBatch {
+		let mut data = vec![0u8; shard_count * shard_size];
+		for i in 0..shard_count {
+			let offset = i * shard_size;
+			data[offset..offset + 4].copy_from_slice(&(i as u32).to_le_bytes());
+		}
+		ShardBatch::from_raw(data, shard_size)
 	}
 
 	#[tokio::test]
@@ -242,5 +311,74 @@ mod tests {
 				assert!(chunk.len() / shard_size <= 64, "chunk must respect segment cap");
 			}
 		}
+	}
+
+	#[tokio::test]
+	async fn paced_send_batch_delivers_all_shards_at_target_rate() {
+		let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let dest = receiver.local_addr().unwrap();
+		// Grow receiver buffer so loopback never drops shards during the test.
+		let _ = socket2::SockRef::from(&receiver).set_recv_buffer_size(4 * 1024 * 1024);
+
+		let mut sender = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let bytes_per_sec = 22_500_000; // 180 Mb/s
+		assert_eq!(sender.set_pacing(Some(bytes_per_sec)), Some(bytes_per_sec));
+
+		let shard_count = 160usize; // 40 chunks of 4 shards (~225 KiB payload)
+		let shard_size = 1408usize;
+		let batch = synthetic_batch(shard_count, shard_size);
+
+		let recv_task = tokio::spawn(async move {
+			let mut buf = vec![0u8; shard_size + 64];
+			let mut received = Vec::with_capacity(shard_count);
+			for _ in 0..shard_count {
+				let (len, _) = tokio::time::timeout(Duration::from_secs(2), receiver.recv_from(&mut buf))
+					.await
+					.expect("timed out waiting for paced shard")
+					.unwrap();
+				assert_eq!(len, shard_size);
+				let idx = u32::from_le_bytes(buf[..4].try_into().unwrap());
+				received.push(idx);
+			}
+			received
+		});
+
+		let start = Instant::now();
+		let failed = sender.send_batch(&batch, dest).await;
+		let elapsed = start.elapsed();
+
+		assert_eq!(failed, 0);
+		let received = recv_task.await.unwrap();
+		let expected_indices: Vec<u32> = (0..shard_count as u32).collect();
+		assert_eq!(received, expected_indices);
+
+		// 39 inter-chunk gaps * 4 * (1408 + 42) = 226,200 wire bytes at 22.5 MB/s ≈ 10.05 ms.
+		let wire_chunk = chunk_wire_bytes(PACED_MAX_GSO_SEGMENTS * shard_size, shard_size, false);
+		let expected_ms = (39 * wire_chunk) as f64 / bytes_per_sec as f64 * 1000.0;
+		let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+		assert!(
+			elapsed_ms >= expected_ms * 0.85 && elapsed_ms <= expected_ms * 1.5,
+			"expected ~{expected_ms:.2} ms for paced batch, got {elapsed_ms:.2} ms"
+		);
+	}
+
+	#[tokio::test]
+	async fn paced_send_batch_cancels_promptly() {
+		let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let dest = receiver.local_addr().unwrap();
+
+		let mut sender = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		sender.set_pacing(Some(1_250_000)); // 10 Mb/s -> ~180 ms for 160 shards
+		let batch = synthetic_batch(160, 1408);
+
+		let start = Instant::now();
+		let result = tokio::time::timeout(Duration::from_millis(20), sender.send_batch(&batch, dest)).await;
+		let elapsed = start.elapsed();
+
+		assert!(result.is_err(), "slow paced batch should be cancelled by timeout");
+		assert!(
+			elapsed < Duration::from_millis(60),
+			"cancellation took too long: {elapsed:?}"
+		);
 	}
 }

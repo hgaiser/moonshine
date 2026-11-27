@@ -319,16 +319,22 @@ impl PacketBatch {
 		(self.epoch, self.shards)
 	}
 
+	/// A batch carrying `shards` and holding a new in-flight slot, for packet handler tests.
+	#[cfg(test)]
+	pub(super) fn with_shards(shards: ShardBatch, in_flight: &Arc<AtomicUsize>) -> Self {
+		in_flight.fetch_add(1, Ordering::Relaxed);
+		Self {
+			epoch: 0,
+			shards,
+			in_flight: InFlightGuard(in_flight.clone()),
+		}
+	}
+
 	/// An empty batch holding a new in-flight slot, as the encoding thread and
 	/// the consumer would produce it.
 	#[cfg(test)]
 	pub(super) fn holding_slot(in_flight: &Arc<AtomicUsize>) -> Self {
-		in_flight.fetch_add(1, Ordering::Relaxed);
-		Self {
-			epoch: 0,
-			shards: ShardBatch::empty(),
-			in_flight: InFlightGuard(in_flight.clone()),
-		}
+		Self::with_shards(ShardBatch::empty(), in_flight)
 	}
 }
 

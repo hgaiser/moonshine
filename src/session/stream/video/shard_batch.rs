@@ -19,6 +19,13 @@ impl ShardBatch {
 		}
 	}
 
+	/// Build a batch from raw contiguous shard bytes for tests.
+	#[cfg(test)]
+	pub fn from_raw(data: Vec<u8>, shard_size: usize) -> Self {
+		debug_assert!(shard_size > 0 && data.len().is_multiple_of(shard_size));
+		Self { data, shard_size }
+	}
+
 	/// Raw contiguous buffer for GSO sends.
 	pub fn as_bytes(&self) -> &[u8] {
 		&self.data

@@ -399,7 +399,7 @@ impl Webserver {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
 						return Ok(resp);
 					}
-					self.resume(params, local_address).await
+					self.resume(params, local_address, peer_cert_fingerprint).await
 				},
 				(&Method::GET, "/cancel") => {
 					if let Some(resp) = self.verify_paired_client(&peer_cert_fingerprint) {
@@ -867,7 +867,12 @@ impl Webserver {
 		if initialize_result.is_err() {
 			return xml_error(400, "Failed to start session");
 		}
-		self.session_manager.set_session_client(peer_cert_fingerprint).await;
+		let packet_pacing = peer_cert_fingerprint
+			.as_deref()
+			.is_some_and(|fp| self.client_manager.device_packet_pacing(fp));
+		self.session_manager
+			.set_session_client(peer_cert_fingerprint, packet_pacing)
+			.await;
 
 		match tokio::time::timeout(
 			std::time::Duration::from_secs(APP_LAUNCH_HTTP_TIMEOUT_SECS),
@@ -917,6 +922,7 @@ impl Webserver {
 		&self,
 		mut params: HashMap<String, String>,
 		local_address: Option<SocketAddr>,
+		peer_cert_fingerprint: Option<String>,
 	) -> Response<Full<Bytes>> {
 		let remote_input_key = match params.remove("rikey") {
 			Some(remote_input_key) => remote_input_key,
@@ -968,6 +974,13 @@ impl Webserver {
 				return xml_error(400, &message);
 			},
 		}
+
+		let packet_pacing = peer_cert_fingerprint
+			.as_deref()
+			.is_some_and(|fp| self.client_manager.device_packet_pacing(fp));
+		self.session_manager
+			.set_session_client(peer_cert_fingerprint, packet_pacing)
+			.await;
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		if let Some(addr) = local_address {
