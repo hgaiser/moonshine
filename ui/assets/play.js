@@ -28,7 +28,7 @@ try {
 // The last choices, in this browser: { app, size ("native" or [w, h]), fps, audioMode ("auto", 2, 6
 // or 8; "audio" was the old fixed choice and is ignored), hdrMode ("auto"
 // or "off"), codec ("auto", "hevc", "h264" or "av1"), fullscreen, stats, bitrate ({ kbps, width, height, fps } only when the user changed
-// the default) }.
+// the default), apps ({ [app id]: the advanced options to use for that application }) }.
 const CHOICES = "moonshine-stream-choices";
 function loadChoices() {
   try { return JSON.parse(localStorage.getItem(CHOICES)) || {}; } catch { return {}; }
@@ -40,6 +40,7 @@ function saveChoices(choices) {
 let message = null;
 let playing = false;
 let shown = null; // What the form shows: redrawn only when this changes, to keep the user's choices.
+let picked = null; // The application that the user selected in the form.
 
 async function load() {
   if (playing) return;
@@ -54,7 +55,7 @@ async function load() {
   const state = JSON.stringify([snap.server?.browser_streaming, snap.session && [snap.session.application, snap.session.width, snap.session.height, snap.session.fps], (snap.library || []).map(a => a.id), message]);
   if (state === shown) return;
   shown = state;
-  render(snap);
+  render(snap, picked);
 }
 
 // A session can start or stop elsewhere (Moonlight, the control panel): follow it.
@@ -64,7 +65,9 @@ function show(html) {
   $("#play-form").innerHTML = `<h2 id="play-title">play</h2>${html}`;
 }
 
-function render(snap) {
+/// Draw the form. `pick` is the application that the user selected; `keep` holds what the form
+/// keeps when it is drawn again for another application.
+function render(snap, pick = null, keep = null) {
   const player = window.MoonshineStream;
   if (!player) { show(`<p class="err">The stream player did not load. Reload the page.</p>`); return; }
   if (snap.server?.browser_streaming === false) {
@@ -76,9 +79,14 @@ function render(snap) {
   const join = Boolean(snap.session);
   const session = snap.session;
   const apps = snap.library || [];
-  const last = loadChoices();
+  const saved = loadChoices();
   // A link with ?app= wins over the last choice.
-  const wanted = new URLSearchParams(location.search).get("app") ?? (last.app != null ? String(last.app) : null);
+  let wanted = pick ?? new URLSearchParams(location.search).get("app") ?? (saved.app != null ? String(saved.app) : null);
+  if (!apps.some(a => String(a.id) === wanted)) wanted = apps.length ? String(apps[0].id) : null;
+  // The options saved for this application, else the options of the last stream.
+  const own = join ? null : saved.apps?.[wanted] ?? null;
+  const last = own ? { ...saved, ...own } : saved;
+  const fullscreenOn = keep ? keep.fullscreen : saved.fullscreen !== false;
   const dpr = window.devicePixelRatio || 1;
   // Landscape, also on a phone held upright: the player turns the device to landscape where it can.
   const long = Math.max(screen.width, screen.height), short = Math.min(screen.width, screen.height);
@@ -102,8 +110,8 @@ function render(snap) {
     ${join ? `<p class="muted">${esc(session.application || "A session")} runs at ${session.width} × ${session.height} @ ${session.fps}. This browser takes it over; a Moonlight client that streams it now disconnects.</p>` :
       `<div class="field"><label for="s-app">Application</label><select id="s-app">${apps.map(a => `<option value="${a.id}" ${String(a.id) === wanted ? "selected" : ""}>${esc(a.title)}</option>`).join("")}</select></div>
 `}
-    <div class="field"><label class="switch"><input type="checkbox" id="s-full" ${last.fullscreen === false ? "" : "checked"}><span>Start in full screen</span></label><span class="help">On a phone or tablet, also turns the screen to landscape.</span></div>
-    <details class="adv"><summary><strong>Advanced options</strong><span class="adv-sum muted" id="s-adv-sum"></span></summary><div style="display:grid;gap:14px">
+    <div class="field"><label class="switch"><input type="checkbox" id="s-full" ${fullscreenOn ? "checked" : ""}><span>Start in full screen</span></label><span class="help">On a phone or tablet, also turns the screen to landscape.</span></div>
+    <details class="adv" ${keep?.open ? "open" : ""}><summary><strong>Advanced options</strong><span class="adv-sum muted" id="s-adv-sum"></span></summary><div style="display:grid;gap:14px">
       ${join ? "" : `<div class="field"><label for="s-size">Resolution</label><select id="s-size">${sizes.map((r, i) => `<option value="${i}" ${i === sizeIndex ? "selected" : ""}>${r[0]} × ${r[1]}${i === 0 ? " (this screen)" : ""}</option>`).join("")}</select></div>`}
       ${join ? "" : `<div class="field"><label for="s-fps">Frame rate</label><select id="s-fps">${[60, 120, 30].map(f => `<option value="${f}" ${f === lastFps ? "selected" : ""}>${f}</option>`).join("")}</select></div>`}
       <div class="field"><label for="s-rate">Bitrate (Mb/s)</label><input type="number" id="s-rate" min="1" max="500" step="1"><span class="help">The whole stream, with FEC and audio. The default follows Moonlight: 20 Mb/s at 1080p60.</span></div>
@@ -111,6 +119,7 @@ function render(snap) {
       ${join ? "" : `<div class="field"><label for="s-codec">Video codec</label><select id="s-codec"><option value="auto">Automatic</option></select><span class="help" id="s-codec-help"></span></div>`}
       ${join ? "" : `<div class="field"><label for="s-audio">Audio</label><select id="s-audio"><option value="auto">Automatic (${audioName(autoChannels)})</option>${AUDIO.map(([n, l]) => `<option value="${n}" ${n === audioMode ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">This device has ${speakers} audio channel${speakers === 1 ? "" : "s"}. Automatic selects the most channels that it takes. The browser mixes more channels down to fit.</span></div>`}
       <div class="field"><label class="switch"><input type="checkbox" id="s-stats" ${last.stats ? "checked" : ""}><span>Show statistics</span></label><span class="help">Statistics on top of the stream: frame rate, bitrate, decode time, round trip and loss. Ctrl+Alt+Shift+S shows or hides them during the stream.</span></div>
+      ${join ? "" : `<div class="field"><label class="switch"><input type="checkbox" id="s-own" ${own ? "checked" : ""}><span>Remember these options for this application</span></label><span class="help">The next stream of this application uses these options again. Without this, it uses the options of the last stream.</span></div>`}
     </div></details>
     <div class="sheet-actions">
       <button type="submit" class="btn primary" id="s-go" ${missing || (!join && !apps.length) ? "disabled" : ""}>${join ? "Join the session" : "Start streaming"}</button>
@@ -183,6 +192,9 @@ function render(snap) {
   $("#s-hdr")?.addEventListener("change", hdrHelp);
   $("#s-codec")?.addEventListener("change", () => { codecHelp(); hdrHelp(); });
 
+  // Another application: draw the form again with its saved options.
+  $("#s-app")?.addEventListener("change", () => render(snap, picked = $("#s-app").value, { open: $("details.adv").open, fullscreen: $("#s-full").checked }));
+
   // The player must open in the click: full screen and audio need its user gesture.
   $("#play-form").onsubmit = e => {
     e.preventDefault();
@@ -195,19 +207,32 @@ function render(snap) {
     // A default bitrate removes only a typed bitrate for this size and frame rate.
     const same = last.bitrate && last.bitrate.width === width && last.bitrate.height === height && last.bitrate.fps === fps();
     const bitrate = custom ? { kbps: bitrateKbps, width, height, fps: fps() } : same ? null : last.bitrate ?? null;
-    const choices = { ...last, fullscreen, stats, bitrate };
+    const choices = { ...saved, fullscreen };
     delete choices.hdr; // The old HDR switch.
-    if (!join) {
+    delete choices.audio; // The old fixed audio choice.
+    if (join) {
+      Object.assign(choices, { stats, bitrate });
+    } else {
       const index = Number($("#s-size")?.value || 0);
-      delete choices.audio; // The old fixed audio choice.
-      Object.assign(choices, {
-        app: app ? app.id : null,
+      const options = {
         size: index === 0 ? "native" : sizes[index],
         fps: fps(),
+        bitrate,
+        hdrMode: $("#s-hdr")?.value === "off" ? "off" : "auto",
+        codec: codec() || "auto",
         audioMode: $("#s-audio")?.value === "auto" ? "auto" : Number($("#s-audio")?.value),
-      });
-      choices.hdrMode = $("#s-hdr")?.value === "off" ? "off" : "auto";
-      choices.codec = codec() || "auto";
+        stats,
+      };
+      choices.app = app ? app.id : null;
+      // Options for this application only, or the options for the next stream of any application.
+      const own = { ...saved.apps };
+      if (app && $("#s-own")?.checked) {
+        own[app.id] = options;
+      } else {
+        if (app) delete own[app.id];
+        Object.assign(choices, options);
+      }
+      if (Object.keys(own).length) choices.apps = own; else delete choices.apps;
     }
     saveChoices(choices);
     message = null;
