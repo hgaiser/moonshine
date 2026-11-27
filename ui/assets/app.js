@@ -830,7 +830,7 @@ const bannerFx = (() => {
 
 /* ---------- Guide ---------- */
 // A tour for new users: the page goes dark except one part, and a card tells what that part does.
-// It opens by itself until the user turns it off. The guide button in the masthead opens it again.
+// It opens by itself until the user turns it off.
 const guide = (() => {
   const KEY = "moonshine-guide";
   const STEPS = [
@@ -844,8 +844,7 @@ const guide = (() => {
     { page: "apps", sel: "#app-list > .panel:first-child", title: "Your applications", text: "Add an application with a name and a command. Clients show it in their app list." },
     { page: "apps", sel: "#app-list > .section-head", title: "Scanners", text: "A scanner finds your Steam games or desktop apps. It updates the list when you install or remove something. Hide an app that you do not want to see in Moonlight." },
     { page: "config", sel: "#settings > :first-child", title: "Settings", text: "Each setting shows when a change takes effect: now, at the next stream, or after a restart. Select Save to write your changes to config.toml." },
-    { page: "logs", sel: "#report", title: "Logs", text: "This page shows the latest messages from Moonshine. If you find a bug, download the report and attach it to the issue." },
-    { page: null, sel: "#guide-btn", title: "Open the guide again", text: "Select guide to see this tour again." }
+    { page: "logs", sel: "#report", title: "Logs", text: "This page shows the latest messages from Moonshine. If you find a bug, download the report and attach it to the issue." }
   ];
   const get = () => { try { return localStorage.getItem(KEY); } catch (e) { return null; } };
   const put = v => { try { localStorage.setItem(KEY, v); } catch (e) { /* storage blocked */ } };
@@ -940,7 +939,6 @@ const guide = (() => {
     if (focusBack && focusBack.focus) focusBack.focus();
   }
 
-  $("#guide-btn").onclick = e => { e.stopPropagation(); open(); };
   // At start, wait for the first data so the panels have their size.
   return { start() { if (get() !== "off") requestAnimationFrame(open); } };
 })();
