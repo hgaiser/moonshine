@@ -2,8 +2,9 @@
 //
 // WebTransport carries the stream (see ui/src/stream.rs for the protocol): video and audio as
 // datagrams, control messages and input on one bidirectional stream. WebCodecs decodes the video
-// (drawn on a canvas) and the audio (played through an AudioWorklet). Input goes to the server as
-// Moonlight input packets, so the server handles it as it handles Moonlight's.
+// (shown in a <video> element, or drawn on a canvas) and the audio (played through an
+// AudioWorklet). Input goes to the server as Moonlight input packets, so the server handles it as
+// it handles Moonlight's.
 //
 // app.js opens a stream with `window.MoonshineStream.open(...)`.
 
@@ -200,18 +201,61 @@ const clamp16 = v => Math.max(-32768, Math.min(32767, Math.round(v)));
 
 // ---------- Renderers ----------
 
-/// Draws frames on a 2D canvas. The browser converts each frame from its color space (in the
-/// bitstream) to the canvas's sRGB: an HDR (PQ) frame is tone-mapped to SDR. An HDR renderer
-/// (WebGPU with extended range, or a <video> element) can replace it with the same interface.
+/// Whether this browser can show the frames in a <video> element.
+const canPlayFrames = () => typeof MediaStreamTrackGenerator !== "undefined";
+
+/// Shows frames in a <video> element, through a generated video track (Chromium). The browser
+/// shows an HDR (PQ) frame in HDR on an HDR display, which a canvas cannot. Not slower than the
+/// canvas (a test on Android: 20 ms against 22.5 ms to the expected display time).
+class VideoRenderer {
+  constructor(video) {
+    this.video = video;
+    this.track = new MediaStreamTrackGenerator({ kind: "video" });
+    this.writer = this.track.writable.getWriter();
+    this.pending = 0;
+    video.srcObject = new MediaStream([this.track]);
+    this.play();
+  }
+
+  /// Takes the frame: the track closes it once it was written.
+  draw(frame) {
+    // A frame is still waiting: drop this one rather than queue behind it.
+    if (this.pending > 1) { frame.close(); return; }
+    this.pending++;
+    this.writer.write(frame).catch(() => frame.close()).finally(() => this.pending--);
+  }
+
+  play() {
+    this.video.play().catch(() => { /* Played after the next user gesture. */ });
+  }
+
+  close() {
+    this.writer.close().catch(() => {});
+    this.track.stop();
+    this.video.srcObject = null;
+  }
+}
+
+/// Draws frames on a 2D canvas, for browsers without generated video tracks. The browser converts
+/// each frame from its color space (in the bitstream) to the canvas's sRGB: an HDR (PQ) frame is
+/// tone-mapped to SDR.
 class CanvasRenderer {
-  constructor(canvas) {
-    this.canvas = canvas;
+  constructor(canvas, width, height) {
+    canvas.width = width;
+    canvas.height = height;
+    this.view = canvas;
     this.context = canvas.getContext("2d", { alpha: false, desynchronized: true });
   }
 
+  /// Takes the frame and closes it.
   draw(frame) {
-    this.context.drawImage(frame, 0, 0, this.canvas.width, this.canvas.height);
+    this.context.drawImage(frame, 0, 0, this.streamWidth, this.streamHeight);
+    frame.close();
   }
+
+  play() {}
+
+  close() {}
 }
 
 // ---------- The player ----------
@@ -247,10 +291,16 @@ class Player {
   // -- UI --
 
   buildUi() {
+    // The <video> element where the browser can feed it; the canvas otherwise, or when asked
+    // (options.renderer "canvas", or localStorage "moonshine-stream-renderer" = "canvas", to compare).
+    const forced = this.options.renderer ?? localStorage.getItem("moonshine-stream-renderer");
+    this.useVideo = canPlayFrames() && forced !== "canvas";
     const root = document.createElement("div");
     root.className = "stream-root";
     root.innerHTML = `
-      <canvas class="stream-video" tabindex="0" aria-label="The stream"></canvas>
+      ${this.useVideo
+        ? `<video class="stream-video" tabindex="0" aria-label="The stream" muted playsinline disablepictureinpicture disableremoteplayback></video>`
+        : `<canvas class="stream-video" tabindex="0" aria-label="The stream"></canvas>`}
       <div class="stream-edge" aria-hidden="true"></div>
       <div class="stream-bar" role="toolbar" aria-label="Stream">
         <span class="stream-title"></span>
@@ -266,13 +316,14 @@ class Player {
     document.body.appendChild(root);
     document.documentElement.classList.add("streaming");
     this.root = root;
-    this.canvas = root.querySelector(".stream-video");
+    this.view = root.querySelector(".stream-video");
     this.status = root.querySelector(".stream-status");
     this.statsBox = root.querySelector(".stream-stats");
+    this.statsBox.hidden = !this.options.stats;
     root.querySelector(".stream-title").textContent = this.options.title || "Stream";
     // Touch screens have no hover: a tap on the top edge shows the bar, a tap on the picture hides it.
     root.querySelector(".stream-edge").addEventListener("pointerdown", () => root.classList.add("bar-open"));
-    this.canvas.addEventListener("pointerdown", () => root.classList.remove("bar-open"), true);
+    this.view.addEventListener("pointerdown", () => root.classList.remove("bar-open"), true);
     root.querySelector(".stream-bar").addEventListener("click", e => {
       const action = e.target.closest("button")?.dataset.act;
       if (action === "fullscreen") this.toggleFullscreen();
@@ -417,9 +468,9 @@ class Player {
 
   async onReady(params) {
     this.params = params;
-    this.canvas.width = params.width;
-    this.canvas.height = params.height;
-    this.renderer = new CanvasRenderer(this.canvas);
+    this.streamWidth = params.width;
+    this.streamHeight = params.height;
+    this.renderer = this.useVideo ? new VideoRenderer(this.view) : new CanvasRenderer(this.view, params.width, params.height);
     this.root.querySelector(".stream-title").textContent =
       `${this.options.title || "Stream"} · ${params.width}×${params.height} @ ${params.fps} · ${params.codec.toUpperCase()}`;
     await this.setupAudio(params).catch(e => this.hint(`No audio: ${e.message}`));
@@ -433,7 +484,7 @@ class Player {
     this.pollGamepads();
     this.setStatus("Waiting for the first frame…");
     this.send(CLIENT.start);
-    this.canvas.focus();
+    this.view.focus();
   }
 
   send(kind, payload = new Uint8Array(0)) {
@@ -670,8 +721,9 @@ class Player {
       this.renderer.draw(videoFrame);
       this.stats.frames++;
       if (++this.totals.frames === 1) this.setStatus("");
+    } else {
+      videoFrame.close();
     }
-    videoFrame.close();
   }
 
   // -- Audio --
@@ -756,23 +808,23 @@ class Player {
   }
 
   bindInput() {
-    const canvas = this.canvas;
+    const element = this.view;
     this.on(document, "keydown", e => this.onKey(e, true), true);
     this.on(document, "keyup", e => this.onKey(e, false), true);
     this.on(window, "blur", () => this.releaseAll());
     this.on(document, "visibilitychange", () => {
       if (document.hidden) this.releaseAll();
-      else this.keepAwake();
+      else { this.keepAwake(); this.renderer?.play(); }
     });
 
-    this.on(canvas, "pointerdown", e => this.onPointer(e, "down"));
-    this.on(canvas, "pointerup", e => this.onPointer(e, "up"));
-    this.on(canvas, "pointercancel", e => this.onPointer(e, "cancel"));
-    this.on(canvas, "pointermove", e => this.onPointer(e, "move"));
-    this.on(canvas, "contextmenu", e => e.preventDefault());
-    this.on(canvas, "wheel", e => this.onWheel(e), { passive: false });
+    this.on(element, "pointerdown", e => this.onPointer(e, "down"));
+    this.on(element, "pointerup", e => this.onPointer(e, "up"));
+    this.on(element, "pointercancel", e => this.onPointer(e, "cancel"));
+    this.on(element, "pointermove", e => this.onPointer(e, "move"));
+    this.on(element, "contextmenu", e => e.preventDefault());
+    this.on(element, "wheel", e => this.onWheel(e), { passive: false });
     this.on(document, "pointerlockchange", () => {
-      if (document.pointerLockElement !== canvas) this.releaseButtons();
+      if (document.pointerLockElement !== element) this.releaseButtons();
     });
   }
 
@@ -814,19 +866,19 @@ class Player {
 
   /// The pointer position in stream pixels, or null outside the picture.
   streamPosition(e) {
-    const rect = this.canvas.getBoundingClientRect();
-    const scale = Math.min(rect.width / this.canvas.width, rect.height / this.canvas.height);
-    const width = this.canvas.width * scale, height = this.canvas.height * scale;
+    const rect = this.view.getBoundingClientRect();
+    const scale = Math.min(rect.width / this.streamWidth, rect.height / this.streamHeight);
+    const width = this.streamWidth * scale, height = this.streamHeight * scale;
     const x = (e.clientX - rect.left - (rect.width - width) / 2) / scale;
     const y = (e.clientY - rect.top - (rect.height - height) / 2) / scale;
-    return { x: Math.max(0, Math.min(this.canvas.width - 1, x)), y: Math.max(0, Math.min(this.canvas.height - 1, y)) };
+    return { x: Math.max(0, Math.min(this.streamWidth - 1, x)), y: Math.max(0, Math.min(this.streamHeight - 1, y)) };
   }
 
   onPointer(e, phase) {
     if (!this.params) return;
     if (e.pointerType === "touch" && this.touchMode === "trackpad") return this.onTrackpad(e, phase);
     if (e.pointerType === "touch" || e.pointerType === "pen") return this.onTouch(e, phase);
-    const locked = document.pointerLockElement === this.canvas;
+    const locked = document.pointerLockElement === this.view;
 
     if (phase === "move") {
       if (locked) {
@@ -840,11 +892,11 @@ class Player {
       return;
     }
 
-    if (phase === "down" && !locked && e.button === 0 && this.canvas.requestPointerLock) {
+    if (phase === "down" && !locked && e.button === 0 && this.view.requestPointerLock) {
       // The first click captures the mouse; games need relative motion.
       this.sendAbsolute(e);
-      const lock = this.canvas.requestPointerLock({ unadjustedMovement: true });
-      if (lock?.catch) lock.catch(() => this.canvas.requestPointerLock());
+      const lock = this.view.requestPointerLock({ unadjustedMovement: true });
+      if (lock?.catch) lock.catch(() => this.view.requestPointerLock());
     }
     const button = [1, 2, 3, 4, 5][e.button];
     if (button === undefined || phase === "cancel") return;
@@ -860,8 +912,8 @@ class Player {
     const { buffer, view } = packet(INPUT.mouseAbsolute, 10);
     view.setInt16(4, Math.round(x), false);
     view.setInt16(6, Math.round(y), false);
-    view.setInt16(10, this.canvas.width, false);
-    view.setInt16(12, this.canvas.height, false);
+    view.setInt16(10, this.streamWidth, false);
+    view.setInt16(12, this.streamHeight, false);
     this.sendInput(buffer);
   }
 
@@ -897,15 +949,15 @@ class Player {
   /// Stream pixels per CSS pixel of the picture on screen: a swipe across the picture moves the
   /// mouse across the stream.
   streamScale() {
-    const rect = this.canvas.getBoundingClientRect();
-    return 1 / Math.min(rect.width / this.canvas.width, rect.height / this.canvas.height);
+    const rect = this.view.getBoundingClientRect();
+    return 1 / Math.min(rect.width / this.streamWidth, rect.height / this.streamHeight);
   }
 
   onTrackpad(e, phase) {
     e.preventDefault();
     const now = performance.now();
     if (phase === "down") {
-      this.canvas.setPointerCapture?.(e.pointerId);
+      this.view.setPointerCapture?.(e.pointerId);
       this.touches.set(e.pointerId, { x: e.clientX, y: e.clientY });
       if (!this.gesture) {
         // A touch soon after a tap, near it, drags (the left button stays down).
@@ -984,8 +1036,8 @@ class Player {
     const { buffer, view } = packet(INPUT.touch, 28);
     view.setUint8(4, kind);
     view.setUint32(8, e.pointerId >>> 0, true);
-    view.setFloat32(12, x / this.canvas.width, true);
-    view.setFloat32(16, y / this.canvas.height, true);
+    view.setFloat32(12, x / this.streamWidth, true);
+    view.setFloat32(16, y / this.streamHeight, true);
     view.setFloat32(20, e.pressure || 0.5, true);
     this.sendInput(buffer);
   }
@@ -1085,7 +1137,7 @@ class Player {
     const seconds = (performance.now() - this.stats.since) / 1000;
     const decode = this.stats.decodeMs.length ? this.stats.decodeMs.reduce((a, b) => a + b, 0) / this.stats.decodeMs.length : NaN;
     this.statsBox.textContent = [
-      `Video     ${this.params.width}×${this.params.height} ${this.codec || this.params.codec}${this.params.hdr ? " 10-bit" : ""}`,
+      `Video     ${this.params.width}×${this.params.height} ${this.codec || this.params.codec}${this.params.hdr ? " 10-bit" : ""}, ${this.useVideo ? "video element" : "canvas"}`,
       `Color     ${this.color || "–"}`,
       `Frames    ${(this.stats.frames / seconds).toFixed(1)} fps of ${this.params.fps}`,
       `Bitrate   ${(this.stats.bytes * 8 / seconds / 1e6).toFixed(1)} Mb/s`,
@@ -1114,6 +1166,7 @@ class Player {
     this.writer?.close().catch(() => {});
     try { this.transport?.close(); } catch { /* Closed already. */ }
     try { this.decoder?.close(); } catch { /* Closed already. */ }
+    try { this.renderer?.close(); } catch { /* Closed already. */ }
     try { this.audioDecoder?.close(); } catch { /* Closed already. */ }
     this.audioContext?.close().catch(() => {});
     if (document.pointerLockElement) document.exitPointerLock();
@@ -1144,12 +1197,22 @@ function speakerChannels() {
   return speakers;
 }
 
+/// Why this browser cannot show an HDR stream in HDR, or null when it can.
+async function hdrProblem() {
+  if (!window.matchMedia?.("(dynamic-range: high)").matches) return "this display is not in HDR mode";
+  if (!canPlayFrames()) return "this browser shows HDR video only as SDR (Chrome and Edge show it in HDR)";
+  if (!(await decodableCodecs(true)).length) return "this browser cannot decode 10-bit video";
+  return null;
+}
+
 window.MoonshineStream = {
   missingFeatures,
+  hdrProblem,
   decodableCodecs,
   speakerChannels,
   /// Open a stream. Options: applicationId, title, width, height, fps, bitrateKbps, audioChannels,
-  /// hdr, fullscreen (try full screen at once: call `open` in a user gesture), onClose(message, failed).
+  /// hdr, fullscreen (try full screen at once: call `open` in a user gesture), stats (show the
+  /// statistics at once), onClose(message, failed).
   open(options) {
     current?.close("Another stream started.");
     current = new Player(options);

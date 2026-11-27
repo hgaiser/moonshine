@@ -25,8 +25,9 @@ try {
   if (theme !== "auto") document.documentElement.setAttribute("data-theme", theme);
 } catch { /* Storage blocked. */ }
 
-// The last choices, in this browser: { app, size ("native" or [w, h]), fps, audio, hdr, fullscreen,
-// bitrate ({ kbps, width, height, fps } only when the user changed the default) }.
+// The last choices, in this browser: { app, size ("native" or [w, h]), fps, audio, hdrMode ("auto"
+// or "off"), fullscreen, stats, bitrate ({ kbps, width, height, fps } only when the user changed
+// the default) }.
 const CHOICES = "moonshine-stream-choices";
 function loadChoices() {
   try { return JSON.parse(localStorage.getItem(CHOICES)) || {}; } catch { return {}; }
@@ -87,8 +88,7 @@ function render(snap) {
   // "native" follows this screen; a saved size that is not in the list falls back to it.
   const sizeIndex = Array.isArray(last.size) ? Math.max(0, sizes.findIndex(r => r[0] === last.size[0] && r[1] === last.size[1])) : 0;
   const lastFps = [30, 60, 120].includes(last.fps) ? last.fps : 60;
-  // HDR needs it on this computer and an HDR display here.
-  const hdrPossible = Boolean(snap.server?.hdr) && window.matchMedia?.("(dynamic-range: high)").matches;
+  const hdrMode = last.hdrMode === "off" ? "off" : "auto";
 
   show(`
     ${message ? `<p class="note">${esc(message)}</p>` : ""}
@@ -98,9 +98,13 @@ function render(snap) {
     <div class="field"><label for="s-size">Resolution</label><select id="s-size">${sizes.map((r, i) => `<option value="${i}" ${i === sizeIndex ? "selected" : ""}>${r[0]} × ${r[1]}${i === 0 ? " (this screen)" : ""}</option>`).join("")}</select></div>
     <div class="field"><label for="s-fps">Frame rate</label><select id="s-fps">${[60, 120, 30].map(f => `<option value="${f}" ${f === lastFps ? "selected" : ""}>${f}</option>`).join("")}</select></div>
     <div class="field"><label for="s-audio">Audio</label><select id="s-audio">${[[2, "Stereo"], [6, "5.1 surround"], [8, "7.1 surround"]].map(([n, l]) => `<option value="${n}" ${n === defaultChannels ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">This device has ${speakers} audio channel${speakers === 1 ? "" : "s"}. The browser mixes more channels down to fit.</span></div>
-    ${hdrPossible ? `<div class="field"><label class="switch"><input type="checkbox" id="s-hdr" ${last.hdr ? "checked" : ""}><span>HDR</span></label><span class="help">10-bit HEVC or AV1. The player draws on an SDR canvas, so HDR content shows as SDR. Not tested with HDR content yet.</span></div>` : ""}`}
+`}
     <div class="field"><label class="switch"><input type="checkbox" id="s-full" ${last.fullscreen === false ? "" : "checked"}><span>Start in full screen</span></label><span class="help">On a phone or tablet, also turns the screen to landscape.</span></div>
     <div class="field"><label for="s-rate">Bitrate (Mb/s)</label><input type="number" id="s-rate" min="1" max="500" step="1"><span class="help">The whole stream, with FEC and audio. The default follows Moonlight: 20 Mb/s at 1080p60.</span></div>
+    <details class="adv"><summary><strong>Advanced options</strong></summary><div style="display:grid;gap:14px">
+      ${join ? "" : `<div class="field"><label for="s-hdr">HDR</label><select id="s-hdr"><option value="auto" ${hdrMode === "auto" ? "selected" : ""}>Automatic</option><option value="off" ${hdrMode === "off" ? "selected" : ""}>Off</option></select><span class="help" id="s-hdr-help"></span></div>`}
+      <div class="field"><label class="switch"><input type="checkbox" id="s-stats" ${last.stats ? "checked" : ""}><span>Show statistics</span></label><span class="help">Statistics on top of the stream: frame rate, bitrate, decode time, round trip and loss. Ctrl+Alt+Shift+S shows or hides them during the stream.</span></div>
+    </div></details>
     <div class="sheet-actions">
       <button type="submit" class="btn primary" id="s-go" ${missing || (!join && !apps.length) ? "disabled" : ""}>${join ? "Join the session" : "Start streaming"}</button>
     </div>`);
@@ -118,18 +122,32 @@ function render(snap) {
   $("#s-size")?.addEventListener("change", update);
   $("#s-fps")?.addEventListener("change", update);
 
+  // Automatic HDR: an HDR stream when this computer and this browser can do it, else SDR.
+  let hdr = false;
+  const hdrHelp = async () => {
+    const help = $("#s-hdr-help");
+    if (!help) return;
+    const problem = !snap.server?.hdr ? "HDR is off on this computer (hdr in the [compositor] table of config.toml)" : await player.hdrProblem();
+    hdr = !problem && $("#s-hdr").value === "auto";
+    help.textContent = $("#s-hdr").value === "off" ? "The stream is SDR." : problem ? `The stream is SDR: ${problem}.` : "The stream is HDR (10-bit HEVC or AV1).";
+  };
+  hdrHelp();
+  $("#s-hdr")?.addEventListener("change", hdrHelp);
+
   // The player must open in the click: full screen and audio need its user gesture.
   $("#play-form").onsubmit = e => {
     e.preventDefault();
     const [width, height] = size();
     const app = apps.find(a => String(a.id) === $("#s-app")?.value);
     const fullscreen = Boolean($("#s-full")?.checked);
+    const stats = Boolean($("#s-stats")?.checked);
     const bitrateKbps = Math.round(Number($("#s-rate").value || 20) * 1000);
     const custom = bitrateKbps !== autoBitrate(width, height, fps());
     // A default bitrate removes only a typed bitrate for this size and frame rate.
     const same = last.bitrate && last.bitrate.width === width && last.bitrate.height === height && last.bitrate.fps === fps();
     const bitrate = custom ? { kbps: bitrateKbps, width, height, fps: fps() } : same ? null : last.bitrate ?? null;
-    const choices = { ...last, fullscreen, bitrate };
+    const choices = { ...last, fullscreen, stats, bitrate };
+    delete choices.hdr; // The old HDR switch.
     if (!join) {
       const index = Number($("#s-size")?.value || 0);
       Object.assign(choices, {
@@ -138,7 +156,7 @@ function render(snap) {
         fps: fps(),
         audio: Number($("#s-audio")?.value || 2),
       });
-      if ($("#s-hdr")) choices.hdr = $("#s-hdr").checked;
+      choices.hdrMode = $("#s-hdr")?.value === "off" ? "off" : "auto";
     }
     saveChoices(choices);
     message = null;
@@ -150,8 +168,9 @@ function render(snap) {
       fps: fps(),
       bitrateKbps,
       audioChannels: Number($("#s-audio")?.value || 2),
-      hdr: Boolean($("#s-hdr")?.checked),
+      hdr,
       fullscreen,
+      stats,
       onClose: (text, failed) => {
         message = text || null;
         playing = false;
