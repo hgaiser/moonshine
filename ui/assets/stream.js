@@ -76,6 +76,9 @@ const CODEC_TESTS = {
   av1: "av01.0.13M.08",
 };
 
+/// The names that the control panel shows for the codecs.
+const CODEC_NAMES = { hevc: "HEVC", h264: "H.264", av1: "AV1" };
+
 // 10-bit (HDR) profiles: HEVC Main 10, AV1 Main at 10 bits.
 const CODEC_TESTS_10BIT = {
   hevc: "hvc1.2.4.L153.B0",
@@ -412,9 +415,15 @@ class Player {
     const missing = missingFeatures();
     if (missing) return this.fail(missing);
 
-    const codecs = await decodableCodecs();
-    const codecs10 = await decodableCodecs(true);
-    if (!codecs.length) return this.fail("This browser can decode none of the video codecs. Check that hardware decoding is on.");
+    // A chosen codec limits the list that Moonshine selects from to that codec.
+    const chosen = list => this.options.codec ? list.filter(c => c === this.options.codec) : list;
+    const codecs = chosen(await decodableCodecs());
+    const codecs10 = chosen(await decodableCodecs(true));
+    if (!codecs.length) {
+      return this.fail(this.options.codec
+        ? `This browser cannot decode ${CODEC_NAMES[this.options.codec]}. Select another codec in the advanced options.`
+        : "This browser can decode none of the video codecs. Check that hardware decoding is on.");
+    }
 
     let token;
     try {
@@ -1209,10 +1218,12 @@ window.MoonshineStream = {
   missingFeatures,
   hdrProblem,
   decodableCodecs,
+  CODEC_NAMES,
   speakerChannels,
   /// Open a stream. Options: applicationId, title, width, height, fps, bitrateKbps, audioChannels,
-  /// hdr, fullscreen (try full screen at once: call `open` in a user gesture), stats (show the
-  /// statistics at once), onClose(message, failed).
+  /// hdr, codec ("hevc", "h264" or "av1"; omit it to let Moonshine select), fullscreen (try full
+  /// screen at once: call `open` in a user gesture), stats (show the statistics at once),
+  /// onClose(message, failed).
   open(options) {
     current?.close("Another stream started.");
     current = new Player(options);
