@@ -891,9 +891,21 @@ class Player {
 
     if (phase === "move") {
       if (locked) {
+        // The browser gives the motion in CSS pixels: scale it to stream pixels, as for the
+        // absolute position, so that the mouse moves as fast as without capture. The fractions
+        // carry over, so that slow motion is not lost.
+        const scale = this.streamScale();
+        if (!Number.isFinite(scale)) return;
+        const rest = this.motionRest ??= { x: 0, y: 0 };
+        rest.x += e.movementX * scale;
+        rest.y += e.movementY * scale;
+        const dx = Math.trunc(rest.x), dy = Math.trunc(rest.y);
+        rest.x -= dx;
+        rest.y -= dy;
+        if (!dx && !dy) return;
         const { buffer, view } = packet(INPUT.mouseRelative, 4);
-        view.setInt16(4, clamp16(e.movementX), false);
-        view.setInt16(6, clamp16(e.movementY), false);
+        view.setInt16(4, clamp16(dx), false);
+        view.setInt16(6, clamp16(dy), false);
         this.sendInput(buffer);
       } else {
         this.sendAbsolute(e);
