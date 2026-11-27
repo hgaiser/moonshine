@@ -27,10 +27,6 @@
     </div>
   </div>
   <div class="mast-tools">
-    <a class="mtool play" id="play" href="/play" hidden title="Stream an application to this browser">
-      <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><rect x="4" y="2" width="2" height="12"/><rect x="6" y="3" width="2" height="10"/><rect x="8" y="4" width="2" height="8"/><rect x="10" y="5" width="2" height="6"/><rect x="12" y="7" width="1" height="2"/></svg>
-      play
-    </a>
     <button class="mtool" id="theme-btn" title="Color theme">auto</button>
     <button class="mtool" id="bell" aria-label="Notifications" aria-expanded="false" aria-controls="notif">
       <svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><rect x="7" y="1" width="2" height="2"/><rect x="6" y="3" width="4" height="1"/><rect x="5" y="4" width="6" height="1"/><rect x="4" y="5" width="8" height="5"/><rect x="3" y="10" width="10" height="1"/><rect x="2" y="11" width="12" height="1"/><rect x="7" y="13" width="2" height="2"/></svg>
@@ -42,6 +38,7 @@
 
 <div class="shell">
   <nav class="rail" aria-label="Pages">
+    <a href="/play" class="rail-play" id="play" hidden title="Stream an application to this browser"><svg viewBox="0 0 16 16" aria-hidden="true" fill="currentColor"><rect x="4" y="2" width="2" height="12"/><rect x="6" y="3" width="2" height="10"/><rect x="8" y="4" width="2" height="8"/><rect x="10" y="5" width="2" height="6"/><rect x="12" y="7" width="1" height="2"/></svg>Play</a>
     <a href="#home" data-page="home">Home <span class="count warn" id="nav-health" hidden>0</span></a>
     <a href="#clients" data-page="clients">Clients <span class="count info" id="nav-pair" hidden>0</span></a>
     <a href="#apps" data-page="apps">Applications</a>

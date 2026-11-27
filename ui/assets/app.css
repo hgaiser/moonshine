@@ -82,9 +82,7 @@ button, input, select, textarea { font: inherit; color: inherit; }
 .mast-tools { position: absolute; z-index: 2; top: 12px; right: max(16px, env(safe-area-inset-right, 0px)); display: flex; gap: 8px; }
 .mtool { position: relative; display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 10px; border: 0; cursor: pointer; background: rgba(23,18,58,.82); color: #ecebff; clip-path: var(--px4); font-family: var(--font-display); font-size: 14px; text-transform: lowercase; }
 .mtool:hover { background: rgba(48,40,106,.95); }
-.mtool.play { background: #e8c46a; color: #1a1430; text-decoration: none; font-weight: 600; }
-.mtool.play:hover { background: #ffe18c; }
-.mtool[hidden] { display: none; }
+
 .mtool svg { width: 18px; height: 18px; shape-rendering: crispEdges; }
 .mtool .count { position: static; background: #e8c46a; color: #1a1430; }
 .notif { position: fixed; z-index: 25; top: calc(env(safe-area-inset-top, 0px) + 54px); right: max(16px, env(safe-area-inset-right, 0px)); width: min(380px, calc(100% - 32px)); max-height: min(520px, calc(100% - 80px)); overflow: auto;
@@ -112,6 +110,12 @@ nav.rail { display: flex; flex-direction: column; gap: 2px; position: sticky; to
 nav.rail a { position: relative; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 8px 12px 8px 28px; color: var(--muted); text-decoration: none; font-weight: 500; clip-path: var(--px4); }
 nav.rail a::before { content: ""; position: absolute; left: 13px; top: 50%; width: 2px; height: 2px; margin-top: -1px; background: var(--line); }
 nav.rail a:hover { background: var(--surface-2); color: var(--fg); }
+/* Play opens the stream page: an action in the accent color, with a play icon instead of the dot. */
+nav.rail a.rail-play { justify-content: flex-start; padding-left: 10px; margin-bottom: 8px; background: var(--accent); color: var(--on-accent); font-weight: 600; }
+nav.rail a.rail-play:hover { background: var(--accent); color: var(--on-accent); filter: brightness(1.1); }
+nav.rail a.rail-play::before { display: none; }
+nav.rail a.rail-play svg { width: 16px; height: 16px; flex: none; shape-rendering: crispEdges; }
+nav.rail a[hidden] { display: none; }
 nav.rail a[aria-current="page"] { background: var(--surface-2); color: var(--fg); }
 /* A four-point pixel star, like the ones in the banner sky. */
 nav.rail a[aria-current="page"]::before { background: var(--accent);
@@ -160,6 +164,7 @@ details.scanner[open] > summary { margin-bottom: 8px; }
 /* Buttons get a stepped one-pixel border: the button paints the border color, and ::before
    paints the face one pixel inside it with the same stepped corners. */
 .btn { --face: var(--surface-2); position: relative; isolation: isolate; display: inline-flex; align-items: center; justify-content: center; gap: 6px; padding: 7px 14px; border: 0; background: var(--edge); color: var(--fg); cursor: pointer; font-weight: 500; white-space: nowrap; clip-path: var(--px4); }
+a.btn { text-decoration: none; }
 .btn::before { content: ""; position: absolute; inset: 1px; z-index: -1; background: var(--face); clip-path: var(--px4); box-shadow: inset 0 -2px 0 var(--line); }
 .btn:hover { --face: var(--line); }
 .btn:active::before { box-shadow: inset 0 2px 0 var(--line); }
@@ -354,6 +359,7 @@ details.adv[open] > summary .adv-sum { display: none; }
   .shell { grid-template-columns: minmax(0, 1fr); gap: 16px; padding-block: 0 64px; }
   nav.rail { position: sticky; top: env(safe-area-inset-top, 0px); z-index: 8; flex-direction: row; overflow-x: auto; background: var(--bg); margin: 0 -16px; padding: 8px 16px; border-bottom: 1px solid var(--line); }
   nav.rail a { flex: none; }
+  nav.rail a.rail-play { margin-bottom: 0; margin-right: 6px; }
   nav.rail a[aria-current="page"] { box-shadow: inset 0 -2px 0 var(--accent); }
   .rail-foot { display: none; }
   .mast img { height: 160px; object-position: -40px center; }

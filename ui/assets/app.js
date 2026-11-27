@@ -146,7 +146,7 @@ function renderSession() {
       $("#stop-yes").onclick = async () => { $("#stop-yes").disabled = true; await act("stop_session"); };
     };
   }
-  // Play in this browser: from the banner always, and next to Stop stream to reconnect to the
+  // Play in this browser: from the menu always, and next to Stop stream to reconnect to the
   // session of a browser that lost its stream.
   const off = snap.server?.browser_streaming === false;
   $("#play").hidden = off;
@@ -418,6 +418,13 @@ function renderClients() {
 /* ---------- Applications ---------- */
 const openScanners = new Set();
 let scannersSeen = false;
+/// A button that streams the application to this browser, when browser streaming is on and
+/// Moonlight lists the application (a hidden one is not in the library).
+function playButton(title) {
+  if (snap.server?.browser_streaming === false) return "";
+  const app = (snap.library || []).find(a => a.title === title);
+  return app ? `<a class="btn sm" href="/play?app=${encodeURIComponent(app.id)}">Play</a>` : "";
+}
 function appRow(title, sub, hidden, actions) {
   return `<div class="row${hidden ? " dim" : ""}">
       <div class="avatar" style="background:${colorOf(title)}">${esc(initials(title))}</div>
@@ -439,7 +446,7 @@ function renderApps() {
   const own = snap.applications.filter(a => match(a.form.title)).sort((a, b) => a.form.title.localeCompare(b.form.title, undefined, { sensitivity: "base" }));
   let html = `<div class="panel">
       <div class="panel-head"><div><h2>Your applications</h2><p class="muted" style="margin:2px 0 0;font-size:13px">Saved in config.toml.</p></div><button class="btn primary sm" id="add-app">Add application</button></div>
-      <div class="list">${own.length ? own.map(a => appRow(a.form.title, a.form.command, false, `<button class="btn sm" data-editapp="${a.index}">Edit</button>`)).join("") : `<p class="empty-note">${q ? "No applications match the search." : "No applications yet."}</p>`}</div>
+      <div class="list">${own.length ? own.map(a => appRow(a.form.title, a.form.command, false, `${playButton(a.form.title)}<button class="btn sm" data-editapp="${a.index}">Edit</button>`)).join("") : `<p class="empty-note">${q ? "No applications match the search." : "No applications yet."}</p>`}</div>
     </div>
     <div class="section-head">
       <div><h2 class="sec">Scanners</h2><p class="muted" style="margin:2px 0 0">Scanners add apps by themselves and update the list when you install or remove something.${snap.scanned_at ? " Last scan " + rel(snap.scanned_at) + "." : ""}</p></div>
@@ -455,7 +462,7 @@ function renderApps() {
         <div class="scanner-meta"><span class="muted num">${s.applications.length} apps${hid ? ` · ${hid} hidden` : ""}</span>
           <button class="btn sm ghost" data-editscanner="${s.index}">Edit</button></div>
       </summary>
-      <div class="list">${list.length ? list.map(a => appRow(a.title, "", a.hidden, `<button class="btn sm ghost" data-hide="${esc(a.title)}" data-hidden="${a.hidden}">${a.hidden ? "Show" : "Hide"}</button>`)).join("")
+      <div class="list">${list.length ? list.map(a => appRow(a.title, "", a.hidden, `${playButton(a.title)}<button class="btn sm ghost" data-hide="${esc(a.title)}" data-hidden="${a.hidden}">${a.hidden ? "Show" : "Hide"}</button>`)).join("")
         : `<p class="empty-note">${q ? "No apps match the search." : "This scanner found no apps."}</p>`}</div>
     </details>`;
   }).join("") : `<p class="empty-note">No scanners. Add one to list your Steam games or desktop apps.</p>`;
