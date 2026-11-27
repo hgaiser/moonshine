@@ -28,7 +28,8 @@ try {
 // The last choices, in this browser: { app, size ("native" or [w, h]), fps, audioMode ("auto", 2, 6
 // or 8; "audio" was the old fixed choice and is ignored), hdrMode ("auto"
 // or "off"), codec ("auto", "hevc", "h264" or "av1"), fullscreen, stats, bitrate ({ kbps, width, height, fps } only when the user changed
-// the default), apps ({ [app id]: the advanced options to use for that application }) }.
+// the default), mouse ("raw" or "accelerated"), apps ({ [app id]: the advanced options to use for
+// that application }) }.
 const CHOICES = "moonshine-stream-choices";
 function loadChoices() {
   try { return JSON.parse(localStorage.getItem(CHOICES)) || {}; } catch { return {}; }
@@ -136,6 +137,7 @@ function render(snap, pick = null, keep = null) {
   const lastFps = [30, 60, 120].includes(last.fps) ? last.fps : 60;
   const hdrMode = last.hdrMode === "off" ? "off" : "auto";
   const lastCodec = ["hevc", "h264", "av1"].includes(last.codec) ? last.codec : "auto";
+  const mouse = last.mouse === "accelerated" ? "accelerated" : "raw";
 
   show(`
     ${message ? `<p class="note">${esc(message)}</p>` : ""}
@@ -151,6 +153,7 @@ function render(snap, pick = null, keep = null) {
       ${rejoin ? "" : `<div class="field"><label for="s-hdr">HDR</label><select id="s-hdr"><option value="auto" ${hdrMode === "auto" ? "selected" : ""}>Automatic</option><option value="off" ${hdrMode === "off" ? "selected" : ""}>Off</option></select><span class="help" id="s-hdr-help"></span></div>`}
       ${rejoin ? "" : `<div class="field"><label for="s-codec">Video codec</label><select id="s-codec"><option value="auto">Automatic</option></select><span class="help" id="s-codec-help"></span></div>`}
       ${rejoin ? "" : `<div class="field"><label for="s-audio">Audio</label><select id="s-audio"><option value="auto">Automatic (${audioName(autoChannels)})</option>${AUDIO.map(([n, l]) => `<option value="${n}" ${n === audioMode ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">This device has ${speakers} audio channel${speakers === 1 ? "" : "s"}. Automatic selects the most channels that it takes. The browser mixes more channels down to fit.</span></div>`}
+      <div class="field"><label for="s-mouse">Captured mouse</label><select id="s-mouse"><option value="raw" ${mouse === "raw" ? "selected" : ""}>Raw (for games)</option><option value="accelerated" ${mouse === "accelerated" ? "selected" : ""}>Accelerated (as on this device)</option></select><span class="help">The first click in the stream captures the mouse. Raw motion has no acceleration, for exact aim in games. Accelerated motion moves as the pointer of this device, for desktop work.</span></div>
       <div class="field"><label class="switch"><input type="checkbox" id="s-stats" ${last.stats ? "checked" : ""}><span>Show statistics</span></label><span class="help">Statistics on top of the stream: frame rate, bitrate, decode time, round trip and loss. Ctrl+Alt+Shift+S shows or hides them during the stream.</span></div>
       ${rejoin ? "" : `<div class="field"><label class="switch"><input type="checkbox" id="s-own" ${own ? "checked" : ""}><span>Remember these options for this application</span></label><span class="help">The next stream of this application uses these options again. Without this, it uses the options of the last stream.</span></div>`}
     </div></details>
@@ -235,6 +238,7 @@ function render(snap, pick = null, keep = null) {
     const app = apps.find(a => String(a.id) === $("#s-app")?.value);
     const fullscreen = Boolean($("#s-full")?.checked);
     const stats = Boolean($("#s-stats")?.checked);
+    const mouseMode = $("#s-mouse")?.value === "accelerated" ? "accelerated" : "raw";
     const bitrateKbps = Math.round(Number($("#s-rate").value || 20) * 1000);
     const custom = bitrateKbps !== autoBitrate(width, height, fps());
     // A default bitrate removes only a typed bitrate for this size and frame rate.
@@ -244,7 +248,7 @@ function render(snap, pick = null, keep = null) {
     delete choices.hdr; // The old HDR switch.
     delete choices.audio; // The old fixed audio choice.
     if (rejoin) {
-      Object.assign(choices, { stats, bitrate });
+      Object.assign(choices, { stats, bitrate, mouse: mouseMode });
     } else {
       const index = Number($("#s-size")?.value || 0);
       const options = {
@@ -255,6 +259,7 @@ function render(snap, pick = null, keep = null) {
         codec: codec() || "auto",
         audioMode: $("#s-audio")?.value === "auto" ? "auto" : Number($("#s-audio")?.value),
         stats,
+        mouse: mouseMode,
       };
       choices.app = app ? app.id : null;
       // Options for this application only, or the options for the next stream of any application.
@@ -279,6 +284,7 @@ function render(snap, pick = null, keep = null) {
       audioChannels: channels(),
       hdr,
       codec: rejoin ? null : codec(),
+      rawMouse: mouseMode === "raw",
       fullscreen,
       stats,
       onClose: (text, failed) => {

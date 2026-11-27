@@ -164,7 +164,7 @@ To open it through a reverse proxy, see [TIPS.md](TIPS.md#open-the-control-panel
 Select **play** at the top of the control panel, or open http://localhost:47990/play .
 It works in Chrome, Edge and Firefox.
 
-The advanced options set the resolution, frame rate, bitrate, HDR, video codec and audio channels. By default, the stream uses the size of the screen, 60 fps and the bitrate that Moonlight would use. HDR, the codec and the audio are automatic: the stream uses what both this computer and the browser support.
+The advanced options set the resolution, frame rate, bitrate, HDR, video codec, audio channels and the captured mouse (raw for games, or accelerated for desktop work). By default, the stream uses the size of the screen, 60 fps and the bitrate that Moonlight would use. HDR, the codec and the audio are automatic: the stream uses what both this computer and the browser support.
 Turn on **Remember these options for this application** to use other options for one application, for example a lower resolution for a demanding game.
 Only Chrome and Edge show HDR in HDR.
 **Show statistics** shows the frame rate, bitrate, decode time, round trip and loss on top of the stream; Ctrl+Alt+Shift+S shows or hides them during the stream.

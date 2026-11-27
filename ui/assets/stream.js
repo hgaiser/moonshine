@@ -914,9 +914,10 @@ class Player {
     }
 
     if (phase === "down" && !locked && e.button === 0 && this.view.requestPointerLock) {
-      // The first click captures the mouse; games need relative motion.
+      // The first click captures the mouse; games need relative motion. Raw motion (the default)
+      // has no acceleration of this device, for exact aim in games.
       this.sendAbsolute(e);
-      const lock = this.view.requestPointerLock({ unadjustedMovement: true });
+      const lock = this.options.rawMouse === false ? this.view.requestPointerLock() : this.view.requestPointerLock({ unadjustedMovement: true });
       if (lock?.catch) lock.catch(() => this.view.requestPointerLock());
     }
     const button = [1, 2, 3, 4, 5][e.button];
@@ -1233,7 +1234,8 @@ window.MoonshineStream = {
   CODEC_NAMES,
   speakerChannels,
   /// Open a stream. Options: applicationId, title, width, height, fps, bitrateKbps, audioChannels,
-  /// hdr, codec ("hevc", "h264" or "av1"; omit it to let Moonshine select), fullscreen (try full
+  /// hdr, codec ("hevc", "h264" or "av1"; omit it to let Moonshine select), rawMouse (false: the
+  /// captured mouse keeps this device's acceleration), fullscreen (try full
   /// screen at once: call `open` in a user gesture), stats (show the statistics at once),
   /// onClose(message, failed).
   open(options) {
