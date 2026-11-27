@@ -101,12 +101,12 @@ function render(snap) {
     ${missing ? `<p class="err">${esc(missing)}</p>` : ""}
     ${join ? `<p class="muted">${esc(session.application || "A session")} runs at ${session.width} × ${session.height} @ ${session.fps}. This browser takes it over; a Moonlight client that streams it now disconnects.</p>` :
       `<div class="field"><label for="s-app">Application</label><select id="s-app">${apps.map(a => `<option value="${a.id}" ${String(a.id) === wanted ? "selected" : ""}>${esc(a.title)}</option>`).join("")}</select></div>
-    <div class="field"><label for="s-size">Resolution</label><select id="s-size">${sizes.map((r, i) => `<option value="${i}" ${i === sizeIndex ? "selected" : ""}>${r[0]} × ${r[1]}${i === 0 ? " (this screen)" : ""}</option>`).join("")}</select></div>
-    <div class="field"><label for="s-fps">Frame rate</label><select id="s-fps">${[60, 120, 30].map(f => `<option value="${f}" ${f === lastFps ? "selected" : ""}>${f}</option>`).join("")}</select></div>
 `}
     <div class="field"><label class="switch"><input type="checkbox" id="s-full" ${last.fullscreen === false ? "" : "checked"}><span>Start in full screen</span></label><span class="help">On a phone or tablet, also turns the screen to landscape.</span></div>
-    <div class="field"><label for="s-rate">Bitrate (Mb/s)</label><input type="number" id="s-rate" min="1" max="500" step="1"><span class="help">The whole stream, with FEC and audio. The default follows Moonlight: 20 Mb/s at 1080p60.</span></div>
-    <details class="adv"><summary><strong>Advanced options</strong></summary><div style="display:grid;gap:14px">
+    <details class="adv"><summary><strong>Advanced options</strong><span class="adv-sum muted" id="s-adv-sum"></span></summary><div style="display:grid;gap:14px">
+      ${join ? "" : `<div class="field"><label for="s-size">Resolution</label><select id="s-size">${sizes.map((r, i) => `<option value="${i}" ${i === sizeIndex ? "selected" : ""}>${r[0]} × ${r[1]}${i === 0 ? " (this screen)" : ""}</option>`).join("")}</select></div>`}
+      ${join ? "" : `<div class="field"><label for="s-fps">Frame rate</label><select id="s-fps">${[60, 120, 30].map(f => `<option value="${f}" ${f === lastFps ? "selected" : ""}>${f}</option>`).join("")}</select></div>`}
+      <div class="field"><label for="s-rate">Bitrate (Mb/s)</label><input type="number" id="s-rate" min="1" max="500" step="1"><span class="help">The whole stream, with FEC and audio. The default follows Moonlight: 20 Mb/s at 1080p60.</span></div>
       ${join ? "" : `<div class="field"><label for="s-hdr">HDR</label><select id="s-hdr"><option value="auto" ${hdrMode === "auto" ? "selected" : ""}>Automatic</option><option value="off" ${hdrMode === "off" ? "selected" : ""}>Off</option></select><span class="help" id="s-hdr-help"></span></div>`}
       ${join ? "" : `<div class="field"><label for="s-codec">Video codec</label><select id="s-codec"><option value="auto">Automatic</option></select><span class="help" id="s-codec-help"></span></div>`}
       ${join ? "" : `<div class="field"><label for="s-audio">Audio</label><select id="s-audio"><option value="auto">Automatic (${audioName(autoChannels)})</option>${AUDIO.map(([n, l]) => `<option value="${n}" ${n === audioMode ? "selected" : ""}>${l}</option>`).join("")}</select><span class="help">This device has ${speakers} audio channel${speakers === 1 ? "" : "s"}. Automatic selects the most channels that it takes. The browser mixes more channels down to fit.</span></div>`}
@@ -125,7 +125,14 @@ function render(snap) {
     const [w, h] = size(), b = last.bitrate;
     const custom = b && b.width === w && b.height === h && b.fps === fps();
     $("#s-rate").value = (custom ? b.kbps : autoBitrate(w, h, fps())) / 1000;
+    summary();
   };
+  // The closed advanced options still show the stream's size, rate and bitrate.
+  const summary = () => {
+    const [w, h] = size();
+    $("#s-adv-sum").textContent = `${w} × ${h} · ${fps()} fps · ${Number($("#s-rate").value) || 0} Mb/s`;
+  };
+  $("#s-rate").addEventListener("input", summary);
   update();
   $("#s-size")?.addEventListener("change", update);
   $("#s-fps")?.addEventListener("change", update);

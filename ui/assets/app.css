@@ -301,6 +301,8 @@ details.adv > summary::-webkit-details-marker { display: none; }
 details.adv > summary::after { content: "Show"; font-size: 13px; color: var(--accent); }
 details.adv[open] > summary::after { content: "Hide"; }
 details.adv[open] > summary { margin-bottom: 8px; }
+details.adv > summary .adv-sum { margin-left: auto; font-size: 13px; }
+details.adv[open] > summary .adv-sum { display: none; }
 .chips { display: flex; flex-wrap: wrap; gap: 6px; justify-content: end; align-items: center; }
 .chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 4px 2px 9px; border-radius: 99px; background: var(--surface-2); border: 1px solid var(--line); font-family: var(--font-mono); font-size: 12px; }
 .chip button { border: 0; background: transparent; cursor: pointer; color: var(--muted); padding: 0 4px; border-radius: 50%; }
