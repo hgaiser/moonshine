@@ -304,4 +304,11 @@ function render(snap, pick = null, keep = null) {
   };
 }
 
+// Escape on the form goes back to the control panel. During a stream, Escape belongs to the
+// stream (and to the browser, to leave full screen or release the mouse).
+document.addEventListener("keydown", e => {
+  if (e.key !== "Escape" || playing || e.defaultPrevented) return;
+  location.href = "/";
+});
+
 load();
