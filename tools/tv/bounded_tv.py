@@ -19,7 +19,55 @@ import xml.etree.ElementTree as ET
 
 from tv_state import TvState
 
-LOCK_PATH = "/tmp/moonshine-tv-verification.lock"
+
+def default_lock_path():
+    override = os.environ.get("TV_GUI_LOCK_PATH")
+    if override:
+        return override
+    state_home = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+    return str(state_home / "homelab-tv" / "gui.lock")
+
+
+LOCK_PATH = default_lock_path()
+
+
+def _acquire_tv_lock(purpose):
+    lock_file = Path(LOCK_PATH)
+    lock_file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    meta_file = Path(f"{LOCK_PATH}.meta")
+    lock = None
+    try:
+        lock = open(lock_file, "a")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if lock is not None:
+            lock.close()
+        holder = ""
+        if meta_file.is_file():
+            try:
+                holder = f" (held by {meta_file.read_text().strip()})"
+            except OSError:
+                pass
+        raise RuntimeError(f"TV GUI lock unavailable ({LOCK_PATH}): {exc}{holder}") from exc
+    meta = {
+        "pid": os.getpid(),
+        "owner": "moonshine-verify-tv",
+        "purpose": purpose,
+        "started_utc": now(),
+    }
+    try:
+        meta_file.write_text(json.dumps(meta, indent=2) + "\n")
+    except OSError:
+        pass
+    return lock, meta_file
+
+
+def _release_tv_lock(lock, meta_file):
+    try:
+        meta_file.unlink(missing_ok=True)
+    except OSError:
+        pass
+    lock.close()
 
 
 def now():
@@ -108,14 +156,10 @@ def require_idle_tv(tv):
 
 
 def run(args, cli, get_running, running_apps):
-    lock = None
     try:
-        lock = open(LOCK_PATH, "a")
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
-        if lock is not None:
-            lock.close()
-        print(f"TV test lock unavailable: {exc}", file=sys.stderr)
+        lock, meta_file = _acquire_tv_lock(f"verify_tv run {args.app_id}")
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
         return 2
     out = args.out
     created = False
@@ -213,7 +257,7 @@ def run(args, cli, get_running, running_apps):
             report["launch_attempted"] = launch_attempted
             (out / "run-report.json").write_text(json.dumps(report, indent=2) + "\n")
             print(json.dumps({"report": str(out / "run-report.json"), "phase": report["phase"], "cleanup": report["cleanup"], "next_action": report["next_action"]}))
-        lock.close()
+        _release_tv_lock(lock, meta_file)
         for value, handler in old_signals.items():
             signal.signal(value, handler)
     return exit_code

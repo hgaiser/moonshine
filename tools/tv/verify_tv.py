@@ -62,16 +62,20 @@ def main(argv=None):
         if not re.fullmatch(r"[A-Za-z0-9_.-]+", args.ssh_alias) or args.ssh_alias.startswith("-"):
             parser.error("invalid SSH alias")
         import bounded_tv
-        with open(bounded_tv.LOCK_PATH, "a") as lock:
-            import fcntl
-            try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                state = bounded_tv.state_guard(args.out, args.ssh_alias, args.device, args.app_id,
-                                               lambda device: running_apps(get_running(device)))
-                state.restore()
-            except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
-                print(f"TV restoration deferred: {exc}", file=sys.stderr)
-                return 2
+        try:
+            lock, meta_file = bounded_tv._acquire_tv_lock(f"verify_tv restore-state {args.app_id}")
+        except RuntimeError as exc:
+            print(f"TV restoration deferred: {exc}", file=sys.stderr)
+            return 2
+        try:
+            state = bounded_tv.state_guard(args.out, args.ssh_alias, args.device, args.app_id,
+                                           lambda device: running_apps(get_running(device)))
+            state.restore()
+        except (OSError, RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+            print(f"TV restoration deferred: {exc}", file=sys.stderr)
+            return 2
+        finally:
+            bounded_tv._release_tv_lock(lock, meta_file)
         print(json.dumps({"tv_state_restored": True, "next_action": "TV state restored; retain this run's evidence. No TV action is required."}))
         return 0
 

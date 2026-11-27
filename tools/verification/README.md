@@ -15,7 +15,7 @@ The Nix development shell provides Python, `vkcube`, Xwayland and the EGL/Vulkan
 loader paths required by a Cargo-built benchmark. Keep the smoke command inside
 that shell. Outside Nix, provide those runtime dependencies separately.
 
-The doctor checks that the benchmark binary and rendering application (`vkcube` by default) are executable, that at least one DRM render node is accessible, and that UDP port 47998 is not already bound on loopback. A free port is only a best-effort check; another process could claim it later. Do not start a smoke run while another Moonshine video stream is using the port.
+The doctor checks that the benchmark binary and rendering application (`vkcube` by default) are executable, that at least one DRM render node is accessible, that UDP port 47998 is free, that any local Moonshine `serverinfo` endpoint is idle (`MOONSHINE_SERVER_FREE`), that no other process is actively consuming DRM VCN decode/encode engines (`--allow-vcn-busy` opts out), and that the host benchmark lock (`$XDG_STATE_HOME/moonshine-bench/hw.lock`) is free. Pass `--compare-against <baseline-binary-or-report.json>` for A/B runs to reject colliding binary `sha256` hashes from a shared `CARGO_TARGET_DIR`. Do not start a smoke run while another Moonshine video stream is using the port.
 
 The host must support Vulkan Video encoding for the requested codec. The doctor cannot reliably prove that from device-node access alone. A failing codec initialization is a real smoke-test failure, not a reason to bypass the check.
 

@@ -19,4 +19,6 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: Check TV launcher without touching a TV
-        run: python3 -m unittest discover -s tools/tv -p 'test_*.py'
+        run: |
+          python3 -m py_compile tools/tv/*.py
+          python3 -m unittest discover -s tools/tv -p 'test_*.py'

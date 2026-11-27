@@ -5,48 +5,31 @@ description: "Run fork-local, opt-in real Moonlight/webOS TV integration checks 
 
 # Verify Moonshine to a physical LG/webOS TV
 
-Use only in the `repparw/moonshine` fork and only when the TV's operator has authorized control. This is deliberately separate from the upstream-portable `verify-moonshine` skill: a server-only `moonshine-bench` run cannot prove real-client decode, HDR output or display latency.
+Fork-only (`repparw/moonshine`) procedure for authorized physical LG C3 tests. Read [tools/tv/README.md](../../../tools/tv/README.md) for command semantics and [docs/alpha-c3-baselines.md](../../../docs/alpha-c3-baselines.md) for settled TV baselines.
 
-Read [the TV verification README](../../../tools/tv/README.md) and the source for the *installed* Moonlight/webOS version. Never assume its app ID or launch behavior from upstream's development head.
+## Steps
 
-## Launch and doctor
+1. **Probe read-only state first** using `homelab-devices` `tv/bin/tv-snapshot` (or `verify_tv.py doctor` in `nix develop`):
+   ```sh
+   /home/repparw/Projects/homelab-devices/tv/bin/tv-snapshot
+   nix develop -c python3 tools/tv/verify_tv.py plan --device <alias> --app-id <app-id> --host-uuid <uuid> --host-app-id <id>
+   ```
+   Confirm the TV is on Home with no active video, Moonlight is idle, and the shared TV GUI lock (`homelab-tv/gui.lock`) is free.
 
-From the repo root, run `python3 tools/tv/verify_tv.py plan` with the paired host UUID, installed Moonlight app ID, device alias and advertised host application ID. `plan` is offline and shows the command it would run.
+2. **Run bounded, state-preserving verification** (automatically acquires the shared TV GUI lock, records power/mute/volume via `tv_state.py`, mutes an idle TV, and restores original mute state on exit):
+   ```sh
+   nix develop -c python3 tools/tv/verify_tv.py run --device <alias> --ssh-alias tv \
+     --app-id <app-id> --host-uuid <uuid> --host-app-id <id> \
+     --host-pid <pid> --journal-unit moonshine.service \
+     --duration 60 --interval 15 --settings-confirmed --confirm --out target/tv-verification/<run-id>
+   ```
+   For game tests, confirm active gameplay past title/main menus and collect matched host logs plus Moonlight client statistics (FPS, drops, decode/network latency, HDR state).
 
-Use `python3 tools/tv/verify_tv.py doctor --device <alias> --app-id <app-id>` to query running apps through `ares-launch`. If Moonlight is already running, do not interrupt it. If TV access is not authorized or any identifier is unknown, stop with a concrete blocker.
+3. **Recover cleanly if interrupted**: if a prior run left a pending journal under `$XDG_STATE_HOME/moonshine-tv/pending-state.json`, inspect ownership, stop only the owned session through Moonlight's UI, and execute the exact `restore-state` command printed in `next_action`.
 
-Only an explicit `start ... --confirm --out <empty-folder>` contacts the TV with a launch request. The helper refuses to start a second Moonlight when the first is listed as running. The CLI response is not proof of a started video stream.
+4. **Report with an explicit operator decision**: state host SHA, client version, workload, matched host/client evidence, and what the operator should do next (`merge`, `recover`, or `none`). Retain evidence under `target/tv-verification/`.
 
-## Drive
-
-Pair host and TV once through the supported Moonlight UI; do not programmatically alter credentials. Create a controlled, identifiable Moonshine streaming application if the intended test workload does not already exist.
-
-For each test, name the host SHA, TV's Moonlight version, codec, bitrate, 4K/1440p mode, HDR/SDR state, and actual render source. Start the client with the guarded helper, then observe the actual video stream and run the test for the intended duration. Never infer decode/display success from an app-launch exit code or a server-side frame count.
-
-When diagnosing the 4K60 HDR shortfall, collect Moonshine per-frame latency and the Moonlight on-screen statistics for matching intervals. Compare baseline and candidate with interleaved runs and equivalent workload/settings. Name the resource that limits FPS before claiming a speedup.
-
-## Evidence
-
-Save `tools/tv` helper's `report.json` and `ares-launch.log`; collect the running-app listing via `collect`. Independently capture client streaming statistics and host logs, with timestamps and source commit.
-
-A live HDR pass requires observing actual HDR content and client/TV HDR operation, not merely setting `--hdr` on the host. A real stream must show video decoding and sustained frame delivery; launch success alone is classified **unverified**.
-
-## Cleanup
-
-Use the shared `tools/tv/tv_state.py` guard around authorized verification, not ad hoc mute commands. `run` records the original power, mute, and volume before muting. It restores the original mute state without changing volume and leaves an initially on TV on. An `ACTIVE` Home screensaver is an on-state, not standby. Sleeping, screen-off, or unknown power state is refused; no implicit wake or power-off is implemented. Never equate unreachable SSH with power-off.
-
-If a previous run left a pending state journal, inspect ownership and use the `restore-state` command printed in its `next_action`. Do not start another run or delete the journal to bypass recovery. Hard process kills cannot execute cleanup; the journal must remain recoverable. Restoration is a separate cleanup action, so an unrelated settings or logging failure cannot skip it.
-
-Stop the test from Moonlight's normal UI, only after confirming that the session still belongs to the test. Never use a broad `pkill`, close an unrelated TV app, modify persistent TV settings or power-cycle the TV as part of automated cleanup.
-
-Keep the evidence under `target/tv-verification/` after the app stops. If the app remains in an unknown state, record this and ask for an operator to inspect it instead of forcing termination.
-
-Every handoff report must state what the operator should do with it: finish a named recovery action, review evidence for a specific decision, or take no action. Collection alone never justifies merging a performance change.
-
-## Helper tests and maintenance
-
-```sh
-python3 -m unittest discover -s tools/tv -p 'test_*.py'
-```
-
-These exercise dry-run construction, refusal to interrupt an active app, and the state-preservation guard. Parameterized launch has since been validated on the physical LG C3: real streaming sessions started through this helper and were confirmed with independent host, client and TV evidence. If the installed Moonlight client differs from the source, update the helper and this skill only after proving the observed behavior.
+5. **Run offline safety tests** after editing `tools/tv/`:
+   ```sh
+   nix develop -c python3 -m unittest discover -s tools/tv -p 'test_*.py'
+   ```
