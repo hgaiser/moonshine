@@ -62,6 +62,31 @@ async function load() {
 // A session can start or stop elsewhere (Moonlight, the control panel): follow it.
 setInterval(load, 3000);
 
+/// Stop the running session, on the second click: the first one asks for it.
+async function stopStream() {
+  const button = $("#s-stop");
+  if (!button.dataset.sure) {
+    button.dataset.sure = "1";
+    button.textContent = "Stop the stream: the application closes";
+    return;
+  }
+  button.disabled = true;
+  try {
+    const res = await fetch("/api/action", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "X-Moonshine-UI": "1" },
+      body: JSON.stringify({ action: "stop_session" }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || data.error) throw new Error(data.error || `The request failed (${res.status}).`);
+  } catch (e) {
+    toast(e.message, 6000);
+    button.disabled = false;
+  }
+  shown = null;
+  load();
+}
+
 function show(html) {
   $("#play-form").innerHTML = `<h2 id="play-title">play</h2>${html}`;
 }
@@ -86,29 +111,7 @@ function render(snap, pick = null, keep = null) {
       ${message ? `<p class="note">${esc(message)}</p>` : ""}
       <p>${esc(s.device || "Another device")} ${s.phase === "streaming" ? "streams" : "starts"} ${esc(s.application || "an application")} now. To start a stream here, stop that stream first. The application closes.</p>
       <div class="sheet-actions"><button type="button" class="btn danger" id="s-stop">Stop the stream</button></div>`);
-    $("#s-stop").onclick = async () => {
-      const button = $("#s-stop");
-      if (!button.dataset.sure) {
-        button.dataset.sure = "1";
-        button.textContent = "Stop the stream: the application closes";
-        return;
-      }
-      button.disabled = true;
-      try {
-        const res = await fetch("/api/action", {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "X-Moonshine-UI": "1" },
-          body: JSON.stringify({ action: "stop_session" }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok || data.error) throw new Error(data.error || `The request failed (${res.status}).`);
-      } catch (e) {
-        toast(e.message, 6000);
-        button.disabled = false;
-      }
-      shown = null;
-      load();
-    };
+    $("#s-stop").onclick = stopStream;
     return;
   }
   const session = snap.session;
@@ -158,6 +161,7 @@ function render(snap, pick = null, keep = null) {
       ${rejoin ? "" : `<div class="field"><label class="switch"><input type="checkbox" id="s-own" ${own ? "checked" : ""}><span>Remember these options for this application</span></label><span class="help">The next stream of this application uses these options again. Without this, it uses the options of the last stream.</span></div>`}
     </div></details>
     <div class="sheet-actions">
+      ${rejoin ? '<button type="button" class="btn danger" id="s-stop">Stop the stream</button>' : ""}
       <button type="submit" class="btn primary" id="s-go" ${missing || (!rejoin && !apps.length) ? "disabled" : ""}>${rejoin ? "Reconnect" : "Start streaming"}</button>
     </div>`);
 
@@ -227,6 +231,8 @@ function render(snap, pick = null, keep = null) {
   hdrHelp();
   $("#s-hdr")?.addEventListener("change", hdrHelp);
   $("#s-codec")?.addEventListener("change", () => { codecHelp(); hdrHelp(); });
+
+  $("#s-stop")?.addEventListener("click", stopStream);
 
   // Another application: draw the form again with its saved options.
   $("#s-app")?.addEventListener("change", () => render(snap, picked = $("#s-app").value, { open: $("details.adv").open, fullscreen: $("#s-full").checked }));
