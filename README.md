@@ -161,8 +161,12 @@ To open it through a reverse proxy, see [TIPS.md](TIPS.md#open-the-control-panel
 
 ### Streaming in the browser
 
-Select **Stream in browser** in the control panel, or open http://localhost:47990/play .
+Select **play** at the top of the control panel, or open http://localhost:47990/play .
 It works in Chrome, Edge and Firefox.
+
+The advanced options set HDR, the video codec and the audio channels. Each one is automatic by default: the stream uses what both this computer and the browser support.
+Only Chrome and Edge show HDR in HDR.
+**Show statistics** shows the frame rate, bitrate, decode time, round trip and loss on top of the stream; Ctrl+Alt+Shift+S shows or hides them during the stream.
 
 - The stream uses UDP port 47990: open it in the firewall.
 - From other devices, the page uses HTTPS with a self-signed certificate, so the browser warns the first time. To use your own, set `certificate` and `private_key` in `[ui]`.

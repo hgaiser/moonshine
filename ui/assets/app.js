@@ -834,7 +834,8 @@ const guide = (() => {
   const KEY = "moonshine-guide";
   const STEPS = [
     { page: "home", sel: "nav.rail", title: "Pages", text: "The control panel has five pages. Select a page here to open it." },
-    { page: "home", sel: "#session", title: "Stream", text: "This panel shows which device streams which application. While a device streams, live graphs show the latency, bitrate and frame rate. You can also stop the stream here." },
+    { page: "home", sel: "#session", title: "Stream", text: "This panel shows which device streams which application. While a device streams, live graphs show the latency, bitrate and frame rate. You can also stop the stream here, or select Play to take it over in this browser." },
+    { page: "home", sel: "#play", when: () => snap?.server?.browser_streaming !== false, title: "Play in this browser", text: "Select play to stream an application to this browser. You do not need Moonlight. The advanced options let you select HDR, the video codec and the audio channels, and show statistics on top of the stream." },
     { page: "home", sel: "#page-home .panel:has(#health)", title: "Health", text: "When Moonshine starts, it checks the GPU, the encoders and the ports. A warning tells you what to repair. After a repair, select Check again." },
     { page: "home", sel: "#bell", title: "Notifications", text: "The bell shows pairing requests, health warnings and stream events. The number shows how many you did not read." },
     { page: "clients", sel: "#pair-panel", title: "Pair a device", text: "To add a device, select this computer in Moonlight. Moonlight shows a PIN. Type that PIN here. Turn off Allow new devices to refuse all new devices." },
@@ -847,6 +848,8 @@ const guide = (() => {
   ];
   const get = () => { try { return localStorage.getItem(KEY); } catch (e) { return null; } };
   const put = v => { try { localStorage.setItem(KEY, v); } catch (e) { /* storage blocked */ } };
+  // The steps for this server: a step with `when` shows only when its condition is true.
+  let steps = STEPS;
   let ui = null, i = 0, raf = 0, last = "", from = "", inerted = [], focusBack = null;
 
   // The part to light up. If it is not on the page (for example, no settings yet), light up the page heading.
@@ -858,30 +861,30 @@ const guide = (() => {
 
   function show(n) {
     i = n; last = "";
-    const s = STEPS[i];
+    const s = steps[i];
     if (s.page && location.hash.slice(1) !== s.page) { location.hash = s.page; route(); }
     const t = target(s);
     if (t) t.scrollIntoView({ block: t.offsetHeight < innerHeight * .6 ? "center" : "start" });
     ui.card.innerHTML = `
-      <div class="guide-step">${i + 1} / ${STEPS.length}</div>
+      <div class="guide-step">${i + 1} / ${steps.length}</div>
       <h2 id="guide-title">${esc(s.title)}</h2>
       <p id="guide-text">${esc(s.text)}</p>
       <label class="switch guide-off"><input type="checkbox" id="guide-off" ${ui.off ? "checked" : ""}><span>Do not show the guide at start</span></label>
       <div class="guide-actions">
         <button class="btn sm ghost" data-g="close">Close</button><span class="grow"></span>
         ${i ? '<button class="btn sm" data-g="back">Back</button>' : ""}
-        <button class="btn sm primary" data-g="next">${i === STEPS.length - 1 ? "Done" : "Next"}</button>
+        <button class="btn sm primary" data-g="next">${i === steps.length - 1 ? "Done" : "Next"}</button>
       </div>`;
     $("#guide-off").onchange = e => { ui.off = e.target.checked; };
     $$("[data-g]", ui.card).forEach(b => b.onclick = () => ({ close, back: () => show(i - 1), next })[b.dataset.g]());
     $('[data-g="next"]', ui.card).focus();
   }
-  const next = () => i < STEPS.length - 1 ? show(i + 1) : close();
+  const next = () => i < steps.length - 1 ? show(i + 1) : close();
 
   // Follow the part every frame: the page renders again when new data arrives, and it can scroll or resize.
   function track() {
     raf = requestAnimationFrame(track);
-    const t = target(STEPS[i]); if (!t) return;
+    const t = target(steps[i]); if (!t) return;
     const r = t.getBoundingClientRect(), vw = document.documentElement.clientWidth, vh = innerHeight, pad = 6, g = 12;
     const top = Math.max(4, r.top - pad), bot = Math.min(vh - 4, r.bottom + pad), left = Math.max(4, r.left - pad), right = Math.min(vw - 4, r.right + pad);
     const cw = ui.card.offsetWidth, ch = ui.card.offsetHeight;
@@ -918,6 +921,7 @@ const guide = (() => {
     inerted = [...document.body.children].filter(el => !el.inert);
     inerted.forEach(el => { el.inert = true; });
     document.body.appendChild(root);
+    steps = STEPS.filter(s => !s.when || s.when());
     ui = { root, hole: $(".guide-hole", root), card: $(".guide-card", root), off: get() !== "on" };
     document.addEventListener("keydown", onKey, true);
     show(0);
