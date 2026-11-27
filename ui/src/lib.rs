@@ -6,7 +6,7 @@
 
 use std::convert::Infallible;
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,6 +19,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_tungstenite::HyperWebsocket;
 use hyper_tungstenite::tungstenite::Message;
 use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
 use tokio::sync::{Notify, broadcast, watch};
 use tokio::task::JoinHandle;
@@ -27,6 +28,7 @@ mod access;
 mod logs;
 pub mod protocol;
 mod stats;
+pub mod stream;
 
 pub use access::Network;
 pub use logs::{LogBuffer, LogLayer, LogLine};
@@ -50,6 +52,12 @@ pub trait Backend: Send + Sync + 'static {
 
 	/// Look for applications that were installed or removed.
 	fn refresh(&self) -> impl Future<Output = ()> + Send;
+
+	/// Stream to a browser: start a session, or join the running one.
+	fn start_stream(
+		&self,
+		request: stream::StreamRequest,
+	) -> impl Future<Output = Result<stream::StreamLink, String>> + Send;
 }
 
 /// Where and for whom the control panel is served.
@@ -61,7 +69,36 @@ pub struct Options {
 	/// Names of this computer that the `Host` header may hold, besides IP addresses and
 	/// `localhost`.
 	pub host_names: Vec<String>,
+	/// The TLS configuration for HTTPS. With it, the control panel serves HTTPS and HTTP on the
+	/// same port: plain HTTP stays on loopback connections (which browsers treat as secure) and
+	/// gets a redirect to HTTPS on all others. Without it, the control panel serves HTTP only.
+	pub tls: Option<Arc<rustls::ServerConfig>>,
+	/// The certificate for streaming to the browser (WebTransport, UDP on the same port).
+	pub stream_certificate: stream::WebTransportCertificate,
+	/// The address or name that browsers connect to for the stream. Without it, a page that comes
+	/// through a reverse proxy streams from the address that the proxy connected to, and any
+	/// other page from the address in its own URL.
+	pub stream_host: Option<String>,
+	/// Whether to stream to the browser at all. Off: no WebTransport server and no tokens.
+	pub streaming: bool,
 }
+
+/// How a connection reached the control panel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Scheme {
+	/// Plain HTTP that the control panel serves.
+	Http,
+	/// HTTPS.
+	Https,
+	/// Plain HTTP that only gets a redirect to HTTPS.
+	RedirectToHttps,
+}
+
+/// How long a new connection can take to send its first byte.
+const FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The first byte of a TLS handshake record.
+const TLS_HANDSHAKE: u8 = 0x16;
 
 /// How often the snapshot is rebuilt while nothing pokes it.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
@@ -91,6 +128,8 @@ impl Drop for UiServer {
 struct State<B> {
 	backend: Arc<B>,
 	options: Options,
+	/// The server for streams to the browser, unless it failed to start.
+	webtransport: Option<Arc<stream::WebTransport>>,
 	snapshot: watch::Receiver<Arc<String>>,
 	poke: Arc<Notify>,
 	stats: StatsHistory,
@@ -98,7 +137,7 @@ struct State<B> {
 }
 
 /// Start the control panel. Fails when it cannot listen on any address.
-pub async fn serve<B: Backend>(backend: Arc<B>, options: Options, logs: LogBuffer) -> Result<UiServer, String> {
+pub async fn serve<B: Backend>(backend: Arc<B>, mut options: Options, logs: LogBuffer) -> Result<UiServer, String> {
 	let mut listeners = Vec::new();
 	let mut errors = Vec::new();
 	for address in &options.listen {
@@ -157,18 +196,50 @@ pub async fn serve<B: Backend>(backend: Arc<B>, options: Options, logs: LogBuffe
 	let (current, events) = backend.stats();
 	tasks.push(tokio::spawn(stats.clone().run(current, events)));
 
+	// Streaming to the browser listens on the same addresses and port, over UDP.
+	let stream_addresses: Vec<SocketAddr> = listeners
+		.iter()
+		.filter_map(|listener| listener.local_addr().ok())
+		.collect();
+	let port = stream_addresses.first().map(SocketAddr::port).unwrap_or_default();
+	let stream_access = Arc::new(stream::Access {
+		allowed_networks: options.allowed_networks.clone(),
+		host_names: options.host_names.clone(),
+	});
+	let certificate = std::mem::replace(
+		&mut options.stream_certificate,
+		stream::WebTransportCertificate::SelfSigned { names: Vec::new() },
+	);
+	let webtransport = if !options.streaming {
+		tracing::info!("Streaming to the browser is off ([ui] streaming = false).");
+		None
+	} else {
+		match stream::serve(backend.clone(), &stream_addresses, port, certificate, stream_access).await {
+			Ok((webtransport, stream_tasks)) => {
+				tasks.extend(stream_tasks);
+				Some(webtransport)
+			},
+			Err(e) => {
+				tracing::warn!("{e} The control panel cannot stream to a browser.");
+				None
+			},
+		}
+	};
+
 	let state = Arc::new(State {
 		backend,
 		options,
+		webtransport,
 		snapshot: snapshot_rx,
 		poke,
 		stats,
 		logs,
 	});
 
+	let scheme = if state.options.tls.is_some() { "https" } else { "http" };
 	for listener in listeners {
 		if let Ok(address) = listener.local_addr() {
-			tracing::info!("Control panel listening on http://{address}");
+			tracing::info!("Control panel listening on {scheme}://{address}");
 		}
 		tasks.push(tokio::spawn(accept(listener, state.clone())));
 	}
@@ -202,24 +273,72 @@ async fn accept<B: Backend>(listener: TcpListener, state: Arc<State<B>>) {
 			tracing::debug!("Control panel refused {peer}: not in [ui] allowed_networks.");
 		}
 
+		let Ok(local) = connection.local_addr() else {
+			continue;
+		};
+		let peer = Peer { remote: peer, local };
 		let state = state.clone();
 		tokio::spawn(async move {
-			let service = service_fn(move |request| {
-				let state = state.clone();
-				async move { Ok::<_, Infallible>(handle(state, request, allowed).await) }
-			});
-			let _ = hyper::server::conn::http1::Builder::new()
-				.serve_connection(TokioIo::new(connection), service)
-				.with_upgrades()
-				.await;
+			let Some(tls) = state.options.tls.clone() else {
+				serve_connection(connection, state, allowed, peer, Scheme::Http).await;
+				return;
+			};
+
+			// TLS and plain HTTP share the port: a TLS connection starts with a handshake record.
+			let mut first = [0u8; 1];
+			let is_tls = match tokio::time::timeout(FIRST_BYTE_TIMEOUT, connection.peek(&mut first)).await {
+				Ok(Ok(1)) => first[0] == TLS_HANDSHAKE,
+				_ => return,
+			};
+			if is_tls {
+				match tokio_rustls::TlsAcceptor::from(tls).accept(connection).await {
+					Ok(stream) => serve_connection(stream, state, allowed, peer, Scheme::Https).await,
+					// Usually a browser that does not trust the certificate yet.
+					Err(e) => tracing::debug!("Control panel TLS handshake with {peer} failed: {e}"),
+				}
+			} else if peer.remote.ip().is_loopback() {
+				serve_connection(connection, state, allowed, peer, Scheme::Http).await;
+			} else {
+				serve_connection(connection, state, allowed, peer, Scheme::RedirectToHttps).await;
+			}
 		});
 	}
+}
+
+/// Both ends of a connection to the control panel.
+#[derive(Clone, Copy, Debug)]
+struct Peer {
+	remote: SocketAddr,
+	/// The address of this computer that the connection came to.
+	local: SocketAddr,
+}
+
+impl std::fmt::Display for Peer {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.remote.fmt(f)
+	}
+}
+
+async fn serve_connection<B: Backend, I>(io: I, state: Arc<State<B>>, allowed: bool, peer: Peer, scheme: Scheme)
+where
+	I: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+	let service = service_fn(move |request| {
+		let state = state.clone();
+		async move { Ok::<_, Infallible>(handle(state, request, allowed, peer, scheme).await) }
+	});
+	let _ = hyper::server::conn::http1::Builder::new()
+		.serve_connection(TokioIo::new(io), service)
+		.with_upgrades()
+		.await;
 }
 
 async fn handle<B: Backend>(
 	state: Arc<State<B>>,
 	mut request: Request<Incoming>,
 	allowed: bool,
+	peer: Peer,
+	scheme: Scheme,
 ) -> Response<Full<Bytes>> {
 	let host = header_str(&request, header::HOST).unwrap_or_default().to_string();
 	if !allowed {
@@ -237,6 +356,26 @@ async fn handle<B: Backend>(
 			 restart Moonshine.",
 		);
 	}
+
+	// A reverse proxy that serves HTTPS itself connects with plain HTTP and says so in
+	// `X-Forwarded-Proto`; a redirect would loop. The redirect is only a convenience, so a client
+	// that sends the header itself gains nothing.
+	let forwarded_https =
+		header_str(&request, "x-forwarded-proto").is_some_and(|proto| proto.eq_ignore_ascii_case("https"));
+	if scheme == Scheme::RedirectToHttps && !forwarded_https {
+		return redirect_to_https(&host, &request);
+	}
+
+	// A reverse proxy forwards the page but not the stream, so the browser streams from this
+	// computer directly.
+	let forwarded = ["x-forwarded-for", "x-forwarded-proto", "forwarded"]
+		.iter()
+		.any(|name| request.headers().contains_key(*name));
+	let stream_host = stream_host(&state.options, forwarded, peer.local);
+	let stream_source = state
+		.webtransport
+		.as_ref()
+		.map(|webtransport| stream_source(stream_host.as_deref(), &host, webtransport.port()));
 
 	let path = request.uri().path().to_string();
 	let mut response = match (request.method(), path.as_str()) {
@@ -265,7 +404,28 @@ async fn handle<B: Backend>(
 		},
 		(&Method::GET, "/app.js") => asset(include_bytes!("../assets/app.js"), "text/javascript; charset=utf-8"),
 		(&Method::GET, "/app.css") => asset(include_bytes!("../assets/app.css"), "text/css; charset=utf-8"),
+		(&Method::GET, "/stream.js") => asset(include_bytes!("../assets/stream.js"), "text/javascript; charset=utf-8"),
+		(&Method::GET, "/play" | "/play/") => asset(include_bytes!("../assets/play.html"), "text/html; charset=utf-8"),
+		(&Method::GET, "/play.js") => asset(include_bytes!("../assets/play.js"), "text/javascript; charset=utf-8"),
+		(&Method::GET, "/fec.js") => asset(include_bytes!("../assets/fec.js"), "text/javascript; charset=utf-8"),
+		(&Method::GET, "/stream-audio.js") => asset(
+			include_bytes!("../assets/stream-audio.js"),
+			"text/javascript; charset=utf-8",
+		),
 		(&Method::GET, "/banner.png") => asset(include_bytes!("../../assets/banner-ui.png"), "image/png"),
+		(&Method::GET, "/manifest.webmanifest") => asset(
+			include_bytes!("../assets/manifest.webmanifest"),
+			"application/manifest+json",
+		),
+		(&Method::GET, "/icon-180.png") => asset(include_bytes!("../assets/icon-180.png"), "image/png"),
+		(&Method::GET, "/icon-192.png") => asset(include_bytes!("../assets/icon-192.png"), "image/png"),
+		(&Method::GET, "/icon-512.png") => asset(include_bytes!("../assets/icon-512.png"), "image/png"),
+		(&Method::GET, "/icon-maskable-192.png") => {
+			asset(include_bytes!("../assets/icon-maskable-192.png"), "image/png")
+		},
+		(&Method::GET, "/icon-maskable-512.png") => {
+			asset(include_bytes!("../assets/icon-maskable-512.png"), "image/png")
+		},
 		(&Method::GET, "/pixelify-sans.woff2") => asset(include_bytes!("../assets/pixelify-sans.woff2"), "font/woff2"),
 		(&Method::GET, "/api/snapshot") => {
 			let snapshot = state.snapshot.borrow().clone();
@@ -280,11 +440,60 @@ async fn handle<B: Backend>(
 			response
 		},
 		(&Method::POST, "/api/action") => action(&state, request).await,
+		(&Method::POST, "/api/stream/token") => {
+			let client = if forwarded {
+				forwarded_client(header_str(&request, "x-forwarded-for"))
+			} else {
+				Some(peer.remote.ip())
+			};
+			stream_token(&state, &request, client, stream_host)
+		},
 		_ => text(StatusCode::NOT_FOUND, "Not found."),
 	};
 
-	secure(&mut response, &host);
+	secure(&mut response, &host, stream_source.as_deref());
 	response
+}
+
+/// The address or name that the page streams from, or `None` for the one in its own URL.
+fn stream_host(options: &Options, forwarded: bool, local: SocketAddr) -> Option<String> {
+	if let Some(host) = &options.stream_host {
+		return Some(host.clone());
+	}
+	// A trusted certificate names this computer, not an address, so only `stream_host` helps.
+	if !forwarded
+		|| matches!(
+			options.stream_certificate,
+			stream::WebTransportCertificate::Files { .. }
+		) {
+		return None;
+	}
+	// The address that the reverse proxy connected to. The browser can usually reach it too.
+	let ip = match local.ip() {
+		IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+		ip => ip,
+	};
+	(!ip.is_loopback() && !ip.is_unspecified()).then(|| ip.to_string())
+}
+
+/// The `connect-src` source for the stream. CSP cannot name an IPv6 address, so those get any
+/// host on the stream's port.
+fn stream_source(stream_host: Option<&str>, page_host: &str, port: u16) -> String {
+	let host = stream_host.unwrap_or_else(|| access::host_without_port(page_host));
+	if host.is_empty() || host.contains(':') {
+		format!("https://*:{port}")
+	} else {
+		format!("https://{host}:{port}")
+	}
+}
+
+/// The browser's address from a reverse proxy's `X-Forwarded-For`, if it is there.
+fn forwarded_client(forwarded_for: Option<&str>) -> Option<IpAddr> {
+	let first = forwarded_for?.split(',').next()?.trim();
+	first
+		.parse::<IpAddr>()
+		.ok()
+		.or_else(|| first.parse::<SocketAddr>().ok().map(|address| address.ip()))
 }
 
 async fn action<B: Backend>(state: &State<B>, request: Request<Incoming>) -> Response<Full<Bytes>> {
@@ -316,6 +525,44 @@ async fn action<B: Backend>(state: &State<B>, request: Request<Incoming>) -> Res
 		),
 		Err(error) => json(
 			StatusCode::UNPROCESSABLE_ENTITY,
+			serde_json::json!({ "error": error }).to_string().into_bytes(),
+		),
+	}
+}
+
+/// A token for one WebTransport session, for the browser at `client` (`None`: not known).
+fn stream_token<B: Backend>(
+	state: &State<B>,
+	request: &Request<Incoming>,
+	client: Option<IpAddr>,
+	host: Option<String>,
+) -> Response<Full<Bytes>> {
+	if header_str(request, "x-moonshine-ui") != Some("1") {
+		return text(
+			StatusCode::FORBIDDEN,
+			"Requests for a stream must come from the control panel.",
+		);
+	}
+	if !state.options.streaming {
+		return json(
+			StatusCode::FORBIDDEN,
+			serde_json::json!({ "error": "Streaming in the browser is off. To turn it on, set `streaming = true` in the [ui] table of config.toml, then restart Moonshine." })
+				.to_string()
+				.into_bytes(),
+		);
+	}
+	let Some(webtransport) = &state.webtransport else {
+		return json(
+			StatusCode::SERVICE_UNAVAILABLE,
+			serde_json::json!({ "error": "Streaming to the browser is not available. The log of Moonshine says why." })
+				.to_string()
+				.into_bytes(),
+		);
+	};
+	match webtransport.issue_token(client, host) {
+		Ok(token) => json(StatusCode::OK, serde_json::to_vec(&token).unwrap_or_default()),
+		Err(error) => json(
+			StatusCode::INTERNAL_SERVER_ERROR,
 			serde_json::json!({ "error": error }).to_string().into_bytes(),
 		),
 	}
@@ -383,6 +630,24 @@ async fn websocket_session<B: Backend>(state: Arc<State<B>>, websocket: HyperWeb
 	}
 }
 
+/// Send a plain HTTP request to the same address over HTTPS. Browsers allow streaming (WebCodecs,
+/// WebTransport, the Gamepad API) only on secure pages.
+fn redirect_to_https<B>(host: &str, request: &Request<B>) -> Response<Full<Bytes>> {
+	let target = request.uri().path_and_query().map(|p| p.as_str()).unwrap_or("/");
+	let location = format!("https://{host}{target}");
+	let mut response = text(
+		StatusCode::PERMANENT_REDIRECT,
+		&format!("The control panel is at {location}."),
+	);
+	match HeaderValue::from_str(&location) {
+		Ok(location) => {
+			response.headers_mut().insert(header::LOCATION, location);
+		},
+		Err(_) => *response.status_mut() = StatusCode::BAD_REQUEST,
+	}
+	response
+}
+
 fn header_str<B>(request: &Request<B>, name: impl header::AsHeaderName) -> Option<&str> {
 	request.headers().get(name).and_then(|value| value.to_str().ok())
 }
@@ -424,10 +689,11 @@ fn asset(body: &'static [u8], content_type: &'static str) -> Response<Full<Bytes
 }
 
 /// Add the headers that keep other pages from framing, sniffing or scripting the control panel.
-fn secure(response: &mut Response<Full<Bytes>>, host: &str) {
+fn secure(response: &mut Response<Full<Bytes>>, host: &str, stream_source: Option<&str>) {
+	let stream_source = stream_source.unwrap_or_default();
 	let csp = format!(
 		"default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; \
-		 font-src 'self'; connect-src 'self' ws://{host} wss://{host}; frame-ancestors 'none'; \
+		 font-src 'self'; connect-src 'self' ws://{host} wss://{host} {stream_source}; frame-ancestors 'none'; \
 		 base-uri 'none'; form-action 'none'"
 	);
 	let headers = response.headers_mut();
@@ -437,4 +703,96 @@ fn secure(response: &mut Response<Full<Bytes>>, host: &str) {
 	headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
 	headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
 	headers.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn options(stream_host: Option<&str>, trusted: bool) -> Options {
+		Options {
+			listen: Vec::new(),
+			allowed_networks: Vec::new(),
+			host_names: Vec::new(),
+			tls: None,
+			stream_certificate: if trusted {
+				stream::WebTransportCertificate::Files {
+					certificate: "cert.pem".into(),
+					private_key: "key.pem".into(),
+				}
+			} else {
+				stream::WebTransportCertificate::SelfSigned { names: Vec::new() }
+			},
+			stream_host: stream_host.map(str::to_string),
+			streaming: true,
+		}
+	}
+
+	#[test]
+	fn a_proxied_page_streams_from_the_address_the_proxy_used() {
+		let tailscale: SocketAddr = "100.95.89.123:47990".parse().unwrap();
+		assert_eq!(stream_host(&options(None, false), false, tailscale), None);
+		assert_eq!(
+			stream_host(&options(None, false), true, tailscale).as_deref(),
+			Some("100.95.89.123")
+		);
+		let mapped: SocketAddr = "[::ffff:100.95.89.123]:47990".parse().unwrap();
+		assert_eq!(
+			stream_host(&options(None, false), true, mapped).as_deref(),
+			Some("100.95.89.123")
+		);
+		// A proxy on this computer connects over loopback, which the browser cannot use.
+		let loopback: SocketAddr = "127.0.0.1:47990".parse().unwrap();
+		assert_eq!(stream_host(&options(None, false), true, loopback), None);
+		// A trusted certificate does not name the address.
+		assert_eq!(stream_host(&options(None, true), true, tailscale), None);
+		// The setting always wins.
+		assert_eq!(
+			stream_host(&options(Some("desktop.ts.net"), true), false, loopback).as_deref(),
+			Some("desktop.ts.net")
+		);
+	}
+
+	#[test]
+	fn the_csp_allows_the_stream_host_and_port() {
+		assert_eq!(
+			stream_source(Some("100.95.89.123"), "moonshine.example.org", 47990),
+			"https://100.95.89.123:47990"
+		);
+		assert_eq!(
+			stream_source(None, "desktop.local:47990", 47990),
+			"https://desktop.local:47990"
+		);
+		assert_eq!(stream_source(None, "[fd7a::1]:47990", 47990), "https://*:47990");
+		assert_eq!(stream_source(Some("fd7a::1"), "x", 47990), "https://*:47990");
+	}
+
+	#[test]
+	fn the_forwarded_client_is_the_first_address() {
+		assert_eq!(
+			forwarded_client(Some("100.64.0.9, 100.127.201.61")),
+			Some("100.64.0.9".parse().unwrap())
+		);
+		assert_eq!(
+			forwarded_client(Some("[fd7a::9]:1234")),
+			Some("fd7a::9".parse().unwrap())
+		);
+		assert_eq!(forwarded_client(Some("unknown")), None);
+		assert_eq!(forwarded_client(None), None);
+	}
+
+	#[test]
+	fn a_proxy_name_is_an_allowed_origin_for_the_stream() {
+		let names = vec!["moonshine.example.org".to_string()];
+		assert!(access::origin_allowed(
+			"https://moonshine.example.org",
+			"100.95.89.123:47990",
+			&names
+		));
+		assert!(!access::origin_allowed(
+			"https://evil.example",
+			"100.95.89.123:47990",
+			&names
+		));
+	}
 }

@@ -20,7 +20,33 @@ mod shard_batch;
 pub use crate::session::compositor::frame::FrameColorSpace;
 use gso_socket::UdpGsoSocket;
 pub(crate) use pipeline::KcmpProbe;
-use pipeline::{MAX_FRAMES_IN_FLIGHT, PacketBatch, VideoPipeline};
+use pipeline::{BatchPayload, MAX_FRAMES_IN_FLIGHT, PacketBatch, VideoPipeline};
+
+/// An encoded frame for a sink that does its own framing (the browser).
+#[derive(Debug)]
+pub struct EncodedFrame {
+	/// The bitstream: Annex B for H.264 and HEVC, OBUs for AV1.
+	pub data: Vec<u8>,
+	pub key_frame: bool,
+	/// Whether the frame recovers from a reference frame invalidation.
+	pub recovery: bool,
+	/// Counts from 1 after each reset of the stream.
+	pub frame_number: u32,
+	/// When the compositor made the frame.
+	pub captured_at: std::time::Instant,
+}
+
+/// Where the video stream sends its frames. There is one encoder per session; a takeover only
+/// changes the sink.
+#[derive(Clone, Debug, Default)]
+pub(crate) enum VideoSink {
+	/// The GameStream client, at the address its PINGs come from.
+	#[default]
+	GameStream,
+	/// A browser. The sender waits when this channel is full, so the pipeline drops captures
+	/// before it encodes them.
+	Browser(mpsc::Sender<EncodedFrame>),
+}
 
 /// Configuration for the video stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -473,6 +499,8 @@ pub(crate) struct VideoStreamHandle {
 	invalidate_tx: broadcast::Sender<(u32, u32)>,
 	/// Set by a resume; the packet handler fires the reset on the client's next PING.
 	resume_pending: Arc<AtomicBool>,
+	/// Where the frames go.
+	sink: Arc<watch::Sender<VideoSink>>,
 }
 
 impl VideoStreamHandle {
@@ -513,6 +541,15 @@ impl VideoStreamHandle {
 	/// The start signal, for external triggering (e.g. bench binary).
 	pub fn start_signal(&self) -> StartSignal {
 		self.start.clone()
+	}
+
+	/// Send the frames somewhere else. A switch to a browser resets the stream (frame counters and
+	/// a key frame) at once; a switch to GameStream waits for the client's PING, as a resume does.
+	pub fn set_sink(&self, sink: VideoSink) {
+		if matches!(sink, VideoSink::GameStream) {
+			self.request_reset();
+		}
+		self.sink.send_replace(sink);
 	}
 }
 
@@ -601,6 +638,8 @@ impl VideoStream {
 		// channel never holds more than the in-flight limit.
 		let (packet_tx, packet_rx) = mpsc::channel::<PacketBatch>(MAX_FRAMES_IN_FLIGHT);
 
+		let (sink_tx, sink_rx) = watch::channel(VideoSink::GameStream);
+
 		// Spawn packet handler — gated behind start.
 		spawn_handle_video_packets(
 			packet_rx,
@@ -609,6 +648,7 @@ impl VideoStream {
 			reset_tx.clone(),
 			resume_pending.clone(),
 			stop.clone(),
+			sink_rx.clone(),
 		);
 
 		// Spawn pipeline thread — gated behind start.
@@ -627,6 +667,7 @@ impl VideoStream {
 			hdr_metadata_tx,
 			start.waiter(),
 			stats_tx,
+			sink_rx,
 		)
 		.map_err(|()| tracing::error!("Failed to create video pipeline"))?;
 
@@ -635,6 +676,7 @@ impl VideoStream {
 			idr_tx,
 			invalidate_tx,
 			resume_pending,
+			sink: Arc::new(sink_tx),
 		})
 	}
 }
@@ -646,6 +688,7 @@ fn spawn_handle_video_packets(
 	reset_tx: broadcast::Sender<u32>,
 	resume_pending: Arc<AtomicBool>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
+	mut sink: watch::Receiver<VideoSink>,
 ) {
 	tokio::spawn(async move {
 		if !start.wait(&stop_session_manager).await {
@@ -663,19 +706,53 @@ fn spawn_handle_video_packets(
 		let _stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::VideoPacketHandlerStopped);
 		let _delay_stop = stop_session_manager.delay_shutdown_token();
 
+		let mut sink_open = true;
 		while !stop_session_manager.is_shutdown_triggered() {
 			tokio::select! {
+				changed = sink.changed(), if sink_open => {
+					if changed.is_err() {
+						sink_open = false;
+						continue;
+					}
+					// A browser has no PING to wait for: reset the stream now, so its first
+					// frame is a key frame.
+					if matches!(*sink.borrow_and_update(), VideoSink::Browser(_)) {
+						reset_epoch += 1;
+						let _ = reset_tx.send(reset_epoch);
+					}
+				},
 				batch = stop_session_manager.wrap_cancel(packet_rx.recv()) => {
 					match batch {
 						Ok(Some(batch)) => {
 							// Taking the batch frees its frame's in-flight slot, so a slow
 							// send doesn't hold back encoding; a stall still fills the
 							// slots with the batches queued behind it.
-							let (epoch, shards) = batch.into_parts();
+							let (epoch, payload) = batch.into_parts();
+							// Frames from before a reset would reach the new client with old
+							// frame numbers, making it drop the reset frames as stale.
+							if epoch < reset_epoch {
+								continue;
+							}
+							let shards = match payload {
+								BatchPayload::Shards(shards) => shards,
+								BatchPayload::Encoded(frame) => {
+									let browser = match &*sink.borrow() {
+										VideoSink::Browser(browser) => browser.clone(),
+										VideoSink::GameStream => continue,
+									};
+									// Waiting here is the backpressure: the batches queue behind
+									// this one and the pipeline drops new captures.
+									match stop_session_manager.wrap_cancel(browser.send(frame)).await {
+										Ok(_) => continue,
+										Err(_) => break,
+									}
+								},
+							};
+							if !matches!(*sink.borrow(), VideoSink::GameStream) {
+								continue;
+							}
 							if let Some(addr) = client_address {
-								// Frames from before a resume's reset would reach the new client
-								// with old frame numbers, making it drop the reset frames as stale.
-								if epoch < reset_epoch || shards.shard_count() == 0 {
+								if shards.shard_count() == 0 {
 									continue;
 								}
 
@@ -757,6 +834,7 @@ mod tests {
 			reset_tx,
 			Arc::new(AtomicBool::new(false)),
 			stop.clone(),
+			watch::channel(VideoSink::GameStream).1,
 		);
 
 		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
@@ -782,6 +860,7 @@ mod tests {
 			reset_tx,
 			Arc::new(AtomicBool::new(false)),
 			stop.clone(),
+			watch::channel(VideoSink::GameStream).1,
 		);
 
 		let in_flight = Arc::new(AtomicUsize::new(0));

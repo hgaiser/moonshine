@@ -117,7 +117,7 @@ function renderSession() {
       <div class="panel-head"><h2>Stream</h2><span class="pill plain">Idle</span></div>
       <div class="empty">
         <h3 style="font-size:18px;font-weight:600;margin:0">No one is streaming</h3>
-        <p class="muted" style="margin:0;max-width:56ch">Open Moonlight on a paired device and select an application. The live graphs for the stream show here.</p>
+        <p class="muted" style="margin:0;max-width:56ch">Open Moonlight on a paired device and select an application${snap.server?.browser_streaming === false ? "" : ", or select Play to stream to this browser"}. The live graphs for the stream show here.</p>
       </div>
       ${stats.buckets.length ? chartsHTML(true) : ""}`;
   } else {
@@ -128,7 +128,7 @@ function renderSession() {
     el.innerHTML = `
       <div class="session-top">
         <div class="session-title"><h3>${title}</h3>${pill}</div>
-        <button class="btn sm danger" id="stop">Stop stream</button>
+        <span style="display:flex;gap:8px">${s.browser_rejoin ? '<button class="btn sm" id="join-browser">Reconnect</button>' : ""}<button class="btn sm danger" id="stop">Stop stream</button></span>
       </div>
       <div id="stop-confirm"></div>
       <dl class="facts">
@@ -146,10 +146,18 @@ function renderSession() {
       $("#stop-yes").onclick = async () => { $("#stop-yes").disabled = true; await act("stop_session"); };
     };
   }
+  // Play in this browser: from the menu always, and next to Stop stream to reconnect to the
+  // session of a browser that lost its stream.
+  const off = snap.server?.browser_streaming === false;
+  $("#play").hidden = off;
+  const joinButton = $("#join-browser");
+  if (joinButton && off) joinButton.remove();
+  else if (joinButton) joinButton.onclick = () => { location.href = "/play"; };
   bindCharts();
   drawAll();
 }
 
+/* ---------- Stream in the browser ---------- */
 function chartsHTML(idle) {
   const leg = STAGES.map(([k, l]) => `<span><i style="background:var(--s-${k})"></i>${l}</span>`).join("") + `<span><i style="background:var(--fg);height:2px"></i>Slowest frame</span>`;
   return `<div class="charts-head">
@@ -410,6 +418,13 @@ function renderClients() {
 /* ---------- Applications ---------- */
 const openScanners = new Set();
 let scannersSeen = false;
+/// A button that streams the application to this browser, when browser streaming is on and
+/// Moonlight lists the application (a hidden one is not in the library).
+function playButton(title) {
+  if (snap.server?.browser_streaming === false) return "";
+  const app = (snap.library || []).find(a => a.title === title);
+  return app ? `<a class="btn sm" href="/play?app=${encodeURIComponent(app.id)}">Play</a>` : "";
+}
 function appRow(title, sub, hidden, actions) {
   return `<div class="row${hidden ? " dim" : ""}">
       <div class="avatar" style="background:${colorOf(title)}">${esc(initials(title))}</div>
@@ -428,10 +443,10 @@ function renderApps() {
   $("#show-hidden-lbl").textContent = `Show hidden (${hiddenN})`;
   const match = t => !q || t.toLowerCase().includes(q);
   const kinds = Object.fromEntries(snap.scanner_kinds.map(k => [k.kind, k]));
-  const own = snap.applications.filter(a => match(a.form.title));
+  const own = snap.applications.filter(a => match(a.form.title)).sort((a, b) => a.form.title.localeCompare(b.form.title, undefined, { sensitivity: "base" }));
   let html = `<div class="panel">
       <div class="panel-head"><div><h2>Your applications</h2><p class="muted" style="margin:2px 0 0;font-size:13px">Saved in config.toml.</p></div><button class="btn primary sm" id="add-app">Add application</button></div>
-      <div class="list">${own.length ? own.map(a => appRow(a.form.title, a.form.command, false, `<button class="btn sm" data-editapp="${a.index}">Edit</button>`)).join("") : `<p class="empty-note">${q ? "No applications match the search." : "No applications yet."}</p>`}</div>
+      <div class="list">${own.length ? own.map(a => appRow(a.form.title, a.form.command, false, `${playButton(a.form.title)}<button class="btn sm" data-editapp="${a.index}">Edit</button>`)).join("") : `<p class="empty-note">${q ? "No applications match the search." : "No applications yet."}</p>`}</div>
     </div>
     <div class="section-head">
       <div><h2 class="sec">Scanners</h2><p class="muted" style="margin:2px 0 0">Scanners add apps by themselves and update the list when you install or remove something.${snap.scanned_at ? " Last scan " + rel(snap.scanned_at) + "." : ""}</p></div>
@@ -447,7 +462,7 @@ function renderApps() {
         <div class="scanner-meta"><span class="muted num">${s.applications.length} apps${hid ? ` · ${hid} hidden` : ""}</span>
           <button class="btn sm ghost" data-editscanner="${s.index}">Edit</button></div>
       </summary>
-      <div class="list">${list.length ? list.map(a => appRow(a.title, "", a.hidden, `<button class="btn sm ghost" data-hide="${esc(a.title)}" data-hidden="${a.hidden}">${a.hidden ? "Show" : "Hide"}</button>`)).join("")
+      <div class="list">${list.length ? list.map(a => appRow(a.title, "", a.hidden, `${playButton(a.title)}<button class="btn sm ghost" data-hide="${esc(a.title)}" data-hidden="${a.hidden}">${a.hidden ? "Show" : "Hide"}</button>`)).join("")
         : `<p class="empty-note">${q ? "No apps match the search." : "This scanner found no apps."}</p>`}</div>
     </details>`;
   }).join("") : `<p class="empty-note">No scanners. Add one to list your Steam games or desktop apps.</p>`;
@@ -571,7 +586,7 @@ function syncSettings() {
 
 function control(s) {
   const v = draft[s.key], id = "s-" + s.key;
-  if (s.kind === "bool") return `<label class="switch"><input type="checkbox" id="${id}" ${v ? "checked" : ""} aria-label="${esc(s.label)}"><span>${v ? "On" : "Off"}</span></label>`;
+  if (s.kind === "bool") return `<label class="switch"><input type="checkbox" id="${id}" ${v ? "checked" : ""} ${s.read_only ? "disabled" : ""} aria-label="${esc(s.label)}"><span>${v ? "On" : "Off"}</span></label>`;
   if (s.kind === "range") return `<div style="display:grid;gap:2px;width:100%"><div class="range"><input type="range" id="${id}" min="${s.min ?? 0}" max="${s.max ?? 100}" step="5" value="${v}" aria-label="${esc(s.label)}" aria-valuetext="${v} percent"><output for="${id}" id="o-${s.key}">${v}${esc(s.unit || "")}</output></div>
     <div class="range-scale" aria-hidden="true"><span>${s.min ?? 0}${esc(s.unit || "")}</span><span>${Math.round(((s.min ?? 0) + (s.max ?? 100)) / 2)}${esc(s.unit || "")}</span><span>${s.max ?? 100}${esc(s.unit || "")}</span></div></div>`;
   if (s.kind === "choice") return `<select id="${id}" aria-label="${esc(s.label)}">${(s.options || []).map(o => `<option value="${esc(o.value)}" ${o.value === v ? "selected" : ""}>${esc(o.label)}</option>`).join("")}</select>`;
@@ -822,12 +837,13 @@ const bannerFx = (() => {
 
 /* ---------- Guide ---------- */
 // A tour for new users: the page goes dark except one part, and a card tells what that part does.
-// It opens by itself until the user turns it off. The guide button in the masthead opens it again.
+// It opens by itself until the user turns it off.
 const guide = (() => {
   const KEY = "moonshine-guide";
   const STEPS = [
     { page: "home", sel: "nav.rail", title: "Pages", text: "The control panel has five pages. Select a page here to open it." },
     { page: "home", sel: "#session", title: "Stream", text: "This panel shows which device streams which application. While a device streams, live graphs show the latency, bitrate and frame rate. You can also stop the stream here." },
+    { page: "home", sel: "#play", when: () => snap?.server?.browser_streaming !== false, title: "Play in this browser", text: "Select play to stream an application to this browser." },
     { page: "home", sel: "#page-home .panel:has(#health)", title: "Health", text: "When Moonshine starts, it checks the GPU, the encoders and the ports. A warning tells you what to repair. After a repair, select Check again." },
     { page: "home", sel: "#bell", title: "Notifications", text: "The bell shows pairing requests, health warnings and stream events. The number shows how many you did not read." },
     { page: "clients", sel: "#pair-panel", title: "Pair a device", text: "To add a device, select this computer in Moonlight. Moonlight shows a PIN. Type that PIN here. Turn off Allow new devices to refuse all new devices." },
@@ -835,11 +851,12 @@ const guide = (() => {
     { page: "apps", sel: "#app-list > .panel:first-child", title: "Your applications", text: "Add an application with a name and a command. Clients show it in their app list." },
     { page: "apps", sel: "#app-list > .section-head", title: "Scanners", text: "A scanner finds your Steam games or desktop apps. It updates the list when you install or remove something. Hide an app that you do not want to see in Moonlight." },
     { page: "config", sel: "#settings > :first-child", title: "Settings", text: "Each setting shows when a change takes effect: now, at the next stream, or after a restart. Select Save to write your changes to config.toml." },
-    { page: "logs", sel: "#report", title: "Logs", text: "This page shows the latest messages from Moonshine. If you find a bug, download the report and attach it to the issue." },
-    { page: null, sel: "#guide-btn", title: "Open the guide again", text: "Select guide to see this tour again." }
+    { page: "logs", sel: "#report", title: "Logs", text: "This page shows the latest messages from Moonshine. If you find a bug, download the report and attach it to the issue." }
   ];
   const get = () => { try { return localStorage.getItem(KEY); } catch (e) { return null; } };
   const put = v => { try { localStorage.setItem(KEY, v); } catch (e) { /* storage blocked */ } };
+  // The steps for this server: a step with `when` shows only when its condition is true.
+  let steps = STEPS;
   let ui = null, i = 0, raf = 0, last = "", from = "", inerted = [], focusBack = null;
 
   // The part to light up. If it is not on the page (for example, no settings yet), light up the page heading.
@@ -851,30 +868,30 @@ const guide = (() => {
 
   function show(n) {
     i = n; last = "";
-    const s = STEPS[i];
+    const s = steps[i];
     if (s.page && location.hash.slice(1) !== s.page) { location.hash = s.page; route(); }
     const t = target(s);
     if (t) t.scrollIntoView({ block: t.offsetHeight < innerHeight * .6 ? "center" : "start" });
     ui.card.innerHTML = `
-      <div class="guide-step">${i + 1} / ${STEPS.length}</div>
+      <div class="guide-step">${i + 1} / ${steps.length}</div>
       <h2 id="guide-title">${esc(s.title)}</h2>
       <p id="guide-text">${esc(s.text)}</p>
       <label class="switch guide-off"><input type="checkbox" id="guide-off" ${ui.off ? "checked" : ""}><span>Do not show the guide at start</span></label>
       <div class="guide-actions">
         <button class="btn sm ghost" data-g="close">Close</button><span class="grow"></span>
         ${i ? '<button class="btn sm" data-g="back">Back</button>' : ""}
-        <button class="btn sm primary" data-g="next">${i === STEPS.length - 1 ? "Done" : "Next"}</button>
+        <button class="btn sm primary" data-g="next">${i === steps.length - 1 ? "Done" : "Next"}</button>
       </div>`;
     $("#guide-off").onchange = e => { ui.off = e.target.checked; };
     $$("[data-g]", ui.card).forEach(b => b.onclick = () => ({ close, back: () => show(i - 1), next })[b.dataset.g]());
     $('[data-g="next"]', ui.card).focus();
   }
-  const next = () => i < STEPS.length - 1 ? show(i + 1) : close();
+  const next = () => i < steps.length - 1 ? show(i + 1) : close();
 
   // Follow the part every frame: the page renders again when new data arrives, and it can scroll or resize.
   function track() {
     raf = requestAnimationFrame(track);
-    const t = target(STEPS[i]); if (!t) return;
+    const t = target(steps[i]); if (!t) return;
     const r = t.getBoundingClientRect(), vw = document.documentElement.clientWidth, vh = innerHeight, pad = 6, g = 12;
     const top = Math.max(4, r.top - pad), bot = Math.min(vh - 4, r.bottom + pad), left = Math.max(4, r.left - pad), right = Math.min(vw - 4, r.right + pad);
     const cw = ui.card.offsetWidth, ch = ui.card.offsetHeight;
@@ -911,6 +928,7 @@ const guide = (() => {
     inerted = [...document.body.children].filter(el => !el.inert);
     inerted.forEach(el => { el.inert = true; });
     document.body.appendChild(root);
+    steps = STEPS.filter(s => !s.when || s.when());
     ui = { root, hole: $(".guide-hole", root), card: $(".guide-card", root), off: get() !== "on" };
     document.addEventListener("keydown", onKey, true);
     show(0);
@@ -928,7 +946,6 @@ const guide = (() => {
     if (focusBack && focusBack.focus) focusBack.focus();
   }
 
-  $("#guide-btn").onclick = e => { e.stopPropagation(); open(); };
   // At start, wait for the first data so the panels have their size.
   return { start() { if (get() !== "off") requestAnimationFrame(open); } };
 })();

@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>Play · Moonshine</title>
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icon-192.png" type="image/png">
+<link rel="apple-touch-icon" href="/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0d0a22">
+<link rel="stylesheet" href="/app.css">
+<script src="/stream.js" type="module"></script>
+<script src="/play.js" type="module"></script>
+</head>
+<body class="play-page">
+<header class="play-head">
+  <span class="wordmark">moonshine</span>
+  <a class="btn sm ghost" href="/">Control panel</a>
+</header>
+<main class="play-main">
+  <form class="sheet" id="play-form" aria-labelledby="play-title">
+    <h2 id="play-title">play</h2>
+    <p class="muted" id="play-loading">Loading…</p>
+  </form>
+</main>
+<div class="toasts" id="toasts" aria-live="polite"></div>
+</body>
+</html>

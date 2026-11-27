@@ -255,7 +255,7 @@ pub(crate) fn load_catalog(
 	applications.extend(scanned_applications.into_iter().map(|(_, application)| application));
 	resolve_missing_boxart(&mut applications);
 
-	applications
+	let mut catalog: Vec<CatalogEntry> = applications
 		.into_iter()
 		.zip(scanners)
 		.map(|(application, scanner)| CatalogEntry {
@@ -263,7 +263,10 @@ pub(crate) fn load_catalog(
 			application,
 			scanner,
 		})
-		.collect()
+		.collect();
+	// Clients and the control panel list applications in this order: by name, ignoring case.
+	catalog.sort_by_cached_key(|entry| (entry.application.title.to_lowercase(), entry.application.title.clone()));
+	catalog
 }
 
 /// Resolve missing boxart for applications by searching for icons matching the application title.

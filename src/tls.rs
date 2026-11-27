@@ -1,7 +1,7 @@
 use std::fmt;
 use std::fs::File;
 use std::io::{BufReader, ErrorKind, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -315,6 +315,171 @@ fn load_tls_files<P: AsRef<Path>>(certificate: P, private_key: P) -> Result<Serv
 		.map_err(|e| tracing::error!("Failed to create TLS configuration: {}", e))?;
 
 	Ok(config)
+}
+
+/// The TLS configuration of the control panel: the certificate in [ui], or else a self-signed
+/// certificate of its own (see [`load_or_create_page_certificate`]). The control panel asks for no
+/// client certificate.
+///
+/// `names` are the host names the control panel answers to.
+pub(crate) fn control_panel_tls_config(config: &Config, names: &[String]) -> Result<ServerConfig, ()> {
+	let (certificate, private_key) = match (&config.ui.certificate, &config.ui.private_key) {
+		(Some(certificate), Some(private_key)) => (certificate.clone(), private_key.clone()),
+		(None, None) => load_or_create_page_certificate(config, names)?,
+		_ => {
+			tracing::error!("Set both `certificate` and `private_key` in the [ui] table, or neither.");
+			return Err(());
+		},
+	};
+	let certs = load_certs(&certificate)?;
+	let key = load_private_key(&private_key)?;
+	let mut tls = ServerConfig::builder()
+		.with_no_client_auth()
+		.with_single_cert(certs, key)
+		.map_err(|e| tracing::error!("Failed to create the control panel's TLS configuration: {e}"))?;
+	tls.alpn_protocols = vec![b"http/1.1".to_vec()];
+	Ok(tls)
+}
+
+/// How long the control panel's own certificate is valid. Browsers refuse longer validity for
+/// web pages, also for a certificate the user accepted.
+const PAGE_CERTIFICATE_DAYS: u64 = 397;
+
+/// Make a new page certificate when the current one expires within this many days.
+const PAGE_CERTIFICATE_RENEW_DAYS: u64 = 30;
+
+/// The control panel's self-signed certificate, next to the GameStream certificate. It is not the
+/// GameStream certificate: that one is a long-lived RSA CA certificate without names, which Safari
+/// and Firefox refuse for a web page, and pairing depends on it, so it must not change.
+///
+/// The file stays as long as it is valid and holds all of `names` and this computer's addresses,
+/// so the browser keeps the user's exception. Returns the certificate and key paths.
+fn load_or_create_page_certificate(config: &Config, names: &[String]) -> Result<(PathBuf, PathBuf), ()> {
+	let directory = config
+		.webserver
+		.certificate
+		.parent()
+		.map(Path::to_path_buf)
+		.unwrap_or_else(|| PathBuf::from("."));
+	let certificate_path = directory.join("ui-cert.pem");
+	let key_path = directory.join("ui-key.pem");
+
+	// The names and IPv4 addresses must be in the certificate. IPv6 addresses go into a new
+	// certificate too, but a missing one does not make a new certificate: privacy addresses change
+	// every day, and each new certificate means a new browser warning.
+	let mut required: Vec<String> = vec!["localhost".to_string(), "127.0.0.1".to_string(), "::1".to_string()];
+	required.extend(names.iter().cloned());
+	let mut ipv6 = Vec::new();
+	if let Ok(interfaces) = if_addrs::get_if_addrs() {
+		for ip in interfaces.iter().map(|interface| interface.ip()) {
+			match ip {
+				std::net::IpAddr::V4(v4) if !v4.is_loopback() && !v4.is_link_local() => required.push(v4.to_string()),
+				std::net::IpAddr::V6(v6) if !v6.is_loopback() && !v6.is_unicast_link_local() => {
+					ipv6.push(v6.to_string())
+				},
+				_ => {},
+			}
+		}
+	}
+	required.sort();
+	required.dedup();
+
+	if page_certificate_is_current(&certificate_path, &key_path, &required) {
+		return Ok((certificate_path, key_path));
+	}
+	let mut wanted = required;
+	wanted.extend(ipv6);
+	wanted.dedup();
+
+	tracing::info!("Creating a certificate for the control panel.");
+	let key_pair =
+		KeyPair::generate().map_err(|e| tracing::error!("Failed to create a key for the control panel: {e}"))?;
+	let mut params = CertificateParams::new(wanted)
+		.map_err(|e| tracing::error!("Failed to create the control panel certificate: {e}"))?;
+	params.distinguished_name.push(
+		rcgen::DnType::CommonName,
+		format!("Moonshine control panel ({})", config.name),
+	);
+	params.is_ca = rcgen::IsCa::ExplicitNoCa;
+	params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+	params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
+	let now = SystemTime::now();
+	params.not_before = (now - Duration::from_secs(60 * 60)).into();
+	params.not_after = (now + Duration::from_secs(PAGE_CERTIFICATE_DAYS * 24 * 60 * 60)).into();
+	let certificate = params
+		.self_signed(&key_pair)
+		.map_err(|e| tracing::error!("Failed to sign the control panel certificate: {e}"))?;
+
+	std::fs::create_dir_all(&directory)
+		.map_err(|e| tracing::error!("Failed to create {}: {e}", directory.display()))?;
+	std::fs::write(&certificate_path, certificate.pem())
+		.map_err(|e| tracing::error!("Failed to write {}: {e}", certificate_path.display()))?;
+	write_private_file(&key_path, key_pair.serialize_pem().as_bytes())?;
+	Ok((certificate_path, key_path))
+}
+
+/// Whether the page certificate exists, has a key, stays valid for a while and names everything in
+/// `wanted`.
+fn page_certificate_is_current(certificate_path: &Path, key_path: &Path, wanted: &[String]) -> bool {
+	if !key_path.exists() {
+		return false;
+	}
+	let Ok(certs) = load_certs_quiet(certificate_path) else {
+		return false;
+	};
+	let Some(der) = certs.first() else {
+		return false;
+	};
+	let Ok((_, certificate)) = X509Certificate::from_der(der) else {
+		return false;
+	};
+	let renew_at = SystemTime::now() + Duration::from_secs(PAGE_CERTIFICATE_RENEW_DAYS * 24 * 60 * 60);
+	let not_after = certificate.validity().not_after.timestamp();
+	let renew_at = renew_at
+		.duration_since(std::time::UNIX_EPOCH)
+		.map(|d| d.as_secs() as i64)
+		.unwrap_or(i64::MAX);
+	if not_after < renew_at {
+		return false;
+	}
+	let mut names: Vec<String> = Vec::new();
+	if let Ok(Some(san)) = certificate.subject_alternative_name() {
+		for name in &san.value.general_names {
+			match name {
+				GeneralName::DNSName(dns) => names.push(dns.to_string()),
+				GeneralName::IPAddress(bytes) => match bytes.len() {
+					4 => names.push(std::net::Ipv4Addr::from(<[u8; 4]>::try_from(*bytes).unwrap()).to_string()),
+					16 => names.push(std::net::Ipv6Addr::from(<[u8; 16]>::try_from(*bytes).unwrap()).to_string()),
+					_ => {},
+				},
+				_ => {},
+			}
+		}
+	}
+	wanted
+		.iter()
+		.all(|name| names.iter().any(|have| have.eq_ignore_ascii_case(name)))
+}
+
+fn load_certs_quiet(path: &Path) -> Result<Vec<CertificateDer<'static>>, ()> {
+	let mut reader = BufReader::new(File::open(path).map_err(|_| ())?);
+	rustls_pemfile::certs(&mut reader)
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|_| ())
+}
+
+/// Write a file that only the user can read.
+fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), ()> {
+	use std::os::unix::fs::OpenOptionsExt;
+	let mut file = std::fs::OpenOptions::new()
+		.write(true)
+		.create(true)
+		.truncate(true)
+		.mode(0o600)
+		.open(path)
+		.map_err(|e| tracing::error!("Failed to create {}: {e}", path.display()))?;
+	file.write_all(contents)
+		.map_err(|e| tracing::error!("Failed to write {}: {e}", path.display()))
 }
 
 fn load_certs(path: &Path) -> Result<Vec<CertificateDer<'static>>, ()> {

@@ -12,14 +12,17 @@ use crate::session::SessionKeyData;
 use crate::session::SessionKeys;
 use crate::session::SessionKeysSender;
 use crate::session::SessionState;
+use crate::session::browser::BrowserStream;
 use crate::session::compositor::CompositorConfig;
 use crate::session::stream::StartSignal;
 use crate::session::stream::audio::AudioStreamConfig;
 use crate::session::stream::audio::AudioStreamContext;
+use crate::session::stream::audio::{AudioChannels, AudioConfig};
 use crate::session::stream::control::ControlStreamConfig;
 use crate::session::stream::video::VideoStreamConfig;
 use crate::session::stream::video::VideoStreamContext;
 use crate::session::stream::video::{StatsSender, StreamEvent, StreamInfo};
+use crate::session::stream::video::{VideoChromaSampling, VideoDynamicRange, VideoFormat};
 
 const SESSION_SHUTDOWN_TIMEOUT_SECS: u64 = 10;
 
@@ -50,6 +53,9 @@ pub struct SessionStatus {
 
 	/// The video stream as negotiated with the client, once it runs.
 	pub stream: Option<StreamInfo>,
+
+	/// Whether a browser can attach to the session again: a browser streamed it and went away.
+	pub browser_rejoin: bool,
 }
 
 /// The settings a session is created with. Changes apply to the next session.
@@ -310,11 +316,18 @@ impl SessionManager {
 				tracing::warn!("SetStreamContext rejected: session not yet launched (Initialized state)");
 				Err(())
 			},
-			Some(SessionState::Active(_)) => {
+			Some(SessionState::Active(active)) => {
 				// Client is resuming an already-running session (reconnect). The video,
 				// audio, and control streams are still running and re-learn the client's
 				// address from its PINGs (with refreshed keys via `/resume`), so there is
-				// nothing to rebuild — accept the re-ANNOUNCE without storing new contexts.
+				// nothing to rebuild — accept the re-ANNOUNCE without storing new contexts,
+				// unless the client wants a stream that the running one is not.
+				if let Some(mismatch) = active.resume_mismatch(&video_stream_context, &audio_stream_context) {
+					tracing::warn!(
+						"A client cannot resume the session: the running stream differs from what it asks for: {mismatch}. Stop the session first."
+					);
+					return Err(());
+				}
 				tracing::info!("Resuming active session: accepting RTSP ANNOUNCE from reconnecting client.");
 				Ok(())
 			},
@@ -340,6 +353,7 @@ impl SessionManager {
 			client: guard.session_client.clone(),
 			started: guard.session_started.unwrap_or_else(SystemTime::now),
 			stream: self.stats_tx.join().0,
+			browser_rejoin: matches!(session, SessionState::Active(active) if active.browser_can_rejoin()),
 		})
 	}
 
@@ -482,7 +496,9 @@ impl SessionManager {
 					tracing::warn!("StartSession rejected: session not yet launched");
 					return Err(());
 				},
-				Some(SessionState::Active(active)) => {
+				Some(SessionState::Active(mut active)) => {
+					// A Moonlight client takes the session over from a browser.
+					active.attach_gamestream();
 					// Resume (reconnect): the streams are already running, so PLAY is a
 					// no-op — the client picks up the existing streams once it PINGs.
 					// The reconnecting client is a fresh Moonlight session that expects
@@ -561,6 +577,119 @@ impl SessionManager {
 
 		wait_for_session_shutdown(&stop, &shutdown, SESSION_SHUTDOWN_TIMEOUT_SECS).await?;
 		tracing::info!("Session stopped by user, waiting for new session.");
+		Ok(())
+	}
+
+	/// Stream to a browser: start a new session, or attach again to the session of a browser that
+	/// went away. Any other session has to stop first.
+	pub async fn stream_to_browser(&self, request: BrowserStreamRequest) -> Result<BrowserStream, String> {
+		let joining = {
+			let guard = self.inner.lock().await;
+			match &guard.session {
+				None => false,
+				Some(SessionState::Active(active)) if active.browser_can_rejoin() => true,
+				Some(SessionState::Active(_)) => {
+					return Err("Another device streams now. Stop that stream first.".to_string());
+				},
+				Some(_) => return Err("A client is starting a session. Try again in a moment.".to_string()),
+			}
+		};
+
+		if !joining {
+			self.start_browser_session(&request).await?;
+		}
+
+		let mut guard = self.inner.lock().await;
+		let stop = guard.stop.clone();
+		match guard.session.as_mut() {
+			Some(SessionState::Active(active)) => {
+				active.attach_browser(&request.codecs, &request.codecs_10bit, request.bitrate, stop)
+			},
+			_ => Err("The session stopped before the browser could attach.".to_string()),
+		}
+	}
+
+	/// Start a session for a browser, through all of a Moonlight client's steps.
+	async fn start_browser_session(&self, request: &BrowserStreamRequest) -> Result<(), String> {
+		let failed = "The session failed to start. The log of Moonshine says why.".to_string();
+		let codecs = if request.hdr {
+			&request.codecs_10bit
+		} else {
+			&request.codecs
+		};
+		let video_format = *codecs
+			.first()
+			.ok_or_else(|| "The browser can decode none of the codecs of this computer.".to_string())?;
+
+		// The browser's connection is encrypted already, so these keys only fill the context.
+		let mut key = vec![0u8; 16];
+		let mut key_id = [0u8; 8];
+		rsa::rand_core::RngCore::fill_bytes(&mut rsa::rand_core::OsRng, &mut key);
+		rsa::rand_core::RngCore::fill_bytes(&mut rsa::rand_core::OsRng, &mut key_id);
+
+		self.initialize_session(SessionContext {
+			application: request.application.clone(),
+			application_id: request.application_id,
+			resolution: (request.width, request.height),
+			refresh_rate: request.fps,
+			keys: SessionKeys::new(key, i64::from_le_bytes(key_id) & 0x7fff_ffff),
+			audio_channels: request.audio_channels,
+			audio_channel_mask: channel_mask(request.audio_channels),
+			hdr: request.hdr,
+		})
+		.await
+		.map_err(|()| failed.clone())?;
+
+		let launched = tokio::time::timeout(
+			std::time::Duration::from_secs(crate::session::APP_LAUNCH_HTTP_TIMEOUT_SECS),
+			self.launch_session(),
+		)
+		.await;
+		if !matches!(launched, Ok(Ok(()))) {
+			let _ = self.stop_session().await;
+			return Err("The application failed to start. The log of Moonshine says why.".to_string());
+		}
+
+		let video = VideoStreamContext {
+			width: request.width,
+			height: request.height,
+			fps: request.fps,
+			// Moonlight's default, for a Moonlight client that takes the session over.
+			packet_size: 1392,
+			bitrate: request.bitrate,
+			minimum_fec_packets: 2,
+			qos: false,
+			video_format,
+			dynamic_range: if request.hdr {
+				VideoDynamicRange::Hdr
+			} else {
+				VideoDynamicRange::Sdr
+			},
+			chroma_sampling_type: VideoChromaSampling::Yuv420,
+			// The browser recovers from a lost frame with reference frame invalidation. It sees a
+			// loss later than Moonlight does (it waits for late datagrams), so it gets the most.
+			max_reference_frames: crate::rtsp::MAX_REFERENCES,
+			full_range: false,
+			encrypt_video: false,
+		};
+		let audio = AudioStreamContext {
+			packet_duration_ms: 10,
+			qos: false,
+			// High-quality surround packets do not fit in one datagram on every path (Tailscale's
+			// MTU is 1280), so surround uses the normal quality.
+			audio_config: AudioConfig::from_channels(
+				request.audio_channels,
+				channel_mask(request.audio_channels),
+				request.audio_channels == AudioChannels::Stereo,
+			),
+			// A browser gets plain Opus either way; a Moonlight client that takes over asks for
+			// encrypted audio (Moonlight does on a LAN), and the running encoder must match.
+			encrypt_audio: true,
+		};
+		if self.set_stream_context(video, audio).await.is_err() || self.start_session().await.is_err() {
+			let _ = self.stop_session().await;
+			return Err(failed);
+		}
 		Ok(())
 	}
 
@@ -667,4 +796,33 @@ async fn wait_for_session_shutdown(
 			Err(())
 		},
 	}
+}
+
+/// A browser's request to stream.
+/// The WAVE channel mask of a layout, as Moonlight sends it.
+fn channel_mask(channels: AudioChannels) -> u32 {
+	match channels {
+		AudioChannels::Stereo => 0x3,
+		AudioChannels::Surround51 => 0x3f,
+		AudioChannels::Surround71 => 0x63f,
+	}
+}
+
+pub struct BrowserStreamRequest {
+	pub application: crate::session::application::ApplicationConfig,
+	/// The application's ID, as Moonlight knows it.
+	pub application_id: i32,
+	pub width: u32,
+	pub height: u32,
+	pub fps: u32,
+	/// Video bitrate in bits per second.
+	pub bitrate: usize,
+	/// The codecs that both the browser and this computer support, best first.
+	pub codecs: Vec<VideoFormat>,
+	/// The same, in 10 bits (for HDR).
+	pub codecs_10bit: Vec<VideoFormat>,
+	/// Whether a new session streams HDR.
+	pub hdr: bool,
+	/// The audio channels for a new session.
+	pub audio_channels: crate::session::stream::audio::AudioChannels,
 }

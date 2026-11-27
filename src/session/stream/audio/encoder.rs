@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use async_shutdown::ShutdownManager;
 use fec_rs::ReedSolomon;
 use tokio::sync::mpsc;
@@ -68,6 +71,7 @@ impl AudioEncoder {
 		frame_recycle_tx: crossbeam_channel::Sender<AudioFrame>,
 		keys_rx: SessionKeysReceiver,
 		encrypt: bool,
+		plain: Arc<AtomicBool>,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop: ShutdownManager<SessionShutdownReason>,
 		start: StartWaiter,
@@ -113,6 +117,7 @@ impl AudioEncoder {
 					encoder,
 					keys_rx,
 					encrypt,
+					plain,
 					packet_tx,
 					stop,
 					start,
@@ -137,6 +142,7 @@ impl AudioEncoderInner {
 		mut encoder: opus::MSEncoder,
 		keys_rx: SessionKeysReceiver,
 		encrypt: bool,
+		plain: Arc<AtomicBool>,
 		packet_tx: mpsc::Sender<Vec<u8>>,
 		stop: ShutdownManager<SessionShutdownReason>,
 		mut start: StartWaiter,
@@ -217,8 +223,9 @@ impl AudioEncoderInner {
 			// Read current keys from watch channel.
 			let keys = &*keys_rx.borrow();
 
-			// Encrypt the audio data if encryption is enabled.
-			let payload = match encrypt {
+			// Encrypt the audio data if encryption is enabled. A browser gets plain Opus, over a
+			// connection that is encrypted already.
+			let payload = match encrypt && !plain.load(Ordering::Relaxed) {
 				true => {
 					let iv = keys.remote_input_key_id as u32 + sequence_number as u32;
 					let mut iv = iv.to_be_bytes().to_vec();

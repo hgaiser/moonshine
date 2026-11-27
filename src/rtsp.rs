@@ -691,7 +691,7 @@ const INVALIDATION_WINDOW_MS: u32 = 150;
 /// Fewest references held for invalidation, for low frame rates.
 const MIN_INVALIDATION_REFERENCES: u32 = 4;
 /// Most references the codecs can hold (H.264 `max_num_ref_frames`).
-const MAX_REFERENCES: u32 = 16;
+pub(crate) const MAX_REFERENCES: u32 = 16;
 
 /// The reference frames to hold for a client's `maxNumReferenceFrames`.
 ///

@@ -1,5 +1,7 @@
 use std::net::SocketAddr;
-use std::time::Duration;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use async_shutdown::ShutdownManager;
 use serde::{Deserialize, Serialize};
@@ -8,7 +10,7 @@ use tokio::sync::watch;
 use tokio_enet::{Event, Host, HostConfig, Packet, PacketMode, PeerState};
 
 use self::input::gamepad::GamepadConfig;
-use self::{feedback::FeedbackCommand, input::InputHandler};
+pub(crate) use self::{feedback::FeedbackCommand, input::InputHandler};
 use crate::crypto::{decrypt, encrypt};
 use crate::session::SessionContext;
 use crate::session::SessionKeysReceiver;
@@ -22,6 +24,30 @@ use crate::session::stream::video::VideoStreamHandle;
 
 mod feedback;
 pub(crate) mod input;
+
+/// When a client was last heard from. The session stops after `stream_timeout` without a client:
+/// Moonlight's pings and an attached browser both keep it alive.
+#[derive(Clone, Debug)]
+pub(crate) struct KeepAlive(Arc<std::sync::Mutex<Instant>>);
+
+impl KeepAlive {
+	pub fn new() -> Self {
+		Self(Arc::new(std::sync::Mutex::new(Instant::now())))
+	}
+
+	/// A client is there now.
+	pub fn touch(&self) {
+		*self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Instant::now();
+	}
+
+	/// Time since a client was last there.
+	pub fn elapsed(&self) -> Duration {
+		self.0
+			.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+			.elapsed()
+	}
+}
 
 /// Configuration for the control stream.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -280,7 +306,7 @@ impl ControlStreamContext {
 
 pub(crate) struct ControlStream {
 	stop: ShutdownManager<SessionShutdownReason>,
-	input_handler: InputHandler,
+	input_handler: Arc<InputHandler>,
 	host: Host,
 }
 
@@ -291,7 +317,11 @@ impl ControlStream {
 		compositor_input: CompositorInput,
 		stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
-		let input_handler = InputHandler::new(compositor_input, stop_session_manager.clone(), config.gamepad.clone())?;
+		let input_handler = Arc::new(InputHandler::new(
+			compositor_input,
+			stop_session_manager.clone(),
+			config.gamepad.clone(),
+		)?);
 
 		let socket_address = SocketAddr::new(
 			address
@@ -318,6 +348,13 @@ impl ControlStream {
 		})
 	}
 
+	/// The session's input handler, which a browser uses too.
+	pub fn input_handler(&self) -> Arc<InputHandler> {
+		self.input_handler.clone()
+	}
+
+	/// `kick` ends the stream of the connected Moonlight client (a browser took over).
+	#[allow(clippy::too_many_arguments)]
 	pub fn start(
 		self,
 		stream_timeout: u64,
@@ -325,6 +362,8 @@ impl ControlStream {
 		video_handle: VideoStreamHandle,
 		audio_trigger: StartSignal,
 		hdr_metadata_rx: watch::Receiver<HdrModeState>,
+		keepalive: KeepAlive,
+		kick: Arc<AtomicBool>,
 	) {
 		let Self {
 			stop: stop_session_manager,
@@ -342,6 +381,8 @@ impl ControlStream {
 				input_handler,
 				stop_session_manager,
 				hdr_metadata_rx,
+				keepalive,
+				kick,
 			)
 			.await;
 		});
@@ -453,15 +494,18 @@ async fn run_control_loop(
 	video_handle: VideoStreamHandle,
 	audio_trigger: StartSignal,
 	context: ControlStreamContext,
-	input_handler: InputHandler,
+	input_handler: Arc<InputHandler>,
 	stop_session_manager: ShutdownManager<SessionShutdownReason>,
 	mut hdr_metadata_rx: watch::Receiver<HdrModeState>,
+	keepalive: KeepAlive,
+	kick: Arc<AtomicBool>,
 ) {
 	// Trigger session shutdown when the control stream stops.
 	let _session_stop_token = stop_session_manager.trigger_shutdown_token(SessionShutdownReason::ControlStreamStopped);
 	let _delay_stop = stop_session_manager.delay_shutdown_token();
 
-	let mut stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
+	keepalive.touch();
+	let timeout = Duration::from_secs(stream_timeout);
 
 	// Create a channel over which we can receive feedback messages to send to the connected client.
 	let (feedback_tx, mut feedback_rx) = mpsc::channel::<FeedbackCommand>(10);
@@ -475,12 +519,26 @@ async fn run_control_loop(
 
 	while !stop_session_manager.is_shutdown_triggered() {
 		// Check if the timeout has passed.
-		if std::time::Instant::now() > stop_deadline {
-			tracing::info!(
-				"Stopping because we haven't received a ping for {} seconds.",
-				stream_timeout
-			);
+		if keepalive.elapsed() > timeout {
+			tracing::info!("Stopping because no client was connected for {stream_timeout} seconds.");
 			break;
+		}
+
+		// A browser took over: end the Moonlight client's stream, as a server shutdown would.
+		if kick.swap(false, Ordering::Relaxed)
+			&& let Some(peer_id) = connected_peer.take()
+		{
+			tracing::info!("A browser took over the session; ending the Moonlight client's stream.");
+			let key = context.keys_rx.borrow().remote_input_key.clone();
+			send_to_peer(
+				&mut host,
+				peer_id,
+				&key,
+				sequence_number,
+				&build_termination_payload(0x80030023),
+				"termination",
+			);
+			sequence_number += 1;
 		}
 
 		// Check for feedback messages.
@@ -565,7 +623,7 @@ async fn run_control_loop(
 						send_hdr_mode = context.hdr;
 					},
 					ControlMessage::Ping => {
-						stop_deadline = std::time::Instant::now() + std::time::Duration::from_secs(stream_timeout);
+						keepalive.touch();
 					},
 					ControlMessage::InputData(event) => {
 						let _ = input_handler.handle_raw_input(event, feedback_tx.clone()).await;

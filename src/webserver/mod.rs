@@ -953,6 +953,43 @@ impl Webserver {
 			},
 		};
 
+		let layout = |channels: AudioChannels| match channels {
+			AudioChannels::Stereo => "stereo",
+			AudioChannels::Surround51 => "5.1",
+			AudioChannels::Surround71 => "7.1",
+		};
+		// The running encoders stay as they are, so a client that wants another audio layout or
+		// dynamic range could not decode the stream. (A browser can start a session that differs
+		// from what this client asks for.)
+		if let Some(status) = self.session_manager.status().await {
+			let channels = params
+				.get("surroundAudioInfo")
+				.and_then(|s| s.parse::<u32>().ok())
+				.map(|info| AudioChannels::from_wire_or_stereo((info & 0xFFFF) as u8));
+			if let Some(channels) = channels.filter(|channels| *channels != status.context.audio_channels) {
+				let message = format!(
+					"The running session has {} audio, and this client asks for {}. Stop the session first, or change the client's audio setting.",
+					layout(status.context.audio_channels),
+					layout(channels),
+				);
+				tracing::warn!("{message}");
+				return xml_error(400, &message);
+			}
+			let hdr = params
+				.get("hdrMode")
+				.and_then(|s| s.parse::<u32>().ok())
+				.map(|mode| mode != 0);
+			if let Some(hdr) = hdr.filter(|hdr| *hdr != status.context.hdr) {
+				let message = format!(
+					"The running session streams {}, and this client asks for {}. Stop the session first, or change the client's HDR setting.",
+					if status.context.hdr { "HDR" } else { "SDR" },
+					if hdr { "HDR" } else { "SDR" },
+				);
+				tracing::warn!("{message}");
+				return xml_error(400, &message);
+			}
+		}
+
 		match self
 			.session_manager
 			.update_keys(SessionKeyData {

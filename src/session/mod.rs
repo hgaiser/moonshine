@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use async_shutdown::ShutdownManager;
 use manager::SessionShutdownReason;
@@ -8,11 +10,14 @@ use crate::gpu::GpuContext;
 use crate::session::compositor::CompositorConfig;
 use crate::session::stream::StartSignal;
 use crate::session::stream::audio::AudioChannels;
+use crate::session::stream::audio::AudioHandle;
 use crate::session::stream::audio::AudioStream;
 use crate::session::stream::audio::AudioStreamContext;
 use crate::session::stream::control::ControlStream;
 use crate::session::stream::control::ControlStreamContext;
+use crate::session::stream::control::{InputHandler, KeepAlive};
 use crate::session::stream::video::StatsSender;
+use crate::session::stream::video::VideoFormat;
 use crate::session::stream::video::VideoStream;
 use crate::session::stream::video::VideoStreamContext;
 use crate::session::stream::video::VideoStreamHandle;
@@ -29,6 +34,7 @@ use self::stream::control::ControlStreamConfig;
 use self::stream::video::VideoStreamConfig;
 
 pub mod application;
+pub mod browser;
 pub mod compositor;
 pub mod inhibit;
 pub mod manager;
@@ -292,13 +298,18 @@ impl LaunchedSession {
 			tracing::error!("Session keys not initialized");
 		})?;
 
+		let video_format = video_ctx.video_format;
+		let audio_layout = audio_ctx.audio_config.stream_config.clone();
+		let ten_bit = video_ctx.dynamic_range == crate::session::stream::video::VideoDynamicRange::Hdr;
+		let started_with = (video_ctx.clone(), audio_ctx.clone());
+
 		// Start video stream — gated, returns VideoStreamHandle.
 		let video_handle = video_stream
 			.start(video_config, video_ctx, keys_rx.clone(), stop.clone())
 			.map_err(|()| tracing::error!("Failed to start video stream"))?;
 
 		// Start audio stream — gated, returns its StartSignal.
-		let audio_trigger = audio
+		let (audio_trigger, audio_handle) = audio
 			.start(audio_ctx, keys_rx)
 			.map_err(|()| tracing::error!("Failed to start audio stream"))?;
 
@@ -310,6 +321,15 @@ impl LaunchedSession {
 		// frame counters (see `ActiveSession::reset_video_stream`).
 		let video_handle_for_resume = video_handle.clone();
 
+		let controls = SessionControls {
+			video: video_handle.clone(),
+			audio: audio_handle,
+			audio_start: audio_trigger.clone(),
+			input: control_stream.input_handler(),
+			keepalive: KeepAlive::new(),
+			kick_gamestream: Arc::new(AtomicBool::new(false)),
+		};
+
 		// Start control stream — receives both handles.
 		let control_ctx = ControlStreamContext::new(&context, hdr_effective);
 		control_stream.start(
@@ -318,6 +338,8 @@ impl LaunchedSession {
 			video_handle,
 			audio_trigger,
 			hdr_metadata_rx,
+			controls.keepalive.clone(),
+			controls.kick_gamestream.clone(),
 		);
 
 		let sleep_inhibitor = if inhibit_sleep {
@@ -332,11 +354,31 @@ impl LaunchedSession {
 				_application: application,
 				video_handle: video_handle_for_resume,
 				sleep_inhibitor,
+				video_format,
+				audio_layout,
+				ten_bit,
+				started_with,
+				controls,
+				browser: None,
+				attachment: Arc::new(AtomicU64::new(0)),
 			},
 			video_start,
 			audio_start,
 		))
 	}
+}
+
+/// The parts of a running session that a client (Moonlight or a browser) drives.
+#[derive(Clone)]
+pub(crate) struct SessionControls {
+	pub video: VideoStreamHandle,
+	pub audio: AudioHandle,
+	/// Starts the audio encoder (`StartB`).
+	pub audio_start: StartSignal,
+	pub input: Arc<InputHandler>,
+	pub keepalive: KeepAlive,
+	/// Set to end the Moonlight client's stream.
+	pub kick_gamestream: Arc<AtomicBool>,
 }
 
 /// Active session state — streams are active.
@@ -347,11 +389,74 @@ pub(crate) struct ActiveSession {
 	/// Held while the session is active to keep the host awake; dropped on teardown.
 	#[allow(dead_code)]
 	sleep_inhibitor: Option<SleepInhibitor>,
+	/// The codec of the session's encoder. A client must decode it to join.
+	video_format: VideoFormat,
+	/// The Opus layout of the session's audio. A client must decode it to join.
+	audio_layout: crate::session::stream::audio::OpusStreamConfig,
+	/// Whether the encoder makes 10-bit HDR video. A client must decode it to join.
+	ten_bit: bool,
+	/// The stream settings that the running encoders and packetizers use.
+	started_with: (VideoStreamContext, AudioStreamContext),
+	controls: SessionControls,
+	/// The attached browser, if any.
+	browser: Option<browser::Attachment>,
+	/// Counts attachments; the client of the current one owns the sinks.
+	attachment: Arc<AtomicU64>,
 }
 
 impl ActiveSession {
 	pub(crate) fn context(&self) -> &SessionContext {
 		&self.context
+	}
+
+	/// Why a resuming Moonlight client cannot use the running streams, if it cannot. The encoders
+	/// and packetizers keep the settings they started with, and another client (or a browser)
+	/// may have started them.
+	pub(crate) fn resume_mismatch(&self, video: &VideoStreamContext, audio: &AudioStreamContext) -> Option<String> {
+		let (running, running_audio) = &self.started_with;
+		let differences = [
+			(running.video_format != video.video_format)
+				.then(|| format!("codec {:?} (asked: {:?})", running.video_format, video.video_format)),
+			(running.dynamic_range != video.dynamic_range).then(|| {
+				format!(
+					"dynamic range {:?} (asked: {:?})",
+					running.dynamic_range, video.dynamic_range
+				)
+			}),
+			(running.chroma_sampling_type != video.chroma_sampling_type).then(|| {
+				format!(
+					"chroma {:?} (asked: {:?})",
+					running.chroma_sampling_type, video.chroma_sampling_type
+				)
+			}),
+			(running.packet_size != video.packet_size)
+				.then(|| format!("packet size {} (asked: {})", running.packet_size, video.packet_size)),
+			(running.encrypt_video != video.encrypt_video).then(|| {
+				format!(
+					"video encryption {} (asked: {})",
+					running.encrypt_video, video.encrypt_video
+				)
+			}),
+			(running_audio.encrypt_audio != audio.encrypt_audio).then(|| {
+				format!(
+					"audio encryption {} (asked: {})",
+					running_audio.encrypt_audio, audio.encrypt_audio
+				)
+			}),
+			(running_audio.audio_config.channels != audio.audio_config.channels
+				|| running_audio.audio_config.high_quality != audio.audio_config.high_quality)
+				.then(|| {
+					format!(
+						"audio {:?} (high quality {}) (asked: {:?}, high quality {})",
+						running_audio.audio_config.channels,
+						running_audio.audio_config.high_quality,
+						audio.audio_config.channels,
+						audio.audio_config.high_quality
+					)
+				}),
+		];
+		let differences: Vec<String> = differences.into_iter().flatten().collect();
+		(!differences.is_empty()).then(|| differences.join(", "))
 	}
 
 	/// Arm a video stream reset (frame counters + forced IDR) for a resuming client.
