@@ -439,8 +439,9 @@ pub struct VideoStreamContext {
 
 	/// Total stream bitrate requested by the client in bits per second
 	/// (`x-ml-video.configuredBitrateKbps * 1000`), before subtracting FEC/audio overhead.
-	/// When `0`, falls back to `bitrate`.
-	pub configured_bitrate: usize,
+	/// `None` when not specified (for example in benchmarks), in which case pacing derives the
+	/// stream rate from `bitrate` and `fec_percentage`.
+	pub configured_bitrate: Option<usize>,
 
 	/// Minimum number of FEC packets to include for each frame.
 	pub minimum_fec_packets: u32,
@@ -618,18 +619,16 @@ impl VideoStream {
 		// channel never holds more than the in-flight limit.
 		let (packet_tx, packet_rx) = mpsc::channel::<PacketBatch>(MAX_FRAMES_IN_FLIGHT);
 
-		let configured_bitrate = if context.configured_bitrate > 0 {
-			context.configured_bitrate
-		} else {
-			context.bitrate
+		let pacing = PacingControl {
+			enabled: pacing_enabled.clone(),
+			bytes_per_sec: pacing_bytes_per_sec(context.configured_bitrate, context.bitrate, config.fec_percentage),
 		};
 
 		// Spawn packet handler — gated behind start.
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
-			pacing_enabled.clone(),
-			configured_bitrate,
+			pacing,
 			start.waiter(),
 			reset_tx.clone(),
 			resume_pending.clone(),
@@ -665,29 +664,46 @@ impl VideoStream {
 	}
 }
 
-fn apply_pacing(socket: &mut UdpGsoSocket, enabled: bool, configured_bitrate_bps: usize) {
-	if enabled {
-		let bytes_per_sec = pacing_bytes_per_sec(configured_bitrate_bps);
-		if let Some(active) = socket.set_pacing(Some(bytes_per_sec)) {
-			let rate_mbps = active as f64 * 8.0 / 1_000_000.0;
-			tracing::info!(
-				rate_mbps = format_args!("{rate_mbps:.1}"),
-				max_gso_segments = PACED_MAX_GSO_SEGMENTS,
-				"Enabled video packet pacing for stream"
-			);
+/// Minimum delay before retrying `timerfd` creation if enabling packet pacing failed transiently.
+const PACING_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Live packet pacing toggle and target wire rate for the video packet handler.
+struct PacingControl {
+	enabled: Arc<AtomicBool>,
+	bytes_per_sec: u64,
+}
+
+impl PacingControl {
+	fn is_enabled(&self) -> bool {
+		self.enabled.load(Ordering::Relaxed)
+	}
+
+	/// Apply `enabled` to `socket` and return whether pacing is now active on the socket.
+	fn apply(&self, socket: &mut UdpGsoSocket, enabled: bool) -> bool {
+		if enabled {
+			if let Some(active) = socket.set_pacing(Some(self.bytes_per_sec)) {
+				let rate_mbps = active as f64 * 8.0 / 1_000_000.0;
+				tracing::info!(
+					rate_mbps = format_args!("{rate_mbps:.1}"),
+					max_gso_segments = PACED_MAX_GSO_SEGMENTS,
+					"Enabled video packet pacing for stream"
+				);
+				true
+			} else {
+				false
+			}
+		} else {
+			socket.set_pacing(None);
+			tracing::info!("Disabled video packet pacing for stream");
+			false
 		}
-	} else {
-		socket.set_pacing(None);
-		tracing::info!("Disabled video packet pacing for stream");
 	}
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_handle_video_packets(
 	mut packet_rx: mpsc::Receiver<PacketBatch>,
 	mut socket: UdpGsoSocket,
-	pacing_enabled: Arc<AtomicBool>,
-	configured_bitrate_bps: usize,
+	pacing: PacingControl,
 	mut start: StartWaiter,
 	reset_tx: broadcast::Sender<u32>,
 	resume_pending: Arc<AtomicBool>,
@@ -701,9 +717,12 @@ fn spawn_handle_video_packets(
 		let mut buf = [0; 1024];
 		let mut client_address = None;
 		let mut applied_pacing = false;
-		if pacing_enabled.load(Ordering::Relaxed) {
-			applied_pacing = true;
-			apply_pacing(&mut socket, true, configured_bitrate_bps);
+		let mut last_pacing_retry: Option<std::time::Instant> = None;
+		if pacing.is_enabled() {
+			applied_pacing = pacing.apply(&mut socket, true);
+			if !applied_pacing {
+				last_pacing_retry = Some(std::time::Instant::now());
+			}
 		}
 		// Epoch of the last reset fired; batches packetized before it carry old counters.
 		let mut reset_epoch = 0u32;
@@ -720,8 +739,8 @@ fn spawn_handle_video_packets(
 					match batch {
 						Ok(Some(batch)) => {
 							// Taking the batch frees its frame's in-flight slot, so a slow
-							// send doesn't hold back encoding; a stall still fills the
-							// slots with the batches queued behind it.
+							// send doesn't hold back encoding; a stall (or sustained pacing
+							// backlog) still fills the slots with the batches queued behind it.
 							let (epoch, shards) = batch.into_parts();
 							if let Some(addr) = client_address {
 								// Frames from before a resume's reset would reach the new client
@@ -730,10 +749,19 @@ fn spawn_handle_video_packets(
 									continue;
 								}
 
-								let desired_pacing = pacing_enabled.load(Ordering::Relaxed);
-								if desired_pacing != applied_pacing {
-									applied_pacing = desired_pacing;
-									apply_pacing(&mut socket, desired_pacing, configured_bitrate_bps);
+								if !pacing.is_enabled() {
+									last_pacing_retry = None;
+									if applied_pacing {
+										applied_pacing = pacing.apply(&mut socket, false);
+									}
+								} else if !applied_pacing
+									&& last_pacing_retry
+										.is_none_or(|t| t.elapsed() >= PACING_RETRY_INTERVAL)
+								{
+									applied_pacing = pacing.apply(&mut socket, true);
+									if !applied_pacing {
+										last_pacing_retry = Some(std::time::Instant::now());
+									}
 								}
 
 								// Sends are wrapped in wrap_cancel so a socket that
@@ -810,8 +838,10 @@ mod tests {
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
-			Arc::new(AtomicBool::new(false)),
-			0,
+			PacingControl {
+				enabled: Arc::new(AtomicBool::new(false)),
+				bytes_per_sec: pacing_bytes_per_sec(None, 0, 0),
+			},
 			start.waiter(),
 			reset_tx,
 			Arc::new(AtomicBool::new(false)),
@@ -837,8 +867,10 @@ mod tests {
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
-			Arc::new(AtomicBool::new(false)),
-			0,
+			PacingControl {
+				enabled: Arc::new(AtomicBool::new(false)),
+				bytes_per_sec: pacing_bytes_per_sec(None, 0, 0),
+			},
 			start.waiter(),
 			reset_tx,
 			Arc::new(AtomicBool::new(false)),
@@ -942,12 +974,14 @@ mod tests {
 		let stop = ShutdownManager::new();
 		let pacing_enabled = Arc::new(AtomicBool::new(true));
 
-		// 35 Mb/s stream -> 52.5 Mb/s paced (6.5625 MB/s): 80 shards * 1408B (~116 KB wire) takes ~16.8 ms.
+		// 35 Mb/s stream -> 52.5 Mb/s paced (6.5625 MB/s): 80 shards * 1408B (~118 KB wire) takes ~17.1 ms.
 		spawn_handle_video_packets(
 			packet_rx,
 			socket,
-			pacing_enabled.clone(),
-			35_000_000,
+			PacingControl {
+				enabled: pacing_enabled.clone(),
+				bytes_per_sec: pacing_bytes_per_sec(Some(35_000_000), 28_000_000, 20),
+			},
 			start.waiter(),
 			reset_tx,
 			Arc::new(AtomicBool::new(false)),
@@ -965,7 +999,7 @@ mod tests {
 		let shard_size = 1408usize;
 		let mut buf = vec![0u8; shard_size + 64];
 
-		let send_and_measure = |fill: u8| {
+		let make_batch = |fill: u8| {
 			PacketBatch::with_shards(
 				ShardBatch::from_raw(vec![fill; shard_count * shard_size], shard_size),
 				&in_flight,
@@ -974,7 +1008,7 @@ mod tests {
 
 		// Pacing initially ON.
 		let t0 = Instant::now();
-		packet_tx.send(send_and_measure(0xAB)).await.unwrap();
+		packet_tx.send(make_batch(0xAB)).await.unwrap();
 		for _ in 0..shard_count {
 			let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
 				.await
@@ -991,7 +1025,7 @@ mod tests {
 		// Toggle pacing OFF live.
 		pacing_enabled.store(false, Ordering::Relaxed);
 		let t1 = Instant::now();
-		packet_tx.send(send_and_measure(0xCD)).await.unwrap();
+		packet_tx.send(make_batch(0xCD)).await.unwrap();
 		for _ in 0..shard_count {
 			let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
 				.await
@@ -1008,7 +1042,7 @@ mod tests {
 		// Toggle pacing back ON live.
 		pacing_enabled.store(true, Ordering::Relaxed);
 		let t2 = Instant::now();
-		packet_tx.send(send_and_measure(0xEF)).await.unwrap();
+		packet_tx.send(make_batch(0xEF)).await.unwrap();
 		for _ in 0..shard_count {
 			let (len, _) = tokio::time::timeout(Duration::from_secs(2), client.recv_from(&mut buf))
 				.await
@@ -1021,6 +1055,80 @@ mod tests {
 			repaced_elapsed >= Duration::from_millis(12),
 			"expected re-paced batch to take >=12 ms, got {repaced_elapsed:?}"
 		);
+
+		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
+	}
+
+	#[tokio::test]
+	async fn paced_sender_applies_in_flight_backpressure_and_drains() {
+		use std::sync::atomic::AtomicUsize;
+		use std::time::Duration;
+
+		use super::shard_batch::ShardBatch;
+
+		let socket = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
+		let server_addr = socket.local_addr().unwrap();
+		let (packet_tx, packet_rx) = mpsc::channel(MAX_FRAMES_IN_FLIGHT);
+		let (reset_tx, _) = broadcast::channel(1);
+		let start = StartSignal::new();
+		let stop = ShutdownManager::new();
+		let pacing_enabled = Arc::new(AtomicBool::new(true));
+
+		// Floor at 10 Mb/s (1.25 MB/s): a 120-shard (~177 KB wire) batch takes ~137 ms to pace.
+		spawn_handle_video_packets(
+			packet_rx,
+			socket,
+			PacingControl {
+				enabled: pacing_enabled.clone(),
+				bytes_per_sec: pacing_bytes_per_sec(None, 0, 0),
+			},
+			start.waiter(),
+			reset_tx,
+			Arc::new(AtomicBool::new(false)),
+			stop.clone(),
+		);
+		start.trigger();
+
+		let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+		let _ = socket2::SockRef::from(&client).set_recv_buffer_size(2 * 1024 * 1024);
+		client.send_to(b"PING", server_addr).await.unwrap();
+		tokio::time::sleep(Duration::from_millis(10)).await;
+
+		let in_flight = Arc::new(AtomicUsize::new(0));
+		let shard_size = 1408usize;
+		let make_slow_batch = || {
+			PacketBatch::with_shards(
+				ShardBatch::from_raw(vec![0x42; 120 * shard_size], shard_size),
+				&in_flight,
+			)
+		};
+
+		// Queue one slow batch and wait for the sender to dequeue it (freeing its slot while it paces).
+		packet_tx.try_send(make_slow_batch()).unwrap();
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while in_flight.load(Ordering::Relaxed) > 0 {
+				tokio::task::yield_now().await;
+			}
+		})
+		.await
+		.expect("sender did not dequeue initial batch");
+
+		// While the first batch is still pacing, subsequent frames fill the bounded queue and hold
+		// all MAX_FRAMES_IN_FLIGHT slots so the pipeline drops new captures pre-encode.
+		for _ in 0..MAX_FRAMES_IN_FLIGHT {
+			packet_tx.try_send(PacketBatch::holding_slot(&in_flight)).unwrap();
+		}
+		assert_eq!(in_flight.load(Ordering::Relaxed), MAX_FRAMES_IN_FLIGHT);
+		assert_eq!(packet_tx.capacity(), 0);
+
+		// Once the paced batch finishes, the queued slots drain cleanly.
+		tokio::time::timeout(Duration::from_secs(2), async {
+			while in_flight.load(Ordering::Relaxed) > 0 {
+				tokio::time::sleep(Duration::from_millis(5)).await;
+			}
+		})
+		.await
+		.expect("queued in-flight slots did not drain after paced batch finished");
 
 		stop.trigger_shutdown(SessionShutdownReason::ManagerShutdown).unwrap();
 	}

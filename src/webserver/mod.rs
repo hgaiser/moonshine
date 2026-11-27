@@ -867,12 +867,7 @@ impl Webserver {
 		if initialize_result.is_err() {
 			return xml_error(400, "Failed to start session");
 		}
-		let packet_pacing = peer_cert_fingerprint
-			.as_deref()
-			.is_some_and(|fp| self.client_manager.device_packet_pacing(fp));
-		self.session_manager
-			.set_session_client(peer_cert_fingerprint, packet_pacing)
-			.await;
+		self.set_session_client(peer_cert_fingerprint).await;
 
 		match tokio::time::timeout(
 			std::time::Duration::from_secs(APP_LAUNCH_HTTP_TIMEOUT_SECS),
@@ -975,12 +970,7 @@ impl Webserver {
 			},
 		}
 
-		let packet_pacing = peer_cert_fingerprint
-			.as_deref()
-			.is_some_and(|fp| self.client_manager.device_packet_pacing(fp));
-		self.session_manager
-			.set_session_client(peer_cert_fingerprint, packet_pacing)
-			.await;
+		self.set_session_client(peer_cert_fingerprint).await;
 
 		let mut response = "<root status_code=\"200\">".to_string();
 		if let Some(addr) = local_address {
@@ -999,6 +989,12 @@ impl Webserver {
 			.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/xml"));
 
 		response
+	}
+
+	async fn set_session_client(&self, peer_cert_fingerprint: Option<String>) {
+		self.session_manager
+			.set_session_client(peer_cert_fingerprint, |fp| self.client_manager.device_packet_pacing(fp))
+			.await;
 	}
 
 	async fn cancel(&self) -> Response<Full<Bytes>> {

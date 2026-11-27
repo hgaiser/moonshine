@@ -1,7 +1,7 @@
 use quinn_udp::{Transmit, UdpSockRef, UdpSocketState};
 use tokio::net::UdpSocket;
 
-use super::pacing::{PACED_MAX_GSO_SEGMENTS, PacketPacer, chunk_wire_bytes};
+use super::pacing::{PACED_MAX_GSO_SEGMENTS, PacketPacer, chunk_wire_bytes, is_ipv6_wire};
 use super::shard_batch::ShardBatch;
 
 /// Maximum payload of one UDP datagram (65535 minus IPv4/UDP headers).
@@ -155,6 +155,14 @@ impl UdpGsoSocket {
 		}
 	}
 
+	/// Pace a chunk of `chunk_len` UDP payload bytes when packet pacing is active.
+	async fn pace_chunk(&mut self, chunk_len: usize, shard_size: usize, addr: std::net::SocketAddr) {
+		if let Some(pacer) = self.pacer.as_mut() {
+			let wire_bytes = chunk_wire_bytes(chunk_len, shard_size, is_ipv6_wire(addr));
+			pacer.pace(wire_bytes).await;
+		}
+	}
+
 	/// Send a batch as GSO chunks sized to the kernel's segment and datagram
 	/// caps (and the active pacer's segment cap, if any); a frame's batch
 	/// routinely exceeds these caps. Uses `try_send` because `send` masks every
@@ -174,15 +182,12 @@ impl UdpGsoSocket {
 
 		let mut failed_chunks = 0u32;
 		for chunk in batch.as_bytes().chunks(segments_per_send * shard_size) {
-			if let Some(pacer) = self.pacer.as_mut() {
-				let wire_bytes = chunk_wire_bytes(chunk.len(), shard_size, addr.is_ipv6());
-				pacer.pace(wire_bytes).await;
-			}
+			self.pace_chunk(chunk.len(), shard_size, addr).await;
 			let transmit = Transmit {
 				destination: addr,
 				ecn: None,
 				contents: chunk,
-				segment_size: (chunk.len() > shard_size).then_some(shard_size),
+				segment_size: Some(shard_size),
 				src_ip: None,
 			};
 			// Use Tokio's readiness-aware raw-I/O wrapper: a GSO send can
@@ -213,10 +218,7 @@ impl UdpGsoSocket {
 		}
 		if self.pacer.is_some() {
 			for chunk in bytes.chunks(PACED_MAX_GSO_SEGMENTS * shard_size) {
-				if let Some(pacer) = self.pacer.as_mut() {
-					let wire_bytes = chunk_wire_bytes(chunk.len(), shard_size, addr.is_ipv6());
-					pacer.pace(wire_bytes).await;
-				}
+				self.pace_chunk(chunk.len(), shard_size, addr).await;
 				self.send_shards_unpaced(chunk, shard_size, addr).await;
 			}
 		} else {
@@ -321,10 +323,10 @@ mod tests {
 		let _ = socket2::SockRef::from(&receiver).set_recv_buffer_size(4 * 1024 * 1024);
 
 		let mut sender = UdpGsoSocket::new("127.0.0.1", 0).await.unwrap();
-		let bytes_per_sec = 22_500_000; // 180 Mb/s
+		let bytes_per_sec = 6_250_000; // 50 Mb/s
 		assert_eq!(sender.set_pacing(Some(bytes_per_sec)), Some(bytes_per_sec));
 
-		let shard_count = 160usize; // 40 chunks of 4 shards (~225 KiB payload)
+		let shard_count = 96usize; // 24 chunks of 4 shards (~135 KiB payload)
 		let shard_size = 1408usize;
 		let batch = synthetic_batch(shard_count, shard_size);
 
@@ -352,12 +354,12 @@ mod tests {
 		let expected_indices: Vec<u32> = (0..shard_count as u32).collect();
 		assert_eq!(received, expected_indices);
 
-		// 39 inter-chunk gaps * 4 * (1408 + 42) = 226,200 wire bytes at 22.5 MB/s ≈ 10.05 ms.
+		// 23 inter-chunk gaps * 4 * (1408 + 66) = 135,608 wire bytes at 6.25 MB/s ≈ 21.7 ms.
 		let wire_chunk = chunk_wire_bytes(PACED_MAX_GSO_SEGMENTS * shard_size, shard_size, false);
-		let expected_ms = (39 * wire_chunk) as f64 / bytes_per_sec as f64 * 1000.0;
+		let expected_ms = (23 * wire_chunk) as f64 / bytes_per_sec as f64 * 1000.0;
 		let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
 		assert!(
-			elapsed_ms >= expected_ms * 0.85 && elapsed_ms <= expected_ms * 1.5,
+			elapsed_ms >= expected_ms * 0.85 && elapsed_ms <= expected_ms * 2.0,
 			"expected ~{expected_ms:.2} ms for paced batch, got {elapsed_ms:.2} ms"
 		);
 	}

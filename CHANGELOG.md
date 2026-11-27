@@ -9,6 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add a per-device packet pacing toggle on the Clients page of the control panel, for links with small buffers such as USB Ethernet adapters or 100 Mb/s TV ports. When turned on, Moonshine sends video in smaller bursts paced to the stream's bitrate instead of sending each frame at link speed.
 - A guide in the control panel for new users. It darkens the page except one part and tells what that part does. It opens by itself at start until you turn it off, and the guide button in the masthead opens it again.
 
 ## [v0.19.2] - 26-11-2026

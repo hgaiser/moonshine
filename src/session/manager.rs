@@ -170,6 +170,13 @@ struct SessionManagerInner {
 }
 
 impl SessionManagerInner {
+	fn set_packet_pacing(&mut self, enabled: bool) {
+		self.session_packet_pacing = enabled;
+		if let Some(SessionState::Active(active)) = &self.session {
+			active.set_video_packet_pacing(enabled);
+		}
+	}
+
 	fn reset_session(&mut self) {
 		if let Some(handle) = self.stop_watcher.take() {
 			handle.abort();
@@ -349,14 +356,21 @@ impl SessionManager {
 	}
 
 	/// Record which client launched or resumed the current session and apply its packet pacing setting.
-	pub(crate) async fn set_session_client(&self, fingerprint: Option<String>, packet_pacing: bool) {
+	///
+	/// `lookup_pacing` is evaluated under the session lock so a concurrent toggle from the control
+	/// panel cannot be overwritten by a stale value read before `session_client` was updated. On
+	/// resume, only the on/off toggle follows the resuming client; the pacing rate stays tied to
+	/// the running encoder's bitrate, which is not reconfigured on resume.
+	pub(crate) async fn set_session_client(
+		&self,
+		fingerprint: Option<String>,
+		lookup_pacing: impl FnOnce(&str) -> bool,
+	) {
 		let mut guard = self.inner.lock().await;
 		if guard.session.is_some() {
+			let packet_pacing = fingerprint.as_deref().is_some_and(lookup_pacing);
 			guard.session_client = fingerprint;
-			guard.session_packet_pacing = packet_pacing;
-			if let Some(SessionState::Active(active)) = &guard.session {
-				active.set_video_packet_pacing(packet_pacing);
-			}
+			guard.set_packet_pacing(packet_pacing);
 		}
 	}
 
@@ -364,10 +378,7 @@ impl SessionManager {
 	pub async fn set_client_packet_pacing(&self, fingerprint: &str, enabled: bool) {
 		let mut guard = self.inner.lock().await;
 		if guard.session_client.as_deref() == Some(fingerprint) {
-			guard.session_packet_pacing = enabled;
-			if let Some(SessionState::Active(active)) = &guard.session {
-				active.set_video_packet_pacing(enabled);
-			}
+			guard.set_packet_pacing(enabled);
 		}
 	}
 
