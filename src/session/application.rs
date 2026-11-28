@@ -168,7 +168,7 @@ pub(crate) struct Application {
 impl Application {
 	pub async fn spawn(
 		config: ApplicationConfig,
-		context: ApplicationContext,
+		mut context: ApplicationContext,
 		stop: ShutdownManager<SessionShutdownReason>,
 	) -> Result<Self, ()> {
 		let Some(program) = config.command.first() else {
@@ -176,7 +176,6 @@ impl Application {
 			return Err(());
 		};
 		let args = &config.command[1..];
-		let envs = make_envs(&context, &config.env, config.steam_integration)?;
 		let working_directory = config
 			.working_directory
 			.as_deref()
@@ -190,6 +189,19 @@ impl Application {
 			.await
 			.map_err(|e| tracing::error!("Failed to connect to session bus: {e}"))?;
 		subscribe_to_systemd_signals(&conn).await?;
+
+		// add steam_helper_dir with steamos-session-select to PATH when steam integration is enabled
+		if config.steam_integration {
+			match (steam_helper_dir(), manager_path(&conn).await) {
+				(Some(dir), Some(path)) => {
+					context
+						.extra_env
+						.insert("PATH".to_string(), format!("{}:{path}", dir.display()));
+				},
+				_ => tracing::warn!("PATH not modified, see reason above. \"Switch to Desktop\" will not work."),
+			}
+		}
+		let envs = make_envs(&context, &config.env, config.steam_integration)?;
 
 		// Stop any leftover unit from a previous session.
 		let _ = stop_unit(&conn, &context.unit_name).await;
@@ -249,6 +261,52 @@ impl Drop for Application {
 /// integration Moonshine leaves them out, so Steam acts as on a desktop (its
 /// power menu has "Exit Big Picture Mode", not "Switch to Desktop").
 const GAMESCOPE_SESSION_ENV: &[&str] = &["XDG_CURRENT_DESKTOP", "GAMESCOPE_WAYLAND_DISPLAY"];
+
+/// The directory with Moonshine's `steamos-session-select`
+fn steam_helper_dir() -> Option<PathBuf> {
+	let exe = std::env::current_exe()
+		.map_err(|e| tracing::warn!("Failed to find the moonshine binary: {e}"))
+		.ok()?;
+	let Some(base) = exe.parent().and_then(Path::parent) else {
+		tracing::warn!(
+			"Can't determine the base directory of lib/moonshine from {}.",
+			exe.display()
+		);
+		return None;
+	};
+	Some(base.join("lib/moonshine"))
+}
+
+/// read the PATH from user manager's environment, used as base for later modificaitons
+async fn manager_path(conn: &Connection) -> Option<String> {
+	let reply = conn
+		.call_method(
+			Some(SYSTEMD_BUS),
+			SYSTEMD_PATH,
+			Some(PROPERTIES_INTERFACE),
+			"Get",
+			&(SYSTEMD_MANAGER, "Environment"),
+		)
+		.await
+		.map_err(|e| tracing::warn!("Failed to get the user manager's environment: {e}"))
+		.ok()?;
+	let body = reply.body();
+	let (variant,): (zvariant::OwnedValue,) = body
+		.deserialize()
+		.map_err(|e| tracing::warn!("Failed to deserialize the user manager's environment: {e}"))
+		.ok()?;
+	let environment: Vec<String> = variant
+		.try_into()
+		.map_err(|e| tracing::warn!("Unexpected user manager environment: {e}"))
+		.ok()?;
+	let path = environment
+		.into_iter()
+		.find_map(|entry| entry.strip_prefix("PATH=").map(str::to_string));
+	if path.is_none() {
+		tracing::warn!("The user manager's environment has no PATH.");
+	}
+	path
+}
 
 fn make_envs(
 	context: &ApplicationContext,

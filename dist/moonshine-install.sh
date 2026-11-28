@@ -278,6 +278,9 @@ install_opt() {
     # Deploy the gamescope wrapper (see TIPS.md)
     "install -Dm755 '${S}/bin/moonshine-gamescope' '${MOONSHINE_HOME}/bin/moonshine-gamescope'"
 
+    # Deploy the helper for Steam's "Switch to Desktop" action
+    "install -Dm755 '${S}/lib/moonshine/steamos-session-select' '${MOONSHINE_HOME}/lib/moonshine/steamos-session-select'"
+
     # Deploy the install script itself for future upgrades/uninstall
     "install -m755 '${S}/bin/moonshine-install.sh' '${MOONSHINE_HOME}/bin/moonshine-install.sh'"
 

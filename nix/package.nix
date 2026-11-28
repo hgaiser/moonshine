@@ -205,6 +205,9 @@ rustPlatform.buildRustPackage {
     # gamescope itself comes from the user's PATH.
     install -Dm755 dist/moonshine-gamescope $out/bin/moonshine-gamescope
 
+    # Steam's "Switch to Desktop" with Steam integration now shuts Steam down
+    install -Dm755 dist/steamos-session-select $out/lib/moonshine/steamos-session-select
+
     # Polkit rule that lets the 'moonshine' group hold a block-type sleep
     # inhibitor (used by the suspend-inhibit tip in TIPS.md). The group itself
     # is declared in the NixOS module; the rule is referenced from there.

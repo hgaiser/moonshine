@@ -80,7 +80,7 @@ in
           application = [
             {
               title = "Steam";
-              command = [ "/run/current-system/sw/bin/steam" "steam://open/bigpicture" ];
+              command = [ "/run/current-system/sw/bin/steam" "-steamos3" "steam://open/bigpicture" ];
               steam_integration = true;
             }
           ];

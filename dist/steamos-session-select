@@ -1,0 +1,8 @@
+#!/bin/sh
+# Shut Steam down when it asks to switch to the desktop session.
+#
+# Steam waits for this script, so start the shutdown in the background
+# instead of waiting for it.
+
+steam -shutdown >/dev/null 2>&1 &
+exit 0

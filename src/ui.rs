@@ -1141,7 +1141,7 @@ const SCANNER_KINDS: &[ScannerKindSpec] = &[
 		name: "Steam",
 		description: "Installed games in your Steam libraries.",
 		path_label: "Steam folder",
-		default: r#"{"type":"steam","library":"$HOME/.local/share/Steam","command":["/usr/bin/steam","-bigpicture","steam://rungameid/{game_id}"]}"#,
+		default: r#"{"type":"steam","library":"$HOME/.local/share/Steam","command":["/usr/bin/steam","-steamos3","-bigpicture","steam://rungameid/{game_id}"]}"#,
 	},
 	ScannerKindSpec {
 		kind: "desktop",
