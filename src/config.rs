@@ -208,7 +208,11 @@ impl Default for Config {
 			stream: Default::default(),
 			applications: vec![ApplicationConfig {
 				title: "Steam".to_string(),
-				command: vec!["/usr/bin/steam".to_string(), "steam://open/bigpicture".to_string()],
+				command: vec![
+					"/usr/bin/steam".to_string(),
+					"-steamos3".to_string(),
+					"steam://open/bigpicture".to_string(),
+				],
 				boxart: None,
 				steam_integration: true,
 				..Default::default()
@@ -217,6 +221,7 @@ impl Default for Config {
 				library: "$HOME/.local/share/Steam".into(),
 				command: vec![
 					"/usr/bin/steam".to_string(),
+					"-steamos3".to_string(),
 					"-bigpicture".to_string(),
 					"steam://rungameid/{game_id}".to_string(),
 				],

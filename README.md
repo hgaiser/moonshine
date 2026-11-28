@@ -95,7 +95,7 @@ services.moonshine = {
   settings.application = [
     {
       title = "Steam";
-      command = [ "/run/current-system/sw/bin/steam" "steam://open/bigpicture" ];
+      command = [ "/run/current-system/sw/bin/steam" "-steamos3" "steam://open/bigpicture" ];
       steam_integration = true;
     }
   ];
@@ -187,7 +187,7 @@ Each application runs in its own isolated streaming session. Add them in the con
 ```toml
 [[application]]
 title = "Steam"
-command = ["/usr/bin/steam", "steam://open/bigpicture"]
+command = ["/usr/bin/steam", "-steamos3", "steam://open/bigpicture"]
 boxart = "/path/to/steam.png"
 steam_integration = true
 pre_command = [
@@ -220,7 +220,7 @@ Scanners find installed applications, so you don't have to add them one by one:
 [[application_scanner]]
 type = "steam"
 library = "$HOME/.local/share/Steam"
-command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
+command = ["/usr/bin/steam", "-steamos3", "-bigpicture", "steam://rungameid/{game_id}"]
 ```
 
 See [SCANNERS.md](SCANNERS.md) for the options of each scanner.

@@ -53,6 +53,7 @@ Then import the module and enable the service in your configuration:
           title = "Steam";
           command = [
             "/run/current-system/sw/bin/steam"
+            "-steamos3"
             "steam://open/bigpicture"
           ];
           steam_integration = true;

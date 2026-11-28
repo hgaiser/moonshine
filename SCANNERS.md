@@ -24,7 +24,7 @@ Finds all installed Steam games. The default configuration includes this scanner
 [[application_scanner]]
 type = "steam"
 library = "$HOME/.local/share/Steam"
-command = ["/usr/bin/steam", "-bigpicture", "steam://rungameid/{game_id}"]
+command = ["/usr/bin/steam", "-steamos3", "-bigpicture", "steam://rungameid/{game_id}"]
 ```
 
 ## Desktop entries
