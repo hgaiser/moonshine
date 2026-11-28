@@ -22,6 +22,8 @@ contents:
     dst: /usr/bin/start-moonshine.sh
   - src: ./dist/moonshine-gamescope
     dst: /usr/bin/moonshine-gamescope
+  - src: ./dist/steamos-session-select
+    dst: /usr/lib/moonshine/steamos-session-select
   - src: ./dist/60-moonshine.rules
     dst: /usr/lib/udev/rules.d/60-moonshine.rules
   - src: ./dist/moonshine-modules.conf

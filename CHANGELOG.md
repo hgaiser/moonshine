@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - A guide in the control panel for new users. It darkens the page except one part and tells what that part does. It opens by itself at start until you turn it off.
 
+### Fixed
+
+- Let Steam quit from its power menu with Steam integration on. Moonshine now installs `/usr/lib/moonshine/steamos-session-select` and puts it first in Steam's PATH, so "Switch to Desktop" shuts Steam down and ends the session.
+
 ## [v0.19.2] - 26-11-2026
 
 ### Changed
